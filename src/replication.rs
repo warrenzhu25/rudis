@@ -230,8 +230,24 @@ pub struct ShardReplicaFlow {
     pub client_id: u64,
     pub shard_id: usize,
     pub sender: flume::Sender<Vec<u8>>,
+    /// The flow's socket, shut down if it falls too far behind. Cleared
+    /// before the socket closes so a reused fd is never shut down.
+    fd: Mutex<Option<i32>>,
     pub lsn: AtomicU64,
     pub ack_lsn: AtomicU64,
+}
+
+impl ShardReplicaFlow {
+    /// Forgets the socket; called before it closes.
+    pub fn detach_fd(&self) {
+        *self.fd.lock().unwrap() = None;
+    }
+
+    fn drop_link(&self) {
+        if let Some(fd) = *self.fd.lock().unwrap() {
+            unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+        }
+    }
 }
 
 pub struct ReplicationBacklog {
@@ -596,11 +612,13 @@ impl ReplicationHub {
         shard_id: usize,
         client_id: u64,
         sender: flume::Sender<Vec<u8>>,
+        fd: Option<i32>,
     ) -> Arc<ShardReplicaFlow> {
         let flow = Arc::new(ShardReplicaFlow {
             client_id,
             shard_id,
             sender,
+            fd: Mutex::new(fd),
             lsn: AtomicU64::new(0),
             ack_lsn: AtomicU64::new(0),
         });
@@ -803,20 +821,24 @@ impl ReplicationHub {
                 }
                 for (&cid, flow) in map {
                     flow.lsn.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    if flow.sender.send(bytes.to_vec()).is_err() {
-                        dead.push((sid, cid));
+                    // Never block the writing shard on a slow flow: once its
+                    // queue is full the flow is dropped and its socket shut
+                    // down, and the replica resyncs (like an output buffer
+                    // limit).
+                    match flow.sender.try_send(bytes.to_vec()) {
+                        Ok(()) => {}
+                        Err(flume::TrySendError::Full(_)) => {
+                            flow.drop_link();
+                            dead.push((sid, cid));
+                        }
+                        Err(flume::TrySendError::Disconnected(_)) => dead.push((sid, cid)),
                     }
                 }
             }
             dead
         };
-        if !dead_flows.is_empty() {
-            let mut flows = self.shard_flows.write().unwrap();
-            for (sid, cid) in dead_flows {
-                if let Some(map) = flows.get_mut(&sid) {
-                    map.remove(&cid);
-                }
-            }
+        for (sid, cid) in dead_flows {
+            self.unregister_shard_flow(sid, cid);
         }
     }
 
@@ -1235,6 +1257,71 @@ impl Drop for SyncConnGuard<'_> {
     }
 }
 
+/// Longest line accepted on a replication link outside the command stream:
+/// a master's handshake replies and RDB `$<len>` header, and everything a
+/// replica sends (REPLCONF ACKs). Like Redis' PROTO_INLINE_MAX_SIZE.
+pub const MAX_REPL_LINE: usize = 64 * 1024;
+
+/// How long a replica waits for each handshake reply (Redis' default
+/// repl-timeout) before reconnecting.
+const REPL_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Splits the first CRLF-terminated line off `buf`. `Ok(None)` means more
+/// data is needed; `Err` that `buf` holds a longer line than a master ever
+/// sends, so the link is dropped rather than buffered without bound.
+fn take_repl_line(buf: &mut bytes::BytesMut) -> Result<Option<bytes::BytesMut>, ()> {
+    match buf.windows(2).position(|w| w == b"\r\n") {
+        Some(pos) if pos <= MAX_REPL_LINE => Ok(Some(buf.split_to(pos + 2))),
+        Some(_) => Err(()),
+        None if buf.len() > MAX_REPL_LINE => Err(()),
+        None => Ok(None),
+    }
+}
+
+/// Takes the `$<len>` line that precedes a full-sync RDB, skipping the bare
+/// `\n` keepalives Redis masters send while producing it. A length that is
+/// not a plain number (including diskless `$EOF:` transfers, which are not
+/// supported) is an error.
+fn take_rdb_header(buf: &mut bytes::BytesMut) -> Result<Option<usize>, ()> {
+    loop {
+        let keepalives = buf.iter().take_while(|&&b| b == b'\n').count();
+        bytes::Buf::advance(buf, keepalives);
+        let Some(line) = take_repl_line(buf)? else {
+            return Ok(None);
+        };
+        if let Some(len) = line.strip_prefix(b"$") {
+            return crate::resp::parse_decimal_bytes(&len[..len.len() - 2])
+                .map(Some)
+                .ok_or(());
+        }
+    }
+}
+
+/// A replication id as masters send it: 40 alphanumeric characters.
+fn valid_replid(id: &str) -> bool {
+    id.len() == 40 && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Parses a master's PSYNC reply: `+FULLRESYNC <replid> <offset>` or
+/// `+CONTINUE [<replid>]`. Returns whether it continues, the replication id
+/// and the offset to resume from; offsets are Redis' signed 64-bit values.
+fn parse_psync_reply(
+    line: &[u8],
+    cached_replid: &str,
+    cached_offset: u64,
+) -> Option<(bool, String, u64)> {
+    let text = std::str::from_utf8(line).ok()?;
+    match text.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["+CONTINUE"] => Some((true, cached_replid.to_string(), cached_offset)),
+        ["+CONTINUE", id] if valid_replid(id) => Some((true, id.to_string(), cached_offset)),
+        ["+FULLRESYNC", id, off] if valid_replid(id) => {
+            let off = u64::try_from(off.parse::<i64>().ok()?).ok()?;
+            Some((false, id.to_string(), off))
+        }
+        _ => None,
+    }
+}
+
 async fn run_replica_worker(
     my_port: u16,
     master_host: String,
@@ -1304,13 +1391,26 @@ async fn run_replica_worker(
                 }
                 let mut line_res = None;
                 loop {
-                    if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-                        let line = buf.split_to(pos + 2);
-                        line_res = Some(line);
-                        break;
+                    match take_repl_line(&mut buf) {
+                        Ok(Some(line)) => {
+                            line_res = Some(line);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(()) => break,
                     }
-                    let (res, returned) = stream.read(read_buf).await;
-                    read_buf = returned;
+                    let read = monoio::time::timeout(
+                        REPL_HANDSHAKE_TIMEOUT,
+                        stream.read(std::mem::take(&mut read_buf)),
+                    )
+                    .await;
+                    let res = match read {
+                        Ok((res, returned)) => {
+                            read_buf = returned;
+                            res
+                        }
+                        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+                    };
                     match res {
                         Ok(0) | Err(_) => {
                             if let ReplicationRole::Slave {
@@ -1422,8 +1522,9 @@ async fn run_replica_worker(
         };
 
         let line = send_and_expect_line!(psync_payload);
-        let is_continue = line.starts_with(b"+CONTINUE");
-        if !line.starts_with(b"+FULLRESYNC") && !is_continue {
+        let Some((is_continue, new_replid, initial_offset)) =
+            parse_psync_reply(&line, &cached_replid, cached_offset)
+        else {
             if let ReplicationRole::Slave {
                 ref mut link_status,
                 ..
@@ -1436,51 +1537,23 @@ async fn run_replica_worker(
             }
             monoio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue 'reconnect_loop;
-        }
-
-        let line_str = String::from_utf8_lossy(&line);
-        let parts: Vec<&str> = line_str.split_whitespace().collect();
-
-        let (new_replid, initial_offset) = if is_continue {
-            let r_id = if parts.len() >= 2 {
-                parts[1].to_string()
-            } else {
-                cached_replid.clone()
-            };
-            (r_id, cached_offset)
-        } else {
-            let r_id = if parts.len() >= 2 {
-                parts[1].to_string()
-            } else {
-                String::new()
-            };
-            let off: u64 = if parts.len() >= 3 {
-                parts[2].parse().unwrap_or(0)
-            } else {
-                0
-            };
-            (r_id, off)
         };
 
         if !is_continue {
             // 5. Read RDB header: $<len>\r\n
-            let mut rdb_len: Option<usize> = None;
-            loop {
-                if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-                    let line = buf.split_to(pos + 2);
-                    if line.starts_with(b"$") {
-                        let s = std::str::from_utf8(&line[1..line.len() - 2]).unwrap_or("0");
-                        rdb_len = Some(s.parse().unwrap_or(0));
-                        break;
-                    }
+            let rdb_len = loop {
+                match take_rdb_header(&mut buf) {
+                    Ok(Some(len)) => break Some(len),
+                    Ok(None) => {}
+                    Err(()) => break None,
                 }
                 let (res, returned) = stream.read(read_buf).await;
                 read_buf = returned;
                 match res {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => break None,
                     Ok(n) => buf.extend_from_slice(&read_buf[..n]),
                 }
-            }
+            };
 
             let rdb_len = match rdb_len {
                 Some(l) => l,
@@ -1561,6 +1634,7 @@ async fn run_replica_worker(
             if is_sync_cancelled(&cancel_rx) {
                 break 'reconnect_loop;
             }
+            let mut protocol_error = false;
 
             while !buf.is_empty() {
                 let initial_buf_len = buf.len();
@@ -1590,8 +1664,10 @@ async fn run_replica_worker(
                         }
                     }
                     Ok(None) => break,
+                    // Skipping the bad bytes would silently diverge from
+                    // the master; reconnect and resume from what was applied.
                     Err(_) => {
-                        buf.clear();
+                        protocol_error = true;
                         break;
                     }
                 }
@@ -1603,6 +1679,9 @@ async fn run_replica_worker(
             } = *hub.role.write().unwrap()
             {
                 *master_repl_offset = current_offset;
+            }
+            if protocol_error {
+                break;
             }
 
             let (res, returned) = stream.read(read_buf).await;
@@ -1639,6 +1718,7 @@ async fn run_replica_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
 
     #[test]
     fn test_backlog_append_and_diff() {
@@ -1986,8 +2066,8 @@ mod tests {
         let (tx1, rx1) = flume::bounded(16);
 
         // Register flows for Shard 0 and Shard 1
-        let flow0 = hub.register_shard_flow(0, 100, tx0);
-        let flow1 = hub.register_shard_flow(1, 101, tx1);
+        let flow0 = hub.register_shard_flow(0, 100, tx0, None);
+        let flow1 = hub.register_shard_flow(1, 101, tx1, None);
 
         assert!(hub.has_shard_flows.load(Ordering::Relaxed));
         assert_eq!(flow0.shard_id, 0);
@@ -2020,5 +2100,157 @@ mod tests {
         hub.unregister_shard_flow(0, 100);
         hub.unregister_shard_flow(1, 101);
         assert!(!hub.has_shard_flows.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_take_repl_line_bounds_lines() {
+        let mut buf = BytesMut::from(&b"+PONG\r\n+OK"[..]);
+        assert_eq!(
+            &take_repl_line(&mut buf).unwrap().unwrap()[..],
+            b"+PONG\r\n"
+        );
+        assert_eq!(take_repl_line(&mut buf), Ok(None));
+        assert_eq!(&buf[..], b"+OK");
+
+        let mut buf = BytesMut::from(&vec![b'a'; MAX_REPL_LINE + 1][..]);
+        assert_eq!(take_repl_line(&mut buf), Err(()));
+        let mut line = vec![b'a'; MAX_REPL_LINE + 1];
+        line.extend_from_slice(b"\r\n");
+        assert_eq!(take_repl_line(&mut BytesMut::from(&line[..])), Err(()));
+        let mut line = vec![b'a'; MAX_REPL_LINE];
+        line.extend_from_slice(b"\r\n");
+        let mut buf = BytesMut::from(&line[..]);
+        assert_eq!(
+            take_repl_line(&mut buf).unwrap().unwrap().len(),
+            MAX_REPL_LINE + 2
+        );
+    }
+
+    #[test]
+    fn test_take_rdb_header_rejects_bad_lengths() {
+        let mut buf = BytesMut::from(&b"\n\n\n$5\r\nREDIS"[..]);
+        assert_eq!(take_rdb_header(&mut buf), Ok(Some(5)));
+        assert_eq!(&buf[..], b"REDIS");
+        let mut buf = BytesMut::from(&b"\n\n$12"[..]);
+        assert_eq!(take_rdb_header(&mut buf), Ok(None));
+        for bad in [
+            &b"$abc\r\n"[..],
+            b"$\r\n",
+            b"$-1\r\n",
+            b"$+5\r\n",
+            b"$ 5\r\n",
+            b"$EOF:0123456789012345678901234567890123456789\r\n",
+            b"$99999999999999999999999\r\n",
+        ] {
+            assert_eq!(
+                take_rdb_header(&mut BytesMut::from(bad)),
+                Err(()),
+                "{:?}",
+                bad
+            );
+        }
+        let mut huge = b"$".to_vec();
+        huge.extend(std::iter::repeat_n(b'1', MAX_REPL_LINE + 8));
+        assert_eq!(take_rdb_header(&mut BytesMut::from(&huge[..])), Err(()));
+    }
+
+    #[test]
+    fn test_parse_psync_reply_validates_fields() {
+        let id = "a".repeat(40);
+        let full = format!("+FULLRESYNC {} 42\r\n", id);
+        assert_eq!(
+            parse_psync_reply(full.as_bytes(), "", 0),
+            Some((false, id.clone(), 42))
+        );
+        assert_eq!(
+            parse_psync_reply(b"+CONTINUE\r\n", &id, 7),
+            Some((true, id.clone(), 7))
+        );
+        let cont = format!("+CONTINUE {}\r\n", "b".repeat(40));
+        assert_eq!(
+            parse_psync_reply(cont.as_bytes(), &id, 7),
+            Some((true, "b".repeat(40), 7))
+        );
+        for bad in [
+            format!("+FULLRESYNC {} -5\r\n", id),
+            format!("+FULLRESYNC {} x\r\n", id),
+            format!("+FULLRESYNC {}\r\n", id),
+            format!("+FULLRESYNC {} 1 2\r\n", id),
+            "+FULLRESYNC short 1\r\n".to_string(),
+            format!("+FULLRESYNC {}! 1\r\n", "a".repeat(39)),
+            format!("+CONTINUE {}\r\n", "c".repeat(41)),
+            "-ERR no\r\n".to_string(),
+            "+FULLRESYNCX\r\n".to_string(),
+        ] {
+            assert_eq!(parse_psync_reply(bad.as_bytes(), &id, 0), None, "{}", bad);
+        }
+        assert_eq!(parse_psync_reply(b"+CONTINUE \xff\r\n", &id, 0), None);
+    }
+
+    /// Cheap deterministic fuzz of the replica's handshake decoders: they
+    /// must never panic and never accept more than they bound.
+    #[test]
+    fn test_replica_handshake_decoders_fuzz() {
+        let alphabet = b"$+-:\r\n0123456789aZ FULLRESYNCONTIE";
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 96) as usize;
+            let mut input: Vec<u8> = (0..len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            if next() % 8 == 0 {
+                input.splice(0..0, b"+FULLRESYNC ".iter().copied());
+            }
+            let mut buf = BytesMut::from(&input[..]);
+            while let Ok(Some(line)) = take_repl_line(&mut buf) {
+                assert!(line.ends_with(b"\r\n") && line.len() <= MAX_REPL_LINE + 2);
+                if let Some((_, id, _)) = parse_psync_reply(&line, "", 0) {
+                    assert!(valid_replid(&id));
+                }
+            }
+            let mut buf = BytesMut::from(&input[..]);
+            let _ = take_rdb_header(&mut buf);
+        }
+    }
+
+    #[test]
+    fn test_full_shard_flow_is_dropped_not_waited_on() {
+        let hub = ReplicationHub::new(19995);
+        let (tx, rx) = flume::bounded(1);
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&ours);
+        hub.register_shard_flow(0, 100, tx, Some(fd));
+
+        hub.propagate_shard(0, b"first");
+        assert!(hub.has_shard_flows.load(Ordering::Relaxed));
+        // The queue is full: the shard must not block, the flow is dropped
+        // and its socket shut down so the replica resyncs.
+        hub.propagate_shard(0, b"second");
+        assert!(!hub.has_shard_flows.load(Ordering::Relaxed));
+        assert_eq!(rx.try_recv().unwrap(), b"first".to_vec());
+        let mut byte = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut &theirs, &mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_detached_shard_flow_leaves_socket_alone() {
+        let hub = ReplicationHub::new(19994);
+        let (tx, _rx) = flume::bounded(1);
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&ours);
+        let flow = hub.register_shard_flow(0, 100, tx, Some(fd));
+        flow.detach_fd();
+        hub.propagate_shard(0, b"first");
+        hub.propagate_shard(0, b"second");
+        assert!(!hub.has_shard_flows.load(Ordering::Relaxed));
+        std::io::Write::write_all(&mut &ours, b"x").unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut &theirs, &mut byte).unwrap(), 1);
     }
 }

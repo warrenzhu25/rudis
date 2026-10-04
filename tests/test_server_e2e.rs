@@ -19937,3 +19937,119 @@ fn test_empty_frame_flood_does_not_crash_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child.0);
 }
+
+/// A hostile master (and replica) must only ever cost the link: the replica
+/// drops it and reconnects, the master closes the flow, and both keep
+/// serving clients.
+#[test]
+fn test_hostile_replication_peer_drops_link_e2e() {
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    let port: u16 = 17087;
+    let port_s = port.to_string();
+    let args = ["--port", &port_s, "--threads", "2", "--no-pin"];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+
+    // As a master: a flow for a shard that does not exist is refused, and a
+    // replica streaming an endless partial command is cut off.
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let reply = resp_cmd(&mut c, &["DFLY", "FLOW", "x", "y", "18446744073709551615"]);
+    assert_eq!(reply, "-ERR invalid shard id\r\n");
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let reply = resp_cmd(&mut c, &["DFLY", "FLOW", "x", "y", "0"]);
+    assert!(reply.starts_with("+OK FLOW 0\r\n"), "{reply:?}");
+    let _ = c.write_all(b"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$999999999\r\n");
+    let _ = c.write_all(&vec![b'1'; 1 << 20]);
+    let mut sink = [0u8; 65536];
+    let closed = loop {
+        match c.read(&mut sink) {
+            Ok(0) => break true,
+            Ok(_) => {}
+            Err(e) => break e.kind() == std::io::ErrorKind::ConnectionReset,
+        }
+    };
+    assert!(closed, "master kept a replica link with an endless command");
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+
+    // As a replica: each hostile master reply must make it reconnect.
+    let master = TcpListener::bind("127.0.0.1:0").unwrap();
+    let master_port = master.local_addr().unwrap().port();
+    let (conn_tx, conn_rx) = mpsc::channel::<usize>();
+    thread::spawn(move || {
+        let replid = "a".repeat(40);
+        let attacks: Vec<Vec<u8>> = vec![
+            // A reply line that never ends.
+            vec![b'+'; 1 << 20],
+            // A FULLRESYNC with a bogus replication id.
+            b"+FULLRESYNC not-an-id 0\r\n$0\r\n".to_vec(),
+            // An RDB length that is not a number.
+            format!("+FULLRESYNC {replid} 0\r\n$abc\r\n").into_bytes(),
+            // A command stream that does not parse.
+            format!("+FULLRESYNC {replid} 0\r\n$0\r\n*1\r\n$x\r\n").into_bytes(),
+        ];
+        let mut held = Vec::new();
+        for (i, conn) in master.incoming().enumerate() {
+            let Ok(mut conn) = conn else { return };
+            let _ = conn_tx.send(i);
+            let Some(attack) = attacks.get(i) else {
+                held.push(conn);
+                continue;
+            };
+            conn.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut answer = |conn: &mut TcpStream, until: &[u8], reply: &[u8]| {
+                while !got.windows(until.len()).any(|w| w == until) {
+                    match conn.read(&mut buf) {
+                        Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+                        _ => return false,
+                    }
+                }
+                got.clear();
+                conn.write_all(reply).is_ok()
+            };
+            if i == 0 {
+                answer(&mut conn, b"PING\r\n", attack);
+            } else {
+                let _ = answer(&mut conn, b"PING\r\n", b"+PONG\r\n")
+                    && answer(&mut conn, b"listening-port\r\n", b"+OK\r\n")
+                    && answer(&mut conn, b"psync2\r\n", b"+OK\r\n")
+                    && answer(&mut conn, b"PSYNC\r\n", attack);
+            }
+            // Keep the connection open: only the replica may end it.
+            held.push(conn);
+        }
+    });
+
+    let mport = master_port.to_string();
+    assert_eq!(
+        resp_cmd(&mut c, &["REPLICAOF", "127.0.0.1", &mport]),
+        "+OK\r\n"
+    );
+    for want in 0..5 {
+        let got = conn_rx
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("replica did not reconnect after attack {want}"));
+        assert_eq!(got, want);
+    }
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    let info = resp_cmd(&mut c, &["INFO", "replication"]);
+    assert!(info.contains("role:slave"), "{info}");
+    assert!(!info.contains("master_link_status:up"), "{info}");
+    assert_eq!(resp_cmd(&mut c, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+}

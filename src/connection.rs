@@ -4872,6 +4872,42 @@ fn replica_output_limit_reached(client_id: u64) {
     );
 }
 
+/// Reads what a replica sends back, which is only `REPLCONF ACK <offset>`,
+/// until the link ends. Malformed input or a partial command longer than
+/// any ack drops the link instead of being skipped or buffered without
+/// bound.
+async fn read_replica_acks<R: AsyncReadRent>(reader: &mut R, mut on_ack: impl FnMut(u64)) {
+    let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
+    let mut buf = BytesMut::with_capacity(32768);
+    loop {
+        let (res, returned_buf) = reader.read(read_buf).await;
+        read_buf = returned_buf;
+        match res {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+        }
+        loop {
+            match crate::resp::parse_command(&mut buf) {
+                Ok(Some(Command::Replconf(args)))
+                    if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"ack") =>
+                {
+                    if let Ok(s) = std::str::from_utf8(&args[1])
+                        && let Ok(ack_off) = s.parse::<u64>()
+                    {
+                        on_ack(ack_off);
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => return,
+            }
+        }
+        if buf.len() > crate::replication::MAX_REPL_LINE {
+            return;
+        }
+    }
+}
+
 async fn run_master_replica_stream(
     stream: TcpStream,
     client_id: u64,
@@ -4983,38 +5019,7 @@ async fn run_master_replica_stream(
         writer_hub.unregister_replica(client_id);
     });
 
-    let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
-    let mut buf = BytesMut::with_capacity(32768);
-    loop {
-        let (res, returned_buf) = reader.read(read_buf).await;
-        read_buf = returned_buf;
-        match res {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&read_buf[..n]);
-                while !buf.is_empty() {
-                    match crate::resp::parse_command(&mut buf) {
-                        Ok(Some(cmd)) => {
-                            if let Command::Replconf(args) = cmd
-                                && args.len() >= 2
-                                && args[0].eq_ignore_ascii_case(b"ack")
-                                && let Ok(s) = std::str::from_utf8(&args[1])
-                                && let Ok(ack_off) = s.parse::<u64>()
-                            {
-                                hub.update_replica_ack(client_id, ack_off);
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(_) => {
-                            buf.clear();
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(_) => break,
-        }
-    }
+    read_replica_acks(&mut reader, |off| hub.update_replica_ack(client_id, off)).await;
     reader_repl.detach_fd();
     hub.unregister_replica(client_id);
 }
@@ -5027,10 +5032,17 @@ async fn run_shard_replication_flow(
     _lsn: Option<u64>,
 ) {
     let hub = crate::replication::get_replication_hub(router.port);
+    let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
     let (mut reader, mut writer) = stream.into_split();
+    if shard_id >= router.num_shards {
+        let _ = writer
+            .write_all(b"-ERR invalid shard id\r\n".to_vec())
+            .await;
+        return;
+    }
     let (write_tx, write_rx) = flume::bounded::<Vec<u8>>(4096);
 
-    let _flow = hub.register_shard_flow(shard_id, client_id, write_tx.clone());
+    let _flow = hub.register_shard_flow(shard_id, client_id, write_tx.clone(), Some(raw_fd));
 
     // Fetch this shard's RDB chunk
     let chunk = if shard_id == router.shard_id {
@@ -5068,38 +5080,11 @@ async fn run_shard_replication_flow(
         writer_hub.unregister_shard_flow(shard_id, client_id);
     });
 
-    let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
-    let mut buf = BytesMut::with_capacity(32768);
-    loop {
-        let (res, returned_buf) = reader.read(read_buf).await;
-        read_buf = returned_buf;
-        match res {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&read_buf[..n]);
-                while !buf.is_empty() {
-                    match crate::resp::parse_command(&mut buf) {
-                        Ok(Some(cmd)) => {
-                            if let Command::Replconf(args) = cmd
-                                && args.len() >= 2
-                                && args[0].eq_ignore_ascii_case(b"ack")
-                                && let Ok(s) = std::str::from_utf8(&args[1])
-                                && let Ok(ack_off) = s.parse::<u64>()
-                            {
-                                hub.update_shard_flow_ack(shard_id, client_id, ack_off);
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(_) => {
-                            buf.clear();
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(_) => break,
-        }
-    }
+    read_replica_acks(&mut reader, |off| {
+        hub.update_shard_flow_ack(shard_id, client_id, off)
+    })
+    .await;
+    _flow.detach_fd();
     hub.unregister_shard_flow(shard_id, client_id);
 }
 
