@@ -91,6 +91,61 @@ Both builds land near 1M `GET` ops/sec on this machine, so the 886,960 figure ab
 older build too. The 1.50M mean from `benchmark_vs_dragonfly_valkey.md` was the outlier, which fits that
 report's own warning that this cell had a ~36% coefficient of variation.
 
+### 2.3 TLS Client Parity: Interleaved A/B (2026-10-04)
+
+The TLS-parity change (`3d68330`) moved plaintext clients onto a transport-generic `handle_client` and
+TLS clients onto the same loop. This run checks that plaintext did not regress and measures TLS. Base is
+`d0fef9b` (before the change), head is `3d68330`. The shape matches Section 2.2: 1 KB values, 100,000
+keys, `memtier_benchmark` 8 threads x 8 connections on cores `32-47`, server on cores `0..N-1`, rounds
+alternate which build goes first, each round uses a fresh server, a `P:P allkeys` fill before `GET`, and
+10 seconds of measurement. Every run was inside a private network namespace. TLS runs used
+`--tls --tls-skip-verify` against `--tls-port` (self-signed certificate). The machine was shared and
+noisy during these runs, so absolute numbers are lower than in Section 2.2. Compare builds within each
+table, not across reports.
+
+**Plaintext, pipeline 16 (6 rounds):**
+
+| Workload | Build | Runs | Median Ops/sec | Mean ± Std | Min / Max | Median p99 |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| `GET`, 1 shard | `d0fef9b` | 6 | 489,061 | 475,664 ± 40,836 | 421,218 / 519,991 | 3.839 ms |
+| `GET`, 1 shard | `3d68330` | 6 | 497,534 | 487,314 ± 29,495 | 428,113 / 518,925 | 3.679 ms |
+| `SET`, 1 shard | `d0fef9b` | 6 | 653,294 | 653,490 ± 15,649 | 634,080 / 675,515 | 2.399 ms |
+| `SET`, 1 shard | `3d68330` | 6 | 646,089 | 653,955 ± 46,169 | 605,064 / 744,369 | 2.487 ms |
+| `GET`, 16 shards | `d0fef9b` | 6 | 738,246 | 736,822 ± 7,810 | 726,102 / 745,348 | 2.567 ms |
+| `GET`, 16 shards | `3d68330` | 6 | 743,921 | 741,322 ± 5,283 | 732,169 / 746,154 | 2.391 ms |
+| `SET`, 16 shards | `d0fef9b` | 6 | 1,378,668 | 1,378,670 ± 12,285 | 1,358,191 / 1,399,586 | 1.543 ms |
+| `SET`, 16 shards | `3d68330` | 6 | 1,364,634 | 1,367,412 ± 8,741 | 1,359,828 / 1,385,285 | 1.623 ms |
+
+**Plaintext shows no regression.** Head is within ±2% of base at the median for every cell, which is
+inside the run-to-run spread.
+
+**TLS, 8 shards, pipeline 16 (4 rounds):**
+
+| Workload | Build | Runs | Median Ops/sec | Mean ± Std | Min / Max | Median p99 |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| `GET` | `d0fef9b` | 4 | 1,001,605 (≈100% misses) | 998,809 ± 43,133 | 943,051 / 1,048,975 | 2.115 ms |
+| `GET` | `3d68330` | 4 | 1,200,220 (0 misses) | 1,239,967 ± 91,250 | 1,164,981 / 1,394,446 | 2.203 ms |
+| `SET` | `d0fef9b` | 4 | 0 (stalled) | 0 | 0 / 0 | n/a |
+| `SET` | `3d68330` | 4 | 633,909 | 641,514 ± 21,952 | 620,232 / 678,007 | 4.943 ms |
+
+The base build cannot run this workload. Sixteen pipelined 1 KB `SET`s exceed the ~4 KiB rustls hands
+back per `read_tls` call, and the old loop dropped the rest, so `SET` stalled and completed nothing. For
+the same reason the `GET` fill stored nothing, and base's `GET` figure counts misses only (empty replies).
+On head every `GET` hits.
+
+**TLS, 8 shards, pipeline 1 (3 rounds), the shape the old code could handle:**
+
+| Workload | Build | Runs | Median Ops/sec | Mean ± Std | Min / Max | Median p99 |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| `GET` | `d0fef9b` | 3 | 191,731 | 200,345 ± 12,795 | 190,871 / 218,434 | 0.695 ms |
+| `GET` | `3d68330` | 3 | 194,392 | 193,967 ± 1,387 | 192,095 / 195,413 | 0.735 ms |
+| `SET` | `d0fef9b` | 3 | 146,898 | 148,460 ± 3,276 | 145,464 / 153,018 | 0.959 ms |
+| `SET` | `3d68330` | 3 | 142,905 | 145,692 ± 4,413 | 142,251 / 151,922 | 0.999 ms |
+
+Without pipelining, TLS throughput is unchanged within noise (+1.4% `GET`, −2.7% `SET` at the median,
+with overlapping ranges). The gain from the change is that pipelined TLS traffic now works and is
+squashed the same way as plaintext.
+
 ---
 
 ## 3. Benchmark Execution Details
