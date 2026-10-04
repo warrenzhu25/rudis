@@ -15161,7 +15161,7 @@ fn info_field(c: &mut TcpStream, field: &str) -> String {
 
 #[test]
 fn test_save_points_trigger_background_saves_and_config_is_truthful_e2e() {
-    let port = 16980;
+    let port = 17108;
     let dir = std::env::temp_dir().join(format!("rudis-savesched-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -15821,7 +15821,7 @@ fn test_pipelined_mget_folds_across_shards_in_order_e2e() {
 
 #[test]
 fn test_keyspace_events_match_when_pipeline_is_batched_e2e() {
-    let port = 16970;
+    let port = 17107;
     let port_s = port.to_string();
     let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -16508,7 +16508,7 @@ fn test_info_stats_counts_commands_bytes_and_connections_e2e() {
 
 #[test]
 fn test_info_stats_counts_pubsub_channels_and_patterns_e2e() {
-    let port = 16960;
+    let port = 17106;
     let port_s = port.to_string();
     let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -16958,7 +16958,7 @@ fn test_rename_and_copy_across_shards_e2e() {
 
 #[test]
 fn test_lmove_and_smove_across_shards_e2e() {
-    let port = 16950;
+    let port = 17105; // 16950 is taken by an in-process server for the whole run
     let port_s = port.to_string();
     let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
