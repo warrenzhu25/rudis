@@ -5976,7 +5976,7 @@ async fn execute_rebalance_plans(
                 && let Ok(mut stream) = monoio::net::TcpStream::connect(sock_addr).await
             {
                 let cmd_importing = format!(
-                    "*4\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$9\r\nIMPORTING\r\n${}\r\n{}\r\n",
+                    "*5\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$9\r\nIMPORTING\r\n${}\r\n{}\r\n",
                     p.slot.to_string().len(),
                     p.slot,
                     hub.my_id().len(),
@@ -6016,7 +6016,7 @@ async fn execute_rebalance_plans(
                 && let Ok(mut stream) = monoio::net::TcpStream::connect(sock_addr).await
             {
                 let cmd_node = format!(
-                    "*4\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$4\r\nNODE\r\n$6\r\nmyself\r\n",
+                    "*5\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$4\r\nNODE\r\n$6\r\nmyself\r\n",
                     p.slot.to_string().len(),
                     p.slot
                 );
@@ -6031,13 +6031,13 @@ async fn execute_rebalance_plans(
                 p.slot,
                 crate::shard::SlotState::Moved(p.target_addr.clone()),
             );
-            crate::cluster::remove_slots(&mut hub.my_slots.write().unwrap(), &[p.slot]);
+            hub.assign_slot(p.slot, &p.target_node_id);
             hub.slot_states.write().unwrap().remove(&p.slot);
-
-            if let Some(target_node) = hub.nodes.write().unwrap().get_mut(&p.target_node_id) {
-                target_node.slots.push((p.slot, p.slot));
-                crate::cluster::compact_slots(&mut target_node.slots);
-            }
+            hub.bump_config_epoch();
+            // The target bumped its epoch when it took the slot; learning that
+            // epoch now makes any older announcement from it (still without
+            // the slot) stale, and gives it our new epoch the same way.
+            hub.refresh_peer(&p.target_node_id).await;
             moved += 1;
         } else if p.target_node_id == hub.my_id() {
             hub.slot_states
@@ -6049,13 +6049,9 @@ async fn execute_rebalance_plans(
                 crate::shard::SlotState::Importing(p.source_addr.clone()),
             );
 
-            hub.my_slots.write().unwrap().push((p.slot, p.slot));
-            crate::cluster::compact_slots(&mut hub.my_slots.write().unwrap());
+            hub.assign_slot(p.slot, &p.target_node_id);
             hub.slot_states.write().unwrap().remove(&p.slot);
-
-            if let Some(src_node) = hub.nodes.write().unwrap().get_mut(&p.source_node_id) {
-                crate::cluster::remove_slots(&mut src_node.slots, &[p.slot]);
-            }
+            hub.bump_config_epoch();
             moved += 1;
         }
     }
@@ -9930,13 +9926,22 @@ async fn execute_command(
                                 });
                             router.set_slot_owner(slot, shard);
                             router.set_slot_state(slot, crate::shard::SlotState::Stable);
-                            let mut my_slots = hub.my_slots.write().unwrap();
-                            if !my_slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
-                                my_slots.push((slot, slot));
-                            }
-                            hub.config_epoch
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // Also drops the slot from the previous owner in
+                            // our view, so the cluster never shows it twice.
+                            hub.assign_slot(slot, &my_id);
+                            hub.bump_config_epoch();
                         } else {
+                            let owner_id = {
+                                let nodes = hub.nodes.read().unwrap();
+                                if nodes.contains_key(&node) {
+                                    Some(node.clone())
+                                } else {
+                                    nodes
+                                        .values()
+                                        .find(|n| format!("{}:{}", n.ip, n.port) == node)
+                                        .map(|n| n.id.clone())
+                                }
+                            };
                             let target_addr = if node.contains(':') {
                                 node
                             } else {
@@ -9947,8 +9952,22 @@ async fn execute_command(
                                     node
                                 }
                             };
-                            let mut my_slots = hub.my_slots.write().unwrap();
-                            my_slots.retain(|&(s, e)| !(slot >= s && slot <= e));
+                            let owned = hub
+                                .my_slots
+                                .read()
+                                .unwrap()
+                                .iter()
+                                .any(|&(s, e)| slot >= s && slot <= e);
+                            match owner_id {
+                                Some(id) => hub.assign_slot(slot, &id),
+                                None => crate::cluster::remove_slots(
+                                    &mut hub.my_slots.write().unwrap(),
+                                    &[slot],
+                                ),
+                            }
+                            if owned {
+                                hub.bump_config_epoch();
+                            }
                             router
                                 .set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
                         }
@@ -9974,7 +9993,7 @@ async fn execute_command(
                     {
                         let slot_str = slot.to_string();
                         let setslot_import = format!(
-                            "*4\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$9\r\nIMPORTING\r\n${}\r\n{}\r\n",
+                            "*5\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$9\r\nIMPORTING\r\n${}\r\n{}\r\n",
                             slot_str.len(),
                             slot_str,
                             my_id.len(),
@@ -10019,7 +10038,7 @@ async fn execute_command(
                     {
                         let slot_str = slot.to_string();
                         let setslot_node = format!(
-                            "*4\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$4\r\nNODE\r\n$6\r\nmyself\r\n",
+                            "*5\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$4\r\nNODE\r\n$6\r\nmyself\r\n",
                             slot_str.len(),
                             slot_str
                         );

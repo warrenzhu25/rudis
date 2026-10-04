@@ -8754,7 +8754,6 @@ fn test_cluster_check_and_rebalance_live_migration_e2e() {
     // 2. Connect nodes via MEET
     let meet_cmd = format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2);
     assert_eq!(send_and_read(&mut c1, meet_cmd.as_bytes()), "+OK\r\n");
-    thread::sleep(Duration::from_millis(250));
 
     let myid1 = send_and_read(&mut c1, b"CLUSTER MYID\r\n")
         .trim()
@@ -8765,9 +8764,22 @@ fn test_cluster_check_and_rebalance_live_migration_e2e() {
         .replace("$40\r\n", "")
         .replace("\r\n", "");
 
-    // 3. CLUSTER CHECK on Node 1: verifies all 16384 slots are covered across the 2 nodes
-    let check1 = send_and_read(&mut c1, b"CLUSTER CHECK\r\n");
-    assert!(check1.contains("[OK] All 16384 slots covered"));
+    // 3. CLUSTER CHECK on Node 1: verifies all 16384 slots are covered across the 2 nodes.
+    // MEET's handshake is bounded by short timeouts; if it misses under load,
+    // Node 1 learns Node 2's slots from the next bus tick, so poll (bounded).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let check1 = loop {
+        let check = send_and_read(&mut c1, b"CLUSTER CHECK\r\n");
+        if check.contains("[OK] All 16384 slots covered") || std::time::Instant::now() > deadline {
+            break check;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        check1.contains("[OK] All 16384 slots covered"),
+        "{}",
+        check1
+    );
 
     // 4. CLUSTER REBALANCE SIMULATE: preview rebalancing plan without moving slots
     let sim_resp = send_and_read(&mut c1, b"CLUSTER REBALANCE SIMULATE\r\n");
@@ -8787,10 +8799,10 @@ fn test_cluster_check_and_rebalance_live_migration_e2e() {
 
     // 7. Verify CLUSTER CHECK is healthy after migrations
     let check_after = send_and_read(&mut c1, b"CLUSTER CHECK\r\n");
-    assert!(check_after.contains("[OK]"));
+    assert!(check_after.contains("[OK]"), "{}", check_after);
 
     let check_c2 = send_and_read(&mut c2, b"CLUSTER CHECK\r\n");
-    assert!(check_c2.contains("[OK]"));
+    assert!(check_c2.contains("[OK]"), "{}", check_c2);
 }
 
 #[test]

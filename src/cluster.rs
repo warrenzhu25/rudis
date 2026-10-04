@@ -195,6 +195,116 @@ impl ClusterHub {
         self.my_id.read().unwrap().clone()
     }
 
+    /// Gives this node a new config epoch after its own slot set changed.
+    ///
+    /// Peers only accept a node's slot list if it carries an epoch at least
+    /// as new as the last one they applied, so the bump is what makes the
+    /// change win over announcements built before it.
+    pub fn bump_config_epoch(&self) -> u64 {
+        let next = self
+            .config_epoch
+            .load(Ordering::SeqCst)
+            .max(self.current_epoch.load(Ordering::SeqCst))
+            + 1;
+        self.config_epoch.store(next, Ordering::SeqCst);
+        self.current_epoch.fetch_max(next, Ordering::SeqCst);
+        next
+    }
+
+    /// Records in the local view that `owner_id` (this node or a known peer)
+    /// now serves `slot`, and that no other node does.
+    pub fn assign_slot(&self, slot: u16, owner_id: &str) {
+        let me = owner_id == self.my_id();
+        {
+            let mut my_slots = self.my_slots.write().unwrap();
+            if me {
+                if !my_slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
+                    my_slots.push((slot, slot));
+                    compact_slots(&mut my_slots);
+                }
+            } else {
+                remove_slots(&mut my_slots, &[slot]);
+            }
+        }
+        let mut nodes = self.nodes.write().unwrap();
+        for (id, node) in nodes.iter_mut() {
+            if id == owner_id {
+                if !node.slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
+                    node.slots.push((slot, slot));
+                    compact_slots(&mut node.slots);
+                }
+            } else if node.slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
+                remove_slots(&mut node.slots, &[slot]);
+            }
+        }
+    }
+
+    /// The `PING` this node sends on the cluster bus.
+    fn ping_frame(&self, gossip: &str) -> String {
+        format!(
+            "PING {} {} {} {} GOSSIP {}\r\n",
+            self.my_id(),
+            self.config_epoch.load(Ordering::Relaxed),
+            self.role.read().unwrap(),
+            slots_repr(&self.my_slots.read().unwrap()),
+            gossip
+        )
+    }
+
+    /// Applies a `+PONG <id> <epoch> <role> <slots>` reply from `node_id`.
+    /// Returns whether it was a PONG.
+    pub fn apply_pong(&self, node_id: &str, resp: &str) -> bool {
+        if !resp.starts_with("+PONG") {
+            return false;
+        }
+        let parts: Vec<&str> = resp.split_whitespace().collect();
+        let epoch = parts.get(2).and_then(|v| v.parse::<u64>().ok());
+        let slots = parts.get(4).map_or_else(Vec::new, |r| parse_slot_ranges(r));
+        let mut nodes = self.nodes.write().unwrap();
+        let mut key = node_id;
+        // A MEET whose handshake reply was lost leaves the peer under a
+        // placeholder id; its PONG names it, so move the entry to the real id.
+        if let Some(&real_id) = parts.get(1)
+            && real_id != node_id
+        {
+            if let Some(mut node) = nodes.remove(node_id)
+                && !nodes.contains_key(real_id)
+            {
+                node.id = real_id.to_string();
+                nodes.insert(real_id.to_string(), node);
+            }
+            key = real_id;
+        }
+        if let Some(node) = nodes.get_mut(key) {
+            apply_peer_slots(node, epoch, slots);
+        }
+        true
+    }
+
+    /// Exchanges a fresh PING/PONG with `node_id`, so both sides see each
+    /// other's current slots and epoch right away instead of on the next tick.
+    pub async fn refresh_peer(&self, node_id: &str) {
+        use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+        let addr = match self.nodes.read().unwrap().get(node_id) {
+            Some(n) => format!("{}:{}", n.ip, n.cport),
+            None => return,
+        };
+        let Ok(addr) = addr.parse::<SocketAddr>() else {
+            return;
+        };
+        let exchange = async {
+            let mut stream = monoio::net::TcpStream::connect(addr).await.ok()?;
+            let (res, _) = stream.write_all(self.ping_frame("").into_bytes()).await;
+            res.ok()?;
+            let (res, buf) = stream.read(Vec::with_capacity(512)).await;
+            res.ok()?;
+            Some(String::from_utf8_lossy(&buf).into_owned())
+        };
+        if let Ok(Some(resp)) = monoio::time::timeout(Duration::from_millis(500), exchange).await {
+            self.apply_pong(node_id, &resp);
+        }
+    }
+
     pub fn cluster_nodes(&self) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -376,7 +486,6 @@ impl ClusterHub {
         {
             let mut nodes = self.nodes.write().unwrap();
             if !nodes.values().any(|n| n.port == port) {
-                let next_epoch = self.current_epoch.load(Ordering::Relaxed) + 1;
                 nodes.insert(
                     temp_id.clone(),
                     ClusterNodeInfo {
@@ -388,7 +497,8 @@ impl ClusterHub {
                         master_id: "-".to_string(),
                         ping_sent: now,
                         pong_recv: now,
-                        config_epoch: next_epoch,
+                        // Unknown until the peer answers; any real epoch is newer.
+                        config_epoch: 0,
                         link_state: "connected".to_string(),
                         slots: Vec::new(),
                     },
@@ -1478,6 +1588,32 @@ impl ClusterHub {
     }
 }
 
+/// Encodes slot ranges as the bus does: `0-100,200-300`.
+fn slots_repr(slots: &[(u16, u16)]) -> String {
+    slots
+        .iter()
+        .map(|(s, e)| format!("{}-{}", s, e))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Applies a peer's own announcement of its slots and config epoch.
+///
+/// An announcement older than the last one applied (lower epoch) is stale:
+/// it was built before a migration the peer has since taken part in, so it
+/// must not undo the newer assignment.
+fn apply_peer_slots(node: &mut ClusterNodeInfo, epoch: Option<u64>, slots: Vec<(u16, u16)>) {
+    if let Some(epoch) = epoch {
+        if epoch < node.config_epoch {
+            return;
+        }
+        node.config_epoch = epoch;
+    }
+    if !slots.is_empty() {
+        node.slots = slots;
+    }
+}
+
 pub fn compact_slots(slots: &mut Vec<(u16, u16)>) {
     if slots.is_empty() {
         return;
@@ -1730,10 +1866,8 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                         node.flags = parts[3].to_string();
                     }
                     if parts.len() >= 5 {
-                        let peer_slots = parse_slot_ranges(parts[4]);
-                        if !peer_slots.is_empty() {
-                            node.slots = peer_slots;
-                        }
+                        let epoch = parts[2].parse::<u64>().ok();
+                        apply_peer_slots(node, epoch, parse_slot_ranges(parts[4]));
                     }
                 }
             }
@@ -1933,17 +2067,6 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         gossip_payload.pop();
     }
 
-    let my_epoch = hub.config_epoch.load(Ordering::Relaxed);
-    let role = hub.role.read().unwrap().clone();
-    let my_slots = hub.my_slots.read().unwrap().clone();
-    let mut slots_repr = String::new();
-    for (s, e) in my_slots {
-        slots_repr.push_str(&format!("{}-{},", s, e));
-    }
-    if slots_repr.ends_with(',') {
-        slots_repr.pop();
-    }
-
     for (id, ip, _port, cport) in peers {
         let addr = format!("{}:{}", ip, cport);
         let parsed_addr = match addr.parse::<SocketAddr>() {
@@ -1962,33 +2085,14 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
             let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-            let ping_msg = format!(
-                "PING {} {} {} {} GOSSIP {}\r\n",
-                hub.my_id(),
-                my_epoch,
-                role,
-                slots_repr,
-                gossip_payload
-            );
-            let (success, peer_slots, peer_epoch) = if stream.write_all(ping_msg.as_bytes()).is_ok()
-            {
-                let mut buf = [0u8; 512];
-                if let Ok(n) = stream.read(&mut buf) {
-                    let resp = String::from_utf8_lossy(&buf[..n]);
-                    if resp.starts_with("+PONG") {
-                        let parts: Vec<&str> = resp.split_whitespace().collect();
-                        let ep = parts.get(2).and_then(|val| val.parse::<u64>().ok());
-                        let slots = parts.get(4).map_or_else(Vec::new, |r| parse_slot_ranges(r));
-                        (true, Some(slots), ep)
-                    } else {
-                        (false, None, None)
-                    }
-                } else {
-                    (false, None, None)
-                }
-            } else {
-                (false, None, None)
-            };
+            // Built per peer, so it carries this node's slots as of sending.
+            let ping_msg = hub.ping_frame(&gossip_payload);
+            let mut buf = [0u8; 512];
+            // apply_pong records the peer's slots and epoch, ignoring stale ones.
+            let success = stream.write_all(ping_msg.as_bytes()).is_ok()
+                && stream
+                    .read(&mut buf)
+                    .is_ok_and(|n| hub.apply_pong(&id, &String::from_utf8_lossy(&buf[..n])));
 
             if let Ok(mut nodes) = hub.nodes.write()
                 && let Some(node) = nodes.get_mut(&id)
@@ -1996,14 +2100,6 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
                 if success {
                     node.pong_recv = now;
                     node.link_state = "connected".to_string();
-                    if let Some(slots) = peer_slots
-                        && !slots.is_empty()
-                    {
-                        node.slots = slots;
-                    }
-                    if let Some(ep) = peer_epoch {
-                        node.config_epoch = ep;
-                    }
                     if node.flags == "fail?" || node.flags == "fail" {
                         node.flags = "master".to_string();
                     }
