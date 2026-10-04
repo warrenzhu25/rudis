@@ -123,9 +123,9 @@ flagged (and which was fixed) in `MGET`/`MSET` scatter-gather has reappeared her
 
 **Verified findings.** `CLIENT REPLY OFF`/`SKIP` is tracked (`ClientInfo.reply_mode`) but never consulted
 anywhere else — replies are written unconditionally regardless of mode. `CLIENT KILL`/`PAUSE`/`UNPAUSE`/
-`NO-TOUCH`/`CACHING` remain accepted-but-inert `+OK` stubs. TLS connections still never take the
-pipeline-squashing fast path — every command over TLS pays one `execute_command` call (and one full remote
-`.await` round-trip for remote keys). A newly-discovered dead-code duplicate: two separate `else if` arms in
+`NO-TOUCH`/`CACHING` remain accepted-but-inert `+OK` stubs. TLS connections now run the same generic
+`handle_client<T: ClientTransport>` loop as plaintext connections (the separate `handle_tls_connection` loop
+was deleted), so they take the pipeline-squashing fast path too. A newly-discovered dead-code duplicate: two separate `else if` arms in
 the squashed fast-path chain match `Command::IncrBy` under the identical guard condition; the second is
 unreachable. Live cluster slot migration (`migrate_keys_to_node`/`execute_rebalance_plans`, now documented as
 living in `connection.rs` rather than `router.rs`) is a real DUMP-and-replay-as-write-commands protocol,
@@ -716,7 +716,10 @@ TLS connections on a shard share one identical `AclManager`. `HAS_CUSTOM_ACL: At
 for the whole process, never reset. `AclUser{name, enabled, passwords, password_hashes, nopass, all_commands,
 allowed_commands, disallowed_commands, all_keys, allowed_key_patterns}`. `AllocatorStats{allocated, active,
 resident, metadata, mapped, fragmentation_ratio}` from real `tikv_jemalloc_ctl::stats::*` reads.
-`TlsSession{conn: rustls::ServerConnection, is_ktls_active: bool}`.
+`TlsSession` wraps a `rustls::ServerConnection` (the former `is_ktls_active` flag is gone — kTLS is not
+implemented); after the handshake it is wrapped in `TlsTransport`, the `ClientTransport` impl that lets TLS
+clients run the shared generic `handle_client` loop (`src/transport.rs` holds the trait, `PlainTransport`, and
+`PushTarget`).
 
 **Key algorithm / workflow.** `check_auth` computes **three** hash forms (`hash_password` legacy SHA1 with a
 hardcoded global salt, `hash_password_sha256` — unsalted, matching real Redis exactly, `hash_password_salted`
@@ -736,10 +739,11 @@ dependency. `INFO`'s `mem_allocator` field is a **hardcoded literal `"libc"`** d
 `CONFIG SET requirepass` both clear+repopulate `passwords`/`password_hashes`, push the SHA-256 hash, set
 `nopass=false` and `HAS_CUSTOM_ACL=true`; `is_auth_required_for_default()` now correctly returns `true` and
 both plain/TLS connections bootstrap `authenticated=false` — traced to commit `002086a`, closing a gap a
-prior revision explicitly documented. (b) **The kTLS plaintext-bypass bug is FIXED.** Both `complete_handshake`
-and `handshake_monoio` now discard `enable_ktls`'s result and unconditionally set `self.is_ktls_active =
-false`; `is_ktls_active` is confirmed never set `true` anywhere in `tls.rs`, so every `--tls-port` connection
-genuinely takes the rustls encrypt/decrypt branch — traced to commit `8c39a2f`. (c) **TLS cert loading does
+prior revision explicitly documented. (b) **kTLS is not implemented; the old kTLS plaintext-bypass note is
+obsolete.** The partial `enable_ktls` (a `TCP_ULP` attach with no `SOL_TLS` `TLS_TX`/`TLS_RX` key install),
+the `is_ktls_active` flag, and the never-taken kTLS branches in `read_plaintext`/`write_plaintext` have been
+deleted outright, so every `--tls-port` connection uses userspace rustls and the buggy code path no longer
+exists. (c) **TLS cert loading does
 NOT do PEM decoding and will likely panic on real PEM files.** `load_certs_and_key_from_files` reads raw file
 bytes and passes them directly to `create_server_config` as if already DER — no `pem`/`rustls-pemfile`
 dependency exists anywhere, despite the function's own doc comment claiming PEM support. Real

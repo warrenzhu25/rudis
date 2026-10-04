@@ -493,9 +493,11 @@ The fix is explicit, not kernel-level:
 (same 200ms shutdown-poll timeout via `monoio::time::timeout`), with client IDs carved from the
 *upper* half of the shard's 48-bit ID space (`(shard_id << 48) | 0x8000_0000_0000` plus an
 incrementing counter). Each accepted connection is upgraded via `crate::tls::TlsSession::new` +
-`session.handshake_monoio` (a real `rustls` handshake driven over the `monoio` stream) before being
-handed to `crate::connection::handle_tls_connection` — a distinct entry point from the plain loop's
-`handle_connection`. Both accept and post-handshake work are wrapped in `catch_unwind_async`.
+`session.handshake_monoio` (a real `rustls` handshake driven over the `monoio` stream, bounded by a
+10 s handshake timeout) and then wrapped in a `TlsTransport`, which is driven by the same generic
+`crate::connection::handle_client<T: ClientTransport>` loop the plain path uses (via
+`PlainTransport`) — there is no longer a separate TLS client loop. Both accept and post-handshake
+work are wrapped in `catch_unwind_async`.
 
 **Verified gap: TLS connections never touch `conn_balance` at all.** Reading `src/server.rs:1861-1926`
 line-by-line shows no call to `conn_balance::register_conn`, `claim_owner`, or `unregister_conn`
@@ -557,7 +559,7 @@ in `std::panic::catch_unwind`, so a panic inside the wrapped future becomes an `
 unwind that would otherwise propagate through `monoio::spawn` and — because the runtime is
 single-threaded per shard — potentially take down every other task and connection sharing that
 shard's runtime. Every accept path (plain, TLS, and cross-shard-adopted) wraps its call to
-`handle_connection`/`handle_tls_connection` in this combinator and, on `Err`, calls
+its connection entry point (all of which run the generic `handle_client` loop) in this combinator and, on `Err`, calls
 `crate::connection::inc_isolated_panics()` and logs via `tracing::error!` instead of propagating.
 
 ---
@@ -669,8 +671,9 @@ dispatcher, not the reactor.
 
 ## 7. Cross-Component Interactions
 
-- **`src/connection.rs`**: every accepted socket becomes `handle_connection(...)` or
-  `handle_tls_connection(...)`, spawned as a task on this shard's runtime, panic-isolated per §3.5.
+- **`src/connection.rs`**: every accepted socket (plain via `PlainTransport`, TLS via `TlsTransport`)
+  becomes a `handle_client<T: ClientTransport>(...)` task spawned on this shard's runtime,
+  panic-isolated per §3.5.
   `CURRENT_ROUTER`/`set_current_router` (§3.1) also lives here. See Component 02.
 - **`src/router.rs`**: `Router` is constructed once per shard (§4) and shared (`Rc`) with every
   connection task; owns the `senders` mesh, slot ownership state, the AOF writer handle, `db_dir`,
@@ -752,7 +755,7 @@ legitimately fire even though this specific `rudis` process is unaffected.
   long-lived per-shard loop added elsewhere will not automatically observe shutdown unless it
   adopts the same polling pattern (or an equivalent).
 * **Gotcha 6**: Any new per-connection entry point should be wrapped in `catch_unwind_async`
-  (§3.5) the same way `handle_connection`/`handle_tls_connection` are, or a panic in that path will
+  (§3.5) the same way the plain and TLS `handle_client` entry points are, or a panic in that path will
   take down the whole shard.
 * **Gotcha 7 (new)**: Before assuming "the" implementation of a `ShardMessage::Batch`-style
   branching construct, check whether the condition that selects it is actually reachable —

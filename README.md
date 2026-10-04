@@ -506,8 +506,11 @@ stop past its grace period) skips all of the above, so give the process at least
   explicit cert/key pair, Rudis generates a self-signed certificate **in memory** at startup — do
   not rely on that beyond local testing, since clients have nothing to verify it against.
 - TLS connections run through userspace `rustls` only; there is no kernel TLS offload (see
-  [Kernel-Bypass Networking & TLS: Status](#7-kernel-bypass-networking--tls-status)) — and TLS
-  connections never receive pipeline-squashing acceleration.
+  [Kernel-Bypass Networking & TLS: Status](#7-kernel-bypass-networking--tls-status)). They run
+  the same client loop as plaintext ones, so pipelining (including cross-shard squashing),
+  transactions, Pub/Sub, blocking commands, MONITOR, client tracking, `CLIENT KILL`/`LIST`/`REPLY`
+  and output-buffer limits behave identically. Replication links (`PSYNC`/`SYNC`) are only
+  accepted on the plaintext port.
 - Run as a dedicated non-root user; the included [`Dockerfile`](Dockerfile) already does this via
   a `rudis` system user.
 - Bind to a private interface (`bind <ip>`) rather than `0.0.0.0` unless the port is otherwise

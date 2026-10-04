@@ -26,6 +26,11 @@ use crate::connection::{READ_BUFFER_SIZE, RecvBytesMut};
 /// The read buffer always keeps at least this much spare room before a read.
 pub(crate) const MIN_READ_SPARE: usize = 16 * 1024;
 
+/// How many out-of-band messages may wait for a TLS client before new ones
+/// are dropped. Plaintext pushes are non-blocking sends that drop once the
+/// socket buffer is full; this is the TLS equivalent of that bound.
+pub(crate) const PUSH_QUEUE_CAPACITY: usize = 4096;
+
 /// Where out-of-band data for a client (MONITOR output, tracking
 /// invalidations) is delivered from any thread.
 #[derive(Clone, Debug)]

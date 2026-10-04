@@ -255,8 +255,9 @@ network path today**. This is worth stating plainly rather than leaving to infer
   makes a real `AF_XDP` socket syscall, loads an eBPF program, or binds to a NIC.
 - `src/zerocopy.rs` implements correct `SO_ZEROCOPY`/registered-buffer primitives, but the
   real connection write path (`src/connection.rs`, on `monoio`) does not call into it.
-- Kernel TLS (kTLS) is attempted best-effort after a real `rustls` handshake, but the promotion
-  result is currently discarded (`is_ktls_active` is always `false`).
+- Kernel TLS (kTLS) is **not implemented**. The former partial `enable_ktls` scaffolding (a
+  `TCP_ULP` attach with no key install, whose result was discarded) has been removed; all TLS
+  traffic is encrypted/decrypted in userspace by `rustls`.
 
 Treat this subsystem as a real foundation for a future kernel-bypass data path, not as active
 acceleration today. Full rationale for why this direction is worth pursuing anyway, and exactly

@@ -2059,13 +2059,37 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                             return;
                                         }
                                     };
-                                    if let Err(e) = session.handshake_monoio(&mut stream).await {
-                                        tracing::warn!("[Shard {}] TLS handshake error: {}", shard_id, e);
+                                    match monoio::time::timeout(
+                                        TLS_HANDSHAKE_TIMEOUT,
+                                        session.handshake_monoio(&mut stream),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(e)) => {
+                                            tracing::warn!("[Shard {}] TLS handshake error: {}", shard_id, e);
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            tracing::warn!("[Shard {}] TLS handshake timed out", shard_id);
+                                            return;
+                                        }
+                                    }
+                                    let mut transport =
+                                        crate::tls::TlsTransport::new(stream, session);
+                                    if crate::netsec::protected_mode_denies(
+                                        router_clone.base_port,
+                                        client_addr.ip(),
+                                    ) {
+                                        let _ = crate::transport::ClientTransport::write_all(
+                                            &mut transport,
+                                            crate::netsec::PROTECTED_MODE_DENIED.to_vec(),
+                                        )
+                                        .await;
                                         return;
                                     }
-                                    crate::connection::handle_tls_connection(
-                                        stream,
-                                        session,
+                                    crate::connection::handle_client(
+                                        transport,
                                         client_addr,
                                         client_id,
                                         reg_clone,
@@ -2200,6 +2224,10 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
         }
     });
 }
+
+/// A TLS client must finish its handshake within this time, so idle or
+/// stalled sockets cannot pile up before they are ever counted as clients.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Stops reading from this shard's clients and waits for them to finish.
 ///

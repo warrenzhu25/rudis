@@ -4,8 +4,11 @@
 > **High-Level Design Spec**: [`docs/design/15_security_tls.md`](../design/15_security_tls.md)
 > **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 >
-> This revision re-verifies every claim against current source. Two previously-documented defects
-> are **now fixed**: the `requirepass` enforcement gap and the kTLS plaintext-bypass bug. Several
+> This revision re-verifies every claim against current source. The previously-documented
+> `requirepass` enforcement gap is **now fixed**. The old kTLS plaintext-bypass note is
+> **obsolete**: kTLS is not implemented and its partial scaffolding (`enable_ktls`,
+> `is_ktls_active`, kTLS read/write branches) has been removed (§5.3). TLS clients now run the
+> same generic client loop as plaintext clients (§5.4). Several
 > new findings are documented below (§6) that were not present in the prior pass.
 
 ---
@@ -16,7 +19,8 @@
 | :--- | :--- | :--- |
 | `src/acl.rs` | Per-port ACL registry, password hashing, `AUTH`/`ACL *` logic | `AclUser`, `AclManager`, `PORT_ACLS`, `HAS_CUSTOM_ACL`, `hash_password*` |
 | `src/allocator.rs` | jemalloc telemetry for `INFO`, plus an unrelated small-collection object-pool arena | `AllocatorStats`, `get_allocator_stats`, `format_memory_info`, `SmallCollectionArena` |
-| `src/tls.rs` | rustls-backed TLS, self-signed cert generation, kTLS attempt-and-discard, `TlsSession` async I/O | `TlsSession`, `generate_self_signed_cert`, `create_server_config`, `enable_ktls` |
+| `src/tls.rs` | rustls-backed TLS (userspace only — no kTLS), self-signed cert generation, `TlsSession` handshake, `TlsTransport` (the TLS `ClientTransport` impl) | `TlsSession`, `TlsTransport`, `generate_self_signed_cert`, `create_server_config` |
+| `src/transport.rs` | Transport trait the generic client loop is monomorphized over; plaintext impl; out-of-band push target | `ClientTransport`, `PlainTransport`, `PushTarget` |
 
 `src/allocator.rs` is really two unrelated modules sharing a file: lines 1–89 are jemalloc
 telemetry; lines 91–344 are `SmallCollectionArena`, a per-shard free-list pool for `List`/`Hash`/
@@ -62,15 +66,15 @@ INFO command (memory section)
 
 --tls-port listener (server.rs, spawned per shard, parallel SO_REUSEPORT socket)
                                    │
-     TlsSession::new(rustls ServerConfig) → handshake_monoio()
+     TlsSession::new(rustls ServerConfig) → handshake_monoio()  (10 s handshake timeout)
      (genuine async rustls handshake loop driven over monoio AsyncReadRent/AsyncWriteRentExt)
                                    │
-     enable_ktls(raw_fd) attempted via setsockopt(TCP_ULP) — result DISCARDED
-     is_ktls_active forced to `false` unconditionally after every handshake (§5, FIXED)
+     no kTLS: userspace rustls only (enable_ktls / is_ktls_active removed, §5.3)
                                    │
-     handle_tls_connection() runs the same command-execution machinery as handle_connection(),
-     reading/writing via TlsSession::read_plaintext/write_plaintext, which — because
-     is_ktls_active is always false — always take the real rustls encrypt/decrypt branch
+     TlsTransport → handle_client<TlsTransport>(): the SAME generic client loop as
+     handle_connection() → handle_client<PlainTransport>() (squashing, MULTI/EXEC, Pub/Sub,
+     CLIENT KILL/LIST, limits, stats); MONITOR/tracking pushes arrive via PushTarget::Queue
+     and are encrypted by the owning connection (§5.4)
 ```
 
 ---
@@ -225,8 +229,8 @@ pub fn is_auth_required_for_default(&self) -> bool {
 
 ### 3.5 Connection-level enforcement
 
-**Bootstrap** (`handle_connection`, connection.rs:1627-1630, and `handle_tls_connection`,
-connection.rs:1230-1233 — byte-identical formula in both):
+**Bootstrap** (the generic `handle_client` loop in `connection.rs`, shared by plaintext and TLS
+connections — one code site for both):
 
 ```rust
 let mut authenticated = !crate::acl::get_acl_for_port(router.port)
@@ -521,7 +525,7 @@ churn pattern on small collections — it has no interaction with jemalloc stats
 
 ---
 
-## 5. TLS (`src/tls.rs`) — rustls handshake, self-signed certs, and the kTLS attempt-then-discard path
+## 5. TLS (`src/tls.rs`) — rustls handshake, self-signed certs, and `TlsTransport` (no kTLS)
 
 ### 5.1 Certificate provisioning
 
@@ -552,86 +556,70 @@ The function's own doc comment says "Loads certificates and private key from PEM
 inline comment says "Parse PEM using rcgen/rustls or fallback to raw DER", but no such parsing
 exists — see §6 for the resulting bug.
 
-### 5.2 `TlsSession` and the handshake (tls.rs:115-216)
+### 5.2 `TlsSession` and the handshake
 
-```rust
-pub struct TlsSession {
-    pub conn: rustls::ServerConnection,
-    pub is_ktls_active: bool,
-}
-```
+`TlsSession` wraps a `rustls::ServerConnection`. (It used to also carry an `is_ktls_active: bool`
+that was always `false`; that field is gone — see §5.3.)
 
-Two handshake drivers exist with identical logic, one blocking (`complete_handshake<S: Read +
-Write + AsRawFd>`, tls.rs:131-166, currently unused directly by the connection path) and one
-async (`handshake_monoio`, tls.rs:169-216, the one actually wired into `server.rs`'s TLS accept
-loop). Both run the standard rustls handshake loop — `while conn.is_handshaking() { write_tls
-while wants_write; read_tls + process_new_packets when wants_read }` — then flush any trailing
-handshake/ticket frames. `handshake_monoio` drives this over `monoio::net::TcpStream` using
-`AsyncReadRent`/`AsyncWriteRentExt` instead of blocking `Read`/`Write`; it is a correct async
-adaptation of the same loop — the handshake itself is real and correctly negotiates a session.
+The async handshake driver `handshake_monoio` is the one wired into `server.rs`'s TLS accept loop,
+bounded by a 10 s handshake timeout. It runs the standard rustls handshake loop — `while
+conn.is_handshaking() { write_tls while wants_write; read_tls + process_new_packets when
+wants_read }` — then flushes any trailing handshake/ticket frames, driven over
+`monoio::net::TcpStream` using `AsyncReadRent`/`AsyncWriteRentExt`. It is a correct async
+adaptation of the loop — the handshake itself is real and correctly negotiates a session.
 
-### 5.3 kTLS — attempted, then unconditionally discarded (FIXED from a prior plaintext-bypass bug)
+### 5.3 kTLS — not implemented (scaffolding removed)
 
-At the end of **both** handshake functions:
+Earlier revisions of `tls.rs` carried partial kTLS scaffolding: an `enable_ktls(raw_fd)` that only
+issued `setsockopt(IPPROTO_TCP, TCP_ULP, "tls")` (attaching the kernel TLS ULP, with **no**
+`setsockopt(SOL_TLS, TLS_TX/TLS_RX, ...)` key install), called after every handshake with its
+result discarded; an `is_ktls_active` flag hard-forced to `false`; and raw-socket kTLS branches in
+`read_plaintext`/`write_plaintext` that could therefore never run. (Before commit `8c39a2f` the flag
+was set from `enable_ktls`'s success, which produced the old plaintext-bypass bug; that bug note is
+now obsolete because the whole code path is gone.)
 
-```rust
-// Try promoting to kTLS if on Linux
-let raw_fd = stream.as_raw_fd();
-let _ = enable_ktls(raw_fd);        // return value explicitly discarded
-self.is_ktls_active = false;        // unconditionally forced false, regardless of enable_ktls's result
-```
+All of that has been **deleted**. TLS is userspace `rustls` only. Real kTLS was judged not worth it
+for Rudis: it would need `rustls`'s `dangerous_extract_secrets` plus per-cipher-suite
+`SOL_TLS` `TLS_TX`/`TLS_RX` key installation, RX-side handling of TLS 1.3 control records
+(`recvmsg` with a record-type cmsg for KeyUpdate / NewSessionTicket / alerts), and the `tls` kernel
+module — and since Rudis does not use `sendfile`, it would mostly just move the crypto cost into the
+kernel. It is also not testable in this project's CI. Removing it is preferable to keeping inert
+scaffolding that reads like a working feature.
 
-```rust
-pub fn enable_ktls(raw_fd: RawFd) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        // setsockopt(IPPROTO_TCP, TCP_ULP, "tls") — attaches the kernel TLS ULP module only.
-        // Succeeds whenever the kernel's `tls` module is loadable, independent of any key
-        // material. No setsockopt(SOL_TLS, TLS_TX/TLS_RX, ...) key-install call exists anywhere
-        // in this file — so even a successful TCP_ULP attach never actually arms kernel
-        // encryption.
-    }
-    #[cfg(not(target_os = "linux"))]
-    { Err(io::Error::new(io::ErrorKind::Unsupported, "kTLS is only supported on Linux")) }
-}
-```
-
-`enable_ktls` is still only a partial kTLS implementation (it would need the `TLS_TX`/`TLS_RX`
-`setsockopt` calls to actually arm hardware/kernel framing), but **the dangerous half of the
-previously-reported bug is gone**: both call sites now discard `enable_ktls`'s result with `let _
-= ...` and hardcode `self.is_ktls_active = false` on the very next line, instead of the earlier
-`if enable_ktls(raw_fd).is_ok() { self.is_ktls_active = true; }` pattern. Since
-`TlsSession::read_plaintext`/`write_plaintext` (tls.rs:219-301) branch on `self.is_ktls_active`
-— the `true` branch would read/write the **raw socket directly with no rustls encrypt/decrypt at
-all** — and that field can now never become `true` via the handshake path (it is only initialized
-`false` in `TlsSession::new`, tls.rs:121-128, and never flipped `true` anywhere in the file, `rg
--n is_ktls_active.*=.*true src/tls.rs` returns zero matches), **every `--tls-port` connection
-unconditionally takes the real rustls-mediated encrypt/decrypt branch**. The raw-socket branch in
-`read_plaintext`/`write_plaintext` is now simply dead code reachable only if some future caller
-sets `is_ktls_active = true` directly (nothing does today).
-
-**Verified fix commit**: `git log` shows `8c39a2f fix(tls): use rustls userspace crypto to avoid
-unconfigured kTLS framing`, which matches exactly what current source does.
-
-### 5.4 Wiring into the server (server.rs / main.rs / connection.rs)
+### 5.4 Wiring into the server (server.rs / main.rs / connection.rs / transport.rs)
 
 - `main.rs:182-204` builds the `rustls::ServerConfig` once at startup (via
   `load_certs_and_key_from_files` or `generate_self_signed_cert`+`create_server_config`) and
-  wraps it in `TlsWorkerConfig { tls_port, server_config }` (tls.rs:304-309), passed down to every
+  wraps it in `TlsWorkerConfig { tls_port, server_config }`, passed down to every
   shard worker.
 - `server.rs:101-127` conditionally opens a **second** `SO_REUSEPORT`/`SO_REUSEADDR` socket on
   `tls_cfg.tls_port`, parallel to the shard's plain listener, when `tls_config` is `Some`.
-- `server.rs:1861-1910` spawns a dedicated accept loop for that listener (polled with a 200ms
+- `server.rs` spawns a dedicated accept loop for that listener (polled with a 200ms
   timeout against `crate::shutdown::is_shutting_down()`, same pattern as the plain accept loop).
   Each accepted TLS client gets `client_id = ((shard_id as u64) << 48) | 0x8000_0000_0000 + n` —
   the `0x8000_0000_0000` bit flags it as a TLS-origin client ID, disjoint from plain client IDs on
   the same shard. Per connection: `TlsSession::new(server_config.clone())` →
-  `session.handshake_monoio(&mut stream).await` → on success,
-  `connection::handle_tls_connection(stream, session, client_addr, client_id, registry, router)`.
-- `handle_tls_connection` (connection.rs:1162+) mirrors `handle_connection`'s structure (same
-  `ClientInfo` registration, same cleanup-on-drop guard pattern, same `authenticated`/`auth_user`
-  bootstrap at connection.rs:1230-1233) but reads/writes exclusively through
-  `TlsSession::read_plaintext`/`write_plaintext` instead of the raw `monoio::net::TcpStream`.
+  `session.handshake_monoio(&mut stream)` (10 s timeout) → on success the session is wrapped in a
+  `TlsTransport` and handed to the generic client loop.
+- There is no separate TLS client loop any more (the old `handle_tls_connection` was deleted).
+  `handle_client<T: ClientTransport>` in `connection.rs` is generic over the trait in
+  `src/transport.rs` and monomorphized for `PlainTransport` and `TlsTransport` (no `dyn`, so the
+  plaintext path is unchanged). TLS clients therefore get the full plaintext feature set: pipeline
+  squashing (`execute_commands_squashed`), `MULTI`/`EXEC` pipelining, Pub/Sub mode (generic
+  `run_pubsub_loop` over a split transport; the rustls session is shared between reader and writer
+  task via `Rc<RefCell>`), `CLIENT KILL`/`CLIENT LIST` via the global client registry,
+  output-buffer limits, `omem`/`qbuf`/pipeline stats, protocol-error close, shutdown drain, idle
+  timeout, max-clients, and the same `authenticated`/`auth_user` bootstrap (§3.5).
+- Out-of-band pushes (`MONITOR` lines, client-tracking invalidations) produced on other threads go
+  through `transport::PushTarget`: `Fd(RawFd)` for plaintext (non-blocking `libc::send` on the fd,
+  as before) and `Queue` (bounded flume channel, 4096) for TLS, drained and encrypted by the owning
+  connection. Previously these were raw `libc::send`s on the fd, which injected plaintext into a
+  TLS `MONITOR` client's stream.
+- Two rustls usage bugs were fixed along the way: ciphertext left over beyond one `read_tls` call
+  (~4 KiB) used to be silently dropped (pipelines larger than ~4 KiB per read lost commands), and
+  replies larger than 64 KiB failed on rustls's default send-buffer limit.
+- Replication links (`PSYNC`/`SYNC`/`DFLY FLOW`) remain plaintext-port only; on the TLS port they get
+  `-ERR replication links are only supported on the plaintext port` and the connection is closed.
 
 ---
 
@@ -640,7 +628,8 @@ unconfigured kTLS framing`, which matches exactly what current source does.
 | Issue | Prior status | Current status |
 | :--- | :--- | :--- |
 | `requirepass` config/`CONFIG SET` not enforced (default user stayed `nopass: true`, `HAS_CUSTOM_ACL` never set) | Verified gap | **FIXED.** `main.rs:137-153` and `CONFIG SET requirepass` (connection.rs:6686-6703) both now clear+repopulate `passwords`/`password_hashes`, flip `nopass=false`, and set `HAS_CUSTOM_ACL=true`. `is_auth_required_for_default()` correctly returns `true` afterward, and both plain and TLS connections (same `router.port` → same `AclManager`) bootstrap `authenticated=false`. Traced to commit `002086a feat(security): synchronize requirepass ACL enforcement and implement salted SHA-256 password hashing`. |
-| kTLS `TCP_ULP`-success treated as "encryption active", causing silent plaintext after a real handshake | Verified CRITICAL bug | **FIXED.** Both `complete_handshake` and `handshake_monoio` now discard `enable_ktls`'s result and unconditionally force `is_ktls_active = false` (tls.rs:162-163, 212-213). `rg` confirms `is_ktls_active` is never set `true` anywhere in the file. Traced to commit `8c39a2f fix(tls): use rustls userspace crypto to avoid unconfigured kTLS framing`. All `--tls-port` traffic now genuinely goes through rustls encrypt/decrypt. |
+| kTLS `TCP_ULP`-success treated as "encryption active", causing silent plaintext after a real handshake | Verified CRITICAL bug | **OBSOLETE — code removed.** First neutralized in commit `8c39a2f` (result discarded, `is_ktls_active` forced `false`); now `enable_ktls`, `is_ktls_active`, and the kTLS read/write branches are deleted entirely. kTLS is not implemented; all `--tls-port` traffic goes through userspace rustls (§5.3). |
+| TLS clients ran a separate, feature-poor loop (`handle_tls_connection`: no pipeline squashing, no output-buffer limits, etc.); MONITOR/tracking pushes were written as plaintext onto TLS sockets; >~4 KiB leftover ciphertext per read dropped; >64 KiB replies failed | Gap / bugs | **FIXED.** TLS clients run the generic `handle_client<TlsTransport>` loop; pushes go through `PushTarget::Queue` and are encrypted by the owning connection; both rustls buffering bugs fixed (§5.4). |
 | Password hashing scheme / unsalted-SHA-256 compatibility with real Redis | To re-verify | **Confirmed**: `hash_password_sha256` (acl.rs:33-42) is unsalted `SHA256(password)`, `#`-prefixed 64-hex — matches real Redis's ACL hash format exactly. (A separate legacy fixed-salt SHA1 scheme and a dead per-user-salted SHA-256 scheme also exist in the same file — see §3.2 — but the SHA-256 unsalted form is the one actually written by `requirepass`/`ACL SETUSER >password`.) |
 | Allocator is jemalloc, not mimalloc | To re-verify | **Confirmed**: `src/lib.rs:39-40` sets `#[global_allocator] = tikv_jemallocator::Jemalloc`. `mimalloc` remains in `Cargo.toml` as a dependency but has zero references anywhere in `src/` — dead/unused. |
 
@@ -688,8 +677,8 @@ unconfigured kTLS framing`, which matches exactly what current source does.
 
 - **`src/connection.rs`**: hosts essentially all ACL/TLS *behavior* — `AUTH`/`HELLO AUTH`/`RESET`/
   `ACL *` command handlers, the per-command and squash-path enforcement gates (§3.5), `CONFIG
-  GET/SET requirepass` (§3.6), and the second connection-handling entry point
-  `handle_tls_connection` alongside plain `handle_connection` (§5.4). `allocator::format_memory_info`
+  GET/SET requirepass` (§3.6), and the single generic client loop `handle_client<T:
+  ClientTransport>` that serves both plain and TLS connections (§5.4). `allocator::format_memory_info`
   is called from `INFO`'s handler.
 - **`src/server.rs`** (Component 01): conditionally binds the second `SO_REUSEPORT` TLS listener
   per shard and spawns its dedicated accept loop (§5.4), parallel to everything it already does
@@ -761,10 +750,12 @@ unconfigured kTLS framing`, which matches exactly what current source does.
 * **Gotcha 4**: `SmallCollectionArena` (allocator.rs §4.4) is unrelated to jemalloc — don't
   expect `pool_stats()`/`allocations_saved` to show up in jemalloc `INFO` fields; it is a
   hand-rolled free-list pool that sits *above* jemalloc, reducing calls into it.
-* **Gotcha 5**: `enable_ktls`'s return value is intentionally discarded at both call sites
-  (tls.rs:162, 212) — this is deliberate now (§5.3), not an oversight; do not "fix" it by wiring
-  `is_ktls_active = true` back up without also implementing the `TLS_TX`/`TLS_RX` key-install
-  `setsockopt` calls, or the plaintext-bypass bug returns.
+* **Gotcha 5**: kTLS is deliberately **not implemented** (§5.3) — the old `enable_ktls`/
+  `is_ktls_active` scaffolding was removed rather than left inert. Re-adding kTLS means a full
+  implementation (`dangerous_extract_secrets`, `SOL_TLS` `TLS_TX`/`TLS_RX` key install per cipher
+  suite, RX control-record handling via `recvmsg` cmsgs), not just a `TCP_ULP` attach — a partial
+  version is exactly what produced the old plaintext-bypass bug. Likewise, never `libc::send`
+  directly on a TLS client's fd: deliver out-of-band data through `PushTarget` (§5.4).
 * **Gotcha 6**: `--tls-cert-file`/`--tls-key-file` currently expect **raw DER**, not PEM, despite
   naming/doc comments suggesting PEM support (§6) — verify file format before deploying with
   real certificates.

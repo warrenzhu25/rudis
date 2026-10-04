@@ -12,7 +12,8 @@ This document was rewritten from a systematic, line-by-line audit of the current
 
 | File | Subsystem Role | Key Functions / Structs |
 | :--- | :--- | :--- |
-| `src/connection.rs` | Per-connection accept-to-close lifecycle, protocol detection, transactions, pipeline squashing, blocking-command integration, pub/sub and replication mode switches, TLS loop, Memcached command handlers | `handle_connection`, `handle_tls_connection`, `execute_tx_step`, `execute_command`, `execute_local_command`, `execute_commands_squashed`, `ClientInfo`, `ConnScratch` |
+| `src/connection.rs` | Per-connection accept-to-close lifecycle (one generic client loop for plaintext and TLS), protocol detection, transactions, pipeline squashing, blocking-command integration, pub/sub and replication mode switches, Memcached command handlers | `handle_connection`, `handle_client<T: ClientTransport>`, `execute_tx_step`, `execute_command`, `execute_local_command`, `execute_commands_squashed`, `ClientInfo`, `ConnScratch` |
+| `src/transport.rs` | Client transport abstraction that lets one monomorphized client loop serve both plaintext and TLS (`TlsTransport` lives in `src/tls.rs`), plus the out-of-band push target used by MONITOR / client tracking | `ClientTransport`, `PlainTransport`, `PushTarget` (`Fd` / `Queue`) |
 | `src/mailbox.rs` | Cross-shard response mailboxes (`BatchResponder`), single-key fast-path descriptors, SPSC ring buffers | `BatchResponder`, `FastGetDescriptor`, `FastSetDescriptor`, `SpscQueue` |
 | `src/shard.rs` | Reply payload representation, per-shard-worker message envelope, and (in `server.rs`) the remote-side handler for that envelope | `CompactResp`, `ShardMessage`, `ShardDb` |
 | `src/router.rs` | Local-vs-remote routing, cross-shard `MGET`/`MSET` scatter-gather, VLL transaction locks, single-key remote GET/SET fast paths | `Router`, `MgetInFlight`/`MsetInFlight`, `ScatterMgetDescriptor`/`ScatterMsetDescriptor` |
@@ -25,10 +26,10 @@ All line numbers below were confirmed against the current `src/connection.rs`/`s
 ## 2. Component Architecture & Data Structures
 
 ```
-                 Client TCP Stream
+       Client TCP Stream (PlainTransport) / TLS (TlsTransport)
                         │
                         ▼
-      handle_connection()/handle_tls_connection() loop
+       handle_client<T: ClientTransport>() loop
                         │
         ┌───────────────┼──────────────┬────────────────┬───────────────────┐
         ▼               ▼               ▼                ▼                   ▼
@@ -111,7 +112,7 @@ thread_local! {
 
 `CURRENT_ROUTER` is new versus the prior revision of this document: `set_current_router` (line 196) stashes the reactor thread's `Rc<Router>` once at startup so that deeply-nested helpers (`notify_keyspace_event`, line 202) can fire keyspace-notification pub/sub messages without threading a `&Router` argument through every call site.
 
-There is still no `ClientContext`/`ClientTxState`/`ClientProtocol` struct. Per-connection transaction state (`in_multi: bool`, `tx_queue: Vec<Command>`, `tx_has_error: bool`) lives as plain stack locals in `handle_connection`/`handle_tls_connection`, passed by `&mut` into the shared `execute_tx_step` helper (§4.2). RESP3-vs-RESP2 mode is tracked via the `CURRENT_CLIENT_RESP3` thread-local (set at the top of `execute_command`/`execute_commands_squashed` from `ClientInfo.is_resp3`).
+There is still no `ClientContext`/`ClientTxState`/`ClientProtocol` struct. Per-connection transaction state (`in_multi: bool`, `tx_queue: Vec<Command>`, `tx_has_error: bool`) lives as plain stack locals in the generic `handle_client` loop (shared by plaintext and TLS, §3.3), passed by `&mut` into the shared `execute_tx_step` helper (§4.2). RESP3-vs-RESP2 mode is tracked via the `CURRENT_CLIENT_RESP3` thread-local (set at the top of `execute_command`/`execute_commands_squashed` from `ClientInfo.is_resp3`).
 
 ### 2.3 Process-wide static state (WATCH, tracking, stats, buffer limits)
 
@@ -222,9 +223,11 @@ Each loop iteration:
 
 On loop exit (client disconnect, read error, hard output-buffer-limit breach, or a command handler returning `should_quit = true`), the `ConnScratch` is returned to the pool via `recycle_conn_scratch` and `unwatch_keys(router.port, client_id)` clears this client's `WATCH` state. `ClientCleanup::drop` runs automatically via RAII as the function returns.
 
-### 3.3 `handle_tls_connection` (line 1162): shares transaction logic, skips squashing
+### 3.3 TLS connections: the same loop over `TlsTransport`
 
-Structurally simpler than `handle_connection`: no `ConnScratch` pooling, no pipeline squashing, no output-buffer-limit enforcement, no kernel-drain trick. It decrypts into a plaintext buffer via `crate::tls::TlsSession::read_plaintext`, parses one command at a time, and — **this is new versus the prior revision of this document** — routes every parsed command through the same `execute_tx_step` helper that `handle_connection` uses (§4.2), so TLS connections now get full `MULTI`/`EXEC`/`WATCH` transaction support, not just bare `execute_command` dispatch. What TLS connections still never get is pipeline squashing: every command, transactional or not, pays one `execute_tx_step`→`execute_command` call (and, for remote keys, one full `.await` round-trip) — there is no batch-fan-out fast path over TLS. Flush is a single `session.write_plaintext` per read, with no non-blocking `libc::send` fast path.
+There is no longer a separate TLS client loop — the old duplicated `handle_tls_connection` loop (no `ConnScratch` pooling, no pipeline squashing, no output-buffer limits) has been deleted. The loop described in §3.2 is actually `handle_client<T: ClientTransport>`, generic over the transport trait in `src/transport.rs`; `handle_connection` instantiates it with `PlainTransport`, and the TLS accept path (after a `rustls` handshake bounded by a 10 s timeout) instantiates it with `TlsTransport` (`src/tls.rs`). It is monomorphized (no `dyn`), so the plaintext instantiation compiles to the same io_uring read into a rented `BytesMut`, the same non-blocking `libc::recv` drains (`read_ready`), and the same `libc::send`-then-io_uring flush described in §3.2 — those raw-fd steps are `PlainTransport` method bodies. `TlsTransport` implements the same methods by feeding ciphertext through `rustls` (draining all buffered ciphertext rather than a single ~4 KiB `read_tls` chunk, and without `rustls`'s default 64 KiB send-buffer cap — both former bugs).
+
+TLS clients therefore get everything plaintext clients get: pipeline squashing (`execute_commands_squashed`, §6), `MULTI`/`EXEC` pipelining via `execute_tx_step` (§4.2), Pub/Sub mode (the generic `run_pubsub_loop` over a split transport; for TLS the `rustls` session is shared between the reader and the writer task via `Rc<RefCell>`), `CLIENT KILL`/`CLIENT LIST` (registration in the global client registry), output-buffer limits (§5), `omem`/`qbuf`/pipeline stats, protocol-error close, shutdown drain, idle timeout, and max-clients. Out-of-band pushes from other threads (`MONITOR` lines, client-tracking invalidations) go through `transport::PushTarget`: `Fd(RawFd)` for plaintext (a non-blocking `libc::send` on the fd, unchanged) and `Queue` (a bounded flume channel of 4096) for TLS, drained and encrypted by the owning connection — previously a raw `send` on a TLS client's fd injected plaintext into its TLS stream. Replication links (`PSYNC`/`SYNC`/`DFLY FLOW`) take over the raw TCP socket (`into_tcp_stream`) and so remain plaintext-port only: on the TLS port they get `-ERR replication links are only supported on the plaintext port` and the connection is closed.
 
 ### 3.4 Shutdown / close
 
@@ -279,7 +282,7 @@ For a **local** key, an unconditional plain `SET` (no `NX`/`XX`/`IFEQ`/etc., no 
 
 ### 4.2 `execute_tx_step` (line 1302): `MULTI`/`EXEC`/`WATCH`, shared by TLS and plaintext connections
 
-This function did not exist as a separate unit in the prior revision of this document — transaction handling has been extracted out of `handle_connection` into a standalone `async fn` so that `handle_tls_connection` can share the exact same `MULTI`/`EXEC`/`WATCH`/`DISCARD`/`RESET` state machine (§3.3). Signature takes `&mut in_multi`, `&mut tx_queue`, `&mut tx_has_error` by reference alongside the usual auth/asking state.
+This function did not exist as a separate unit in the prior revision of this document — transaction handling has been extracted out of `handle_connection` into a standalone `async fn` so that the (now-deleted) separate TLS loop could share the exact same `MULTI`/`EXEC`/`WATCH`/`DISCARD`/`RESET` state machine; today plaintext and TLS both reach it from the single generic `handle_client` loop (§3.3). Signature takes `&mut in_multi`, `&mut tx_queue`, `&mut tx_has_error` by reference alongside the usual auth/asking state.
 
 When **not** in a transaction: `MULTI` sets `in_multi = true` and clears `tx_queue`/`tx_has_error`; `WATCH(keys)` calls `watch_keys`; `UNWATCH` calls `unwatch_keys`; `DISCARD`/`EXEC` without a preceding `MULTI` are rejected; anything else falls through to `execute_command` directly.
 
@@ -385,7 +388,7 @@ Both the local fast paths in `execute_commands_squashed` (§6.4) and the remote 
 - **Dead/unreachable duplicate `IncrBy` fast-path arm** in `execute_commands_squashed` (§6.4) — cosmetic, not a behavioral bug, but worth removing.
 - **`ResponderChannel` type alias is dead and now additionally stale** (§6) — unreferenced, and its element type no longer matches either `ShardMessage::Batch`'s payload shape or `BatchResponder`'s pointer-based delivery mechanism.
 - **`execute_command`/`execute_local_command`'s hand-synced duplication continues to grow.** The two independent `match` statements over `Command` are now roughly 7,432 and 6,312 lines respectively (both roughly 60-80% larger than the ~5,013/~4,054 lines noted in the prior revision), and a *third*, largely-mirrored copy of the hottest local fast paths (`GET`/`SET`/`INCRBY`/`HSET`/`SISMEMBER`/`SADD`/`LPUSH`/`LPOP`) now also lives in `src/server.rs`'s `ShardMessage::Batch` handler (the remote-shard receiving side, §6) — a third place a new command or a fast-path-eligibility change must be replicated by hand to stay consistent. No macro or exhaustiveness test enforces this today.
-- **TLS connections still never take the pipeline-squashing fast path** (§3.3) — a real, current scope limitation: every pipelined command over TLS pays one `execute_command` call (and, for remote keys, one full `.await` round-trip), with no inline fast paths and no cross-shard parallel fan-out.
+- **TLS connections now take the pipeline-squashing fast path** (§3.3) — this former scope limitation is gone: TLS clients run the same generic `handle_client` loop as plaintext clients, with the same inline fast paths and cross-shard parallel fan-out.
 - **`CLIENT KILL`/`CLIENT PAUSE`/`CLIENT UNPAUSE`/`CLIENT NO-TOUCH`/`CLIENT CACHING` are accepted-but-inert `+OK` stubs** (§4.1) — clients that rely on `CLIENT KILL` to forcibly disconnect another client, or `CLIENT PAUSE` to briefly halt processing, will not observe the expected effect.
 - **`src/server.rs`'s `needs_async` branch of the `ShardMessage::Batch` handler is permanently dead** (`let needs_async = false;`, hardcoded) — a substantial, separately-maintained async/`monoio::spawn` copy of the same fast-path dispatch logic that never executes. Out of scope for this document (it lives in `server.rs`, Component 01's file) but directly relevant to anyone auditing the cross-shard mailbox mechanism end-to-end, since it is easy to mistake for the live code path on a casual read.
 
@@ -420,7 +423,7 @@ Command variants `MemcachedSet`/`MemcachedAdd`/`MemcachedReplace`/`MemcachedGet`
 - **`src/acl.rs`** (Component 15): `HAS_CUSTOM_ACL`/`get_acl_for_port`; both `execute_command` and `execute_commands_squashed` enforce per-command/per-key authorization (`-NOPERM`) via `AclUser::can_execute_command`/`can_access_key`, checked against every key (`cmd_keys`/`for_each_cmd_key`), not just the routing-primary key.
 - **`src/aof.rs`**: `execute_local_command`/`record_change!` take an `Option<&RefCell<AofWriter>>` to append write commands for persistence; `command_to_resp` is reused to detect "is this command a write" for the replica read-only guard, the `OOM` gate, and every squashed fast-path AOF-emptiness gate.
 - **`src/slowlog.rs`**: `execute_command`'s `SlowlogTracker` RAII guard reports every command's wall-clock duration via `log_command_if_slow` when `SLOWLOG_LOG_SLOWER_THAN >= 0`.
-- **`src/tls.rs`**: `handle_tls_connection` (§3.3) — the non-squashed TLS execution path, now sharing `execute_tx_step` with the plaintext path.
+- **`src/tls.rs`** / **`src/transport.rs`**: `TlsTransport` and `PlainTransport`, the two `ClientTransport` impls the generic `handle_client` loop is monomorphized over (§3.3), plus `PushTarget` for out-of-band MONITOR/tracking pushes.
 - **`src/scripting.rs`**: `Eval`/`Evalsha`/`Fcall` (§4.1) — local-shard-only dispatch, forwarding the whole script command to the key's owning shard rather than distributing execution.
 
 ---

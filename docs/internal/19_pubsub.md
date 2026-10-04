@@ -24,7 +24,7 @@ This revision re-verifies every claim in the previous pass directly against curr
 | :--- | :--- |
 | `src/pubsub.rs` | `PubSubHub` (per-shard subscriber registry), `ShardedPresenceTable` (cross-shard presence bitmask), RESP frame builders, the recursive glob matcher. |
 | `src/router.rs` | `Router::publish`/`pubsub_channels`/`pubsub_numsub`/`pubsub_numpat` (cross-shard fan-out for standard/pattern Pub/Sub, presence-filtered); `Router::spublish`/`ssubscribe`/`sunsubscribe`/`pubsub_shardnumsub` (CRC16 slot routing for sharded Pub/Sub); `key_slot`/`slot_to_shard` (shared with ordinary key routing, Component 04). |
-| `src/connection.rs` | `run_pubsub_loop`/`handle_pubsub_cmd` — the dedicated per-connection task a client is handed off to, permanently, the first time it issues `SUBSCRIBE`/`PSUBSCRIBE`/`SSUBSCRIBE`; `ClientCleanup`/`TlsClientCleanup` Drop guards that call `remove_client_with_presence` on disconnect. |
+| `src/connection.rs` | `run_pubsub_loop`/`handle_pubsub_cmd` — the dedicated per-connection task a client is handed off to, permanently, the first time it issues `SUBSCRIBE`/`PSUBSCRIBE`/`SSUBSCRIBE` (generic over the client transport, so TLS clients use it too, via a split `TlsTransport` whose rustls state is shared between reader and writer task through `Rc<RefCell>`); the `ClientCleanup` Drop guard in the generic `handle_client` loop (shared by plaintext and TLS — the former `TlsClientCleanup` is gone) that calls `remove_client_with_presence` on disconnect. |
 | `src/shard.rs` | The 10 `ShardMessage` variants that carry Pub/Sub operations across the per-shard `flume` mailbox mesh: `Publish`, `Spublish`, `Ssubscribe`, `Sunsubscribe`, `PubsubChannels`, `PubsubShardchannels`, `PubsubNumsub`, `PubsubShardnumsub`, `PubsubNumpat`, `RemoveClientPubSub`. |
 
 Pub/Sub state (`PubSubHub`) is **not** shared across shards — each shard's `run_shard_worker`
@@ -360,10 +360,11 @@ pub fn remove_client_with_presence(&mut self, client_id: u64, presence_info: Opt
 }
 ```
 
-Called from two places (`src/connection.rs:1573-1604`'s `ClientCleanup::drop` for plaintext
-connections, and the TLS equivalent at `src/connection.rs:1200-1216`, plus the writer-task path
+Called from the `ClientCleanup::drop` guard in the generic `handle_client` loop in
+`src/connection.rs`, which serves both plaintext and TLS connections (there is no longer a separate
+TLS guard). The writer-task path
 inside `run_pubsub_loop` itself is *not* where cleanup happens — it's the outer connection-level
-Drop guard that runs regardless of which branch inside `run_pubsub_loop` returned). On the
+Drop guard that runs regardless of which branch inside `run_pubsub_loop` returned. On the
 client's own (home) shard, cleanup passes `presence_info = Some((shard_id, &presence_table))` so
 that a channel's or the pattern class's local subscriber count dropping to zero correctly clears
 that shard's presence bit. The home-shard `Drop` guard also unconditionally broadcasts

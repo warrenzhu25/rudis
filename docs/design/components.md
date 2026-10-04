@@ -666,17 +666,16 @@ silently allowing a denied command through.
 entries plus one SHA1 computation — negligible, paid once per connection. Real per-command ACL overhead now
 exists: every command after auth takes a read-lock and a hash-set lookup, small but no longer zero.
 
-**Verified findings.** TLS is genuinely wired up end-to-end for the safe `rustls` path — the handshake is a
-correct async adaptation of the rustls handshake loop, not dead code. **But the kTLS offload fast path has a
-critical, live bug: it silently transmits application data in plaintext.** `enable_ktls` performs only the
-first of two required `setsockopt` calls (`TCP_ULP`, attaching the kernel TLS module) — this succeeds on
-essentially any modern Linux host regardless of whether key material was ever installed, so `is_ktls_active`
-becomes `true` on real deployments. The second, actually-required call that installs the negotiated
-cipher/key/IV into the kernel socket does not exist. Once `is_ktls_active` is set, `read_plaintext`/
-`write_plaintext` read/write the raw socket directly with **no rustls encryption at all**, while both client
-and server believe a real TLS session is active because the handshake itself genuinely succeeded. This is
-worse than TLS simply being absent: enabling `--tls-port` today produces a working handshake followed by
-silent plaintext for anyone who trusts it.
+**Verified findings.** TLS is genuinely wired up end-to-end via userspace `rustls` — the handshake is a
+correct async adaptation of the rustls handshake loop (with a 10 s timeout), not dead code. **kTLS is not
+implemented.** An earlier revision of this document reported a critical kTLS plaintext bug; that note is
+obsolete — the partial `enable_ktls` scaffolding (a `TCP_ULP` attach with no `SOL_TLS` key install),
+`is_ktls_active`, and the kTLS read/write branches have all been removed, so the code path no longer exists.
+TLS clients now run the same generic `handle_client<T: ClientTransport>` loop as plaintext clients
+(`TlsTransport` vs `PlainTransport`, monomorphized), so they get pipeline squashing, Pub/Sub, `CLIENT
+KILL`/`LIST`, output-buffer limits, and the other plaintext-loop features; `MONITOR`/client-tracking pushes
+reach TLS clients through an encrypted per-connection queue (`transport::PushTarget::Queue`) instead of a raw
+`send` on the fd. Replication links (`PSYNC`/`SYNC`/`DFLY FLOW`) are refused on the TLS port.
 
 **Further reading:** [`docs/internal/15_security_tls.md`](../internal/15_security_tls.md)
 

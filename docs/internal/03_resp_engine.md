@@ -540,13 +540,13 @@ matching in `docs/internal/05_storage_engine.md` for where that technique actual
 
 ## 5. Every Caller of `parse_command` Outside `resp.rs`
 
-Verified by grepping for `resp::parse_command`/`parse_command(` across `src/*.rs` — **9 call
-sites across 4 files**:
+Verified by grepping for `resp::parse_command`/`parse_command(` across `src/*.rs` — **8 call
+sites across 4 files** (the former separate `handle_tls_connection` call site is gone: TLS clients
+now share the generic `handle_client` loop). Line numbers are approximate and drift as the code changes:
 
 | File:Line | Loop | What it does with the parsed `Command` |
 | :--- | :--- | :--- |
-| `connection.rs:1253` | `handle_tls_connection` (TLS client loop) | Executes **one command at a time** via `execute_tx_step` — TLS clients do not go through the pipelined/squashed batch executor that plaintext clients use. |
-| `connection.rs:1685` | `handle_connection`'s main plaintext read loop | Parses **all** complete commands currently buffered into a `Vec<Command>`, then hands the whole batch to `execute_commands_squashed` — the primary, pipelined client command path. |
+| `connection.rs` (`handle_client`) | `handle_client<T: ClientTransport>`'s main read loop, shared by plaintext (`PlainTransport`) and TLS (`TlsTransport`) clients | Parses **all** complete commands currently buffered into a `Vec<Command>`, then hands the whole batch to `execute_commands_squashed` — the primary, pipelined client command path, for both transports. |
 | `connection.rs:2526` | `run_pubsub_loop`, draining commands already buffered before entering subscribe mode | One-time drain of any pipelined commands that arrived in the same read as the initial `SUBSCRIBE`. |
 | `connection.rs:2563` | `run_pubsub_loop`'s steady-state read loop | Parses commands from a client that is in Pub/Sub mode (still accepts `PING`, `SUBSCRIBE`/`UNSUBSCRIBE`, etc.). |
 | `connection.rs:2672` | Master-side replica ACK tracking (plain replication) | Decodes `REPLCONF ACK <offset>` frames sent back by a connected replica, feeding `hub.update_replica_ack`. |

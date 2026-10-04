@@ -68,10 +68,12 @@ Rudis employs a **Thread-Per-Core (Shared-Nothing)** multi-reactor architecture 
          └──────────────────────────────┘      └──────────────────────────────┘
 ```
 
-> The diagram above intentionally omits AF_XDP kernel bypass and kernel TLS (kTLS): both exist
-> in the codebase (`src/xdp.rs`, `src/zerocopy.rs`, `src/tls.rs`) but are not on this live
-> request path today — see [`docs/design/10_kernel_bypass_xdp.md`](design/10_kernel_bypass_xdp.md)
-> and [`docs/design/15_security_tls.md`](design/15_security_tls.md) for their current, honestly-scoped status.
+> The diagram above intentionally omits AF_XDP kernel bypass: it exists in the codebase
+> (`src/xdp.rs`, `src/zerocopy.rs`) but is not on this live request path today — see
+> [`docs/design/10_kernel_bypass_xdp.md`](design/10_kernel_bypass_xdp.md). Kernel TLS (kTLS) is
+> not implemented at all: `--tls-port` connections use userspace `rustls` (`src/tls.rs`) and run the
+> same generic client loop as plaintext connections — see
+> [`docs/design/15_security_tls.md`](design/15_security_tls.md).
 
 ### Key Concurrency Principles:
 1. **Physical Core Pinning**: Every worker thread is pinned to an exclusive physical CPU core via `core_affinity` (disabled with `--no-pin`). The OS scheduler cannot migrate worker threads between cores, improving L1/L2 cache locality.

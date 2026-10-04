@@ -24,8 +24,8 @@ touching the hot request path is exactly where a regression is most likely to hi
 likely to have been caught by the broad architectural documentation pass (which read the
 codebase for what it *does*, not for what changed most recently or most riskily).
 
-**For the rest of the codebase's known gaps** — the >64-shard MGET/MSET bug, the kTLS
-plaintext bug, ACL's weak password hashing, the O(N) GEORADIUS scans, missing RDB persistence
+**For the rest of the codebase's known gaps** — the >64-shard MGET/MSET bug, ACL's weak
+password hashing, the O(N) GEORADIUS scans, missing RDB persistence
 for JSON/Probabilistic/Vector state, and everything else already found — see each component's
 own "Future Improvements" section in `docs/design/components.md` and
 `docs/internal/components.md`. This document does not repeat those.
