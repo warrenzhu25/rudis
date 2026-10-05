@@ -862,19 +862,7 @@ impl ShardDb {
         }
         if let Some(tm) = &self.tier_manager {
             for (ptr, is_cooled) in self.table.dropped_tier.drain(..) {
-                tm.on_key_deleted(ptr);
-                if is_cooled {
-                    tm.stats
-                        .cooled_keys
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    tm.stats
-                        .tiered_keys
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                tm.stats
-                    .total_deletes
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tm.on_key_overwritten(ptr, is_cooled);
             }
         } else {
             self.table.dropped_tier.clear();

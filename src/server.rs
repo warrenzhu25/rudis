@@ -1079,12 +1079,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                         crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                     }
-                                    if let Some((ptr, is_cooled)) =
-                                        db.table.set_with_hash(key, key_hash, value, expire_in)
-                                        && let Some(tm) = &db.tier_manager
-                                    {
-                                        tm.on_key_overwritten(ptr, is_cooled);
-                                    }
+                                    db.table.set_with_hash(key, key_hash, value, expire_in);
                                     responder.write_slot(idx, crate::shard::CompactResp::OK);
                                     continue;
                                 } else if !has_tracking

@@ -23135,13 +23135,7 @@ async fn execute_commands_squashed(
                     if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                         notify_key_invalidation(router.port, key.as_ref(), client_id);
                     }
-                    if let Some((ptr, is_cooled)) = local_db
-                        .table
-                        .set_with_hash(key, key_hash, value, expire_in)
-                        && let Some(tm) = &local_db.tier_manager
-                    {
-                        tm.on_key_overwritten(ptr, is_cooled);
-                    }
+                    local_db.table.set_with_hash(key, key_hash, value, expire_in);
                     responses[idx] = crate::shard::CompactResp::OK;
                     continue;
                 } else if write_fast_path && let Command::IncrBy(ref key, delta, _) = cmd {
