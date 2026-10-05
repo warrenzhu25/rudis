@@ -21015,3 +21015,65 @@ fn test_tiered_cooling_mutation_and_extent_reclamation_e2e() {
     assert!(info_flush.contains("tiered_keys:0"));
 }
 
+/// Regression: each accept loop re-checks for shutdown every 200 ms. It used
+/// to drop the in-flight io_uring accept on that tick, and a connection the
+/// kernel accepted in the same instant was discarded: it stayed established
+/// but was never served, so the client hung on its first command. The race
+/// needs the shards busy (completions reaped late), so half the workers keep
+/// them busy with cross-shard pipelines while the other half open short-lived
+/// connections across many ticks. Every one of those must be answered.
+#[test]
+fn test_connections_accepted_at_shutdown_poll_tick_are_served_e2e() {
+    let port = 17990;
+    start_test_server(port, 4);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Reads until `lines` reply lines have arrived (each SET is one, each GET two).
+    fn read_lines(c: &mut TcpStream, lines: usize, what: &str) {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16384];
+        while got.iter().filter(|&&b| b == b'\n').count() < lines {
+            let n = c
+                .read(&mut buf)
+                .unwrap_or_else(|e| panic!("{what}: no reply on {:?} ({e})", c.local_addr()));
+            assert!(n > 0, "{what}: closed");
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+    let workers: Vec<_> = (0..16)
+        .map(|w| {
+            thread::spawn(move || {
+                let mut pipeline = Vec::new();
+                for j in 0..32 {
+                    pipeline
+                        .extend_from_slice(format!("SET tick:{w}:{j} v\r\nGET tick:{w}:{j}\r\n").as_bytes());
+                }
+                let connect = || {
+                    let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    c
+                };
+                let mut c = connect();
+                let mut fresh = 0u64;
+                while std::time::Instant::now() < deadline {
+                    if w % 2 == 0 {
+                        c = connect();
+                        c.write_all(b"PING\r\n").unwrap();
+                        read_lines(
+                            &mut c,
+                            1,
+                            &format!("worker {w}: fresh connection after {fresh} served"),
+                        );
+                        fresh += 1;
+                    }
+                    c.write_all(&pipeline).unwrap();
+                    read_lines(&mut c, 32 * 3, &format!("worker {w}: pipeline"));
+                }
+                fresh
+            })
+        })
+        .collect();
+    let fresh: u64 = workers.into_iter().map(|h| h.join().unwrap()).sum();
+    assert!(fresh > 0);
+}
+
+
