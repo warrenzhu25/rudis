@@ -2214,10 +2214,8 @@ impl RudisFlatTable {
             self.segments[seg_id].last_access[local_idx] = coarse_now_secs();
             self.segments[seg_id].slots[local_idx].replace(entry)
         } else {
-            if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
-                let slot = crate::router::key_slot(&entry.key) as usize;
-                self.slot_counts[slot] += 1;
-            }
+            let slot = crate::router::key_slot(&entry.key) as usize;
+            self.slot_counts[slot] += 1;
             self.segments[seg_id].insert_at(entry, mix_hash(h), local_idx);
             self.items += 1;
             None
@@ -2226,10 +2224,8 @@ impl RudisFlatTable {
 
     #[inline(always)]
     pub fn insert_prepared(&mut self, entry: RudisEntry, hash: u64, global_idx: usize) {
-        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
-            let slot = crate::router::key_slot(&entry.key) as usize;
-            self.slot_counts[slot] += 1;
-        }
+        let slot = crate::router::key_slot(&entry.key) as usize;
+        self.slot_counts[slot] += 1;
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
         unsafe {
@@ -2255,10 +2251,8 @@ impl RudisFlatTable {
         let local_idx = global_idx & GLOBAL_IDX_MASK;
         let entry = self.segments.get_mut(seg_id)?.remove(local_idx)?;
         self.items -= 1;
-        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
-            let slot = crate::router::key_slot(&entry.key) as usize;
-            self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
-        }
+        let slot = crate::router::key_slot(&entry.key) as usize;
+        self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
         Some(entry)
     }
 
@@ -2272,10 +2266,8 @@ impl RudisFlatTable {
                 .remove_present(local_idx)
         };
         self.items -= 1;
-        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
-            let slot = crate::router::key_slot(&entry.key) as usize;
-            self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
-        }
+        let slot = crate::router::key_slot(&entry.key) as usize;
+        self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
         entry
     }
 
@@ -9766,16 +9758,11 @@ impl RudisTable {
     }
 
     pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
-        if self.table.items == 0 {
+        if self.table.items == 0 || self.table.slot_counts[slot as usize] == 0 {
             return 0;
         }
-        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
-            if self.table.slot_counts[slot as usize] == 0 {
-                return 0;
-            }
-            if self.num_expires == 0 {
-                return self.table.slot_counts[slot as usize] as usize;
-            }
+        if self.num_expires == 0 {
+            return self.table.slot_counts[slot as usize] as usize;
         }
         let now = Instant::now();
         let mut count = 0;
@@ -9804,12 +9791,7 @@ impl RudisTable {
     }
 
     pub fn get_keys_in_slot(&mut self, slot: u16, count: usize) -> Vec<Bytes> {
-        if self.table.items == 0 {
-            return Vec::new();
-        }
-        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed)
-            && self.table.slot_counts[slot as usize] == 0
-        {
+        if self.table.items == 0 || self.table.slot_counts[slot as usize] == 0 {
             return Vec::new();
         }
         let mut result = Vec::new();
@@ -10995,54 +10977,54 @@ impl RudisTable {
             if !was_exp {
                 self.warm_slot(idx);
                 if let Some(entry) = self.table.get_slot_mut(idx) {
-                match &mut entry.val {
-                    RudisValue::String(b) => {
-                        let old_len = b.len();
-                        let mut vec = b.to_vec();
-                        let grew = vec.len() <= byte_idx;
-                        if grew {
-                            vec.resize(byte_idx + 1, 0);
-                            self.used_memory += (byte_idx + 1).saturating_sub(old_len);
-                        }
-                        let old_byte = vec[byte_idx];
-                        let old_bit = (old_byte >> bit_idx) & 1;
-                        let changed = grew || (old_bit != value);
-                        if changed {
-                            if value == 1 {
-                                vec[byte_idx] |= 1 << bit_idx;
-                            } else {
-                                vec[byte_idx] &= !(1 << bit_idx);
+                    match &mut entry.val {
+                        RudisValue::String(b) => {
+                            let old_len = b.len();
+                            let mut vec = b.to_vec();
+                            let grew = vec.len() <= byte_idx;
+                            if grew {
+                                vec.resize(byte_idx + 1, 0);
+                                self.used_memory += (byte_idx + 1).saturating_sub(old_len);
                             }
-                            *b = Bytes::from(vec);
-                        }
-                        return Ok((old_bit, changed));
-                    }
-                    RudisValue::Int(n) => {
-                        let mut vec = Self::format_i64(*n).to_vec();
-                        let grew = vec.len() <= byte_idx;
-                        if grew {
-                            vec.resize(byte_idx + 1, 0);
-                        }
-                        self.used_memory += vec.len().saturating_sub(8);
-                        let old_byte = vec[byte_idx];
-                        let old_bit = (old_byte >> bit_idx) & 1;
-                        let changed = grew || (old_bit != value);
-                        if changed {
-                            if value == 1 {
-                                vec[byte_idx] |= 1 << bit_idx;
-                            } else {
-                                vec[byte_idx] &= !(1 << bit_idx);
+                            let old_byte = vec[byte_idx];
+                            let old_bit = (old_byte >> bit_idx) & 1;
+                            let changed = grew || (old_bit != value);
+                            if changed {
+                                if value == 1 {
+                                    vec[byte_idx] |= 1 << bit_idx;
+                                } else {
+                                    vec[byte_idx] &= !(1 << bit_idx);
+                                }
+                                *b = Bytes::from(vec);
                             }
-                            entry.val = RudisValue::String(Bytes::from(vec));
+                            return Ok((old_bit, changed));
                         }
-                        return Ok((old_bit, changed));
+                        RudisValue::Int(n) => {
+                            let mut vec = Self::format_i64(*n).to_vec();
+                            let grew = vec.len() <= byte_idx;
+                            if grew {
+                                vec.resize(byte_idx + 1, 0);
+                            }
+                            self.used_memory += vec.len().saturating_sub(8);
+                            let old_byte = vec[byte_idx];
+                            let old_bit = (old_byte >> bit_idx) & 1;
+                            let changed = grew || (old_bit != value);
+                            if changed {
+                                if value == 1 {
+                                    vec[byte_idx] |= 1 << bit_idx;
+                                } else {
+                                    vec[byte_idx] &= !(1 << bit_idx);
+                                }
+                                entry.val = RudisValue::String(Bytes::from(vec));
+                            }
+                            return Ok((old_bit, changed));
+                        }
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
-                    _ => {
-                        return Err(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        );
-                    }
-                }
                 }
             }
         }

@@ -273,7 +273,7 @@ impl Router {
     }
 
     pub fn target_shard(&self, key: &[u8]) -> usize {
-        if self.cluster_enabled || crate::cluster::HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed) {
+        if self.cluster_enabled || crate::cluster::has_active_cluster(self.port) {
             let slot = key_slot(key);
             self.target_shard_for_slot(slot)
         } else {
@@ -2110,7 +2110,7 @@ impl Router {
     }
 
     pub async fn count_keys_in_slot(&self, slot: u16) -> usize {
-        if self.cluster_enabled || crate::cluster::HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed) {
+        if self.cluster_enabled || crate::cluster::has_active_cluster(self.port) {
             let target = self.target_shard_for_slot(slot);
             if target == self.shard_id {
                 self.local_db.borrow_mut().count_keys_in_slot(slot)
@@ -2146,7 +2146,7 @@ impl Router {
     }
 
     pub async fn get_keys_in_slot(&self, slot: u16, count: usize) -> Vec<Bytes> {
-        if self.cluster_enabled || crate::cluster::HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed) {
+        if self.cluster_enabled || crate::cluster::has_active_cluster(self.port) {
             let target = self.target_shard_for_slot(slot);
             if target == self.shard_id {
                 self.local_db.borrow_mut().get_keys_in_slot(slot, count)

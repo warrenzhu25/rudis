@@ -5,7 +5,7 @@ use smallvec::smallvec;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::resp::{
     ClientSubcommand, ClusterSubcommand, Command, LatencySubcommand, MemorySubcommand,
@@ -5985,7 +5985,11 @@ async fn execute_rebalance_plans(
                 .parse::<std::net::SocketAddr>()
                 .ok();
             if let Some(sock_addr) = target_sock
-                && let Ok(mut stream) = monoio::net::TcpStream::connect(sock_addr).await
+                && let Ok(Ok(mut stream)) = monoio::time::timeout(
+                    Duration::from_millis(1000),
+                    monoio::net::TcpStream::connect(sock_addr),
+                )
+                .await
             {
                 let cmd_importing = format!(
                     "*5\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$9\r\nIMPORTING\r\n${}\r\n{}\r\n",
@@ -5997,7 +6001,8 @@ async fn execute_rebalance_plans(
                 let (w_res, _) = stream.write_all(cmd_importing.into_bytes()).await;
                 if w_res.is_ok() {
                     let buf = vec![0u8; 64];
-                    let _ = stream.read(buf).await;
+                    let _ =
+                        monoio::time::timeout(Duration::from_millis(1000), stream.read(buf)).await;
                 }
             }
 
@@ -6025,7 +6030,11 @@ async fn execute_rebalance_plans(
             }
 
             if let Some(sock_addr) = target_sock
-                && let Ok(mut stream) = monoio::net::TcpStream::connect(sock_addr).await
+                && let Ok(Ok(mut stream)) = monoio::time::timeout(
+                    Duration::from_millis(1000),
+                    monoio::net::TcpStream::connect(sock_addr),
+                )
+                .await
             {
                 let cmd_node = format!(
                     "*5\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$4\r\nNODE\r\n$6\r\nmyself\r\n",
@@ -6035,7 +6044,8 @@ async fn execute_rebalance_plans(
                 let (w_res, _) = stream.write_all(cmd_node.into_bytes()).await;
                 if w_res.is_ok() {
                     let buf = vec![0u8; 64];
-                    let _ = stream.read(buf).await;
+                    let _ =
+                        monoio::time::timeout(Duration::from_millis(1000), stream.read(buf)).await;
                 }
             }
 
@@ -7780,9 +7790,7 @@ async fn execute_command(
                         );
                         return false;
                     }
-                } else if crate::cluster::HAS_ACTIVE_CLUSTER
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
+                } else if crate::cluster::has_active_cluster(router.port) {
                     let hub = crate::cluster::get_cluster_hub(router.port);
                     let my_slots = hub.my_slots.read().unwrap();
                     let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
@@ -10014,7 +10022,11 @@ async fn execute_command(
                         Err(_) => None,
                     };
                     if let Some(sock_addr) = target_sock
-                        && let Ok(mut stream) = monoio::net::TcpStream::connect(sock_addr).await
+                        && let Ok(Ok(mut stream)) = monoio::time::timeout(
+                            Duration::from_millis(1000),
+                            monoio::net::TcpStream::connect(sock_addr),
+                        )
+                        .await
                     {
                         let slot_str = slot.to_string();
                         let setslot_import = format!(
@@ -10027,7 +10039,11 @@ async fn execute_command(
                         let (write_res, _) = stream.write_all(setslot_import.into_bytes()).await;
                         if write_res.is_ok() {
                             let buf = vec![0u8; 64];
-                            let _ = stream.read(buf).await;
+                            let _ = monoio::time::timeout(
+                                Duration::from_millis(1000),
+                                stream.read(buf),
+                            )
+                            .await;
                         }
                     }
 
@@ -10059,7 +10075,11 @@ async fn execute_command(
 
                     // 4. Notify remote node to take final ownership: CLUSTER SETSLOT <slot> NODE myself
                     if let Some(sock_addr) = target_sock
-                        && let Ok(mut stream) = monoio::net::TcpStream::connect(sock_addr).await
+                        && let Ok(Ok(mut stream)) = monoio::time::timeout(
+                            Duration::from_millis(1000),
+                            monoio::net::TcpStream::connect(sock_addr),
+                        )
+                        .await
                     {
                         let slot_str = slot.to_string();
                         let setslot_node = format!(
@@ -10070,7 +10090,11 @@ async fn execute_command(
                         let (write_res, _) = stream.write_all(setslot_node.into_bytes()).await;
                         if write_res.is_ok() {
                             let buf = vec![0u8; 64];
-                            let _ = stream.read(buf).await;
+                            let _ = monoio::time::timeout(
+                                Duration::from_millis(1000),
+                                stream.read(buf),
+                            )
+                            .await;
                         }
                     }
 
@@ -22946,7 +22970,7 @@ async fn execute_commands_squashed(
         let acl_guard = acl.as_ref().map(|a| a.read().unwrap());
         let user = acl_guard.as_ref().and_then(|g| g.users.get(auth_user));
 
-        let hub = if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+        let hub = if crate::cluster::has_active_cluster(router.port) {
             let h = crate::cluster::get_cluster_hub(router.port);
             if !h.nodes.read().unwrap().is_empty() {
                 Some(h)
@@ -23135,7 +23159,9 @@ async fn execute_commands_squashed(
                     if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                         notify_key_invalidation(router.port, key.as_ref(), client_id);
                     }
-                    local_db.table.set_with_hash(key, key_hash, value, expire_in);
+                    local_db
+                        .table
+                        .set_with_hash(key, key_hash, value, expire_in);
                     responses[idx] = crate::shard::CompactResp::OK;
                     continue;
                 } else if write_fast_path && let Command::IncrBy(ref key, delta, _) = cmd {

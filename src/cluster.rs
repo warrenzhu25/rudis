@@ -133,6 +133,16 @@ pub struct ClusterHub {
 
 pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
 
+#[inline]
+pub fn has_active_cluster(port: u16) -> bool {
+    let hubs = CLUSTER_HUBS.read().unwrap();
+    if let Some(hub) = hubs.get(&port) {
+        hub.has_nodes.load(Ordering::Relaxed) || hub.cluster_enabled.load(Ordering::Relaxed)
+    } else {
+        HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed)
+    }
+}
+
 static CLUSTER_HUBS: LazyLock<RwLock<HashMap<u16, Arc<ClusterHub>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 

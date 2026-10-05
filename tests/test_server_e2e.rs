@@ -20946,60 +20946,120 @@ fn test_tiered_cooling_mutation_and_extent_reclamation_e2e() {
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
     // 1. String: SET -> COOL -> APPEND
-    assert_eq!(send_and_read(&mut client, b"SET str_key hello\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"TIER COOL str_key\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET str_key hello\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"TIER COOL str_key\r\n"),
+        ":1\r\n"
+    );
     let info = send_and_read(&mut client, b"TIER INFO\r\n");
     assert!(info.contains("cooled_keys:1"));
 
     // Mutate via APPEND: must not fail with WRONGTYPE, must uncool and drop extent
-    assert_eq!(send_and_read(&mut client, b"APPEND str_key _world\r\n"), ":11\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET str_key\r\n"), "$11\r\nhello_world\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"APPEND str_key _world\r\n"),
+        ":11\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET str_key\r\n"),
+        "$11\r\nhello_world\r\n"
+    );
     let info_after_append = send_and_read(&mut client, b"TIER INFO\r\n");
     assert!(info_after_append.contains("cooled_keys:0"));
     assert!(info_after_append.contains("total_deletes:1"));
 
     // 2. Integer: SET -> COOL -> INCRBY
     assert_eq!(send_and_read(&mut client, b"SET int_key 42\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"TIER COOL int_key\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"INCRBY int_key 8\r\n"), ":50\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET int_key\r\n"), "$2\r\n50\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TIER COOL int_key\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"INCRBY int_key 8\r\n"),
+        ":50\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET int_key\r\n"),
+        "$2\r\n50\r\n"
+    );
     let info_after_incr = send_and_read(&mut client, b"TIER INFO\r\n");
     assert!(info_after_incr.contains("cooled_keys:0"));
     assert!(info_after_incr.contains("total_deletes:2"));
 
     // 3. Hash: HSET -> COOL -> HSET (new field)
-    assert_eq!(send_and_read(&mut client, b"HSET h_key f1 v1\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"HSET h_key f1 v1\r\n"),
+        ":1\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"TIER COOL h_key\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"HSET h_key f2 v2\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"HGET h_key f1\r\n"), "$2\r\nv1\r\n");
-    assert_eq!(send_and_read(&mut client, b"HGET h_key f2\r\n"), "$2\r\nv2\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"HSET h_key f2 v2\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HGET h_key f1\r\n"),
+        "$2\r\nv1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HGET h_key f2\r\n"),
+        "$2\r\nv2\r\n"
+    );
     let info_after_hset = send_and_read(&mut client, b"TIER INFO\r\n");
     assert!(info_after_hset.contains("cooled_keys:0"));
     assert!(info_after_hset.contains("total_deletes:3"));
 
     // 4. List: RPUSH -> COOL -> LPUSH & LPOP
-    assert_eq!(send_and_read(&mut client, b"RPUSH list_key elem1\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"TIER COOL list_key\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"LPUSH list_key elem0\r\n"), ":2\r\n");
-    assert_eq!(send_and_read(&mut client, b"LPOP list_key\r\n"), "$5\r\nelem0\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"RPUSH list_key elem1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"TIER COOL list_key\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"LPUSH list_key elem0\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"LPOP list_key\r\n"),
+        "$5\r\nelem0\r\n"
+    );
     let info_after_list = send_and_read(&mut client, b"TIER INFO\r\n");
     assert!(info_after_list.contains("cooled_keys:0"));
     assert!(info_after_list.contains("total_deletes:4"));
 
     // 5. Set: SADD -> COOL -> SADD
     assert_eq!(send_and_read(&mut client, b"SADD set_key m1\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"TIER COOL set_key\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TIER COOL set_key\r\n"),
+        ":1\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"SADD set_key m2\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"SISMEMBER set_key m1\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"SISMEMBER set_key m2\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SISMEMBER set_key m1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SISMEMBER set_key m2\r\n"),
+        ":1\r\n"
+    );
     let info_after_set = send_and_read(&mut client, b"TIER INFO\r\n");
     assert!(info_after_set.contains("cooled_keys:0"));
     assert!(info_after_set.contains("total_deletes:5"));
 
     // 6. Sorted Set: ZADD -> COOL -> ZADD
-    assert_eq!(send_and_read(&mut client, b"ZADD z_key 10.0 z1\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"ZADD z_key 10.0 z1\r\n"),
+        ":1\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"TIER COOL z_key\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"ZADD z_key 20.0 z2\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"ZADD z_key 20.0 z2\r\n"),
+        ":1\r\n"
+    );
     let zcard = send_and_read(&mut client, b"ZCARD z_key\r\n");
     assert_eq!(zcard, ":2\r\n");
     let info_after_zadd = send_and_read(&mut client, b"TIER INFO\r\n");
@@ -21044,8 +21104,9 @@ fn test_connections_accepted_at_shutdown_poll_tick_are_served_e2e() {
             thread::spawn(move || {
                 let mut pipeline = Vec::new();
                 for j in 0..32 {
-                    pipeline
-                        .extend_from_slice(format!("SET tick:{w}:{j} v\r\nGET tick:{w}:{j}\r\n").as_bytes());
+                    pipeline.extend_from_slice(
+                        format!("SET tick:{w}:{j} v\r\nGET tick:{w}:{j}\r\n").as_bytes(),
+                    );
                 }
                 let connect = || {
                     let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -21075,5 +21136,3 @@ fn test_connections_accepted_at_shutdown_poll_tick_are_served_e2e() {
     let fresh: u64 = workers.into_iter().map(|h| h.join().unwrap()).sum();
     assert!(fresh > 0);
 }
-
-
