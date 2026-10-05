@@ -1016,6 +1016,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     responder.write_slot(idx, crate::shard::CompactResp::from_slice(&temp_buf));
                                 }
                                 if has_writes {
+                                    r.local_db.borrow_mut().drain_dropped_tier();
                                     r.check_auto_tier_after_write();
                                 }
                                 responder.finish(items);
@@ -1444,6 +1445,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                 }
                                 responder.write_slot(idx, crate::shard::CompactResp::from_slice(&temp_buf));
                             }
+                            db.drain_dropped_tier();
                             drop(db);
                             if has_tracking {
                                 crate::connection::CURRENT_CLIENT_ID.set(prev_cid);

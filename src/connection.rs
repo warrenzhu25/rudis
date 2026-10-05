@@ -16297,6 +16297,15 @@ pub fn execute_local_command(
         cid,
         cmd,
     };
+    struct DroppedTierGuard(*mut ShardDb);
+    impl Drop for DroppedTierGuard {
+        fn drop(&mut self) {
+            unsafe {
+                (*self.0).drain_dropped_tier();
+            }
+        }
+    }
+    let _tier_guard = DroppedTierGuard(db as *mut ShardDb);
     // GET and MGET read through counting table accessors; probe the keys of
     // the other read commands for INFO keyspace_hits / keyspace_misses.
     if !matches!(cmd, Command::Get(_) | Command::Mget(_)) {
@@ -23554,6 +23563,7 @@ async fn execute_commands_squashed(
             }
             folded_mgets.push((idx, start, responses.len() - start));
         } else if let Command::Mset(pairs) = cmd {
+            local_db.drain_dropped_tier();
             drop(local_db);
             if remote_batches.iter().any(|b| !b.is_empty()) {
                 stat_run.flush();
@@ -23589,6 +23599,7 @@ async fn execute_commands_squashed(
                 | Command::FunctionStats
                 | Command::FunctionKill
         ) {
+            local_db.drain_dropped_tier();
             drop(local_db);
             stat_run.flush();
             if remote_batches.iter().any(|b| !b.is_empty()) {
@@ -23629,6 +23640,7 @@ async fn execute_commands_squashed(
             responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
         }
     }
+    local_db.drain_dropped_tier();
     drop(local_db);
     stat_run.flush();
 

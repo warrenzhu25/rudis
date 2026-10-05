@@ -1477,6 +1477,24 @@ pub struct RudisEntry {
     pub expire_at: Option<Instant>,
 }
 
+impl RudisEntry {
+    /// If this entry holds a [`RudisValue::Cooled`], warms it back up to its
+    /// in-memory [`RudisValue`] in place and returns its stale on-disk pointer.
+    #[inline(always)]
+    pub fn uncool(&mut self) -> Option<TieredPointer> {
+        if matches!(self.val, RudisValue::Cooled { .. }) {
+            let (p, v) = match std::mem::replace(&mut self.val, RudisValue::Int(0)) {
+                RudisValue::Cooled { ptr, val } => (ptr, *val),
+                _ => unreachable!(),
+            };
+            self.val = v;
+            Some(p)
+        } else {
+            None
+        }
+    }
+}
+
 #[inline(always)]
 pub fn hash_key(key: &[u8]) -> u64 {
     hash64(key)
@@ -2513,6 +2531,7 @@ pub struct RudisTable {
     pub arena: crate::allocator::SmallCollectionArena,
     pub num_expires: usize,
     pub hash_field_expires: hashbrown::HashMap<Bytes, hashbrown::HashMap<Bytes, Instant>>,
+    pub dropped_tier: smallvec::SmallVec<[(TieredPointer, bool); 4]>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2766,6 +2785,44 @@ impl RudisTable {
             arena: crate::allocator::SmallCollectionArena::new(),
             num_expires: 0,
             hash_field_expires: hashbrown::HashMap::new(),
+            dropped_tier: smallvec::SmallVec::new(),
+        }
+    }
+
+    /// Finds an entry for in-place mutation: if the key is Cooled (its data
+    /// is in RAM but also has a stale NVMe extent), warms it back to a plain
+    /// in-memory [`RudisValue`] in place, charges the freed 24B Cooled
+    /// wrapper, and records the stale extent in `dropped_tier` for release.
+    #[inline(always)]
+    pub fn find_entry_mut_warm(&mut self, key: &[u8], h: u64) -> Option<(usize, &mut RudisEntry)> {
+        let (idx, entry) = self.table.find_entry_mut(key, h)?;
+        if let Some(ptr) = entry.uncool() {
+            self.used_memory = self.used_memory.saturating_sub(24);
+            self.dropped_tier.push((ptr, true));
+        }
+        Some((idx, entry))
+    }
+
+    /// Like [`Self::find_entry_mut_warm`] for an already-located slot.
+    #[inline(always)]
+    pub fn get_slot_mut_warm(&mut self, idx: usize) -> Option<&mut RudisEntry> {
+        let entry = self.table.get_slot_mut(idx)?;
+        if let Some(ptr) = entry.uncool() {
+            self.used_memory = self.used_memory.saturating_sub(24);
+            self.dropped_tier.push((ptr, true));
+        }
+        Some(entry)
+    }
+
+    /// Warms up a slot in place if it is currently Cooled, releasing its 24B
+    /// wrapper from memory and queuing its stale NVMe pointer to `dropped_tier`.
+    #[inline(always)]
+    pub fn warm_slot(&mut self, idx: usize) {
+        if let Some(entry) = self.table.get_slot_mut(idx)
+            && let Some(ptr) = entry.uncool()
+        {
+            self.used_memory = self.used_memory.saturating_sub(24);
+            self.dropped_tier.push((ptr, true));
         }
     }
 
@@ -2889,6 +2946,11 @@ impl RudisTable {
             return;
         }
         if let Some(removed) = self.table.remove(slot_idx) {
+            match removed.val {
+                RudisValue::Tiered(ptr) => self.dropped_tier.push((ptr, false)),
+                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((ptr, true)),
+                _ => {}
+            }
             if removed.expire_at.is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
@@ -2982,6 +3044,11 @@ impl RudisTable {
         if let Some(slot_idx) = best_slot
             && let Some(removed) = self.table.remove(slot_idx)
         {
+            match removed.val {
+                RudisValue::Tiered(ptr) => self.dropped_tier.push((ptr, false)),
+                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((ptr, true)),
+                _ => {}
+            }
             if removed.expire_at.is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
@@ -3342,6 +3409,9 @@ impl RudisTable {
                 entry.expire_at = expire_in.map(|d| Instant::now() + d);
             }
             self.used_memory = self.used_memory.saturating_sub(old_bytes) + val_bytes;
+            if let Some((ptr, is_cooled)) = old_tiered {
+                self.dropped_tier.push((ptr, is_cooled));
+            }
             return old_tiered;
         }
 
@@ -3389,6 +3459,8 @@ impl RudisTable {
                 self.used_memory = self.used_memory.saturating_sub(freed);
                 let entry = self.table.remove_present(idx);
                 match entry.val {
+                    RudisValue::Tiered(ptr) => self.dropped_tier.push((ptr, false)),
+                    RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((ptr, true)),
                     RudisValue::String(_) | RudisValue::Int(_) => {}
                     other => self.recycle_value(other),
                 }
@@ -3417,6 +3489,8 @@ impl RudisTable {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
             match entry.val {
+                RudisValue::Tiered(ptr) => self.dropped_tier.push((ptr, false)),
+                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((ptr, true)),
                 RudisValue::String(_) | RudisValue::Int(_) => {}
                 other => self.recycle_value(other),
             }
@@ -3488,6 +3562,10 @@ impl RudisTable {
             {
                 self.expire_slot(idx);
             } else {
+                if let Some(ptr) = entry.uncool() {
+                    self.used_memory = self.used_memory.saturating_sub(24);
+                    self.dropped_tier.push((ptr, true));
+                }
                 match &mut entry.val {
                     RudisValue::Int(n) => {
                         let nv = n
@@ -4268,7 +4346,7 @@ impl RudisTable {
                 self.set(key, value, None);
                 return Ok(None);
             }
-            if let Some(entry) = self.table.get_slot_mut(idx) {
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::String(old) => {
                         let prev = old.clone();
@@ -4307,20 +4385,18 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(None);
             }
-            if let Some(entry) = self.table.get_slot(idx) {
-                match &entry.val {
-                    RudisValue::String(s) => {
-                        let val = s.clone();
-                        self.table.remove(idx);
-                        Ok(Some(val))
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
+                let val = match &entry.val {
+                    RudisValue::String(s) => s.clone(),
+                    RudisValue::Int(n) => Self::format_i64(*n),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
-                    RudisValue::Int(n) => {
-                        let val = Self::format_i64(*n);
-                        self.table.remove(idx);
-                        Ok(Some(val))
-                    }
-                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
-                }
+                };
+                self.del_with_hash(key, h);
+                Ok(Some(val))
             } else {
                 Ok(None)
             }
@@ -4338,7 +4414,7 @@ impl RudisTable {
                 self.set(key, new_val, None);
                 return Ok(len);
             }
-            if let Some(entry) = self.table.get_slot_mut(idx) {
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::String(s) => {
                         let mut combined = Vec::with_capacity(s.len() + val_to_append.len());
@@ -4477,7 +4553,7 @@ impl RudisTable {
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing
             && !self.check_expired_slot(idx)
-            && let Some(entry) = self.table.get_slot_mut(idx)
+            && let Some(entry) = self.get_slot_mut_warm(idx)
         {
             let mut bytes: Vec<u8> = match &entry.val {
                 RudisValue::String(s) => s.to_vec(),
@@ -4520,7 +4596,7 @@ impl RudisTable {
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing
             && !self.check_expired_slot(idx)
-            && let Some(entry) = self.table.get_slot_mut(idx)
+            && let Some(entry) = self.get_slot_mut_warm(idx)
         {
             let curr: f64 = match &entry.val {
                 RudisValue::String(s) => {
@@ -4578,7 +4654,7 @@ impl RudisTable {
         let (key_exists, prior_expire_at, existing_slot) = if let Some(idx) = existing {
             if self.check_expired_slot(idx) {
                 (false, None, None)
-            } else if let Some(entry) = self.table.get_slot(idx) {
+            } else if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &entry.val {
                     RudisValue::String(_) | RudisValue::Int(_) | RudisValue::HyperLogLog(_) => {
                         (true, entry.expire_at, Some(idx))
@@ -4759,9 +4835,7 @@ impl RudisTable {
                 if is_past_expired {
                     if key_exists {
                         let h = hash_key(&key);
-                        if let Some(idx) = self.table.find(&key, h) {
-                            self.table.remove(idx);
-                        }
+                        self.del_with_hash(&key, h);
                     }
                     let rep_cmd = if is_lazyfree_lazy_expire() {
                         Command::Unlink(smallvec::smallvec![key.clone()])
@@ -4998,9 +5072,7 @@ impl RudisTable {
                 if is_past_expired {
                     if key_exists {
                         let h = hash_key(&key);
-                        if let Some(idx) = self.table.find(&key, h) {
-                            self.table.remove(idx);
-                        }
+                        self.del_with_hash(&key, h);
                     }
                     let rep_cmd = if is_lazyfree_lazy_expire() {
                         Command::Unlink(smallvec::smallvec![key.clone()])
@@ -5124,6 +5196,10 @@ impl RudisTable {
             {
                 self.expire_slot(idx);
             } else {
+                if let Some(ptr) = entry.uncool() {
+                    self.used_memory = self.used_memory.saturating_sub(24);
+                    self.dropped_tier.push((ptr, true));
+                }
                 match &mut entry.val {
                     RudisValue::SmallHash(pairs) => {
                         if pairs.len() == 1 && pairs[0].0 == *field {
@@ -5230,6 +5306,10 @@ impl RudisTable {
             {
                 self.expire_slot(idx);
             } else {
+                if let Some(ptr) = entry.uncool() {
+                    self.used_memory = self.used_memory.saturating_sub(24);
+                    self.dropped_tier.push((ptr, true));
+                }
                 match &mut entry.val {
                     RudisValue::SmallHash(pairs) => {
                         let mut added = 0;
@@ -5378,7 +5458,7 @@ impl RudisTable {
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing
             && !self.check_expired_slot(idx)
-            && let Some(entry) = self.table.get_slot_mut(idx)
+            && let Some(entry) = self.get_slot_mut_warm(idx)
         {
             match &mut entry.val {
                 RudisValue::SmallHash(pairs) => {
@@ -6305,7 +6385,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(0);
             }
-            let (count, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+            let (count, is_empty) = if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::SmallHash(pairs) => {
                         let mut c = 0;
@@ -6528,7 +6608,7 @@ impl RudisTable {
                 return Ok((vec![None; fields.len()], Vec::new()));
             }
             let (results, deleted_fields, is_empty) =
-                if let Some(entry) = self.table.get_slot_mut(idx) {
+                if let Some(entry) = self.get_slot_mut_warm(idx) {
                     let mut results = Vec::with_capacity(fields.len());
                     let mut deleted_fields = Vec::new();
                     match &mut entry.val {
@@ -6622,7 +6702,7 @@ impl RudisTable {
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing
             && !self.check_expired_slot(idx)
-            && let Some(entry) = self.table.get_slot_mut(idx)
+            && let Some(entry) = self.get_slot_mut_warm(idx)
         {
             match &mut entry.val {
                 RudisValue::SmallHash(pairs) => {
@@ -6704,7 +6784,7 @@ impl RudisTable {
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing
             && !self.check_expired_slot(idx)
-            && let Some(entry) = self.table.get_slot_mut(idx)
+            && let Some(entry) = self.get_slot_mut_warm(idx)
         {
             match &mut entry.val {
                 RudisValue::SmallHash(pairs) => {
@@ -6948,6 +7028,10 @@ impl RudisTable {
             {
                 self.expire_slot(idx);
             } else {
+                if let Some(ptr) = entry.uncool() {
+                    self.used_memory = self.used_memory.saturating_sub(24);
+                    self.dropped_tier.push((ptr, true));
+                }
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         if values.len() == 1 {
@@ -7026,6 +7110,10 @@ impl RudisTable {
             {
                 self.expire_slot(idx);
             } else {
+                if let Some(ptr) = entry.uncool() {
+                    self.used_memory = self.used_memory.saturating_sub(24);
+                    self.dropped_tier.push((ptr, true));
+                }
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         if values.len() == 1 {
@@ -7078,7 +7166,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(0);
             }
-            if let Some(entry) = self.table.get_slot_mut(idx) {
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         for v in values {
@@ -7108,7 +7196,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(0);
             }
-            if let Some(entry) = self.table.get_slot_mut(idx) {
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         for v in values {
@@ -7154,6 +7242,10 @@ impl RudisTable {
                     crate::connection::write_resp_null(out);
                 }
                 return Ok(false);
+            }
+            if let Some(ptr) = entry.uncool() {
+                self.used_memory = self.used_memory.saturating_sub(24);
+                self.dropped_tier.push((ptr, true));
             }
 
             let mut has_written = false;
@@ -7245,6 +7337,10 @@ impl RudisTable {
                 }
                 return Ok(false);
             }
+            if let Some(ptr) = entry.uncool() {
+                self.used_memory = self.used_memory.saturating_sub(24);
+                self.dropped_tier.push((ptr, true));
+            }
 
             let mut has_written = false;
             let is_empty = match &mut entry.val {
@@ -7334,6 +7430,10 @@ impl RudisTable {
                 self.expire_slot(idx);
                 return Ok(None);
             }
+            if let Some(ptr) = entry.uncool() {
+                self.used_memory = self.used_memory.saturating_sub(24);
+                self.dropped_tier.push((ptr, true));
+            }
             let (popped, is_empty) = match &mut entry.val {
                 RudisValue::List(deque) => {
                     if deque.len() == 1 {
@@ -7391,6 +7491,10 @@ impl RudisTable {
                 self.expire_slot(idx);
                 return Ok(None);
             }
+            if let Some(ptr) = entry.uncool() {
+                self.used_memory = self.used_memory.saturating_sub(24);
+                self.dropped_tier.push((ptr, true));
+            }
             let (popped, is_empty) = match &mut entry.val {
                 RudisValue::List(deque) => {
                     if deque.len() == 1 {
@@ -7432,7 +7536,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(Vec::new());
             }
-            let (popped, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+            let (popped, is_empty) = if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         let mut res = Vec::with_capacity(count.min(deque.len()));
@@ -7471,7 +7575,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(Vec::new());
             }
-            let (popped, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+            let (popped, is_empty) = if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         let mut res = Vec::with_capacity(count.min(deque.len()));
@@ -7724,7 +7828,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(());
             }
-            let is_empty = if let Some(entry) = self.table.get_slot_mut(idx) {
+            let is_empty = if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         let n = deque.len() as i64;
@@ -7774,7 +7878,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Err("ERR no such key");
             }
-            if let Some(entry) = self.table.get_slot_mut(idx) {
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         let n = deque.len() as i64;
@@ -7801,7 +7905,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(0);
             }
-            let (removed, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+            let (removed, is_empty) = if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         let mut removed = 0;
@@ -7944,7 +8048,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(0);
             }
-            if let Some(entry) = self.table.get_slot_mut(idx) {
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         if let Some(pos) = deque.iter().position(|m| m.as_ref() == pivot) {
@@ -7992,7 +8096,7 @@ impl RudisTable {
             return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
         }
 
-        let (popped, is_empty) = match self.table.get_slot_mut(src_idx) {
+        let (popped, is_empty) = match self.get_slot_mut_warm(src_idx) {
             Some(entry) => match &mut entry.val {
                 RudisValue::List(deque) => {
                     let elem = match where_from {
@@ -8023,7 +8127,7 @@ impl RudisTable {
         let (existing, _) = self.table.find_or_prepare_insert(&destination, h_dst);
         if let Some(dst_idx) = existing
             && !self.check_expired_slot(dst_idx)
-            && let Some(entry) = self.table.get_slot_mut(dst_idx)
+            && let Some(entry) = self.get_slot_mut_warm(dst_idx)
         {
             match &mut entry.val {
                 RudisValue::List(deque) => {
@@ -8118,7 +8222,7 @@ impl RudisTable {
 
         if samekey {
             let mut vals = Vec::with_capacity(tomove);
-            if let Some(entry) = self.table.get_slot_mut(src_idx)
+            if let Some(entry) = self.get_slot_mut_warm(src_idx)
                 && let RudisValue::List(deque) = &mut entry.val
             {
                 for _ in 0..tomove {
@@ -8157,7 +8261,7 @@ impl RudisTable {
         // Distinct keys
         let mut vals = Vec::with_capacity(tomove);
         let src_is_empty = {
-            let entry = self.table.get_slot_mut(src_idx).unwrap();
+            let entry = self.get_slot_mut_warm(src_idx).unwrap();
             let deque = match &mut entry.val {
                 RudisValue::List(d) => d,
                 _ => unreachable!(),
@@ -8190,7 +8294,7 @@ impl RudisTable {
         let (existing, _) = self.table.find_or_prepare_insert(&destination, h_dst);
         if let Some(dst_idx) = existing
             && !self.check_expired_slot(dst_idx)
-            && let Some(entry) = self.table.get_slot_mut(dst_idx)
+            && let Some(entry) = self.get_slot_mut_warm(dst_idx)
         {
             match &mut entry.val {
                 RudisValue::List(deque) => {
@@ -8265,6 +8369,10 @@ impl RudisTable {
             {
                 self.expire_slot(idx);
             } else {
+                if let Some(ptr) = entry.uncool() {
+                    self.used_memory = self.used_memory.saturating_sub(24);
+                    self.dropped_tier.push((ptr, true));
+                }
                 match &mut entry.val {
                     RudisValue::Set(s) => match &mut **s {
                         RudisSet::Small(v) if v.len() == 1 => {
@@ -8350,6 +8458,10 @@ impl RudisTable {
             {
                 self.expire_slot(idx);
             } else {
+                if let Some(ptr) = entry.uncool() {
+                    self.used_memory = self.used_memory.saturating_sub(24);
+                    self.dropped_tier.push((ptr, true));
+                }
                 match &mut entry.val {
                     RudisValue::Set(set) => {
                         if members.len() == 1 {
@@ -8440,7 +8552,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(0);
             }
-            let (removed_count, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+            let (removed_count, is_empty) = if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::Set(set) => {
                         let mut c = 0;
@@ -8626,7 +8738,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(Vec::new());
             }
-            let (popped, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+            let (popped, is_empty) = if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::Set(set) => {
                         let mut res = Vec::new();
@@ -9127,7 +9239,7 @@ impl RudisTable {
             });
         }
 
-        let empty_after = if let Some(entry) = self.table.get_slot_mut(src_idx) {
+        let empty_after = if let Some(entry) = self.get_slot_mut_warm(src_idx) {
             if let RudisValue::Set(s) = &mut entry.val {
                 s.remove(member.as_ref());
                 s.is_empty()
@@ -9145,7 +9257,7 @@ impl RudisTable {
         let dst_added = if dst_exists {
             let (existing, _) = self.table.find_or_prepare_insert(&destination, h_dst);
             if let Some(dst_idx) = existing {
-                if let Some(entry) = self.table.get_slot_mut(dst_idx) {
+                if let Some(entry) = self.get_slot_mut_warm(dst_idx) {
                     if let RudisValue::Set(s) = &mut entry.val {
                         let already_has = s.contains(member.as_ref());
                         s.insert(member);
@@ -9811,6 +9923,10 @@ impl RudisTable {
             {
                 self.expire_slot(idx);
             } else {
+                if let Some(ptr) = entry.uncool() {
+                    self.used_memory = self.used_memory.saturating_sub(24);
+                    self.dropped_tier.push((ptr, true));
+                }
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
                         let mut added_count = 0usize;
@@ -10027,7 +10143,7 @@ impl RudisTable {
         if let Some(idx) = self.table.find(&key, h) {
             if self.check_expired_slot(idx) {
                 // Expired slot has been cleaned up, will insert as new below
-            } else if let Some(entry) = self.table.get_slot_mut(idx) {
+            } else if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
                         let new_score = if let Some(old_score) = zset.get_score(&member) {
@@ -10420,7 +10536,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(0);
             }
-            let (removed_count, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+            let (removed_count, is_empty) = if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
                         let mut count = 0usize;
@@ -10456,7 +10572,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(Vec::new());
             }
-            let (res, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+            let (res, is_empty) = if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
                         let popped = zset.pop_min(count);
@@ -10487,7 +10603,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(Vec::new());
             }
-            let (res, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+            let (res, is_empty) = if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
                         let popped = zset.pop_max(count);
@@ -10607,7 +10723,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(0);
             }
-            if let Some(entry) = self.table.get_slot_mut(idx) {
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
                         let removed = zset.rem_range_by_rank(start, stop);
@@ -10640,7 +10756,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(0);
             }
-            if let Some(entry) = self.table.get_slot_mut(idx) {
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
                         let removed = zset.rem_range_by_score(min, min_inc, max, max_inc);
@@ -10671,7 +10787,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return Ok(0);
             }
-            if let Some(entry) = self.table.get_slot_mut(idx) {
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
                         let removed = zset.rem_range_by_lex(min, max);
@@ -10876,7 +10992,9 @@ impl RudisTable {
         let h = hash_key(&key);
         if let Some(idx) = self.table.find(&key, h) {
             let was_exp = self.check_expired_slot(idx);
-            if !was_exp && let Some(entry) = self.table.get_slot_mut(idx) {
+            if !was_exp {
+                self.warm_slot(idx);
+                if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::String(b) => {
                         let old_len = b.len();
@@ -10924,6 +11042,7 @@ impl RudisTable {
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
                         );
                     }
+                }
                 }
             }
         }
@@ -11209,7 +11328,7 @@ impl RudisTable {
         let mut current_vec: Vec<u8> = Vec::new();
         if let Some(idx) = self.table.find(&key, h) {
             let was_exp = self.check_expired_slot(idx);
-            if !was_exp && let Some(entry) = self.table.get_slot(idx) {
+            if !was_exp && let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &entry.val {
                     RudisValue::String(b) => {
                         key_exists = true;
@@ -11524,7 +11643,7 @@ impl RudisTable {
         if let Some(idx) = existing
             && !self.check_expired_slot(idx)
         {
-            if let Some(entry) = self.table.get_slot_mut(idx) {
+            if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::String(s) => {
                         crate::hll::hll_validate(s)?;
@@ -11587,7 +11706,7 @@ impl RudisTable {
             let h = hash_key(k);
             if let Some(idx) = self.table.find(k, h)
                 && !self.check_expired_slot(idx)
-                && let Some(entry) = self.table.get_slot_mut(idx)
+                && let Some(entry) = self.get_slot_mut_warm(idx)
             {
                 match &mut entry.val {
                     RudisValue::String(s) => {
@@ -11785,7 +11904,7 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h)
             && !self.check_expired_slot(idx)
-            && let Some(entry) = self.table.get_slot_mut(idx)
+            && let Some(entry) = self.get_slot_mut_warm(idx)
         {
             match &mut entry.val {
                 RudisValue::String(s) => {

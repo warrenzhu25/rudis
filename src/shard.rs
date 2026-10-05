@@ -855,30 +855,36 @@ impl ShardDb {
         self.table.write_get_resp(key, out)
     }
 
-    #[inline]
-    pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
-        if let Some(ptr) = self.table.is_tiered(&key) {
-            if let Some(tm) = &self.tier_manager {
+    #[inline(always)]
+    pub fn drain_dropped_tier(&mut self) {
+        if self.table.dropped_tier.is_empty() {
+            return;
+        }
+        if let Some(tm) = &self.tier_manager {
+            for (ptr, is_cooled) in self.table.dropped_tier.drain(..) {
                 tm.on_key_deleted(ptr);
-                tm.stats
-                    .tiered_keys
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if is_cooled {
+                    tm.stats
+                        .cooled_keys
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    tm.stats
+                        .tiered_keys
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 tm.stats
                     .total_deletes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-        } else if let Some(ptr) = self.table.is_cooled(&key)
-            && let Some(tm) = &self.tier_manager
-        {
-            tm.on_key_deleted(ptr);
-            tm.stats
-                .cooled_keys
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            tm.stats
-                .total_deletes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.table.dropped_tier.clear();
         }
+    }
+
+    #[inline]
+    pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         self.table.set(key, value, expire_in);
+        self.drain_dropped_tier();
     }
 
     #[inline]
@@ -889,78 +895,19 @@ impl ShardDb {
         expire_in: Option<Duration>,
         keepttl: bool,
     ) {
-        if let Some(ptr) = self.table.is_tiered(&key) {
-            if let Some(tm) = &self.tier_manager {
-                tm.on_key_deleted(ptr);
-                tm.stats
-                    .tiered_keys
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                tm.stats
-                    .total_deletes
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        } else if let Some(ptr) = self.table.is_cooled(&key)
-            && let Some(tm) = &self.tier_manager
-        {
-            tm.on_key_deleted(ptr);
-            tm.stats
-                .cooled_keys
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            tm.stats
-                .total_deletes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         self.table.set_extended(key, value, expire_in, keepttl);
+        self.drain_dropped_tier();
     }
 
     #[inline(always)]
     pub fn del(&mut self, key: &[u8]) -> bool {
-        if self.tier_manager.is_none() && self.sticky_keys.is_empty() {
-            if self.table.del(key) {
-                return true;
-            }
-            if !self.vector_indexes.is_empty()
-                && let Ok(s) = std::str::from_utf8(key)
-            {
-                return self
-                    .vector_indexes
-                    .remove(s)
-                    .is_some_and(|idx| !idx.is_empty());
-            }
-            return false;
-        }
-        let ptr = self.table.is_tiered(key);
-        let cooled_ptr = if ptr.is_none() {
-            self.table.is_cooled(key)
-        } else {
-            None
-        };
         let deleted = self.table.del(key);
         if deleted {
             self.sticky_keys.remove(key);
-            if let Some(ptr) = ptr {
-                if let Some(tm) = &self.tier_manager {
-                    tm.on_key_deleted(ptr);
-                    tm.stats
-                        .tiered_keys
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    tm.stats
-                        .total_deletes
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            } else if let Some(ptr) = cooled_ptr
-                && let Some(tm) = &self.tier_manager
-            {
-                tm.on_key_deleted(ptr);
-                tm.stats
-                    .cooled_keys
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                tm.stats
-                    .total_deletes
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+            self.drain_dropped_tier();
             return true;
         }
+        self.drain_dropped_tier();
         if !self.vector_indexes.is_empty()
             && let Ok(s) = std::str::from_utf8(key)
         {
@@ -974,21 +921,22 @@ impl ShardDb {
 
     #[inline(always)]
     pub fn del_with_hash(&mut self, key: &[u8], hash: u64) -> bool {
-        if self.tier_manager.is_none() && self.sticky_keys.is_empty() {
-            if self.table.del_with_hash(key, hash) {
-                return true;
-            }
-            if !self.vector_indexes.is_empty()
-                && let Ok(s) = std::str::from_utf8(key)
-            {
-                return self
-                    .vector_indexes
-                    .remove(s)
-                    .is_some_and(|idx| !idx.is_empty());
-            }
-            return false;
+        let deleted = self.table.del_with_hash(key, hash);
+        if deleted {
+            self.sticky_keys.remove(key);
+            self.drain_dropped_tier();
+            return true;
         }
-        self.del(key)
+        self.drain_dropped_tier();
+        if !self.vector_indexes.is_empty()
+            && let Ok(s) = std::str::from_utf8(key)
+        {
+            return self
+                .vector_indexes
+                .remove(s)
+                .is_some_and(|idx| !idx.is_empty());
+        }
+        false
     }
 
     #[inline]
@@ -1080,17 +1028,23 @@ impl ShardDb {
 
     #[inline(always)]
     pub fn incr_by_slice_fast(&mut self, key: &Bytes, delta: i64) -> Result<i64, &'static str> {
-        self.table.incr_by_slice_fast(key, delta)
+        let res = self.table.incr_by_slice_fast(key, delta);
+        self.drain_dropped_tier();
+        res
     }
 
     #[inline]
     pub fn incr_by_slice(&mut self, key: &[u8], delta: i64) -> Result<i64, &'static str> {
-        self.table.incr_by_slice(key, delta)
+        let res = self.table.incr_by_slice(key, delta);
+        self.drain_dropped_tier();
+        res
     }
 
     #[inline]
     pub fn incr_by(&mut self, key: Bytes, delta: i64) -> Result<i64, String> {
-        self.table.incr_by(key, delta)
+        let res = self.table.incr_by(key, delta);
+        self.drain_dropped_tier();
+        res
     }
 
     #[inline]
@@ -1866,6 +1820,10 @@ impl ShardDb {
     #[inline]
     pub fn flushdb(&mut self) {
         self.table.flushdb();
+        self.table.dropped_tier.clear();
+        if let Some(tm) = &self.tier_manager {
+            tm.reset();
+        }
         self.vector_indexes.clear();
         self.semantic_caches.clear();
         self.agent_memories.clear();
@@ -2068,7 +2026,9 @@ impl ShardDb {
 
     #[inline]
     pub fn active_expire_cycle(&mut self) -> usize {
-        self.table.active_expire_cycle()
+        let n = self.table.active_expire_cycle();
+        self.drain_dropped_tier();
+        n
     }
 
     #[inline]

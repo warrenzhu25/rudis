@@ -884,6 +884,27 @@ impl ShardTierManager {
         self.on_key_deleted(ptr);
     }
 
+    /// Resets the on-disk tier file and memory allocator structures back to
+    /// empty (used on FLUSHDB, FLUSHALL, and master full-sync loads).
+    pub fn reset(&self) {
+        {
+            let mut bins = self.small_bins.borrow_mut();
+            bins.active_bin = None;
+            bins.flushing.clear();
+            bins.page_active_counts.clear();
+            bins.dead_pages.clear();
+        }
+        self.free_pages.borrow_mut().clear();
+        self.free_extents.borrow_mut().clear();
+        self.current_offset.set(0);
+        self.preallocated_len.set(0);
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::ftruncate(self.file.as_raw_fd(), 0);
+        }
+        reset_tier_stats(self.port);
+    }
+
     pub fn read_ptr_sync(&self, ptr: TieredPointer) -> io::Result<(Bytes, Vec<u8>)> {
         if let Ok(sb) = self.small_bins.try_borrow()
             && let Some(data) = sb.bytes_in_memory(ptr)
