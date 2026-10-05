@@ -5961,6 +5961,7 @@ async fn execute_rebalance_plans(
     router: &Router,
     hub: &std::sync::Arc<crate::cluster::ClusterHub>,
     plans: &[crate::cluster::SlotMigrationPlan],
+    pipeline: usize,
 ) -> usize {
     let mut moved = 0;
     for p in plans {
@@ -6006,8 +6007,9 @@ async fn execute_rebalance_plans(
                 }
             }
 
+            let batch_size = pipeline.clamp(1, 1000);
             loop {
-                let keys = router.get_keys_in_slot(p.slot, 100).await;
+                let keys = router.get_keys_in_slot(p.slot, batch_size).await;
                 if keys.is_empty() {
                     break;
                 }
@@ -7781,20 +7783,23 @@ async fn execute_command(
                 }
             }
             crate::shard::SlotState::Stable => {
-                if router.cluster_enabled {
-                    let target_shard = router.target_shard_for_slot(slot);
-                    if target_shard != router.shard_id {
-                        let target_port = router.base_port + target_shard as u16;
-                        out.extend_from_slice(
-                            format!("-MOVED {} 127.0.0.1:{}\r\n", slot, target_port).as_bytes(),
-                        );
-                        return false;
-                    }
-                } else if crate::cluster::has_active_cluster(router.port) {
+                if router.cluster_enabled || crate::cluster::has_active_cluster(router.port) {
                     let hub = crate::cluster::get_cluster_hub(router.port);
                     let my_slots = hub.my_slots.read().unwrap();
                     let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
-                    if !owns_slot {
+                    if owns_slot {
+                        if router.cluster_enabled {
+                            let target_shard = router.target_shard_for_slot(slot);
+                            if target_shard != router.shard_id {
+                                let target_port = router.base_port + target_shard as u16;
+                                out.extend_from_slice(
+                                    format!("-MOVED {} 127.0.0.1:{}\r\n", slot, target_port)
+                                        .as_bytes(),
+                                );
+                                return false;
+                            }
+                        }
+                    } else {
                         let nodes = hub.nodes.read().unwrap();
                         if !nodes.is_empty()
                             && let Some(peer) = nodes.values().find(|n| {
@@ -7808,6 +7813,8 @@ async fn execute_command(
                             );
                             return false;
                         }
+                        out.extend_from_slice(b"-CLUSTERDOWN Hash slot not served\r\n");
+                        return false;
                     }
                 }
             }
@@ -10110,18 +10117,19 @@ async fn execute_command(
                     weights,
                     simulate,
                     threshold,
-                    pipeline: _,
+                    pipeline,
                 } => {
                     let hub = crate::cluster::get_cluster_hub(router.port);
                     let target_hp = match (host, port) {
                         (Some(h), Some(p)) => Some((h, p, slots)),
                         _ => None,
                     };
+                    let pipeline_batch = pipeline;
                     let opts = crate::cluster::RebalanceOptions {
                         weights: weights.into_iter().collect(),
                         simulate,
                         threshold,
-                        pipeline: 16,
+                        pipeline: pipeline_batch,
                         target_host_port: target_hp,
                     };
 
@@ -10150,7 +10158,9 @@ async fn execute_command(
                                     }
                                 }
                             } else {
-                                let moved = execute_rebalance_plans(router, &hub, &plans).await;
+                                let moved =
+                                    execute_rebalance_plans(router, &hub, &plans, pipeline_batch)
+                                        .await;
                                 write_resp_integer(out, moved as i64);
                             }
                         }
@@ -10173,7 +10183,7 @@ async fn execute_command(
                     let hub = crate::cluster::get_cluster_hub(router.port);
                     match hub.compute_reshard_plan(&target_node_id, &source_node_id, slots) {
                         Ok(plans) => {
-                            let moved = execute_rebalance_plans(router, &hub, &plans).await;
+                            let moved = execute_rebalance_plans(router, &hub, &plans, 100).await;
                             write_resp_integer(out, moved as i64);
                         }
                         Err(e) => {
@@ -10211,6 +10221,18 @@ async fn execute_command(
                 },
                 ClusterSubcommand::SaveConfig => {
                     out.extend_from_slice(b"+OK\r\n");
+                }
+                ClusterSubcommand::BumpEpoch => {
+                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let new_epoch = hub.bump_config_epoch();
+                    out.extend_from_slice(format!("+BUMPED {}\r\n", new_epoch).as_bytes());
+                }
+                ClusterSubcommand::SetConfigEpoch(epoch) => {
+                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    match hub.set_config_epoch(epoch) {
+                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
+                    }
                 }
             }
             false

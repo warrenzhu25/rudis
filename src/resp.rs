@@ -59,6 +59,8 @@ pub enum ClusterSubcommand {
     Forget(String),
     Replicate(String),
     SaveConfig,
+    BumpEpoch,
+    SetConfigEpoch(u64),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -4028,6 +4030,22 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     ))))
                 }
                 "SAVECONFIG" => Ok(Some(Command::Cluster(ClusterSubcommand::SaveConfig))),
+                "BUMPEPOCH" => Ok(Some(Command::Cluster(ClusterSubcommand::BumpEpoch))),
+                "SET-CONFIG-EPOCH" | "SETCONFIGEPOCH" => {
+                    if args.len() < 3 {
+                        return Err(
+                            "wrong number of arguments for 'cluster set-config-epoch' command"
+                                .to_string(),
+                        );
+                    }
+                    let epoch: u64 = std::str::from_utf8(&args[2])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                    Ok(Some(Command::Cluster(ClusterSubcommand::SetConfigEpoch(
+                        epoch,
+                    ))))
+                }
                 _ => Ok(Some(Command::Unknown(format!("CLUSTER {}", sub)))),
             }
         }

@@ -183,7 +183,7 @@ impl ClusterHub {
             cport,
             my_id: RwLock::new(my_id),
             current_epoch: AtomicU64::new(1),
-            config_epoch: AtomicU64::new(1),
+            config_epoch: AtomicU64::new(0),
             last_vote_epoch: AtomicU64::new(0),
             election_in_progress: AtomicBool::new(false),
             role: RwLock::new("master".to_string()),
@@ -219,6 +219,38 @@ impl ClusterHub {
         self.config_epoch.store(next, Ordering::SeqCst);
         self.current_epoch.fetch_max(next, Ordering::SeqCst);
         next
+    }
+
+    /// Sets the node configuration epoch if it is currently 0 and no slots are assigned.
+    pub fn set_config_epoch(&self, epoch: u64) -> Result<(), String> {
+        if epoch == 0 {
+            return Err("ERR Invalid config epoch specified".to_string());
+        }
+        let current_cfg = self.config_epoch.load(Ordering::SeqCst);
+        if current_cfg != 0 {
+            return Err(format!(
+                "ERR Node config epoch is already set to {}",
+                current_cfg
+            ));
+        }
+        let slots = self.my_slots.read().unwrap();
+        let has_explicit_slots = !slots.is_empty() && !(slots.len() == 1 && slots[0] == (0, 16383));
+        if has_explicit_slots {
+            return Err(
+                "ERR Node has slots assigned to it. Setting config epoch is not allowed."
+                    .to_string(),
+            );
+        }
+        drop(slots);
+        {
+            let mut my_slots = self.my_slots.write().unwrap();
+            if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
+                my_slots.clear();
+            }
+        }
+        self.config_epoch.store(epoch, Ordering::SeqCst);
+        self.current_epoch.fetch_max(epoch, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Records in the local view that `owner_id` (this node or a known peer)
@@ -1481,10 +1513,10 @@ impl ClusterHub {
             let new_id = generate_node_id(self.port);
             *self.my_id.write().unwrap() = new_id;
             self.current_epoch.store(1, Ordering::SeqCst);
-            self.config_epoch.store(1, Ordering::SeqCst);
+            self.config_epoch.store(0, Ordering::SeqCst);
             *self.role.write().unwrap() = "master".to_string();
             *self.master_id.write().unwrap() = "-".to_string();
-            *self.my_slots.write().unwrap() = vec![(0, 16383)];
+            self.my_slots.write().unwrap().clear();
         }
         Ok(())
     }

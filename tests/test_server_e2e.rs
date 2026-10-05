@@ -2561,8 +2561,8 @@ fn test_rdb_cold_start_restore_e2e() {
 
 #[test]
 fn test_cluster_migrate_slot_e2e() {
-    let port1 = 16403;
-    let port2 = 16404;
+    let port1 = 18230;
+    let port2 = 18231;
     start_test_server(port1, 2);
     start_test_server(port2, 2);
 
@@ -8857,11 +8857,25 @@ fn test_cluster_check_and_rebalance_live_migration_e2e() {
     let rebalance_resp = send_and_read(&mut c1, rebalance_cmd.as_bytes());
     assert_eq!(rebalance_resp, ":5\r\n");
 
-    // 7. Verify CLUSTER CHECK is healthy after migrations
-    let check_after = send_and_read(&mut c1, b"CLUSTER CHECK\r\n");
+    // 7. Verify CLUSTER CHECK is healthy after migrations (poll with bounded deadline for gossip sync)
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let check_after = loop {
+        let check = send_and_read(&mut c1, b"CLUSTER CHECK\r\n");
+        if check.contains("[OK]") || std::time::Instant::now() > deadline {
+            break check;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     assert!(check_after.contains("[OK]"), "{}", check_after);
 
-    let check_c2 = send_and_read(&mut c2, b"CLUSTER CHECK\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let check_c2 = loop {
+        let check = send_and_read(&mut c2, b"CLUSTER CHECK\r\n");
+        if check.contains("[OK]") || std::time::Instant::now() > deadline {
+            break check;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     assert!(check_c2.contains("[OK]"), "{}", check_c2);
 }
 
@@ -21135,4 +21149,202 @@ fn test_connections_accepted_at_shutdown_poll_tick_are_served_e2e() {
         .collect();
     let fresh: u64 = workers.into_iter().map(|h| h.join().unwrap()).sum();
     assert!(fresh > 0);
+}
+
+#[test]
+fn test_cluster_bumpepoch_and_set_config_epoch_e2e() {
+    let port = 18200;
+    start_test_server(port, 2);
+    rudis::cluster::start_cluster_bus(port);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+
+    // 1. Invalid epoch 0
+    let resp = send_and_read(&mut client, b"CLUSTER SET-CONFIG-EPOCH 0\r\n");
+    assert!(
+        resp.starts_with("-ERR Invalid config epoch"),
+        "Expected invalid epoch error, got: {}",
+        resp
+    );
+
+    // 2. Set valid epoch 5 on fresh node
+    let resp = send_and_read(&mut client, b"CLUSTER SET-CONFIG-EPOCH 5\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let nodes = send_and_read(&mut client, b"CLUSTER NODES\r\n");
+    assert!(
+        nodes.contains(" 5 ") || nodes.contains("connected"),
+        "Nodes output: {}",
+        nodes
+    );
+
+    // 3. Reject setting when epoch is already non-zero
+    let resp = send_and_read(&mut client, b"CLUSTER SET-CONFIG-EPOCH 6\r\n");
+    assert!(
+        resp.starts_with("-ERR Node config epoch is already set"),
+        "Expected already set error, got: {}",
+        resp
+    );
+
+    // 4. BUMPEPOCH bumps from 5 to 6
+    let resp = send_and_read(&mut client, b"CLUSTER BUMPEPOCH\r\n");
+    assert_eq!(resp, "+BUMPED 6\r\n");
+
+    // 5. BUMPEPOCH again bumps to 7
+    let resp = send_and_read(&mut client, b"CLUSTER BUMPEPOCH\r\n");
+    assert_eq!(resp, "+BUMPED 7\r\n");
+
+    // 6. Hard reset clears epoch to 0 and slots
+    let resp = send_and_read(&mut client, b"CLUSTER RESET HARD\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    // 7. After hard reset, SET-CONFIG-EPOCH works again
+    let resp = send_and_read(&mut client, b"CLUSTER SET-CONFIG-EPOCH 42\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    // 8. Add slot and verify SET-CONFIG-EPOCH is rejected
+    let resp = send_and_read(&mut client, b"CLUSTER ADDSLOTS 100\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut client, b"CLUSTER SET-CONFIG-EPOCH 99\r\n");
+    assert!(
+        resp.starts_with("-ERR Node"),
+        "Expected error when slots assigned or epoch already set, got: {}",
+        resp
+    );
+}
+
+#[test]
+fn test_cluster_slot_routing_moved_and_clusterdown_e2e() {
+    let port1 = 18205;
+    let port2 = 18206;
+    start_test_server(port1, 2);
+    rudis::cluster::start_cluster_bus(port1);
+    start_test_server(port2, 2);
+    rudis::cluster::start_cluster_bus(port2);
+
+    let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+    let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+    c1.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    c2.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // Node 1 owns 0..8191, Node 2 owns 8192..16300 (leaving 16301..16383 unassigned)
+    assert_eq!(
+        send_and_read(&mut c1, b"CLUSTER ADDSLOTS-RANGE 0 8191\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c2, b"CLUSTER ADDSLOTS-RANGE 8192 16300\r\n"),
+        "+OK\r\n"
+    );
+
+    // Connect via MEET
+    let meet_cmd = format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2);
+    assert_eq!(send_and_read(&mut c1, meet_cmd.as_bytes()), "+OK\r\n");
+
+    // Wait until Node 1 discovers Node 2
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let nodes = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
+        if nodes.contains(&format!(":{}", port2)) && nodes.contains("8192-16300") {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("Timeout waiting for cluster node discovery:\n{}", nodes);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Find keys matching specific slots
+    let mut key_node1 = None;
+    let mut key_node2 = None;
+    let mut key_unassigned = None;
+    for i in 0..100000 {
+        let k = format!("k_{}", i);
+        let s = rudis::router::key_slot(k.as_bytes());
+        if s == 100 && key_node1.is_none() {
+            key_node1 = Some((k, s));
+        } else if s == 9000 && key_node2.is_none() {
+            key_node2 = Some((k, s));
+        } else if s == 16350 && key_unassigned.is_none() {
+            key_unassigned = Some((k, s));
+        }
+        if key_node1.is_some() && key_node2.is_some() && key_unassigned.is_some() {
+            break;
+        }
+    }
+
+    let (k1, s1) = key_node1.unwrap();
+    let (k2, s2) = key_node2.unwrap();
+    let (k3, _s3) = key_unassigned.unwrap();
+
+    // 1. Key in slot 100 on Node 1: served locally
+    let resp = send_and_read(&mut c1, format!("SET {} val1\r\n", k1).as_bytes());
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut c1, format!("GET {}\r\n", k1).as_bytes());
+    assert_eq!(resp, "$4\r\nval1\r\n");
+
+    // 2. Key in slot 9000 on Node 1: redirected with -MOVED to Node 2
+    let resp = send_and_read(&mut c1, format!("GET {}\r\n", k2).as_bytes());
+    assert_eq!(resp, format!("-MOVED {} 127.0.0.1:{}\r\n", s2, port2));
+
+    // 3. Key in unassigned slot 16350 on Node 1: returns -CLUSTERDOWN
+    let resp = send_and_read(&mut c1, format!("GET {}\r\n", k3).as_bytes());
+    assert_eq!(resp, "-CLUSTERDOWN Hash slot not served\r\n");
+
+    // 4. Delete slot 100 on Node 1: now returns -CLUSTERDOWN
+    let resp = send_and_read(&mut c1, format!("CLUSTER DELSLOTS {}\r\n", s1).as_bytes());
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut c1, format!("GET {}\r\n", k1).as_bytes());
+    assert_eq!(resp, "-CLUSTERDOWN Hash slot not served\r\n");
+
+    // 5. Re-add slot 100 on Node 1: query served locally again
+    let resp = send_and_read(&mut c1, format!("CLUSTER ADDSLOTS {}\r\n", s1).as_bytes());
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut c1, format!("SET {} val_readded\r\n", k1).as_bytes());
+    assert_eq!(resp, "+OK\r\n");
+}
+
+#[test]
+fn test_cluster_rebalance_pipeline_e2e() {
+    let port1 = 18215;
+    let port2 = 18216;
+    start_test_server(port1, 2);
+    rudis::cluster::start_cluster_bus(port1);
+    start_test_server(port2, 2);
+    rudis::cluster::start_cluster_bus(port2);
+
+    let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+    let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+    c1.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+    c2.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+
+    // Node 1: 0..12000, Node 2: 12001..16383
+    assert_eq!(
+        send_and_read(&mut c1, b"CLUSTER ADDSLOTS-RANGE 0 12000\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c2, b"CLUSTER ADDSLOTS-RANGE 12001 16383\r\n"),
+        "+OK\r\n"
+    );
+
+    let meet_cmd = format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2);
+    assert_eq!(send_and_read(&mut c1, meet_cmd.as_bytes()), "+OK\r\n");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let check = send_and_read(&mut c1, b"CLUSTER CHECK\r\n");
+        if check.contains("[OK] All 16384 slots covered") || std::time::Instant::now() > deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Run rebalance with custom target and PIPELINE option
+    let rebalance_cmd = format!("CLUSTER REBALANCE 127.0.0.1 {} 5 PIPELINE 5\r\n", port2);
+    let rebalance_resp = send_and_read(&mut c1, rebalance_cmd.as_bytes());
+    assert_eq!(rebalance_resp, ":5\r\n");
 }

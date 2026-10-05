@@ -3877,6 +3877,7 @@ impl Router {
         if res.is_ok() {
             for &s in slots {
                 self.set_slot_state(s, crate::shard::SlotState::Stable);
+                self.set_slot_owner(s, slot_to_shard(s, self.num_shards));
             }
         }
         res
@@ -3892,6 +3893,7 @@ impl Router {
             for &(start, end) in ranges {
                 for s in start..=end {
                     self.set_slot_state(s, crate::shard::SlotState::Stable);
+                    self.set_slot_owner(s, slot_to_shard(s, self.num_shards));
                 }
             }
         }
