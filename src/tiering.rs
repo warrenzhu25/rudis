@@ -1,11 +1,11 @@
 use bytes::Bytes;
+use parking_lot::RwLock;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::table::TieredPointer;
@@ -43,7 +43,18 @@ pub struct TieringStats {
     pub gc_cycles: AtomicU64,
     pub offload_threshold_pct: AtomicU64, // e.g. 60 (trigger background offload when memory >= 60% maxmemory)
     pub upload_threshold_pct: AtomicU64, // e.g. 80 (stream cold reads without promotion when memory >= 80% maxmemory)
+    /// `used_memory` of each shard, published by the shard itself after
+    /// write batches and on its cron tick, so any shard can compare the total
+    /// against `maxmemory` without messaging the others. One cache line per
+    /// shard so publishing doesn't contend.
+    pub shard_used: Box<[crate::mailbox::CachePadded<AtomicU64>]>,
+    /// Number of shards publishing into `shard_used`.
+    pub num_shards: AtomicUsize,
 }
+
+/// Shards beyond this share the last `shard_used` slot (sums stay correct
+/// only up to this many shards; far above any realistic core count).
+pub const MAX_PUBLISHED_SHARDS: usize = 1024;
 
 impl Default for TieringStats {
     fn default() -> Self {
@@ -69,11 +80,47 @@ impl Default for TieringStats {
             gc_cycles: AtomicU64::new(0),
             offload_threshold_pct: AtomicU64::new(60),
             upload_threshold_pct: AtomicU64::new(80),
+            shard_used: (0..MAX_PUBLISHED_SHARDS)
+                .map(|_| crate::mailbox::CachePadded(AtomicU64::new(0)))
+                .collect(),
+            num_shards: AtomicUsize::new(1),
         }
     }
 }
 
 impl TieringStats {
+    /// Publishes `shard`'s current `used_memory`. Only writes the cache line
+    /// when the value changed.
+    #[inline]
+    pub fn publish_shard_used(&self, shard: usize, used: usize) {
+        let slot = &self.shard_used[shard.min(MAX_PUBLISHED_SHARDS - 1)];
+        if slot.load(Ordering::Relaxed) != used as u64 {
+            slot.store(used as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// The `used_memory` shard `shard` last published.
+    #[inline]
+    pub fn published_shard_used(&self, shard: usize) -> usize {
+        self.shard_used[shard.min(MAX_PUBLISHED_SHARDS - 1)].load(Ordering::Relaxed) as usize
+    }
+
+    /// Sum of the published per-shard `used_memory`, optionally skipping one
+    /// shard (whose fresh value the caller adds itself).
+    #[inline]
+    pub fn published_used_total(&self, skip: Option<usize>) -> usize {
+        let n = self
+            .num_shards
+            .load(Ordering::Relaxed)
+            .clamp(1, MAX_PUBLISHED_SHARDS);
+        self.shard_used[..n]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != skip)
+            .map(|(_, v)| v.load(Ordering::Relaxed) as usize)
+            .sum()
+    }
+
     pub fn reset_counters(&self) {
         self.tiered_keys.store(0, Ordering::Relaxed);
         self.tiered_bytes.store(0, Ordering::Relaxed);
@@ -96,44 +143,56 @@ impl TieringStats {
     }
 }
 
+/// Bumped whenever `maxmemory`, `maxmemory-policy` or the dataset is reset
+/// (FLUSHALL/FLUSHDB), so back-offs computed under the old state (e.g.
+/// "nothing evictable") are not reused.
+pub static MAXMEMORY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub fn bump_maxmemory_epoch() {
+    MAXMEMORY_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn maxmemory_epoch() -> u64 {
+    MAXMEMORY_EPOCH.load(Ordering::Relaxed)
+}
+
 #[inline]
 pub fn set_max_memory(port: u16, bytes: u64) {
-    get_tier_stats(port)
-        .max_memory
-        .store(bytes, Ordering::Relaxed);
+    with_tier_stats(port, |s| s.max_memory.store(bytes, Ordering::Relaxed));
+    bump_maxmemory_epoch();
 }
 
 #[inline]
 pub fn get_max_memory(port: u16) -> u64 {
-    get_tier_stats(port).max_memory.load(Ordering::Relaxed)
+    with_tier_stats(port, |s| s.max_memory.load(Ordering::Relaxed))
 }
 
 #[inline]
 pub fn set_offload_threshold_pct(port: u16, pct: u64) {
-    get_tier_stats(port)
-        .offload_threshold_pct
-        .store(pct.min(100), Ordering::Relaxed);
+    with_tier_stats(port, |s| {
+        s.offload_threshold_pct
+            .store(pct.min(100), Ordering::Relaxed)
+    });
 }
 
 #[inline]
 pub fn get_offload_threshold_pct(port: u16) -> u64 {
-    get_tier_stats(port)
-        .offload_threshold_pct
-        .load(Ordering::Relaxed)
+    with_tier_stats(port, |s| s.offload_threshold_pct.load(Ordering::Relaxed))
 }
 
 #[inline]
 pub fn set_upload_threshold_pct(port: u16, pct: u64) {
-    get_tier_stats(port)
-        .upload_threshold_pct
-        .store(pct.min(100), Ordering::Relaxed);
+    with_tier_stats(port, |s| {
+        s.upload_threshold_pct
+            .store(pct.min(100), Ordering::Relaxed)
+    });
 }
 
 #[inline]
 pub fn get_upload_threshold_pct(port: u16) -> u64 {
-    get_tier_stats(port)
-        .upload_threshold_pct
-        .load(Ordering::Relaxed)
+    with_tier_stats(port, |s| s.upload_threshold_pct.load(Ordering::Relaxed))
 }
 
 pub fn format_bytes_human(bytes: u64) -> String {
@@ -176,14 +235,46 @@ pub fn parse_memory_bytes(s: &str) -> Option<u64> {
 
 static TIER_STATS: RwLock<Option<HashMap<u16, Arc<TieringStats>>>> = RwLock::new(None);
 
+thread_local! {
+    /// Per-thread copy of `TIER_STATS` entries. A port's `Arc` is never
+    /// replaced (see [`reset_tier_stats`]), so a cached entry stays valid.
+    /// Saves every shard a read lock (an atomic RMW on one cache line shared
+    /// by all shards) and an `Arc` clone per access on the command path.
+    static TIER_STATS_TLS: std::cell::RefCell<Vec<(u16, Arc<TieringStats>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` on the port's stats without taking the global lock (after the
+/// first access on this thread) and without cloning the `Arc`.
+#[inline]
+pub fn with_tier_stats<R>(port: u16, f: impl FnOnce(&TieringStats) -> R) -> R {
+    TIER_STATS_TLS.with(|cache| {
+        if let Some((_, s)) = cache.borrow().iter().find(|(p, _)| *p == port) {
+            return f(s);
+        }
+        let stats = get_tier_stats_locked(port);
+        let r = f(&stats);
+        cache.borrow_mut().push((port, stats));
+        r
+    })
+}
+
 pub fn get_tier_stats(port: u16) -> Arc<TieringStats> {
-    if let Ok(guard) = TIER_STATS.read()
-        && let Some(map) = guard.as_ref()
-        && let Some(stats) = map.get(&port)
-    {
+    TIER_STATS_TLS.with(|cache| {
+        if let Some((_, s)) = cache.borrow().iter().find(|(p, _)| *p == port) {
+            return s.clone();
+        }
+        let stats = get_tier_stats_locked(port);
+        cache.borrow_mut().push((port, stats.clone()));
+        stats
+    })
+}
+
+fn get_tier_stats_locked(port: u16) -> Arc<TieringStats> {
+    if let Some(stats) = TIER_STATS.read().as_ref().and_then(|m| m.get(&port)) {
         return stats.clone();
     }
-    let mut map = TIER_STATS.write().unwrap();
+    let mut map = TIER_STATS.write();
     let entry = map.get_or_insert_with(HashMap::new);
     entry
         .entry(port)
@@ -198,10 +289,7 @@ pub fn get_tier_stats(port: u16) -> Arc<TieringStats> {
 /// in-place rather than replacing or removing the map entry, ensuring that active `Router`
 /// instances observe the reset and do not keep an orphaned, un-resettable reference.
 pub fn reset_tier_stats(port: u16) {
-    if let Ok(guard) = TIER_STATS.read()
-        && let Some(map) = guard.as_ref()
-        && let Some(stats) = map.get(&port)
-    {
+    if let Some(stats) = TIER_STATS.read().as_ref().and_then(|m| m.get(&port)) {
         stats.reset_counters();
     }
 }
@@ -467,11 +555,13 @@ pub struct ShardTierManager {
 /// run left is garbage and would otherwise be kept (and appended after)
 /// forever. The lock keeps a second server configured with the same file
 /// from truncating or overwriting the first one's live data.
-fn claim_tier_file(file: &monoio::fs::File, path: &Path) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let err = io::Error::last_os_error();
+fn claim_tier_file(file: &std::fs::File, path: &Path) -> io::Result<()> {
+    // `try_lock` is an exclusive, non-blocking `flock` on Linux.
+    if let Err(e) = file.try_lock() {
+        let err = match e {
+            std::fs::TryLockError::Error(err) => err,
+            std::fs::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
+        };
         return Err(io::Error::new(
             err.kind(),
             format!(
@@ -481,10 +571,7 @@ fn claim_tier_file(file: &monoio::fs::File, path: &Path) -> io::Result<()> {
             ),
         ));
     }
-    if unsafe { libc::ftruncate(fd, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    file.set_len(0)
 }
 
 impl ShardTierManager {
@@ -496,25 +583,26 @@ impl ShardTierManager {
         let direct_io_enabled = std::env::var("RUDIS_DIRECT_IO")
             .map(|v| v != "0")
             .unwrap_or(false);
-        let (file, is_direct) = if direct_io_enabled {
-            let mut opts = monoio::fs::OpenOptions::new();
-            opts.read(true).write(true).create(true);
-            opts.custom_flags(libc::O_DIRECT);
-            match opts.open(&path).await {
+        // Opened with std (a one-off at startup) so the file can be locked
+        // and truncated through std's safe API, then handed to monoio.
+        let open_std = |direct: bool| {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true).write(true).create(true).truncate(false);
+            if direct {
+                opts.custom_flags(libc::O_DIRECT);
+            }
+            opts.open(&path)
+        };
+        let (std_file, is_direct) = if direct_io_enabled {
+            match open_std(true) {
                 Ok(f) => (f, true),
-                Err(_) => {
-                    let mut fallback = monoio::fs::OpenOptions::new();
-                    fallback.read(true).write(true).create(true);
-                    (fallback.open(&path).await?, false)
-                }
+                Err(_) => (open_std(false)?, false),
             }
         } else {
-            let mut opts = monoio::fs::OpenOptions::new();
-            opts.read(true).write(true).create(true);
-            (opts.open(&path).await?, false)
+            (open_std(false)?, false)
         };
-
-        claim_tier_file(&file, &path)?;
+        claim_tier_file(&std_file, &path)?;
+        let file = monoio::fs::File::from_std(std_file)?;
         let stats = get_tier_stats(port);
         Ok(Self {
             shard_id,
@@ -542,6 +630,8 @@ impl ShardTierManager {
     ) -> bool {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
+        // SAFETY: fallocate(2) takes no pointers; `fd` belongs to `file`, which is
+        // borrowed for the call and therefore open.
         let ret = unsafe {
             libc::fallocate(
                 fd,
@@ -584,41 +674,24 @@ impl ShardTierManager {
         use std::fs::OpenOptions;
         use std::os::unix::io::AsRawFd;
 
-        let src_file = OpenOptions::new().read(true).open(src_path)?;
-        let dst_file = OpenOptions::new()
+        let mut src_file = OpenOptions::new().read(true).open(src_path)?;
+        let mut dst_file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(dst_path)?;
 
         const FICLONE: libc::c_ulong = 0x40049409;
+        // SAFETY: FICLONE takes the source fd as its argument and only reads
+        // the two fds, both owned by live `File`s for the whole call. There is
+        // no std wrapper for reflink.
         let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
         if ret == 0 {
             Ok(true) // Instantaneous CoW reflink succeeded!
         } else {
-            let src_fd = src_file.as_raw_fd();
-            let dst_fd = dst_file.as_raw_fd();
-            let len = src_file.metadata()?.len();
-            let mut copied = 0u64;
-            while copied < len {
-                let chunk = (len - copied).min(1024 * 1024 * 16) as libc::size_t;
-                let ret = unsafe {
-                    libc::copy_file_range(
-                        src_fd,
-                        std::ptr::null_mut(),
-                        dst_fd,
-                        std::ptr::null_mut(),
-                        chunk,
-                        0,
-                    )
-                };
-                if ret > 0 {
-                    copied += ret as u64;
-                } else {
-                    std::fs::copy(src_path, dst_path)?;
-                    return Ok(false);
-                }
-            }
+            // std's file-to-file copy uses copy_file_range (then sendfile,
+            // then read/write) on Linux.
+            std::io::copy(&mut src_file, &mut dst_file)?;
             Ok(false)
         }
     }
@@ -661,6 +734,8 @@ impl ShardTierManager {
             let fd = self.file.as_raw_fd();
             // Only the new range: allocating from 0 would fill every hole
             // that GC punched below the old end.
+            // SAFETY: fallocate(2)/ftruncate(2) take no pointers; `fd` belongs to
+            // `self.file`, which outlives this call.
             unsafe {
                 if libc::fallocate(
                     fd,
@@ -887,6 +962,7 @@ impl ShardTierManager {
     /// Resets the on-disk tier file and memory allocator structures back to
     /// empty (used on FLUSHDB, FLUSHALL, and master full-sync loads).
     pub fn reset(&self) {
+        bump_maxmemory_epoch();
         {
             let mut bins = self.small_bins.borrow_mut();
             bins.active_bin = None;
@@ -899,6 +975,7 @@ impl ShardTierManager {
         self.current_offset.set(0);
         self.preallocated_len.set(0);
         use std::os::unix::io::AsRawFd;
+        // SAFETY: ftruncate(2) takes no pointers; `self.file` keeps the fd open.
         unsafe {
             libc::ftruncate(self.file.as_raw_fd(), 0);
         }
@@ -1177,6 +1254,9 @@ mod tests {
             assert_eq!(first.read_ptr_sync(ptr).unwrap().1, b"live");
 
             drop(first);
+            // io_uring closes the dropped fd as an async op; let the ring run
+            // so the flock is released before reopening.
+            monoio::time::sleep(std::time::Duration::from_millis(5)).await;
             let again = ShardTierManager::open(0, 55559, &dir).await.unwrap();
             assert_eq!(again.current_offset.get(), 0);
         });

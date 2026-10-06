@@ -1,3 +1,6 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use clap::Parser;
 use std::thread;
 
@@ -88,21 +91,8 @@ struct Args {
 }
 
 fn get_process_affinity_cores() -> Vec<usize> {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
-            let mut cores = Vec::new();
-            for i in 0..libc::CPU_SETSIZE as usize {
-                if libc::CPU_ISSET(i, &set) {
-                    cores.push(i);
-                }
-            }
-            if !cores.is_empty() {
-                return cores;
-            }
-        }
-    }
+    // On Linux this is `sched_getaffinity` on the calling (main) thread, i.e.
+    // the cores the process may run on (honours taskset/cgroup cpusets).
     core_affinity::get_core_ids()
         .unwrap_or_default()
         .into_iter()
@@ -112,6 +102,8 @@ fn get_process_affinity_cores() -> Vec<usize> {
 
 fn main() {
     #[cfg(target_os = "linux")]
+    // SAFETY: prctl(PR_SET_THP_DISABLE, ...) takes only integer arguments and
+    // touches none of our memory; it runs before any other thread is spawned.
     unsafe {
         // Disable Linux Transparent Huge Pages (THP) for this process and all its worker threads.
         // Prevents the kernel from promoting allocations to 2MB physical pages and eliminates 512x COW amplification.
@@ -192,7 +184,6 @@ fn main() {
     if let Some(ref pass) = server_config.requirepass {
         rudis::acl::get_acl_for_port(port)
             .write()
-            .unwrap()
             .set_requirepass(pass);
     }
 
@@ -230,7 +221,11 @@ fn main() {
     }
     let listen_addrs = rudis::netsec::bind_addrs(port);
     for p in listen_ports {
-        if let Err(e) = rudis::netsec::ensure_port_free(&listen_addrs, p) {
+        if let Err(e) = rudis::netsec::ensure_port_free_with_grace(
+            &listen_addrs,
+            p,
+            std::time::Duration::from_secs(3),
+        ) {
             eprintln!("{}", e);
             eprintln!("Failed listening on port {} (tcp), aborting.", p);
             std::process::exit(1);
@@ -267,6 +262,11 @@ fn main() {
             std::process::exit(1);
         })
     });
+    // Redis default `jemalloc-bg-thread yes`: without the background thread,
+    // jemalloc only returns freed pages to the OS on later allocator activity,
+    // so an idle server keeps its peak RSS after DEL/FLUSHALL. A config
+    // directive below can still turn it off.
+    rudis::allocator::set_background_thread(true);
     let mut ignored_directives: Vec<&str> = Vec::new();
     for (name, value) in &server_config.extra_directives {
         if (name == "replicaof" || name == "slaveof")
@@ -297,7 +297,6 @@ fn main() {
     for (user, rules) in &server_config.users {
         if let Err(e) = rudis::acl::get_acl_for_port(port)
             .write()
-            .unwrap()
             .set_user(user, rules)
         {
             eprintln!("FATAL CONFIG: error in user declaration '{}': {}", user, e);

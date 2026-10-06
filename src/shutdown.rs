@@ -20,6 +20,9 @@ pub fn reset_shutdown() {
 
 /// Installs OS signal handlers (SIGINT, SIGTERM) to trigger graceful server shutdown.
 pub fn install_signal_handlers() {
+    // SAFETY: signal(2) with SIG_IGN or an `extern "C" fn(c_int)` handler is
+    // valid, and `handle_signal` only stores to an AtomicBool, which is
+    // async-signal-safe.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         libc::signal(
@@ -76,14 +79,14 @@ pub fn all_shards_drained(num_shards: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     use std::thread;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_shutdown_flag_state_transitions() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock();
         reset_shutdown();
         assert!(!is_shutting_down());
 
@@ -96,7 +99,7 @@ mod tests {
 
     #[test]
     fn test_signal_is_pending_until_taken_and_does_not_stop_by_itself() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock();
         reset_shutdown();
         signal_shutdown();
         // The save step decides; the signal alone must not stop the server.
@@ -107,7 +110,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_concurrent_observation() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock();
         reset_shutdown();
         let handle = thread::spawn(|| {
             while !is_shutting_down() {
@@ -124,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_drain_barrier_waits_for_every_shard_and_resets() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock();
         reset_shutdown();
         assert!(!all_shards_drained(3));
         let shards: Vec<_> = (0..2).map(|_| thread::spawn(mark_shard_drained)).collect();

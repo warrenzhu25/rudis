@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use flume::Sender;
+use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListPopType {
@@ -121,7 +122,7 @@ pub fn has_blocked_waiters(_port: u16) -> bool {
 }
 
 pub fn get_block_hub_for_port(port: u16) -> Arc<Mutex<BlockHub>> {
-    let mut map = PORT_BLOCK_HUBS.lock().unwrap();
+    let mut map = PORT_BLOCK_HUBS.lock();
     map.entry(port)
         .or_insert_with(|| Arc::new(Mutex::new(BlockHub::new(port))))
         .clone()

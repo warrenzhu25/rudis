@@ -1,7 +1,7 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -142,7 +142,6 @@ pub fn bind_metrics_listener(port: u16, addr: SocketAddr) -> std::io::Result<Soc
     let local = listener.local_addr()?;
     METRICS_LISTENERS
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
         .insert(port, listener);
     Ok(local)
@@ -150,11 +149,7 @@ pub fn bind_metrics_listener(port: u16, addr: SocketAddr) -> std::io::Result<Soc
 
 /// Takes the listener bound by [`bind_metrics_listener`], if any.
 pub fn take_metrics_listener(port: u16) -> Option<std::net::TcpListener> {
-    METRICS_LISTENERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_mut()?
-        .remove(&port)
+    METRICS_LISTENERS.lock().as_mut()?.remove(&port)
 }
 
 /// The HTTP response for a request head: the metrics for `GET /metrics`,

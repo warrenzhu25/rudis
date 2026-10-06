@@ -11,7 +11,7 @@
 //! baseline instead of zeroing the slots, which would race with their
 //! owners.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -56,7 +56,7 @@ fn register_slot() -> &'static Slot {
     let slot: &'static Slot = Box::leak(Box::new(Slot {
         counters: [const { AtomicU64::new(0) }; NUM_STATS],
     }));
-    SLOTS.lock().unwrap_or_else(|e| e.into_inner()).push(slot);
+    SLOTS.lock().push(slot);
     slot
 }
 
@@ -86,7 +86,6 @@ pub fn note_key_lookup(found: bool) {
 fn raw_total(stat: Stat) -> u64 {
     SLOTS
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .map(|s| s.counters[stat as usize].load(Ordering::Relaxed))
         .fold(0u64, u64::wrapping_add)
@@ -116,7 +115,7 @@ pub fn reset() {
     for stat in ALL {
         BASELINE[stat as usize].store(raw_total(stat), Ordering::Relaxed);
     }
-    let mut s = SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = SAMPLER.lock();
     *s = Sampler::new();
 }
 
@@ -154,7 +153,7 @@ static SAMPLER: Mutex<Sampler> = Mutex::new(Sampler::new());
 pub fn sample() {
     let now = Instant::now();
     let values = RATED.map(raw_total);
-    let mut s = SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = SAMPLER.lock();
     if let Some(last) = s.last_time {
         let ms = now.duration_since(last).as_millis();
         if ms < SAMPLE_PERIOD_MS {
@@ -174,7 +173,7 @@ pub fn sample() {
 /// Average per-second rates over the last samples:
 /// (ops/sec, input bytes/sec, output bytes/sec).
 pub fn instantaneous() -> (u64, u64, u64) {
-    let s = SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+    let s = SAMPLER.lock();
     let avg = |i: usize| s.rates[i].iter().sum::<u64>() / SAMPLES as u64;
     (avg(0), avg(1), avg(2))
 }

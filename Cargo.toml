@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+parking_lot = "0.12"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
 core_affinity = "0.8.3"
@@ -12,7 +13,6 @@ flume = "0.12.0"
 hashbrown = "0.17.1"
 fxhash = "0.2.1"
 smallvec = "1.14"
-mimalloc = { version = "0.1.52", default-features = false }
 monoio = { version = "0.2.4", features = ["sync", "zero-copy"] }
 socket2 = { version = "0.6.5", features = ["all"] }
 mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
@@ -35,5 +35,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 debug = 1
 opt-level = 3
 lto = "thin"
+
+# Maximum optimization for shipped binaries: `cargo build --profile dist`.
+# Fat LTO with one codegen unit measured +1-4% throughput (within noise) for
+# ~3x the build time, so day-to-day release builds and tests keep thin LTO.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 

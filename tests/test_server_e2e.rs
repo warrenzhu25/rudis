@@ -3039,7 +3039,7 @@ fn test_valkey_missing_features_e2e() {
     // one from the push.
     {
         let other_hub = rudis::block::get_block_hub_for_port(port + 1);
-        let mut other_hub = other_hub.lock().unwrap();
+        let mut other_hub = other_hub.lock();
         let (tx, _rx) = flume::unbounded();
         other_hub.register_blocked_client(1, tx);
         other_hub.unregister_blocked_client(1);
@@ -4540,10 +4540,13 @@ fn test_zero_copy_network_engine_e2e() {
     let _ = ZeroCopyEngine::enable_so_zerocopy(fd1);
 
     let test_msg = b"+PONG_ZEROCOPY\r\n";
-    let sent = engine.send_zc(fd1, test_msg).expect("zero-copy send");
+    // SAFETY: below PAGE_SIZE, so the kernel copies the payload.
+    let sent = unsafe { engine.send_zc(fd1, test_msg) }.expect("zero-copy send");
     assert_eq!(sent, test_msg.len());
 
     let mut recv_buf = [0u8; 32];
+    // SAFETY: `recv_buf` is a local 32-byte array and the length passed
+    // matches; `fd2` is owned by `s2`, which is alive.
     let n = unsafe {
         libc::recv(
             fd2,
@@ -11375,7 +11378,7 @@ fn test_config_rewrite_and_dynamic_configuration_e2e() {
 
     // Pre-create initial config file
     std::fs::write(&cfg_path, "# Initial config\nmaxclients 1000\n").unwrap();
-    *rudis::config::ACTIVE_CONFIG_FILE.write().unwrap() = Some(cfg_path.clone());
+    *rudis::config::ACTIVE_CONFIG_FILE.write() = Some(cfg_path.clone());
 
     start_test_server(port, 2);
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -14824,7 +14827,7 @@ fn test_script_redis_call_enforces_caller_acl_e2e() {
 fn run_rudis_until_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
     let mut child = rudis_bin()
         .args(args)
-        .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -14910,13 +14913,26 @@ fn test_startup_refuses_unloadable_rdb_and_aof_e2e() {
 fn spawn_rudis_listening(args: &[&str], port: u16) -> std::process::Child {
     let mut child = rudis_bin()
         .args(args)
-        .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn rudis");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    // A bare connect is not enough: right after a previous instance on the
+    // same port was SIGKILLed, the kernel may still hold its io_uring
+    // listener, which completes handshakes but never answers. Any reply
+    // (`+PONG`, `-NOAUTH`, `-LOADING`, ...) comes from a live server.
+    let ready = || -> bool {
+        let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+            return false;
+        };
+        let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+        let mut buf = [0u8; 64];
+        s.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok()
+            && matches!(s.read(&mut buf), Ok(n) if n > 0 && matches!(buf[0], b'+' | b'-'))
+    };
+    while !ready() {
         if let Some(s) = child.try_wait().unwrap() {
             panic!("rudis exited early: {s}");
         }
@@ -15202,6 +15218,8 @@ fn test_sigterm_and_shutdown_save_when_save_points_configured_e2e() {
         conf.to_str().unwrap(),
     ];
     let rdb = dir.join("dump.rdb");
+    // SAFETY: (for the closure's unsafe block) kill(2) takes no pointers; the pid
+    // is our own child, not yet reaped, so it cannot have been reused.
     let sigterm = |child: &std::process::Child| unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
     };
@@ -15281,6 +15299,8 @@ fn test_shutdown_without_save_points_writes_no_rdb_e2e() {
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     assert_eq!(resp_cmd(&mut c, &["SET", "a", "1"]), "+OK\r\n");
     drop(c);
+    // SAFETY: kill(2) takes no pointers; the pid is our own child, not yet reaped
+    // (`wait_exit` below), so it cannot have been reused.
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
     }
@@ -18103,7 +18123,7 @@ fn test_config_file_directives_are_applied_or_rejected_e2e() {
         std::fs::write(&conf, bad).unwrap();
         let status = rudis_bin()
             .args(args)
-            .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+            .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -19014,7 +19034,7 @@ fn test_metrics_port_serves_prometheus_over_http_e2e() {
 fn rudis_startup_error(args: &[&str]) -> String {
     let mut child = rudis_bin()
         .args(args)
-        .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -19143,6 +19163,8 @@ fn test_sigterm_drains_clients_and_keeps_every_acked_write_e2e() {
         .unwrap();
     thread::sleep(Duration::from_millis(100));
     let started = std::time::Instant::now();
+    // SAFETY: kill(2) takes no pointers; the pid is our own child, not yet
+    // reaped, so it cannot have been reused.
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
 
     idle.set_read_timeout(Some(Duration::from_secs(10)))
@@ -19668,7 +19690,7 @@ fn test_config_rewrite_targets_the_startup_config_file_e2e() {
         rudis_bin()
             .args(args)
             .current_dir(&cwd)
-            .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+            .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
             .stdout(std::process::Stdio::null())
             .stderr(stderr)
             .spawn()
@@ -20817,7 +20839,7 @@ fn test_tier_file_lives_under_dir_is_reset_at_startup_and_not_shared_e2e() {
                 "--no-pin",
             ])
             .env("RUDIS_TIER_DIR", &tier_dir)
-            .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+            .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -21454,4 +21476,329 @@ fn test_pipeline_flood_memory_is_bounded_and_released_e2e() {
         "{} MiB still allocated after the flood client disconnected",
         retained >> 20
     );
+}
+
+fn info_field_u64(c: &mut TcpStream, section: &str, field: &str) -> u64 {
+    let info = resp_cmd(c, &["INFO", section]);
+    let prefix = format!("{field}:");
+    info.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no {field} in INFO {section}: {info}"))
+}
+
+/// Streams `n` pipelined `SET key:<i> <32-byte value>` on one connection while
+/// draining replies concurrently; returns the raw reply bytes.
+fn pipelined_set_load(port: u16, n: usize) -> Vec<u8> {
+    let conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let mut writer = conn.try_clone().unwrap();
+    let w = thread::spawn(move || {
+        let val = "v".repeat(32);
+        let mut chunk = Vec::with_capacity(1 << 20);
+        for i in 0..n {
+            let key = format!("key:{i:08}");
+            chunk.extend_from_slice(
+                format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n$32\r\n{}\r\n",
+                    key.len(),
+                    key,
+                    val
+                )
+                .as_bytes(),
+            );
+            if chunk.len() >= 1 << 20 {
+                writer.write_all(&chunk).unwrap();
+                chunk.clear();
+            }
+        }
+        writer.write_all(&chunk).unwrap();
+    });
+    let mut reader = conn;
+    let mut replies = Vec::new();
+    let mut lines = 0usize;
+    let mut buf = vec![0u8; 1 << 16];
+    while lines < n {
+        let r = reader.read(&mut buf).expect("load reply");
+        assert!(r > 0, "server closed the load connection");
+        lines += buf[..r].iter().filter(|&&b| b == b'\n').count();
+        replies.extend_from_slice(&buf[..r]);
+    }
+    w.join().unwrap();
+    replies
+}
+
+/// `maxmemory` must bound what the process actually allocates, not just the
+/// server's own estimate: loading ~5x the limit under each policy has to keep
+/// jemalloc's live bytes near the limit.
+#[test]
+fn test_maxmemory_bounds_real_allocation_e2e() {
+    const N: usize = 1_000_000;
+    const LIMIT: u64 = 48 << 20;
+    for (port, policy, threads) in [
+        (17392u16, "allkeys-random", "1"),
+        (17393u16, "noeviction", "1"),
+        (17394u16, "allkeys-lru", "4"),
+        (17395u16, "noeviction", "4"),
+    ] {
+        let port_s = port.to_string();
+        let args = [
+            "--port",
+            port_s.as_str(),
+            "--threads",
+            threads,
+            "--no-pin",
+            "--bind",
+            "127.0.0.1",
+        ];
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _child = KillOnDrop(spawn_rudis_listening(&args, port));
+        let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        admin
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let base_alloc = info_allocated_bytes(&mut admin);
+        assert_eq!(
+            resp_cmd(
+                &mut admin,
+                &["CONFIG", "SET", "maxmemory", &LIMIT.to_string()]
+            ),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut admin, &["CONFIG", "SET", "maxmemory-policy", policy]),
+            "+OK\r\n"
+        );
+
+        let replies = pipelined_set_load(port, N);
+        let text = String::from_utf8_lossy(&replies);
+        let oom = text.matches("-OOM").count();
+        if policy == "noeviction" {
+            assert!(oom > 0, "noeviction never rejected a write past maxmemory");
+        } else {
+            assert_eq!(oom, 0, "{policy} rejected writes instead of evicting");
+        }
+
+        let used = info_field_u64(&mut admin, "memory", "used_memory");
+        let alloc = info_allocated_bytes(&mut admin).saturating_sub(base_alloc);
+        assert!(
+            used <= LIMIT + LIMIT / 8,
+            "{policy}/{threads}: used_memory {} MiB over the {} MiB limit",
+            used >> 20,
+            LIMIT >> 20
+        );
+        // Real live bytes must stay within 1.5x the limit (allows for the
+        // allocator's size-class rounding and per-connection buffers).
+        assert!(
+            alloc <= LIMIT + LIMIT / 2,
+            "{policy}/{threads}: allocator holds {} MiB for a {} MiB maxmemory (used_memory {} MiB)",
+            alloc >> 20,
+            LIMIT >> 20,
+            used >> 20
+        );
+    }
+}
+
+/// Keys the tier holds (spilled to disk or cooled) must answer every command
+/// with their real value; they used to answer WRONGTYPE to all but GET/TYPE,
+/// which auto-tiering makes visible on any server under memory pressure.
+#[test]
+fn test_tiered_keys_answer_every_command_e2e() {
+    let port = 17431;
+    let dir = std::env::temp_dir().join(format!("rudis-tier-cmds-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("rudis.conf");
+    std::fs::write(&conf, format!("dir {}\n", dir.display())).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Several keys of each kind so both shards (local and remote to this
+    // connection) are covered.
+    for i in 0..4 {
+        let (s, n, h, l) = (
+            format!("s{i}"),
+            format!("n{i}"),
+            format!("h{i}"),
+            format!("l{i}"),
+        );
+        assert_eq!(resp_cmd(&mut c, &["SET", &s, "hello"]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SET", &n, "10"]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut c, &["HSET", &h, "f", "v"]), ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["RPUSH", &l, "a", "b"]), ":2\r\n");
+        for k in [&s, &n, &h, &l] {
+            assert_eq!(resp_cmd(&mut c, &["TIER", "SPILL", k]), ":1\r\n", "{k}");
+        }
+        assert_eq!(resp_cmd(&mut c, &["STRLEN", &s]), ":5\r\n", "{s}");
+        assert_eq!(resp_cmd(&mut c, &["APPEND", &s, "!"]), ":6\r\n", "{s}");
+        assert_eq!(
+            resp_cmd(&mut c, &["GETRANGE", &s, "0", "1"]),
+            "$2\r\nhe\r\n",
+            "{s}"
+        );
+        assert_eq!(resp_cmd(&mut c, &["INCR", &n]), ":11\r\n", "{n}");
+        assert_eq!(resp_cmd(&mut c, &["HGET", &h, "f"]), "$1\r\nv\r\n", "{h}");
+        assert_eq!(
+            resp_cmd(&mut c, &["LRANGE", &l, "0", "-1"]),
+            "*2\r\n$1\r\na\r\n$1\r\nb\r\n",
+            "{l}"
+        );
+        // Cooled keys too.
+        let cs = format!("c{i}");
+        assert_eq!(resp_cmd(&mut c, &["SET", &cs, "abc"]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut c, &["TIER", "COOL", &cs]), ":1\r\n", "{cs}");
+        assert_eq!(resp_cmd(&mut c, &["STRLEN", &cs]), ":3\r\n", "{cs}");
+        // Pipelined (squashed) path.
+        assert_eq!(resp_cmd(&mut c, &["TIER", "SPILL", &n]), ":1\r\n", "{n}");
+        let mut got = send_and_read(&mut c, format!("INCR {n}\r\nINCR {n}\r\n").as_bytes());
+        while got.matches("\r\n").count() < 2 {
+            got.push_str(&send_and_read(&mut c, b""));
+        }
+        assert_eq!(got, ":12\r\n:13\r\n", "{n}");
+    }
+    drop(c);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Redis tracking.tcl "invalidation message of eviction keys should be
+/// before response", from connections on every shard: a write executed for
+/// another shard must republish that shard's usage (it didn't for SETBIT),
+/// and the eviction's invalidation must precede the reply.
+#[test]
+fn test_eviction_invalidation_precedes_reply_across_shards_e2e() {
+    let port = 17432;
+    let dir = std::env::temp_dir().join(format!("rudis-evict-track-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("rudis.conf");
+    std::fs::write(&conf, format!("dir {}\n", dir.display())).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    for round in 0..8 {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd(&mut c, &["HELLO", "3"]);
+        resp_cmd(&mut c, &["DEL", "volatile-key", "big-key"]);
+        assert_eq!(resp_cmd(&mut c, &["CLIENT", "TRACKING", "on"]), "+OK\r\n");
+        let info = resp_cmd(&mut c, &["INFO", "memory"]);
+        let used: u64 = info
+            .lines()
+            .find_map(|l| l.strip_prefix("used_memory:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let limit = (used + 100 * 1024).to_string();
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", &limit]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            resp_cmd(
+                &mut c,
+                &["CONFIG", "SET", "maxmemory-policy", "volatile-random"]
+            ),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["SETEX", "volatile-key", "10000", "x"]),
+            "+OK\r\n"
+        );
+        assert_eq!(resp_cmd(&mut c, &["GET", "volatile-key"]), "$1\r\nx\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["SETBIT", "big-key", "1600000", "0"]),
+            ":0\r\n"
+        );
+        let mut got = resp_cmd(&mut c, &["GETBIT", "big-key", "0"]);
+        while !got.ends_with(":0\r\n") {
+            got.push_str(&send_and_read(&mut c, b""));
+        }
+        assert_eq!(
+            got, ">2\r\n$10\r\ninvalidate\r\n*1\r\n$12\r\nvolatile-key\r\n:0\r\n",
+            "round {round}"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "0"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-policy", "noeviction"]),
+            "+OK\r\n"
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `INFO keyspace` used to be an empty section; clients and exporters read
+/// `db0:keys=…,expires=…` from it. Counts must be server-wide across shards.
+#[test]
+fn test_info_keyspace_counts_all_shards_e2e() {
+    let port = 17433;
+    start_test_server(port, 4);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["FLUSHALL"]), "+OK\r\n");
+    let empty = resp_cmd(&mut c, &["INFO", "keyspace"]);
+    assert!(empty.contains("# Keyspace"), "{empty}");
+    assert!(!empty.contains("db0:"), "{empty}");
+    for i in 0..20 {
+        let k = format!("ks{i}");
+        if i < 7 {
+            assert_eq!(resp_cmd(&mut c, &["SET", &k, "v", "EX", "100"]), "+OK\r\n");
+        } else {
+            assert_eq!(resp_cmd(&mut c, &["SET", &k, "v"]), "+OK\r\n");
+        }
+    }
+    let info = resp_cmd(&mut c, &["INFO", "keyspace"]);
+    assert!(
+        info.contains("db0:keys=20,expires=7,avg_ttl=0"),
+        "INFO keyspace: {info}"
+    );
+    // Default INFO includes the section too.
+    let mut all = resp_cmd(&mut c, &["INFO"]);
+    while !all.contains("db0:keys=") && all.len() < 1 << 20 {
+        let more = send_and_read(&mut c, b"");
+        if more.is_empty() {
+            break;
+        }
+        all.push_str(&more);
+    }
+    assert!(all.contains("db0:keys=20,expires=7"), "INFO: {all}");
+}
+
+/// Driver for spawned server binaries: inherits `MONOIO_FORCE_LEGACY_DRIVER`
+/// from the test process (CI runs one job per driver) and defaults to the
+/// legacy driver, which avoids io_uring memlock limits on old kernels.
+fn legacy_driver_env() -> String {
+    std::env::var("MONOIO_FORCE_LEGACY_DRIVER").unwrap_or_else(|_| "1".to_string())
 }

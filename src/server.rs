@@ -9,18 +9,20 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 pub struct CatchUnwind<F> {
-    inner: F,
+    // Boxed so the wrapper is `Unpin` and polling needs no unsafe pin
+    // projection; one allocation per connection or worker task.
+    inner: Pin<Box<F>>,
 }
 
 pub fn catch_unwind_async<F: Future>(f: F) -> CatchUnwind<F> {
-    CatchUnwind { inner: f }
+    CatchUnwind { inner: Box::pin(f) }
 }
 
 impl<F: Future> Future for CatchUnwind<F> {
     type Output = Result<F::Output, Box<dyn std::any::Any + Send + 'static>>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let inner = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().inner) };
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self.inner.as_mut();
         match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
             Ok(Poll::Ready(val)) => Poll::Ready(Ok(val)),
             Ok(Poll::Pending) => Poll::Pending,
@@ -246,10 +248,20 @@ pub fn run_shard_worker(
 
         // Active expiration cycle: run every 100ms
         let active_db = local_db.clone();
+        let mem_router = router.clone();
         monoio::spawn(async move {
             loop {
                 monoio::time::sleep(std::time::Duration::from_millis(100)).await;
                 active_db.borrow_mut().active_expire_cycle();
+                // Give back table segments emptied by deletes and expiry.
+                // Not while a snapshot walks the segments: moving entries
+                // would make it restart as one blocking pass.
+                if !mem_router.is_saving.load(std::sync::atomic::Ordering::Relaxed) {
+                    active_db.borrow_mut().table.shrink_step(32);
+                }
+                // Deletes, flushes and CONFIG SET maxmemory don't go through
+                // the post-write check; publish this shard's usage here.
+                mem_router.publish_memory_state();
                 // Rates for INFO instantaneous_*; extra calls are no-ops.
                 crate::server_stats::sample();
             }
@@ -268,7 +280,7 @@ pub fn run_shard_worker(
         monoio::spawn(async move {
             loop {
                 monoio::time::sleep(std::time::Duration::from_millis(20)).await;
-                offload_router.check_auto_tier().await;
+                offload_router.check_auto_tier_local().await;
             }
         });
 
@@ -347,6 +359,9 @@ pub fn run_shard_worker(
                         // overloaded shard. Safe: the sending shard released the
                         // fd via into_raw_fd without closing it, and we are in
                         // the same process, so the fd is valid in our table.
+                        // SAFETY: The sending shard gave up `fd` with into_raw_fd and never uses it
+                        // again, and each AdoptConnection is received once, so we become its sole
+                        // owner.
                         let std_stream = unsafe {
                             <std::net::TcpStream as std::os::unix::io::FromRawFd>::from_raw_fd(fd)
                         };
@@ -587,7 +602,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             }
                             let age = now.duration_since(client.connected_at).as_secs();
                             let idle = now.duration_since(client.last_active).as_secs();
-                            let is_blocked = crate::block::get_block_hub_for_port(port).lock().unwrap().is_blocked(client.id);
+                            let is_blocked = crate::block::get_block_hub_for_port(port).lock().is_blocked(client.id);
                             let flags = if client.is_monitor { "O" } else if is_blocked { "b" } else { "N" };
                             let (qbuf, qbuf_free) = client.effective_qbuf(idle);
                             let tot_net_in = client.stats.tot_net_in.load(std::sync::atomic::Ordering::Relaxed);
@@ -1038,6 +1053,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                 smallvec::SmallVec::new();
                             for (idx, key_hash, cmd) in items.drain(..) {
                                 temp_buf.clear();
+                                db.hydrate_cmd_keys(&cmd);
                                 if !has_tracking && let Command::Get(ref key) = cmd {
                                     match db.table.get_compact_with_hash(key.as_ref(), key_hash) {
                                         Ok(Some(resp)) => {
@@ -1433,7 +1449,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     }
                                     db = cross_shard_db.borrow_mut();
                                 } else {
-                                    if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
+                                    if cmd.is_write_command() {
                                         has_writes = true;
                                     }
                                     let _ = execute_local_command(&cmd, &mut db, &mut temp_buf, aof_ref);
@@ -1869,7 +1885,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     ShardMessage::NotifyList { keys } => {
                         let mut db = cross_shard_db.borrow_mut();
                         let hub_arc = crate::block::get_block_hub_for_port(db.port);
-                        let mut hub = hub_arc.lock().unwrap();
+                        let mut hub = hub_arc.lock();
                         for k in keys {
                             hub.notify_stream(&mut db, &k);
                             hub.notify_list(&mut db.table, &k);
@@ -1908,9 +1924,31 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let count = cross_shard_router.decommit_local(key.as_deref());
                         let _ = responder.send(count);
                     }
+                    ShardMessage::TierAutoSpill { responder } => {
+                        let r = cross_shard_router.clone();
+                        monoio::spawn(async move {
+                            r.check_auto_tier_local().await;
+                            let used = r.local_db.borrow().table.used_memory();
+                            let _ = responder.send(used);
+                        });
+                    }
                     ShardMessage::GetUsedMemory { responder } => {
-                        let used = cross_shard_db.borrow().table.used_memory;
+                        let used = cross_shard_db.borrow().table.used_memory();
                         let _ = responder.send(used);
+                    }
+                    ShardMessage::EvictUntilUnder {
+                        policy,
+                        floor,
+                        client_id,
+                        responder,
+                    } => {
+                        // Invalidations owed to the requesting client ride
+                        // back in the reply, ahead of its command response.
+                        let ((), track) = crate::connection::with_evict_capture(client_id, || {
+                            cross_shard_router.evict_local_until_under(&policy, floor);
+                        });
+                        let used = cross_shard_db.borrow().table.used_memory();
+                        let _ = responder.send((used, track));
                     }
                     ShardMessage::TryEvictOneKey { policy, responder } => {
                         let freed = cross_shard_db.borrow_mut().table.try_evict_one_key(&policy);
@@ -2007,14 +2045,15 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
     });
 
         println!(
-            "[Shard {}/{}] Worker started and listening on {} via io_uring",
+            "[Shard {}/{}] Worker started and listening on {} via {}",
             shard_id,
             num_shards,
             listen_addrs
                 .iter()
                 .map(|a| a.to_string())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            crate::connection::io_driver_name()
         );
 
         // 4.9 Spawn TLS Accept loop if enabled
@@ -2253,6 +2292,8 @@ async fn drain_clients(
             return;
         }
         for fd in fds {
+            // SAFETY: shutdown(2) takes no pointers. The fds were collected from this
+            // shard's registry with no await since, and the connection removes its registry entry (ClientCleanup / PubsubCleanup) before its socket is closed, so the fd is not a reused number.
             unsafe { libc::shutdown(fd, libc::SHUT_RD) };
         }
         monoio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -2317,6 +2358,8 @@ async fn accept_loop(
                 let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
                 if crate::netsec::protected_mode_denies(router.base_port, client_addr.ip()) {
                     let msg = crate::netsec::PROTECTED_MODE_DENIED;
+                    // SAFETY: `msg` is a 'static byte slice and the length matches; `raw_fd` is
+                    // `stream`'s socket, which is still open (dropped below).
                     unsafe {
                         libc::send(
                             raw_fd,
@@ -2330,6 +2373,8 @@ async fn accept_loop(
                 }
                 let _ = stream.set_nodelay(true);
                 crate::connection::apply_tcp_keepalive(raw_fd);
+                // SAFETY: `yes` is a live c_int and optlen is its size; `raw_fd` belongs to
+                // `stream`, which is alive here.
                 unsafe {
                     let yes: libc::c_int = 1;
                     libc::setsockopt(
@@ -2390,6 +2435,8 @@ async fn accept_loop(
                         // close it rather than leak it, and give back the
                         // slot that was reserved for it.
                         crate::conn_balance::unregister_conn(owner);
+                        // SAFETY: The message (and with it the fd) was not handed over, so we still
+                        // own the fd from into_raw_fd and close it exactly once.
                         unsafe { libc::close(fd) };
                     }
                 } else {

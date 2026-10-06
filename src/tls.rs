@@ -311,6 +311,8 @@ impl TlsTransport {
         if len == 0 {
             return Ok(());
         }
+        // SAFETY: `wire_out` holds `len` initialized bytes and is borrowed for the
+        // call; `self.fd` is the socket owned by `self.stream`.
         let sent = unsafe {
             libc::send(
                 self.fd,
@@ -404,6 +406,8 @@ impl TlsTransport {
         let mut plain = 0;
         loop {
             let cap = self.wire_in.capacity();
+            // SAFETY: `wire_in` has `cap` bytes of allocated capacity at `as_mut_ptr()`
+            // and recv writes at most `cap` bytes; `self.fd` is owned by `self.stream`.
             let n = unsafe {
                 libc::recv(
                     self.fd,
@@ -416,6 +420,8 @@ impl TlsTransport {
                 return Ok(plain);
             }
             let n = n as usize;
+            // SAFETY: recv returned `0 < n <= cap`, so `n` bytes of `wire_in`'s buffer
+            // were just written and `n` is within its capacity.
             unsafe { self.wire_in.set_len(n) };
             let (p, closed) = self.absorb(n, buf)?;
             plain += p;
@@ -448,6 +454,8 @@ impl ClientTransport for TlsTransport {
             Ok(n) => n,
             Err(_) => {
                 // A corrupt record ends the session: make the next read fail.
+                // SAFETY: shutdown(2) takes no pointers; `self.fd` is owned by `self.stream`,
+                // which is alive while `self` is.
                 unsafe { libc::shutdown(self.fd, libc::SHUT_RDWR) };
                 0
             }

@@ -1,6 +1,7 @@
 use bytes::Bytes;
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock};
 
 pub type DocId = u32;
 
@@ -1037,12 +1038,12 @@ pub fn has_active_search_indices() -> bool {
 }
 
 pub fn get_search_index(name: &str) -> Option<Arc<RwLock<InvertedIndex>>> {
-    let registry = SEARCH_INDICES.read().unwrap();
+    let registry = SEARCH_INDICES.read();
     registry.get(name).cloned()
 }
 
 pub fn create_search_index(schema: IndexSchema) -> Result<(), String> {
-    let mut registry = SEARCH_INDICES.write().unwrap();
+    let mut registry = SEARCH_INDICES.write();
     if registry.contains_key(&schema.name) {
         return Err(format!("Index already exists: {}", schema.name));
     }
@@ -1054,7 +1055,7 @@ pub fn create_search_index(schema: IndexSchema) -> Result<(), String> {
 }
 
 pub fn reset_search_index(schema: IndexSchema) {
-    let mut registry = SEARCH_INDICES.write().unwrap();
+    let mut registry = SEARCH_INDICES.write();
     let name = schema.name.clone();
     let idx = Arc::new(RwLock::new(InvertedIndex::new(schema)));
     registry.insert(name, idx);
@@ -1062,7 +1063,7 @@ pub fn reset_search_index(schema: IndexSchema) {
 }
 
 pub fn drop_search_index(name: &str) -> Result<(), String> {
-    let mut registry = SEARCH_INDICES.write().unwrap();
+    let mut registry = SEARCH_INDICES.write();
     if registry.remove(name).is_some() {
         SEARCH_INDICES_COUNT.store(registry.len(), std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -1072,16 +1073,16 @@ pub fn drop_search_index(name: &str) -> Result<(), String> {
 }
 
 pub fn list_search_indices() -> Vec<String> {
-    let registry = SEARCH_INDICES.read().unwrap();
+    let registry = SEARCH_INDICES.read();
     let mut names: Vec<String> = registry.keys().cloned().collect();
     names.sort();
     names
 }
 
 pub fn index_document_hook(key: &str, raw: &[(Bytes, Bytes)]) {
-    let registry = SEARCH_INDICES.read().unwrap();
+    let registry = SEARCH_INDICES.read();
     for idx_lock in registry.values() {
-        let mut idx = idx_lock.write().unwrap();
+        let mut idx = idx_lock.write();
         if let Some(schema) = &idx.schema {
             if schema.on_type.to_uppercase() != "HASH" {
                 continue;
@@ -1239,9 +1240,9 @@ pub fn extract_json_fields(
 }
 
 pub fn index_json_document_hook(key: &str, root: &serde_json::Value) {
-    let registry = SEARCH_INDICES.read().unwrap();
+    let registry = SEARCH_INDICES.read();
     for idx_lock in registry.values() {
-        let mut idx = idx_lock.write().unwrap();
+        let mut idx = idx_lock.write();
         if let Some(schema) = &idx.schema {
             if schema.on_type.to_uppercase() != "JSON" {
                 continue;
@@ -1261,9 +1262,9 @@ pub fn index_json_document_hook(key: &str, root: &serde_json::Value) {
 }
 
 pub fn delete_document_hook(key: &str) {
-    let registry = SEARCH_INDICES.read().unwrap();
+    let registry = SEARCH_INDICES.read();
     for idx_lock in registry.values() {
-        let mut idx = idx_lock.write().unwrap();
+        let mut idx = idx_lock.write();
         idx.remove_document(key);
     }
 }
@@ -3522,7 +3523,7 @@ mod tests {
         index_json_document_hook("inv:2", &json2);
 
         let idx_arc = get_search_index("idx:inventory_json").expect("index exists");
-        let idx = idx_arc.read().unwrap();
+        let idx = idx_arc.read();
         assert_eq!(idx.total_docs, 2);
 
         // 1. Text search for "rust"

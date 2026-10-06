@@ -9,9 +9,10 @@
 //!
 //! With no `bind` directive Redis listens on `* -::*`; we use the same default.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{LazyLock, RwLock};
+use std::sync::LazyLock;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -73,12 +74,12 @@ static BIND_ADDRS: LazyLock<RwLock<HashMap<u16, Vec<BindAddr>>>> =
 
 /// Registers the bind addresses for the server whose base port is `port`.
 pub fn set_bind_addrs(port: u16, addrs: Vec<BindAddr>) {
-    BIND_ADDRS.write().unwrap().insert(port, addrs);
+    BIND_ADDRS.write().insert(port, addrs);
 }
 
 /// Bind addresses for the server on base port `port` (Redis default if unset).
 pub fn bind_addrs(port: u16) -> Vec<BindAddr> {
-    if let Some(v) = BIND_ADDRS.read().unwrap().get(&port) {
+    if let Some(v) = BIND_ADDRS.read().get(&port) {
         return v.clone();
     }
     parse_bind_spec(DEFAULT_BIND).expect("default bind spec is valid")
@@ -89,17 +90,12 @@ static PROTECTED_MODE: LazyLock<RwLock<HashMap<u16, bool>>> =
 
 /// Enables/disables protected mode for the server on base port `port`.
 pub fn set_protected_mode(port: u16, enabled: bool) {
-    PROTECTED_MODE.write().unwrap().insert(port, enabled);
+    PROTECTED_MODE.write().insert(port, enabled);
 }
 
 /// Protected mode for base port `port` (Redis default: enabled).
 pub fn protected_mode(port: u16) -> bool {
-    PROTECTED_MODE
-        .read()
-        .unwrap()
-        .get(&port)
-        .copied()
-        .unwrap_or(true)
+    PROTECTED_MODE.read().get(&port).copied().unwrap_or(true)
 }
 
 fn is_loopback_peer(ip: IpAddr) -> bool {
@@ -119,7 +115,6 @@ pub fn protected_mode_denies(port: u16, peer: IpAddr) -> bool {
     }
     crate::acl::get_acl_for_port(port)
         .read()
-        .unwrap()
         .get_user("default")
         .is_some_and(|u| u.nopass)
 }
@@ -232,6 +227,39 @@ pub fn ensure_port_free(addrs: &[BindAddr], port: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// [`ensure_port_free`], retried for up to `grace`.
+///
+/// When a previous instance on the io_uring driver dies abruptly (crash,
+/// OOM kill, `kill -9`), the kernel tears its rings down asynchronously and
+/// in-flight accepts keep its listening sockets alive for a short while
+/// after the process is gone. A supervisor restarting the server right away
+/// would otherwise abort with "Address already in use" (7 of 8 immediate
+/// restarts did). A genuine second server still fails once `grace` expires.
+pub fn ensure_port_free_with_grace(
+    addrs: &[BindAddr],
+    port: u16,
+    grace: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + grace;
+    let mut warned = false;
+    loop {
+        match ensure_port_free(addrs, port) {
+            Ok(()) => return Ok(()),
+            Err(e) if std::time::Instant::now() >= deadline => return Err(e),
+            Err(_) => {
+                if !warned {
+                    warned = true;
+                    eprintln!(
+                        "Port {} is busy; waiting up to {:?} for a previous instance to release it",
+                        port, grace
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,7 +358,7 @@ mod tests {
         // A default-user password lifts the restriction.
         {
             let acl = crate::acl::get_acl_for_port(port);
-            let mut g = acl.write().unwrap();
+            let mut g = acl.write();
             g.set_user("default", &[">s3cret".to_string()]).unwrap();
         }
         assert!(!protected_mode_denies(port, ext));

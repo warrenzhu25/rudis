@@ -190,8 +190,9 @@ pub fn build_pubsub_pframe(
     Bytes::from(buf)
 }
 
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock};
 
 pub const PUBSUB_STRIPES: usize = 16;
 pub const PUBSUB_WORDS_PER_STRIPE: usize = 4; // Scales cleanly up to 256 shards
@@ -285,12 +286,12 @@ static PRESENCE_TABLES: LazyLock<RwLock<hashbrown::HashMap<u16, Arc<ShardedPrese
     LazyLock::new(|| RwLock::new(hashbrown::HashMap::new()));
 
 pub fn get_presence_table(port: u16) -> Arc<ShardedPresenceTable> {
-    let read = PRESENCE_TABLES.read().unwrap();
+    let read = PRESENCE_TABLES.read();
     if let Some(t) = read.get(&port) {
         return t.clone();
     }
     drop(read);
-    let mut write = PRESENCE_TABLES.write().unwrap();
+    let mut write = PRESENCE_TABLES.write();
     write
         .entry(port)
         .or_insert_with(|| Arc::new(ShardedPresenceTable::new()))

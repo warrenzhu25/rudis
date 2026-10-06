@@ -400,22 +400,23 @@ fn unquote(v: &str) -> &str {
     }
 }
 
-static SAVE_POINTS: std::sync::Mutex<Option<HashMap<u16, Vec<(u64, u64)>>>> =
-    std::sync::Mutex::new(None);
+static SAVE_POINTS: parking_lot::Mutex<Option<HashMap<u16, Vec<(u64, u64)>>>> =
+    parking_lot::Mutex::new(None);
 
 pub fn set_save_points(port: u16, points: Vec<(u64, u64)>) {
-    let mut map = SAVE_POINTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = SAVE_POINTS.lock();
     map.get_or_insert_with(HashMap::new).insert(port, points);
 }
 
 pub fn save_points(port: u16) -> Vec<(u64, u64)> {
-    let map = SAVE_POINTS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = SAVE_POINTS.lock();
     map.as_ref()
         .and_then(|m| m.get(&port).cloned())
         .unwrap_or_default()
 }
 
-static DB_FILENAMES: std::sync::Mutex<Option<HashMap<u16, String>>> = std::sync::Mutex::new(None);
+static DB_FILENAMES: parking_lot::Mutex<Option<HashMap<u16, String>>> =
+    parking_lot::Mutex::new(None);
 
 pub const DEFAULT_DBFILENAME: &str = "dump.rdb";
 
@@ -423,7 +424,7 @@ pub const DEFAULT_DBFILENAME: &str = "dump.rdb";
 /// a plain file name, not a path.
 pub fn set_dbfilename(port: u16, name: &str) -> Result<(), String> {
     validate_dbfilename(name)?;
-    let mut map = DB_FILENAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = DB_FILENAMES.lock();
     map.get_or_insert_with(HashMap::new)
         .insert(port, name.to_string());
     Ok(())
@@ -437,7 +438,7 @@ pub fn validate_dbfilename(name: &str) -> Result<(), String> {
 }
 
 pub fn dbfilename(port: u16) -> String {
-    let map = DB_FILENAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = DB_FILENAMES.lock();
     map.as_ref()
         .and_then(|m| m.get(&port).cloned())
         .unwrap_or_else(|| DEFAULT_DBFILENAME.to_string())
@@ -778,13 +779,14 @@ impl RudisConfig {
 
 /// The file the server was started with (`--config`), stored as an absolute
 /// path so that CONFIG REWRITE does not depend on the working directory.
-pub static ACTIVE_CONFIG_FILE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+pub static ACTIVE_CONFIG_FILE: parking_lot::RwLock<Option<PathBuf>> =
+    parking_lot::RwLock::new(None);
 
 /// Records `path` as the file CONFIG REWRITE updates.
 pub fn set_active_config_file(path: &Path) -> Result<(), String> {
     let abs = std::path::absolute(path)
         .map_err(|e| format!("Failed to resolve config file {:?}: {}", path, e))?;
-    *ACTIVE_CONFIG_FILE.write().unwrap() = Some(abs);
+    *ACTIVE_CONFIG_FILE.write() = Some(abs);
     Ok(())
 }
 
@@ -794,7 +796,6 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
     // invent one in the working directory.
     let path = ACTIVE_CONFIG_FILE
         .read()
-        .unwrap()
         .clone()
         .ok_or_else(|| "The server is running without a config file".to_string())?;
 
@@ -863,7 +864,7 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
 
     // If requirepass is set
     let acl = crate::acl::get_acl_for_port(port);
-    if let Some(pass) = acl.read().unwrap().requirepass.clone() {
+    if let Some(pass) = acl.read().requirepass.clone() {
         directives.insert("requirepass".to_string(), pass);
     }
 
@@ -1214,31 +1215,31 @@ mod tests {
     }
 
     /// Serializes the tests that set the process-wide `ACTIVE_CONFIG_FILE`.
-    static ACTIVE_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ACTIVE_CONFIG_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn test_rewrite_requires_a_config_file_and_resolves_it_absolutely() {
-        let _guard = ACTIVE_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = ACTIVE_CONFIG_FILE.write().unwrap().take();
+        let _guard = ACTIVE_CONFIG_LOCK.lock();
+        let saved = ACTIVE_CONFIG_FILE.write().take();
 
         let err = rewrite_config_file(9999).unwrap_err();
         assert_eq!(err, "The server is running without a config file");
-        assert!(ACTIVE_CONFIG_FILE.read().unwrap().is_none());
+        assert!(ACTIVE_CONFIG_FILE.read().is_none());
 
         set_active_config_file(Path::new("conf/rudis.conf")).unwrap();
-        let active = ACTIVE_CONFIG_FILE.read().unwrap().clone().unwrap();
+        let active = ACTIVE_CONFIG_FILE.read().clone().unwrap();
         assert!(active.is_absolute(), "{active:?}");
         assert_eq!(
             active,
             std::env::current_dir().unwrap().join("conf/rudis.conf")
         );
 
-        *ACTIVE_CONFIG_FILE.write().unwrap() = saved;
+        *ACTIVE_CONFIG_FILE.write() = saved;
     }
 
     #[test]
     fn test_rewrite_config_file_atomic_and_durable() {
-        let _guard = ACTIVE_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ACTIVE_CONFIG_LOCK.lock();
         let temp_dir = std::env::temp_dir().join(format!("rudis-cfg-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
         let cfg_path = temp_dir.join("test_rudis.conf");
@@ -1250,7 +1251,7 @@ mod tests {
         )
         .unwrap();
 
-        *ACTIVE_CONFIG_FILE.write().unwrap() = Some(cfg_path.clone());
+        *ACTIVE_CONFIG_FILE.write() = Some(cfg_path.clone());
 
         // Rewrite with port 9999
         let res = rewrite_config_file(9999);

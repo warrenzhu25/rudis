@@ -171,6 +171,10 @@ const WRONGTYPE_ERR: &str = "WRONGTYPE Operation against a key holding the wrong
 /// Producer-side error when the RDB writer thread hung up; its own error wins.
 const WRITER_GONE: &str = "rdb writer gone";
 
+/// Upper bound on keys one `check_auto_tier` call tries to spill; it can run
+/// inline on the write path, and the 20 ms cron picks up where it stopped.
+const MAX_SPILL_ATTEMPTS_PER_CALL: usize = 1024;
+
 /// The router handles dispatching operations.
 /// If the key belongs to the current shard, it directly touches `local_db` without locking.
 /// If the key belongs to a peer shard, it routes the message across cores via the mesh.
@@ -192,6 +196,22 @@ pub struct Router {
     pub is_saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub db_dir: std::path::PathBuf,
     pub is_auto_tiering: Rc<Cell<bool>>,
+    /// Set after an auto-tier spill pass frees nothing; spilling is skipped
+    /// until then so over-budget writes don't rescan the table each time.
+    pub spill_backoff_until: Rc<Cell<Option<std::time::Instant>>>,
+    /// Local `used_memory` when the spill backoff was set; growth past it
+    /// (new, possibly spillable data) lifts the backoff early.
+    pub spill_backoff_used: Rc<Cell<usize>>,
+    /// Same as `spill_backoff_until`/`spill_backoff_used`, for asking the
+    /// other shards to spill; keyed on the server-wide published total.
+    pub remote_spill_backoff: Rc<Cell<Option<(std::time::Instant, usize)>>>,
+    /// Same, for asking the other shards to evict.
+    pub remote_evict_backoff: Rc<Cell<Option<(std::time::Instant, usize)>>>,
+    /// `tiering::maxmemory_epoch()` the back-offs above were computed under;
+    /// a config change or flush clears them.
+    pub backoff_epoch: Rc<Cell<u64>>,
+    /// Last time `refresh_published_usage` re-read the other shards' usage.
+    pub last_usage_refresh: Rc<Cell<Option<std::time::Instant>>>,
     pub notify_channel_pool: Rc<RefCell<Vec<(flume::Sender<()>, flume::Receiver<()>)>>>,
     pub remote_responder_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::BatchResponder>>>>,
     pub mget_batch_pool: Rc<RefCell<Vec<Vec<Vec<(usize, Bytes)>>>>>,
@@ -201,6 +221,15 @@ pub struct Router {
     pub pubsub_responder_pool: Rc<RefCell<Vec<(flume::Sender<usize>, flume::Receiver<usize>)>>>,
     pub presence_table: std::sync::Arc<crate::pubsub::ShardedPresenceTable>,
     pub tier_stats: std::sync::Arc<crate::tiering::TieringStats>,
+}
+
+/// Usage that maxmemory eviction brings the server down to once it is over
+/// `max_mem`: a little below the limit (1/64 of it, at most 1 MiB), so a
+/// steady write stream pays one eviction round (and at most one mesh round
+/// trip) per few thousand writes instead of one per write.
+#[inline]
+fn eviction_target(max_mem: usize) -> usize {
+    max_mem - (max_mem / 64).min(1 << 20)
 }
 
 impl Router {
@@ -242,6 +271,12 @@ impl Router {
             is_saving: crate::snapshot::is_saving(port),
             db_dir,
             is_auto_tiering: Rc::new(Cell::new(false)),
+            spill_backoff_until: Rc::new(Cell::new(None)),
+            spill_backoff_used: Rc::new(Cell::new(0)),
+            remote_spill_backoff: Rc::new(Cell::new(None)),
+            remote_evict_backoff: Rc::new(Cell::new(None)),
+            backoff_epoch: Rc::new(Cell::new(0)),
+            last_usage_refresh: Rc::new(Cell::new(None)),
             notify_channel_pool: Rc::new(RefCell::new(Vec::new())),
             remote_responder_pool: Rc::new(RefCell::new(Vec::new())),
             mget_batch_pool: Rc::new(RefCell::new(Vec::new())),
@@ -250,7 +285,12 @@ impl Router {
             mset_desc_pool: Rc::new(RefCell::new(Vec::new())),
             pubsub_responder_pool: Rc::new(RefCell::new(Vec::new())),
             presence_table: crate::pubsub::get_presence_table(port),
-            tier_stats: crate::tiering::get_tier_stats(port),
+            tier_stats: {
+                let t = crate::tiering::get_tier_stats(port);
+                // Sizes the published per-shard usage sum (see TieringStats::shard_used).
+                t.num_shards.fetch_max(num_shards.max(1), Ordering::Relaxed);
+                t
+            },
         }
     }
 
@@ -585,6 +625,12 @@ impl Router {
                 0
             }
         } else {
+            // decommit_all_cooled walks the whole table, and this runs on
+            // every over-budget write; skip it when nothing is cooled. The
+            // counter is per port, so it is conservative for multi-shard.
+            if stats.cooled_keys.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                return 0;
+            }
             let (count, freed) = db.table.decommit_all_cooled();
             if count > 0 {
                 stats
@@ -660,7 +706,7 @@ impl Router {
     }
 
     pub async fn get_total_used_memory(&self) -> usize {
-        let mut total = self.local_db.borrow().table.used_memory;
+        let mut total = self.local_db.borrow().table.used_memory();
         for s in 0..self.num_shards {
             if s != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
@@ -673,42 +719,230 @@ impl Router {
         total
     }
 
-    pub async fn evict_until_under_maxmemory(&self, max_mem: usize, policy: &str) -> bool {
-        let mut total = self.get_total_used_memory().await;
-        if total <= max_mem {
+    /// This shard's share of `maxmemory`, or `None` when no limit is set.
+    #[inline]
+    pub fn shard_memory_budget(&self) -> Option<usize> {
+        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
+        (max_mem > 0).then(|| (max_mem / self.num_shards.max(1) as u64).max(1) as usize)
+    }
+
+    /// Server-wide used memory: this shard's fresh value plus what the other
+    /// shards last published.
+    #[inline]
+    fn total_used_with_local(&self, local: usize) -> usize {
+        local + self.tier_stats.published_used_total(Some(self.shard_id))
+    }
+
+    /// Publishes this shard's `used_memory` for the other shards and returns
+    /// whether the server as a whole is over `maxmemory` (Redis semantics:
+    /// the limit is global, not per shard).
+    #[inline]
+    pub fn publish_memory_state(&self) -> bool {
+        let local = self.local_db.borrow().table.used_memory();
+        self.tier_stats.publish_shard_used(self.shard_id, local);
+        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed) as usize;
+        max_mem > 0 && self.total_used_with_local(local) > max_mem
+    }
+
+    /// Clears the eviction/spill back-offs if `maxmemory`, the policy or the
+    /// dataset was reset since they were set.
+    #[inline]
+    fn sync_backoff_epoch(&self) {
+        let epoch = crate::tiering::maxmemory_epoch();
+        if self.backoff_epoch.get() != epoch {
+            self.backoff_epoch.set(epoch);
+            self.spill_backoff_until.set(None);
+            self.remote_spill_backoff.set(None);
+            self.remote_evict_backoff.set(None);
+        }
+    }
+
+    /// Evicts local keys under `policy` while the server is over `maxmemory`,
+    /// this shard holds more than `floor` bytes, and something is evictable;
+    /// publishes this shard's usage and returns whether the server ended
+    /// within the limit. Any key frees memory toward the global limit, so
+    /// with `floor == 0` a shard evicts even when it is under its own share
+    /// (otherwise writes here would be refused while the shard holding the
+    /// excess sees no writes).
+    pub fn evict_local_until_under(&self, policy: &str, floor: usize) -> bool {
+        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed) as usize;
+        if max_mem == 0 {
+            self.publish_memory_state();
             return true;
         }
-        let mut attempts = 0;
-        while total > max_mem && attempts < 256 {
-            attempts += 1;
-            let mut freed_any = false;
-            if let Some(freed) = self.local_db.borrow_mut().table.try_evict_one_key(policy) {
-                total = total.saturating_sub(freed);
-                freed_any = true;
-            }
-            if total <= max_mem {
-                break;
-            }
-            for s in 0..self.num_shards {
-                if s != self.shard_id && total > max_mem {
-                    let (tx, rx) = flume::bounded(1);
-                    let msg = ShardMessage::TryEvictOneKey {
-                        policy: policy.to_string(),
-                        responder: tx,
-                    };
-                    if self.senders[s].send(msg).is_ok()
-                        && let Some(freed) = rx.recv_async().await.unwrap_or(None)
-                    {
-                        total = total.saturating_sub(freed);
-                        freed_any = true;
-                    }
+        if policy != "noeviction" {
+            // Once over the limit, evict a little below it so the next
+            // writes don't each trigger another (possibly remote) round.
+            let target = eviction_target(max_mem);
+            let others = self.tier_stats.published_used_total(Some(self.shard_id));
+            let mut db = self.local_db.borrow_mut();
+            loop {
+                let local = db.table.used_memory();
+                if others + local <= target || local <= floor {
+                    break;
+                }
+                if db.table.try_evict_one_key(policy).is_none() {
+                    break;
                 }
             }
-            if !freed_any {
-                break;
+        }
+        !self.publish_memory_state()
+    }
+
+    /// Whether the server is over `maxmemory`, using this shard's fresh
+    /// usage (which it also publishes) and the others' published usage.
+    #[inline]
+    pub fn over_maxmemory(&self) -> bool {
+        self.publish_memory_state()
+    }
+
+    /// Re-reads every other shard's `used_memory` over the mesh and publishes
+    /// it on their behalf (each shard overwrites its slot again with fresher
+    /// values). Used before acting on a published "over the limit", since a
+    /// shard that shrank (DEL, FLUSH, decommit) republishes only on its cron.
+    /// Rate-limited to once per millisecond per shard.
+    pub async fn refresh_published_usage(&self) {
+        if self.num_shards <= 1 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .last_usage_refresh
+            .get()
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(1))
+        {
+            return;
+        }
+        self.last_usage_refresh.set(Some(now));
+        for s in 0..self.num_shards {
+            if s != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if self.senders[s]
+                    .send(ShardMessage::GetUsedMemory { responder: tx })
+                    .is_ok()
+                    && let Ok(used) = rx.recv_async().await
+                {
+                    self.tier_stats.publish_shard_used(s, used);
+                }
             }
         }
-        total <= max_mem
+    }
+
+    /// Like [`Router::over_maxmemory`], but confirms a positive answer with
+    /// fresh numbers from the other shards.
+    pub async fn over_maxmemory_checked(&self) -> bool {
+        if !self.over_maxmemory() {
+            return false;
+        }
+        self.refresh_published_usage().await;
+        self.over_maxmemory()
+    }
+
+    /// Asks shard `s` to evict down to `floor` while the server is over the
+    /// limit, appending the invalidations owed to `client_id` to `track_out`.
+    async fn evict_remote(
+        &self,
+        s: usize,
+        policy: &str,
+        floor: usize,
+        client_id: u64,
+        track_out: &mut Vec<u8>,
+    ) {
+        let (tx, rx) = flume::bounded(1);
+        if self.senders[s]
+            .send(ShardMessage::EvictUntilUnder {
+                policy: policy.to_string(),
+                floor,
+                client_id,
+                responder: tx,
+            })
+            .is_ok()
+            && let Ok((used, track)) = rx.recv_async().await
+        {
+            self.tier_stats.publish_shard_used(s, used);
+            track_out.extend_from_slice(&track);
+        }
+    }
+
+    /// Enforces `maxmemory` before a command runs, evicting while the server
+    /// is over the limit. Other shards are judged by the usage they publish
+    /// (after every write batch and every 100 ms), refreshed over the mesh
+    /// when that says "over". Returns whether the server is within its limit.
+    ///
+    /// Shards first shed what they hold beyond their fair share
+    /// (`maxmemory / shards`): this shard locally, then the others from the
+    /// most loaded down, so one connection's shard is not drained while the
+    /// excess sits elsewhere. Only if that is not enough (e.g. under
+    /// volatile-* the keys with a TTL live on a few shards) do shards evict
+    /// below their share. Tracking invalidations owed to `client_id` are
+    /// appended to `track_out`, ahead of the command's reply.
+    pub async fn evict_until_under_maxmemory(
+        &self,
+        max_mem: usize,
+        policy: &str,
+        client_id: u64,
+        track_out: &mut Vec<u8>,
+    ) -> bool {
+        self.sync_backoff_epoch();
+        if !self.over_maxmemory_checked().await {
+            return true;
+        }
+        let target = eviction_target(max_mem);
+        let share = (target / self.num_shards.max(1)).max(1);
+        let floors: &[usize] = if self.num_shards <= 1 {
+            &[0]
+        } else {
+            &[share, 0]
+        };
+        let regrowth = (max_mem / 1024).max(1024);
+        let total = || self.tier_stats.published_used_total(None);
+        for &floor in floors {
+            let (under, track) = crate::connection::with_evict_capture(client_id, || {
+                self.evict_local_until_under(policy, floor)
+            });
+            track_out.extend_from_slice(&track);
+            if self.num_shards <= 1 || policy == "noeviction" {
+                return under;
+            }
+            if total() <= target {
+                return true;
+            }
+            // A fan-out that ended over the limit backs off (like the
+            // cross-shard spill), so commands don't each pay a mesh round
+            // trip per shard while nothing evictable is left.
+            if let Some((until, at_total)) = self.remote_evict_backoff.get()
+                && total() < at_total.saturating_add(regrowth)
+                && std::time::Instant::now() < until
+            {
+                return under;
+            }
+            let mut order: Vec<usize> = (0..self.num_shards)
+                .filter(|&s| s != self.shard_id)
+                .collect();
+            order.sort_unstable_by_key(|&s| {
+                std::cmp::Reverse(self.tier_stats.published_shard_used(s))
+            });
+            for s in order {
+                if self.tier_stats.published_shard_used(s) <= floor {
+                    break;
+                }
+                self.evict_remote(s, policy, floor, client_id, track_out)
+                    .await;
+                if total() <= target {
+                    self.remote_evict_backoff.set(None);
+                    return true;
+                }
+            }
+            if !self.over_maxmemory() {
+                self.remote_evict_backoff.set(None);
+                return true;
+            }
+        }
+        self.remote_evict_backoff.set(Some((
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            total(),
+        )));
+        false
     }
 
     #[inline(always)]
@@ -721,22 +955,76 @@ impl Router {
             .tier_stats
             .offload_threshold_pct
             .load(Ordering::Relaxed);
-        let used_mem = self.local_db.borrow().table.used_memory;
+        let used_mem = self.local_db.borrow().table.used_memory();
         let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
         used_mem >= (shard_threshold * offload_pct as usize) / 100
     }
 
-    /// Decommit cooled keys, then spill hot keys to NVMe until this shard is
-    /// back under its share of `maxmemory`. Returns whether the shard ended
-    /// under its share (also `true` when no limit is set).
+    /// Decommit cooled keys, then spill hot keys to NVMe while the server is
+    /// over `maxmemory`: this shard first, then (the limit being global) the
+    /// other shards, since the excess may live where this shard cannot free
+    /// it. Returns whether the server ended within the limit (also `true`
+    /// when no limit is set).
     pub async fn check_auto_tier(&self) -> bool {
-        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
+        if self.check_auto_tier_local().await || self.num_shards <= 1 {
+            return !self.over_maxmemory();
+        }
+        // Fanning out costs a round trip per shard; after one that ends over
+        // the limit, wait a second (or for the total to grow) before the next.
+        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed) as usize;
+        let regrowth = (max_mem / 1024).max(1024);
+        let total = || self.tier_stats.published_used_total(None);
+        if let Some((until, at_total)) = self.remote_spill_backoff.get()
+            && total() < at_total.saturating_add(regrowth)
+            && std::time::Instant::now() < until
+        {
+            return false;
+        }
+        for s in 0..self.num_shards {
+            if s == self.shard_id {
+                continue;
+            }
+            let (tx, rx) = flume::bounded(1);
+            if self.senders[s]
+                .send(ShardMessage::TierAutoSpill { responder: tx })
+                .is_ok()
+                && let Ok(used) = rx.recv_async().await
+            {
+                self.tier_stats.publish_shard_used(s, used);
+            }
+            if !self.over_maxmemory() {
+                self.remote_spill_backoff.set(None);
+                return true;
+            }
+        }
+        self.remote_spill_backoff.set(Some((
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            total(),
+        )));
+        false
+    }
+
+    /// [`Router::check_auto_tier`] restricted to this shard's own keys.
+    /// Returns whether the server ended within the limit.
+    pub async fn check_auto_tier_local(&self) -> bool {
+        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed) as usize;
         if max_mem == 0 {
             return true;
         }
-        let shard_max_mem = (max_mem / self.num_shards.max(1) as u64).max(1) as usize;
-        let under = || self.local_db.borrow().table.used_memory <= shard_max_mem;
-        if self.is_auto_tiering.get() || under() {
+        // With an eviction policy, maxmemory is enforced by evicting keys
+        // before commands (Redis semantics); the tier stands in for eviction
+        // only under noeviction, where data must not be dropped.
+        if !crate::connection::max_memory_policy_is_noeviction() {
+            return !self.over_maxmemory();
+        }
+        self.sync_backoff_epoch();
+        if self.over_maxmemory() {
+            self.refresh_published_usage().await;
+        }
+        let under = || !self.over_maxmemory();
+        // Without a tier there is nothing to spill to; the scan below would
+        // walk every key and fail on each one.
+        if self.is_auto_tiering.get() || under() || self.local_db.borrow().tier_manager.is_none() {
             return under();
         }
         self.is_auto_tiering.set(true);
@@ -749,33 +1037,55 @@ impl Router {
         }
 
         // Phase 2: Spill Hot keys to NVMe disk in 64-key slices until under target_mem.
-        // Stop once a full pass over the table spills nothing, otherwise a shard
-        // whose keys cannot be spilled would spin here forever.
-        let target_mem = shard_max_mem.saturating_sub((shard_max_mem / 20).max(128 * 1024));
-        let mut fruitless = 0usize;
-        loop {
-            if self.local_db.borrow().table.used_memory <= target_mem {
-                break;
-            }
-            let pass_len = self.local_db.borrow_mut().table.dbsize().max(1);
-            if fruitless >= pass_len {
+        // Work per call is bounded (this runs inline on the write path when
+        // over budget), progress is judged by used_memory actually dropping
+        // (spilling small values can grow it: the tier pointer outweighs the
+        // value), and after a pass that frees nothing we back off for a
+        // second instead of rescanning the table on every write.
+        let regrowth = (max_mem / 1024).max(1024);
+        if self.local_db.borrow().table.used_memory()
+            < self.spill_backoff_used.get().saturating_add(regrowth)
+            && self
+                .spill_backoff_until
+                .get()
+                .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            self.is_auto_tiering.set(false);
+            return under();
+        }
+        // Local target so that, with the other shards' published usage, the
+        // server ends a little below the limit.
+        let others = self.tier_stats.published_used_total(Some(self.shard_id));
+        let target_mem = max_mem
+            .saturating_sub((max_mem / 20).max(128 * 1024))
+            .saturating_sub(others);
+        let start_used = self.local_db.borrow().table.used_memory();
+        let mut attempts = 0usize;
+        let mut exhausted = false;
+        while attempts < MAX_SPILL_ATTEMPTS_PER_CALL {
+            if self.local_db.borrow().table.used_memory() <= target_mem {
                 break;
             }
             let hot_keys = self.local_db.borrow_mut().table.get_hot_keys_for_spill(64);
             if hot_keys.is_empty() {
+                exhausted = true;
                 break;
             }
             for k in hot_keys {
-                if self.spill_local_internal(&k, false).await {
-                    fruitless = 0;
-                } else {
-                    fruitless += 1;
-                }
-                if self.local_db.borrow().table.used_memory <= target_mem {
+                attempts += 1;
+                self.spill_local_internal(&k, false).await;
+                if self.local_db.borrow().table.used_memory() <= target_mem {
                     break;
                 }
             }
         }
+        let end_used = self.local_db.borrow().table.used_memory();
+        let freed_nothing = end_used >= start_used;
+        self.spill_backoff_used.set(end_used);
+        self.spill_backoff_until.set(
+            (exhausted || freed_nothing)
+                .then(|| std::time::Instant::now() + std::time::Duration::from_secs(1)),
+        );
 
         let tm = self.local_db.borrow().tier_manager.clone();
         if let Some(tm) = tm {
@@ -960,34 +1270,23 @@ impl Router {
         if target == self.shard_id {
             self.get_local_checked(&key).await
         } else {
-            let (tx, rx) = self.acquire_notify_channel();
-            let desc = Arc::new(crate::mailbox::FastGetDescriptor::new(key, tx.clone()));
+            let desc = Arc::new(crate::mailbox::FastGetDescriptor::new(key));
             let msg = ShardMessage::FastGet {
                 descriptor: desc.clone(),
             };
-            let res = if self.senders[target].send(msg).is_ok() {
-                if !desc.done.load(Ordering::Acquire) {
-                    for _ in 0..crate::mailbox::cross_shard_spin() {
-                        std::hint::spin_loop();
-                        if desc.done.load(Ordering::Acquire) {
-                            break;
-                        }
-                    }
-                    if !desc.done.load(Ordering::Acquire) {
-                        let _ = rx.recv_async().await;
-                    }
-                }
-                while rx.try_recv().is_ok() {}
+            if self.senders[target].send(msg).is_ok() {
+                desc.wait_done(crate::mailbox::cross_shard_spin()).await;
                 if desc.wrong_type.load(Ordering::Relaxed) {
                     Err(WRONGTYPE_ERR)
                 } else {
+                    // SAFETY: `wait_done` observed the remote shard's Release store of `done`,
+                    // which follows its write of `val` in `finish`; it never touches `val` again
+                    // and we are the only reader.
                     Ok(unsafe { (*desc.val.get()).take() })
                 }
             } else {
                 Ok(None)
-            };
-            self.release_notify_channel(tx, rx);
-            res
+            }
         }
     }
 
@@ -1158,45 +1457,31 @@ impl Router {
             }
             let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
             if max_mem > 0 {
-                let used = self.local_db.borrow().table.used_memory;
+                let used = self.local_db.borrow().table.used_memory();
                 let shard_max_mem = (max_mem / self.num_shards.max(1) as u64) as usize;
                 if used > shard_max_mem && !self.is_auto_tiering.get() {
                     let decommitted = self.decommit_local(None);
-                    let used_after = self.local_db.borrow().table.used_memory;
+                    let used_after = self.local_db.borrow().table.used_memory();
                     if (decommitted == 0 || used_after > shard_max_mem)
                         && !self.is_auto_tiering.get()
                     {
                         let r = self.clone();
                         monoio::spawn(async move {
-                            r.check_auto_tier().await;
+                            r.check_auto_tier_local().await;
                         });
                     }
                 }
             }
         } else {
-            let (tx, rx) = self.acquire_notify_channel();
             let desc = Arc::new(crate::mailbox::FastSetDescriptor::new(
-                key,
-                value,
-                expire_in,
-                tx.clone(),
+                key, value, expire_in,
             ));
             let msg = ShardMessage::FastSet {
                 descriptor: desc.clone(),
             };
-            if self.senders[target].send(msg).is_ok() && !desc.done.load(Ordering::Acquire) {
-                for _ in 0..crate::mailbox::cross_shard_spin() {
-                    std::hint::spin_loop();
-                    if desc.done.load(Ordering::Acquire) {
-                        break;
-                    }
-                }
-                if !desc.done.load(Ordering::Acquire) {
-                    let _ = rx.recv_async().await;
-                }
-                while rx.try_recv().is_ok() {}
+            if self.senders[target].send(msg).is_ok() {
+                desc.wait_done(crate::mailbox::cross_shard_spin()).await;
             }
-            self.release_notify_channel(tx, rx);
         }
     }
 
@@ -1204,31 +1489,27 @@ impl Router {
     pub(crate) fn check_auto_tier_after_write(&self) {
         let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
         if max_mem > 0 {
-            let used = self.local_db.borrow().table.used_memory;
+            let used = self.local_db.borrow().table.used_memory();
             let shard_max_mem = (max_mem / self.num_shards.max(1) as u64) as usize;
-            if used > shard_max_mem && !self.is_auto_tiering.get() {
+            if used > shard_max_mem
+                && !self.is_auto_tiering.get()
+                && crate::connection::max_memory_policy_is_noeviction()
+            {
                 let decommitted = self.decommit_local(None);
-                let used_after = self.local_db.borrow().table.used_memory;
+                let used_after = self.local_db.borrow().table.used_memory();
                 if (decommitted == 0 || used_after > shard_max_mem) && !self.is_auto_tiering.get() {
                     let r = self.clone();
                     monoio::spawn(async move {
-                        r.check_auto_tier().await;
+                        r.check_auto_tier_local().await;
                     });
                 }
-
-                // If memory is still above threshold after decommit/offload, evict keys based on maxmemory-policy
-                let policy = crate::connection::get_max_memory_policy();
-                if policy != "noeviction" {
-                    let mut db = self.local_db.borrow_mut();
-                    let mut attempts = 0;
-                    while db.table.used_memory > shard_max_mem && attempts < 32 {
-                        attempts += 1;
-                        if db.table.try_evict_one_key(&policy).is_none() {
-                            break;
-                        }
-                    }
-                }
             }
+            // Publish this shard's usage for the other shards' gates. No
+            // eviction here: like Redis, keys are evicted only before a
+            // command runs (the gate in `execute_command`; squashed batches
+            // fall back to it when over the limit). Evicting after a write
+            // would send tracking invalidations ahead of that write's reply.
+            self.publish_memory_state();
         }
     }
 
@@ -1561,6 +1842,9 @@ impl Router {
 
         out.reserve(total_keys * 32 + 16);
         crate::connection::write_resp_array_header(out, total_keys);
+        // SAFETY: `wait_completed` observed DESC_COMPLETED (Acquire) after every
+        // remote shard's `finish_shard`, so all result writes are visible and no
+        // shard writes the slots anymore; `results[i]` is bounds-checked.
         unsafe {
             for i in 0..total_keys {
                 let slot = (*descriptor.results[i].get()).take();
@@ -2335,7 +2619,6 @@ impl Router {
             let idle = now.duration_since(client.last_active).as_secs();
             let is_blocked = crate::block::get_block_hub_for_port(self.port)
                 .lock()
-                .unwrap()
                 .is_blocked(client.id);
             let flags = if client.is_monitor {
                 "O"
@@ -2412,7 +2695,8 @@ impl Router {
 
     pub async fn reset_command_stats(&self) {
         crate::connection::reset_local_cmd_stats();
-        if let Ok(mut map) = crate::connection::CMD_STATS.write() {
+        {
+            let mut map = crate::connection::CMD_STATS.write();
             map.clear();
         }
         for (shard_id, sender) in self.senders.iter().enumerate() {
@@ -2447,7 +2731,7 @@ impl Router {
             .pop()
             .unwrap_or_else(|| std::sync::Arc::new(crate::mailbox::BatchResponder::new()));
         let mut slot = crate::shard::CompactResp::empty();
-        responder.prepare(&mut slot as *mut _);
+        responder.prepare(&mut slot as *mut _, 1);
         let h = crate::connection::cmd_primary_key(&cmd)
             .map(|k| crate::table::hash_key(k))
             .unwrap_or(0);
@@ -2525,7 +2809,7 @@ impl Router {
                 .borrow_mut()
                 .pop()
                 .unwrap_or_else(|| std::sync::Arc::new(crate::mailbox::BatchResponder::new()));
-            responder.prepare(&mut slots[i] as *mut _);
+            responder.prepare(&mut slots[i] as *mut _, 1);
             let h = crate::connection::cmd_primary_key(&cmd)
                 .map(|k| crate::table::hash_key(k))
                 .unwrap_or(0);
@@ -2609,13 +2893,39 @@ impl Router {
         total
     }
 
+    /// Server-wide `(keys, keys with a TTL)` for `INFO keyspace`.
+    pub async fn keyspace_stats(&self) -> (usize, usize) {
+        let (mut keys, mut expires) = {
+            let mut db = self.local_db.borrow_mut();
+            let k = db.dbsize();
+            (k, db.table.num_expires.min(k))
+        };
+        for res in self
+            .execute_remote_many(self.to_other_shards(|| Command::KeyspaceStats))
+            .await
+        {
+            let mut nums = res
+                .split(|&b| b == b'\n')
+                .filter_map(|l| l.strip_prefix(b":"))
+                .filter_map(|l| {
+                    std::str::from_utf8(l)
+                        .ok()?
+                        .trim_end()
+                        .parse::<usize>()
+                        .ok()
+                });
+            keys += nums.next().unwrap_or(0);
+            expires += nums.next().unwrap_or(0);
+        }
+        (keys, expires)
+    }
+
     pub async fn flushdb(&self) {
         {
             let mut db = self.local_db.borrow_mut();
             db.flushdb();
             crate::block::get_block_hub_for_port(self.port)
                 .lock()
-                .unwrap()
                 .notify_all_streams(&mut db);
         }
         self.log_mutation(|| Command::Flushdb);
@@ -2983,7 +3293,7 @@ impl Router {
             {
                 s.clone()
             } else if let Some(idx_arc) = crate::search::get_search_index(index) {
-                let idx = idx_arc.read().unwrap();
+                let idx = idx_arc.read();
                 idx.schema
                     .clone()
                     .ok_or_else(|| format!("Unknown Index name: {}", index))?
@@ -3080,7 +3390,7 @@ impl Router {
             if let Some(idx) = db.search_indices.get(index) {
                 crate::search::execute_search(idx, ast, &scatter_opts)
             } else if let Some(idx_arc) = crate::search::get_search_index(index) {
-                let idx = idx_arc.read().unwrap();
+                let idx = idx_arc.read();
                 crate::search::execute_search(&idx, ast, &scatter_opts)
             } else {
                 (0, Vec::new())
@@ -3973,7 +4283,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(router.mset(pairs));
-        let used = db.borrow().table.used_memory;
+        let used = db.borrow().table.used_memory();
         // Limit below current usage but above what remains once values are offloaded.
         let limit = used - 64 * 2048;
         crate::tiering::set_max_memory(port, limit as u64);
@@ -4262,6 +4572,9 @@ mod tests {
     #[test]
     fn test_check_auto_tier_spills_under_limit() {
         let port = 19872;
+        // Auto-tier spilling only runs under `noeviction`; pin it.
+        let _policy_guard = crate::connection::MAX_MEMORY_POLICY_TEST_LOCK.lock();
+        crate::connection::set_max_memory_policy("noeviction");
         let (router, db) = single_shard_router(port);
         let limit = fill_and_limit(&router, &db, port);
         let dir = std::env::temp_dir().join(format!("rudis-autotier-{}", std::process::id()));
@@ -4275,7 +4588,7 @@ mod tests {
                 .unwrap();
             db.borrow_mut().tier_manager = Some(Rc::new(tm));
             assert!(router.check_auto_tier().await);
-            assert!(db.borrow().table.used_memory <= limit);
+            assert!(db.borrow().table.used_memory() <= limit);
             assert_eq!(
                 router.get(Bytes::from_static(b"tier_k0")).await,
                 Some(Bytes::from(vec![b'v'; 4096]))
@@ -4485,7 +4798,7 @@ mod tests {
         let k0 = k_shard0.unwrap();
         let k1 = k_shard1.unwrap();
 
-        let rx1_clone = rx1.clone();
+        let rx1_clone = rx1;
         std::thread::spawn(move || {
             let mut remote_db = ShardDb::new(9999);
             while let Ok(msg) = rx1_clone.recv() {
@@ -4592,7 +4905,7 @@ mod tests {
         let k0 = k_shard0.unwrap();
         let k1 = k_shard1.unwrap();
 
-        let rx1_clone = rx1.clone();
+        let rx1_clone = rx1;
         let k1_remote = k1.clone();
         std::thread::spawn(move || {
             let mut remote_db = ShardDb::new(9998);
@@ -4671,7 +4984,7 @@ mod tests {
             }
         }
         let k1 = k_shard1.unwrap();
-        let rx1_clone = rx1.clone();
+        let rx1_clone = rx1;
         let k1_remote = k1.clone();
 
         std::thread::spawn(move || {
@@ -4711,14 +5024,16 @@ mod tests {
             .unwrap();
 
         rt.block_on(async move {
+            // Remote GETs signal through the descriptor's own doorbell and
+            // no longer take a channel from the pool.
             assert_eq!(router.notify_channel_pool.borrow().len(), 0);
             let val1 = router.get(k1.clone()).await;
             assert_eq!(val1, Some(Bytes::from("pool_val")));
-            assert_eq!(router.notify_channel_pool.borrow().len(), 1);
+            assert_eq!(router.notify_channel_pool.borrow().len(), 0);
 
             let val2 = router.get(k1.clone()).await;
             assert_eq!(val2, Some(Bytes::from("pool_val")));
-            assert_eq!(router.notify_channel_pool.borrow().len(), 1);
+            assert_eq!(router.notify_channel_pool.borrow().len(), 0);
 
             assert_eq!(router.remote_responder_pool.borrow().len(), 0);
             let resp1 = router.execute_remote(1, Command::Ping(None)).await;
@@ -4765,7 +5080,7 @@ mod tests {
         }
         let k0 = k_shard0.unwrap();
         let k1 = k_shard1.unwrap();
-        let rx1_clone = rx1.clone();
+        let rx1_clone = rx1;
 
         std::thread::spawn(move || {
             let mut remote_db = ShardDb::new(9996);
@@ -4896,7 +5211,7 @@ mod tests {
         }
         let k0 = k_shard0.unwrap();
         let k1 = k_shard1.unwrap();
-        let rx1_clone = rx1.clone();
+        let rx1_clone = rx1;
 
         std::thread::spawn(move || {
             let mut remote_db = ShardDb::new(9994);
@@ -5002,7 +5317,7 @@ mod tests {
         }
         let k0 = k_shard0.unwrap();
         let k1 = k_shard1.unwrap();
-        let rx1_clone = rx1.clone();
+        let rx1_clone = rx1;
 
         std::thread::spawn(move || {
             let mut remote_db = ShardDb::new(9995);
@@ -5110,7 +5425,7 @@ mod tests {
         }
         let k0 = k_shard0.unwrap();
         let k1 = k_shard1.unwrap();
-        let rx1_clone = rx1.clone();
+        let rx1_clone = rx1;
 
         std::thread::spawn(move || {
             let remote_db = ShardDb::new(9996);
@@ -5193,7 +5508,7 @@ mod tests {
         }
         let k0 = k_shard0.unwrap();
         let k1 = k_shard1.unwrap();
-        let rx1_clone = rx1.clone();
+        let rx1_clone = rx1;
 
         std::thread::spawn(move || {
             let mut remote_db = ShardDb::new(9997);
@@ -5262,9 +5577,7 @@ mod tests {
 
     #[test]
     fn test_router_del_keys_publishes_del_events() {
-        let _flags = crate::connection::NOTIFY_FLAGS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _flags = crate::connection::NOTIFY_FLAGS_TEST_LOCK.lock();
         let (mut senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
         let db0 = Rc::new(RefCell::new(ShardDb::new(9996)));
         let pubsub = Rc::new(RefCell::new(crate::pubsub::PubSubHub::new()));

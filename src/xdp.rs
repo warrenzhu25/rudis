@@ -1,7 +1,8 @@
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +157,7 @@ impl<T: Clone + Default> XskRing<T> {
             return false; // Ring full
         }
         let idx = (prod & self.mask) as usize;
-        *self.entries[idx].write().unwrap() = item;
+        *self.entries[idx].write() = item;
         self.producer.store(prod.wrapping_add(1), Ordering::Release);
         true
     }
@@ -169,7 +170,7 @@ impl<T: Clone + Default> XskRing<T> {
             return None; // Ring empty
         }
         let idx = (cons & self.mask) as usize;
-        let item = self.entries[idx].read().unwrap().clone();
+        let item = self.entries[idx].read().clone();
         self.consumer.store(cons.wrapping_add(1), Ordering::Release);
         Some(item)
     }
@@ -208,7 +209,7 @@ impl XskUmem {
     }
 
     pub fn write_frame(&self, frame_idx: usize, data: &[u8]) {
-        let mut frames = self.frames.write().unwrap();
+        let mut frames = self.frames.write();
         if let Some(frame) = frames.get_mut(frame_idx) {
             let len = data.len().min(self.frame_size);
             frame[..len].copy_from_slice(&data[..len]);
@@ -216,7 +217,7 @@ impl XskUmem {
     }
 
     pub fn read_frame(&self, frame_idx: usize, len: usize) -> Vec<u8> {
-        let frames = self.frames.read().unwrap();
+        let frames = self.frames.read();
         if let Some(frame) = frames.get(frame_idx) {
             let actual_len = len.min(self.frame_size).min(frame.len());
             frame[..actual_len].to_vec()
@@ -379,13 +380,13 @@ impl XdpEngine {
             network,
             netmask,
         };
-        let mut rules = self.rules.write().unwrap();
+        let mut rules = self.rules.write();
         rules.push(rule);
         Ok(id)
     }
 
     pub fn del_rule(&self, id: u32) -> Result<(), String> {
-        let mut rules = self.rules.write().unwrap();
+        let mut rules = self.rules.write();
         let initial_len = rules.len();
         rules.retain(|r| r.id != id);
         if rules.len() < initial_len {
@@ -396,7 +397,7 @@ impl XdpEngine {
     }
 
     pub fn list_rules(&self) -> Vec<XdpRule> {
-        let rules = self.rules.read().unwrap();
+        let rules = self.rules.read();
         rules.clone()
     }
 
@@ -451,7 +452,7 @@ impl XdpEngine {
 
         if let Some(ip) = src_ip {
             // 1. Check eBPF CIDR Filter Rules
-            let rules = self.rules.read().unwrap();
+            let rules = self.rules.read();
             for r in rules.iter() {
                 if (ip & r.netmask) == r.network {
                     match r.action {
@@ -473,7 +474,7 @@ impl XdpEngine {
             }
 
             // 2. Token Bucket IP Rate Limiter
-            let mut limiters = self.rate_limiters.write().unwrap();
+            let mut limiters = self.rate_limiters.write();
             let bucket = limiters.entry(ip).or_insert_with(|| {
                 TokenBucket::new(self.default_rate_capacity, self.default_rate_limit)
             });
@@ -492,7 +493,7 @@ impl XdpEngine {
     }
 
     pub fn get_or_create_socket(&self, port: u16, queue_id: u32) -> Arc<XskSocket> {
-        let mut sockets = self.sockets.write().unwrap();
+        let mut sockets = self.sockets.write();
         sockets
             .entry((port, queue_id))
             .or_insert_with(|| Arc::new(XskSocket::new(queue_id, self.frame_size, self.num_frames)))
@@ -500,16 +501,16 @@ impl XdpEngine {
     }
 
     pub fn get_socket(&self, port: u16, queue_id: u32) -> Option<Arc<XskSocket>> {
-        self.sockets.read().unwrap().get(&(port, queue_id)).cloned()
+        self.sockets.read().get(&(port, queue_id)).cloned()
     }
 
     pub fn list_sockets(&self) -> Vec<(u16, u32)> {
-        self.sockets.read().unwrap().keys().copied().collect()
+        self.sockets.read().keys().copied().collect()
     }
 
     pub fn info(&self) -> String {
-        let rules_count = self.rules.read().unwrap().len();
-        let sockets_count = self.sockets.read().unwrap().len();
+        let rules_count = self.rules.read().len();
+        let sockets_count = self.sockets.read().len();
         format!(
             "# XDP Kernel Bypass\r\n\
             interface:{}\r\n\

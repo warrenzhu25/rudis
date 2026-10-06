@@ -584,9 +584,24 @@ pub enum ShardMessage {
     GetUsedMemory {
         responder: flume::Sender<usize>,
     },
+    /// Run `check_auto_tier_local` (spill this shard's hot keys while the
+    /// server is over `maxmemory`); replies with the shard's `used_memory`.
+    TierAutoSpill {
+        responder: flume::Sender<usize>,
+    },
     TryEvictOneKey {
         policy: String,
         responder: flume::Sender<Option<usize>>,
+    },
+    /// Evict this shard's keys under `policy` while the server is over
+    /// `maxmemory` and the shard holds more than `floor` bytes; replies with
+    /// the shard's `used_memory` and the tracking invalidations owed to
+    /// `client_id` (delivered by the requester ahead of its reply).
+    EvictUntilUnder {
+        policy: String,
+        floor: usize,
+        client_id: u64,
+        responder: flume::Sender<(usize, Vec<u8>)>,
     },
     StreamColdRead {
         key: Bytes,
@@ -713,10 +728,8 @@ impl ShardDb {
                 {
                     let key_str = String::from_utf8_lossy(&key);
                     idx.add_hash_document(&key_str, &raw);
-                    if let Some(ref g) = global_idx
-                        && let Ok(mut g_idx) = g.write()
-                    {
-                        g_idx.add_hash_document(&key_str, &raw);
+                    if let Some(ref g) = global_idx {
+                        g.write().add_hash_document(&key_str, &raw);
                     }
                 }
             }
@@ -732,10 +745,9 @@ impl ShardDb {
                     let (extracted_fields, extracted_vectors) =
                         crate::search::extract_json_fields(&schema, doc);
                     idx.add_document(&k_str, extracted_fields.clone(), extracted_vectors.clone());
-                    if let Some(ref g) = global_idx
-                        && let Ok(mut g_idx) = g.write()
-                    {
-                        g_idx.add_document(&k_str, extracted_fields, extracted_vectors);
+                    if let Some(ref g) = global_idx {
+                        g.write()
+                            .add_document(&k_str, extracted_fields, extracted_vectors);
                     }
                 }
             }
@@ -751,10 +763,8 @@ impl ShardDb {
                         Some(meta.vector_fields)
                     };
                     idx.add_document(&key_str, meta.fields.clone(), vecs.clone());
-                    if let Some(ref g) = global_idx
-                        && let Ok(mut g_idx) = g.write()
-                    {
-                        g_idx.add_document(&key_str, meta.fields, vecs);
+                    if let Some(ref g) = global_idx {
+                        g.write().add_document(&key_str, meta.fields, vecs);
                     }
                 }
             }
@@ -1016,6 +1026,7 @@ impl ShardDb {
 
     #[inline(always)]
     pub fn incr_by_slice_fast(&mut self, key: &Bytes, delta: i64) -> Result<i64, &'static str> {
+        self.hydrate_key(key);
         let res = self.table.incr_by_slice_fast(key, delta);
         self.drain_dropped_tier();
         res
@@ -1023,6 +1034,7 @@ impl ShardDb {
 
     #[inline]
     pub fn incr_by_slice(&mut self, key: &[u8], delta: i64) -> Result<i64, &'static str> {
+        self.hydrate_key(key);
         let res = self.table.incr_by_slice(key, delta);
         self.drain_dropped_tier();
         res
@@ -1030,6 +1042,7 @@ impl ShardDb {
 
     #[inline]
     pub fn incr_by(&mut self, key: Bytes, delta: i64) -> Result<i64, String> {
+        self.hydrate_key(&key);
         let res = self.table.incr_by(key, delta);
         self.drain_dropped_tier();
         res
@@ -2423,6 +2436,88 @@ impl ShardDb {
         let raw = self.read_tiered_payload(ptr)?;
         let (val, used) = crate::table::RudisTable::deserialize_val_payload(&raw).ok()?;
         (used == raw.len()).then_some(val)
+    }
+
+    /// Brings `cmd`'s keys that live on the tier (spilled to disk, or cooled)
+    /// back to plain in-memory values before it runs: the data-type commands
+    /// only understand in-memory values and would otherwise answer
+    /// WRONGTYPE (or act on the wrong data) for a key auto-tiering spilled.
+    /// GET/MGET are left alone, they stream cold values without promoting
+    /// them; so are commands that don't read the value. A no-op unless the
+    /// server has tiered or cooled keys.
+    pub fn hydrate_cmd_keys(&mut self, cmd: &crate::resp::Command) {
+        use crate::resp::Command;
+        let Some(tm) = self.tier_manager.as_ref() else {
+            return;
+        };
+        let stats = tm.stats.clone();
+        if stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed) == 0
+            && stats.cooled_keys.load(std::sync::atomic::Ordering::Relaxed) == 0
+        {
+            return;
+        }
+        if matches!(
+            cmd,
+            Command::Get(_)
+                | Command::Mget(_)
+                | Command::Del(_)
+                | Command::Unlink(_)
+                | Command::Exists(_)
+                | Command::Type(_)
+        ) {
+            return;
+        }
+        let mut keys: smallvec::SmallVec<[&[u8]; 4]> = smallvec::SmallVec::new();
+        crate::connection::for_each_cmd_key(cmd, |k| keys.push(k));
+        for key in keys {
+            self.hydrate_key_unchecked(key);
+        }
+        self.drain_dropped_tier();
+    }
+
+    /// [`ShardDb::hydrate_cmd_keys`] for one key.
+    #[inline]
+    pub fn hydrate_key(&mut self, key: &[u8]) {
+        let Some(tm) = self.tier_manager.as_ref() else {
+            return;
+        };
+        if tm
+            .stats
+            .tiered_keys
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+            && tm
+                .stats
+                .cooled_keys
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+        {
+            return;
+        }
+        self.hydrate_key_unchecked(key);
+        self.drain_dropped_tier();
+    }
+
+    fn hydrate_key_unchecked(&mut self, key: &[u8]) {
+        let Some(stats) = self.tier_manager.as_ref().map(|tm| tm.stats.clone()) else {
+            return;
+        };
+        if let Some(ptr) = self.table.is_tiered(key) {
+            let Some(val) = self.hydrate_tiered(ptr) else {
+                return;
+            };
+            let payload_len = ptr.length as u64;
+            if self.table.restore_tiered_value(key, val) {
+                use std::sync::atomic::Ordering::Relaxed;
+                stats.total_fetches.fetch_add(1, Relaxed);
+                stats.tiered_keys.fetch_sub(1, Relaxed);
+                stats.cooled_keys.fetch_add(1, Relaxed);
+                let _ = stats
+                    .ram_saved_bytes
+                    .try_update(Relaxed, Relaxed, |v| Some(v.saturating_sub(payload_len)));
+            }
+        }
+        self.table.warm_key(key);
     }
 
     pub fn save_extended_rdb_chunk(&self, buf: &mut Vec<u8>) {

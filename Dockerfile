@@ -22,8 +22,8 @@ COPY Cargo.toml Cargo.lock ./
 # Copy source code
 COPY src ./src
 
-# Build release binary
-RUN cargo build --release --bin rudis
+# Build the shipped binary with the fat-LTO `dist` profile (see Cargo.toml)
+RUN cargo build --profile dist --bin rudis
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim AS runtime
@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd -r rudis && useradd -r -g rudis -d /var/lib/rudis -m -s /sbin/nologin rudis
 
 # Copy binary from builder
-COPY --from=builder /usr/src/rudis/target/release/rudis /usr/local/bin/rudis
+COPY --from=builder /usr/src/rudis/target/dist/rudis /usr/local/bin/rudis
 
 # Create data directory
 RUN mkdir -p /var/lib/rudis && chown -R rudis:rudis /var/lib/rudis

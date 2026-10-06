@@ -1,11 +1,12 @@
 use crate::resp::Command;
 use bytes::Bytes;
 use mlua::{Lua, MultiValue, Value};
+use parking_lot::RwLock;
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::{LazyLock, RwLock};
+use std::sync::LazyLock;
 
 static SCRIPT_CACHE: LazyLock<RwLock<HashMap<String, String>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -25,20 +26,17 @@ pub fn sha1_hex(data: &[u8]) -> String {
 pub fn load_script(script: &[u8]) -> String {
     let sha = sha1_hex(script);
     let script_str = String::from_utf8_lossy(script).to_string();
-    SCRIPT_CACHE
-        .write()
-        .unwrap()
-        .insert(sha.clone(), script_str);
+    SCRIPT_CACHE.write().insert(sha.clone(), script_str);
     sha
 }
 
 pub fn get_script(sha: &str) -> Option<String> {
     let sha_lower = sha.to_lowercase();
-    SCRIPT_CACHE.read().unwrap().get(&sha_lower).cloned()
+    SCRIPT_CACHE.read().get(&sha_lower).cloned()
 }
 
 pub fn script_exists(shas: &[Bytes]) -> Vec<bool> {
-    let cache = SCRIPT_CACHE.read().unwrap();
+    let cache = SCRIPT_CACHE.read();
     shas.iter()
         .map(|s| {
             let s_str = String::from_utf8_lossy(s).to_lowercase();
@@ -48,11 +46,11 @@ pub fn script_exists(shas: &[Bytes]) -> Vec<bool> {
 }
 
 pub fn flush_scripts() {
-    SCRIPT_CACHE.write().unwrap().clear();
+    SCRIPT_CACHE.write().clear();
 }
 
 pub fn cached_scripts_count() -> usize {
-    SCRIPT_CACHE.read().unwrap().len()
+    SCRIPT_CACHE.read().len()
 }
 
 /// A registered Redis 7 Function definition
@@ -103,7 +101,7 @@ pub fn is_sha_read_only(sha: &[u8]) -> bool {
 }
 
 pub fn is_function_read_only(name: &str) -> bool {
-    let cache = FUNCTION_LIBS.read().unwrap();
+    let cache = FUNCTION_LIBS.read();
     for l in cache.values() {
         for f in &l.functions {
             if f.name.eq_ignore_ascii_case(name) {
@@ -115,12 +113,12 @@ pub fn is_function_read_only(name: &str) -> bool {
 }
 
 pub fn count_functions() -> usize {
-    let cache = FUNCTION_LIBS.read().unwrap();
+    let cache = FUNCTION_LIBS.read();
     cache.values().map(|l| l.functions.len()).sum()
 }
 
 pub fn count_libraries() -> usize {
-    FUNCTION_LIBS.read().unwrap().len()
+    FUNCTION_LIBS.read().len()
 }
 
 /// Where a script that declared no keys may still run. With several shards
@@ -283,7 +281,7 @@ pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
     }
 
     {
-        let cache = FUNCTION_LIBS.read().unwrap();
+        let cache = FUNCTION_LIBS.read();
         if cache.keys().any(|k| k.eq_ignore_ascii_case(&lib_name)) && !replace {
             return Err(format!("ERR Library '{}' already exists", lib_name));
         }
@@ -579,7 +577,7 @@ pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
         return Err("ERR No functions registered".to_string());
     }
 
-    let mut cache = FUNCTION_LIBS.write().unwrap();
+    let mut cache = FUNCTION_LIBS.write();
     // Check cross-library function name collision
     for existing_lib in cache.values() {
         if !existing_lib.name.eq_ignore_ascii_case(&lib_name) {
@@ -617,13 +615,13 @@ pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
 
 /// Returns list of registered libraries and functions
 pub fn list_functions() -> Vec<FunctionLib> {
-    let cache = FUNCTION_LIBS.read().unwrap();
+    let cache = FUNCTION_LIBS.read();
     cache.values().cloned().collect()
 }
 
 /// Delete a registered function library
 pub fn delete_function(lib_name: &str) -> bool {
-    let mut cache = FUNCTION_LIBS.write().unwrap();
+    let mut cache = FUNCTION_LIBS.write();
     if let Some(k) = cache
         .keys()
         .find(|k| k.eq_ignore_ascii_case(lib_name))
@@ -637,7 +635,7 @@ pub fn delete_function(lib_name: &str) -> bool {
 
 /// Flush all registered function libraries
 pub fn flush_functions() {
-    let mut cache = FUNCTION_LIBS.write().unwrap();
+    let mut cache = FUNCTION_LIBS.write();
     let func_count: usize = cache.values().map(|l| l.functions.len()).sum();
     if func_count > 64 {
         crate::table::add_lazyfreed_objects((func_count + 1) as u64);
@@ -646,7 +644,7 @@ pub fn flush_functions() {
 }
 
 pub fn dump_functions() -> Vec<u8> {
-    let cache = FUNCTION_LIBS.read().unwrap();
+    let cache = FUNCTION_LIBS.read();
     let libs: Vec<FunctionLib> = cache.values().cloned().collect();
     let json = serde_json::to_vec(&libs).unwrap_or_default();
     let mut out = Vec::with_capacity(16 + json.len());
@@ -676,7 +674,7 @@ pub fn restore_functions(payload: &[u8], policy: &str) -> Result<(), String> {
     let libs: Vec<FunctionLib> = serde_json::from_slice(json)
         .map_err(|_| "ERR DUMP payload version or checksum are wrong".to_string())?;
 
-    merge_function_libs(&mut FUNCTION_LIBS.write().unwrap(), libs, policy)
+    merge_function_libs(&mut FUNCTION_LIBS.write(), libs, policy)
 }
 
 /// Adds restored `libs` to `cache` under FUNCTION RESTORE's `policy`.
@@ -821,7 +819,7 @@ pub fn call_function(
 ) -> Result<Vec<u8>, String> {
     SCRIPT_RECORDED_ERROR.set(false);
     let (lib, func_def) = {
-        let cache = FUNCTION_LIBS.read().unwrap();
+        let cache = FUNCTION_LIBS.read();
         let mut found = None;
         for l in cache.values() {
             if let Some(f) = l
@@ -843,116 +841,125 @@ pub fn call_function(
     let effective_read_only = read_only || func_def.flags.iter().any(|f| f == "no-writes");
 
     let lua = Lua::new();
-    let aof_raw = aof.map(|a| a as *const _);
-    let script_resp_ver = Rc::new(RefCell::new(2u8));
-    setup_redis_lua_env(
-        &lua,
-        db,
-        aof_raw,
-        effective_read_only,
-        script_resp_ver.clone(),
-    )?;
+    // A scope lets `redis.call`/`redis.pcall` borrow `aof` for exactly this
+    // run instead of smuggling it in as a raw pointer.
+    #[allow(clippy::redundant_closure_call)]
+    lua.scope(|scope| {
+        Ok((|| -> Result<Vec<u8>, String> {
+            let script_resp_ver = Rc::new(RefCell::new(2u8));
+            setup_redis_lua_env(
+                &lua,
+                scope,
+                db,
+                aof,
+                effective_read_only,
+                script_resp_ver.clone(),
+            )?;
 
-    // Set KEYS table
-    let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
-    for (i, k) in keys.iter().enumerate() {
-        let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
-        keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
-    }
-
-    // Set ARGV table
-    let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
-    for (i, a) in args.iter().enumerate() {
-        let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
-        argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
-    }
-
-    // Capture target function during library load phase
-    let target_fn = Rc::new(RefCell::new(None));
-    let target_fn_clone = target_fn.clone();
-    let target_name_lower = func_name.to_lowercase();
-    let in_load_phase = Rc::new(std::cell::Cell::new(true));
-    let in_load_phase_clone = in_load_phase.clone();
-
-    let reg_fn = lua
-        .create_function(move |lua, margs: MultiValue| {
-            if !in_load_phase_clone.get() {
-                return Err(mlua::Error::RuntimeError(
-                    "redis.register_function can only be called on FUNCTION LOAD command"
-                        .to_string(),
-                ));
+            // Set KEYS table
+            let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
+            for (i, k) in keys.iter().enumerate() {
+                let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
+                keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
             }
-            let mut name_opt = None;
-            let mut func_opt = None;
-            if let Some(first) = margs.iter().next() {
-                match first {
-                    Value::String(s) => {
-                        if let Ok(name_str) = s.to_str() {
-                            name_opt = Some(name_str.to_string());
-                        }
-                        if let Some(Value::Function(f)) = margs.iter().nth(1) {
-                            func_opt = Some(f.clone());
+
+            // Set ARGV table
+            let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
+            for (i, a) in args.iter().enumerate() {
+                let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
+                argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+            }
+
+            // Capture target function during library load phase
+            let target_fn = Rc::new(RefCell::new(None));
+            let target_fn_clone = target_fn.clone();
+            let target_name_lower = func_name.to_lowercase();
+            let in_load_phase = Rc::new(std::cell::Cell::new(true));
+            let in_load_phase_clone = in_load_phase.clone();
+
+            let reg_fn = lua
+                .create_function(move |lua, margs: MultiValue| {
+                    if !in_load_phase_clone.get() {
+                        return Err(mlua::Error::RuntimeError(
+                            "redis.register_function can only be called on FUNCTION LOAD command"
+                                .to_string(),
+                        ));
+                    }
+                    let mut name_opt = None;
+                    let mut func_opt = None;
+                    if let Some(first) = margs.iter().next() {
+                        match first {
+                            Value::String(s) => {
+                                if let Ok(name_str) = s.to_str() {
+                                    name_opt = Some(name_str.to_string());
+                                }
+                                if let Some(Value::Function(f)) = margs.iter().nth(1) {
+                                    func_opt = Some(f.clone());
+                                }
+                            }
+                            Value::Table(t) => {
+                                if let Ok(name_str) = t
+                                    .raw_get::<String>("function_name")
+                                    .or_else(|_| t.raw_get::<String>("name"))
+                                {
+                                    name_opt = Some(name_str);
+                                }
+                                if let Ok(f) = t.raw_get::<mlua::Function>("callback") {
+                                    func_opt = Some(f);
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    Value::Table(t) => {
-                        if let Ok(name_str) = t
-                            .raw_get::<String>("function_name")
-                            .or_else(|_| t.raw_get::<String>("name"))
-                        {
-                            name_opt = Some(name_str);
-                        }
-                        if let Ok(f) = t.raw_get::<mlua::Function>("callback") {
-                            func_opt = Some(f);
-                        }
+                    if let (Some(name), Some(f)) = (name_opt, func_opt)
+                        && name.to_lowercase() == target_name_lower
+                    {
+                        let key = lua.create_registry_value(f)?;
+                        *target_fn_clone.borrow_mut() = Some(key);
                     }
-                    _ => {}
-                }
-            }
-            if let (Some(name), Some(f)) = (name_opt, func_opt)
-                && name.to_lowercase() == target_name_lower
-            {
-                let key = lua.create_registry_value(f)?;
-                *target_fn_clone.borrow_mut() = Some(key);
-            }
-            Ok(())
-        })
-        .map_err(|e| e.to_string())?;
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
 
-    let load_redis_proxy = create_load_redis_proxy(&lua, reg_fn).map_err(|e| e.to_string())?;
-    let real_g: mlua::Table = lua
-        .named_registry_value("__real_G")
-        .map_err(|e| e.to_string())?;
-    let runtime_redis: Value = real_g.get("redis").map_err(|e| e.to_string())?;
-    real_g
-        .set("redis", load_redis_proxy)
-        .map_err(|e| e.to_string())?;
+            let load_redis_proxy =
+                create_load_redis_proxy(&lua, reg_fn).map_err(|e| e.to_string())?;
+            let real_g: mlua::Table = lua
+                .named_registry_value("__real_G")
+                .map_err(|e| e.to_string())?;
+            let runtime_redis: Value = real_g.get("redis").map_err(|e| e.to_string())?;
+            real_g
+                .set("redis", load_redis_proxy)
+                .map_err(|e| e.to_string())?;
 
-    // Run library script to define functions
-    lua.load(&lib.raw_code)
-        .exec()
-        .map_err(|e| format!("ERR Failed to compile library: {}", e))?;
+            // Run library script to define functions
+            lua.load(&lib.raw_code)
+                .exec()
+                .map_err(|e| format!("ERR Failed to compile library: {}", e))?;
 
-    in_load_phase.set(false);
-    real_g
-        .set("redis", runtime_redis)
-        .map_err(|e| e.to_string())?;
+            in_load_phase.set(false);
+            real_g
+                .set("redis", runtime_redis)
+                .map_err(|e| e.to_string())?;
 
-    let fn_key = target_fn.borrow_mut().take().ok_or_else(|| {
-        format!(
-            "ERR Function '{}' registered but failed to capture",
-            func_name
-        )
-    })?;
-    let f: mlua::Function = lua.registry_value(&fn_key).map_err(|e| e.to_string())?;
+            let fn_key = target_fn.borrow_mut().take().ok_or_else(|| {
+                format!(
+                    "ERR Function '{}' registered but failed to capture",
+                    func_name
+                )
+            })?;
+            let f: mlua::Function = lua.registry_value(&fn_key).map_err(|e| e.to_string())?;
 
-    let res: Value = f
-        .call((keys_tbl, argv_tbl))
-        .map_err(|e| format_lua_error(&e.to_string()))?;
+            let res: Value = f
+                .call((keys_tbl, argv_tbl))
+                .map_err(|e| format_lua_error(&e.to_string()))?;
 
-    let mut out = Vec::new();
-    let cur_resp_ver = *script_resp_ver.borrow();
-    lua_val_to_resp_with_depth(&res, &mut out, 0, cur_resp_ver)?;
-    Ok(out)
+            let mut out = Vec::new();
+            let cur_resp_ver = *script_resp_ver.borrow();
+            lua_val_to_resp_with_depth(&res, &mut out, 0, cur_resp_ver)?;
+            Ok(out)
+        })())
+    })
+    .map_err(|e| e.to_string())?
 }
 
 pub fn eval_script(
@@ -1018,43 +1025,48 @@ pub fn eval_script(
     }
 
     let lua = Lua::new();
-    let aof_raw = aof.map(|a| a as *const _);
-    let script_resp_ver = Rc::new(RefCell::new(2u8));
-    setup_redis_lua_env(
-        &lua,
-        db,
-        aof_raw,
-        effective_read_only,
-        script_resp_ver.clone(),
-    )?;
+    // A scope lets `redis.call`/`redis.pcall` borrow `aof` for exactly this
+    // run instead of smuggling it in as a raw pointer.
+    #[allow(clippy::redundant_closure_call)]
+    lua.scope(|scope| {
+        Ok((|| -> Result<Vec<u8>, String> {
+            let script_resp_ver = Rc::new(RefCell::new(2u8));
+            setup_redis_lua_env(
+                &lua,
+                scope,
+                db,
+                aof,
+                effective_read_only,
+                script_resp_ver.clone(),
+            )?;
 
-    // Set KEYS table (1-indexed)
-    let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
-    for (i, k) in keys.iter().enumerate() {
-        let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
-        keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
-    }
+            // Set KEYS table (1-indexed)
+            let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
+            for (i, k) in keys.iter().enumerate() {
+                let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
+                keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+            }
 
-    // Set ARGV table (1-indexed)
-    let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
-    for (i, a) in args.iter().enumerate() {
-        let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
-        argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
-    }
+            // Set ARGV table (1-indexed)
+            let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
+            for (i, a) in args.iter().enumerate() {
+                let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
+                argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+            }
 
-    if let Ok(real_g) = lua.named_registry_value::<mlua::Table>("__real_G") {
-        real_g.set("KEYS", keys_tbl).map_err(|e| e.to_string())?;
-        real_g.set("ARGV", argv_tbl).map_err(|e| e.to_string())?;
-    }
+            if let Ok(real_g) = lua.named_registry_value::<mlua::Table>("__real_G") {
+                real_g.set("KEYS", keys_tbl).map_err(|e| e.to_string())?;
+                real_g.set("ARGV", argv_tbl).map_err(|e| e.to_string())?;
+            }
 
-    let chunk_func = lua
-        .load(&processed_script)
-        .set_name("@user_script")
-        .into_function()
-        .map_err(|e| format_lua_error(&e.to_string()))?;
-    let runner: mlua::Function = lua
-        .load(
-            r#"
+            let chunk_func = lua
+                .load(&processed_script)
+                .set_name("@user_script")
+                .into_function()
+                .map_err(|e| format_lua_error(&e.to_string()))?;
+            let runner: mlua::Function = lua
+                .load(
+                    r#"
         local f = ...
         return xpcall(f, function(err)
             if type(err) == "table" then
@@ -1067,33 +1079,37 @@ pub fn eval_script(
             return tostring(err)
         end)
         "#,
-        )
-        .into_function()
-        .map_err(|e| e.to_string())?;
+                )
+                .into_function()
+                .map_err(|e| e.to_string())?;
 
-    let (ok, res): (bool, Value) = runner
-        .call(chunk_func)
-        .map_err(|e| format_lua_error(&e.to_string()))?;
+            let (ok, res): (bool, Value) = runner
+                .call(chunk_func)
+                .map_err(|e| format_lua_error(&e.to_string()))?;
 
-    if !ok {
-        let err_msg = match res {
-            Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
-            _ => format!("{:?}", res),
-        };
-        let sha = load_script(script_content.as_bytes());
-        return Err(format_eval_error(&err_msg, &sha));
-    }
+            if !ok {
+                let err_msg = match res {
+                    Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
+                    _ => format!("{:?}", res),
+                };
+                let sha = load_script(script_content.as_bytes());
+                return Err(format_eval_error(&err_msg, &sha));
+            }
 
-    let mut resp = Vec::new();
-    let cur_resp_ver = *script_resp_ver.borrow();
-    lua_val_to_resp_with_depth(&res, &mut resp, 0, cur_resp_ver)?;
-    Ok(resp)
+            let mut resp = Vec::new();
+            let cur_resp_ver = *script_resp_ver.borrow();
+            lua_val_to_resp_with_depth(&res, &mut resp, 0, cur_resp_ver)?;
+            Ok(resp)
+        })())
+    })
+    .map_err(|e| e.to_string())?
 }
 
-fn setup_redis_lua_env(
+fn setup_redis_lua_env<'scope, 'env: 'scope>(
     lua: &Lua,
+    scope: &'scope mlua::Scope<'scope, 'env>,
     db: &Rc<RefCell<crate::shard::ShardDb>>,
-    aof: Option<*const RefCell<crate::aof::AofWriter>>,
+    aof: Option<&'env RefCell<crate::aof::AofWriter>>,
     read_only: bool,
     script_resp_ver: Rc<RefCell<u8>>,
 ) -> Result<(), String> {
@@ -1153,8 +1169,9 @@ fn setup_redis_lua_env(
     register_cjson_module(lua, &real_g).map_err(|e| e.to_string())?;
     register_cmsgpack_module(lua, &real_g).map_err(|e| e.to_string())?;
 
-    let real_redis = register_redis_module(lua, &real_g, db, aof, read_only, script_resp_ver)
-        .map_err(|e| e.to_string())?;
+    let real_redis =
+        register_redis_module(lua, scope, &real_g, db, aof, read_only, script_resp_ver)
+            .map_err(|e| e.to_string())?;
     lua.set_named_registry_value("__real_redis", real_redis)
         .map_err(|e| e.to_string())?;
 
@@ -2101,11 +2118,12 @@ fn unpack_msgpack_val(lua: &Lua, buf: &[u8], offset: &mut usize) -> mlua::Result
     }
 }
 
-fn register_redis_module(
+fn register_redis_module<'scope, 'env: 'scope>(
     lua: &Lua,
+    scope: &'scope mlua::Scope<'scope, 'env>,
     real_g: &mlua::Table,
     db: &Rc<RefCell<crate::shard::ShardDb>>,
-    aof: Option<*const RefCell<crate::aof::AofWriter>>,
+    aof: Option<&'env RefCell<crate::aof::AofWriter>>,
     read_only: bool,
     script_resp_ver: Rc<RefCell<u8>>,
 ) -> mlua::Result<mlua::Table> {
@@ -2124,7 +2142,7 @@ fn register_redis_module(
     let aof_call = aof;
     let srv_call = script_resp_ver.clone();
     let port = db.borrow().port;
-    let call_fn = lua.create_function(move |lua, margs: MultiValue| {
+    let call_fn = scope.create_function(move |lua, margs: MultiValue| {
         let mut cmd_args = Vec::with_capacity(margs.len());
         for v in margs {
             match v {
@@ -2226,9 +2244,12 @@ fn register_redis_module(
             && cmd.is_write_command()
             && !cmd.allows_oom()
         {
-            let used = db_call.borrow().table.used_memory;
-            let shard_max = max_mem as usize;
-            if used > shard_max {
+            let used = db_call.borrow().table.used_memory();
+            // Server-wide: other shards' published usage plus ours.
+            let total = used
+                + crate::tiering::get_tier_stats(port)
+                    .published_used_total(Some(crate::connection::current_shard_id()));
+            if total > max_mem as usize {
                 crate::connection::record_rejected_stat(cmd_name);
                 crate::connection::record_error_stat("OOM", None);
                 SCRIPT_RECORDED_ERROR.set(true);
@@ -2248,7 +2269,7 @@ fn register_redis_module(
             crate::connection::broadcast_monitor(port, "lua", &monitor_argv);
         }
         let mut out = Vec::new();
-        let aof_ref = unsafe { aof_call.map(|ptr| &*ptr) };
+        let aof_ref = aof_call;
         crate::connection::execute_local_command(
             &cmd,
             &mut db_call.borrow_mut(),
@@ -2280,7 +2301,7 @@ fn register_redis_module(
     let db_pcall = db.clone();
     let aof_pcall = aof;
     let srv_pcall = script_resp_ver.clone();
-    let pcall_fn = lua.create_function(move |lua, margs: MultiValue| {
+    let pcall_fn = scope.create_function(move |lua, margs: MultiValue| {
         let mut cmd_args = Vec::with_capacity(margs.len());
         for v in margs {
             match v {
@@ -2398,9 +2419,12 @@ fn register_redis_module(
             && cmd.is_write_command()
             && !cmd.allows_oom()
         {
-            let used = db_pcall.borrow().table.used_memory;
-            let shard_max = max_mem as usize;
-            if used > shard_max {
+            let used = db_pcall.borrow().table.used_memory();
+            // Server-wide: other shards' published usage plus ours.
+            let total = used
+                + crate::tiering::get_tier_stats(port)
+                    .published_used_total(Some(crate::connection::current_shard_id()));
+            if total > max_mem as usize {
                 crate::connection::record_rejected_stat(cmd_name);
                 crate::connection::record_error_stat("OOM", None);
                 SCRIPT_RECORDED_ERROR.set(true);
@@ -2423,7 +2447,7 @@ fn register_redis_module(
             crate::connection::broadcast_monitor(port, "lua", &monitor_argv);
         }
         let mut out = Vec::new();
-        let aof_ref = unsafe { aof_pcall.map(|ptr| &*ptr) };
+        let aof_ref = aof_pcall;
         crate::connection::execute_local_command(
             &cmd,
             &mut db_pcall.borrow_mut(),
@@ -2570,7 +2594,7 @@ fn script_acl_denied(port: u16, cmd: &Command) -> Option<String> {
         return None;
     }
     let acl = crate::acl::get_acl_for_port(port);
-    let guard = acl.read().unwrap();
+    let guard = acl.read();
     let user = guard.users.get(user_name)?;
     let name = crate::connection::acl_cmd_name(cmd);
     if !user.can_execute_command(name) {
@@ -2914,7 +2938,6 @@ mod tests {
         let port = 65041;
         crate::acl::get_acl_for_port(port)
             .write()
-            .unwrap()
             .set_user(
                 "lua",
                 &["on", "nopass", "-@all", "+eval", "+get", "~ok:*", "&news"].map(String::from),

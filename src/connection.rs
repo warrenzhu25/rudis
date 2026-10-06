@@ -155,12 +155,12 @@ pub enum ClientClass {
 
 pub static HAS_CUSTOM_BUFFER_LIMIT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-pub static NORMAL_BUFFER_LIMIT: std::sync::RwLock<BufferLimit> =
-    std::sync::RwLock::new(BufferLimit::new(0, 0, 0));
-pub static SLAVE_BUFFER_LIMIT: std::sync::RwLock<BufferLimit> =
-    std::sync::RwLock::new(BufferLimit::new(268435456, 67108864, 60));
-pub static PUBSUB_BUFFER_LIMIT: std::sync::RwLock<BufferLimit> =
-    std::sync::RwLock::new(BufferLimit::new(33554432, 8388608, 60));
+pub static NORMAL_BUFFER_LIMIT: parking_lot::RwLock<BufferLimit> =
+    parking_lot::RwLock::new(BufferLimit::new(0, 0, 0));
+pub static SLAVE_BUFFER_LIMIT: parking_lot::RwLock<BufferLimit> =
+    parking_lot::RwLock::new(BufferLimit::new(268435456, 67108864, 60));
+pub static PUBSUB_BUFFER_LIMIT: parking_lot::RwLock<BufferLimit> =
+    parking_lot::RwLock::new(BufferLimit::new(33554432, 8388608, 60));
 
 #[inline(always)]
 pub fn get_client_output_buffer_limit(class: ClientClass) -> BufferLimit {
@@ -169,17 +169,17 @@ pub fn get_client_output_buffer_limit(class: ClientClass) -> BufferLimit {
             if !HAS_CUSTOM_BUFFER_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
                 return BufferLimit::new(0, 0, 0);
             }
-            *NORMAL_BUFFER_LIMIT.read().unwrap()
+            *NORMAL_BUFFER_LIMIT.read()
         }
-        ClientClass::Replica => *SLAVE_BUFFER_LIMIT.read().unwrap(),
-        ClientClass::Pubsub => *PUBSUB_BUFFER_LIMIT.read().unwrap(),
+        ClientClass::Replica => *SLAVE_BUFFER_LIMIT.read(),
+        ClientClass::Pubsub => *PUBSUB_BUFFER_LIMIT.read(),
     }
 }
 
 pub fn format_client_output_buffer_limit_config() -> String {
-    let norm = *NORMAL_BUFFER_LIMIT.read().unwrap();
-    let slv = *SLAVE_BUFFER_LIMIT.read().unwrap();
-    let ps = *PUBSUB_BUFFER_LIMIT.read().unwrap();
+    let norm = *NORMAL_BUFFER_LIMIT.read();
+    let slv = *SLAVE_BUFFER_LIMIT.read();
+    let ps = *PUBSUB_BUFFER_LIMIT.read();
     format!(
         "normal {} {} {} slave {} {} {} pubsub {} {} {}",
         norm.hard_limit,
@@ -252,14 +252,14 @@ pub fn set_client_output_buffer_limit_str(val: &str) -> Result<(), &'static str>
     for (class, limit) in updates {
         match class {
             ClientClass::Normal => {
-                *NORMAL_BUFFER_LIMIT.write().unwrap() = limit;
+                *NORMAL_BUFFER_LIMIT.write() = limit;
                 HAS_CUSTOM_BUFFER_LIMIT.store(
                     limit.hard_limit > 0 || limit.soft_limit > 0,
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
-            ClientClass::Replica => *SLAVE_BUFFER_LIMIT.write().unwrap() = limit,
-            ClientClass::Pubsub => *PUBSUB_BUFFER_LIMIT.write().unwrap() = limit,
+            ClientClass::Replica => *SLAVE_BUFFER_LIMIT.write() = limit,
+            ClientClass::Pubsub => *PUBSUB_BUFFER_LIMIT.write() = limit,
         }
     }
     Ok(())
@@ -298,7 +298,6 @@ thread_local! {
     pub static CURRENT_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static EXECUTING_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static DEFER_BCAST_FLUSH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    pub static IN_MAXMEMORY_EVICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub static PRE_CMD_TRACK_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     pub static IN_TX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub static CURRENT_ROUTER: std::cell::RefCell<Option<std::rc::Rc<Router>>> = const { std::cell::RefCell::new(None) };
@@ -308,10 +307,31 @@ pub static ACTIVE_COMMAND_CLIENT_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static DEFER_BCAST_FLUSH_GLOBAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-pub static IN_MAXMEMORY_EVICT_GLOBAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-pub static PRE_CMD_TRACK_BUF_GLOBAL: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+thread_local! {
+    /// While maxmemory eviction runs on behalf of a client (locally or for
+    /// a remote shard's request), that client's id and the tracking
+    /// invalidations owed to it, which must reach it before the reply to
+    /// the command that triggered the eviction.
+    static EVICT_CAPTURE: std::cell::RefCell<Option<(u64, Vec<u8>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` (maxmemory eviction) capturing the tracking invalidations
+/// addressed to `client_id`; returns `f`'s result and those bytes, which the
+/// caller writes ahead of the client's reply. Nested captures are kept
+/// separate.
+pub fn with_evict_capture<R>(client_id: u64, f: impl FnOnce() -> R) -> (R, Vec<u8>) {
+    let prev = EVICT_CAPTURE.with(|c| c.replace(Some((client_id, Vec::new()))));
+    let r = f();
+    let captured = EVICT_CAPTURE.with(|c| c.replace(prev));
+    (r, captured.map(|(_, buf)| buf).unwrap_or_default())
+}
+
+/// Shard id of the router installed on this thread (0 if none).
+pub fn current_shard_id() -> usize {
+    CURRENT_ROUTER.with(|cr| cr.borrow().as_ref().map_or(0, |r| r.shard_id))
+}
 
 pub fn set_current_router(router: std::rc::Rc<Router>) {
     CURRENT_ROUTER.with(|cr| {
@@ -349,7 +369,7 @@ pub fn recheck_blocking_keys<'a>(router: &Router, keys: impl IntoIterator<Item =
         let shard = router.target_shard(k);
         if shard == router.shard_id {
             let mut db = router.local_db.borrow_mut();
-            let mut hub = hub_arc.lock().unwrap();
+            let mut hub = hub_arc.lock();
             if hub.is_paused() {
                 hub.add_pending_notify(k.clone());
                 continue;
@@ -370,7 +390,7 @@ pub fn recheck_blocking_keys<'a>(router: &Router, keys: impl IntoIterator<Item =
         }
         {
             // While paused, resume() routes pending keys to their owners.
-            let mut hub = hub_arc.lock().unwrap();
+            let mut hub = hub_arc.lock();
             if hub.is_paused() {
                 for k in keys {
                     hub.add_pending_notify(k);
@@ -389,7 +409,7 @@ pub fn notify_list_or_defer(db: &mut ShardDb, key: &Bytes) {
         return;
     }
     let hub_arc = crate::block::get_block_hub_for_port(db.port);
-    let mut hub = hub_arc.lock().unwrap();
+    let mut hub = hub_arc.lock();
     if hub.is_paused() {
         hub.add_pending_notify(key.clone());
     } else {
@@ -404,7 +424,7 @@ pub fn notify_zset_or_defer(db: &mut ShardDb, key: &Bytes) {
         return;
     }
     let hub_arc = crate::block::get_block_hub_for_port(db.port);
-    let mut hub = hub_arc.lock().unwrap();
+    let mut hub = hub_arc.lock();
     if hub.is_paused() {
         hub.add_pending_notify(key.clone());
     } else {
@@ -419,7 +439,7 @@ pub fn notify_stream_or_defer(db: &mut ShardDb, key: &Bytes) {
         return;
     }
     let hub_arc = crate::block::get_block_hub_for_port(db.port);
-    let mut hub = hub_arc.lock().unwrap();
+    let mut hub = hub_arc.lock();
     if hub.is_paused() {
         hub.add_pending_notify(key.clone());
     } else {
@@ -477,6 +497,9 @@ pub fn format_score(val: f64) -> String {
         "0".to_string()
     } else {
         let mut buf = [0u8; 64];
+        // SAFETY: `buf` is a 64-byte local array and snprintf writes at most
+        // `buf.len()` bytes including the NUL; the format is a NUL-terminated C
+        // literal whose single `%.17g` is matched by one f64 vararg.
         let len = unsafe {
             libc::snprintf(
                 buf.as_mut_ptr() as *mut libc::c_char,
@@ -486,7 +509,7 @@ pub fn format_score(val: f64) -> String {
             )
         };
         if len > 0 && (len as usize) < buf.len() {
-            unsafe { std::str::from_utf8_unchecked(&buf[..len as usize]) }.to_string()
+            String::from_utf8_lossy(&buf[..len as usize]).into_owned()
         } else {
             val.to_string()
         }
@@ -542,7 +565,7 @@ pub struct BlockedClientGuard {
 impl Drop for BlockedClientGuard {
     fn drop(&mut self) {
         let hub_arc = crate::block::get_block_hub_for_port(self.port);
-        let mut hub = hub_arc.lock().unwrap();
+        let mut hub = hub_arc.lock();
         hub.unregister_blocked_client(self.client_id);
     }
 }
@@ -554,6 +577,8 @@ pub fn is_fd_closed(fd: std::os::unix::io::RawFd) -> bool {
         events: libc::POLLIN | libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR,
         revents: 0,
     };
+    // SAFETY: `pollfd` is a valid, exclusively borrowed local and nfds is 1;
+    // timeout 0 never blocks. A stale fd only yields POLLNVAL.
     let ret = unsafe { libc::poll(&mut pollfd, 1, 0) };
     if ret > 0 {
         if pollfd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
@@ -561,6 +586,8 @@ pub fn is_fd_closed(fd: std::os::unix::io::RawFd) -> bool {
         }
         if pollfd.revents & libc::POLLIN != 0 {
             let mut buf = [0u8; 1];
+            // SAFETY: `buf` is a 1-byte local array and the length passed is 1;
+            // MSG_PEEK | MSG_DONTWAIT neither consumes data nor blocks.
             let n = unsafe {
                 libc::recv(
                     fd,
@@ -682,12 +709,14 @@ pub async fn wait_for_stream_result(
 }
 
 static WATCHED_KEYS: std::sync::LazyLock<
-    std::sync::RwLock<hashbrown::HashMap<u16, hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+    parking_lot::RwLock<
+        hashbrown::HashMap<u16, hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>>,
+    >,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 
 static CLIENT_WATCH_TAINTED: std::sync::LazyLock<
-    std::sync::RwLock<hashbrown::HashMap<(u16, u64), bool>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+    parking_lot::RwLock<hashbrown::HashMap<(u16, u64), bool>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 
 /// Number of latency histogram buckets; bucket `i` counts calls taking at
 /// most 2^i microseconds (the last one also takes everything slower).
@@ -732,8 +761,9 @@ fn latency_bucket(usec: u64) -> usize {
     }
 }
 
-pub static CMD_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<String, CmdStat>>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+pub static CMD_STATS: std::sync::LazyLock<
+    parking_lot::RwLock<hashbrown::HashMap<String, CmdStat>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 pub static MIN_REPLICAS_TO_WRITE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -856,7 +886,8 @@ pub fn flush_local_cmd_stats() {
         if local_map.is_empty() {
             return;
         }
-        if let Ok(mut global_map) = CMD_STATS.write() {
+        {
+            let mut global_map = CMD_STATS.write();
             for (&cmd, stat) in local_map.iter() {
                 global_map
                     .entry(cmd.to_lowercase())
@@ -876,8 +907,8 @@ pub fn reset_local_cmd_stats() {
 pub static LATENCY_MONITOR_THRESHOLD: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 pub static LATENCY_EVENTS: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::BTreeMap<String, Vec<(u64, u64)>>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::BTreeMap::new()));
+    parking_lot::RwLock<std::collections::BTreeMap<String, Vec<(u64, u64)>>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(std::collections::BTreeMap::new()));
 
 /// Name a command is counted under in INFO commandstats and LATENCY
 /// HISTOGRAM: [`get_cmd_name`], with CONFIG split into its subcommands
@@ -903,7 +934,8 @@ pub fn record_latency_event(event: &str, latency_ms: u64) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if let Ok(mut map) = LATENCY_EVENTS.write() {
+    {
+        let mut map = LATENCY_EVENTS.write();
         let samples = map.entry(event.to_string()).or_default();
         if let Some(last) = samples.last_mut()
             && last.0 == now_sec
@@ -920,7 +952,7 @@ pub fn record_latency_event(event: &str, latency_ms: u64) {
 pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
     match sub {
         LatencySubcommand::Latest => {
-            let map = LATENCY_EVENTS.read().unwrap();
+            let map = LATENCY_EVENTS.read();
             let active: Vec<_> = map.iter().filter(|(_, s)| !s.is_empty()).collect();
             write_resp_array_header(out, active.len());
             for (ev, samples) in active {
@@ -939,7 +971,7 @@ pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
                     b"-ERR wrong number of arguments for 'latency history' command\r\n",
                 );
             } else {
-                let map = LATENCY_EVENTS.read().unwrap();
+                let map = LATENCY_EVENTS.read();
                 if let Some(samples) = map.get(ev) {
                     write_resp_array_header(out, samples.len());
                     for &(ts, lat) in samples {
@@ -956,7 +988,7 @@ pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
             out.extend_from_slice(b"+Dave, no latency spikes observed in your instance.\r\n");
         }
         LatencySubcommand::Reset(events) => {
-            let mut map = LATENCY_EVENTS.write().unwrap();
+            let mut map = LATENCY_EVENTS.write();
             let count = if events.is_empty() {
                 let n = map.len() as i64;
                 map.clear();
@@ -978,7 +1010,7 @@ pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
                     b"-ERR wrong number of arguments for 'latency graph' command\r\n",
                 );
             } else {
-                let map = LATENCY_EVENTS.read().unwrap();
+                let map = LATENCY_EVENTS.read();
                 if let Some(samples) = map.get(ev)
                     && !samples.is_empty()
                 {
@@ -997,7 +1029,7 @@ pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
         }
         LatencySubcommand::Histogram(cmds) => {
             // Callers flush every shard's pending stats first.
-            let map = CMD_STATS.read().unwrap();
+            let map = CMD_STATS.read();
             let wanted: Vec<String> = cmds.iter().map(|c| c.to_lowercase()).collect();
             let mut matched: Vec<(&String, &CmdStat)> = map
                 .iter()
@@ -1081,6 +1113,9 @@ pub fn apply_tcp_keepalive(fd: std::os::unix::io::RawFd) {
     if secs == 0 {
         return;
     }
+    // SAFETY: (for the closure's unsafe block) `val` is a live c_int on the stack and
+    // optlen is its exact size; setsockopt only reads it. `fd` is the caller's
+    // freshly accepted socket.
     let set = |level: libc::c_int, opt: libc::c_int, val: libc::c_int| unsafe {
         libc::setsockopt(
             fd,
@@ -1125,8 +1160,8 @@ pub static PAUSE_DEADLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub static PAUSE_WRITE_ONLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub static PAUSED_CLIENTS: std::sync::LazyLock<
-    std::sync::Mutex<Vec<(u16, u64, flume::Sender<()>)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+    parking_lot::Mutex<Vec<(u16, u64, flume::Sender<()>)>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
 
 #[inline]
 pub fn now_epoch_ms() -> u64 {
@@ -1158,7 +1193,7 @@ pub fn set_client_pause(timeout_ms: u64, write_only: bool) {
 
 pub fn unpause_clients() -> usize {
     PAUSE_DEADLINE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
-    let mut list = PAUSED_CLIENTS.lock().unwrap();
+    let mut list = PAUSED_CLIENTS.lock();
     let woken = list.len();
     for (_, _, tx) in list.drain(..) {
         let _ = tx.send(());
@@ -1188,7 +1223,7 @@ pub fn paused_clients_count() -> usize {
     if is_client_paused().is_none() {
         return 0;
     }
-    PAUSED_CLIENTS.lock().unwrap().len()
+    PAUSED_CLIENTS.lock().len()
 }
 
 pub fn should_pause_command(cmd: &Command, write_only: bool) -> bool {
@@ -1235,7 +1270,7 @@ struct PausedClientGuard {
 
 impl Drop for PausedClientGuard {
     fn drop(&mut self) {
-        let mut list = PAUSED_CLIENTS.lock().unwrap();
+        let mut list = PAUSED_CLIENTS.lock();
         list.retain(|&(_, cid, _)| cid != self.client_id);
     }
 }
@@ -1250,7 +1285,7 @@ pub async fn wait_if_client_paused(port: u16, client_id: u64, cmd: &Command) {
         }
         let (tx, rx) = flume::bounded(1);
         {
-            let mut list = PAUSED_CLIENTS.lock().unwrap();
+            let mut list = PAUSED_CLIENTS.lock();
             if !list.iter().any(|&(_, cid, _)| cid == client_id) {
                 list.push((port, client_id, tx));
             }
@@ -1278,7 +1313,7 @@ pub async fn wait_if_tx_paused(port: u16, client_id: u64, tx_queue: &[Command]) 
         }
         let (tx, rx) = flume::bounded(1);
         {
-            let mut list = PAUSED_CLIENTS.lock().unwrap();
+            let mut list = PAUSED_CLIENTS.lock();
             if !list.iter().any(|&(_, cid, _)| cid == client_id) {
                 list.push((port, client_id, tx));
             }
@@ -1298,48 +1333,73 @@ pub async fn wait_if_tx_paused(port: u16, client_id: u64, tx_queue: &[Command]) 
 }
 
 pub static TOTAL_ERROR_REPLIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static ERROR_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<String, u64>>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+pub static ERROR_STATS: std::sync::LazyLock<parking_lot::RwLock<hashbrown::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 pub static FAILED_CMD_STATS: std::sync::LazyLock<
-    std::sync::RwLock<hashbrown::HashMap<String, u64>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+    parking_lot::RwLock<hashbrown::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 pub static REJECTED_CMD_STATS: std::sync::LazyLock<
-    std::sync::RwLock<hashbrown::HashMap<String, u64>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+    parking_lot::RwLock<hashbrown::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
+
+/// Increments `map[key]` (lowercased when `lower`), allocating the key only
+/// on first insert. Error replies can be hot (e.g. every write rejected
+/// under `noeviction`), so the common case stays allocation-free.
+fn bump_stat(map: &mut hashbrown::HashMap<String, u64>, key: &str, lower: bool) {
+    let mut buf = [0u8; 64];
+    let key = if lower && key.bytes().any(|b| b.is_ascii_uppercase()) {
+        if key.len() <= buf.len() && key.is_ascii() {
+            buf[..key.len()].copy_from_slice(key.as_bytes());
+            buf[..key.len()].make_ascii_lowercase();
+            // ASCII in, ASCII out.
+            std::str::from_utf8(&buf[..key.len()]).unwrap_or(key)
+        } else {
+            *map.entry(key.to_lowercase()).or_insert(0) += 1;
+            return;
+        }
+    } else {
+        key
+    };
+    *map.entry_ref(key).or_insert(0) += 1;
+}
 
 pub fn record_rejected_stat(cmd_name: &str) {
-    if let Ok(mut map) = REJECTED_CMD_STATS.write() {
-        *map.entry(cmd_name.to_lowercase()).or_insert(0) += 1;
+    {
+        let mut map = REJECTED_CMD_STATS.write();
+        bump_stat(&mut map, cmd_name, true);
     }
 }
 
 pub fn record_failed_stat(cmd_name: &str) {
-    if let Ok(mut map) = FAILED_CMD_STATS.write() {
-        *map.entry(cmd_name.to_lowercase()).or_insert(0) += 1;
+    {
+        let mut map = FAILED_CMD_STATS.write();
+        bump_stat(&mut map, cmd_name, true);
     }
 }
 
 pub fn record_error_stat(prefix: &str, cmd_name: Option<&str>) {
     TOTAL_ERROR_REPLIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut map) = ERROR_STATS.write() {
-        *map.entry(prefix.to_string()).or_insert(0) += 1;
-    }
-    if let Some(cmd) = cmd_name
-        && let Ok(mut map) = FAILED_CMD_STATS.write()
     {
-        *map.entry(cmd.to_lowercase()).or_insert(0) += 1;
+        let mut map = ERROR_STATS.write();
+        bump_stat(&mut map, prefix, false);
+    }
+    if let Some(cmd) = cmd_name {
+        bump_stat(&mut FAILED_CMD_STATS.write(), cmd, true);
     }
 }
 
 pub fn reset_error_stats() {
     TOTAL_ERROR_REPLIES.store(0, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut map) = ERROR_STATS.write() {
+    {
+        let mut map = ERROR_STATS.write();
         map.clear();
     }
-    if let Ok(mut map) = FAILED_CMD_STATS.write() {
+    {
+        let mut map = FAILED_CMD_STATS.write();
         map.clear();
     }
-    if let Ok(mut map) = REJECTED_CMD_STATS.write() {
+    {
+        let mut map = REJECTED_CMD_STATS.write();
         map.clear();
     }
 }
@@ -1352,14 +1412,13 @@ pub fn watch_keys(port: u16, client_id: u64, keys: &[Bytes]) {
         return;
     }
     HAS_WATCHED_KEYS.store(true, std::sync::atomic::Ordering::Relaxed);
-    let mut map = WATCHED_KEYS.write().unwrap();
+    let mut map = WATCHED_KEYS.write();
     let port_map = map.entry(port).or_default();
     for k in keys {
         port_map.entry(k.clone()).or_default().insert(client_id);
     }
     CLIENT_WATCH_TAINTED
         .write()
-        .unwrap()
         .entry((port, client_id))
         .or_insert(false);
 }
@@ -1368,16 +1427,13 @@ pub fn unwatch_keys(port: u16, client_id: u64) {
     if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let mut map = WATCHED_KEYS.write().unwrap();
+    let mut map = WATCHED_KEYS.write();
     if let Some(port_map) = map.get_mut(&port) {
         for set in port_map.values_mut() {
             set.remove(&client_id);
         }
     }
-    CLIENT_WATCH_TAINTED
-        .write()
-        .unwrap()
-        .remove(&(port, client_id));
+    CLIENT_WATCH_TAINTED.write().remove(&(port, client_id));
     if map.values().all(|pm| pm.values().all(|s| s.is_empty())) {
         HAS_WATCHED_KEYS.store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1389,7 +1445,6 @@ pub fn is_watch_tainted(port: u16, client_id: u64) -> bool {
     }
     CLIENT_WATCH_TAINTED
         .read()
-        .unwrap()
         .get(&(port, client_id))
         .copied()
         .unwrap_or(false)
@@ -1400,11 +1455,11 @@ pub fn touch_watched_key(port: u16, key: &[u8]) {
     if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let map = WATCHED_KEYS.read().unwrap();
+    let map = WATCHED_KEYS.read();
     if let Some(port_map) = map.get(&port)
         && let Some(clients) = port_map.get(key)
     {
-        let mut tainted = CLIENT_WATCH_TAINTED.write().unwrap();
+        let mut tainted = CLIENT_WATCH_TAINTED.write();
         for &cid in clients {
             tainted.insert((port, cid), true);
         }
@@ -1416,8 +1471,8 @@ pub fn touch_watched_key_any_port(key: &[u8]) {
     if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let map = WATCHED_KEYS.read().unwrap();
-    let mut tainted = CLIENT_WATCH_TAINTED.write().unwrap();
+    let map = WATCHED_KEYS.read();
+    let mut tainted = CLIENT_WATCH_TAINTED.write();
     for (&port, port_map) in map.iter() {
         if let Some(clients) = port_map.get(key) {
             for &cid in clients {
@@ -1428,8 +1483,8 @@ pub fn touch_watched_key_any_port(key: &[u8]) {
 }
 
 static GLOBAL_CLIENTS: std::sync::LazyLock<
-    std::sync::RwLock<hashbrown::HashMap<(u16, u64), GlobalClientEntry>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+    parking_lot::RwLock<hashbrown::HashMap<(u16, u64), GlobalClientEntry>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 
 pub static ACTIVE_COMMAND_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
@@ -1437,7 +1492,7 @@ pub fn inc_active_client_tot_cmds() {
     let port = ACTIVE_COMMAND_PORT.load(std::sync::atomic::Ordering::Relaxed);
     let cid = ACTIVE_COMMAND_CLIENT_ID.load(std::sync::atomic::Ordering::Relaxed);
     if cid > 0
-        && let Some(entry) = GLOBAL_CLIENTS.read().unwrap().get(&(port, cid))
+        && let Some(entry) = GLOBAL_CLIENTS.read().get(&(port, cid))
     {
         entry
             .stats
@@ -1450,8 +1505,8 @@ pub static HAS_MONITOR_CLIENTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 static MONITOR_CLIENTS: std::sync::LazyLock<
-    std::sync::RwLock<Vec<(u16, u64, crate::transport::PushTarget)>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(Vec::new()));
+    parking_lot::RwLock<Vec<(u16, u64, crate::transport::PushTarget)>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(Vec::new()));
 
 #[inline(always)]
 pub fn has_monitor_clients() -> bool {
@@ -1459,7 +1514,7 @@ pub fn has_monitor_clients() -> bool {
 }
 
 pub fn register_monitor_client(port: u16, client_id: u64, push: crate::transport::PushTarget) {
-    let mut list = MONITOR_CLIENTS.write().unwrap();
+    let mut list = MONITOR_CLIENTS.write();
     if !list.iter().any(|(p, id, _)| *p == port && *id == client_id) {
         list.push((port, client_id, push));
     }
@@ -1470,7 +1525,7 @@ pub fn unregister_monitor_client(port: u16, client_id: u64) {
     if !has_monitor_clients() {
         return;
     }
-    let mut list = MONITOR_CLIENTS.write().unwrap();
+    let mut list = MONITOR_CLIENTS.write();
     let prev_len = list.len();
     list.retain(|(p, id, _)| !(*p == port && *id == client_id));
     if list.len() != prev_len {
@@ -1508,7 +1563,7 @@ pub fn broadcast_monitor(port: u16, source_addr: &str, argv: &[Bytes]) {
     }
     line.push_str("\r\n");
     let bytes = line.as_bytes();
-    let list = MONITOR_CLIENTS.read().unwrap();
+    let list = MONITOR_CLIENTS.read();
     for (p, _, target) in list.iter() {
         if *p == port {
             target.push(bytes);
@@ -1531,7 +1586,7 @@ pub fn register_global_client(
     is_pubsub: bool,
     stats: std::sync::Arc<ClientStats>,
 ) {
-    GLOBAL_CLIENTS.write().unwrap().insert(
+    GLOBAL_CLIENTS.write().insert(
         (port, client_id),
         GlobalClientEntry {
             raw_fd,
@@ -1546,30 +1601,30 @@ pub fn register_global_client(
 }
 
 pub fn unregister_global_client(port: u16, client_id: u64) {
-    GLOBAL_CLIENTS.write().unwrap().remove(&(port, client_id));
+    GLOBAL_CLIENTS.write().remove(&(port, client_id));
 }
 
 pub fn update_global_client_resp3(port: u16, client_id: u64, is_resp3: bool) {
-    if let Some(entry) = GLOBAL_CLIENTS.write().unwrap().get_mut(&(port, client_id)) {
+    if let Some(entry) = GLOBAL_CLIENTS.write().get_mut(&(port, client_id)) {
         entry.is_resp3 = is_resp3;
     }
 }
 
 pub fn update_global_client_auth(port: u16, client_id: u64, auth_user: &str) {
-    if let Some(entry) = GLOBAL_CLIENTS.write().unwrap().get_mut(&(port, client_id)) {
+    if let Some(entry) = GLOBAL_CLIENTS.write().get_mut(&(port, client_id)) {
         entry.auth_user = auth_user.to_string();
     }
 }
 
 pub fn update_global_client_pubsub(port: u16, client_id: u64, is_pubsub: bool) {
-    if let Some(entry) = GLOBAL_CLIENTS.write().unwrap().get_mut(&(port, client_id)) {
+    if let Some(entry) = GLOBAL_CLIENTS.write().get_mut(&(port, client_id)) {
         entry.is_pubsub = is_pubsub;
     }
 }
 
 static TRACKING_CLIENTS: std::sync::LazyLock<
-    std::sync::RwLock<hashbrown::HashMap<(u16, u64), ClientTracker>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+    parking_lot::RwLock<hashbrown::HashMap<(u16, u64), ClientTracker>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 
 pub static HAS_TRACKING_CLIENTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1596,7 +1651,7 @@ pub fn register_client_tracking(
         None => 0,
     };
     if redirect_id > 0 {
-        let clients = GLOBAL_CLIENTS.read().unwrap();
+        let clients = GLOBAL_CLIENTS.read();
         if !clients.contains_key(&(port, redirect_id)) {
             return Err("The client ID you want to redirect to does not exist".to_string());
         }
@@ -1621,7 +1676,7 @@ pub fn register_client_tracking(
         }
     }
 
-    let mut map = TRACKING_CLIENTS.write().unwrap();
+    let mut map = TRACKING_CLIENTS.write();
     if let Some(existing) = map.get_mut(&(port, client_id))
         && existing.bcast
         && bcast
@@ -1676,7 +1731,7 @@ pub fn unregister_client_tracking(port: u16, client_id: u64) {
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let mut map = TRACKING_CLIENTS.write().unwrap();
+    let mut map = TRACKING_CLIENTS.write();
     if map.remove(&(port, client_id)).is_some() {
         HAS_TRACKING_CLIENTS.store(!map.is_empty(), std::sync::atomic::Ordering::Release);
     }
@@ -1692,7 +1747,7 @@ pub fn set_client_caching(
             "CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
         );
     }
-    let mut map = TRACKING_CLIENTS.write().unwrap();
+    let mut map = TRACKING_CLIENTS.write();
     let Some(tracker) = map.get_mut(&(port, client_id)) else {
         return Err(
             "CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
@@ -1721,7 +1776,7 @@ pub fn reset_client_caching(port: u16, client_id: u64) {
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let mut map = TRACKING_CLIENTS.write().unwrap();
+    let mut map = TRACKING_CLIENTS.write();
     if let Some(tracker) = map.get_mut(&(port, client_id)) {
         tracker.caching = None;
     }
@@ -1731,7 +1786,7 @@ pub fn get_client_redir(port: u16, client_id: u64) -> i64 {
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return -1;
     }
-    let map = TRACKING_CLIENTS.read().unwrap();
+    let map = TRACKING_CLIENTS.read();
     if let Some(tracker) = map.get(&(port, client_id)) {
         tracker.redirect_id as i64
     } else {
@@ -1740,7 +1795,7 @@ pub fn get_client_redir(port: u16, client_id: u64) -> i64 {
 }
 
 pub fn write_client_tracking_info(port: u16, client_id: u64, is_resp3: bool, out: &mut Vec<u8>) {
-    let map = TRACKING_CLIENTS.read().unwrap();
+    let map = TRACKING_CLIENTS.read();
     let tracker_opt = map.get(&(port, client_id));
 
     let mut flags: Vec<&'static str> = Vec::new();
@@ -1805,7 +1860,7 @@ pub fn get_tracking_info_stats(port: u16) -> (usize, usize, usize, usize) {
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return (0, 0, 0, 0);
     }
-    let map = TRACKING_CLIENTS.read().unwrap();
+    let map = TRACKING_CLIENTS.read();
     let mut tracking_clients = 0usize;
     let mut tracking_total_items = 0usize;
     let mut unique_keys: hashbrown::HashSet<&[u8]> = hashbrown::HashSet::new();
@@ -1834,6 +1889,16 @@ pub fn get_tracking_info_stats(port: u16) -> (usize, usize, usize, usize) {
 }
 
 fn send_raw_to_client_entry(target_id: u64, entry: &GlobalClientEntry, msg: Vec<u8>) {
+    let captured = EVICT_CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+        Some((id, buf)) if *id == target_id => {
+            buf.extend_from_slice(&msg);
+            true
+        }
+        _ => false,
+    });
+    if captured {
+        return;
+    }
     let exec_cid = {
         let local = EXECUTING_CLIENT_ID.get();
         if local != 0 {
@@ -1843,16 +1908,7 @@ fn send_raw_to_client_entry(target_id: u64, entry: &GlobalClientEntry, msg: Vec<
         }
     };
     if target_id == exec_cid {
-        if IN_MAXMEMORY_EVICT.get()
-            || IN_MAXMEMORY_EVICT_GLOBAL.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            PRE_CMD_TRACK_BUF_GLOBAL
-                .lock()
-                .unwrap()
-                .extend_from_slice(&msg);
-        } else {
-            let _ = entry.track_tx.send(msg);
-        }
+        let _ = entry.track_tx.send(msg);
     } else {
         entry.push.push(&msg);
     }
@@ -1953,7 +2009,7 @@ fn can_tracker_read_key(
         return true;
     }
     let acl = crate::acl::get_acl_for_port(port);
-    let guard = acl.read().unwrap();
+    let guard = acl.read();
     guard
         .users
         .get(user_name)
@@ -1966,8 +2022,8 @@ pub fn enforce_tracking_max_keys(port: u16) {
         return;
     }
     let max_keys = TRACKING_TABLE_MAX_KEYS.load(std::sync::atomic::Ordering::Relaxed);
-    let mut map = TRACKING_CLIENTS.write().unwrap();
-    let clients = GLOBAL_CLIENTS.read().unwrap();
+    let mut map = TRACKING_CLIENTS.write();
+    let clients = GLOBAL_CLIENTS.read();
 
     loop {
         let total_keys: usize = map
@@ -2002,7 +2058,7 @@ pub fn record_client_read(port: u16, client_id: u64, key: &[u8]) {
         return;
     }
     let needs_evict = {
-        let mut map = TRACKING_CLIENTS.write().unwrap();
+        let mut map = TRACKING_CLIENTS.write();
         if let Some(tracker) = map.get_mut(&(port, client_id))
             && !tracker.bcast
         {
@@ -2031,8 +2087,8 @@ pub fn notify_key_invalidation(port: u16, key: &[u8], sender_client_id: u64) {
     }
     let defer_bcast = DEFER_BCAST_FLUSH.get()
         || DEFER_BCAST_FLUSH_GLOBAL.load(std::sync::atomic::Ordering::Relaxed);
-    let mut map = TRACKING_CLIENTS.write().unwrap();
-    let clients = GLOBAL_CLIENTS.read().unwrap();
+    let mut map = TRACKING_CLIENTS.write();
+    let clients = GLOBAL_CLIENTS.read();
     for tracker in map.values_mut() {
         if tracker.port != port {
             continue;
@@ -2077,8 +2133,8 @@ pub fn flush_pending_bcast(port: u16) {
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let mut map = TRACKING_CLIENTS.write().unwrap();
-    let clients = GLOBAL_CLIENTS.read().unwrap();
+    let mut map = TRACKING_CLIENTS.write();
+    let clients = GLOBAL_CLIENTS.read();
     for tracker in map.values_mut() {
         if tracker.port == port && !tracker.pending_bcast.is_empty() {
             let pending = std::mem::take(&mut tracker.pending_bcast);
@@ -2095,7 +2151,7 @@ pub fn notify_key_invalidation_any_port(key: &[u8], sender_client_id: u64) {
         return;
     }
     let ports: smallvec::SmallVec<[u16; 4]> = {
-        let map = TRACKING_CLIENTS.read().unwrap();
+        let map = TRACKING_CLIENTS.read();
         let mut p = smallvec::SmallVec::new();
         for &(port, _) in map.keys() {
             if !p.contains(&port) {
@@ -2113,8 +2169,8 @@ pub fn notify_flush_invalidation(port: u16, sender_client_id: u64) {
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let mut map = TRACKING_CLIENTS.write().unwrap();
-    let clients = GLOBAL_CLIENTS.read().unwrap();
+    let mut map = TRACKING_CLIENTS.write();
+    let clients = GLOBAL_CLIENTS.read();
     for tracker in map.values_mut() {
         if tracker.port != port {
             continue;
@@ -2403,7 +2459,7 @@ pub static CLIENT_NO_TOUCH: std::sync::atomic::AtomicBool =
 pub static PAUSE_CRON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static ACTIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static MAX_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
-pub static MAX_MEMORY_POLICY: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+pub static MAX_MEMORY_POLICY: parking_lot::RwLock<String> = parking_lot::RwLock::new(String::new());
 
 static CONFIG_BACKUP_SEALED_TTL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(86400);
@@ -2423,16 +2479,16 @@ pub fn key_load_delay_us() -> u64 {
 }
 static CONFIG_LUA_TIME_LIMIT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(5000);
-static CONFIG_OOM_SCORE_ADJ: std::sync::LazyLock<std::sync::RwLock<String>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new("no".to_string()));
-static CONFIG_OOM_SCORE_ADJ_VALUES: std::sync::LazyLock<std::sync::RwLock<String>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new("0 200 800".to_string()));
-static CONFIG_MAXMEMORY_CLIENTS: std::sync::LazyLock<std::sync::RwLock<String>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new("0".to_string()));
-static CONFIG_BACKUPDIRNAME: std::sync::LazyLock<std::sync::RwLock<String>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new("backup".to_string()));
-static CONFIG_SLAVEOF: std::sync::LazyLock<std::sync::RwLock<String>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(String::new()));
+static CONFIG_OOM_SCORE_ADJ: std::sync::LazyLock<parking_lot::RwLock<String>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new("no".to_string()));
+static CONFIG_OOM_SCORE_ADJ_VALUES: std::sync::LazyLock<parking_lot::RwLock<String>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new("0 200 800".to_string()));
+static CONFIG_MAXMEMORY_CLIENTS: std::sync::LazyLock<parking_lot::RwLock<String>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new("0".to_string()));
+static CONFIG_BACKUPDIRNAME: std::sync::LazyLock<parking_lot::RwLock<String>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new("backup".to_string()));
+static CONFIG_SLAVEOF: std::sync::LazyLock<parking_lot::RwLock<String>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(String::new()));
 
 fn parse_config_num<T: std::str::FromStr>(name: &str, val: &str) -> Result<T, String> {
     val.trim()
@@ -2527,7 +2583,7 @@ pub fn apply_config_value(
         "maxmemory-policy" => set_max_memory_policy(val_str),
         "requirepass" => {
             let acl = crate::acl::get_acl_for_port(port);
-            acl.write().unwrap().set_requirepass(val_str);
+            acl.write().set_requirepass(val_str);
         }
         "notify-keyspace-events" => set_notify_keyspace_events_str(val_str),
         "aof-load-truncated" => {
@@ -2566,10 +2622,8 @@ pub fn apply_config_value(
         "lua-time-limit" | "busy-reply-threshold" => {
             CONFIG_LUA_TIME_LIMIT.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
-        "oom-score-adj" => *CONFIG_OOM_SCORE_ADJ.write().unwrap() = val_str.to_string(),
-        "oom-score-adj-values" => {
-            *CONFIG_OOM_SCORE_ADJ_VALUES.write().unwrap() = val_str.to_string()
-        }
+        "oom-score-adj" => *CONFIG_OOM_SCORE_ADJ.write() = val_str.to_string(),
+        "oom-score-adj-values" => *CONFIG_OOM_SCORE_ADJ_VALUES.write() = val_str.to_string(),
         "cross-shard-spin" => {
             crate::mailbox::set_cross_shard_spin(parse_config_num(name, val_str)?)
         }
@@ -2579,9 +2633,9 @@ pub fn apply_config_value(
         "save" => {
             crate::config::set_save_points(base_port, crate::config::parse_save_points(val_str)?)
         }
-        "maxmemory-clients" => *CONFIG_MAXMEMORY_CLIENTS.write().unwrap() = val_str.to_string(),
-        "backupdirname" => *CONFIG_BACKUPDIRNAME.write().unwrap() = val_str.to_string(),
-        "slaveof" | "replicaof" => *CONFIG_SLAVEOF.write().unwrap() = val_str.to_string(),
+        "maxmemory-clients" => *CONFIG_MAXMEMORY_CLIENTS.write() = val_str.to_string(),
+        "backupdirname" => *CONFIG_BACKUPDIRNAME.write() = val_str.to_string(),
+        "slaveof" | "replicaof" => *CONFIG_SLAVEOF.write() = val_str.to_string(),
         "dbfilename" => crate::config::set_dbfilename(base_port, val_str)?,
         "timeout" => {
             CLIENT_IDLE_TIMEOUT_SECS.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
@@ -2594,6 +2648,9 @@ pub fn apply_config_value(
         }
         "masterauth" => crate::replication::set_masterauth(port, val_str),
         "masteruser" => crate::replication::set_masteruser(port, val_str),
+        "jemalloc-bg-thread" => {
+            crate::allocator::set_background_thread(parse_config_bool(name, val_str)?);
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -2612,21 +2669,42 @@ pub fn get_active_clients() -> usize {
 }
 
 pub fn set_max_memory_policy(policy: &str) {
-    if let Ok(mut lock) = MAX_MEMORY_POLICY.write() {
+    {
+        let mut lock = MAX_MEMORY_POLICY.write();
         *lock = policy.to_lowercase();
+    }
+    crate::tiering::bump_maxmemory_epoch();
+}
+
+/// The I/O driver the shards actually run on. monoio falls back to epoll
+/// when io_uring is unavailable or `MONOIO_FORCE_LEGACY_DRIVER` is set, so
+/// this must not be hard-coded.
+pub fn io_driver_name() -> &'static str {
+    if monoio::utils::detect_uring() {
+        "io_uring"
+    } else {
+        "epoll"
     }
 }
 
 pub fn get_max_memory_policy() -> String {
-    if let Ok(lock) = MAX_MEMORY_POLICY.read() {
-        if lock.is_empty() {
-            "noeviction".to_string()
-        } else {
-            lock.clone()
-        }
-    } else {
+    let lock = MAX_MEMORY_POLICY.read();
+    if lock.is_empty() {
         "noeviction".to_string()
+    } else {
+        lock.clone()
     }
+}
+
+/// Serialises unit tests that mutate the process-global `maxmemory-policy`.
+#[cfg(test)]
+pub(crate) static MAX_MEMORY_POLICY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Whether `maxmemory-policy` is `noeviction` (the default), without
+/// allocating.
+pub fn max_memory_policy_is_noeviction() -> bool {
+    let lock = MAX_MEMORY_POLICY.read();
+    lock.is_empty() || lock.eq_ignore_ascii_case("noeviction")
 }
 
 pub const NOTIFY_KEYSPACE: u32 = 1 << 0; // K
@@ -2659,10 +2737,11 @@ pub const NOTIFY_ALL: u32 = NOTIFY_GENERIC
 
 pub static NOTIFY_KEYSPACE_FLAGS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
-pub static NOTIFY_KEYSPACE_STR: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+pub static NOTIFY_KEYSPACE_STR: parking_lot::RwLock<String> =
+    parking_lot::RwLock::new(String::new());
 /// Held by unit tests that change the process-wide notification flags.
 #[cfg(test)]
-pub(crate) static NOTIFY_FLAGS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static NOTIFY_FLAGS_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 pub fn notify_keyspace_flags_to_string(flags: u32) -> String {
     let mut res = String::new();
@@ -2722,11 +2801,7 @@ pub fn notify_keyspace_flags_to_string(flags: u32) -> String {
 }
 
 pub fn get_notify_keyspace_events_str() -> String {
-    if let Ok(lock) = NOTIFY_KEYSPACE_STR.read() {
-        lock.clone()
-    } else {
-        String::new()
-    }
+    NOTIFY_KEYSPACE_STR.read().clone()
 }
 
 pub fn set_notify_keyspace_events_str(s: &str) {
@@ -2754,7 +2829,8 @@ pub fn set_notify_keyspace_events_str(s: &str) {
         }
     }
     NOTIFY_KEYSPACE_FLAGS.store(flags, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut lock) = NOTIFY_KEYSPACE_STR.write() {
+    {
+        let mut lock = NOTIFY_KEYSPACE_STR.write();
         *lock = notify_keyspace_flags_to_string(flags);
     }
 }
@@ -3038,7 +3114,6 @@ async fn execute_tx_step(
                 unwatch_keys(router.port, client_id);
                 crate::block::get_block_hub_for_port(router.port)
                     .lock()
-                    .unwrap()
                     .clear_pending_notifies();
                 out_buf.extend_from_slice(b"+OK\r\n");
                 false
@@ -3051,7 +3126,6 @@ async fn execute_tx_step(
                 unwatch_keys(router.port, client_id);
                 crate::block::get_block_hub_for_port(router.port)
                     .lock()
-                    .unwrap()
                     .clear_pending_notifies();
                 if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                     c.name = None;
@@ -3068,7 +3142,7 @@ async fn execute_tx_step(
                 reset_client_pubsub(router, client_id);
 
                 let acl = crate::acl::get_acl_for_port(router.port);
-                let default_requires_auth = acl.read().unwrap().is_auth_required_for_default();
+                let default_requires_auth = acl.read().is_auth_required_for_default();
                 *authenticated = !default_requires_auth;
                 *auth_user = "default".to_string();
 
@@ -3105,7 +3179,6 @@ async fn execute_tx_step(
                     unwatch_keys(router.port, client_id);
                     crate::block::get_block_hub_for_port(router.port)
                         .lock()
-                        .unwrap()
                         .clear_pending_notifies();
                     out_buf.extend_from_slice(
                         b"-EXECABORT Transaction discarded because of previous errors.\r\n",
@@ -3122,7 +3195,6 @@ async fn execute_tx_step(
                     unwatch_keys(router.port, client_id);
                     crate::block::get_block_hub_for_port(router.port)
                         .lock()
-                        .unwrap()
                         .clear_pending_notifies();
                     out_buf.extend_from_slice(
                         b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
@@ -3137,7 +3209,6 @@ async fn execute_tx_step(
                     unwatch_keys(router.port, client_id);
                     crate::block::get_block_hub_for_port(router.port)
                         .lock()
-                        .unwrap()
                         .clear_pending_notifies();
                     write_resp_null_array(out_buf);
                     false
@@ -3163,7 +3234,7 @@ async fn execute_tx_step(
                     };
 
                     let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                    hub_arc.lock().unwrap().pause();
+                    hub_arc.lock().pause();
 
                     let count = tx_queue.len();
                     out_buf.extend_from_slice(format!("*{}\r\n", count).as_bytes());
@@ -3210,12 +3281,12 @@ async fn execute_tx_step(
                         router.release_tx_locks(&sorted_shards, tx_id).await;
                     }
 
-                    let pending = hub_arc.lock().unwrap().resume();
+                    let pending = hub_arc.lock().resume();
                     for k in pending {
                         let shard_id = router.target_shard(&k);
                         if shard_id == router.shard_id {
                             let mut local_db = router.local_db.borrow_mut();
-                            let mut hub = hub_arc.lock().unwrap();
+                            let mut hub = hub_arc.lock();
                             hub.notify_stream(&mut local_db, &k);
                             hub.notify_list(&mut local_db.table, &k);
                             hub.notify_zset(&mut local_db.table, &k);
@@ -3450,7 +3521,7 @@ pub(crate) async fn handle_client<T: crate::transport::ClientTransport>(
             unregister_client_tracking(self.port, self.client_id);
             if crate::block::has_blocked_waiters(self.port) {
                 let hub_arc = crate::block::get_block_hub_for_port(self.port);
-                let mut hub = hub_arc.lock().unwrap();
+                let mut hub = hub_arc.lock();
                 hub.unregister_blocked_client(self.client_id);
             }
         }
@@ -3480,41 +3551,51 @@ pub(crate) async fn handle_client<T: crate::transport::ClientTransport>(
     let mut tx_has_error = false;
     let mut authenticated = !crate::acl::get_acl_for_port(router.port)
         .read()
-        .unwrap()
         .is_auth_required_for_default();
     let mut auth_user = "default".to_string();
     let mut soft_limit_start: Option<Instant> = None;
 
     use crate::transport::MIN_READ_SPARE;
+    // Set when the previous batch stopped at MAX_DRAIN_BATCH_CMDS with
+    // complete frames still in `buf`: run them before reading more.
+    let mut carry_over = false;
     loop {
         if buf.capacity() - buf.len() < MIN_READ_SPARE {
             buf.reserve(READ_BUFFER_SIZE);
         }
 
-        let (res, returned_buf) = match idle_read_limit(&router, client_id, &client_registry) {
-            None => transport.read(buf).await,
-            Some(limit) => {
-                match monoio::time::timeout(limit, transport.read(buf)).await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        // Idle for `timeout` seconds: close, like Redis.
-                        buf = BytesMut::new();
-                        break;
+        let res = if std::mem::take(&mut carry_over) {
+            Ok(None)
+        } else {
+            let (res, returned_buf) = match idle_read_limit(&router, client_id, &client_registry) {
+                None => transport.read(buf).await,
+                Some(limit) => {
+                    match monoio::time::timeout(limit, transport.read(buf)).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            // Idle for `timeout` seconds: close, like Redis.
+                            buf = BytesMut::new();
+                            break;
+                        }
                     }
                 }
-            }
+            };
+            buf = returned_buf;
+            res.map(Some)
         };
-        buf = returned_buf;
 
         match res {
-            Ok(0) => {
+            Ok(Some(0)) => {
                 // Client disconnected
                 break;
             }
-            Ok(n) => {
-                stats
-                    .read_events
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(read) => {
+                let n = read.unwrap_or(0);
+                if read.is_some() {
+                    stats
+                        .read_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 stats
                     .tot_net_in
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
@@ -3552,6 +3633,13 @@ pub(crate) async fn handle_client<T: crate::transport::ClientTransport>(
                             commands.push(cmd);
                             if is_quit {
                                 buf.clear();
+                                break;
+                            }
+                            // Bound the batch even when one read delivered far
+                            // more: memory checks (maxmemory), replies and other
+                            // clients all wait for the whole batch to execute.
+                            if commands.len() >= MAX_DRAIN_BATCH_CMDS {
+                                carry_over = !buf.is_empty();
                                 break;
                             }
                         }
@@ -3799,6 +3887,9 @@ pub(crate) async fn handle_client<T: crate::transport::ClientTransport>(
                         || HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
                         || has_monitor_clients()
                         || crate::block::has_blocked_waiters(router.port)
+                        // Over maxmemory: the squashed path has no per-command
+                        // OOM/eviction gate, so take the per-command path.
+                        || (router.shard_memory_budget().is_some() && router.over_maxmemory())
                         || client_registry
                             .borrow()
                             .get(&client_id)
@@ -4201,15 +4292,18 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
             }
         }
     }
+    use crate::transport::{TransportRead, TransportWrite};
+    let (write_tx, write_rx) = flume::bounded::<Bytes>(4096);
+    let (mut reader, mut writer) = transport.into_split(&write_tx);
+    // Declared after the split so it drops (and unregisters the client from
+    // GLOBAL_CLIENTS) before `reader` closes the socket: other threads use the
+    // registered fd for CLIENT KILL / MONITOR, and must never see a closed,
+    // possibly reused, fd number.
     let _ps_cleanup = PubsubCleanup {
         client_id,
         client_registry: client_registry.clone(),
         router: router.clone(),
     };
-
-    use crate::transport::{TransportRead, TransportWrite};
-    let (write_tx, write_rx) = flume::bounded::<Bytes>(4096);
-    let (mut reader, mut writer) = transport.into_split(&write_tx);
 
     let reg_writer = client_registry.clone();
     monoio::spawn(async move {
@@ -4308,7 +4402,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                     reset_client_pubsub(router, client_id);
 
                     let acl = crate::acl::get_acl_for_port(router.port);
-                    let default_requires_auth = acl.read().unwrap().is_auth_required_for_default();
+                    let default_requires_auth = acl.read().is_auth_required_for_default();
                     *authenticated = !default_requires_auth;
                     *auth_user = "default".to_string();
 
@@ -4739,7 +4833,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                 reset_client_pubsub(router, client_id);
 
                 let acl = crate::acl::get_acl_for_port(router.port);
-                let default_requires_auth = acl.read().unwrap().is_auth_required_for_default();
+                let default_requires_auth = acl.read().is_auth_required_for_default();
                 *authenticated = !default_requires_auth;
                 *auth_user = "default".to_string();
 
@@ -4980,6 +5074,23 @@ async fn read_replica_acks<R: AsyncReadRent>(reader: &mut R, mut on_ack: impl Fn
     }
 }
 
+/// Removes a connection from the cross-thread registries (GLOBAL_CLIENTS,
+/// MONITOR) on drop. Declared after a stream is split so it runs before the
+/// socket closes: other threads `shutdown`/`send` on the registered raw fd and
+/// must never act on a closed, possibly reused, fd number. Idempotent with the
+/// connection's own cleanup.
+struct UnregisterFdOnDrop {
+    port: u16,
+    client_id: u64,
+}
+
+impl Drop for UnregisterFdOnDrop {
+    fn drop(&mut self) {
+        unregister_global_client(self.port, self.client_id);
+        unregister_monitor_client(self.port, self.client_id);
+    }
+}
+
 async fn run_master_replica_stream(
     stream: TcpStream,
     client_id: u64,
@@ -4990,6 +5101,10 @@ async fn run_master_replica_stream(
     let hub = crate::replication::get_replication_hub(router.port);
     let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
     let (mut reader, mut writer) = stream.into_split();
+    let _unregister = UnregisterFdOnDrop {
+        port: router.port,
+        client_id,
+    };
     let (write_tx, write_rx) = flume::unbounded::<Vec<u8>>();
 
     let is_sync = matches!(&psync_cmd, Command::Sync);
@@ -5106,6 +5221,10 @@ async fn run_shard_replication_flow(
     let hub = crate::replication::get_replication_hub(router.port);
     let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
     let (mut reader, mut writer) = stream.into_split();
+    let _unregister = UnregisterFdOnDrop {
+        port: router.port,
+        client_id,
+    };
     if shard_id >= router.num_shards {
         let _ = writer
             .write_all(b"-ERR invalid shard id\r\n".to_vec())
@@ -6026,7 +6145,6 @@ async fn execute_rebalance_plans(
         if p.source_node_id == hub.my_id() {
             hub.slot_states
                 .write()
-                .unwrap()
                 .insert(p.slot, ("migrating".to_string(), p.target_node_id.clone()));
             router.set_slot_state(
                 p.slot,
@@ -6109,7 +6227,7 @@ async fn execute_rebalance_plans(
             );
             router.sync_slot_tables().await;
             hub.assign_slot(p.slot, &p.target_node_id);
-            hub.slot_states.write().unwrap().remove(&p.slot);
+            hub.slot_states.write().remove(&p.slot);
             hub.bump_config_epoch();
             // The target bumped its epoch when it took the slot; learning that
             // epoch now makes any older announcement from it (still without
@@ -6119,7 +6237,6 @@ async fn execute_rebalance_plans(
         } else if p.target_node_id == hub.my_id() {
             hub.slot_states
                 .write()
-                .unwrap()
                 .insert(p.slot, ("importing".to_string(), p.source_node_id.clone()));
             router.set_slot_state(
                 p.slot,
@@ -6128,7 +6245,7 @@ async fn execute_rebalance_plans(
             router.sync_slot_tables().await;
 
             hub.assign_slot(p.slot, &p.target_node_id);
-            hub.slot_states.write().unwrap().remove(&p.slot);
+            hub.slot_states.write().remove(&p.slot);
             hub.bump_config_epoch();
             moved += 1;
         }
@@ -6406,6 +6523,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Echo(_) => "ECHO",
         Command::Type(_) => "TYPE",
         Command::Dbsize => "DBSIZE",
+        Command::KeyspaceStats => "KEYSPACESTATS",
         Command::Select(_) => "SELECT",
         Command::Slowlog(_) => "SLOWLOG",
         Command::Flushdb => "FLUSHDB",
@@ -7015,7 +7133,7 @@ async fn handle_bzpop(
     };
     {
         let hub_arc = crate::block::get_block_hub_for_port(router.port);
-        let mut hub = hub_arc.lock().unwrap();
+        let mut hub = hub_arc.lock();
         hub.register_blocked_zset_client(client_id, tx.clone());
         for k in keys.iter() {
             hub.register_zset_waiter(client_id, k.clone(), pop_type, 1, false, tx.clone());
@@ -7495,7 +7613,7 @@ fn mode_switch_denied(
         return None;
     }
     let acl = crate::acl::get_acl_for_port(port);
-    let guard = acl.read().unwrap();
+    let guard = acl.read();
     let user = guard.users.get(auth_user)?;
     let name = acl_cmd_name(cmd);
     if user.can_execute_command(name) {
@@ -7695,46 +7813,16 @@ async fn execute_command(
         client_registry,
     };
 
-    struct ErrorStatTracker {
-        start_len: usize,
-        out: *const Vec<u8>,
-        cmd_name: &'static str,
-    }
-    impl Drop for ErrorStatTracker {
-        fn drop(&mut self) {
-            let out = unsafe { &*self.out };
-            if out.len() > self.start_len {
-                let reply = &out[self.start_len..];
-                if let Some(err_line) = reply.strip_prefix(b"-") {
-                    let end_idx = err_line
-                        .iter()
-                        .position(|&b| b == b' ' || b == b'\r' || b == b'\n')
-                        .unwrap_or(err_line.len());
-                    if let Ok(prefix) = std::str::from_utf8(&err_line[..end_idx]) {
-                        let is_script_cmd = self.cmd_name == "EVAL"
-                            || self.cmd_name == "EVALSHA"
-                            || self.cmd_name == "EVAL_RO"
-                            || self.cmd_name == "EVALSHA_RO"
-                            || self.cmd_name == "FCALL"
-                            || self.cmd_name == "FCALL_RO";
-                        if is_script_cmd {
-                            record_failed_stat(self.cmd_name);
-                            if !crate::scripting::SCRIPT_RECORDED_ERROR.get() {
-                                record_error_stat(prefix, None);
-                            }
-                        } else {
-                            record_error_stat(prefix, Some(self.cmd_name));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let _error_stat_guard = ErrorStatTracker {
-        start_len: out.len(),
-        out,
-        cmd_name,
-    };
+    let error_stat_start = out.len();
+    let is_client_reply_cmd = matches!(cmd, Command::Client(ClientSubcommand::Reply(_)));
+    // Set once the command reaches the point where CLIENT REPLY OFF/SKIP
+    // applies; its reply is then dropped after the body below.
+    let mut reply_mode_start: Option<usize> = None;
+    // The body runs as an async block so that its many early `return`s
+    // leave only the block, and the reply post-processing below sees `out`
+    // through the normal borrow (it used to be done by drop guards holding
+    // a raw pointer to `out`, aliasing the live `&mut`).
+    let ret: bool = async {
 
     CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
 
@@ -7760,7 +7848,7 @@ async fn execute_command(
             || auth_user != "default")
     {
         let acl = crate::acl::get_acl_for_port(router.port);
-        let acl_guard = acl.read().unwrap();
+        let acl_guard = acl.read();
         if let Some(user) = acl_guard.users.get(auth_user) {
             let acl_name = acl_cmd_name(&cmd);
             if !user.can_execute_command(acl_name) {
@@ -7837,7 +7925,7 @@ async fn execute_command(
             crate::shard::SlotState::Stable => {
                 if router.cluster_enabled || crate::cluster::has_active_cluster(router.port) {
                     let hub = crate::cluster::get_cluster_hub(router.port);
-                    let my_slots = hub.my_slots.read().unwrap();
+                    let my_slots = hub.my_slots.read();
                     let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
                     if owns_slot {
                         if router.cluster_enabled {
@@ -7852,7 +7940,7 @@ async fn execute_command(
                             }
                         }
                     } else {
-                        let nodes = hub.nodes.read().unwrap();
+                        let nodes = hub.nodes.read();
                         if !nodes.is_empty()
                             && let Some(peer) = nodes.values().find(|n| {
                                 n.flags.contains("master")
@@ -7888,7 +7976,10 @@ async fn execute_command(
     }
 
     // Enforce maxmemory: evict or return OOM if memory limit is exceeded
-    let max_mem = crate::tiering::get_max_memory(router.port);
+    let max_mem = router
+        .tier_stats
+        .max_memory
+        .load(std::sync::atomic::Ordering::Relaxed);
     if max_mem > 0 {
         let policy = get_max_memory_policy();
         if policy != "noeviction" {
@@ -7896,20 +7987,9 @@ async fn execute_command(
                 cmd,
                 Command::ConfigGet(_) | Command::ConfigSet { .. } | Command::Info(_)
             ) {
-                IN_MAXMEMORY_EVICT.set(true);
-                IN_MAXMEMORY_EVICT_GLOBAL.store(true, std::sync::atomic::Ordering::Relaxed);
                 let under = router
-                    .evict_until_under_maxmemory(max_mem as usize, &policy)
+                    .evict_until_under_maxmemory(max_mem as usize, &policy, client_id, out)
                     .await;
-                IN_MAXMEMORY_EVICT.set(false);
-                IN_MAXMEMORY_EVICT_GLOBAL.store(false, std::sync::atomic::Ordering::Relaxed);
-                {
-                    let mut pre_buf = PRE_CMD_TRACK_BUF_GLOBAL.lock().unwrap();
-                    if !pre_buf.is_empty() {
-                        out.extend_from_slice(&pre_buf);
-                        pre_buf.clear();
-                    }
-                }
                 if !under && cmd.is_write_command() && !cmd.allows_oom() {
                     let c_name = get_cmd_name(&cmd);
                     record_rejected_stat(c_name);
@@ -7921,11 +8001,15 @@ async fn execute_command(
                 }
             }
         } else if cmd.is_write_command() && !cmd.allows_oom() {
-            let used = router.local_db.borrow().table.used_memory;
-            let shard_max = (max_mem / router.num_shards.max(1) as u64) as usize;
             // noeviction never deletes data, but values may still be offloaded
-            // to the NVMe tier; only reject if that cannot make room.
-            if used > shard_max && !router.check_auto_tier().await {
+            // to the NVMe tier; reject only while the server stays over the
+            // limit (other shards' published usage, refreshed when it says
+            // "over") after the tier had a chance to make room.
+            let over = router.over_maxmemory_checked().await && {
+                router.check_auto_tier().await;
+                router.over_maxmemory()
+            };
+            if over {
                 let c_name = get_cmd_name(&cmd);
                 record_rejected_stat(c_name);
                 record_error_stat("OOM", Some(c_name));
@@ -7937,37 +8021,7 @@ async fn execute_command(
         }
     }
 
-    let is_client_reply_cmd = matches!(cmd, Command::Client(ClientSubcommand::Reply(_)));
-    struct ReplyModeTracker<'a> {
-        start_len: usize,
-        out: *mut Vec<u8>,
-        mode: crate::resp::ClientReplyMode,
-        is_reply_cmd: bool,
-        client_id: u64,
-        client_registry: &'a RefCell<hashbrown::HashMap<u64, ClientInfo>>,
-    }
-    impl<'a> Drop for ReplyModeTracker<'a> {
-        fn drop(&mut self) {
-            if !self.is_reply_cmd && self.mode != crate::resp::ClientReplyMode::On {
-                unsafe {
-                    (*self.out).truncate(self.start_len);
-                }
-                if self.mode == crate::resp::ClientReplyMode::Skip
-                    && let Some(c) = self.client_registry.borrow_mut().get_mut(&self.client_id)
-                {
-                    c.reply_mode = crate::resp::ClientReplyMode::On;
-                }
-            }
-        }
-    }
-    let _reply_mode_guard = ReplyModeTracker {
-        start_len: out.len(),
-        out: out as *mut Vec<u8>,
-        mode: initial_reply_mode,
-        is_reply_cmd: is_client_reply_cmd,
-        client_id,
-        client_registry,
-    };
+    reply_mode_start = Some(out.len());
 
     match cmd {
         Command::Get(key) => {
@@ -8863,7 +8917,7 @@ async fn execute_command(
             );
             let (blocked_clients_count, total_blocking_keys, total_blocking_keys_on_nokey) = {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                let hub = hub_arc.lock().unwrap();
+                let hub = hub_arc.lock();
                 (
                     hub.blocked_clients_count() + paused_clients_count(),
                     hub.blocking_keys_count(),
@@ -8907,17 +8961,20 @@ async fn execute_command(
                 router.flush_all_command_stats().await;
                 let mut s = String::from("# Commandstats\r\n");
                 let mut all_cmds = hashbrown::HashSet::new();
-                if let Ok(map) = CMD_STATS.read() {
+                {
+                    let map = CMD_STATS.read();
                     for k in map.keys() {
                         all_cmds.insert(k.clone());
                     }
                 }
-                if let Ok(map) = FAILED_CMD_STATS.read() {
+                {
+                    let map = FAILED_CMD_STATS.read();
                     for k in map.keys() {
                         all_cmds.insert(k.clone());
                     }
                 }
-                if let Ok(map) = REJECTED_CMD_STATS.read() {
+                {
+                    let map = REJECTED_CMD_STATS.read();
                     for k in map.keys() {
                         all_cmds.insert(k.clone());
                     }
@@ -8925,11 +8982,7 @@ async fn execute_command(
                 let mut entries: Vec<_> = all_cmds.into_iter().collect();
                 entries.sort();
                 for cmd in entries {
-                    let stat = CMD_STATS
-                        .read()
-                        .ok()
-                        .and_then(|m| m.get(&cmd).copied())
-                        .unwrap_or_default();
+                    let stat = CMD_STATS.read().get(&cmd).copied().unwrap_or_default();
                     let calls = stat.calls;
                     let usec = stat.nanos / 1000;
                     let usec_per_call = if calls == 0 {
@@ -8937,16 +8990,8 @@ async fn execute_command(
                     } else {
                         stat.nanos as f64 / 1000.0 / calls as f64
                     };
-                    let failed = FAILED_CMD_STATS
-                        .read()
-                        .ok()
-                        .and_then(|m| m.get(&cmd).copied())
-                        .unwrap_or(0);
-                    let rejected = REJECTED_CMD_STATS
-                        .read()
-                        .ok()
-                        .and_then(|m| m.get(&cmd).copied())
-                        .unwrap_or(0);
+                    let failed = FAILED_CMD_STATS.read().get(&cmd).copied().unwrap_or(0);
+                    let rejected = REJECTED_CMD_STATS.read().get(&cmd).copied().unwrap_or(0);
                     if let Some(slow) = crate::slowlog::get_cmd_slow_stat(&cmd) {
                         s.push_str(&format!(
                             "cmdstat_{}:calls={},usec={},usec_per_call={:.2},rejected_calls={},failed_calls={},slowlog_count={},slowlog_time_ms_sum={:.2},slowlog_time_ms_max={:.2}\r\n",
@@ -8963,7 +9008,8 @@ async fn execute_command(
             };
             let errorstat_str = {
                 let mut s = String::from("# Errorstats\r\n");
-                if let Ok(map) = ERROR_STATS.read() {
+                {
+                    let map = ERROR_STATS.read();
                     let mut entries: Vec<_> = map.iter().collect();
                     entries.sort_by_key(|(k, _)| *k);
                     for (prefix, count) in entries {
@@ -8973,8 +9019,12 @@ async fn execute_command(
                 s
             };
             let server_str = format!(
-                "# Server\r\nredis_version:7.2.4\r\nredis_git_sha1:00000000\r\nredis_git_dirty:0\r\nredis_build_id:0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\nmultiplexing_api:io_uring\r\nrudis_version:0.1.0\r\narch:shared-nothing-io_uring\r\nshard_id:{}\r\nnum_shards:{}\r\ntcp_port:{}\r\n",
-                router.shard_id, router.num_shards, router.port,
+                "# Server\r\nredis_version:7.2.4\r\nredis_git_sha1:00000000\r\nredis_git_dirty:0\r\nredis_build_id:0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\nmultiplexing_api:{}\r\nrudis_version:0.1.0\r\narch:shared-nothing-{}\r\nshard_id:{}\r\nnum_shards:{}\r\ntcp_port:{}\r\n",
+                io_driver_name(),
+                io_driver_name(),
+                router.shard_id,
+                router.num_shards,
+                router.port,
             );
             let cpu_str = "# CPU\r\nused_cpu_sys:0.000000\r\nused_cpu_user:0.000000\r\nused_cpu_sys_children:0.000000\r\nused_cpu_user_children:0.000000\r\nused_cpu_sys_main_thread:0.000000\r\nused_cpu_user_main_thread:0.000000\r\n";
             let repl_str = format!("# Replication\r\n{}", hub.format_info_replication());
@@ -9012,6 +9062,7 @@ async fn execute_command(
                                     "cpu",
                                     "storage",
                                     "errorstats",
+                                    "keyspace",
                                 ] {
                                     push_unique(s);
                                 }
@@ -9028,6 +9079,7 @@ async fn execute_command(
                                     "storage",
                                     "commandstats",
                                     "errorstats",
+                                    "keyspace",
                                 ] {
                                     push_unique(s);
                                 }
@@ -9042,6 +9094,7 @@ async fn execute_command(
                             "storage" | "tiered" => push_unique("storage"),
                             "commandstats" => push_unique("commandstats"),
                             "errorstats" => push_unique("errorstats"),
+                            "keyspace" => push_unique("keyspace"),
                             _ => {}
                         }
                     }
@@ -9058,6 +9111,17 @@ async fn execute_command(
                             "storage" => acc.push_str(&storage_str),
                             "commandstats" => acc.push_str(&cmdstat_str),
                             "errorstats" => acc.push_str(&errorstat_str),
+                            "keyspace" => {
+                                // Only fan out when the section is requested.
+                                let (keys, expires) = router.keyspace_stats().await;
+                                acc.push_str("# Keyspace\r\n");
+                                if keys > 0 {
+                                    acc.push_str(&format!(
+                                        "db0:keys={},expires={},avg_ttl=0,subexpiry=0\r\n",
+                                        keys, expires
+                                    ));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -9310,7 +9374,7 @@ async fn execute_command(
                         .to_string();
                     let obuf = format_client_output_buffer_limit_config();
                     let acl = crate::acl::get_acl_for_port(router.port);
-                    let pass = acl.read().unwrap().requirepass.clone().unwrap_or_default();
+                    let pass = acl.read().requirepass.clone().unwrap_or_default();
                     let app = if router.aof.is_some() {
                         "yes".to_string()
                     } else {
@@ -9349,17 +9413,17 @@ async fn execute_command(
                     let lua_time_limit = CONFIG_LUA_TIME_LIMIT
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let oom_adj = CONFIG_OOM_SCORE_ADJ.read().unwrap().clone();
-                    let oom_adj_vals = CONFIG_OOM_SCORE_ADJ_VALUES.read().unwrap().clone();
+                    let oom_adj = CONFIG_OOM_SCORE_ADJ.read().clone();
+                    let oom_adj_vals = CONFIG_OOM_SCORE_ADJ_VALUES.read().clone();
                     let save_cfg = crate::snapshot::format_save_points(
                         &crate::config::save_points(router.base_port),
                     );
-                    let maxmem_clients = CONFIG_MAXMEMORY_CLIENTS.read().unwrap().clone();
+                    let maxmem_clients = CONFIG_MAXMEMORY_CLIENTS.read().clone();
                     let bind_cfg = crate::netsec::format_bind_spec(&crate::netsec::bind_addrs(
                         router.base_port,
                     ));
-                    let backup_dir = CONFIG_BACKUPDIRNAME.read().unwrap().clone();
-                    let slaveof_cfg = CONFIG_SLAVEOF.read().unwrap().clone();
+                    let backup_dir = CONFIG_BACKUPDIRNAME.read().clone();
+                    let slaveof_cfg = CONFIG_SLAVEOF.read().clone();
 
                     let ro = if REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
                         "yes"
@@ -9955,7 +10019,7 @@ async fn execute_command(
                             node.clone()
                         } else {
                             let hub = crate::cluster::get_cluster_hub(router.port);
-                            let nodes = hub.nodes.read().unwrap();
+                            let nodes = hub.nodes.read();
                             if let Some(n) = nodes.get(&node) {
                                 format!("{}:{}", n.ip, n.port)
                             } else {
@@ -9967,7 +10031,6 @@ async fn execute_command(
                         let hub = crate::cluster::get_cluster_hub(router.port);
                         hub.slot_states
                             .write()
-                            .unwrap()
                             .insert(slot, ("migrating".to_string(), node));
                         router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
@@ -9977,7 +10040,7 @@ async fn execute_command(
                             node.clone()
                         } else {
                             let hub = crate::cluster::get_cluster_hub(router.port);
-                            let nodes = hub.nodes.read().unwrap();
+                            let nodes = hub.nodes.read();
                             if let Some(n) = nodes.get(&node) {
                                 format!("{}:{}", n.ip, n.port)
                             } else {
@@ -9989,7 +10052,6 @@ async fn execute_command(
                         let hub = crate::cluster::get_cluster_hub(router.port);
                         hub.slot_states
                             .write()
-                            .unwrap()
                             .insert(slot, ("importing".to_string(), node));
                         router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
@@ -9997,7 +10059,7 @@ async fn execute_command(
                     SetSlotSubcommand::Stable => {
                         router.set_slot_state(slot, crate::shard::SlotState::Stable);
                         let hub = crate::cluster::get_cluster_hub(router.port);
-                        hub.slot_states.write().unwrap().remove(&slot);
+                        hub.slot_states.write().remove(&slot);
                         router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
                     }
@@ -10007,7 +10069,7 @@ async fn execute_command(
                             || node == my_id
                             || (0..router.num_shards).any(|s| node == format!("{:040x}", s + 1));
                         let hub = crate::cluster::get_cluster_hub(router.port);
-                        hub.slot_states.write().unwrap().remove(&slot);
+                        hub.slot_states.write().remove(&slot);
                         if is_myself {
                             let shard = (0..router.num_shards)
                                 .find(|&s| node == format!("{:040x}", s + 1))
@@ -10022,7 +10084,7 @@ async fn execute_command(
                             hub.bump_config_epoch();
                         } else {
                             let owner_id = {
-                                let nodes = hub.nodes.read().unwrap();
+                                let nodes = hub.nodes.read();
                                 if nodes.contains_key(&node) {
                                     Some(node.clone())
                                 } else {
@@ -10035,7 +10097,7 @@ async fn execute_command(
                             let target_addr = if node.contains(':') {
                                 node
                             } else {
-                                let nodes = hub.nodes.read().unwrap();
+                                let nodes = hub.nodes.read();
                                 if let Some(n) = nodes.get(&node) {
                                     format!("{}:{}", n.ip, n.port)
                                 } else {
@@ -10045,15 +10107,13 @@ async fn execute_command(
                             let owned = hub
                                 .my_slots
                                 .read()
-                                .unwrap()
                                 .iter()
                                 .any(|&(s, e)| slot >= s && slot <= e);
                             match owner_id {
                                 Some(id) => hub.assign_slot(slot, &id),
-                                None => crate::cluster::remove_slots(
-                                    &mut hub.my_slots.write().unwrap(),
-                                    &[slot],
-                                ),
+                                None => {
+                                    crate::cluster::remove_slots(&mut hub.my_slots.write(), &[slot])
+                                }
                             }
                             if owned {
                                 hub.bump_config_epoch();
@@ -10306,7 +10366,6 @@ async fn execute_command(
                         let idle = now.duration_since(c.last_active).as_secs();
                         let is_blocked = crate::block::get_block_hub_for_port(router.port)
                             .lock()
-                            .unwrap()
                             .is_blocked(c.id);
                         let flags = if c.is_monitor {
                             "O"
@@ -10496,7 +10555,7 @@ async fn execute_command(
                         if killed_cids.is_empty() {
                             out.extend_from_slice(b"-ERR No such client\r\n");
                         } else {
-                            let map = GLOBAL_CLIENTS.read().unwrap();
+                            let map = GLOBAL_CLIENTS.read();
                             for cid in killed_cids {
                                 if cid == client_id {
                                     close_conn = true;
@@ -10515,12 +10574,13 @@ async fn execute_command(
                                         ACTIVE_CLIENTS
                                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                     }
+                                    // SAFETY: shutdown(2) takes no pointers. The entry is read under the
+                                    // GLOBAL_CLIENTS read lock and the connection removes its registry entry (ClientCleanup / PubsubCleanup) before its socket is closed, so the fd is not a reused number.
                                     unsafe {
                                         libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
                                     }
                                     crate::block::get_block_hub_for_port(router.port)
                                         .lock()
-                                        .unwrap()
                                         .remove_waiters_for_client(cid);
                                 }
                             }
@@ -10568,7 +10628,7 @@ async fn execute_command(
                                 }
                                 "USER" => {
                                     let acl = crate::acl::get_acl_for_port(router.port);
-                                    if acl.read().unwrap().get_user(&v).is_none() {
+                                    if acl.read().get_user(&v).is_none() {
                                         err_msg = Some(format!("-ERR No such user '{}'\r\n", v));
                                         break;
                                     }
@@ -10618,7 +10678,7 @@ async fn execute_command(
                             out.extend_from_slice(err.as_bytes());
                         } else {
                             let list = router.client_list(client_registry, &[]).await;
-                            let map = GLOBAL_CLIENTS.read().unwrap();
+                            let map = GLOBAL_CLIENTS.read();
                             let mut killed_cids = Vec::new();
                             for line in list.lines() {
                                 let mut cid_opt = None;
@@ -10700,12 +10760,13 @@ async fn execute_command(
                                         ACTIVE_CLIENTS
                                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                     }
+                                    // SAFETY: shutdown(2) takes no pointers. The entry is read under the
+                                    // GLOBAL_CLIENTS read lock and the connection removes its registry entry (ClientCleanup / PubsubCleanup) before its socket is closed, so the fd is not a reused number.
                                     unsafe {
                                         libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
                                     }
                                     crate::block::get_block_hub_for_port(router.port)
                                         .lock()
-                                        .unwrap()
                                         .remove_waiters_for_client(cid);
                                 }
                             }
@@ -10718,7 +10779,7 @@ async fn execute_command(
                     unblock_type,
                 } => {
                     let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                    let mut hub = hub_arc.lock().unwrap();
+                    let mut hub = hub_arc.lock();
                     let unblocked = hub.unblock_client(target_id, unblock_type);
                     if unblocked {
                         out.extend_from_slice(b":1\r\n");
@@ -11146,7 +11207,7 @@ async fn execute_command(
 
                     {
                         let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                        let mut hub = hub_arc.lock().unwrap();
+                        let mut hub = hub_arc.lock();
                         for k in keys {
                             hub.register_stream_waiter(
                                 client_id,
@@ -11355,7 +11416,7 @@ async fn execute_command(
                         loop {
                             {
                                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                                let mut hub = hub_arc.lock().unwrap();
+                                let mut hub = hub_arc.lock();
                                 for k in keys {
                                     hub.register_stream_waiter(
                                         client_id,
@@ -11442,7 +11503,7 @@ async fn execute_command(
             let uname = username.as_deref().unwrap_or("default");
             let pass = password.as_str();
             let acl = crate::acl::get_acl_for_port(router.port);
-            let acl_guard = acl.read().unwrap();
+            let acl_guard = acl.read();
             if let Ok(authed_user) = acl_guard.check_auth(Some(uname), pass) {
                 *authenticated = true;
                 *auth_user = authed_user.clone();
@@ -11464,14 +11525,14 @@ async fn execute_command(
                     );
                 }
                 crate::resp::AclSubcommand::Users => {
-                    let users = acl.read().unwrap().users();
+                    let users = acl.read().users();
                     out.extend_from_slice(format!("*{}\r\n", users.len()).as_bytes());
                     for u in users {
                         out.extend_from_slice(format!("${}\r\n{}\r\n", u.len(), u).as_bytes());
                     }
                 }
                 crate::resp::AclSubcommand::List => {
-                    let list = acl.read().unwrap().list();
+                    let list = acl.read().list();
                     out.extend_from_slice(format!("*{}\r\n", list.len()).as_bytes());
                     for line in list {
                         out.extend_from_slice(
@@ -11480,7 +11541,7 @@ async fn execute_command(
                     }
                 }
                 crate::resp::AclSubcommand::GetUser(username) => {
-                    if let Some(user) = acl.read().unwrap().get_user(&username) {
+                    if let Some(user) = acl.read().get_user(&username) {
                         out.extend_from_slice(b"*10\r\n");
                         out.extend_from_slice(b"$5\r\nflags\r\n");
                         let flags = user.flags();
@@ -11518,13 +11579,13 @@ async fn execute_command(
                 }
                 crate::resp::AclSubcommand::SetUser { username, rules } => {
                     flush_pending_bcast(router.port);
-                    match acl.write().unwrap().set_user(&username, &rules) {
+                    match acl.write().set_user(&username, &rules) {
                         Ok(()) => out.extend_from_slice(b"+OK\r\n"),
                         Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
                     }
                 }
                 crate::resp::AclSubcommand::DelUser(usernames) => {
-                    let count = acl.write().unwrap().del_user(&usernames);
+                    let count = acl.write().del_user(&usernames);
                     write_resp_integer(out, count as i64);
                 }
                 crate::resp::AclSubcommand::Cat => {
@@ -11627,7 +11688,7 @@ async fn execute_command(
             let (tx, rx) = flume::bounded(1);
             {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                let mut hub = hub_arc.lock().unwrap();
+                let mut hub = hub_arc.lock();
                 hub.register_blocked_client(client_id, tx.clone());
                 for k in &keys {
                     hub.register_list_waiter(
@@ -11771,7 +11832,7 @@ async fn execute_command(
             let (tx, rx) = flume::bounded(1);
             {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                let mut hub = hub_arc.lock().unwrap();
+                let mut hub = hub_arc.lock();
                 hub.register_blocked_client(client_id, tx.clone());
                 for k in &keys {
                     hub.register_list_waiter(
@@ -12194,7 +12255,7 @@ async fn execute_command(
             let (tx, rx) = flume::bounded(1);
             {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                let mut hub = hub_arc.lock().unwrap();
+                let mut hub = hub_arc.lock();
                 hub.register_blocked_client(client_id, tx.clone());
                 let from_type = match where_from {
                     crate::table::ListDirection::Left => crate::block::ListPopType::Left,
@@ -12400,7 +12461,7 @@ async fn execute_command(
             let (tx, rx) = flume::bounded(1);
             {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                let mut hub = hub_arc.lock().unwrap();
+                let mut hub = hub_arc.lock();
                 hub.register_blocked_client(client_id, tx.clone());
                 let from_type = match where_from {
                     crate::table::ListDirection::Left => crate::block::ListPopType::Left,
@@ -12697,7 +12758,7 @@ async fn execute_command(
             };
             {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                let mut hub = hub_arc.lock().unwrap();
+                let mut hub = hub_arc.lock();
                 hub.register_blocked_client(client_id, tx.clone());
                 for k in &keys {
                     hub.register_list_waiter(client_id, k.clone(), pop_type, count, tx.clone());
@@ -12945,7 +13006,7 @@ async fn execute_command(
             };
             {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                let mut hub = hub_arc.lock().unwrap();
+                let mut hub = hub_arc.lock();
                 hub.register_blocked_zset_client(client_id, tx.clone());
                 for k in keys.iter() {
                     hub.register_zset_waiter(
@@ -12998,10 +13059,10 @@ async fn execute_command(
             }
 
             let acl = crate::acl::get_acl_for_port(router.port);
-            let default_requires_auth = acl.read().unwrap().is_auth_required_for_default();
+            let default_requires_auth = acl.read().is_auth_required_for_default();
 
             if let Some((uname, pass)) = auth {
-                if let Ok(user) = acl.read().unwrap().check_auth(Some(uname), pass) {
+                if let Ok(user) = acl.read().check_auth(Some(uname), pass) {
                     *authenticated = true;
                     *auth_user = user.clone();
                     update_global_client_auth(router.port, client_id, &user);
@@ -13088,7 +13149,7 @@ async fn execute_command(
             reset_client_pubsub(router, client_id);
 
             let acl = crate::acl::get_acl_for_port(router.port);
-            let default_requires_auth = acl.read().unwrap().is_auth_required_for_default();
+            let default_requires_auth = acl.read().is_auth_required_for_default();
             *authenticated = !default_requires_auth;
             *auth_user = "default".to_string();
             out.extend_from_slice(b"+RESET\r\n");
@@ -13883,6 +13944,11 @@ async fn execute_command(
             write_resp_integer(out, count as i64);
             false
         }
+        Command::KeyspaceStats => {
+            let (keys, expires) = router.keyspace_stats().await;
+            out.extend_from_slice(format!("*2\r\n:{}\r\n:{}\r\n", keys, expires).as_bytes());
+            false
+        }
         Command::Dbsize => {
             let count = router.dbsize().await;
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
@@ -13950,7 +14016,7 @@ async fn execute_command(
         Command::Flushdb | Command::Flushall => {
             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                 let watched_keys_for_port: Vec<Bytes> = {
-                    let map = WATCHED_KEYS.read().unwrap();
+                    let map = WATCHED_KEYS.read();
                     map.get(&router.port)
                         .map(|m| m.keys().cloned().collect())
                         .unwrap_or_default()
@@ -15078,7 +15144,7 @@ async fn execute_command(
         }
         Command::FtInfo(index) => {
             if let Some(idx_arc) = crate::search::get_search_index(&index) {
-                let idx = idx_arc.read().unwrap();
+                let idx = idx_arc.read();
                 if let Some(schema) = &idx.schema {
                     let total_vec_bytes: usize =
                         idx.vector_indices.values().map(|v| v.memory_usage()).sum();
@@ -15218,7 +15284,7 @@ async fn execute_command(
             fields,
         } => {
             if let Some(idx_arc) = crate::search::get_search_index(&index) {
-                let mut idx = idx_arc.write().unwrap();
+                let mut idx = idx_arc.write();
                 let map: std::collections::HashMap<String, String> = fields.into_iter().collect();
                 idx.add_document(&doc_id, map, None);
                 out.extend_from_slice(b"+OK\r\n");
@@ -15833,6 +15899,51 @@ async fn execute_command(
         }
         Command::DflyFlow { .. } => false,
     }
+    }
+    .await;
+
+    if let Some(start_len) = reply_mode_start
+        && !is_client_reply_cmd
+        && initial_reply_mode != crate::resp::ClientReplyMode::On
+    {
+        out.truncate(start_len);
+        if initial_reply_mode == crate::resp::ClientReplyMode::Skip
+            && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
+        {
+            c.reply_mode = crate::resp::ClientReplyMode::On;
+        }
+    }
+    record_reply_error_stat(out, error_stat_start, cmd_name);
+    ret
+}
+
+/// Counts an error reply (`-PREFIX ...`) written to `out[start_len..]` in
+/// INFO errorstats / commandstats.
+fn record_reply_error_stat(out: &[u8], start_len: usize, cmd_name: &'static str) {
+    if out.len() <= start_len {
+        return;
+    }
+    let reply = &out[start_len..];
+    if let Some(err_line) = reply.strip_prefix(b"-") {
+        let end_idx = err_line
+            .iter()
+            .position(|&b| b == b' ' || b == b'\r' || b == b'\n')
+            .unwrap_or(err_line.len());
+        if let Ok(prefix) = std::str::from_utf8(&err_line[..end_idx]) {
+            let is_script_cmd = matches!(
+                cmd_name,
+                "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO"
+            );
+            if is_script_cmd {
+                record_failed_stat(cmd_name);
+                if !crate::scripting::SCRIPT_RECORDED_ERROR.get() {
+                    record_error_stat(prefix, None);
+                }
+            } else {
+                record_error_stat(prefix, Some(cmd_name));
+            }
+        }
+    }
 }
 
 pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
@@ -16333,6 +16444,7 @@ pub fn execute_local_command(
     out: &mut Vec<u8>,
     aof: Option<&RefCell<crate::aof::AofWriter>>,
 ) -> bool {
+    db.hydrate_cmd_keys(cmd);
     let cid = {
         let local = CURRENT_CLIENT_ID.get();
         if local != 0 {
@@ -16395,1816 +16507,1757 @@ pub fn execute_local_command(
         cid,
         cmd,
     };
-    struct DroppedTierGuard(*mut ShardDb);
-    impl Drop for DroppedTierGuard {
-        fn drop(&mut self) {
-            unsafe {
-                (*self.0).drain_dropped_tier();
-            }
+    // Tiered values dropped by the command are reclaimed after it, on every
+    // exit path; the body is a closure so its early `return`s land here
+    // (this used to be a drop guard holding a raw pointer to `db`).
+    #[allow(clippy::redundant_closure_call)]
+    let ret = (|| -> bool {
+        // GET and MGET read through counting table accessors; probe the keys of
+        // the other read commands for INFO keyspace_hits / keyspace_misses.
+        if !matches!(cmd, Command::Get(_) | Command::Mget(_)) {
+            for_each_read_key(cmd, |k| {
+                crate::server_stats::note_key_lookup(db.table.key_is_live(k))
+            });
         }
-    }
-    let _tier_guard = DroppedTierGuard(db as *mut ShardDb);
-    // GET and MGET read through counting table accessors; probe the keys of
-    // the other read commands for INFO keyspace_hits / keyspace_misses.
-    if !matches!(cmd, Command::Get(_) | Command::Mget(_)) {
-        for_each_read_key(cmd, |k| {
-            crate::server_stats::note_key_lookup(db.table.key_is_live(k))
-        });
-    }
-    match cmd {
-        Command::Get(key) => {
-            match db.get_checked(key) {
-                Ok(Some(v)) => {
-                    write_resp_bulk(out, &v);
-                }
-                Ok(None) => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-                Err(err) => write_resp_err(out, err),
-            }
-            false
-        }
-        Command::Getex {
-            key,
-            expire_in,
-            persist,
-        } => {
-            let val = match db.get_checked(key.as_ref()) {
-                Ok(val) => val,
-                Err(err) => {
-                    write_resp_err(out, err);
-                    return false;
-                }
-            };
-            match val {
-                Some(v) => {
-                    let ttl_change = if *persist {
-                        db.persist(key.as_ref())
-                            .then(|| ("persist", Command::Persist(key.clone())))
-                    } else if let Some(exp) = expire_in {
-                        let opts = crate::resp::ExpireOptions::default();
-                        db.expire(key.as_ref(), *exp, opts).then(|| {
-                            let cmd = Command::Expire {
-                                key: key.clone(),
-                                duration: *exp,
-                                opts,
-                            };
-                            ("expire", cmd)
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some((event, change)) = ttl_change {
-                        record_change!(&change);
-                        if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                            touch_watched_key(db.port, key.as_ref());
-                        }
-                        if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                            notify_key_invalidation(db.port, key.as_ref(), 0);
-                        }
-                        notify_keyspace_event(NOTIFY_GENERIC, event, key);
+        match cmd {
+            Command::Get(key) => {
+                match db.get_checked(key) {
+                    Ok(Some(v)) => {
+                        write_resp_bulk(out, &v);
                     }
-                    write_resp_bulk(out, &v);
+                    Ok(None) => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                    Err(err) => write_resp_err(out, err),
                 }
-                None => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
+                false
             }
-            false
-        }
-        Command::Mget(keys) => {
-            write_resp_array_header(out, keys.len());
-            for k in keys {
-                match db.get(k) {
-                    Some(v) => write_resp_bulk(out, &v),
-                    None => write_resp_null(out),
-                }
-            }
-            false
-        }
-        Command::Set {
-            key,
-            value,
-            expire_in,
-            condition,
-            get,
-            keepttl,
-            past_expired,
-        } => {
-            let current_val = match db.table.get(key) {
-                Ok(val) => val,
-                Err(err) => {
-                    if *get
-                        || matches!(
-                            condition,
-                            crate::resp::SetCondition::Ifeq(_)
-                                | crate::resp::SetCondition::Ifne(_)
-                                | crate::resp::SetCondition::Ifdeq(_)
-                                | crate::resp::SetCondition::Ifdne(_)
-                        )
-                    {
+            Command::Getex {
+                key,
+                expire_in,
+                persist,
+            } => {
+                let val = match db.get_checked(key.as_ref()) {
+                    Ok(val) => val,
+                    Err(err) => {
                         write_resp_err(out, err);
                         return false;
                     }
-                    None
-                }
-            };
-
-            let exists = db.exists(key);
-            let condition_met = match condition {
-                crate::resp::SetCondition::None => true,
-                crate::resp::SetCondition::Nx => !exists,
-                crate::resp::SetCondition::Xx => exists,
-                crate::resp::SetCondition::Ifeq(expected) => current_val.as_ref() == Some(expected),
-                crate::resp::SetCondition::Ifne(expected) => match &current_val {
-                    None => true,
-                    Some(val) => val != expected,
-                },
-                crate::resp::SetCondition::Ifdeq(expected_digest) => match &current_val {
-                    None => false,
-                    Some(val) => {
-                        if expected_digest.len() != 16
-                            || !expected_digest.iter().all(|b| b.is_ascii_hexdigit())
-                        {
-                            write_resp_err(
-                                out,
-                                "ERR digest must be exactly 16 hexadecimal characters",
-                            );
-                            return false;
-                        }
-                        let d = crate::table::compute_digest(val);
-                        d.eq_ignore_ascii_case(&String::from_utf8_lossy(expected_digest))
-                    }
-                },
-                crate::resp::SetCondition::Ifdne(expected_digest) => match &current_val {
-                    None => true,
-                    Some(val) => {
-                        if expected_digest.len() != 16
-                            || !expected_digest.iter().all(|b| b.is_ascii_hexdigit())
-                        {
-                            write_resp_err(
-                                out,
-                                "ERR digest must be exactly 16 hexadecimal characters",
-                            );
-                            return false;
-                        }
-                        let d = crate::table::compute_digest(val);
-                        !d.eq_ignore_ascii_case(&String::from_utf8_lossy(expected_digest))
-                    }
-                },
-            };
-
-            if !condition_met {
-                if *get {
-                    if let Some(v) = current_val {
-                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                        out.extend_from_slice(&v);
-                        out.extend_from_slice(b"\r\n");
-                    } else {
-                        out.extend_from_slice(b"$-1\r\n");
-                    }
-                } else {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-                return false;
-            }
-
-            if *past_expired {
-                crate::table::inc_expired_keys();
-                if exists {
-                    db.del(key);
-                    record_change!(cmd);
-                }
-                if *get {
-                    if let Some(v) = current_val {
-                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                        out.extend_from_slice(&v);
-                        out.extend_from_slice(b"\r\n");
-                    } else {
-                        out.extend_from_slice(b"$-1\r\n");
-                    }
-                } else {
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                return false;
-            }
-
-            let prev_kind = db.type_of(key.as_ref());
-            db.set_extended(key.clone(), value.clone(), *expire_in, *keepttl);
-            record_change!(cmd);
-            notify_set_key_events_local(prev_kind, "string", key);
-            notify_keyspace_event(NOTIFY_STRING, "set", key);
-            notify_stream_or_defer(db, key);
-            if expire_in.is_some() {
-                notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
-            }
-
-            if *get {
-                if let Some(v) = current_val {
-                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                    out.extend_from_slice(&v);
-                    out.extend_from_slice(b"\r\n");
-                } else {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-            } else {
-                out.extend_from_slice(b"+OK\r\n");
-            }
-            false
-        }
-        Command::Mset(pairs) => {
-            for (k, v) in pairs {
-                db.set(k.clone(), v.clone(), None);
-            }
-            record_change!(cmd);
-            for (k, _) in pairs {
-                notify_keyspace_event(NOTIFY_STRING, "set", k);
-            }
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::Msetex {
-            pairs,
-            condition,
-            expiry,
-        } => {
-            let pass = match condition {
-                MsetexCondition::None => true,
-                MsetexCondition::Nx => pairs.iter().all(|(k, _)| !db.exists(k)),
-                MsetexCondition::Xx => pairs.iter().all(|(k, _)| db.exists(k)),
-            };
-
-            if !pass {
-                out.extend_from_slice(b":0\r\n");
-                return false;
-            }
-
-            for (k, v) in pairs {
-                let ttl = match expiry {
-                    MsetexExpiry::None => None,
-                    MsetexExpiry::KeepTtl => db.get_entry(k).and_then(|(_, exp)| exp),
-                    MsetexExpiry::ExpireIn(d) => Some(*d),
                 };
-                db.set(k.clone(), v.clone(), ttl);
-            }
-            record_change!(cmd);
-            match condition {
-                MsetexCondition::None => {
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                MsetexCondition::Nx | MsetexCondition::Xx => {
-                    out.extend_from_slice(b":1\r\n");
-                }
-            }
-            false
-        }
-        Command::Lcs {
-            key1,
-            key2,
-            len_only,
-            idx,
-            min_match_len,
-            with_match_len,
-        } => {
-            let val1 = match db.table.get(key1) {
-                Ok(v) => v.unwrap_or_default(),
-                Err(err) => {
-                    write_resp_err(out, err);
-                    return false;
-                }
-            };
-            let val2 = match db.table.get(key2) {
-                Ok(v) => v.unwrap_or_default(),
-                Err(err) => {
-                    write_resp_err(out, err);
-                    return false;
-                }
-            };
-
-            let s1 = val1.as_ref();
-            let s2 = val2.as_ref();
-            let m = s1.len();
-            let n = s2.len();
-
-            let mut dp = vec![vec![0u32; n + 1]; m + 1];
-            for i in 1..=m {
-                for j in 1..=n {
-                    if s1[i - 1] == s2[j - 1] {
-                        dp[i][j] = dp[i - 1][j - 1] + 1;
-                    } else {
-                        dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+                match val {
+                    Some(v) => {
+                        let ttl_change = if *persist {
+                            db.persist(key.as_ref())
+                                .then(|| ("persist", Command::Persist(key.clone())))
+                        } else if let Some(exp) = expire_in {
+                            let opts = crate::resp::ExpireOptions::default();
+                            db.expire(key.as_ref(), *exp, opts).then(|| {
+                                let cmd = Command::Expire {
+                                    key: key.clone(),
+                                    duration: *exp,
+                                    opts,
+                                };
+                                ("expire", cmd)
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some((event, change)) = ttl_change {
+                            record_change!(&change);
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(db.port, key.as_ref());
+                            }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                notify_key_invalidation(db.port, key.as_ref(), 0);
+                            }
+                            notify_keyspace_event(NOTIFY_GENERIC, event, key);
+                        }
+                        write_resp_bulk(out, &v);
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
                     }
                 }
+                false
             }
-
-            let lcs_len = dp[m][n] as usize;
-
-            if *len_only {
-                out.extend_from_slice(format!(":{}\r\n", lcs_len).as_bytes());
-                return false;
+            Command::Mget(keys) => {
+                write_resp_array_header(out, keys.len());
+                for k in keys {
+                    match db.get(k) {
+                        Some(v) => write_resp_bulk(out, &v),
+                        None => write_resp_null(out),
+                    }
+                }
+                false
             }
+            Command::Set {
+                key,
+                value,
+                expire_in,
+                condition,
+                get,
+                keepttl,
+                past_expired,
+            } => {
+                let current_val = match db.table.get(key) {
+                    Ok(val) => val,
+                    Err(err) => {
+                        if *get
+                            || matches!(
+                                condition,
+                                crate::resp::SetCondition::Ifeq(_)
+                                    | crate::resp::SetCondition::Ifne(_)
+                                    | crate::resp::SetCondition::Ifdeq(_)
+                                    | crate::resp::SetCondition::Ifdne(_)
+                            )
+                        {
+                            write_resp_err(out, err);
+                            return false;
+                        }
+                        None
+                    }
+                };
 
-            if *idx {
-                let mut matches = Vec::new();
+                let exists = db.exists(key);
+                let condition_met = match condition {
+                    crate::resp::SetCondition::None => true,
+                    crate::resp::SetCondition::Nx => !exists,
+                    crate::resp::SetCondition::Xx => exists,
+                    crate::resp::SetCondition::Ifeq(expected) => {
+                        current_val.as_ref() == Some(expected)
+                    }
+                    crate::resp::SetCondition::Ifne(expected) => match &current_val {
+                        None => true,
+                        Some(val) => val != expected,
+                    },
+                    crate::resp::SetCondition::Ifdeq(expected_digest) => match &current_val {
+                        None => false,
+                        Some(val) => {
+                            if expected_digest.len() != 16
+                                || !expected_digest.iter().all(|b| b.is_ascii_hexdigit())
+                            {
+                                write_resp_err(
+                                    out,
+                                    "ERR digest must be exactly 16 hexadecimal characters",
+                                );
+                                return false;
+                            }
+                            let d = crate::table::compute_digest(val);
+                            d.eq_ignore_ascii_case(&String::from_utf8_lossy(expected_digest))
+                        }
+                    },
+                    crate::resp::SetCondition::Ifdne(expected_digest) => match &current_val {
+                        None => true,
+                        Some(val) => {
+                            if expected_digest.len() != 16
+                                || !expected_digest.iter().all(|b| b.is_ascii_hexdigit())
+                            {
+                                write_resp_err(
+                                    out,
+                                    "ERR digest must be exactly 16 hexadecimal characters",
+                                );
+                                return false;
+                            }
+                            let d = crate::table::compute_digest(val);
+                            !d.eq_ignore_ascii_case(&String::from_utf8_lossy(expected_digest))
+                        }
+                    },
+                };
+
+                if !condition_met {
+                    if *get {
+                        if let Some(v) = current_val {
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                    return false;
+                }
+
+                if *past_expired {
+                    crate::table::inc_expired_keys();
+                    if exists {
+                        db.del(key);
+                        record_change!(cmd);
+                    }
+                    if *get {
+                        if let Some(v) = current_val {
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    } else {
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    return false;
+                }
+
+                let prev_kind = db.type_of(key.as_ref());
+                db.set_extended(key.clone(), value.clone(), *expire_in, *keepttl);
+                record_change!(cmd);
+                notify_set_key_events_local(prev_kind, "string", key);
+                notify_keyspace_event(NOTIFY_STRING, "set", key);
+                notify_stream_or_defer(db, key);
+                if expire_in.is_some() {
+                    notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
+                }
+
+                if *get {
+                    if let Some(v) = current_val {
+                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                        out.extend_from_slice(&v);
+                        out.extend_from_slice(b"\r\n");
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                } else {
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                false
+            }
+            Command::Mset(pairs) => {
+                for (k, v) in pairs {
+                    db.set(k.clone(), v.clone(), None);
+                }
+                record_change!(cmd);
+                for (k, _) in pairs {
+                    notify_keyspace_event(NOTIFY_STRING, "set", k);
+                }
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Msetex {
+                pairs,
+                condition,
+                expiry,
+            } => {
+                let pass = match condition {
+                    MsetexCondition::None => true,
+                    MsetexCondition::Nx => pairs.iter().all(|(k, _)| !db.exists(k)),
+                    MsetexCondition::Xx => pairs.iter().all(|(k, _)| db.exists(k)),
+                };
+
+                if !pass {
+                    out.extend_from_slice(b":0\r\n");
+                    return false;
+                }
+
+                for (k, v) in pairs {
+                    let ttl = match expiry {
+                        MsetexExpiry::None => None,
+                        MsetexExpiry::KeepTtl => db.get_entry(k).and_then(|(_, exp)| exp),
+                        MsetexExpiry::ExpireIn(d) => Some(*d),
+                    };
+                    db.set(k.clone(), v.clone(), ttl);
+                }
+                record_change!(cmd);
+                match condition {
+                    MsetexCondition::None => {
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    MsetexCondition::Nx | MsetexCondition::Xx => {
+                        out.extend_from_slice(b":1\r\n");
+                    }
+                }
+                false
+            }
+            Command::Lcs {
+                key1,
+                key2,
+                len_only,
+                idx,
+                min_match_len,
+                with_match_len,
+            } => {
+                let val1 = match db.table.get(key1) {
+                    Ok(v) => v.unwrap_or_default(),
+                    Err(err) => {
+                        write_resp_err(out, err);
+                        return false;
+                    }
+                };
+                let val2 = match db.table.get(key2) {
+                    Ok(v) => v.unwrap_or_default(),
+                    Err(err) => {
+                        write_resp_err(out, err);
+                        return false;
+                    }
+                };
+
+                let s1 = val1.as_ref();
+                let s2 = val2.as_ref();
+                let m = s1.len();
+                let n = s2.len();
+
+                let mut dp = vec![vec![0u32; n + 1]; m + 1];
+                for i in 1..=m {
+                    for j in 1..=n {
+                        if s1[i - 1] == s2[j - 1] {
+                            dp[i][j] = dp[i - 1][j - 1] + 1;
+                        } else {
+                            dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+                        }
+                    }
+                }
+
+                let lcs_len = dp[m][n] as usize;
+
+                if *len_only {
+                    out.extend_from_slice(format!(":{}\r\n", lcs_len).as_bytes());
+                    return false;
+                }
+
+                if *idx {
+                    let mut matches = Vec::new();
+                    let mut i = m;
+                    let mut j = n;
+                    while i > 0 && j > 0 {
+                        if s1[i - 1] == s2[j - 1] {
+                            let end1 = i - 1;
+                            let end2 = j - 1;
+                            while i > 0 && j > 0 && s1[i - 1] == s2[j - 1] {
+                                i -= 1;
+                                j -= 1;
+                            }
+                            let start1 = i;
+                            let start2 = j;
+                            let match_len = end1 - start1 + 1;
+                            if match_len >= *min_match_len {
+                                matches.push(((start1, end1), (start2, end2), match_len));
+                            }
+                        } else if dp[i - 1][j] >= dp[i][j - 1] {
+                            i -= 1;
+                        } else {
+                            j -= 1;
+                        }
+                    }
+
+                    out.extend_from_slice(b"*4\r\n$7\r\nmatches\r\n");
+                    out.extend_from_slice(format!("*{}\r\n", matches.len()).as_bytes());
+                    for ((s1_idx, e1_idx), (s2_idx, e2_idx), match_len) in matches {
+                        if *with_match_len {
+                            out.extend_from_slice(
+                                format!(
+                                    "*3\r\n*2\r\n:{}\r\n:{}\r\n*2\r\n:{}\r\n:{}\r\n:{}\r\n",
+                                    s1_idx, e1_idx, s2_idx, e2_idx, match_len
+                                )
+                                .as_bytes(),
+                            );
+                        } else {
+                            out.extend_from_slice(
+                                format!(
+                                    "*2\r\n*2\r\n:{}\r\n:{}\r\n*2\r\n:{}\r\n:{}\r\n",
+                                    s1_idx, e1_idx, s2_idx, e2_idx
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                    }
+                    out.extend_from_slice(format!("$3\r\nlen\r\n:{}\r\n", lcs_len).as_bytes());
+                    return false;
+                }
+
+                let mut lcs_bytes = Vec::with_capacity(lcs_len);
                 let mut i = m;
                 let mut j = n;
                 while i > 0 && j > 0 {
                     if s1[i - 1] == s2[j - 1] {
-                        let end1 = i - 1;
-                        let end2 = j - 1;
-                        while i > 0 && j > 0 && s1[i - 1] == s2[j - 1] {
-                            i -= 1;
-                            j -= 1;
-                        }
-                        let start1 = i;
-                        let start2 = j;
-                        let match_len = end1 - start1 + 1;
-                        if match_len >= *min_match_len {
-                            matches.push(((start1, end1), (start2, end2), match_len));
-                        }
+                        lcs_bytes.push(s1[i - 1]);
+                        i -= 1;
+                        j -= 1;
                     } else if dp[i - 1][j] >= dp[i][j - 1] {
                         i -= 1;
                     } else {
                         j -= 1;
                     }
                 }
-
-                out.extend_from_slice(b"*4\r\n$7\r\nmatches\r\n");
-                out.extend_from_slice(format!("*{}\r\n", matches.len()).as_bytes());
-                for ((s1_idx, e1_idx), (s2_idx, e2_idx), match_len) in matches {
-                    if *with_match_len {
-                        out.extend_from_slice(
-                            format!(
-                                "*3\r\n*2\r\n:{}\r\n:{}\r\n*2\r\n:{}\r\n:{}\r\n:{}\r\n",
-                                s1_idx, e1_idx, s2_idx, e2_idx, match_len
-                            )
-                            .as_bytes(),
-                        );
+                lcs_bytes.reverse();
+                out.extend_from_slice(format!("${}\r\n", lcs_bytes.len()).as_bytes());
+                out.extend_from_slice(&lcs_bytes);
+                out.extend_from_slice(b"\r\n");
+                false
+            }
+            Command::Del(keys) | Command::Unlink(keys) => {
+                let is_unlink = matches!(cmd, Command::Unlink(_));
+                if keys.len() == 1 {
+                    let lazy = is_unlink && db.table.is_lazyfree_worthy(&keys[0]);
+                    let deleted = db.del(&keys[0]);
+                    if deleted {
+                        if lazy {
+                            crate::table::add_lazyfreed_objects(1);
+                        }
+                        db.delete_document_local(&String::from_utf8_lossy(&keys[0]));
+                        crate::search::delete_document_hook(&String::from_utf8_lossy(&keys[0]));
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", &keys[0]);
+                        notify_stream_or_defer(db, &keys[0]);
+                        out.extend_from_slice(b":1\r\n");
                     } else {
-                        out.extend_from_slice(
-                            format!(
-                                "*2\r\n*2\r\n:{}\r\n:{}\r\n*2\r\n:{}\r\n:{}\r\n",
-                                s1_idx, e1_idx, s2_idx, e2_idx
-                            )
-                            .as_bytes(),
-                        );
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                    return false;
+                }
+                let mut count = 0usize;
+                for k in keys {
+                    let lazy = is_unlink && db.table.is_lazyfree_worthy(k);
+                    if db.del(k) {
+                        count += 1;
+                        if lazy {
+                            crate::table::add_lazyfreed_objects(1);
+                        }
+                        db.delete_document_local(&String::from_utf8_lossy(k));
+                        crate::search::delete_document_hook(&String::from_utf8_lossy(k));
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", k);
+                        notify_stream_or_defer(db, k);
                     }
                 }
-                out.extend_from_slice(format!("$3\r\nlen\r\n:{}\r\n", lcs_len).as_bytes());
-                return false;
-            }
-
-            let mut lcs_bytes = Vec::with_capacity(lcs_len);
-            let mut i = m;
-            let mut j = n;
-            while i > 0 && j > 0 {
-                if s1[i - 1] == s2[j - 1] {
-                    lcs_bytes.push(s1[i - 1]);
-                    i -= 1;
-                    j -= 1;
-                } else if dp[i - 1][j] >= dp[i][j - 1] {
-                    i -= 1;
-                } else {
-                    j -= 1;
-                }
-            }
-            lcs_bytes.reverse();
-            out.extend_from_slice(format!("${}\r\n", lcs_bytes.len()).as_bytes());
-            out.extend_from_slice(&lcs_bytes);
-            out.extend_from_slice(b"\r\n");
-            false
-        }
-        Command::Del(keys) | Command::Unlink(keys) => {
-            let is_unlink = matches!(cmd, Command::Unlink(_));
-            if keys.len() == 1 {
-                let lazy = is_unlink && db.table.is_lazyfree_worthy(&keys[0]);
-                let deleted = db.del(&keys[0]);
-                if deleted {
-                    if lazy {
-                        crate::table::add_lazyfreed_objects(1);
-                    }
-                    db.delete_document_local(&String::from_utf8_lossy(&keys[0]));
-                    crate::search::delete_document_hook(&String::from_utf8_lossy(&keys[0]));
+                if count > 0 {
                     record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_GENERIC, "del", &keys[0]);
-                    notify_stream_or_defer(db, &keys[0]);
+                }
+                write_resp_integer(out, count as i64);
+                false
+            }
+            Command::Exists(keys) => {
+                if keys.len() == 1 {
+                    let exists = db.exists(&keys[0]);
+                    out.extend_from_slice(if exists { b":1\r\n" } else { b":0\r\n" });
+                    return false;
+                }
+                let mut count = 0usize;
+                for k in keys {
+                    if db.exists(k) {
+                        count += 1;
+                    }
+                }
+                write_resp_integer(out, count as i64);
+                false
+            }
+            Command::IncrBy(key, delta, _) => {
+                match db.incr_by_slice(key.as_ref(), *delta) {
+                    Ok(val) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_STRING, "incrby", key);
+                        write_resp_integer(out, val);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Expire {
+                key,
+                duration,
+                opts,
+            } => {
+                let res = db.expire(key, *duration, *opts);
+                if res {
+                    record_change!(cmd);
+                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                        touch_watched_key(db.port, key.as_ref());
+                    }
+                    if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                        notify_key_invalidation(db.port, key.as_ref(), 0);
+                    }
+                    notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
                     out.extend_from_slice(b":1\r\n");
                 } else {
                     out.extend_from_slice(b":0\r\n");
                 }
-                return false;
+                false
             }
-            let mut count = 0usize;
-            for k in keys {
-                let lazy = is_unlink && db.table.is_lazyfree_worthy(k);
-                if db.del(k) {
-                    count += 1;
-                    if lazy {
-                        crate::table::add_lazyfreed_objects(1);
-                    }
-                    db.delete_document_local(&String::from_utf8_lossy(k));
-                    crate::search::delete_document_hook(&String::from_utf8_lossy(k));
-                    notify_keyspace_event(NOTIFY_GENERIC, "del", k);
-                    notify_stream_or_defer(db, k);
-                }
-            }
-            if count > 0 {
-                record_change!(cmd);
-            }
-            write_resp_integer(out, count as i64);
-            false
-        }
-        Command::Exists(keys) => {
-            if keys.len() == 1 {
-                let exists = db.exists(&keys[0]);
-                out.extend_from_slice(if exists { b":1\r\n" } else { b":0\r\n" });
-                return false;
-            }
-            let mut count = 0usize;
-            for k in keys {
-                if db.exists(k) {
-                    count += 1;
-                }
-            }
-            write_resp_integer(out, count as i64);
-            false
-        }
-        Command::IncrBy(key, delta, _) => {
-            match db.incr_by_slice(key.as_ref(), *delta) {
-                Ok(val) => {
+            Command::Persist(key) => {
+                let res = db.persist(key);
+                if res {
                     record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_STRING, "incrby", key);
-                    write_resp_integer(out, val);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Expire {
-            key,
-            duration,
-            opts,
-        } => {
-            let res = db.expire(key, *duration, *opts);
-            if res {
-                record_change!(cmd);
-                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                    touch_watched_key(db.port, key.as_ref());
-                }
-                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                    notify_key_invalidation(db.port, key.as_ref(), 0);
-                }
-                notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
-                out.extend_from_slice(b":1\r\n");
-            } else {
-                out.extend_from_slice(b":0\r\n");
-            }
-            false
-        }
-        Command::Persist(key) => {
-            let res = db.persist(key);
-            if res {
-                record_change!(cmd);
-                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                    touch_watched_key(db.port, key.as_ref());
-                }
-                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                    notify_key_invalidation(db.port, key.as_ref(), 0);
-                }
-                notify_keyspace_event(NOTIFY_GENERIC, "persist", key);
-                out.extend_from_slice(b":1\r\n");
-            } else {
-                out.extend_from_slice(b":0\r\n");
-            }
-            false
-        }
-        Command::Ttl(key, in_millis) => {
-            let res = db.ttl(key, *in_millis);
-            write_resp_integer(out, res);
-            false
-        }
-        Command::Hset { key, fields } => {
-            match db.hset_slice_fast(key, fields) {
-                Ok(count) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_HASH, "hset", key);
-                    if db.has_search_indices() || crate::search::has_active_search_indices() {
-                        reindex_hash_for_search(db, key);
+                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                        touch_watched_key(db.port, key.as_ref());
                     }
-                    write_resp_integer(out, count as i64);
+                    if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                        notify_key_invalidation(db.port, key.as_ref(), 0);
+                    }
+                    notify_keyspace_event(NOTIFY_GENERIC, "persist", key);
+                    out.extend_from_slice(b":1\r\n");
+                } else {
+                    out.extend_from_slice(b":0\r\n");
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Hsetnx { key, field, value } => {
-            match db.hsetnx(key.clone(), field.clone(), value.clone()) {
-                Ok(count) => {
-                    if count > 0 {
+            Command::Ttl(key, in_millis) => {
+                let res = db.ttl(key, *in_millis);
+                write_resp_integer(out, res);
+                false
+            }
+            Command::Hset { key, fields } => {
+                match db.hset_slice_fast(key, fields) {
+                    Ok(count) => {
                         record_change!(cmd);
                         notify_keyspace_event(NOTIFY_HASH, "hset", key);
-                    }
-                    write_resp_integer(out, count as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hmset { key, fields } => {
-            match db.hset_slice_fast(key, fields) {
-                Ok(_) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_HASH, "hset", key);
-                    if db.has_search_indices() || crate::search::has_active_search_indices() {
-                        reindex_hash_for_search(db, key);
-                    }
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hget { key, field } => {
-            match db.hget(key, field) {
-                Ok(Some(v)) => {
-                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                    out.extend_from_slice(&v);
-                    out.extend_from_slice(b"\r\n");
-                }
-                Ok(None) => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hmget { key, fields } => {
-            match db.hmget(key, fields) {
-                Ok(vals) => {
-                    out.extend_from_slice(format!("*{}\r\n", vals.len()).as_bytes());
-                    for v in vals {
-                        match v {
-                            Some(val) => {
-                                out.extend_from_slice(format!("${}\r\n", val.len()).as_bytes());
-                                out.extend_from_slice(&val);
-                                out.extend_from_slice(b"\r\n");
-                            }
-                            None => {
-                                out.extend_from_slice(b"$-1\r\n");
-                            }
+                        if db.has_search_indices() || crate::search::has_active_search_indices() {
+                            reindex_hash_for_search(db, key);
                         }
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hdel { key, fields } => {
-            match db.hdel(key, fields) {
-                Ok(count) => {
-                    if count > 0 {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_HASH, "hdel", key);
-                        if !db.exists(key) {
-                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
-                        }
-                    }
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hexists { key, field } => {
-            match db.hexists(key, field) {
-                Ok(exists) => {
-                    if exists {
-                        out.extend_from_slice(b":1\r\n");
-                    } else {
-                        out.extend_from_slice(b":0\r\n");
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hlen(key) => {
-            match db.hlen(key) {
-                Ok(len) => {
-                    write_resp_integer(out, len as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hgetall(key) => {
-            match db.hgetall(key) {
-                Ok(pairs) => {
-                    out.extend_from_slice(format!("*{}\r\n", pairs.len() * 2).as_bytes());
-                    for (k, v) in pairs {
-                        out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
-                        out.extend_from_slice(&k);
-                        out.extend_from_slice(b"\r\n");
-                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                        out.extend_from_slice(&v);
-                        out.extend_from_slice(b"\r\n");
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hkeys(key) => {
-            match db.hkeys(key) {
-                Ok(keys) => {
-                    out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
-                    for k in keys {
-                        out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
-                        out.extend_from_slice(&k);
-                        out.extend_from_slice(b"\r\n");
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hvals(key) => {
-            match db.hvals(key) {
-                Ok(vals) => {
-                    out.extend_from_slice(format!("*{}\r\n", vals.len()).as_bytes());
-                    for v in vals {
-                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                        out.extend_from_slice(&v);
-                        out.extend_from_slice(b"\r\n");
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hstrlen { key, field } => {
-            match db.hstrlen(key, field) {
-                Ok(len) => {
-                    write_resp_integer(out, len as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Hgetdel { key, fields } => {
-            match db.hgetdel(key, fields) {
-                Ok((vals, deleted_fields)) => {
-                    if !deleted_fields.is_empty() {
-                        record_change!(cmd);
-                    }
-                    out.extend_from_slice(format!("*{}\r\n", vals.len()).as_bytes());
-                    for v in vals {
-                        match v {
-                            Some(val) => {
-                                out.extend_from_slice(format!("${}\r\n", val.len()).as_bytes());
-                                out.extend_from_slice(&val);
-                                out.extend_from_slice(b"\r\n");
-                            }
-                            None => {
-                                out.extend_from_slice(b"$-1\r\n");
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        // LIST COMMANDS
-        Command::Lpush { key, values } => {
-            match db.lpush_slice(key.as_ref(), values) {
-                Ok(len) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_LIST, "lpush", key);
-                    notify_list_or_defer(db, key);
-                    write_resp_integer(out, len as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Rpush { key, values } => {
-            match db.rpush_slice_fast(key, values) {
-                Ok(len) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_LIST, "rpush", key);
-                    notify_list_or_defer(db, key);
-                    write_resp_integer(out, len as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Lpushx { key, values } => {
-            match db.lpushx_slice(key.as_ref(), values) {
-                Ok(len) => {
-                    if len > 0 {
-                        record_change!(cmd);
-                        notify_list_or_defer(db, key);
-                    }
-                    write_resp_integer(out, len as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Rpushx { key, values } => {
-            match db.rpushx_slice(key.as_ref(), values) {
-                Ok(len) => {
-                    if len > 0 {
-                        record_change!(cmd);
-                        notify_list_or_defer(db, key);
-                    }
-                    write_resp_integer(out, len as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Lpop { key, count } => {
-            if count.is_none() {
-                match db.lpop_one(key.as_ref()) {
-                    Ok(Some(v)) => {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_LIST, "lpop", key);
-                        if !db.exists(key) {
-                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
-                        }
-                        write_resp_bulk(out, &v);
-                    }
-                    Ok(None) => {
-                        write_resp_null(out);
+                        write_resp_integer(out, count as i64);
                     }
                     Err(err) => {
                         write_resp_err(out, err);
                     }
                 }
-                return false;
+                false
             }
-            let n = count.unwrap_or(1);
-            match db.lpop(key, n) {
-                Ok(popped) => {
-                    if !popped.is_empty() {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_LIST, "lpop", key);
-                        if !db.exists(key) {
-                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
-                        }
-                    }
-                    if !popped.is_empty() {
-                        out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
-                        for v in popped {
-                            write_resp_bulk(out, &v);
-                        }
-                    } else if *count == Some(0) && db.exists(key) {
-                        out.extend_from_slice(b"*0\r\n");
-                    } else {
-                        write_resp_null_array(out);
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Rpop { key, count } => {
-            if count.is_none() {
-                match db.rpop_one(key.as_ref()) {
-                    Ok(Some(v)) => {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_LIST, "rpop", key);
-                        if !db.exists(key) {
-                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
-                        }
-                        write_resp_bulk(out, &v);
-                    }
-                    Ok(None) => {
-                        write_resp_null(out);
-                    }
-                    Err(err) => {
-                        write_resp_err(out, err);
-                    }
-                }
-                return false;
-            }
-            let n = count.unwrap_or(1);
-            match db.rpop(key, n) {
-                Ok(popped) => {
-                    if !popped.is_empty() {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_LIST, "rpop", key);
-                        if !db.exists(key) {
-                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
-                        }
-                    }
-                    if !popped.is_empty() {
-                        out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
-                        for v in popped {
-                            write_resp_bulk(out, &v);
-                        }
-                    } else if *count == Some(0) && db.exists(key) {
-                        out.extend_from_slice(b"*0\r\n");
-                    } else {
-                        write_resp_null_array(out);
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Lmpop {
-            keys,
-            where_from,
-            count,
-        } => {
-            let mut popped: Option<(Bytes, Vec<Bytes>)> = None;
-            for k in keys {
-                if !db.exists(k) {
-                    continue;
-                }
-                let res = match where_from {
-                    crate::table::ListDirection::Left => db.lpop(k, *count),
-                    crate::table::ListDirection::Right => db.rpop(k, *count),
-                };
-                match res {
-                    Ok(vals) => {
-                        if !vals.is_empty() {
+            Command::Hsetnx { key, field, value } => {
+                match db.hsetnx(key.clone(), field.clone(), value.clone()) {
+                    Ok(count) => {
+                        if count > 0 {
                             record_change!(cmd);
-                            popped = Some((k.clone(), vals));
-                            break;
+                            notify_keyspace_event(NOTIFY_HASH, "hset", key);
+                        }
+                        write_resp_integer(out, count as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Hmset { key, fields } => {
+                match db.hset_slice_fast(key, fields) {
+                    Ok(_) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_HASH, "hset", key);
+                        if db.has_search_indices() || crate::search::has_active_search_indices() {
+                            reindex_hash_for_search(db, key);
+                        }
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Hget { key, field } => {
+                match db.hget(key, field) {
+                    Ok(Some(v)) => {
+                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                        out.extend_from_slice(&v);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                    Ok(None) => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Hmget { key, fields } => {
+                match db.hmget(key, fields) {
+                    Ok(vals) => {
+                        out.extend_from_slice(format!("*{}\r\n", vals.len()).as_bytes());
+                        for v in vals {
+                            match v {
+                                Some(val) => {
+                                    out.extend_from_slice(format!("${}\r\n", val.len()).as_bytes());
+                                    out.extend_from_slice(&val);
+                                    out.extend_from_slice(b"\r\n");
+                                }
+                                None => {
+                                    out.extend_from_slice(b"$-1\r\n");
+                                }
+                            }
                         }
                     }
                     Err(err) => {
                         write_resp_err(out, err);
-                        return false;
                     }
                 }
+                false
             }
-            if let Some((k, vals)) = popped {
-                out.extend_from_slice(b"*2\r\n$");
-                out.extend_from_slice(k.len().to_string().as_bytes());
-                out.extend_from_slice(b"\r\n");
-                out.extend_from_slice(&k);
-                out.extend_from_slice(b"\r\n*");
-                out.extend_from_slice(vals.len().to_string().as_bytes());
-                out.extend_from_slice(b"\r\n");
-                for v in &vals {
-                    out.extend_from_slice(b"$");
-                    out.extend_from_slice(v.len().to_string().as_bytes());
-                    out.extend_from_slice(b"\r\n");
-                    out.extend_from_slice(v);
-                    out.extend_from_slice(b"\r\n");
-                }
-            } else {
-                write_resp_null_array(out);
-            }
-            false
-        }
-        Command::Blmpop { .. } => false,
-        Command::Llen(key) => {
-            match db.llen(key) {
-                Ok(len) => {
-                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Lindex { key, index } => {
-            match db.lindex(key, *index) {
-                Ok(Some(v)) => {
-                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                    out.extend_from_slice(&v);
-                    out.extend_from_slice(b"\r\n");
-                }
-                Ok(None) => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Lrange { key, start, stop } => {
-            if let Err(err) = db.write_lrange_resp(key.as_ref(), *start, *stop, out) {
-                write_resp_err(out, err);
-            }
-            false
-        }
-        // SET COMMANDS
-        Command::Sadd { key, members } => {
-            match db.sadd_slice(key.as_ref(), members) {
-                Ok(added) => {
-                    if added > 0 {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_SET, "sadd", key);
+            Command::Hdel { key, fields } => {
+                match db.hdel(key, fields) {
+                    Ok(count) => {
+                        if count > 0 {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_HASH, "hdel", key);
+                            if !db.exists(key) {
+                                notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                            }
+                        }
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                     }
-                    out.extend_from_slice(format!(":{}\r\n", added).as_bytes());
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Srem { key, members } => {
-            match db.srem(key, members) {
-                Ok(count) => {
-                    if count > 0 {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_SET, "srem", key);
-                        if !db.exists(key) {
-                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+            Command::Hexists { key, field } => {
+                match db.hexists(key, field) {
+                    Ok(exists) => {
+                        if exists {
+                            out.extend_from_slice(b":1\r\n");
+                        } else {
+                            out.extend_from_slice(b":0\r\n");
                         }
                     }
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Smembers(key) => {
-            match db.smembers(key) {
-                Ok(members) => {
-                    out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
-                    for m in members {
-                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                        out.extend_from_slice(&m);
+            Command::Hlen(key) => {
+                match db.hlen(key) {
+                    Ok(len) => {
+                        write_resp_integer(out, len as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Hgetall(key) => {
+                match db.hgetall(key) {
+                    Ok(pairs) => {
+                        out.extend_from_slice(format!("*{}\r\n", pairs.len() * 2).as_bytes());
+                        for (k, v) in pairs {
+                            out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                            out.extend_from_slice(&k);
+                            out.extend_from_slice(b"\r\n");
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Hkeys(key) => {
+                match db.hkeys(key) {
+                    Ok(keys) => {
+                        out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+                        for k in keys {
+                            out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                            out.extend_from_slice(&k);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Hvals(key) => {
+                match db.hvals(key) {
+                    Ok(vals) => {
+                        out.extend_from_slice(format!("*{}\r\n", vals.len()).as_bytes());
+                        for v in vals {
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Hstrlen { key, field } => {
+                match db.hstrlen(key, field) {
+                    Ok(len) => {
+                        write_resp_integer(out, len as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Hgetdel { key, fields } => {
+                match db.hgetdel(key, fields) {
+                    Ok((vals, deleted_fields)) => {
+                        if !deleted_fields.is_empty() {
+                            record_change!(cmd);
+                        }
+                        out.extend_from_slice(format!("*{}\r\n", vals.len()).as_bytes());
+                        for v in vals {
+                            match v {
+                                Some(val) => {
+                                    out.extend_from_slice(format!("${}\r\n", val.len()).as_bytes());
+                                    out.extend_from_slice(&val);
+                                    out.extend_from_slice(b"\r\n");
+                                }
+                                None => {
+                                    out.extend_from_slice(b"$-1\r\n");
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            // LIST COMMANDS
+            Command::Lpush { key, values } => {
+                match db.lpush_slice(key.as_ref(), values) {
+                    Ok(len) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_LIST, "lpush", key);
+                        notify_list_or_defer(db, key);
+                        write_resp_integer(out, len as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Rpush { key, values } => {
+                match db.rpush_slice_fast(key, values) {
+                    Ok(len) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_LIST, "rpush", key);
+                        notify_list_or_defer(db, key);
+                        write_resp_integer(out, len as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Lpushx { key, values } => {
+                match db.lpushx_slice(key.as_ref(), values) {
+                    Ok(len) => {
+                        if len > 0 {
+                            record_change!(cmd);
+                            notify_list_or_defer(db, key);
+                        }
+                        write_resp_integer(out, len as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Rpushx { key, values } => {
+                match db.rpushx_slice(key.as_ref(), values) {
+                    Ok(len) => {
+                        if len > 0 {
+                            record_change!(cmd);
+                            notify_list_or_defer(db, key);
+                        }
+                        write_resp_integer(out, len as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Lpop { key, count } => {
+                if count.is_none() {
+                    match db.lpop_one(key.as_ref()) {
+                        Ok(Some(v)) => {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_LIST, "lpop", key);
+                            if !db.exists(key) {
+                                notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                            }
+                            write_resp_bulk(out, &v);
+                        }
+                        Ok(None) => {
+                            write_resp_null(out);
+                        }
+                        Err(err) => {
+                            write_resp_err(out, err);
+                        }
+                    }
+                    return false;
+                }
+                let n = count.unwrap_or(1);
+                match db.lpop(key, n) {
+                    Ok(popped) => {
+                        if !popped.is_empty() {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_LIST, "lpop", key);
+                            if !db.exists(key) {
+                                notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                            }
+                        }
+                        if !popped.is_empty() {
+                            out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                            for v in popped {
+                                write_resp_bulk(out, &v);
+                            }
+                        } else if *count == Some(0) && db.exists(key) {
+                            out.extend_from_slice(b"*0\r\n");
+                        } else {
+                            write_resp_null_array(out);
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Rpop { key, count } => {
+                if count.is_none() {
+                    match db.rpop_one(key.as_ref()) {
+                        Ok(Some(v)) => {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_LIST, "rpop", key);
+                            if !db.exists(key) {
+                                notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                            }
+                            write_resp_bulk(out, &v);
+                        }
+                        Ok(None) => {
+                            write_resp_null(out);
+                        }
+                        Err(err) => {
+                            write_resp_err(out, err);
+                        }
+                    }
+                    return false;
+                }
+                let n = count.unwrap_or(1);
+                match db.rpop(key, n) {
+                    Ok(popped) => {
+                        if !popped.is_empty() {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_LIST, "rpop", key);
+                            if !db.exists(key) {
+                                notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                            }
+                        }
+                        if !popped.is_empty() {
+                            out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                            for v in popped {
+                                write_resp_bulk(out, &v);
+                            }
+                        } else if *count == Some(0) && db.exists(key) {
+                            out.extend_from_slice(b"*0\r\n");
+                        } else {
+                            write_resp_null_array(out);
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Lmpop {
+                keys,
+                where_from,
+                count,
+            } => {
+                let mut popped: Option<(Bytes, Vec<Bytes>)> = None;
+                for k in keys {
+                    if !db.exists(k) {
+                        continue;
+                    }
+                    let res = match where_from {
+                        crate::table::ListDirection::Left => db.lpop(k, *count),
+                        crate::table::ListDirection::Right => db.rpop(k, *count),
+                    };
+                    match res {
+                        Ok(vals) => {
+                            if !vals.is_empty() {
+                                record_change!(cmd);
+                                popped = Some((k.clone(), vals));
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            write_resp_err(out, err);
+                            return false;
+                        }
+                    }
+                }
+                if let Some((k, vals)) = popped {
+                    out.extend_from_slice(b"*2\r\n$");
+                    out.extend_from_slice(k.len().to_string().as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                    out.extend_from_slice(&k);
+                    out.extend_from_slice(b"\r\n*");
+                    out.extend_from_slice(vals.len().to_string().as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                    for v in &vals {
+                        out.extend_from_slice(b"$");
+                        out.extend_from_slice(v.len().to_string().as_bytes());
+                        out.extend_from_slice(b"\r\n");
+                        out.extend_from_slice(v);
                         out.extend_from_slice(b"\r\n");
                     }
+                } else {
+                    write_resp_null_array(out);
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Sismember { key, member } => {
-            match db.sismember(key, member) {
-                Ok(is_mem) => {
-                    if is_mem {
-                        out.extend_from_slice(b":1\r\n");
-                    } else {
-                        out.extend_from_slice(b":0\r\n");
+            Command::Blmpop { .. } => false,
+            Command::Llen(key) => {
+                match db.llen(key) {
+                    Ok(len) => {
+                        out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Scard(key) => {
-            match db.scard(key) {
-                Ok(card) => {
-                    out.extend_from_slice(format!(":{}\r\n", card).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Spop { key, count } => {
-            let n = count.unwrap_or(1);
-            match db.spop(key, n) {
-                Ok(popped) => {
-                    if !popped.is_empty() {
-                        let srem_cmd = Command::Srem {
-                            key: key.clone(),
-                            members: popped.clone(),
-                        };
-                        record_change!(&srem_cmd);
-                        notify_keyspace_event(NOTIFY_SET, "spop", key);
-                        notify_del_if_emptied(db, key);
+            Command::Lindex { key, index } => {
+                match db.lindex(key, *index) {
+                    Ok(Some(v)) => {
+                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                        out.extend_from_slice(&v);
+                        out.extend_from_slice(b"\r\n");
                     }
-                    if count.is_some() {
-                        out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
-                        for m in popped {
+                    Ok(None) => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Lrange { key, start, stop } => {
+                if let Err(err) = db.write_lrange_resp(key.as_ref(), *start, *stop, out) {
+                    write_resp_err(out, err);
+                }
+                false
+            }
+            // SET COMMANDS
+            Command::Sadd { key, members } => {
+                match db.sadd_slice(key.as_ref(), members) {
+                    Ok(added) => {
+                        if added > 0 {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_SET, "sadd", key);
+                        }
+                        out.extend_from_slice(format!(":{}\r\n", added).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Srem { key, members } => {
+                match db.srem(key, members) {
+                    Ok(count) => {
+                        if count > 0 {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_SET, "srem", key);
+                            if !db.exists(key) {
+                                notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                            }
+                        }
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Smembers(key) => {
+                match db.smembers(key) {
+                    Ok(members) => {
+                        out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                        for m in members {
                             out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
                             out.extend_from_slice(&m);
                             out.extend_from_slice(b"\r\n");
                         }
-                    } else if let Some(first) = popped.into_iter().next() {
-                        out.extend_from_slice(format!("${}\r\n", first.len()).as_bytes());
-                        out.extend_from_slice(&first);
-                        out.extend_from_slice(b"\r\n");
-                    } else {
-                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Sinter(keys) => {
-            match db.sinter(keys) {
-                Ok(members) => {
-                    out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
-                    for m in members {
-                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                        out.extend_from_slice(&m);
-                        out.extend_from_slice(b"\r\n");
+            Command::Sismember { key, member } => {
+                match db.sismember(key, member) {
+                    Ok(is_mem) => {
+                        if is_mem {
+                            out.extend_from_slice(b":1\r\n");
+                        } else {
+                            out.extend_from_slice(b":0\r\n");
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Sunion(keys) => {
-            match db.sunion(keys) {
-                Ok(members) => {
-                    out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
-                    for m in members {
-                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                        out.extend_from_slice(&m);
-                        out.extend_from_slice(b"\r\n");
+            Command::Scard(key) => {
+                match db.scard(key) {
+                    Ok(card) => {
+                        out.extend_from_slice(format!(":{}\r\n", card).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Sdiff(keys) => {
-            match db.sdiff(keys) {
-                Ok(members) => {
-                    out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
-                    for m in members {
-                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                        out.extend_from_slice(&m);
-                        out.extend_from_slice(b"\r\n");
+            Command::Spop { key, count } => {
+                let n = count.unwrap_or(1);
+                match db.spop(key, n) {
+                    Ok(popped) => {
+                        if !popped.is_empty() {
+                            let srem_cmd = Command::Srem {
+                                key: key.clone(),
+                                members: popped.clone(),
+                            };
+                            record_change!(&srem_cmd);
+                            notify_keyspace_event(NOTIFY_SET, "spop", key);
+                            notify_del_if_emptied(db, key);
+                        }
+                        if count.is_some() {
+                            out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                            for m in popped {
+                                out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                                out.extend_from_slice(&m);
+                                out.extend_from_slice(b"\r\n");
+                            }
+                        } else if let Some(first) = popped.into_iter().next() {
+                            out.extend_from_slice(format!("${}\r\n", first.len()).as_bytes());
+                            out.extend_from_slice(&first);
+                            out.extend_from_slice(b"\r\n");
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Sinterstore { destination, keys } => {
-            let prev_kind = db.type_of(destination.as_ref());
-            match db.sinterstore(destination.clone(), keys) {
-                Ok(count) => {
-                    record_change!(cmd);
-                    if count > 0 {
-                        notify_set_key_events_local(prev_kind, "set", destination.as_ref());
-                    } else if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+            Command::Sinter(keys) => {
+                match db.sinter(keys) {
+                    Ok(members) => {
+                        out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                        for m in members {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                        }
                     }
-                    write_resp_integer(out, count as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Sunionstore { destination, keys } => {
-            let prev_kind = db.type_of(destination.as_ref());
-            match db.sunionstore(destination.clone(), keys) {
-                Ok(count) => {
-                    record_change!(cmd);
-                    if count > 0 {
-                        notify_set_key_events_local(prev_kind, "set", destination.as_ref());
-                    } else if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
-                    write_resp_integer(out, count as i64);
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Sdiffstore { destination, keys } => {
-            let prev_kind = db.type_of(destination.as_ref());
-            match db.sdiffstore(destination.clone(), keys) {
-                Ok(count) => {
-                    record_change!(cmd);
-                    if count > 0 {
-                        notify_set_key_events_local(prev_kind, "set", destination.as_ref());
-                    } else if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+            Command::Sunion(keys) => {
+                match db.sunion(keys) {
+                    Ok(members) => {
+                        out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                        for m in members {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                        }
                     }
-                    write_resp_integer(out, count as i64);
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
+                false
+            }
+            Command::Sdiff(keys) => {
+                match db.sdiff(keys) {
+                    Ok(members) => {
+                        out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                        for m in members {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
                 }
+                false
             }
-            false
-        }
-        Command::Sintercard { keys, limit } => {
-            match db.sintercard(keys, *limit) {
-                Ok(card) => write_resp_integer(out, card as i64),
-                Err(err) => write_resp_err(out, err),
+            Command::Sinterstore { destination, keys } => {
+                let prev_kind = db.type_of(destination.as_ref());
+                match db.sinterstore(destination.clone(), keys) {
+                    Ok(count) => {
+                        record_change!(cmd);
+                        if count > 0 {
+                            notify_set_key_events_local(prev_kind, "set", destination.as_ref());
+                        } else if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                        }
+                        write_resp_integer(out, count as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
             }
-            false
-        }
-        Command::Sunioncard { keys, limit } => {
-            match db.sunioncard(keys, *limit) {
-                Ok(card) => write_resp_integer(out, card as i64),
-                Err(err) => write_resp_err(out, err),
+            Command::Sunionstore { destination, keys } => {
+                let prev_kind = db.type_of(destination.as_ref());
+                match db.sunionstore(destination.clone(), keys) {
+                    Ok(count) => {
+                        record_change!(cmd);
+                        if count > 0 {
+                            notify_set_key_events_local(prev_kind, "set", destination.as_ref());
+                        } else if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                        }
+                        write_resp_integer(out, count as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
             }
-            false
-        }
-        Command::Sdiffcard { keys, limit } => {
-            match db.sdiffcard(keys, *limit) {
-                Ok(card) => write_resp_integer(out, card as i64),
-                Err(err) => write_resp_err(out, err),
+            Command::Sdiffstore { destination, keys } => {
+                let prev_kind = db.type_of(destination.as_ref());
+                match db.sdiffstore(destination.clone(), keys) {
+                    Ok(count) => {
+                        record_change!(cmd);
+                        if count > 0 {
+                            notify_set_key_events_local(prev_kind, "set", destination.as_ref());
+                        } else if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                        }
+                        write_resp_integer(out, count as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
             }
-            false
-        }
-        // ZSET COMMANDS
-        Command::Zadd {
-            key,
-            elements,
-            flags,
-        } => {
-            match db.zadd_slice(key.as_ref(), elements, *flags) {
-                Ok((count, incr_score)) => {
-                    if flags.incr {
-                        if incr_score.is_some() {
+            Command::Sintercard { keys, limit } => {
+                match db.sintercard(keys, *limit) {
+                    Ok(card) => write_resp_integer(out, card as i64),
+                    Err(err) => write_resp_err(out, err),
+                }
+                false
+            }
+            Command::Sunioncard { keys, limit } => {
+                match db.sunioncard(keys, *limit) {
+                    Ok(card) => write_resp_integer(out, card as i64),
+                    Err(err) => write_resp_err(out, err),
+                }
+                false
+            }
+            Command::Sdiffcard { keys, limit } => {
+                match db.sdiffcard(keys, *limit) {
+                    Ok(card) => write_resp_integer(out, card as i64),
+                    Err(err) => write_resp_err(out, err),
+                }
+                false
+            }
+            // ZSET COMMANDS
+            Command::Zadd {
+                key,
+                elements,
+                flags,
+            } => {
+                match db.zadd_slice(key.as_ref(), elements, *flags) {
+                    Ok((count, incr_score)) => {
+                        if flags.incr {
+                            if incr_score.is_some() {
+                                record_change!(cmd);
+                                notify_zset_or_defer(db, key);
+                                notify_keyspace_event(NOTIFY_ZSET, "zadd", key);
+                            }
+                        } else if count > 0 {
                             record_change!(cmd);
                             notify_zset_or_defer(db, key);
                             notify_keyspace_event(NOTIFY_ZSET, "zadd", key);
                         }
-                    } else if count > 0 {
-                        record_change!(cmd);
-                        notify_zset_or_defer(db, key);
-                        notify_keyspace_event(NOTIFY_ZSET, "zadd", key);
-                    }
-                    if flags.incr {
-                        if let Some(score) = incr_score {
-                            let s = format_score(score);
-                            out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
-                        } else {
-                            out.extend_from_slice(b"$-1\r\n");
-                        }
-                    } else {
-                        write_resp_integer(out, count as i64);
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zrem { key, members } => {
-            match db.zrem(key, members) {
-                Ok(count) => {
-                    if count > 0 {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_ZSET, "zrem", key);
-                        if !db.exists(key) {
-                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
-                        }
-                    }
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zscore { key, member } => {
-            match db.zscore(key, member) {
-                Ok(Some(score)) => {
-                    let s = format_score(score);
-                    out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
-                }
-                Ok(None) => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zcard(key) => {
-            match db.zcard(key) {
-                Ok(card) => {
-                    out.extend_from_slice(format!(":{}\r\n", card).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zrank {
-            key,
-            member,
-            with_score,
-        } => {
-            match db.zrank(key, member, false, *with_score) {
-                Ok(Some((rank, score))) => {
-                    if *with_score {
-                        let s = format_score(score.unwrap_or(0.0));
-                        out.extend_from_slice(
-                            format!("*2\r\n:{}\r\n${}\r\n{}\r\n", rank, s.len(), s).as_bytes(),
-                        );
-                    } else {
-                        out.extend_from_slice(format!(":{}\r\n", rank).as_bytes());
-                    }
-                }
-                Ok(None) => {
-                    if *with_score {
-                        out.extend_from_slice(b"*-1\r\n");
-                    } else {
-                        out.extend_from_slice(b"$-1\r\n");
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zrevrank {
-            key,
-            member,
-            with_score,
-        } => {
-            match db.zrank(key, member, true, *with_score) {
-                Ok(Some((rank, score))) => {
-                    if *with_score {
-                        let s = format_score(score.unwrap_or(0.0));
-                        out.extend_from_slice(
-                            format!("*2\r\n:{}\r\n${}\r\n{}\r\n", rank, s.len(), s).as_bytes(),
-                        );
-                    } else {
-                        out.extend_from_slice(format!(":{}\r\n", rank).as_bytes());
-                    }
-                }
-                Ok(None) => {
-                    if *with_score {
-                        out.extend_from_slice(b"*-1\r\n");
-                    } else {
-                        out.extend_from_slice(b"$-1\r\n");
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zcount {
-            key,
-            min,
-            min_inc,
-            max,
-            max_inc,
-        } => {
-            match db.zcount(key, *min, *min_inc, *max, *max_inc) {
-                Ok(count) => {
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zincrby { key, delta, member } => {
-            match db.zincrby(key.clone(), *delta, member.clone()) {
-                Ok(score) => {
-                    record_change!(cmd);
-                    notify_zset_or_defer(db, key);
-                    let s = format_score(score);
-                    out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zrange { key, opts } => {
-            let is_resp3 = CURRENT_CLIENT_RESP3.get();
-            if let Err(err) = db.write_zrange_resp(key.as_ref(), opts, is_resp3, out) {
-                write_resp_err(out, err);
-            }
-            false
-        }
-        Command::Zrangestore { dst, src, opts } => {
-            let prev_kind = db.type_of(dst.as_ref());
-            match db.zrangestore(dst, src, opts) {
-                Ok(count) => {
-                    record_change!(cmd);
-                    if count > 0 {
-                        notify_set_key_events_local(prev_kind, "zset", dst.as_ref());
-                    } else if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", dst.as_ref());
-                    }
-                    write_resp_integer(out, count as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zpopmin { key, count } => {
-            let n = count.unwrap_or(1);
-            match db.zpopmin(key, n) {
-                Ok(popped) => {
-                    if !popped.is_empty() {
-                        let zrem_cmd = Command::Zrem {
-                            key: key.clone(),
-                            members: popped.iter().map(|(m, _)| m.clone()).collect(),
-                        };
-                        record_change!(&zrem_cmd);
-                        notify_keyspace_event(NOTIFY_ZSET, "zpopmin", key);
-                        notify_del_if_emptied(db, key);
-                    }
-                    if count.is_none() {
-                        if popped.is_empty() {
-                            out.extend_from_slice(b"*0\r\n");
-                        } else {
-                            out.extend_from_slice(b"*2\r\n");
-                            let (m, s) = &popped[0];
-                            write_resp_bulk(out, m);
-                            write_resp_score(out, *s);
-                        }
-                    } else if CURRENT_CLIENT_RESP3.get() {
-                        out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
-                        for (m, s) in &popped {
-                            out.extend_from_slice(b"*2\r\n");
-                            write_resp_bulk(out, m);
-                            write_resp_score(out, *s);
-                        }
-                    } else {
-                        out.extend_from_slice(format!("*{}\r\n", popped.len() * 2).as_bytes());
-                        for (m, s) in &popped {
-                            write_resp_bulk(out, m);
-                            write_resp_score(out, *s);
-                        }
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zpopmax { key, count } => {
-            let n = count.unwrap_or(1);
-            match db.zpopmax(key, n) {
-                Ok(popped) => {
-                    if !popped.is_empty() {
-                        let zrem_cmd = Command::Zrem {
-                            key: key.clone(),
-                            members: popped.iter().map(|(m, _)| m.clone()).collect(),
-                        };
-                        record_change!(&zrem_cmd);
-                        notify_keyspace_event(NOTIFY_ZSET, "zpopmax", key);
-                        notify_del_if_emptied(db, key);
-                    }
-                    if count.is_none() {
-                        if popped.is_empty() {
-                            out.extend_from_slice(b"*0\r\n");
-                        } else {
-                            out.extend_from_slice(b"*2\r\n");
-                            let (m, s) = &popped[0];
-                            write_resp_bulk(out, m);
-                            write_resp_score(out, *s);
-                        }
-                    } else if CURRENT_CLIENT_RESP3.get() {
-                        out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
-                        for (m, s) in &popped {
-                            out.extend_from_slice(b"*2\r\n");
-                            write_resp_bulk(out, m);
-                            write_resp_score(out, *s);
-                        }
-                    } else {
-                        out.extend_from_slice(format!("*{}\r\n", popped.len() * 2).as_bytes());
-                        for (m, s) in &popped {
-                            write_resp_bulk(out, m);
-                            write_resp_score(out, *s);
-                        }
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zmpop {
-            keys,
-            is_min,
-            count,
-        } => {
-            let mut popped: Option<(Bytes, Vec<(Bytes, f64)>)> = None;
-            for k in keys {
-                if !db.exists(k) {
-                    continue;
-                }
-                let res = if *is_min {
-                    db.zpopmin(k, *count)
-                } else {
-                    db.zpopmax(k, *count)
-                };
-                match res {
-                    Ok(items) => {
-                        if !items.is_empty() {
-                            let rep_cmd = if *is_min {
-                                Command::Zpopmin {
-                                    key: k.clone(),
-                                    count: Some(items.len()),
-                                }
+                        if flags.incr {
+                            if let Some(score) = incr_score {
+                                let s = format_score(score);
+                                out.extend_from_slice(
+                                    format!("${}\r\n{}\r\n", s.len(), s).as_bytes(),
+                                );
                             } else {
-                                Command::Zpopmax {
-                                    key: k.clone(),
-                                    count: Some(items.len()),
-                                }
-                            };
-                            record_change!(&rep_cmd);
-                            popped = Some((k.clone(), items));
-                            break;
+                                out.extend_from_slice(b"$-1\r\n");
+                            }
+                        } else {
+                            write_resp_integer(out, count as i64);
                         }
                     }
                     Err(err) => {
                         write_resp_err(out, err);
-                        return false;
                     }
                 }
+                false
             }
-            if let Some((k, items)) = popped {
-                format_zmpop_response(out, &k, &items);
-            } else {
-                write_resp_null_array(out);
-            }
-            false
-        }
-        Command::Zunionstore {
-            destination,
-            keys,
-            weights,
-            aggregate,
-        } => {
-            let prev_kind = db.type_of(destination.as_ref());
-            match db.zunionstore(destination.clone(), keys, weights, *aggregate) {
-                Ok(count) => {
-                    record_change!(cmd);
-                    if count > 0 {
-                        notify_set_key_events_local(prev_kind, "zset", destination.as_ref());
-                    } else if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+            Command::Zrem { key, members } => {
+                match db.zrem(key, members) {
+                    Ok(count) => {
+                        if count > 0 {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_ZSET, "zrem", key);
+                            if !db.exists(key) {
+                                notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                            }
+                        }
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                     }
-                    write_resp_integer(out, count as i64);
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
                 }
-                Err(err) => {
+                false
+            }
+            Command::Zscore { key, member } => {
+                match db.zscore(key, member) {
+                    Ok(Some(score)) => {
+                        let s = format_score(score);
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                    }
+                    Ok(None) => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zcard(key) => {
+                match db.zcard(key) {
+                    Ok(card) => {
+                        out.extend_from_slice(format!(":{}\r\n", card).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zrank {
+                key,
+                member,
+                with_score,
+            } => {
+                match db.zrank(key, member, false, *with_score) {
+                    Ok(Some((rank, score))) => {
+                        if *with_score {
+                            let s = format_score(score.unwrap_or(0.0));
+                            out.extend_from_slice(
+                                format!("*2\r\n:{}\r\n${}\r\n{}\r\n", rank, s.len(), s).as_bytes(),
+                            );
+                        } else {
+                            out.extend_from_slice(format!(":{}\r\n", rank).as_bytes());
+                        }
+                    }
+                    Ok(None) => {
+                        if *with_score {
+                            out.extend_from_slice(b"*-1\r\n");
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zrevrank {
+                key,
+                member,
+                with_score,
+            } => {
+                match db.zrank(key, member, true, *with_score) {
+                    Ok(Some((rank, score))) => {
+                        if *with_score {
+                            let s = format_score(score.unwrap_or(0.0));
+                            out.extend_from_slice(
+                                format!("*2\r\n:{}\r\n${}\r\n{}\r\n", rank, s.len(), s).as_bytes(),
+                            );
+                        } else {
+                            out.extend_from_slice(format!(":{}\r\n", rank).as_bytes());
+                        }
+                    }
+                    Ok(None) => {
+                        if *with_score {
+                            out.extend_from_slice(b"*-1\r\n");
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zcount {
+                key,
+                min,
+                min_inc,
+                max,
+                max_inc,
+            } => {
+                match db.zcount(key, *min, *min_inc, *max, *max_inc) {
+                    Ok(count) => {
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zincrby { key, delta, member } => {
+                match db.zincrby(key.clone(), *delta, member.clone()) {
+                    Ok(score) => {
+                        record_change!(cmd);
+                        notify_zset_or_defer(db, key);
+                        let s = format_score(score);
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zrange { key, opts } => {
+                let is_resp3 = CURRENT_CLIENT_RESP3.get();
+                if let Err(err) = db.write_zrange_resp(key.as_ref(), opts, is_resp3, out) {
                     write_resp_err(out, err);
                 }
+                false
             }
-            false
-        }
-        Command::Zinterstore {
-            destination,
-            keys,
-            weights,
-            aggregate,
-        } => {
-            let prev_kind = db.type_of(destination.as_ref());
-            match db.zinterstore(destination.clone(), keys, weights, *aggregate) {
-                Ok(count) => {
-                    record_change!(cmd);
-                    if count > 0 {
-                        notify_set_key_events_local(prev_kind, "zset", destination.as_ref());
-                    } else if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+            Command::Zrangestore { dst, src, opts } => {
+                let prev_kind = db.type_of(dst.as_ref());
+                match db.zrangestore(dst, src, opts) {
+                    Ok(count) => {
+                        record_change!(cmd);
+                        if count > 0 {
+                            notify_set_key_events_local(prev_kind, "zset", dst.as_ref());
+                        } else if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", dst.as_ref());
+                        }
+                        write_resp_integer(out, count as i64);
                     }
-                    write_resp_integer(out, count as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zdiffstore { destination, keys } => {
-            let prev_kind = db.type_of(destination.as_ref());
-            match db.zdiffstore(destination.clone(), keys) {
-                Ok(count) => {
-                    record_change!(cmd);
-                    if count > 0 {
-                        notify_set_key_events_local(prev_kind, "zset", destination.as_ref());
-                    } else if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
-                    write_resp_integer(out, count as i64);
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Zdiff { keys, with_scores } => {
-            match db.zdiff(keys, *with_scores) {
-                Ok(items) => {
-                    if *with_scores {
-                        if CURRENT_CLIENT_RESP3.get() {
-                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                            for (m, s) in items {
+            Command::Zpopmin { key, count } => {
+                let n = count.unwrap_or(1);
+                match db.zpopmin(key, n) {
+                    Ok(popped) => {
+                        if !popped.is_empty() {
+                            let zrem_cmd = Command::Zrem {
+                                key: key.clone(),
+                                members: popped.iter().map(|(m, _)| m.clone()).collect(),
+                            };
+                            record_change!(&zrem_cmd);
+                            notify_keyspace_event(NOTIFY_ZSET, "zpopmin", key);
+                            notify_del_if_emptied(db, key);
+                        }
+                        if count.is_none() {
+                            if popped.is_empty() {
+                                out.extend_from_slice(b"*0\r\n");
+                            } else {
                                 out.extend_from_slice(b"*2\r\n");
-                                write_resp_bulk(out, &m);
-                                write_resp_score(out, s);
+                                let (m, s) = &popped[0];
+                                write_resp_bulk(out, m);
+                                write_resp_score(out, *s);
                             }
-                        } else {
-                            out.extend_from_slice(format!("*{}\r\n", items.len() * 2).as_bytes());
-                            for (m, s) in items {
-                                write_resp_bulk(out, &m);
-                                write_resp_score(out, s);
-                            }
-                        }
-                    } else {
-                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                        for (m, _) in items {
-                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                            out.extend_from_slice(&m);
-                            out.extend_from_slice(b"\r\n");
-                        }
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Zinter {
-            keys,
-            weights,
-            aggregate,
-            with_scores,
-        } => {
-            match db.zinter(keys, weights, *aggregate, *with_scores) {
-                Ok(items) => {
-                    if *with_scores {
-                        if CURRENT_CLIENT_RESP3.get() {
-                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                            for (m, s) in items {
+                        } else if CURRENT_CLIENT_RESP3.get() {
+                            out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                            for (m, s) in &popped {
                                 out.extend_from_slice(b"*2\r\n");
-                                write_resp_bulk(out, &m);
-                                write_resp_score(out, s);
+                                write_resp_bulk(out, m);
+                                write_resp_score(out, *s);
                             }
                         } else {
-                            out.extend_from_slice(format!("*{}\r\n", items.len() * 2).as_bytes());
-                            for (m, s) in items {
-                                write_resp_bulk(out, &m);
-                                write_resp_score(out, s);
+                            out.extend_from_slice(format!("*{}\r\n", popped.len() * 2).as_bytes());
+                            for (m, s) in &popped {
+                                write_resp_bulk(out, m);
+                                write_resp_score(out, *s);
                             }
                         }
-                    } else {
-                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                        for (m, _) in items {
-                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                            out.extend_from_slice(&m);
-                            out.extend_from_slice(b"\r\n");
-                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Zunion {
-            keys,
-            weights,
-            aggregate,
-            with_scores,
-        } => {
-            match db.zunion(keys, weights, *aggregate, *with_scores) {
-                Ok(items) => {
-                    if *with_scores {
-                        if CURRENT_CLIENT_RESP3.get() {
-                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                            for (m, s) in items {
+            Command::Zpopmax { key, count } => {
+                let n = count.unwrap_or(1);
+                match db.zpopmax(key, n) {
+                    Ok(popped) => {
+                        if !popped.is_empty() {
+                            let zrem_cmd = Command::Zrem {
+                                key: key.clone(),
+                                members: popped.iter().map(|(m, _)| m.clone()).collect(),
+                            };
+                            record_change!(&zrem_cmd);
+                            notify_keyspace_event(NOTIFY_ZSET, "zpopmax", key);
+                            notify_del_if_emptied(db, key);
+                        }
+                        if count.is_none() {
+                            if popped.is_empty() {
+                                out.extend_from_slice(b"*0\r\n");
+                            } else {
                                 out.extend_from_slice(b"*2\r\n");
-                                write_resp_bulk(out, &m);
-                                write_resp_score(out, s);
+                                let (m, s) = &popped[0];
+                                write_resp_bulk(out, m);
+                                write_resp_score(out, *s);
+                            }
+                        } else if CURRENT_CLIENT_RESP3.get() {
+                            out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                            for (m, s) in &popped {
+                                out.extend_from_slice(b"*2\r\n");
+                                write_resp_bulk(out, m);
+                                write_resp_score(out, *s);
                             }
                         } else {
-                            out.extend_from_slice(format!("*{}\r\n", items.len() * 2).as_bytes());
-                            for (m, s) in items {
-                                write_resp_bulk(out, &m);
-                                write_resp_score(out, s);
+                            out.extend_from_slice(format!("*{}\r\n", popped.len() * 2).as_bytes());
+                            for (m, s) in &popped {
+                                write_resp_bulk(out, m);
+                                write_resp_score(out, *s);
                             }
                         }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zmpop {
+                keys,
+                is_min,
+                count,
+            } => {
+                let mut popped: Option<(Bytes, Vec<(Bytes, f64)>)> = None;
+                for k in keys {
+                    if !db.exists(k) {
+                        continue;
+                    }
+                    let res = if *is_min {
+                        db.zpopmin(k, *count)
                     } else {
-                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                        for (m, _) in items {
-                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                            out.extend_from_slice(&m);
-                            out.extend_from_slice(b"\r\n");
+                        db.zpopmax(k, *count)
+                    };
+                    match res {
+                        Ok(items) => {
+                            if !items.is_empty() {
+                                let rep_cmd = if *is_min {
+                                    Command::Zpopmin {
+                                        key: k.clone(),
+                                        count: Some(items.len()),
+                                    }
+                                } else {
+                                    Command::Zpopmax {
+                                        key: k.clone(),
+                                        count: Some(items.len()),
+                                    }
+                                };
+                                record_change!(&rep_cmd);
+                                popped = Some((k.clone(), items));
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            write_resp_err(out, err);
+                            return false;
                         }
                     }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
+                if let Some((k, items)) = popped {
+                    format_zmpop_response(out, &k, &items);
+                } else {
+                    write_resp_null_array(out);
                 }
+                false
             }
-            false
-        }
-        Command::Zintercard { keys, limit } => {
-            match db.zintercard(keys, *limit) {
-                Ok(card) => write_resp_integer(out, card as i64),
-                Err(err) => write_resp_err(out, err),
+            Command::Zunionstore {
+                destination,
+                keys,
+                weights,
+                aggregate,
+            } => {
+                let prev_kind = db.type_of(destination.as_ref());
+                match db.zunionstore(destination.clone(), keys, weights, *aggregate) {
+                    Ok(count) => {
+                        record_change!(cmd);
+                        if count > 0 {
+                            notify_set_key_events_local(prev_kind, "zset", destination.as_ref());
+                        } else if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                        }
+                        write_resp_integer(out, count as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
             }
-            false
-        }
-        // GENERIC & DATABASE COMMANDS
-        Command::Type(key) => {
-            let t = db.type_of(key);
-            out.extend_from_slice(format!("+{}\r\n", t).as_bytes());
-            false
-        }
-        Command::Object(sub) => {
-            match sub {
-                crate::resp::ObjectSubcommand::Encoding(key) => {
-                    if let Some(enc) = db.object_encoding(key) {
-                        write_resp_bulk(out, enc.as_bytes());
-                    } else {
-                        out.extend_from_slice(b"$-1\r\n");
+            Command::Zinterstore {
+                destination,
+                keys,
+                weights,
+                aggregate,
+            } => {
+                let prev_kind = db.type_of(destination.as_ref());
+                match db.zinterstore(destination.clone(), keys, weights, *aggregate) {
+                    Ok(count) => {
+                        record_change!(cmd);
+                        if count > 0 {
+                            notify_set_key_events_local(prev_kind, "zset", destination.as_ref());
+                        } else if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                        }
+                        write_resp_integer(out, count as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
-                crate::resp::ObjectSubcommand::Freq(key) => {
-                    if db.exists(key) {
-                        out.extend_from_slice(b":0\r\n");
-                    } else {
-                        out.extend_from_slice(b"$-1\r\n");
-                    }
-                }
-                crate::resp::ObjectSubcommand::Idletime(key) => {
-                    if let Some(idle) = db.idletime(key) {
-                        write_resp_integer(out, idle as i64);
-                    } else {
-                        out.extend_from_slice(b"$-1\r\n");
-                    }
-                }
-                crate::resp::ObjectSubcommand::Refcount(key) => {
-                    if db.exists(key) {
-                        out.extend_from_slice(b":1\r\n");
-                    } else {
-                        out.extend_from_slice(b"$-1\r\n");
-                    }
-                }
-                crate::resp::ObjectSubcommand::Help => {
-                    let help_items = [
-                        "OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-                        "ENCODING <key> -- Return the kind of internal representation used in the object stored at <key>.",
-                        "FREQ <key> -- Return the logarithmic access frequency counter of the object stored at <key>.",
-                        "IDLETIME <key> -- Return the idle time of the object stored at <key>, in seconds.",
-                        "REFCOUNT <key> -- Return the number of references of the value at <key>.",
-                        "HELP -- Print this help.",
-                    ];
-                    write_resp_array_header(out, help_items.len());
-                    for item in help_items {
-                        write_resp_bulk(out, item.as_bytes());
-                    }
-                }
+                false
             }
-            false
-        }
-        Command::Readonly | Command::Readwrite => {
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::Xinfo(sub) => {
-            match sub {
-                crate::resp::XinfoSubcommand::Stream(key) => match db.xinfo_stream(key) {
-                    Ok(info) => {
-                        write_resp_array_header(out, 32);
-                        write_resp_bulk(out, b"length");
-                        write_resp_integer(out, info.length as i64);
-                        write_resp_bulk(out, b"radix-tree-keys");
-                        write_resp_integer(out, info.radix_tree_keys as i64);
-                        write_resp_bulk(out, b"radix-tree-nodes");
-                        write_resp_integer(out, info.radix_tree_nodes as i64);
-                        write_resp_bulk(out, b"last-generated-id");
-                        let last_id_str = info.last_generated_id.to_string();
-                        write_resp_bulk(out, last_id_str.as_bytes());
-                        write_resp_bulk(out, b"max-deleted-entry-id");
-                        let max_del_str = info.max_deleted_entry_id.to_string();
-                        write_resp_bulk(out, max_del_str.as_bytes());
-                        write_resp_bulk(out, b"entries-added");
-                        write_resp_integer(out, info.entries_added as i64);
-                        write_resp_bulk(out, b"recorded-first-entry-id");
-                        let rec_first_str =
-                            info.recorded_first_entry_id.unwrap_or_default().to_string();
-                        write_resp_bulk(out, rec_first_str.as_bytes());
-                        write_resp_bulk(out, b"groups");
-                        write_resp_integer(out, info.groups as i64);
-                        write_resp_bulk(out, b"first-entry");
-                        if let Some((id, fields)) = &info.first_entry {
-                            write_resp_array_header(out, 2);
-                            let id_s = id.to_string();
-                            write_resp_bulk(out, id_s.as_bytes());
-                            write_resp_array_header(out, fields.len() * 2);
-                            for (f, v) in fields {
-                                write_resp_bulk(out, f);
-                                write_resp_bulk(out, v);
+            Command::Zdiffstore { destination, keys } => {
+                let prev_kind = db.type_of(destination.as_ref());
+                match db.zdiffstore(destination.clone(), keys) {
+                    Ok(count) => {
+                        record_change!(cmd);
+                        if count > 0 {
+                            notify_set_key_events_local(prev_kind, "zset", destination.as_ref());
+                        } else if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                        }
+                        write_resp_integer(out, count as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zdiff { keys, with_scores } => {
+                match db.zdiff(keys, *with_scores) {
+                    Ok(items) => {
+                        if *with_scores {
+                            if CURRENT_CLIENT_RESP3.get() {
+                                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                                for (m, s) in items {
+                                    out.extend_from_slice(b"*2\r\n");
+                                    write_resp_bulk(out, &m);
+                                    write_resp_score(out, s);
+                                }
+                            } else {
+                                out.extend_from_slice(
+                                    format!("*{}\r\n", items.len() * 2).as_bytes(),
+                                );
+                                for (m, s) in items {
+                                    write_resp_bulk(out, &m);
+                                    write_resp_score(out, s);
+                                }
                             }
                         } else {
-                            write_resp_null_array(out);
+                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                            for (m, _) in items {
+                                out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                                out.extend_from_slice(&m);
+                                out.extend_from_slice(b"\r\n");
+                            }
                         }
-                        write_resp_bulk(out, b"last-entry");
-                        if let Some((id, fields)) = &info.last_entry {
-                            write_resp_array_header(out, 2);
-                            let id_s = id.to_string();
-                            write_resp_bulk(out, id_s.as_bytes());
-                            write_resp_array_header(out, fields.len() * 2);
-                            for (f, v) in fields {
-                                write_resp_bulk(out, f);
-                                write_resp_bulk(out, v);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zinter {
+                keys,
+                weights,
+                aggregate,
+                with_scores,
+            } => {
+                match db.zinter(keys, weights, *aggregate, *with_scores) {
+                    Ok(items) => {
+                        if *with_scores {
+                            if CURRENT_CLIENT_RESP3.get() {
+                                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                                for (m, s) in items {
+                                    out.extend_from_slice(b"*2\r\n");
+                                    write_resp_bulk(out, &m);
+                                    write_resp_score(out, s);
+                                }
+                            } else {
+                                out.extend_from_slice(
+                                    format!("*{}\r\n", items.len() * 2).as_bytes(),
+                                );
+                                for (m, s) in items {
+                                    write_resp_bulk(out, &m);
+                                    write_resp_score(out, s);
+                                }
                             }
                         } else {
-                            write_resp_null_array(out);
+                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                            for (m, _) in items {
+                                out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                                out.extend_from_slice(&m);
+                                out.extend_from_slice(b"\r\n");
+                            }
                         }
-                        write_resp_bulk(out, b"pids-tracked");
-                        write_resp_integer(out, info.pids_tracked as i64);
-                        write_resp_bulk(out, b"iids-tracked");
-                        write_resp_integer(out, info.iids_tracked as i64);
-                        write_resp_bulk(out, b"iids-added");
-                        write_resp_integer(out, info.iids_added as i64);
-                        write_resp_bulk(out, b"iids-duplicates");
-                        write_resp_integer(out, info.iids_duplicates as i64);
-                        write_resp_bulk(out, b"idmp-duration");
-                        write_resp_integer(out, info.idmp_duration as i64);
-                        write_resp_bulk(out, b"idmp-maxsize");
-                        write_resp_integer(out, info.idmp_maxsize as i64);
                     }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zunion {
+                keys,
+                weights,
+                aggregate,
+                with_scores,
+            } => {
+                match db.zunion(keys, weights, *aggregate, *with_scores) {
+                    Ok(items) => {
+                        if *with_scores {
+                            if CURRENT_CLIENT_RESP3.get() {
+                                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                                for (m, s) in items {
+                                    out.extend_from_slice(b"*2\r\n");
+                                    write_resp_bulk(out, &m);
+                                    write_resp_score(out, s);
+                                }
+                            } else {
+                                out.extend_from_slice(
+                                    format!("*{}\r\n", items.len() * 2).as_bytes(),
+                                );
+                                for (m, s) in items {
+                                    write_resp_bulk(out, &m);
+                                    write_resp_score(out, s);
+                                }
+                            }
+                        } else {
+                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                            for (m, _) in items {
+                                out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                                out.extend_from_slice(&m);
+                                out.extend_from_slice(b"\r\n");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Zintercard { keys, limit } => {
+                match db.zintercard(keys, *limit) {
+                    Ok(card) => write_resp_integer(out, card as i64),
                     Err(err) => write_resp_err(out, err),
-                },
-                crate::resp::XinfoSubcommand::StreamFull { key, count } => {
-                    match db.xinfo_stream_full(key, *count) {
+                }
+                false
+            }
+            // GENERIC & DATABASE COMMANDS
+            Command::Type(key) => {
+                let t = db.type_of(key);
+                out.extend_from_slice(format!("+{}\r\n", t).as_bytes());
+                false
+            }
+            Command::Object(sub) => {
+                match sub {
+                    crate::resp::ObjectSubcommand::Encoding(key) => {
+                        if let Some(enc) = db.object_encoding(key) {
+                            write_resp_bulk(out, enc.as_bytes());
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    crate::resp::ObjectSubcommand::Freq(key) => {
+                        if db.exists(key) {
+                            out.extend_from_slice(b":0\r\n");
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    crate::resp::ObjectSubcommand::Idletime(key) => {
+                        if let Some(idle) = db.idletime(key) {
+                            write_resp_integer(out, idle as i64);
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    crate::resp::ObjectSubcommand::Refcount(key) => {
+                        if db.exists(key) {
+                            out.extend_from_slice(b":1\r\n");
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    crate::resp::ObjectSubcommand::Help => {
+                        let help_items = [
+                            "OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                            "ENCODING <key> -- Return the kind of internal representation used in the object stored at <key>.",
+                            "FREQ <key> -- Return the logarithmic access frequency counter of the object stored at <key>.",
+                            "IDLETIME <key> -- Return the idle time of the object stored at <key>, in seconds.",
+                            "REFCOUNT <key> -- Return the number of references of the value at <key>.",
+                            "HELP -- Print this help.",
+                        ];
+                        write_resp_array_header(out, help_items.len());
+                        for item in help_items {
+                            write_resp_bulk(out, item.as_bytes());
+                        }
+                    }
+                }
+                false
+            }
+            Command::Readonly | Command::Readwrite => {
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Xinfo(sub) => {
+                match sub {
+                    crate::resp::XinfoSubcommand::Stream(key) => match db.xinfo_stream(key) {
                         Ok(info) => {
-                            write_resp_array_header(out, 30);
+                            write_resp_array_header(out, 32);
                             write_resp_bulk(out, b"length");
                             write_resp_integer(out, info.length as i64);
                             write_resp_bulk(out, b"radix-tree-keys");
@@ -18223,10 +18276,10 @@ pub fn execute_local_command(
                             let rec_first_str =
                                 info.recorded_first_entry_id.unwrap_or_default().to_string();
                             write_resp_bulk(out, rec_first_str.as_bytes());
-
-                            write_resp_bulk(out, b"entries");
-                            write_resp_array_header(out, info.entries.len());
-                            for (id, fields) in &info.entries {
+                            write_resp_bulk(out, b"groups");
+                            write_resp_integer(out, info.groups as i64);
+                            write_resp_bulk(out, b"first-entry");
+                            if let Some((id, fields)) = &info.first_entry {
                                 write_resp_array_header(out, 2);
                                 let id_s = id.to_string();
                                 write_resp_bulk(out, id_s.as_bytes());
@@ -18235,14 +18288,163 @@ pub fn execute_local_command(
                                     write_resp_bulk(out, f);
                                     write_resp_bulk(out, v);
                                 }
+                            } else {
+                                write_resp_null_array(out);
                             }
+                            write_resp_bulk(out, b"last-entry");
+                            if let Some((id, fields)) = &info.last_entry {
+                                write_resp_array_header(out, 2);
+                                let id_s = id.to_string();
+                                write_resp_bulk(out, id_s.as_bytes());
+                                write_resp_array_header(out, fields.len() * 2);
+                                for (f, v) in fields {
+                                    write_resp_bulk(out, f);
+                                    write_resp_bulk(out, v);
+                                }
+                            } else {
+                                write_resp_null_array(out);
+                            }
+                            write_resp_bulk(out, b"pids-tracked");
+                            write_resp_integer(out, info.pids_tracked as i64);
+                            write_resp_bulk(out, b"iids-tracked");
+                            write_resp_integer(out, info.iids_tracked as i64);
+                            write_resp_bulk(out, b"iids-added");
+                            write_resp_integer(out, info.iids_added as i64);
+                            write_resp_bulk(out, b"iids-duplicates");
+                            write_resp_integer(out, info.iids_duplicates as i64);
+                            write_resp_bulk(out, b"idmp-duration");
+                            write_resp_integer(out, info.idmp_duration as i64);
+                            write_resp_bulk(out, b"idmp-maxsize");
+                            write_resp_integer(out, info.idmp_maxsize as i64);
+                        }
+                        Err(err) => write_resp_err(out, err),
+                    },
+                    crate::resp::XinfoSubcommand::StreamFull { key, count } => {
+                        match db.xinfo_stream_full(key, *count) {
+                            Ok(info) => {
+                                write_resp_array_header(out, 30);
+                                write_resp_bulk(out, b"length");
+                                write_resp_integer(out, info.length as i64);
+                                write_resp_bulk(out, b"radix-tree-keys");
+                                write_resp_integer(out, info.radix_tree_keys as i64);
+                                write_resp_bulk(out, b"radix-tree-nodes");
+                                write_resp_integer(out, info.radix_tree_nodes as i64);
+                                write_resp_bulk(out, b"last-generated-id");
+                                let last_id_str = info.last_generated_id.to_string();
+                                write_resp_bulk(out, last_id_str.as_bytes());
+                                write_resp_bulk(out, b"max-deleted-entry-id");
+                                let max_del_str = info.max_deleted_entry_id.to_string();
+                                write_resp_bulk(out, max_del_str.as_bytes());
+                                write_resp_bulk(out, b"entries-added");
+                                write_resp_integer(out, info.entries_added as i64);
+                                write_resp_bulk(out, b"recorded-first-entry-id");
+                                let rec_first_str =
+                                    info.recorded_first_entry_id.unwrap_or_default().to_string();
+                                write_resp_bulk(out, rec_first_str.as_bytes());
 
-                            write_resp_bulk(out, b"groups");
-                            write_resp_array_header(out, info.groups.len());
-                            for g in &info.groups {
-                                write_resp_array_header(out, 16);
+                                write_resp_bulk(out, b"entries");
+                                write_resp_array_header(out, info.entries.len());
+                                for (id, fields) in &info.entries {
+                                    write_resp_array_header(out, 2);
+                                    let id_s = id.to_string();
+                                    write_resp_bulk(out, id_s.as_bytes());
+                                    write_resp_array_header(out, fields.len() * 2);
+                                    for (f, v) in fields {
+                                        write_resp_bulk(out, f);
+                                        write_resp_bulk(out, v);
+                                    }
+                                }
+
+                                write_resp_bulk(out, b"groups");
+                                write_resp_array_header(out, info.groups.len());
+                                for g in &info.groups {
+                                    write_resp_array_header(out, 16);
+                                    write_resp_bulk(out, b"name");
+                                    write_resp_bulk(out, &g.name);
+                                    write_resp_bulk(out, b"last-delivered-id");
+                                    let id_str = g.last_delivered_id.to_string();
+                                    write_resp_bulk(out, id_str.as_bytes());
+                                    write_resp_bulk(out, b"entries-read");
+                                    if let Some(er) = g.entries_read {
+                                        write_resp_integer(out, er as i64);
+                                    } else {
+                                        write_resp_null(out);
+                                    }
+                                    write_resp_bulk(out, b"lag");
+                                    if let Some(lag) = g.lag {
+                                        write_resp_integer(out, lag as i64);
+                                    } else {
+                                        write_resp_null(out);
+                                    }
+                                    write_resp_bulk(out, b"pel-count");
+                                    write_resp_integer(out, g.pel_count as i64);
+                                    write_resp_bulk(out, b"nacked-count");
+                                    write_resp_integer(out, g.nacked_count as i64);
+                                    write_resp_bulk(out, b"pending");
+                                    write_resp_array_header(out, g.pending.len());
+                                    for (id, consumer, time, count) in &g.pending {
+                                        write_resp_array_header(out, 4);
+                                        let id_s = id.to_string();
+                                        write_resp_bulk(out, id_s.as_bytes());
+                                        write_resp_bulk(out, consumer);
+                                        write_resp_integer(out, *time as i64);
+                                        write_resp_integer(out, *count as i64);
+                                    }
+                                    write_resp_bulk(out, b"consumers");
+                                    write_resp_array_header(out, g.consumers.len());
+                                    for c in &g.consumers {
+                                        write_resp_array_header(out, 10);
+                                        write_resp_bulk(out, b"name");
+                                        write_resp_bulk(out, &c.name);
+                                        write_resp_bulk(out, b"seen-time");
+                                        write_resp_integer(out, c.seen_time_ms as i64);
+                                        write_resp_bulk(out, b"active-time");
+                                        write_resp_integer(
+                                            out,
+                                            c.active_time_ms.map(|t| t as i64).unwrap_or(-1),
+                                        );
+                                        write_resp_bulk(out, b"pel-count");
+                                        write_resp_integer(out, c.pel_count as i64);
+                                        write_resp_bulk(out, b"pending");
+                                        write_resp_array_header(out, c.pending.len());
+                                        for (id, time, count) in &c.pending {
+                                            write_resp_array_header(out, 3);
+                                            let id_s = id.to_string();
+                                            write_resp_bulk(out, id_s.as_bytes());
+                                            write_resp_integer(out, *time as i64);
+                                            write_resp_integer(out, *count as i64);
+                                        }
+                                    }
+                                }
+
+                                write_resp_bulk(out, b"pids-tracked");
+                                write_resp_integer(out, info.pids_tracked as i64);
+                                write_resp_bulk(out, b"iids-tracked");
+                                write_resp_integer(out, info.iids_tracked as i64);
+                                write_resp_bulk(out, b"iids-added");
+                                write_resp_integer(out, info.iids_added as i64);
+                                write_resp_bulk(out, b"iids-duplicates");
+                                write_resp_integer(out, info.iids_duplicates as i64);
+                                write_resp_bulk(out, b"idmp-duration");
+                                write_resp_integer(out, info.idmp_duration as i64);
+                                write_resp_bulk(out, b"idmp-maxsize");
+                                write_resp_integer(out, info.idmp_maxsize as i64);
+                            }
+                            Err(err) => write_resp_err(out, err),
+                        }
+                    }
+                    crate::resp::XinfoSubcommand::Groups(key) => match db.xinfo_groups(key) {
+                        Ok(mut groups) => {
+                            groups.sort_by(|a, b| a.name.cmp(&b.name));
+                            write_resp_array_header(out, groups.len());
+                            for g in groups {
+                                write_resp_array_header(out, 12);
                                 write_resp_bulk(out, b"name");
                                 write_resp_bulk(out, &g.name);
+                                write_resp_bulk(out, b"consumers");
+                                write_resp_integer(out, g.consumers as i64);
+                                write_resp_bulk(out, b"pending");
+                                write_resp_integer(out, g.pending as i64);
                                 write_resp_bulk(out, b"last-delivered-id");
                                 let id_str = g.last_delivered_id.to_string();
                                 write_resp_bulk(out, id_str.as_bytes());
@@ -18258,1406 +18460,1064 @@ pub fn execute_local_command(
                                 } else {
                                     write_resp_null(out);
                                 }
-                                write_resp_bulk(out, b"pel-count");
-                                write_resp_integer(out, g.pel_count as i64);
-                                write_resp_bulk(out, b"nacked-count");
-                                write_resp_integer(out, g.nacked_count as i64);
-                                write_resp_bulk(out, b"pending");
-                                write_resp_array_header(out, g.pending.len());
-                                for (id, consumer, time, count) in &g.pending {
-                                    write_resp_array_header(out, 4);
-                                    let id_s = id.to_string();
-                                    write_resp_bulk(out, id_s.as_bytes());
-                                    write_resp_bulk(out, consumer);
-                                    write_resp_integer(out, *time as i64);
-                                    write_resp_integer(out, *count as i64);
-                                }
-                                write_resp_bulk(out, b"consumers");
-                                write_resp_array_header(out, g.consumers.len());
-                                for c in &g.consumers {
-                                    write_resp_array_header(out, 10);
+                            }
+                        }
+                        Err(err) => write_resp_err(out, err),
+                    },
+                    crate::resp::XinfoSubcommand::Consumers { key, group } => {
+                        match db.xinfo_consumers(key, group) {
+                            Ok(mut consumers) => {
+                                consumers.sort_by(|a, b| a.name.cmp(&b.name));
+                                write_resp_array_header(out, consumers.len());
+                                for c in consumers {
+                                    write_resp_array_header(out, 8);
                                     write_resp_bulk(out, b"name");
                                     write_resp_bulk(out, &c.name);
-                                    write_resp_bulk(out, b"seen-time");
-                                    write_resp_integer(out, c.seen_time_ms as i64);
-                                    write_resp_bulk(out, b"active-time");
-                                    write_resp_integer(
-                                        out,
-                                        c.active_time_ms.map(|t| t as i64).unwrap_or(-1),
-                                    );
-                                    write_resp_bulk(out, b"pel-count");
-                                    write_resp_integer(out, c.pel_count as i64);
                                     write_resp_bulk(out, b"pending");
-                                    write_resp_array_header(out, c.pending.len());
-                                    for (id, time, count) in &c.pending {
-                                        write_resp_array_header(out, 3);
-                                        let id_s = id.to_string();
-                                        write_resp_bulk(out, id_s.as_bytes());
-                                        write_resp_integer(out, *time as i64);
-                                        write_resp_integer(out, *count as i64);
-                                    }
+                                    write_resp_integer(out, c.pending as i64);
+                                    write_resp_bulk(out, b"idle");
+                                    write_resp_integer(out, c.idle_ms as i64);
+                                    write_resp_bulk(out, b"inactive");
+                                    write_resp_integer(out, c.inactive_ms);
                                 }
                             }
-
-                            write_resp_bulk(out, b"pids-tracked");
-                            write_resp_integer(out, info.pids_tracked as i64);
-                            write_resp_bulk(out, b"iids-tracked");
-                            write_resp_integer(out, info.iids_tracked as i64);
-                            write_resp_bulk(out, b"iids-added");
-                            write_resp_integer(out, info.iids_added as i64);
-                            write_resp_bulk(out, b"iids-duplicates");
-                            write_resp_integer(out, info.iids_duplicates as i64);
-                            write_resp_bulk(out, b"idmp-duration");
-                            write_resp_integer(out, info.idmp_duration as i64);
-                            write_resp_bulk(out, b"idmp-maxsize");
-                            write_resp_integer(out, info.idmp_maxsize as i64);
-                        }
-                        Err(err) => write_resp_err(out, err),
-                    }
-                }
-                crate::resp::XinfoSubcommand::Groups(key) => match db.xinfo_groups(key) {
-                    Ok(mut groups) => {
-                        groups.sort_by(|a, b| a.name.cmp(&b.name));
-                        write_resp_array_header(out, groups.len());
-                        for g in groups {
-                            write_resp_array_header(out, 12);
-                            write_resp_bulk(out, b"name");
-                            write_resp_bulk(out, &g.name);
-                            write_resp_bulk(out, b"consumers");
-                            write_resp_integer(out, g.consumers as i64);
-                            write_resp_bulk(out, b"pending");
-                            write_resp_integer(out, g.pending as i64);
-                            write_resp_bulk(out, b"last-delivered-id");
-                            let id_str = g.last_delivered_id.to_string();
-                            write_resp_bulk(out, id_str.as_bytes());
-                            write_resp_bulk(out, b"entries-read");
-                            if let Some(er) = g.entries_read {
-                                write_resp_integer(out, er as i64);
-                            } else {
-                                write_resp_null(out);
-                            }
-                            write_resp_bulk(out, b"lag");
-                            if let Some(lag) = g.lag {
-                                write_resp_integer(out, lag as i64);
-                            } else {
-                                write_resp_null(out);
-                            }
+                            Err(err) => write_resp_err(out, err),
                         }
                     }
-                    Err(err) => write_resp_err(out, err),
-                },
-                crate::resp::XinfoSubcommand::Consumers { key, group } => {
-                    match db.xinfo_consumers(key, group) {
-                        Ok(mut consumers) => {
-                            consumers.sort_by(|a, b| a.name.cmp(&b.name));
-                            write_resp_array_header(out, consumers.len());
-                            for c in consumers {
-                                write_resp_array_header(out, 8);
-                                write_resp_bulk(out, b"name");
-                                write_resp_bulk(out, &c.name);
-                                write_resp_bulk(out, b"pending");
-                                write_resp_integer(out, c.pending as i64);
-                                write_resp_bulk(out, b"idle");
-                                write_resp_integer(out, c.idle_ms as i64);
-                                write_resp_bulk(out, b"inactive");
-                                write_resp_integer(out, c.inactive_ms);
-                            }
+                    crate::resp::XinfoSubcommand::Help => {
+                        let help_items = [
+                            "CONSUMERS <key> <group> -- Show consumers of <group>.",
+                            "GROUPS <key> -- Show consumer groups of <key>.",
+                            "STREAM <key> -- Show information about stream <key>.",
+                            "HELP -- Print this help.",
+                        ];
+                        write_resp_array_header(out, help_items.len());
+                        for item in help_items {
+                            write_resp_bulk(out, item.as_bytes());
                         }
-                        Err(err) => write_resp_err(out, err),
                     }
                 }
-                crate::resp::XinfoSubcommand::Help => {
-                    let help_items = [
-                        "CONSUMERS <key> <group> -- Show consumers of <group>.",
-                        "GROUPS <key> -- Show consumer groups of <key>.",
-                        "STREAM <key> -- Show information about stream <key>.",
-                        "HELP -- Print this help.",
-                    ];
-                    write_resp_array_header(out, help_items.len());
-                    for item in help_items {
-                        write_resp_bulk(out, item.as_bytes());
-                    }
-                }
+                false
             }
-            false
-        }
-        Command::XgroupHelp => {
-            let help_items = [
-                "CREATE <key> <groupname> <id|$> [option]",
-                "    Create a new consumer group. Options are:",
-                "    * MKSTREAM",
-                "      Create the empty stream if it does not exist.",
-                "    * ENTRIESREAD entries_read",
-                "      Set the group's entries_read counter (internal use).",
-                "CREATECONSUMER <key> <groupname> <consumer>",
-                "    Create a new consumer in the specified group.",
-                "DELCONSUMER <key> <groupname> <consumer>",
-                "    Remove the specified consumer.",
-                "DESTROY <key> <groupname>",
-                "    Destroy the specified consumer group.",
-                "SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]",
-                "    Set the group last delivered ID to <id|$>.",
-                "HELP",
-                "    Print this help.",
-            ];
-            write_resp_array_header(out, help_items.len());
-            for item in help_items {
-                write_resp_bulk(out, item.as_bytes());
-            }
-            false
-        }
-        Command::CommandCount => {
-            crate::command_info::write_count(out);
-            false
-        }
-        Command::CommandList => {
-            crate::command_info::write_list(out, None);
-            false
-        }
-        Command::CommandListFiltered {
-            filter_type,
-            filter_val,
-        } => {
-            crate::command_info::write_list(out, Some((filter_type.as_str(), filter_val.as_str())));
-            false
-        }
-        Command::CommandGetkeys(cmd_args) => {
-            write_command_getkeys(out, cmd_args);
-            false
-        }
-        Command::CommandGetkeysAndFlags(cmd_args) => {
-            write_command_getkeys_and_flags(out, cmd_args);
-            false
-        }
-        Command::CommandInfo(cmds) => {
-            crate::command_info::write_info(out, cmds, CURRENT_CLIENT_RESP3.get());
-            false
-        }
-        Command::Dbsize => {
-            let n = db.dbsize();
-            out.extend_from_slice(format!(":{}\r\n", n).as_bytes());
-            false
-        }
-        Command::Select(idx) => {
-            if *idx >= 16 {
-                out.extend_from_slice(b"-ERR DB index is out of range\r\n");
-            } else {
-                out.extend_from_slice(b"+OK\r\n");
-            }
-            false
-        }
-        Command::Slowlog(args) => {
-            let sub = if !args.is_empty() {
-                args[0].to_ascii_lowercase()
-            } else {
-                b"get".to_vec()
-            };
-            if sub == b"reset" {
-                crate::slowlog::slowlog_reset();
-                out.extend_from_slice(b"+OK\r\n");
-            } else if sub == b"len" {
-                let len = crate::slowlog::slowlog_len();
-                out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
-            } else if sub == b"help" {
-                let help_lines = [
-                    "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-                    "GET [<count>]",
-                    "    Return top <count> entries from the slowlog (default: 10, -1 for all).",
-                    "LEN",
-                    "    Return the length of the slowlog.",
-                    "RESET",
-                    "    Reset the slowlog, clearing all entries.",
+            Command::XgroupHelp => {
+                let help_items = [
+                    "CREATE <key> <groupname> <id|$> [option]",
+                    "    Create a new consumer group. Options are:",
+                    "    * MKSTREAM",
+                    "      Create the empty stream if it does not exist.",
+                    "    * ENTRIESREAD entries_read",
+                    "      Set the group's entries_read counter (internal use).",
+                    "CREATECONSUMER <key> <groupname> <consumer>",
+                    "    Create a new consumer in the specified group.",
+                    "DELCONSUMER <key> <groupname> <consumer>",
+                    "    Remove the specified consumer.",
+                    "DESTROY <key> <groupname>",
+                    "    Destroy the specified consumer group.",
+                    "SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]",
+                    "    Set the group last delivered ID to <id|$>.",
                     "HELP",
-                    "    Return top-level help about SLOWLOG subcommands.",
+                    "    Print this help.",
                 ];
-                out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
-                for line in help_lines {
-                    out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+                write_resp_array_header(out, help_items.len());
+                for item in help_items {
+                    write_resp_bulk(out, item.as_bytes());
                 }
-            } else {
-                let count = if args.len() > 1 {
-                    match std::str::from_utf8(&args[1])
-                        .ok()
-                        .and_then(|s| s.parse::<i64>().ok())
-                    {
-                        Some(c) if c < -1 => {
-                            out.extend_from_slice(
-                                b"-ERR count should be greater than or equal to -1\r\n",
-                            );
-                            return false;
-                        }
-                        Some(c) => Some(c),
-                        None => None,
+                false
+            }
+            Command::CommandCount => {
+                crate::command_info::write_count(out);
+                false
+            }
+            Command::CommandList => {
+                crate::command_info::write_list(out, None);
+                false
+            }
+            Command::CommandListFiltered {
+                filter_type,
+                filter_val,
+            } => {
+                crate::command_info::write_list(
+                    out,
+                    Some((filter_type.as_str(), filter_val.as_str())),
+                );
+                false
+            }
+            Command::CommandGetkeys(cmd_args) => {
+                write_command_getkeys(out, cmd_args);
+                false
+            }
+            Command::CommandGetkeysAndFlags(cmd_args) => {
+                write_command_getkeys_and_flags(out, cmd_args);
+                false
+            }
+            Command::CommandInfo(cmds) => {
+                crate::command_info::write_info(out, cmds, CURRENT_CLIENT_RESP3.get());
+                false
+            }
+            Command::Dbsize => {
+                let n = db.dbsize();
+                out.extend_from_slice(format!(":{}\r\n", n).as_bytes());
+                false
+            }
+            Command::KeyspaceStats => {
+                let keys = db.dbsize();
+                let expires = db.table.num_expires.min(keys);
+                out.extend_from_slice(format!("*2\r\n:{}\r\n:{}\r\n", keys, expires).as_bytes());
+                false
+            }
+            Command::Select(idx) => {
+                if *idx >= 16 {
+                    out.extend_from_slice(b"-ERR DB index is out of range\r\n");
+                } else {
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                false
+            }
+            Command::Slowlog(args) => {
+                let sub = if !args.is_empty() {
+                    args[0].to_ascii_lowercase()
+                } else {
+                    b"get".to_vec()
+                };
+                if sub == b"reset" {
+                    crate::slowlog::slowlog_reset();
+                    out.extend_from_slice(b"+OK\r\n");
+                } else if sub == b"len" {
+                    let len = crate::slowlog::slowlog_len();
+                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                } else if sub == b"help" {
+                    let help_lines = [
+                        "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                        "GET [<count>]",
+                        "    Return top <count> entries from the slowlog (default: 10, -1 for all).",
+                        "LEN",
+                        "    Return the length of the slowlog.",
+                        "RESET",
+                        "    Reset the slowlog, clearing all entries.",
+                        "HELP",
+                        "    Return top-level help about SLOWLOG subcommands.",
+                    ];
+                    out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
+                    for line in help_lines {
+                        out.extend_from_slice(
+                            format!("${}\r\n{}\r\n", line.len(), line).as_bytes(),
+                        );
                     }
                 } else {
-                    None
-                };
-                let entries = crate::slowlog::slowlog_get(count);
-                crate::slowlog::write_slowlog_entries_resp(&entries, out);
+                    let count = if args.len() > 1 {
+                        match std::str::from_utf8(&args[1])
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                        {
+                            Some(c) if c < -1 => {
+                                out.extend_from_slice(
+                                    b"-ERR count should be greater than or equal to -1\r\n",
+                                );
+                                return false;
+                            }
+                            Some(c) => Some(c),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let entries = crate::slowlog::slowlog_get(count);
+                    crate::slowlog::write_slowlog_entries_resp(&entries, out);
+                }
+                false
             }
-            false
-        }
-        Command::Flushdb | Command::Flushall => {
-            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                let watched_keys_for_port: Vec<Bytes> = {
-                    let map = WATCHED_KEYS.read().unwrap();
-                    map.get(&db.port)
-                        .map(|m| m.keys().cloned().collect())
-                        .unwrap_or_default()
-                };
-                for k in watched_keys_for_port {
-                    if db.exists(k.as_ref()) {
-                        touch_watched_key(db.port, k.as_ref());
+            Command::Flushdb | Command::Flushall => {
+                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                    let watched_keys_for_port: Vec<Bytes> = {
+                        let map = WATCHED_KEYS.read();
+                        map.get(&db.port)
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default()
+                    };
+                    for k in watched_keys_for_port {
+                        if db.exists(k.as_ref()) {
+                            touch_watched_key(db.port, k.as_ref());
+                        }
                     }
                 }
+                db.flushdb();
+                record_change!(cmd);
+                crate::block::get_block_hub_for_port(db.port)
+                    .lock()
+                    .notify_all_streams(db);
+                out.extend_from_slice(b"+OK\r\n");
+                false
             }
-            db.flushdb();
-            record_change!(cmd);
-            crate::block::get_block_hub_for_port(db.port)
-                .lock()
-                .unwrap()
-                .notify_all_streams(db);
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::Touch(keys) => {
-            let n = db.touch(keys);
-            out.extend_from_slice(format!(":{}\r\n", n).as_bytes());
-            false
-        }
-        Command::Rename { key, newkey, nx } => {
-            let prev_kind = db.type_of(newkey.as_ref());
-            let src_kind = db.type_of(key.as_ref());
-            match db.rename(key, newkey.clone(), *nx) {
-                Ok(success) => {
-                    if success {
-                        record_change!(cmd);
-                        notify_stream_or_defer(db, key);
-                        notify_stream_or_defer(db, newkey);
-                        if db.type_of(newkey) == "list" {
-                            notify_list_or_defer(db, newkey);
+            Command::Touch(keys) => {
+                let n = db.touch(keys);
+                out.extend_from_slice(format!(":{}\r\n", n).as_bytes());
+                false
+            }
+            Command::Rename { key, newkey, nx } => {
+                let prev_kind = db.type_of(newkey.as_ref());
+                let src_kind = db.type_of(key.as_ref());
+                match db.rename(key, newkey.clone(), *nx) {
+                    Ok(success) => {
+                        if success {
+                            record_change!(cmd);
+                            notify_stream_or_defer(db, key);
+                            notify_stream_or_defer(db, newkey);
+                            if db.type_of(newkey) == "list" {
+                                notify_list_or_defer(db, newkey);
+                            }
+                            if prev_kind != "none" {
+                                notify_set_key_events_local(prev_kind, src_kind, newkey.as_ref());
+                            }
+                            notify_keyspace_event(NOTIFY_GENERIC, "rename_from", key.as_ref());
+                            notify_keyspace_event(NOTIFY_GENERIC, "rename_to", newkey.as_ref());
+                            if *nx {
+                                out.extend_from_slice(b":1\r\n");
+                            } else {
+                                out.extend_from_slice(b"+OK\r\n");
+                            }
+                        } else {
+                            out.extend_from_slice(b":0\r\n");
                         }
-                        if prev_kind != "none" {
-                            notify_set_key_events_local(prev_kind, src_kind, newkey.as_ref());
-                        }
-                        notify_keyspace_event(NOTIFY_GENERIC, "rename_from", key.as_ref());
-                        notify_keyspace_event(NOTIFY_GENERIC, "rename_to", newkey.as_ref());
-                        if *nx {
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Copy {
+                source,
+                destination,
+                replace,
+                ..
+            } => {
+                let prev_kind = db.type_of(destination.as_ref());
+                let src_kind = db.type_of(source.as_ref());
+                match db.copy(source, destination.clone(), *replace) {
+                    Ok(success) => {
+                        if success {
+                            record_change!(cmd);
+                            match db.type_of(destination) {
+                                "list" => notify_list_or_defer(db, destination),
+                                "zset" => notify_zset_or_defer(db, destination),
+                                "stream" => notify_stream_or_defer(db, destination),
+                                _ => touch_watched_key(db.port, destination.as_ref()),
+                            }
+                            if prev_kind != "none" {
+                                notify_set_key_events_local(
+                                    prev_kind,
+                                    src_kind,
+                                    destination.as_ref(),
+                                );
+                            }
+                            notify_keyspace_event(NOTIFY_GENERIC, "copy_to", destination.as_ref());
                             out.extend_from_slice(b":1\r\n");
                         } else {
-                            out.extend_from_slice(b"+OK\r\n");
+                            out.extend_from_slice(b":0\r\n");
                         }
-                    } else {
-                        out.extend_from_slice(b":0\r\n");
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Copy {
-            source,
-            destination,
-            replace,
-            ..
-        } => {
-            let prev_kind = db.type_of(destination.as_ref());
-            let src_kind = db.type_of(source.as_ref());
-            match db.copy(source, destination.clone(), *replace) {
-                Ok(success) => {
-                    if success {
-                        record_change!(cmd);
-                        match db.type_of(destination) {
-                            "list" => notify_list_or_defer(db, destination),
-                            "zset" => notify_zset_or_defer(db, destination),
-                            "stream" => notify_stream_or_defer(db, destination),
-                            _ => touch_watched_key(db.port, destination.as_ref()),
-                        }
-                        if prev_kind != "none" {
-                            notify_set_key_events_local(prev_kind, src_kind, destination.as_ref());
-                        }
-                        notify_keyspace_event(NOTIFY_GENERIC, "copy_to", destination.as_ref());
-                        out.extend_from_slice(b":1\r\n");
-                    } else {
-                        out.extend_from_slice(b":0\r\n");
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        // EXTENDED STRING COMMANDS
-        Command::Setnx { key, value } => {
-            let set = db.setnx(key.clone(), value.clone());
-            if set {
-                record_change!(cmd);
-                notify_keyspace_event(NOTIFY_STRING, "set", key);
-                out.extend_from_slice(b":1\r\n");
-            } else {
-                out.extend_from_slice(b":0\r\n");
-            }
-            false
-        }
-        Command::Getset { key, value } => {
-            match db.getset(key.clone(), value.clone()) {
-                Ok(old) => {
+            // EXTENDED STRING COMMANDS
+            Command::Setnx { key, value } => {
+                let set = db.setnx(key.clone(), value.clone());
+                if set {
                     record_change!(cmd);
                     notify_keyspace_event(NOTIFY_STRING, "set", key);
-                    match old {
-                        Some(v) => {
-                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                            out.extend_from_slice(&v);
-                            out.extend_from_slice(b"\r\n");
-                        }
-                        None => out.extend_from_slice(b"$-1\r\n"),
-                    }
+                    out.extend_from_slice(b":1\r\n");
+                } else {
+                    out.extend_from_slice(b":0\r\n");
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Getdel(key) => {
-            match db.getdel(key) {
-                Ok(old) => {
-                    if old.is_some() {
+            Command::Getset { key, value } => {
+                match db.getset(key.clone(), value.clone()) {
+                    Ok(old) => {
                         record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", key);
-                    }
-                    match old {
-                        Some(v) => {
-                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                            out.extend_from_slice(&v);
-                            out.extend_from_slice(b"\r\n");
+                        notify_keyspace_event(NOTIFY_STRING, "set", key);
+                        match old {
+                            Some(v) => {
+                                out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                                out.extend_from_slice(&v);
+                                out.extend_from_slice(b"\r\n");
+                            }
+                            None => out.extend_from_slice(b"$-1\r\n"),
                         }
-                        None => out.extend_from_slice(b"$-1\r\n"),
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Append { key, value } => {
-            match db.append(key.clone(), value) {
-                Ok(new_len) => {
+            Command::Getdel(key) => {
+                match db.getdel(key) {
+                    Ok(old) => {
+                        if old.is_some() {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                        }
+                        match old {
+                            Some(v) => {
+                                out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                                out.extend_from_slice(&v);
+                                out.extend_from_slice(b"\r\n");
+                            }
+                            None => out.extend_from_slice(b"$-1\r\n"),
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Append { key, value } => {
+                match db.append(key.clone(), value) {
+                    Ok(new_len) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_STRING, "append", key);
+                        out.extend_from_slice(format!(":{}\r\n", new_len).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Strlen(key) => {
+                match db.strlen(key) {
+                    Ok(len) => {
+                        out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Msetnx(pairs) => {
+                let any_exists = pairs.iter().any(|(k, _)| db.exists(k));
+                if any_exists {
+                    out.extend_from_slice(b":0\r\n");
+                } else {
+                    for (k, v) in pairs {
+                        db.set(k.clone(), v.clone(), None);
+                    }
                     record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_STRING, "append", key);
-                    out.extend_from_slice(format!(":{}\r\n", new_len).as_bytes());
+                    for (k, _) in pairs {
+                        notify_keyspace_event(NOTIFY_STRING, "set", k);
+                    }
+                    out.extend_from_slice(b":1\r\n");
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Strlen(key) => {
-            match db.strlen(key) {
-                Ok(len) => {
-                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+            Command::Ping(msg) => {
+                match msg {
+                    Some(m) => {
+                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                        out.extend_from_slice(m);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                    None => {
+                        out.extend_from_slice(b"+PONG\r\n");
+                    }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Msetnx(pairs) => {
-            let any_exists = pairs.iter().any(|(k, _)| db.exists(k));
-            if any_exists {
-                out.extend_from_slice(b":0\r\n");
-            } else {
-                for (k, v) in pairs {
-                    db.set(k.clone(), v.clone(), None);
-                }
-                record_change!(cmd);
-                for (k, _) in pairs {
-                    notify_keyspace_event(NOTIFY_STRING, "set", k);
-                }
-                out.extend_from_slice(b":1\r\n");
+            Command::Monitor => {
+                out.extend_from_slice(b"+OK\r\n");
+                false
             }
-            false
-        }
-        Command::Ping(msg) => {
-            match msg {
-                Some(m) => {
-                    out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                    out.extend_from_slice(m);
-                    out.extend_from_slice(b"\r\n");
-                }
-                None => {
-                    out.extend_from_slice(b"+PONG\r\n");
-                }
+            Command::CommandDocs(cmds) => {
+                crate::command_info::write_docs(out, cmds, CURRENT_CLIENT_RESP3.get());
+                false
             }
-            false
-        }
-        Command::Monitor => {
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::CommandDocs(cmds) => {
-            crate::command_info::write_docs(out, cmds, CURRENT_CLIENT_RESP3.get());
-            false
-        }
-        Command::Keys(pattern) => {
-            let keys = db.keys(pattern);
-            out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
-            for k in keys {
-                out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
-                out.extend_from_slice(&k);
-                out.extend_from_slice(b"\r\n");
-            }
-            false
-        }
-        Command::Scan {
-            cursor,
-            pattern,
-            count,
-            key_type,
-        } => {
-            let cnt = count.unwrap_or(10);
-            let (next_cursor, keys) = db.scan(
-                *cursor as usize,
-                pattern.as_deref(),
-                cnt,
-                key_type.as_deref(),
-            );
-            let cursor_str = next_cursor.to_string();
-            out.extend_from_slice(b"*2\r\n$");
-            out.extend_from_slice(cursor_str.len().to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
-            out.extend_from_slice(cursor_str.as_bytes());
-            out.extend_from_slice(b"\r\n*");
-            out.extend_from_slice(keys.len().to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
-            for k in keys {
-                out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
-                out.extend_from_slice(&k);
-                out.extend_from_slice(b"\r\n");
-            }
-            false
-        }
-        Command::Randomkey => {
-            match db.random_key() {
-                Some(k) => {
+            Command::Keys(pattern) => {
+                let keys = db.keys(pattern);
+                out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+                for k in keys {
                     out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
                     out.extend_from_slice(&k);
                     out.extend_from_slice(b"\r\n");
                 }
-                None => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
+                false
             }
-            false
-        }
-        Command::Expiretime(key, in_millis) => {
-            let ts = db.expiretime(key, *in_millis);
-            out.extend_from_slice(format!(":{}\r\n", ts).as_bytes());
-            false
-        }
-        Command::Multi => {
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::Exec => {
-            out.extend_from_slice(b"-ERR EXEC without MULTI\r\n");
-            false
-        }
-        Command::Discard => {
-            out.extend_from_slice(b"-ERR DISCARD without MULTI\r\n");
-            false
-        }
-        Command::Watch(_) | Command::Unwatch => {
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::Setbit { key, offset, value } => {
-            match db.setbit(key.clone(), *offset, *value) {
-                Ok((old, changed)) => {
-                    if changed {
-                        crate::snapshot::note_changes(1);
-                        record_change!(cmd);
-                    }
-                    notify_keyspace_event(NOTIFY_STRING, "setbit", key);
-                    out.extend_from_slice(format!(":{}\r\n", old).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Getbit { key, offset } => {
-            match db.getbit(key, *offset) {
-                Ok(bit) => {
-                    out.extend_from_slice(format!(":{}\r\n", bit).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Bitcount {
-            key,
-            start,
-            end,
-            is_bit,
-        } => {
-            match db.bitcount(key, *start, *end, *is_bit) {
-                Ok(count) => {
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Bitpos {
-            key,
-            bit,
-            start,
-            end,
-            is_bit,
-        } => {
-            match db.bitpos(key, *bit, *start, *end, *is_bit) {
-                Ok(pos) => {
-                    out.extend_from_slice(format!(":{}\r\n", pos).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Bitfield { key, ops, readonly } => {
-            match db.bitfield(key.clone(), ops) {
-                Ok((results, changes)) => {
-                    if changes > 0 && !*readonly {
-                        crate::snapshot::note_changes(changes as u64);
-                        if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                            touch_watched_key(db.port, key.as_ref());
-                        }
-                        let need_aof = aof.is_some();
-                        let need_rep = crate::replication::has_connected_replicas(db.port);
-                        if (need_aof || need_rep)
-                            && let Some(bytes) = crate::aof::command_to_resp(cmd)
-                        {
-                            if let Some(aof_w) = aof {
-                                aof_w.borrow_mut().append(&bytes);
-                            }
-                            if need_rep {
-                                crate::replication::propagate_shard_bytes(
-                                    db.port,
-                                    db.shard_id,
-                                    &bytes,
-                                );
-                            }
-                        }
-                    }
-                    write_resp_array_header(out, results.len());
-                    for res in results {
-                        match res {
-                            Some(val) => {
-                                write_resp_integer(out, val);
-                            }
-                            None => {
-                                write_resp_null(out);
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Bitop {
-            op,
-            destkey,
-            srckeys,
-        } => {
-            let prev_kind = db.type_of(destkey.as_ref());
-            match db.bitop(op, destkey.clone(), srckeys) {
-                Ok(len) => {
-                    record_change!(cmd);
-                    if len > 0 {
-                        notify_set_key_events_local(prev_kind, "string", destkey.as_ref());
-                        notify_keyspace_event(NOTIFY_STRING, "set", destkey);
-                    } else if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", destkey.as_ref());
-                    }
-                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Pfadd { key, elements } => {
-            match db.pfadd(key.clone(), elements) {
-                Ok(updated) => {
-                    if updated {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_STRING, "pfadd", key);
-                        out.extend_from_slice(b":1\r\n");
-                    } else {
-                        out.extend_from_slice(b":0\r\n");
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Pfcount { keys } => {
-            match db.pfcount(keys) {
-                Ok(count) => {
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Pfmerge { destkey, srckeys } => {
-            match db.pfmerge(destkey.clone(), srckeys) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::PfdebugGetreg(key) => {
-            match db.pfdebug_getreg(key) {
-                Ok(regs) => {
-                    out.extend_from_slice(b"*16384\r\n");
-                    for r in regs {
-                        out.extend_from_slice(format!(":{}\r\n", r).as_bytes());
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::PfdebugEncoding(key) => {
-            match db.pfdebug_encoding(key) {
-                Ok(enc) => {
-                    out.extend_from_slice(format!("+{}\r\n", enc).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::PfdebugTodense(key) => {
-            match db.pfdebug_todense(key) {
-                Ok(changed) => {
-                    if changed {
-                        record_change!(cmd);
-                        out.extend_from_slice(b":1\r\n");
-                    } else {
-                        out.extend_from_slice(b":0\r\n");
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::PfdebugSimd(_) => {
-            out.extend_from_slice(b"+enabled\r\n");
-            false
-        }
-        Command::Pfselftest => {
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::Dump(key) => {
-            match db.dump(key) {
-                Some(bytes) => {
-                    out.extend_from_slice(format!("${}\r\n", bytes.len()).as_bytes());
-                    out.extend_from_slice(&bytes);
+            Command::Scan {
+                cursor,
+                pattern,
+                count,
+                key_type,
+            } => {
+                let cnt = count.unwrap_or(10);
+                let (next_cursor, keys) = db.scan(
+                    *cursor as usize,
+                    pattern.as_deref(),
+                    cnt,
+                    key_type.as_deref(),
+                );
+                let cursor_str = next_cursor.to_string();
+                out.extend_from_slice(b"*2\r\n$");
+                out.extend_from_slice(cursor_str.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(cursor_str.as_bytes());
+                out.extend_from_slice(b"\r\n*");
+                out.extend_from_slice(keys.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                for k in keys {
+                    out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                    out.extend_from_slice(&k);
                     out.extend_from_slice(b"\r\n");
                 }
-                None => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
+                false
             }
-            false
-        }
-        Command::Restore {
-            key,
-            ttl_ms,
-            serialized,
-            replace,
-            absttl,
-        } => {
-            let prev_type = if *replace {
-                Some(db.type_of(key.as_ref()))
-            } else {
-                None
-            };
-            match db.restore(key.clone(), *ttl_ms, serialized, *replace, *absttl) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_GENERIC, "restore", key);
-                    if let Some(prev) = prev_type
-                        && prev != "none"
-                    {
-                        notify_keyspace_event(NOTIFY_OVERWRITTEN, "overwritten", key);
-                        let new_type = db.type_of(key.as_ref());
-                        if prev != new_type {
-                            notify_keyspace_event(NOTIFY_TYPE_CHANGED, "type_changed", key);
-                        }
+            Command::Randomkey => {
+                match db.random_key() {
+                    Some(k) => {
+                        out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                        out.extend_from_slice(&k);
+                        out.extend_from_slice(b"\r\n");
                     }
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    if err.starts_with("BUSYKEY") || err.starts_with("ERR") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Xadd {
-            key,
-            nomkstream,
-            maxlen,
-            minid,
-            approx,
-            trim_strategy,
-            idmp,
-            id,
-            fields,
-            limit,
-        } => {
-            match db.xadd(
-                key.clone(),
-                id.clone(),
-                fields.clone(),
-                *nomkstream,
-                *maxlen,
-                *minid,
-                *approx,
-                *trim_strategy,
-                idmp.clone(),
-                *limit,
-            ) {
-                Ok(crate::table::StreamAddResult::Added(generated_id)) => {
-                    let explicit_cmd = Command::Xadd {
-                        key: key.clone(),
-                        nomkstream: *nomkstream,
-                        maxlen: *maxlen,
-                        minid: *minid,
-                        approx: *approx,
-                        trim_strategy: *trim_strategy,
-                        idmp: idmp.clone(),
-                        id: crate::table::StreamAddId::Explicit(generated_id),
-                        fields: fields.clone(),
-                        limit: *limit,
-                    };
-                    record_change!(&explicit_cmd);
-                    let s = generated_id.to_string();
-                    notify_stream_or_defer(db, key);
-                    notify_keyspace_event(NOTIFY_STREAM, "xadd", key);
-                    out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
-                }
-                Ok(crate::table::StreamAddResult::Duplicate(existing_id)) => {
-                    let s = existing_id.to_string();
-                    out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
-                }
-                Ok(crate::table::StreamAddResult::NoMkStream) => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Xlen(key) => {
-            match db.xlen(key) {
-                Ok(len) => {
-                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
-                }
-                Err(err) => {
-                    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                }
-            }
-            false
-        }
-        Command::Xrange {
-            key,
-            start,
-            end,
-            count,
-        } => {
-            match db.xrange(key, start, end, *count) {
-                Ok(items) => {
-                    out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                    for (id, fields) in items {
-                        let id_str = id.to_string();
-                        out.extend_from_slice(
-                            format!(
-                                "*2\r\n${}\r\n{}\r\n*{}\r\n",
-                                id_str.len(),
-                                id_str,
-                                fields.len() * 2
-                            )
-                            .as_bytes(),
-                        );
-                        for (f, v) in fields {
-                            out.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                            out.extend_from_slice(&f);
-                            out.extend_from_slice(b"\r\n");
-                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                            out.extend_from_slice(&v);
-                            out.extend_from_slice(b"\r\n");
-                        }
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Xrevrange {
-            key,
-            end,
-            start,
-            count,
-        } => {
-            match db.xrevrange(key, end, start, *count) {
-                Ok(items) => {
-                    out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                    for (id, fields) in items {
-                        let id_str = id.to_string();
-                        out.extend_from_slice(
-                            format!(
-                                "*2\r\n${}\r\n{}\r\n*{}\r\n",
-                                id_str.len(),
-                                id_str,
-                                fields.len() * 2
-                            )
-                            .as_bytes(),
-                        );
-                        for (f, v) in fields {
-                            out.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                            out.extend_from_slice(&f);
-                            out.extend_from_slice(b"\r\n");
-                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                            out.extend_from_slice(&v);
-                            out.extend_from_slice(b"\r\n");
-                        }
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Xread {
-            count,
-            maxcount,
-            maxsize,
-            keys,
-            ids,
-            ..
-        } => {
-            match db.xread(keys, ids, *count, *maxcount, *maxsize) {
-                Ok(streams) => {
-                    if streams.is_empty() {
+                    None => {
                         out.extend_from_slice(b"$-1\r\n");
-                    } else {
-                        out.extend_from_slice(format!("*{}\r\n", streams.len()).as_bytes());
-                        for (stream_key, entries) in streams {
-                            out.extend_from_slice(
-                                format!("*2\r\n${}\r\n", stream_key.len()).as_bytes(),
-                            );
-                            out.extend_from_slice(&stream_key);
-                            out.extend_from_slice(format!("\r\n*{}\r\n", entries.len()).as_bytes());
-                            for (id, fields) in entries {
-                                let id_str = id.to_string();
-                                out.extend_from_slice(
-                                    format!(
-                                        "*2\r\n${}\r\n{}\r\n*{}\r\n",
-                                        id_str.len(),
-                                        id_str,
-                                        fields.len() * 2
-                                    )
-                                    .as_bytes(),
-                                );
-                                for (f, v) in fields {
-                                    out.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                                    out.extend_from_slice(&f);
-                                    out.extend_from_slice(b"\r\n");
-                                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                                    out.extend_from_slice(&v);
-                                    out.extend_from_slice(b"\r\n");
+                    }
+                }
+                false
+            }
+            Command::Expiretime(key, in_millis) => {
+                let ts = db.expiretime(key, *in_millis);
+                out.extend_from_slice(format!(":{}\r\n", ts).as_bytes());
+                false
+            }
+            Command::Multi => {
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Exec => {
+                out.extend_from_slice(b"-ERR EXEC without MULTI\r\n");
+                false
+            }
+            Command::Discard => {
+                out.extend_from_slice(b"-ERR DISCARD without MULTI\r\n");
+                false
+            }
+            Command::Watch(_) | Command::Unwatch => {
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Setbit { key, offset, value } => {
+                match db.setbit(key.clone(), *offset, *value) {
+                    Ok((old, changed)) => {
+                        if changed {
+                            crate::snapshot::note_changes(1);
+                            record_change!(cmd);
+                        }
+                        notify_keyspace_event(NOTIFY_STRING, "setbit", key);
+                        out.extend_from_slice(format!(":{}\r\n", old).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Getbit { key, offset } => {
+                match db.getbit(key, *offset) {
+                    Ok(bit) => {
+                        out.extend_from_slice(format!(":{}\r\n", bit).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Bitcount {
+                key,
+                start,
+                end,
+                is_bit,
+            } => {
+                match db.bitcount(key, *start, *end, *is_bit) {
+                    Ok(count) => {
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Bitpos {
+                key,
+                bit,
+                start,
+                end,
+                is_bit,
+            } => {
+                match db.bitpos(key, *bit, *start, *end, *is_bit) {
+                    Ok(pos) => {
+                        out.extend_from_slice(format!(":{}\r\n", pos).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Bitfield { key, ops, readonly } => {
+                match db.bitfield(key.clone(), ops) {
+                    Ok((results, changes)) => {
+                        if changes > 0 && !*readonly {
+                            crate::snapshot::note_changes(changes as u64);
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(db.port, key.as_ref());
+                            }
+                            let need_aof = aof.is_some();
+                            let need_rep = crate::replication::has_connected_replicas(db.port);
+                            if (need_aof || need_rep)
+                                && let Some(bytes) = crate::aof::command_to_resp(cmd)
+                            {
+                                if let Some(aof_w) = aof {
+                                    aof_w.borrow_mut().append(&bytes);
+                                }
+                                if need_rep {
+                                    crate::replication::propagate_shard_bytes(
+                                        db.port,
+                                        db.shard_id,
+                                        &bytes,
+                                    );
+                                }
+                            }
+                        }
+                        write_resp_array_header(out, results.len());
+                        for res in results {
+                            match res {
+                                Some(val) => {
+                                    write_resp_integer(out, val);
+                                }
+                                None => {
+                                    write_resp_null(out);
                                 }
                             }
                         }
                     }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Xdel { key, ids } => {
-            match db.xdel(key, ids) {
-                Ok(count) => {
-                    if count > 0 {
-                        crate::snapshot::note_changes(count as u64);
+            Command::Bitop {
+                op,
+                destkey,
+                srckeys,
+            } => {
+                let prev_kind = db.type_of(destkey.as_ref());
+                match db.bitop(op, destkey.clone(), srckeys) {
+                    Ok(len) => {
                         record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_STREAM, "xdel", key);
-                    }
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Xtrim {
-            key,
-            maxlen,
-            minid,
-            approx,
-            trim_strategy,
-            limit,
-        } => {
-            match db.xtrim(key, *maxlen, *minid, *approx, *trim_strategy, *limit) {
-                Ok(count) => {
-                    if count > 0 {
-                        crate::snapshot::note_changes(count as u64);
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_STREAM, "xtrim", key);
-                    }
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Xcfgset {
-            key,
-            duration,
-            maxsize,
-        } => {
-            match db.xcfgset(key, *duration, *maxsize) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Xsetid {
-            key,
-            last_id,
-            entries_added,
-            max_deleted_id,
-        } => {
-            match db.xsetid(key, *last_id, *entries_added, *max_deleted_id) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Xdelex { key, strategy, ids } => {
-            let (res, dirty_count) = db.xdelex(key, *strategy, ids);
-            if dirty_count > 0 {
-                crate::snapshot::note_changes(dirty_count as u64);
-                record_change!(cmd);
-            }
-            write_resp_array_header(out, res.len());
-            for code in res {
-                write_resp_integer(out, code);
-            }
-            false
-        }
-        Command::Xidmprecord {
-            key,
-            pid,
-            iid,
-            id_raw,
-        } => {
-            match db.xidmprecord(key, pid.clone(), iid.clone(), id_raw) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::XgroupCreate {
-            key,
-            group,
-            id,
-            mkstream,
-            entries_read,
-        } => {
-            match db.xgroup_create(key.clone(), group.clone(), id, *mkstream, *entries_read) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_STREAM, "xgroup-create", key);
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    if err.starts_with("BUSYGROUP") || err.starts_with("ERR") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::XgroupDestroy { key, group } => {
-            match db.xgroup_destroy(key, group) {
-                Ok(destroyed) => {
-                    if destroyed {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-destroy", key);
-                        notify_stream_or_defer(db, key);
-                        out.extend_from_slice(b":1\r\n");
-                    } else {
-                        out.extend_from_slice(b":0\r\n");
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::XgroupCreateConsumer {
-            key,
-            group,
-            consumer,
-        } => {
-            match db.xgroup_createconsumer(key, group, consumer.clone()) {
-                Ok(created) => {
-                    if created {
-                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
-                        out.extend_from_slice(b":1\r\n");
-                    } else {
-                        out.extend_from_slice(b":0\r\n");
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::XgroupDelConsumer {
-            key,
-            group,
-            consumer,
-        } => {
-            match db.xgroup_delconsumer(key, group, consumer) {
-                Ok(Some(pending_count)) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_STREAM, "xgroup-delconsumer", key);
-                    out.extend_from_slice(format!(":{}\r\n", pending_count).as_bytes());
-                }
-                Ok(None) => {
-                    out.extend_from_slice(b":0\r\n");
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::XgroupSetId {
-            key,
-            group,
-            id,
-            entries_read,
-        } => {
-            match db.xgroup_setid(key, group, id, *entries_read) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_STREAM, "xgroup-setid", key);
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Xreadgroup {
-            group,
-            consumer,
-            count,
-            maxcount,
-            maxsize,
-            noack,
-            claim,
-            keys,
-            ids,
-            ..
-        } => {
-            let mut all_results = Vec::new();
-            let mut err = None;
-            let mut any_modified = false;
-            let per_stream_limit = count.unwrap_or(usize::MAX);
-            let max_total = maxcount.unwrap_or(usize::MAX);
-            let max_bytes = maxsize.unwrap_or(usize::MAX);
-            let mut total_entries = 0;
-            let mut total_bytes = 0;
-
-            for (k, id_str) in keys.iter().zip(ids.iter()) {
-                if total_entries >= max_total || (total_entries > 0 && total_bytes >= max_bytes) {
-                    break;
-                }
-                let remaining_count = per_stream_limit.min(max_total - total_entries);
-                match db.xreadgroup(
-                    k,
-                    group,
-                    consumer.clone(),
-                    id_str,
-                    Some(remaining_count),
-                    *noack,
-                    *claim,
-                    max_bytes,
-                    &mut total_entries,
-                    &mut total_bytes,
-                ) {
-                    Ok((entries, modified)) => {
-                        if modified {
-                            // Reading the pending list only updates delivery
-                            // metadata, which (like Redis) is no change.
-                            crate::snapshot::note_changes(1);
-                            any_modified = true;
-                            notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", k);
+                        if len > 0 {
+                            notify_set_key_events_local(prev_kind, "string", destkey.as_ref());
+                            notify_keyspace_event(NOTIFY_STRING, "set", destkey);
+                        } else if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", destkey.as_ref());
                         }
-                        if !entries.is_empty() {
-                            all_results.push((k.clone(), entries));
-                        }
+                        out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
                     }
-                    Err(e) => {
-                        err = Some(e);
-                        break;
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
+                false
             }
-            if let Some(err) = err {
-                if err.starts_with("ERR") || err.starts_with("NOGROUP") {
-                    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                } else {
-                    write_resp_err(out, err);
-                }
-            } else if all_results.is_empty() {
-                if ids.iter().any(|id| id != ">") {
-                    out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
-                    for k in keys {
-                        out.extend_from_slice(format!("*2\r\n${}\r\n", k.len()).as_bytes());
-                        out.extend_from_slice(k);
-                        out.extend_from_slice(b"\r\n*0\r\n");
-                    }
-                } else {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-            } else {
-                out.extend_from_slice(format!("*{}\r\n", all_results.len()).as_bytes());
-                for (stream_key, entries) in all_results {
-                    out.extend_from_slice(format!("*2\r\n${}\r\n", stream_key.len()).as_bytes());
-                    out.extend_from_slice(&stream_key);
-                    out.extend_from_slice(format!("\r\n*{}\r\n", entries.len()).as_bytes());
-                    for (id, fields, claim_info) in entries {
-                        let id_str = id.to_string();
-                        if let Some((idle_ms, delivery_count)) = claim_info {
-                            write_resp_array_header(out, 4);
-                            write_resp_bulk(out, id_str.as_bytes());
-                            write_resp_array_header(out, fields.len() * 2);
-                            for (f, v) in fields {
-                                write_resp_bulk(out, &f);
-                                write_resp_bulk(out, &v);
-                            }
-                            write_resp_integer(out, idle_ms as i64);
-                            write_resp_integer(out, delivery_count as i64);
+            Command::Pfadd { key, elements } => {
+                match db.pfadd(key.clone(), elements) {
+                    Ok(updated) => {
+                        if updated {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_STRING, "pfadd", key);
+                            out.extend_from_slice(b":1\r\n");
                         } else {
-                            write_resp_array_header(out, 2);
-                            write_resp_bulk(out, id_str.as_bytes());
-                            write_resp_array_header(out, fields.len() * 2);
-                            for (f, v) in fields {
-                                write_resp_bulk(out, &f);
-                                write_resp_bulk(out, &v);
-                            }
+                            out.extend_from_slice(b":0\r\n");
                         }
                     }
-                }
-            }
-            if any_modified {
-                record_change!(cmd);
-            }
-            false
-        }
-        Command::Xack { key, group, ids } => {
-            match db.xack(key, group, ids) {
-                Ok(count) => {
-                    if count > 0 {
-                        record_change!(cmd);
-                    }
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
+                    Err(err) => {
                         write_resp_err(out, err);
                     }
                 }
+                false
             }
-            false
-        }
-        Command::Xackdel {
-            key,
-            group,
-            strategy,
-            ids,
-        } => {
-            let (res, dirty_count) = db.xackdel(key, group, *strategy, ids);
-            if dirty_count > 0 {
-                record_change!(cmd);
-            }
-            write_resp_array_header(out, res.len());
-            for code in res {
-                write_resp_integer(out, code);
-            }
-            false
-        }
-        Command::Xnack {
-            key,
-            group,
-            mode,
-            ids,
-            retrycount,
-            force,
-        } => {
-            match db.xnack(key, group, *mode, ids, *retrycount, *force) {
-                Ok(count) => {
-                    if count > 0 {
-                        record_change!(cmd);
-                        notify_stream_or_defer(db, key);
-                    }
-                    write_resp_integer(out, count as i64);
-                }
-                Err(err) => {
-                    if err.starts_with("ERR")
-                        || err.starts_with("NOGROUP")
-                        || err.starts_with("WRONGTYPE")
-                    {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Xpending { key, group, range } => {
-            match range {
-                None => match db.xpending_summary(key, group) {
-                    Ok((count, min_id, max_id, consumers)) => {
-                        out.extend_from_slice(b"*4\r\n");
+            Command::Pfcount { keys } => {
+                match db.pfcount(keys) {
+                    Ok(count) => {
                         out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
-                        if let Some(min) = min_id {
-                            let s = min.to_string();
-                            out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
-                        } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Pfmerge { destkey, srckeys } => {
+                match db.pfmerge(destkey.clone(), srckeys) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::PfdebugGetreg(key) => {
+                match db.pfdebug_getreg(key) {
+                    Ok(regs) => {
+                        out.extend_from_slice(b"*16384\r\n");
+                        for r in regs {
+                            out.extend_from_slice(format!(":{}\r\n", r).as_bytes());
                         }
-                        if let Some(max) = max_id {
-                            let s = max.to_string();
-                            out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::PfdebugEncoding(key) => {
+                match db.pfdebug_encoding(key) {
+                    Ok(enc) => {
+                        out.extend_from_slice(format!("+{}\r\n", enc).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::PfdebugTodense(key) => {
+                match db.pfdebug_todense(key) {
+                    Ok(changed) => {
+                        if changed {
+                            record_change!(cmd);
+                            out.extend_from_slice(b":1\r\n");
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            out.extend_from_slice(b":0\r\n");
                         }
-                        out.extend_from_slice(format!("*{}\r\n", consumers.len()).as_bytes());
-                        for (c_name, c_cnt) in consumers {
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::PfdebugSimd(_) => {
+                out.extend_from_slice(b"+enabled\r\n");
+                false
+            }
+            Command::Pfselftest => {
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Dump(key) => {
+                match db.dump(key) {
+                    Some(bytes) => {
+                        out.extend_from_slice(format!("${}\r\n", bytes.len()).as_bytes());
+                        out.extend_from_slice(&bytes);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                false
+            }
+            Command::Restore {
+                key,
+                ttl_ms,
+                serialized,
+                replace,
+                absttl,
+            } => {
+                let prev_type = if *replace {
+                    Some(db.type_of(key.as_ref()))
+                } else {
+                    None
+                };
+                match db.restore(key.clone(), *ttl_ms, serialized, *replace, *absttl) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_GENERIC, "restore", key);
+                        if let Some(prev) = prev_type
+                            && prev != "none"
+                        {
+                            notify_keyspace_event(NOTIFY_OVERWRITTEN, "overwritten", key);
+                            let new_type = db.type_of(key.as_ref());
+                            if prev != new_type {
+                                notify_keyspace_event(NOTIFY_TYPE_CHANGED, "type_changed", key);
+                            }
+                        }
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => {
+                        if err.starts_with("BUSYKEY") || err.starts_with("ERR") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Xadd {
+                key,
+                nomkstream,
+                maxlen,
+                minid,
+                approx,
+                trim_strategy,
+                idmp,
+                id,
+                fields,
+                limit,
+            } => {
+                match db.xadd(
+                    key.clone(),
+                    id.clone(),
+                    fields.clone(),
+                    *nomkstream,
+                    *maxlen,
+                    *minid,
+                    *approx,
+                    *trim_strategy,
+                    idmp.clone(),
+                    *limit,
+                ) {
+                    Ok(crate::table::StreamAddResult::Added(generated_id)) => {
+                        let explicit_cmd = Command::Xadd {
+                            key: key.clone(),
+                            nomkstream: *nomkstream,
+                            maxlen: *maxlen,
+                            minid: *minid,
+                            approx: *approx,
+                            trim_strategy: *trim_strategy,
+                            idmp: idmp.clone(),
+                            id: crate::table::StreamAddId::Explicit(generated_id),
+                            fields: fields.clone(),
+                            limit: *limit,
+                        };
+                        record_change!(&explicit_cmd);
+                        let s = generated_id.to_string();
+                        notify_stream_or_defer(db, key);
+                        notify_keyspace_event(NOTIFY_STREAM, "xadd", key);
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                    }
+                    Ok(crate::table::StreamAddResult::Duplicate(existing_id)) => {
+                        let s = existing_id.to_string();
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                    }
+                    Ok(crate::table::StreamAddResult::NoMkStream) => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Xlen(key) => {
+                match db.xlen(key) {
+                    Ok(len) => {
+                        out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                    }
+                    Err(err) => {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    }
+                }
+                false
+            }
+            Command::Xrange {
+                key,
+                start,
+                end,
+                count,
+            } => {
+                match db.xrange(key, start, end, *count) {
+                    Ok(items) => {
+                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                        for (id, fields) in items {
+                            let id_str = id.to_string();
                             out.extend_from_slice(
-                                format!("*2\r\n${}\r\n", c_name.len()).as_bytes(),
+                                format!(
+                                    "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                                    id_str.len(),
+                                    id_str,
+                                    fields.len() * 2
+                                )
+                                .as_bytes(),
                             );
-                            out.extend_from_slice(&c_name);
-                            out.extend_from_slice(format!("\r\n:{}\r\n", c_cnt).as_bytes());
+                            for (f, v) in fields {
+                                out.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                                out.extend_from_slice(&f);
+                                out.extend_from_slice(b"\r\n");
+                                out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                                out.extend_from_slice(&v);
+                                out.extend_from_slice(b"\r\n");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Xrevrange {
+                key,
+                end,
+                start,
+                count,
+            } => {
+                match db.xrevrange(key, end, start, *count) {
+                    Ok(items) => {
+                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                        for (id, fields) in items {
+                            let id_str = id.to_string();
+                            out.extend_from_slice(
+                                format!(
+                                    "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                                    id_str.len(),
+                                    id_str,
+                                    fields.len() * 2
+                                )
+                                .as_bytes(),
+                            );
+                            for (f, v) in fields {
+                                out.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                                out.extend_from_slice(&f);
+                                out.extend_from_slice(b"\r\n");
+                                out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                                out.extend_from_slice(&v);
+                                out.extend_from_slice(b"\r\n");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Xread {
+                count,
+                maxcount,
+                maxsize,
+                keys,
+                ids,
+                ..
+            } => {
+                match db.xread(keys, ids, *count, *maxcount, *maxsize) {
+                    Ok(streams) => {
+                        if streams.is_empty() {
+                            out.extend_from_slice(b"$-1\r\n");
+                        } else {
+                            out.extend_from_slice(format!("*{}\r\n", streams.len()).as_bytes());
+                            for (stream_key, entries) in streams {
+                                out.extend_from_slice(
+                                    format!("*2\r\n${}\r\n", stream_key.len()).as_bytes(),
+                                );
+                                out.extend_from_slice(&stream_key);
+                                out.extend_from_slice(
+                                    format!("\r\n*{}\r\n", entries.len()).as_bytes(),
+                                );
+                                for (id, fields) in entries {
+                                    let id_str = id.to_string();
+                                    out.extend_from_slice(
+                                        format!(
+                                            "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                                            id_str.len(),
+                                            id_str,
+                                            fields.len() * 2
+                                        )
+                                        .as_bytes(),
+                                    );
+                                    for (f, v) in fields {
+                                        out.extend_from_slice(
+                                            format!("${}\r\n", f.len()).as_bytes(),
+                                        );
+                                        out.extend_from_slice(&f);
+                                        out.extend_from_slice(b"\r\n");
+                                        out.extend_from_slice(
+                                            format!("${}\r\n", v.len()).as_bytes(),
+                                        );
+                                        out.extend_from_slice(&v);
+                                        out.extend_from_slice(b"\r\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Xdel { key, ids } => {
+                match db.xdel(key, ids) {
+                    Ok(count) => {
+                        if count > 0 {
+                            crate::snapshot::note_changes(count as u64);
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_STREAM, "xdel", key);
+                        }
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Xtrim {
+                key,
+                maxlen,
+                minid,
+                approx,
+                trim_strategy,
+                limit,
+            } => {
+                match db.xtrim(key, *maxlen, *minid, *approx, *trim_strategy, *limit) {
+                    Ok(count) => {
+                        if count > 0 {
+                            crate::snapshot::note_changes(count as u64);
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_STREAM, "xtrim", key);
+                        }
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Xcfgset {
+                key,
+                duration,
+                maxsize,
+            } => {
+                match db.xcfgset(key, *duration, *maxsize) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Xsetid {
+                key,
+                last_id,
+                entries_added,
+                max_deleted_id,
+            } => {
+                match db.xsetid(key, *last_id, *entries_added, *max_deleted_id) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Xdelex { key, strategy, ids } => {
+                let (res, dirty_count) = db.xdelex(key, *strategy, ids);
+                if dirty_count > 0 {
+                    crate::snapshot::note_changes(dirty_count as u64);
+                    record_change!(cmd);
+                }
+                write_resp_array_header(out, res.len());
+                for code in res {
+                    write_resp_integer(out, code);
+                }
+                false
+            }
+            Command::Xidmprecord {
+                key,
+                pid,
+                iid,
+                id_raw,
+            } => {
+                match db.xidmprecord(key, pid.clone(), iid.clone(), id_raw) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::XgroupCreate {
+                key,
+                group,
+                id,
+                mkstream,
+                entries_read,
+            } => {
+                match db.xgroup_create(key.clone(), group.clone(), id, *mkstream, *entries_read) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-create", key);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => {
+                        if err.starts_with("BUSYGROUP") || err.starts_with("ERR") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::XgroupDestroy { key, group } => {
+                match db.xgroup_destroy(key, group) {
+                    Ok(destroyed) => {
+                        if destroyed {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_STREAM, "xgroup-destroy", key);
+                            notify_stream_or_defer(db, key);
+                            out.extend_from_slice(b":1\r\n");
+                        } else {
+                            out.extend_from_slice(b":0\r\n");
                         }
                     }
                     Err(err) => {
@@ -19667,34 +19527,282 @@ pub fn execute_local_command(
                             write_resp_err(out, err);
                         }
                     }
-                },
-                Some((start, end, count, consumer, min_idle)) => {
-                    match db.xpending_range(
-                        key,
+                }
+                false
+            }
+            Command::XgroupCreateConsumer {
+                key,
+                group,
+                consumer,
+            } => {
+                match db.xgroup_createconsumer(key, group, consumer.clone()) {
+                    Ok(created) => {
+                        if created {
+                            notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
+                            out.extend_from_slice(b":1\r\n");
+                        } else {
+                            out.extend_from_slice(b":0\r\n");
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::XgroupDelConsumer {
+                key,
+                group,
+                consumer,
+            } => {
+                match db.xgroup_delconsumer(key, group, consumer) {
+                    Ok(Some(pending_count)) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-delconsumer", key);
+                        out.extend_from_slice(format!(":{}\r\n", pending_count).as_bytes());
+                    }
+                    Ok(None) => {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::XgroupSetId {
+                key,
+                group,
+                id,
+                entries_read,
+            } => {
+                match db.xgroup_setid(key, group, id, *entries_read) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-setid", key);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Xreadgroup {
+                group,
+                consumer,
+                count,
+                maxcount,
+                maxsize,
+                noack,
+                claim,
+                keys,
+                ids,
+                ..
+            } => {
+                let mut all_results = Vec::new();
+                let mut err = None;
+                let mut any_modified = false;
+                let per_stream_limit = count.unwrap_or(usize::MAX);
+                let max_total = maxcount.unwrap_or(usize::MAX);
+                let max_bytes = maxsize.unwrap_or(usize::MAX);
+                let mut total_entries = 0;
+                let mut total_bytes = 0;
+
+                for (k, id_str) in keys.iter().zip(ids.iter()) {
+                    if total_entries >= max_total || (total_entries > 0 && total_bytes >= max_bytes)
+                    {
+                        break;
+                    }
+                    let remaining_count = per_stream_limit.min(max_total - total_entries);
+                    match db.xreadgroup(
+                        k,
                         group,
-                        *start,
-                        *end,
-                        *count,
-                        consumer.as_deref(),
-                        *min_idle,
+                        consumer.clone(),
+                        id_str,
+                        Some(remaining_count),
+                        *noack,
+                        *claim,
+                        max_bytes,
+                        &mut total_entries,
+                        &mut total_bytes,
                     ) {
-                        Ok(entries) => {
-                            out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
-                            for (id, c_name, idle, delivery_cnt) in entries {
-                                let id_str = id.to_string();
+                        Ok((entries, modified)) => {
+                            if modified {
+                                // Reading the pending list only updates delivery
+                                // metadata, which (like Redis) is no change.
+                                crate::snapshot::note_changes(1);
+                                any_modified = true;
+                                notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", k);
+                            }
+                            if !entries.is_empty() {
+                                all_results.push((k.clone(), entries));
+                            }
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(err) = err {
+                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        write_resp_err(out, err);
+                    }
+                } else if all_results.is_empty() {
+                    if ids.iter().any(|id| id != ">") {
+                        out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+                        for k in keys {
+                            out.extend_from_slice(format!("*2\r\n${}\r\n", k.len()).as_bytes());
+                            out.extend_from_slice(k);
+                            out.extend_from_slice(b"\r\n*0\r\n");
+                        }
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                } else {
+                    out.extend_from_slice(format!("*{}\r\n", all_results.len()).as_bytes());
+                    for (stream_key, entries) in all_results {
+                        out.extend_from_slice(
+                            format!("*2\r\n${}\r\n", stream_key.len()).as_bytes(),
+                        );
+                        out.extend_from_slice(&stream_key);
+                        out.extend_from_slice(format!("\r\n*{}\r\n", entries.len()).as_bytes());
+                        for (id, fields, claim_info) in entries {
+                            let id_str = id.to_string();
+                            if let Some((idle_ms, delivery_count)) = claim_info {
+                                write_resp_array_header(out, 4);
+                                write_resp_bulk(out, id_str.as_bytes());
+                                write_resp_array_header(out, fields.len() * 2);
+                                for (f, v) in fields {
+                                    write_resp_bulk(out, &f);
+                                    write_resp_bulk(out, &v);
+                                }
+                                write_resp_integer(out, idle_ms as i64);
+                                write_resp_integer(out, delivery_count as i64);
+                            } else {
+                                write_resp_array_header(out, 2);
+                                write_resp_bulk(out, id_str.as_bytes());
+                                write_resp_array_header(out, fields.len() * 2);
+                                for (f, v) in fields {
+                                    write_resp_bulk(out, &f);
+                                    write_resp_bulk(out, &v);
+                                }
+                            }
+                        }
+                    }
+                }
+                if any_modified {
+                    record_change!(cmd);
+                }
+                false
+            }
+            Command::Xack { key, group, ids } => {
+                match db.xack(key, group, ids) {
+                    Ok(count) => {
+                        if count > 0 {
+                            record_change!(cmd);
+                        }
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Xackdel {
+                key,
+                group,
+                strategy,
+                ids,
+            } => {
+                let (res, dirty_count) = db.xackdel(key, group, *strategy, ids);
+                if dirty_count > 0 {
+                    record_change!(cmd);
+                }
+                write_resp_array_header(out, res.len());
+                for code in res {
+                    write_resp_integer(out, code);
+                }
+                false
+            }
+            Command::Xnack {
+                key,
+                group,
+                mode,
+                ids,
+                retrycount,
+                force,
+            } => {
+                match db.xnack(key, group, *mode, ids, *retrycount, *force) {
+                    Ok(count) => {
+                        if count > 0 {
+                            record_change!(cmd);
+                            notify_stream_or_defer(db, key);
+                        }
+                        write_resp_integer(out, count as i64);
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR")
+                            || err.starts_with("NOGROUP")
+                            || err.starts_with("WRONGTYPE")
+                        {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Xpending { key, group, range } => {
+                match range {
+                    None => match db.xpending_summary(key, group) {
+                        Ok((count, min_id, max_id, consumers)) => {
+                            out.extend_from_slice(b"*4\r\n");
+                            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                            if let Some(min) = min_id {
+                                let s = min.to_string();
                                 out.extend_from_slice(
-                                    format!(
-                                        "*4\r\n${}\r\n{}\r\n${}\r\n",
-                                        id_str.len(),
-                                        id_str,
-                                        c_name.len(),
-                                    )
-                                    .as_bytes(),
+                                    format!("${}\r\n{}\r\n", s.len(), s).as_bytes(),
+                                );
+                            } else {
+                                out.extend_from_slice(b"$-1\r\n");
+                            }
+                            if let Some(max) = max_id {
+                                let s = max.to_string();
+                                out.extend_from_slice(
+                                    format!("${}\r\n{}\r\n", s.len(), s).as_bytes(),
+                                );
+                            } else {
+                                out.extend_from_slice(b"$-1\r\n");
+                            }
+                            out.extend_from_slice(format!("*{}\r\n", consumers.len()).as_bytes());
+                            for (c_name, c_cnt) in consumers {
+                                out.extend_from_slice(
+                                    format!("*2\r\n${}\r\n", c_name.len()).as_bytes(),
                                 );
                                 out.extend_from_slice(&c_name);
-                                out.extend_from_slice(
-                                    format!("\r\n:{}\r\n:{}\r\n", idle, delivery_cnt).as_bytes(),
-                                );
+                                out.extend_from_slice(format!("\r\n:{}\r\n", c_cnt).as_bytes());
                             }
                         }
                         Err(err) => {
@@ -19704,2433 +19812,2522 @@ pub fn execute_local_command(
                                 write_resp_err(out, err);
                             }
                         }
-                    }
-                }
-            }
-            false
-        }
-        Command::Hincrby {
-            key,
-            field,
-            increment,
-        } => {
-            match db.hincrby(key.clone(), field.clone(), *increment) {
-                Ok(val) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_HASH, "hincrby", key);
-                    write_resp_integer(out, val);
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Hincrbyfloat {
-            key,
-            field,
-            increment,
-        } => {
-            match db.hincrbyfloat(key.clone(), field.clone(), *increment) {
-                Ok(val) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_HASH, "hincrbyfloat", key);
-                    write_resp_bulk(out, val.to_string().as_bytes());
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Hrandfield {
-            key,
-            count,
-            with_values,
-        } => {
-            match db.hrandfield(key, *count, *with_values) {
-                Ok(items) => {
-                    if count.is_none() {
-                        if let Some(f) = items.first() {
-                            write_resp_bulk(out, f);
-                        } else {
-                            out.extend_from_slice(b"$-1\r\n");
-                        }
-                    } else if *with_values && CURRENT_CLIENT_RESP3.get() {
-                        let num_pairs = items.len() / 2;
-                        out.extend_from_slice(format!("*{}\r\n", num_pairs).as_bytes());
-                        for chunk in items.chunks(2) {
-                            out.extend_from_slice(b"*2\r\n");
-                            write_resp_bulk(out, &chunk[0]);
-                            write_resp_bulk(out, &chunk[1]);
-                        }
-                    } else {
-                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                        for item in items {
-                            write_resp_bulk(out, &item);
-                        }
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Hscan {
-            key,
-            cursor,
-            pattern,
-            count,
-            no_values,
-        } => {
-            match db.hscan(
-                key,
-                *cursor,
-                pattern.as_deref(),
-                count.unwrap_or(10),
-                *no_values,
-            ) {
-                Ok((next_cursor, entries)) => {
-                    out.extend_from_slice(b"*2\r\n");
-                    let cur_str = next_cursor.to_string();
-                    write_resp_bulk(out, cur_str.as_bytes());
-                    out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
-                    for item in entries {
-                        write_resp_bulk(out, &item);
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Smismember { key, members } => {
-            match db.smismember(key, members) {
-                Ok(bools) => {
-                    out.extend_from_slice(format!("*{}\r\n", bools.len()).as_bytes());
-                    for b in bools {
-                        write_resp_integer(out, if b { 1 } else { 0 });
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Srandmember { key, count } => {
-            match db.srandmember(key, *count) {
-                Ok(items) => {
-                    if count.is_none() {
-                        if let Some(item) = items.first() {
-                            write_resp_bulk(out, item);
-                        } else {
-                            out.extend_from_slice(b"$-1\r\n");
-                        }
-                    } else {
-                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                        for item in items {
-                            write_resp_bulk(out, &item);
-                        }
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Smove {
-            source,
-            destination,
-            member,
-        } => {
-            match db.smove(source, destination.clone(), member.clone()) {
-                Ok(res) => {
-                    if res.moved {
-                        touch_watched_key(db.port, source.as_ref());
-                        if res.dst_added {
-                            touch_watched_key(db.port, destination.as_ref());
-                        }
-                        let need_aof = aof.is_some();
-                        let need_rep = crate::replication::has_connected_replicas(db.port);
-                        if (need_aof || need_rep)
-                            && let Some(bytes) = crate::aof::command_to_resp(cmd)
-                        {
-                            if let Some(aof_w) = aof {
-                                aof_w.borrow_mut().append(&bytes);
-                            }
-                            if need_rep {
-                                crate::replication::propagate_shard_bytes(
-                                    db.port,
-                                    db.shard_id,
-                                    &bytes,
-                                );
-                            }
-                        }
-                    }
-                    write_resp_integer(out, if res.moved { 1 } else { 0 });
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Sscan {
-            key,
-            cursor,
-            pattern,
-            count,
-        } => {
-            match db.sscan(key, *cursor, pattern.as_deref(), count.unwrap_or(10)) {
-                Ok((next_cursor, entries)) => {
-                    out.extend_from_slice(b"*2\r\n");
-                    let cur_str = next_cursor.to_string();
-                    write_resp_bulk(out, cur_str.as_bytes());
-                    out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
-                    for item in entries {
-                        write_resp_bulk(out, &item);
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Zmscore { key, members } => {
-            match db.zmscore(key, members) {
-                Ok(scores) => {
-                    out.extend_from_slice(format!("*{}\r\n", scores.len()).as_bytes());
-                    for s in scores {
-                        match s {
-                            Some(val) => {
-                                let formatted = format_score(val);
-                                write_resp_bulk(out, formatted.as_bytes());
-                            }
-                            None => out.extend_from_slice(b"$-1\r\n"),
-                        }
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Zrandmember {
-            key,
-            count,
-            with_scores,
-        } => {
-            match db.zrandmember(key, *count, *with_scores) {
-                Ok(items) => {
-                    if count.is_none() {
-                        if let Some((m, _)) = items.first() {
-                            write_resp_bulk(out, m);
-                        } else {
-                            out.extend_from_slice(b"$-1\r\n");
-                        }
-                    } else if *with_scores {
-                        if CURRENT_CLIENT_RESP3.get() {
-                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                            for (m, s) in items {
-                                out.extend_from_slice(b"*2\r\n");
-                                write_resp_bulk(out, &m);
-                                let formatted = format_score(s);
-                                write_resp_bulk(out, formatted.as_bytes());
-                            }
-                        } else {
-                            out.extend_from_slice(format!("*{}\r\n", items.len() * 2).as_bytes());
-                            for (m, s) in items {
-                                write_resp_bulk(out, &m);
-                                let formatted = format_score(s);
-                                write_resp_bulk(out, formatted.as_bytes());
-                            }
-                        }
-                    } else {
-                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                        for (m, _) in items {
-                            write_resp_bulk(out, &m);
-                        }
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Zremrangebyrank { key, start, stop } => {
-            match db.zremrangebyrank(key, *start, *stop) {
-                Ok(removed) => {
-                    if removed > 0 {
-                        record_change!(cmd);
-                    }
-                    write_resp_integer(out, removed as i64);
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Zremrangebyscore {
-            key,
-            min_score,
-            min_inc,
-            max_score,
-            max_inc,
-        } => {
-            match db.zremrangebyscore(key, *min_score, *min_inc, *max_score, *max_inc) {
-                Ok(removed) => {
-                    if removed > 0 {
-                        record_change!(cmd);
-                    }
-                    write_resp_integer(out, removed as i64);
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Zremrangebylex { key, min, max } => {
-            match db.zremrangebylex(key, min, max) {
-                Ok(removed) => {
-                    if removed > 0 {
-                        record_change!(cmd);
-                    }
-                    write_resp_integer(out, removed as i64);
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Zlexcount { key, min, max } => {
-            match db.zlexcount(key, min, max) {
-                Ok(count) => {
-                    write_resp_integer(out, count as i64);
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Zscan {
-            key,
-            cursor,
-            pattern,
-            count,
-        } => {
-            match db.zscan(key, *cursor, pattern.as_deref(), count.unwrap_or(10)) {
-                Ok((next_cursor, entries)) => {
-                    out.extend_from_slice(b"*2\r\n");
-                    let cur_str = next_cursor.to_string();
-                    write_resp_bulk(out, cur_str.as_bytes());
-                    out.extend_from_slice(format!("*{}\r\n", entries.len() * 2).as_bytes());
-                    for (m, s) in entries {
-                        write_resp_bulk(out, &m);
-                        let formatted = format_score(s);
-                        write_resp_bulk(out, formatted.as_bytes());
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Ltrim { key, start, stop } => {
-            let existed = NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) != 0
-                && db.exists(key);
-            match db.ltrim(key, *start, *stop) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    if existed {
-                        notify_keyspace_event(NOTIFY_LIST, "ltrim", key);
-                        notify_del_if_emptied(db, key);
-                    }
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Lset {
-            key,
-            index,
-            element,
-        } => {
-            match db.lset(key, *index, element.clone()) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_LIST, "lset", key);
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Lrem {
-            key,
-            count,
-            element,
-        } => {
-            match db.lrem(key, *count, element) {
-                Ok(removed) => {
-                    if removed > 0 {
-                        record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_LIST, "lrem", key);
-                        notify_del_if_emptied(db, key);
-                    }
-                    write_resp_integer(out, removed as i64);
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Lpos {
-            key,
-            element,
-            rank,
-            count,
-            maxlen,
-        } => {
-            match db.lpos(key, element, rank.unwrap_or(1), *count, *maxlen) {
-                Ok(indices) => {
-                    if count.is_none() {
-                        if let Some(idx) = indices.first() {
-                            write_resp_integer(out, *idx as i64);
-                        } else {
-                            out.extend_from_slice(b"$-1\r\n");
-                        }
-                    } else {
-                        out.extend_from_slice(format!("*{}\r\n", indices.len()).as_bytes());
-                        for idx in indices {
-                            write_resp_integer(out, idx as i64);
-                        }
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Linsert {
-            key,
-            before,
-            pivot,
-            element,
-        } => {
-            match db.linsert(key.clone(), *before, pivot, element.clone()) {
-                Ok(len) => {
-                    if len > 0 {
-                        record_change!(cmd);
-                        notify_list_or_defer(db, key);
-                        notify_keyspace_event(NOTIFY_LIST, "linsert", key);
-                    }
-                    write_resp_integer(out, len);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Sort {
-            key,
-            desc,
-            alpha,
-            store,
-            limit,
-            by,
-            get,
-            readonly: _,
-        } => {
-            let t = db.type_of(key);
-            let mut items: Vec<Bytes> = match t {
-                "none" => Vec::new(),
-                "list" => db.lrange(key, 0, -1).unwrap_or_default(),
-                "set" => db.smembers(key).unwrap_or_default(),
-                "zset" => db
-                    .zrange(
-                        key,
-                        &crate::table::ZRangeOpts {
-                            start: 0,
-                            stop: -1,
-                            ..Default::default()
-                        },
-                    )
-                    .map(|pairs| pairs.into_iter().map(|(m, _)| m).collect())
-                    .unwrap_or_default(),
-                _ => {
-                    write_resp_err(
-                        out,
-                        "WRONGTYPE Operation against a key holding the wrong kind of value",
-                    );
-                    return false;
-                }
-            };
-
-            let mut by_pattern = by.clone();
-            let mut sort_alpha = *alpha;
-            let mut dontsort = match &by_pattern {
-                Some(p) => !p.contains(&b'*'),
-                None => false,
-            };
-
-            if dontsort && t == "set" {
-                dontsort = false;
-                sort_alpha = true;
-                by_pattern = None;
-            }
-
-            if !dontsort {
-                let mut sort_items = Vec::with_capacity(items.len());
-                let mut int_conversion_error = false;
-
-                for item in items {
-                    let by_val: Option<Bytes> = if let Some(ref pat) = by_pattern {
-                        let (lookup_key, field_opt) = pattern_subst_and_field(pat, &item);
-                        if let Some(field) = field_opt {
-                            db.hget(&lookup_key, &field).ok().flatten()
-                        } else {
-                            db.get(&lookup_key)
-                        }
-                    } else {
-                        Some(item.clone())
-                    };
-
-                    if sort_alpha {
-                        sort_items.push((0.0f64, by_val, item));
-                    } else {
-                        let score = match by_val {
-                            Some(ref s_bytes) => {
-                                match std::str::from_utf8(s_bytes.as_ref())
-                                    .ok()
-                                    .and_then(|s| s.parse::<f64>().ok())
-                                {
-                                    Some(val) if !val.is_nan() => val,
-                                    _ => {
-                                        int_conversion_error = true;
-                                        0.0
-                                    }
+                    },
+                    Some((start, end, count, consumer, min_idle)) => {
+                        match db.xpending_range(
+                            key,
+                            group,
+                            *start,
+                            *end,
+                            *count,
+                            consumer.as_deref(),
+                            *min_idle,
+                        ) {
+                            Ok(entries) => {
+                                out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
+                                for (id, c_name, idle, delivery_cnt) in entries {
+                                    let id_str = id.to_string();
+                                    out.extend_from_slice(
+                                        format!(
+                                            "*4\r\n${}\r\n{}\r\n${}\r\n",
+                                            id_str.len(),
+                                            id_str,
+                                            c_name.len(),
+                                        )
+                                        .as_bytes(),
+                                    );
+                                    out.extend_from_slice(&c_name);
+                                    out.extend_from_slice(
+                                        format!("\r\n:{}\r\n:{}\r\n", idle, delivery_cnt)
+                                            .as_bytes(),
+                                    );
                                 }
                             }
-                            None => 0.0,
-                        };
-                        sort_items.push((score, None, item));
+                            Err(err) => {
+                                if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                                    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                                } else {
+                                    write_resp_err(out, err);
+                                }
+                            }
+                        }
                     }
                 }
-
-                if int_conversion_error {
-                    write_resp_err(out, "One or more scores can't be converted into double");
-                    return false;
-                }
-
-                if sort_alpha {
-                    sort_items.sort_by(|a, b| {
-                        let cmp = match (&a.1, &b.1) {
-                            (Some(v1), Some(v2)) => v1.cmp(v2),
-                            (None, Some(_)) => std::cmp::Ordering::Less,
-                            (Some(_), None) => std::cmp::Ordering::Greater,
-                            (None, None) => std::cmp::Ordering::Equal,
-                        };
-                        let cmp = if cmp == std::cmp::Ordering::Equal {
-                            a.2.cmp(&b.2)
-                        } else {
-                            cmp
-                        };
-                        if *desc { cmp.reverse() } else { cmp }
-                    });
-                } else {
-                    sort_items.sort_by(|a, b| {
-                        let cmp = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
-                        let cmp = if cmp == std::cmp::Ordering::Equal {
-                            a.2.cmp(&b.2)
-                        } else {
-                            cmp
-                        };
-                        if *desc { cmp.reverse() } else { cmp }
-                    });
-                }
-
-                items = sort_items.into_iter().map(|(_, _, item)| item).collect();
-            } else if *desc {
-                items.reverse();
+                false
             }
-
-            let (start, count) = match limit {
-                Some((offset, count)) => {
-                    let start = (*offset).max(0) as usize;
-                    let count = if *count < 0 {
-                        items.len()
-                    } else {
-                        *count as usize
-                    };
-                    (start, count)
-                }
-                None => (0, items.len()),
-            };
-
-            let sliced_items: Vec<Bytes> = if start >= items.len() {
-                Vec::new()
-            } else {
-                items.into_iter().skip(start).take(count).collect()
-            };
-
-            let mut results: Vec<Option<Bytes>> = Vec::new();
-            if get.is_empty() {
-                for item in sliced_items {
-                    results.push(Some(item));
-                }
-            } else {
-                for item in sliced_items {
-                    for get_pat in get {
-                        if get_pat.as_ref() == b"#" {
-                            results.push(Some(item.clone()));
+            Command::Hincrby {
+                key,
+                field,
+                increment,
+            } => {
+                match db.hincrby(key.clone(), field.clone(), *increment) {
+                    Ok(val) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_HASH, "hincrby", key);
+                        write_resp_integer(out, val);
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
                         } else {
-                            let (lookup_key, field_opt) = pattern_subst_and_field(get_pat, &item);
-                            let val = if let Some(field) = field_opt {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Hincrbyfloat {
+                key,
+                field,
+                increment,
+            } => {
+                match db.hincrbyfloat(key.clone(), field.clone(), *increment) {
+                    Ok(val) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_HASH, "hincrbyfloat", key);
+                        write_resp_bulk(out, val.to_string().as_bytes());
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Hrandfield {
+                key,
+                count,
+                with_values,
+            } => {
+                match db.hrandfield(key, *count, *with_values) {
+                    Ok(items) => {
+                        if count.is_none() {
+                            if let Some(f) = items.first() {
+                                write_resp_bulk(out, f);
+                            } else {
+                                out.extend_from_slice(b"$-1\r\n");
+                            }
+                        } else if *with_values && CURRENT_CLIENT_RESP3.get() {
+                            let num_pairs = items.len() / 2;
+                            out.extend_from_slice(format!("*{}\r\n", num_pairs).as_bytes());
+                            for chunk in items.chunks(2) {
+                                out.extend_from_slice(b"*2\r\n");
+                                write_resp_bulk(out, &chunk[0]);
+                                write_resp_bulk(out, &chunk[1]);
+                            }
+                        } else {
+                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                            for item in items {
+                                write_resp_bulk(out, &item);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Hscan {
+                key,
+                cursor,
+                pattern,
+                count,
+                no_values,
+            } => {
+                match db.hscan(
+                    key,
+                    *cursor,
+                    pattern.as_deref(),
+                    count.unwrap_or(10),
+                    *no_values,
+                ) {
+                    Ok((next_cursor, entries)) => {
+                        out.extend_from_slice(b"*2\r\n");
+                        let cur_str = next_cursor.to_string();
+                        write_resp_bulk(out, cur_str.as_bytes());
+                        out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
+                        for item in entries {
+                            write_resp_bulk(out, &item);
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Smismember { key, members } => {
+                match db.smismember(key, members) {
+                    Ok(bools) => {
+                        out.extend_from_slice(format!("*{}\r\n", bools.len()).as_bytes());
+                        for b in bools {
+                            write_resp_integer(out, if b { 1 } else { 0 });
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Srandmember { key, count } => {
+                match db.srandmember(key, *count) {
+                    Ok(items) => {
+                        if count.is_none() {
+                            if let Some(item) = items.first() {
+                                write_resp_bulk(out, item);
+                            } else {
+                                out.extend_from_slice(b"$-1\r\n");
+                            }
+                        } else {
+                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                            for item in items {
+                                write_resp_bulk(out, &item);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Smove {
+                source,
+                destination,
+                member,
+            } => {
+                match db.smove(source, destination.clone(), member.clone()) {
+                    Ok(res) => {
+                        if res.moved {
+                            touch_watched_key(db.port, source.as_ref());
+                            if res.dst_added {
+                                touch_watched_key(db.port, destination.as_ref());
+                            }
+                            let need_aof = aof.is_some();
+                            let need_rep = crate::replication::has_connected_replicas(db.port);
+                            if (need_aof || need_rep)
+                                && let Some(bytes) = crate::aof::command_to_resp(cmd)
+                            {
+                                if let Some(aof_w) = aof {
+                                    aof_w.borrow_mut().append(&bytes);
+                                }
+                                if need_rep {
+                                    crate::replication::propagate_shard_bytes(
+                                        db.port,
+                                        db.shard_id,
+                                        &bytes,
+                                    );
+                                }
+                            }
+                        }
+                        write_resp_integer(out, if res.moved { 1 } else { 0 });
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Sscan {
+                key,
+                cursor,
+                pattern,
+                count,
+            } => {
+                match db.sscan(key, *cursor, pattern.as_deref(), count.unwrap_or(10)) {
+                    Ok((next_cursor, entries)) => {
+                        out.extend_from_slice(b"*2\r\n");
+                        let cur_str = next_cursor.to_string();
+                        write_resp_bulk(out, cur_str.as_bytes());
+                        out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
+                        for item in entries {
+                            write_resp_bulk(out, &item);
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Zmscore { key, members } => {
+                match db.zmscore(key, members) {
+                    Ok(scores) => {
+                        out.extend_from_slice(format!("*{}\r\n", scores.len()).as_bytes());
+                        for s in scores {
+                            match s {
+                                Some(val) => {
+                                    let formatted = format_score(val);
+                                    write_resp_bulk(out, formatted.as_bytes());
+                                }
+                                None => out.extend_from_slice(b"$-1\r\n"),
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Zrandmember {
+                key,
+                count,
+                with_scores,
+            } => {
+                match db.zrandmember(key, *count, *with_scores) {
+                    Ok(items) => {
+                        if count.is_none() {
+                            if let Some((m, _)) = items.first() {
+                                write_resp_bulk(out, m);
+                            } else {
+                                out.extend_from_slice(b"$-1\r\n");
+                            }
+                        } else if *with_scores {
+                            if CURRENT_CLIENT_RESP3.get() {
+                                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                                for (m, s) in items {
+                                    out.extend_from_slice(b"*2\r\n");
+                                    write_resp_bulk(out, &m);
+                                    let formatted = format_score(s);
+                                    write_resp_bulk(out, formatted.as_bytes());
+                                }
+                            } else {
+                                out.extend_from_slice(
+                                    format!("*{}\r\n", items.len() * 2).as_bytes(),
+                                );
+                                for (m, s) in items {
+                                    write_resp_bulk(out, &m);
+                                    let formatted = format_score(s);
+                                    write_resp_bulk(out, formatted.as_bytes());
+                                }
+                            }
+                        } else {
+                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                            for (m, _) in items {
+                                write_resp_bulk(out, &m);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Zremrangebyrank { key, start, stop } => {
+                match db.zremrangebyrank(key, *start, *stop) {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            record_change!(cmd);
+                        }
+                        write_resp_integer(out, removed as i64);
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Zremrangebyscore {
+                key,
+                min_score,
+                min_inc,
+                max_score,
+                max_inc,
+            } => {
+                match db.zremrangebyscore(key, *min_score, *min_inc, *max_score, *max_inc) {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            record_change!(cmd);
+                        }
+                        write_resp_integer(out, removed as i64);
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Zremrangebylex { key, min, max } => {
+                match db.zremrangebylex(key, min, max) {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            record_change!(cmd);
+                        }
+                        write_resp_integer(out, removed as i64);
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Zlexcount { key, min, max } => {
+                match db.zlexcount(key, min, max) {
+                    Ok(count) => {
+                        write_resp_integer(out, count as i64);
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Zscan {
+                key,
+                cursor,
+                pattern,
+                count,
+            } => {
+                match db.zscan(key, *cursor, pattern.as_deref(), count.unwrap_or(10)) {
+                    Ok((next_cursor, entries)) => {
+                        out.extend_from_slice(b"*2\r\n");
+                        let cur_str = next_cursor.to_string();
+                        write_resp_bulk(out, cur_str.as_bytes());
+                        out.extend_from_slice(format!("*{}\r\n", entries.len() * 2).as_bytes());
+                        for (m, s) in entries {
+                            write_resp_bulk(out, &m);
+                            let formatted = format_score(s);
+                            write_resp_bulk(out, formatted.as_bytes());
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Ltrim { key, start, stop } => {
+                let existed = NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) != 0
+                    && db.exists(key);
+                match db.ltrim(key, *start, *stop) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        if existed {
+                            notify_keyspace_event(NOTIFY_LIST, "ltrim", key);
+                            notify_del_if_emptied(db, key);
+                        }
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Lset {
+                key,
+                index,
+                element,
+            } => {
+                match db.lset(key, *index, element.clone()) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_LIST, "lset", key);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Lrem {
+                key,
+                count,
+                element,
+            } => {
+                match db.lrem(key, *count, element) {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            record_change!(cmd);
+                            notify_keyspace_event(NOTIFY_LIST, "lrem", key);
+                            notify_del_if_emptied(db, key);
+                        }
+                        write_resp_integer(out, removed as i64);
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Lpos {
+                key,
+                element,
+                rank,
+                count,
+                maxlen,
+            } => {
+                match db.lpos(key, element, rank.unwrap_or(1), *count, *maxlen) {
+                    Ok(indices) => {
+                        if count.is_none() {
+                            if let Some(idx) = indices.first() {
+                                write_resp_integer(out, *idx as i64);
+                            } else {
+                                out.extend_from_slice(b"$-1\r\n");
+                            }
+                        } else {
+                            out.extend_from_slice(format!("*{}\r\n", indices.len()).as_bytes());
+                            for idx in indices {
+                                write_resp_integer(out, idx as i64);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Linsert {
+                key,
+                before,
+                pivot,
+                element,
+            } => {
+                match db.linsert(key.clone(), *before, pivot, element.clone()) {
+                    Ok(len) => {
+                        if len > 0 {
+                            record_change!(cmd);
+                            notify_list_or_defer(db, key);
+                            notify_keyspace_event(NOTIFY_LIST, "linsert", key);
+                        }
+                        write_resp_integer(out, len);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Sort {
+                key,
+                desc,
+                alpha,
+                store,
+                limit,
+                by,
+                get,
+                readonly: _,
+            } => {
+                let t = db.type_of(key);
+                let mut items: Vec<Bytes> = match t {
+                    "none" => Vec::new(),
+                    "list" => db.lrange(key, 0, -1).unwrap_or_default(),
+                    "set" => db.smembers(key).unwrap_or_default(),
+                    "zset" => db
+                        .zrange(
+                            key,
+                            &crate::table::ZRangeOpts {
+                                start: 0,
+                                stop: -1,
+                                ..Default::default()
+                            },
+                        )
+                        .map(|pairs| pairs.into_iter().map(|(m, _)| m).collect())
+                        .unwrap_or_default(),
+                    _ => {
+                        write_resp_err(
+                            out,
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                        return false;
+                    }
+                };
+
+                let mut by_pattern = by.clone();
+                let mut sort_alpha = *alpha;
+                let mut dontsort = match &by_pattern {
+                    Some(p) => !p.contains(&b'*'),
+                    None => false,
+                };
+
+                if dontsort && t == "set" {
+                    dontsort = false;
+                    sort_alpha = true;
+                    by_pattern = None;
+                }
+
+                if !dontsort {
+                    let mut sort_items = Vec::with_capacity(items.len());
+                    let mut int_conversion_error = false;
+
+                    for item in items {
+                        let by_val: Option<Bytes> = if let Some(ref pat) = by_pattern {
+                            let (lookup_key, field_opt) = pattern_subst_and_field(pat, &item);
+                            if let Some(field) = field_opt {
                                 db.hget(&lookup_key, &field).ok().flatten()
                             } else {
                                 db.get(&lookup_key)
+                            }
+                        } else {
+                            Some(item.clone())
+                        };
+
+                        if sort_alpha {
+                            sort_items.push((0.0f64, by_val, item));
+                        } else {
+                            let score = match by_val {
+                                Some(ref s_bytes) => {
+                                    match std::str::from_utf8(s_bytes.as_ref())
+                                        .ok()
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                    {
+                                        Some(val) if !val.is_nan() => val,
+                                        _ => {
+                                            int_conversion_error = true;
+                                            0.0
+                                        }
+                                    }
+                                }
+                                None => 0.0,
                             };
-                            results.push(val);
+                            sort_items.push((score, None, item));
+                        }
+                    }
+
+                    if int_conversion_error {
+                        write_resp_err(out, "One or more scores can't be converted into double");
+                        return false;
+                    }
+
+                    if sort_alpha {
+                        sort_items.sort_by(|a, b| {
+                            let cmp = match (&a.1, &b.1) {
+                                (Some(v1), Some(v2)) => v1.cmp(v2),
+                                (None, Some(_)) => std::cmp::Ordering::Less,
+                                (Some(_), None) => std::cmp::Ordering::Greater,
+                                (None, None) => std::cmp::Ordering::Equal,
+                            };
+                            let cmp = if cmp == std::cmp::Ordering::Equal {
+                                a.2.cmp(&b.2)
+                            } else {
+                                cmp
+                            };
+                            if *desc { cmp.reverse() } else { cmp }
+                        });
+                    } else {
+                        sort_items.sort_by(|a, b| {
+                            let cmp = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+                            let cmp = if cmp == std::cmp::Ordering::Equal {
+                                a.2.cmp(&b.2)
+                            } else {
+                                cmp
+                            };
+                            if *desc { cmp.reverse() } else { cmp }
+                        });
+                    }
+
+                    items = sort_items.into_iter().map(|(_, _, item)| item).collect();
+                } else if *desc {
+                    items.reverse();
+                }
+
+                let (start, count) = match limit {
+                    Some((offset, count)) => {
+                        let start = (*offset).max(0) as usize;
+                        let count = if *count < 0 {
+                            items.len()
+                        } else {
+                            *count as usize
+                        };
+                        (start, count)
+                    }
+                    None => (0, items.len()),
+                };
+
+                let sliced_items: Vec<Bytes> = if start >= items.len() {
+                    Vec::new()
+                } else {
+                    items.into_iter().skip(start).take(count).collect()
+                };
+
+                let mut results: Vec<Option<Bytes>> = Vec::new();
+                if get.is_empty() {
+                    for item in sliced_items {
+                        results.push(Some(item));
+                    }
+                } else {
+                    for item in sliced_items {
+                        for get_pat in get {
+                            if get_pat.as_ref() == b"#" {
+                                results.push(Some(item.clone()));
+                            } else {
+                                let (lookup_key, field_opt) =
+                                    pattern_subst_and_field(get_pat, &item);
+                                let val = if let Some(field) = field_opt {
+                                    db.hget(&lookup_key, &field).ok().flatten()
+                                } else {
+                                    db.get(&lookup_key)
+                                };
+                                results.push(val);
+                            }
                         }
                     }
                 }
-            }
 
-            if let Some(dest) = store {
-                record_change!(cmd);
-                let prev_kind = db.type_of(dest);
-                if results.is_empty() {
-                    db.del(dest);
-                    if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", dest.as_ref());
+                if let Some(dest) = store {
+                    record_change!(cmd);
+                    let prev_kind = db.type_of(dest);
+                    if results.is_empty() {
+                        db.del(dest);
+                        if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", dest.as_ref());
+                        }
+                        out.extend_from_slice(b":0\r\n");
+                    } else {
+                        let count = results.len();
+                        let list_items: Vec<Bytes> = results
+                            .into_iter()
+                            .map(|opt| opt.unwrap_or_else(|| Bytes::from_static(b"")))
+                            .collect();
+                        db.del(dest);
+                        let _ = db.rpush(dest.clone(), list_items);
+                        notify_list_or_defer(db, dest);
+                        notify_set_key_events_local(prev_kind, "list", dest.as_ref());
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                     }
-                    out.extend_from_slice(b":0\r\n");
                 } else {
-                    let count = results.len();
-                    let list_items: Vec<Bytes> = results
-                        .into_iter()
-                        .map(|opt| opt.unwrap_or_else(|| Bytes::from_static(b"")))
-                        .collect();
-                    db.del(dest);
-                    let _ = db.rpush(dest.clone(), list_items);
-                    notify_list_or_defer(db, dest);
-                    notify_set_key_events_local(prev_kind, "list", dest.as_ref());
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
-                }
-            } else {
-                out.extend_from_slice(format!("*{}\r\n", results.len()).as_bytes());
-                for res in results {
-                    match res {
-                        Some(b) => write_resp_bulk(out, &b),
-                        None => write_resp_null(out),
+                    out.extend_from_slice(format!("*{}\r\n", results.len()).as_bytes());
+                    for res in results {
+                        match res {
+                            Some(b) => write_resp_bulk(out, &b),
+                            None => write_resp_null(out),
+                        }
                     }
                 }
+                false
             }
-            false
-        }
-        Command::Lmove {
-            source,
-            destination,
-            where_from,
-            where_to,
-        } => {
-            match db.lmove(source, destination.clone(), *where_from, *where_to) {
-                Ok(Some(val)) => {
-                    record_change!(cmd);
-                    notify_list_or_defer(db, destination);
-                    write_resp_bulk(out, &val);
-                }
-                Ok(None) => {
-                    write_resp_null(out);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Lmovem {
-            source,
-            destination,
-            where_from,
-            where_to,
-            mode,
-            count,
-            ordering,
-            ..
-        } => {
-            match db.lmovem(
+            Command::Lmove {
                 source,
-                destination.clone(),
-                *where_from,
-                *where_to,
-                *mode,
-                *count,
-                *ordering,
-            ) {
-                Ok(Some(vals)) => {
-                    record_change!(cmd);
-                    notify_list_or_defer(db, destination);
-                    write_resp_array_header(out, vals.len());
-                    for v in &vals {
-                        write_resp_bulk(out, v);
+                destination,
+                where_from,
+                where_to,
+            } => {
+                match db.lmove(source, destination.clone(), *where_from, *where_to) {
+                    Ok(Some(val)) => {
+                        record_change!(cmd);
+                        notify_list_or_defer(db, destination);
+                        write_resp_bulk(out, &val);
                     }
-                }
-                Ok(None) => {
-                    write_resp_null_array(out);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Incrbyfloat { key, increment } => {
-            match db.incrbyfloat(key.clone(), *increment) {
-                Ok(val) => {
-                    record_change!(cmd);
-                    notify_keyspace_event(NOTIFY_STRING, "incrbyfloat", key);
-                    write_resp_bulk(out, val.to_string().as_bytes());
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
+                    Ok(None) => {
+                        write_resp_null(out);
+                    }
+                    Err(err) => {
                         write_resp_err(out, err);
                     }
                 }
+                false
             }
-            false
-        }
-        Command::Increx {
-            key,
-            increment,
-            lbound,
-            ubound,
-            saturate,
-            expire,
-            enx,
-        } => {
-            match db.increx(
-                key.clone(),
-                *increment,
-                *lbound,
-                *ubound,
-                *saturate,
-                *expire,
-                *enx,
-            ) {
-                Ok(out_res) => {
-                    if let Some(rep) = out_res.rep_cmd {
-                        record_change!(&rep);
+            Command::Lmovem {
+                source,
+                destination,
+                where_from,
+                where_to,
+                mode,
+                count,
+                ordering,
+                ..
+            } => {
+                match db.lmovem(
+                    source,
+                    destination.clone(),
+                    *where_from,
+                    *where_to,
+                    *mode,
+                    *count,
+                    *ordering,
+                ) {
+                    Ok(Some(vals)) => {
+                        record_change!(cmd);
+                        notify_list_or_defer(db, destination);
+                        write_resp_array_header(out, vals.len());
+                        for v in &vals {
+                            write_resp_bulk(out, v);
+                        }
                     }
-                    for ev in out_res.events {
-                        let ev_type = match ev {
-                            "incrby" | "incrbyfloat" => NOTIFY_STRING,
-                            _ => NOTIFY_GENERIC,
-                        };
-                        notify_keyspace_event(ev_type, ev, key);
+                    Ok(None) => {
+                        write_resp_null_array(out);
                     }
-                    out.extend_from_slice(b"*2\r\n");
-                    if out_res.is_float {
-                        let s_val = out_res.val_float.to_string();
-                        out.extend_from_slice(
-                            format!("${}\r\n{}\r\n", s_val.len(), s_val).as_bytes(),
-                        );
-                        let s_delta = out_res.delta_float.to_string();
-                        out.extend_from_slice(
-                            format!("${}\r\n{}\r\n", s_delta.len(), s_delta).as_bytes(),
-                        );
-                    } else {
-                        let s_val = out_res.val_int.to_string();
-                        out.extend_from_slice(format!(":{}\r\n", s_val).as_bytes());
-                        let s_delta = out_res.delta_int.to_string();
-                        out.extend_from_slice(format!(":{}\r\n", s_delta).as_bytes());
-                    }
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
+                    Err(err) => {
                         write_resp_err(out, err);
                     }
                 }
+                false
             }
-            false
-        }
-        Command::Setrange { key, offset, value } => {
-            match db.setrange(key.clone(), *offset, value) {
-                Ok(len) => {
+            Command::Incrbyfloat { key, increment } => {
+                match db.incrbyfloat(key.clone(), *increment) {
+                    Ok(val) => {
+                        record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_STRING, "incrbyfloat", key);
+                        write_resp_bulk(out, val.to_string().as_bytes());
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Increx {
+                key,
+                increment,
+                lbound,
+                ubound,
+                saturate,
+                expire,
+                enx,
+            } => {
+                match db.increx(
+                    key.clone(),
+                    *increment,
+                    *lbound,
+                    *ubound,
+                    *saturate,
+                    *expire,
+                    *enx,
+                ) {
+                    Ok(out_res) => {
+                        if let Some(rep) = out_res.rep_cmd {
+                            record_change!(&rep);
+                        }
+                        for ev in out_res.events {
+                            let ev_type = match ev {
+                                "incrby" | "incrbyfloat" => NOTIFY_STRING,
+                                _ => NOTIFY_GENERIC,
+                            };
+                            notify_keyspace_event(ev_type, ev, key);
+                        }
+                        out.extend_from_slice(b"*2\r\n");
+                        if out_res.is_float {
+                            let s_val = out_res.val_float.to_string();
+                            out.extend_from_slice(
+                                format!("${}\r\n{}\r\n", s_val.len(), s_val).as_bytes(),
+                            );
+                            let s_delta = out_res.delta_float.to_string();
+                            out.extend_from_slice(
+                                format!("${}\r\n{}\r\n", s_delta.len(), s_delta).as_bytes(),
+                            );
+                        } else {
+                            let s_val = out_res.val_int.to_string();
+                            out.extend_from_slice(format!(":{}\r\n", s_val).as_bytes());
+                            let s_delta = out_res.delta_int.to_string();
+                            out.extend_from_slice(format!(":{}\r\n", s_delta).as_bytes());
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Setrange { key, offset, value } => {
+                match db.setrange(key.clone(), *offset, value) {
+                    Ok(len) => {
+                        record_change!(cmd);
+                        if !value.is_empty() {
+                            notify_keyspace_event(NOTIFY_STRING, "setrange", key);
+                        }
+                        write_resp_integer(out, len as i64);
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Getrange { key, start, end } => {
+                match db.getrange(key, *start, *end) {
+                    Ok(slice) => {
+                        write_resp_bulk(out, &slice);
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+                false
+            }
+            Command::Time => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let secs = now.as_secs();
+                let micros = now.subsec_micros();
+                out.extend_from_slice(
+                    format!(
+                        "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                        secs.to_string().len(),
+                        secs,
+                        micros.to_string().len(),
+                        micros
+                    )
+                    .as_bytes(),
+                );
+                false
+            }
+            Command::Echo(msg) => {
+                write_resp_bulk(out, msg);
+                false
+            }
+            // REDISJSON COMMANDS
+            Command::JsonSet {
+                key,
+                path,
+                json_val,
+                nx,
+                xx,
+            } => {
+                match db.json_store.json_set(key, path, json_val, *nx, *xx) {
+                    Ok(true) => {
+                        record_change!(cmd);
+                        if let Some(doc) = db.json_store.get(key).cloned() {
+                            let k_str = String::from_utf8_lossy(key);
+                            db.index_json_document_local(&k_str, &doc);
+                            crate::search::index_json_document_hook(&k_str, &doc);
+                        }
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Ok(false) => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::JsonGet { key, paths } => {
+                let path_refs: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
+                match db.json_store.json_get(key, &path_refs) {
+                    Some(res) => {
+                        write_resp_bulk(out, res.as_bytes());
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                false
+            }
+            Command::JsonDel { key, path } => {
+                let count = db.json_store.json_del(key, path.as_deref());
+                if count > 0 {
                     record_change!(cmd);
-                    if !value.is_empty() {
-                        notify_keyspace_event(NOTIFY_STRING, "setrange", key);
-                    }
-                    write_resp_integer(out, len as i64);
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Getrange { key, start, end } => {
-            match db.getrange(key, *start, *end) {
-                Ok(slice) => {
-                    write_resp_bulk(out, &slice);
-                }
-                Err(err) => {
-                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
-                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-                    } else {
-                        write_resp_err(out, err);
-                    }
-                }
-            }
-            false
-        }
-        Command::Time => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            let secs = now.as_secs();
-            let micros = now.subsec_micros();
-            out.extend_from_slice(
-                format!(
-                    "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    secs.to_string().len(),
-                    secs,
-                    micros.to_string().len(),
-                    micros
-                )
-                .as_bytes(),
-            );
-            false
-        }
-        Command::Echo(msg) => {
-            write_resp_bulk(out, msg);
-            false
-        }
-        // REDISJSON COMMANDS
-        Command::JsonSet {
-            key,
-            path,
-            json_val,
-            nx,
-            xx,
-        } => {
-            match db.json_store.json_set(key, path, json_val, *nx, *xx) {
-                Ok(true) => {
-                    record_change!(cmd);
+                    let k_str = String::from_utf8_lossy(key);
                     if let Some(doc) = db.json_store.get(key).cloned() {
-                        let k_str = String::from_utf8_lossy(key);
                         db.index_json_document_local(&k_str, &doc);
                         crate::search::index_json_document_hook(&k_str, &doc);
+                    } else {
+                        db.delete_document_local(&k_str);
+                        crate::search::delete_document_hook(&k_str);
                     }
-                    out.extend_from_slice(b"+OK\r\n");
                 }
-                Ok(false) => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                write_resp_integer(out, count as i64);
+                false
             }
-            false
-        }
-        Command::JsonGet { key, paths } => {
-            let path_refs: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
-            match db.json_store.json_get(key, &path_refs) {
-                Some(res) => {
-                    write_resp_bulk(out, res.as_bytes());
+            Command::JsonType { key, path } => {
+                match db.json_store.json_type(key, path.as_deref()) {
+                    Some(t) => {
+                        out.extend_from_slice(format!("+{}\r\n", t).as_bytes());
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
                 }
-                None => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
+                false
             }
-            false
-        }
-        Command::JsonDel { key, path } => {
-            let count = db.json_store.json_del(key, path.as_deref());
-            if count > 0 {
-                record_change!(cmd);
-                let k_str = String::from_utf8_lossy(key);
-                if let Some(doc) = db.json_store.get(key).cloned() {
-                    db.index_json_document_local(&k_str, &doc);
-                    crate::search::index_json_document_hook(&k_str, &doc);
-                } else {
-                    db.delete_document_local(&k_str);
-                    crate::search::delete_document_hook(&k_str);
+            Command::JsonNumIncrBy { key, path, delta } => {
+                match db.json_store.json_numincrby(key, path, *delta) {
+                    Ok(new_val) => {
+                        record_change!(cmd);
+                        if let Some(doc) = db.json_store.get(key) {
+                            crate::search::index_json_document_hook(
+                                &String::from_utf8_lossy(key),
+                                doc,
+                            );
+                        }
+                        write_resp_bulk(out, new_val.as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
                 }
+                false
             }
-            write_resp_integer(out, count as i64);
-            false
-        }
-        Command::JsonType { key, path } => {
-            match db.json_store.json_type(key, path.as_deref()) {
-                Some(t) => {
-                    out.extend_from_slice(format!("+{}\r\n", t).as_bytes());
+            Command::JsonNumMultBy { key, path, factor } => {
+                match db.json_store.json_nummultby(key, path, *factor) {
+                    Ok(res) => {
+                        record_change!(cmd);
+                        if let Some(doc) = db.json_store.get(key) {
+                            crate::search::index_json_document_hook(
+                                &String::from_utf8_lossy(key),
+                                doc,
+                            );
+                        }
+                        write_resp_bulk(out, res.as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
                 }
-                None => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
+                false
             }
-            false
-        }
-        Command::JsonNumIncrBy { key, path, delta } => {
-            match db.json_store.json_numincrby(key, path, *delta) {
-                Ok(new_val) => {
+            Command::JsonStrAppend { key, path, value } => {
+                match db.json_store.json_strappend(key, path.as_deref(), value) {
+                    Ok(new_len) => {
+                        record_change!(cmd);
+                        if let Some(doc) = db.json_store.get(key) {
+                            crate::search::index_json_document_hook(
+                                &String::from_utf8_lossy(key),
+                                doc,
+                            );
+                        }
+                        write_resp_integer(out, new_len as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::JsonStrLen { key, path } => {
+                match db.json_store.json_strlen(key, path.as_deref()) {
+                    Some(len) => {
+                        write_resp_integer(out, len as i64);
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                false
+            }
+            Command::JsonArrAppend { key, path, values } => {
+                let val_refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
+                match db.json_store.json_arrappend(key, path, &val_refs) {
+                    Ok(new_len) => {
+                        record_change!(cmd);
+                        if let Some(doc) = db.json_store.get(key) {
+                            crate::search::index_json_document_hook(
+                                &String::from_utf8_lossy(key),
+                                doc,
+                            );
+                        }
+                        write_resp_integer(out, new_len as i64);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::JsonArrLen { key, path } => {
+                match db.json_store.json_arrlen(key, path.as_deref()) {
+                    Some(len) => {
+                        write_resp_integer(out, len as i64);
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                false
+            }
+            Command::JsonArrPop { key, path, index } => {
+                match db.json_store.json_arrpop(key, path.as_deref(), *index) {
+                    Some(popped) => {
+                        record_change!(cmd);
+                        if let Some(doc) = db.json_store.get(key) {
+                            crate::search::index_json_document_hook(
+                                &String::from_utf8_lossy(key),
+                                doc,
+                            );
+                        }
+                        write_resp_bulk(out, popped.as_bytes());
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                false
+            }
+            Command::JsonObjKeys { key, path } => {
+                match db.json_store.json_objkeys(key, path.as_deref()) {
+                    Some(keys) => {
+                        out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+                        for k in keys {
+                            write_resp_bulk(out, k.as_bytes());
+                        }
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                false
+            }
+            Command::JsonObjLen { key, path } => {
+                match db.json_store.json_objlen(key, path.as_deref()) {
+                    Some(len) => {
+                        write_resp_integer(out, len as i64);
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                false
+            }
+            Command::JsonToggle { key, path } => {
+                match db.json_store.json_toggle(key, path) {
+                    Ok(b) => {
+                        record_change!(cmd);
+                        if let Some(doc) = db.json_store.get(key) {
+                            crate::search::index_json_document_hook(
+                                &String::from_utf8_lossy(key),
+                                doc,
+                            );
+                        }
+                        write_resp_bulk(out, b.as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::JsonClear { key, path } => {
+                let cleared = db.json_store.json_clear(key, path.as_deref());
+                if cleared > 0 {
                     record_change!(cmd);
                     if let Some(doc) = db.json_store.get(key) {
                         crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
                     }
-                    write_resp_bulk(out, new_val.as_bytes());
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                write_resp_integer(out, cleared as i64);
+                false
             }
-            false
-        }
-        Command::JsonNumMultBy { key, path, factor } => {
-            match db.json_store.json_nummultby(key, path, *factor) {
-                Ok(res) => {
-                    record_change!(cmd);
-                    if let Some(doc) = db.json_store.get(key) {
-                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
-                    }
-                    write_resp_bulk(out, res.as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::JsonStrAppend { key, path, value } => {
-            match db.json_store.json_strappend(key, path.as_deref(), value) {
-                Ok(new_len) => {
-                    record_change!(cmd);
-                    if let Some(doc) = db.json_store.get(key) {
-                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
-                    }
-                    write_resp_integer(out, new_len as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::JsonStrLen { key, path } => {
-            match db.json_store.json_strlen(key, path.as_deref()) {
-                Some(len) => {
-                    write_resp_integer(out, len as i64);
-                }
-                None => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-            }
-            false
-        }
-        Command::JsonArrAppend { key, path, values } => {
-            let val_refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
-            match db.json_store.json_arrappend(key, path, &val_refs) {
-                Ok(new_len) => {
-                    record_change!(cmd);
-                    if let Some(doc) = db.json_store.get(key) {
-                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
-                    }
-                    write_resp_integer(out, new_len as i64);
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::JsonArrLen { key, path } => {
-            match db.json_store.json_arrlen(key, path.as_deref()) {
-                Some(len) => {
-                    write_resp_integer(out, len as i64);
-                }
-                None => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-            }
-            false
-        }
-        Command::JsonArrPop { key, path, index } => {
-            match db.json_store.json_arrpop(key, path.as_deref(), *index) {
-                Some(popped) => {
-                    record_change!(cmd);
-                    if let Some(doc) = db.json_store.get(key) {
-                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
-                    }
-                    write_resp_bulk(out, popped.as_bytes());
-                }
-                None => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-            }
-            false
-        }
-        Command::JsonObjKeys { key, path } => {
-            match db.json_store.json_objkeys(key, path.as_deref()) {
-                Some(keys) => {
-                    out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
-                    for k in keys {
-                        write_resp_bulk(out, k.as_bytes());
+            // GEOSPATIAL COMMANDS
+            Command::Geoadd {
+                key,
+                items,
+                nx,
+                xx,
+                ch,
+            } => {
+                let mut elements = Vec::with_capacity(items.len());
+                for (lon, lat, member) in items {
+                    match crate::geo::encode_geohash(*lon, *lat) {
+                        Ok(hash) => {
+                            elements.push((hash as f64, member.clone()));
+                        }
+                        Err(e) => {
+                            out.extend_from_slice(format!("-{}\r\n", e).as_bytes());
+                            return false;
+                        }
                     }
                 }
-                None => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-            }
-            false
-        }
-        Command::JsonObjLen { key, path } => {
-            match db.json_store.json_objlen(key, path.as_deref()) {
-                Some(len) => {
-                    write_resp_integer(out, len as i64);
-                }
-                None => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-            }
-            false
-        }
-        Command::JsonToggle { key, path } => {
-            match db.json_store.json_toggle(key, path) {
-                Ok(b) => {
-                    record_change!(cmd);
-                    if let Some(doc) = db.json_store.get(key) {
-                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
+                let flags = crate::table::ZAddFlags {
+                    nx: *nx,
+                    xx: *xx,
+                    ch: *ch,
+                    gt: false,
+                    lt: false,
+                    incr: false,
+                };
+                match db.zadd(key.clone(), elements, flags) {
+                    Ok((added, _)) => {
+                        record_change!(cmd);
+                        write_resp_integer(out, added as i64);
                     }
-                    write_resp_bulk(out, b.as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::JsonClear { key, path } => {
-            let cleared = db.json_store.json_clear(key, path.as_deref());
-            if cleared > 0 {
-                record_change!(cmd);
-                if let Some(doc) = db.json_store.get(key) {
-                    crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
-                }
-            }
-            write_resp_integer(out, cleared as i64);
-            false
-        }
-        // GEOSPATIAL COMMANDS
-        Command::Geoadd {
-            key,
-            items,
-            nx,
-            xx,
-            ch,
-        } => {
-            let mut elements = Vec::with_capacity(items.len());
-            for (lon, lat, member) in items {
-                match crate::geo::encode_geohash(*lon, *lat) {
-                    Ok(hash) => {
-                        elements.push((hash as f64, member.clone()));
-                    }
-                    Err(e) => {
-                        out.extend_from_slice(format!("-{}\r\n", e).as_bytes());
-                        return false;
+                    Err(err) => {
+                        write_resp_err(out, err);
                     }
                 }
+                false
             }
-            let flags = crate::table::ZAddFlags {
-                nx: *nx,
-                xx: *xx,
-                ch: *ch,
-                gt: false,
-                lt: false,
-                incr: false,
-            };
-            match db.zadd(key.clone(), elements, flags) {
-                Ok((added, _)) => {
-                    record_change!(cmd);
-                    write_resp_integer(out, added as i64);
+            Command::Geodist { key, m1, m2, unit } => {
+                let t = db.type_of(key);
+                if t != "none" && t != "zset" {
+                    out.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                    return false;
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Geodist { key, m1, m2, unit } => {
-            let t = db.type_of(key);
-            if t != "none" && t != "zset" {
-                out.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
-                return false;
-            }
-            let s1 = db.zscore(key, m1);
-            let s2 = db.zscore(key, m2);
-            match (s1, s2) {
-                (Ok(Some(sc1)), Ok(Some(sc2))) => {
-                    let (lon1, lat1) = crate::geo::decode_geohash(sc1 as u64);
-                    let (lon2, lat2) = crate::geo::decode_geohash(sc2 as u64);
-                    let mut dist = crate::geo::haversine_distance(lon1, lat1, lon2, lat2);
-                    if let Some(u) = unit {
-                        dist = u.from_meters(dist);
-                    }
-                    let s = format!("{:.4}", dist);
-                    write_resp_bulk(out, s.as_bytes());
-                }
-                _ => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-            }
-            false
-        }
-        Command::Geopos { key, members } => {
-            let t = db.type_of(key);
-            if t != "none" && t != "zset" {
-                out.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
-                return false;
-            }
-            out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
-            for m in members {
-                match db.zscore(key, m) {
-                    Ok(Some(score)) => {
-                        let (lon, lat) = crate::geo::decode_geohash(score as u64);
-                        out.extend_from_slice(b"*2\r\n");
-                        let lon_str = format!("{}", lon);
-                        let lat_str = format!("{}", lat);
-                        write_resp_bulk(out, lon_str.as_bytes());
-                        write_resp_bulk(out, lat_str.as_bytes());
-                    }
-                    _ => {
-                        out.extend_from_slice(b"*-1\r\n");
-                    }
-                }
-            }
-            false
-        }
-        Command::Geohash { key, members } => {
-            let t = db.type_of(key);
-            if t != "none" && t != "zset" {
-                out.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
-                return false;
-            }
-            out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
-            for m in members {
-                match db.zscore(key, m) {
-                    Ok(Some(score)) => {
-                        let b32 = crate::geo::geohash_to_base32(score as u64);
-                        write_resp_bulk(out, b32.as_bytes());
+                let s1 = db.zscore(key, m1);
+                let s2 = db.zscore(key, m2);
+                match (s1, s2) {
+                    (Ok(Some(sc1)), Ok(Some(sc2))) => {
+                        let (lon1, lat1) = crate::geo::decode_geohash(sc1 as u64);
+                        let (lon2, lat2) = crate::geo::decode_geohash(sc2 as u64);
+                        let mut dist = crate::geo::haversine_distance(lon1, lat1, lon2, lat2);
+                        if let Some(u) = unit {
+                            dist = u.from_meters(dist);
+                        }
+                        let s = format!("{:.4}", dist);
+                        write_resp_bulk(out, s.as_bytes());
                     }
                     _ => {
                         out.extend_from_slice(b"$-1\r\n");
                     }
                 }
+                false
             }
-            false
-        }
-        Command::Georadius {
-            key,
-            lon,
-            lat,
-            radius,
-            unit,
-            withcoord,
-            withdist,
-            withhash,
-            count,
-            any,
-            asc,
-            store,
-            storedist,
-        } => {
-            let key_type = db.type_of(key);
-            if key_type != "none" && key_type != "zset" {
-                out.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
-                return false;
-            }
-            let storekey = store.as_ref().or(storedist.as_ref());
-            let is_storedist = storedist.is_some();
-            if key_type == "none" {
-                if let Some(store_dest) = storekey {
-                    db.del(store_dest);
-                    write_resp_integer(out, 0);
-                    return true;
-                } else {
-                    out.extend_from_slice(b"*0\r\n");
-                    return false;
-                }
-            }
-            let radius_m = unit.to_meters(*radius);
-            let shape = crate::geo::GeoSearchShape::Radius { radius_m };
-            let results = crate::geo::execute_geo_query(
-                db, key, *lon, *lat, shape, *unit, *withdist, *withhash, *withcoord, *count, *any,
-                *asc,
-            );
-            let has_options = *withcoord || *withdist || *withhash;
-            if let Some(store_dest) = storekey {
-                let prev_kind = db.type_of(store_dest.as_ref());
-                if results.is_empty() {
-                    db.del(store_dest);
-                    if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", store_dest.as_ref());
-                    }
-                    write_resp_integer(out, 0);
-                } else {
-                    db.del(store_dest);
-                    let mut zset_elements = Vec::with_capacity(results.len());
-                    for item in &results {
-                        let sc = if is_storedist {
-                            unit.from_meters(item.dist_m)
-                        } else {
-                            item.score as f64
-                        };
-                        zset_elements.push((sc, item.member.clone()));
-                    }
-                    let _ = db.zadd(
-                        store_dest.clone(),
-                        zset_elements,
-                        crate::table::ZAddFlags::default(),
+            Command::Geopos { key, members } => {
+                let t = db.type_of(key);
+                if t != "none" && t != "zset" {
+                    out.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
                     );
-                    notify_set_key_events_local(prev_kind, "zset", store_dest.as_ref());
-                    write_resp_integer(out, results.len() as i64);
-                }
-                record_change!(cmd);
-            } else {
-                crate::geo::format_geo_results(out, &results, has_options);
-            }
-            false
-        }
-        Command::Georadiusbymember {
-            key,
-            member,
-            radius,
-            unit,
-            withcoord,
-            withdist,
-            withhash,
-            count,
-            any,
-            asc,
-            store,
-            storedist,
-        } => {
-            let key_type = db.type_of(key);
-            if key_type != "none" && key_type != "zset" {
-                out.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
-                return false;
-            }
-            let storekey = store.as_ref().or(storedist.as_ref());
-            let is_storedist = storedist.is_some();
-            if key_type == "none" {
-                if let Some(store_dest) = storekey {
-                    db.del(store_dest);
-                    write_resp_integer(out, 0);
-                    return true;
-                } else {
-                    out.extend_from_slice(b"*0\r\n");
                     return false;
                 }
-            }
-            let center = match db.zscore(key, member) {
-                Ok(Some(score)) => crate::geo::decode_geohash(score as u64),
-                _ => {
-                    out.extend_from_slice(b"-ERR could not decode requested zset member\r\n");
-                    return false;
+                out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                for m in members {
+                    match db.zscore(key, m) {
+                        Ok(Some(score)) => {
+                            let (lon, lat) = crate::geo::decode_geohash(score as u64);
+                            out.extend_from_slice(b"*2\r\n");
+                            let lon_str = format!("{}", lon);
+                            let lat_str = format!("{}", lat);
+                            write_resp_bulk(out, lon_str.as_bytes());
+                            write_resp_bulk(out, lat_str.as_bytes());
+                        }
+                        _ => {
+                            out.extend_from_slice(b"*-1\r\n");
+                        }
+                    }
                 }
-            };
-            let radius_m = unit.to_meters(*radius);
-            let shape = crate::geo::GeoSearchShape::Radius { radius_m };
-            let results = crate::geo::execute_geo_query(
-                db, key, center.0, center.1, shape, *unit, *withdist, *withhash, *withcoord,
-                *count, *any, *asc,
-            );
-            let has_options = *withcoord || *withdist || *withhash;
-            if let Some(store_dest) = storekey {
-                let prev_kind = db.type_of(store_dest.as_ref());
-                if results.is_empty() {
-                    db.del(store_dest);
-                    if prev_kind != "none" {
-                        notify_keyspace_event(NOTIFY_GENERIC, "del", store_dest.as_ref());
-                    }
-                    write_resp_integer(out, 0);
-                } else {
-                    db.del(store_dest);
-                    let mut zset_elements = Vec::with_capacity(results.len());
-                    for item in &results {
-                        let sc = if is_storedist {
-                            unit.from_meters(item.dist_m)
-                        } else {
-                            item.score as f64
-                        };
-                        zset_elements.push((sc, item.member.clone()));
-                    }
-                    let _ = db.zadd(
-                        store_dest.clone(),
-                        zset_elements,
-                        crate::table::ZAddFlags::default(),
+                false
+            }
+            Command::Geohash { key, members } => {
+                let t = db.type_of(key);
+                if t != "none" && t != "zset" {
+                    out.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
                     );
-                    notify_set_key_events_local(prev_kind, "zset", store_dest.as_ref());
-                    write_resp_integer(out, results.len() as i64);
-                }
-                record_change!(cmd);
-            } else {
-                crate::geo::format_geo_results(out, &results, has_options);
-            }
-            false
-        }
-        Command::Geosearch {
-            key,
-            from_member,
-            from_lonlat,
-            by_radius,
-            by_box,
-            asc,
-            count,
-            any,
-            withcoord,
-            withdist,
-            withhash,
-        } => {
-            let key_type = db.type_of(key);
-            if key_type != "none" && key_type != "zset" {
-                out.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
-                return false;
-            }
-            if key_type == "none" {
-                out.extend_from_slice(b"*0\r\n");
-                return false;
-            }
-            let center_opt = if let Some((lon, lat)) = from_lonlat {
-                Some((*lon, *lat))
-            } else if let Some(m) = from_member {
-                match db.zscore(key, m) {
-                    Ok(Some(score)) => Some(crate::geo::decode_geohash(score as u64)),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            let (center_lon, center_lat) = match center_opt {
-                Some(c) => c,
-                None => {
-                    out.extend_from_slice(b"-ERR could not decode requested zset member\r\n");
                     return false;
                 }
-            };
-            let (shape, unit) = if let Some((rad, u)) = by_radius {
-                (
-                    crate::geo::GeoSearchShape::Radius {
-                        radius_m: u.to_meters(*rad),
-                    },
-                    *u,
-                )
-            } else if let Some((w, h, u)) = by_box {
-                (
-                    crate::geo::GeoSearchShape::Box {
-                        width_m: u.to_meters(*w),
-                        height_m: u.to_meters(*h),
-                    },
-                    *u,
-                )
-            } else {
-                (
-                    crate::geo::GeoSearchShape::Radius { radius_m: 0.0 },
-                    crate::geo::GeoUnit::Meters,
-                )
-            };
-            let results = crate::geo::execute_geo_query(
-                db, key, center_lon, center_lat, shape, unit, *withdist, *withhash, *withcoord,
-                *count, *any, *asc,
-            );
-            let has_options = *withcoord || *withdist || *withhash;
-            crate::geo::format_geo_results(out, &results, has_options);
-            false
-        }
-        Command::Geosearchstore {
-            dest,
-            key,
-            from_member,
-            from_lonlat,
-            by_radius,
-            by_box,
-            asc,
-            count,
-            any,
-            storedist,
-        } => {
-            let key_type = db.type_of(key);
-            if key_type != "none" && key_type != "zset" {
-                out.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
-                return false;
-            }
-            if key_type == "none" {
-                db.del(dest);
-                write_resp_integer(out, 0);
-                return true;
-            }
-            let center_opt = if let Some((lon, lat)) = from_lonlat {
-                Some((*lon, *lat))
-            } else if let Some(m) = from_member {
-                match db.zscore(key, m) {
-                    Ok(Some(score)) => Some(crate::geo::decode_geohash(score as u64)),
-                    _ => None,
+                out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                for m in members {
+                    match db.zscore(key, m) {
+                        Ok(Some(score)) => {
+                            let b32 = crate::geo::geohash_to_base32(score as u64);
+                            write_resp_bulk(out, b32.as_bytes());
+                        }
+                        _ => {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
                 }
-            } else {
-                None
-            };
-            let (center_lon, center_lat) = match center_opt {
-                Some(c) => c,
-                None => {
-                    out.extend_from_slice(b"-ERR could not decode requested zset member\r\n");
+                false
+            }
+            Command::Georadius {
+                key,
+                lon,
+                lat,
+                radius,
+                unit,
+                withcoord,
+                withdist,
+                withhash,
+                count,
+                any,
+                asc,
+                store,
+                storedist,
+            } => {
+                let key_type = db.type_of(key);
+                if key_type != "none" && key_type != "zset" {
+                    out.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
                     return false;
                 }
-            };
-            let (shape, unit) = if let Some((rad, u)) = by_radius {
-                (
-                    crate::geo::GeoSearchShape::Radius {
-                        radius_m: u.to_meters(*rad),
-                    },
-                    *u,
-                )
-            } else if let Some((w, h, u)) = by_box {
-                (
-                    crate::geo::GeoSearchShape::Box {
-                        width_m: u.to_meters(*w),
-                        height_m: u.to_meters(*h),
-                    },
-                    *u,
-                )
-            } else {
-                (
-                    crate::geo::GeoSearchShape::Radius { radius_m: 0.0 },
-                    crate::geo::GeoUnit::Meters,
-                )
-            };
-            let results = crate::geo::execute_geo_query(
-                db, key, center_lon, center_lat, shape, unit, false, false, false, *count, *any,
-                *asc,
-            );
-            let prev_kind = db.type_of(dest.as_ref());
-            if results.is_empty() {
-                db.del(dest);
-                if prev_kind != "none" {
-                    notify_keyspace_event(NOTIFY_GENERIC, "del", dest.as_ref());
-                }
-                write_resp_integer(out, 0);
-            } else {
-                db.del(dest);
-                let mut zset_elements = Vec::with_capacity(results.len());
-                for item in &results {
-                    let sc = if *storedist {
-                        unit.from_meters(item.dist_m)
+                let storekey = store.as_ref().or(storedist.as_ref());
+                let is_storedist = storedist.is_some();
+                if key_type == "none" {
+                    if let Some(store_dest) = storekey {
+                        db.del(store_dest);
+                        write_resp_integer(out, 0);
+                        return true;
                     } else {
-                        item.score as f64
-                    };
-                    zset_elements.push((sc, item.member.clone()));
-                }
-                let _ = db.zadd(
-                    dest.clone(),
-                    zset_elements,
-                    crate::table::ZAddFlags::default(),
-                );
-                notify_set_key_events_local(prev_kind, "zset", dest.as_ref());
-                write_resp_integer(out, results.len() as i64);
-            }
-            record_change!(cmd);
-            false
-        }
-        // PROBABILISTIC COMMANDS
-        Command::BfReserve {
-            key,
-            error_rate,
-            capacity,
-        } => {
-            if db.probabilistic_store.bloom_filters.contains_key(key) {
-                out.extend_from_slice(b"-ERR item exists\r\n");
-            } else {
-                match crate::probabilistic::BloomFilter::try_new(*capacity, *error_rate) {
-                    Ok(bf) => {
-                        db.probabilistic_store.bloom_filters.insert(key.clone(), bf);
-                        record_change!(cmd);
-                        out.extend_from_slice(b"+OK\r\n");
+                        out.extend_from_slice(b"*0\r\n");
+                        return false;
                     }
-                    Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
                 }
+                let radius_m = unit.to_meters(*radius);
+                let shape = crate::geo::GeoSearchShape::Radius { radius_m };
+                let results = crate::geo::execute_geo_query(
+                    db, key, *lon, *lat, shape, *unit, *withdist, *withhash, *withcoord, *count,
+                    *any, *asc,
+                );
+                let has_options = *withcoord || *withdist || *withhash;
+                if let Some(store_dest) = storekey {
+                    let prev_kind = db.type_of(store_dest.as_ref());
+                    if results.is_empty() {
+                        db.del(store_dest);
+                        if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", store_dest.as_ref());
+                        }
+                        write_resp_integer(out, 0);
+                    } else {
+                        db.del(store_dest);
+                        let mut zset_elements = Vec::with_capacity(results.len());
+                        for item in &results {
+                            let sc = if is_storedist {
+                                unit.from_meters(item.dist_m)
+                            } else {
+                                item.score as f64
+                            };
+                            zset_elements.push((sc, item.member.clone()));
+                        }
+                        let _ = db.zadd(
+                            store_dest.clone(),
+                            zset_elements,
+                            crate::table::ZAddFlags::default(),
+                        );
+                        notify_set_key_events_local(prev_kind, "zset", store_dest.as_ref());
+                        write_resp_integer(out, results.len() as i64);
+                    }
+                    record_change!(cmd);
+                } else {
+                    crate::geo::format_geo_results(out, &results, has_options);
+                }
+                false
             }
-            false
-        }
-        Command::BfAdd { key, item } => {
-            let bf = db
-                .probabilistic_store
-                .bloom_filters
-                .entry(key.clone())
-                .or_insert_with(|| crate::probabilistic::BloomFilter::new(1000, 0.01));
-            let added = bf.add(item);
-            if added {
+            Command::Georadiusbymember {
+                key,
+                member,
+                radius,
+                unit,
+                withcoord,
+                withdist,
+                withhash,
+                count,
+                any,
+                asc,
+                store,
+                storedist,
+            } => {
+                let key_type = db.type_of(key);
+                if key_type != "none" && key_type != "zset" {
+                    out.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                    return false;
+                }
+                let storekey = store.as_ref().or(storedist.as_ref());
+                let is_storedist = storedist.is_some();
+                if key_type == "none" {
+                    if let Some(store_dest) = storekey {
+                        db.del(store_dest);
+                        write_resp_integer(out, 0);
+                        return true;
+                    } else {
+                        out.extend_from_slice(b"*0\r\n");
+                        return false;
+                    }
+                }
+                let center = match db.zscore(key, member) {
+                    Ok(Some(score)) => crate::geo::decode_geohash(score as u64),
+                    _ => {
+                        out.extend_from_slice(b"-ERR could not decode requested zset member\r\n");
+                        return false;
+                    }
+                };
+                let radius_m = unit.to_meters(*radius);
+                let shape = crate::geo::GeoSearchShape::Radius { radius_m };
+                let results = crate::geo::execute_geo_query(
+                    db, key, center.0, center.1, shape, *unit, *withdist, *withhash, *withcoord,
+                    *count, *any, *asc,
+                );
+                let has_options = *withcoord || *withdist || *withhash;
+                if let Some(store_dest) = storekey {
+                    let prev_kind = db.type_of(store_dest.as_ref());
+                    if results.is_empty() {
+                        db.del(store_dest);
+                        if prev_kind != "none" {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", store_dest.as_ref());
+                        }
+                        write_resp_integer(out, 0);
+                    } else {
+                        db.del(store_dest);
+                        let mut zset_elements = Vec::with_capacity(results.len());
+                        for item in &results {
+                            let sc = if is_storedist {
+                                unit.from_meters(item.dist_m)
+                            } else {
+                                item.score as f64
+                            };
+                            zset_elements.push((sc, item.member.clone()));
+                        }
+                        let _ = db.zadd(
+                            store_dest.clone(),
+                            zset_elements,
+                            crate::table::ZAddFlags::default(),
+                        );
+                        notify_set_key_events_local(prev_kind, "zset", store_dest.as_ref());
+                        write_resp_integer(out, results.len() as i64);
+                    }
+                    record_change!(cmd);
+                } else {
+                    crate::geo::format_geo_results(out, &results, has_options);
+                }
+                false
+            }
+            Command::Geosearch {
+                key,
+                from_member,
+                from_lonlat,
+                by_radius,
+                by_box,
+                asc,
+                count,
+                any,
+                withcoord,
+                withdist,
+                withhash,
+            } => {
+                let key_type = db.type_of(key);
+                if key_type != "none" && key_type != "zset" {
+                    out.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                    return false;
+                }
+                if key_type == "none" {
+                    out.extend_from_slice(b"*0\r\n");
+                    return false;
+                }
+                let center_opt = if let Some((lon, lat)) = from_lonlat {
+                    Some((*lon, *lat))
+                } else if let Some(m) = from_member {
+                    match db.zscore(key, m) {
+                        Ok(Some(score)) => Some(crate::geo::decode_geohash(score as u64)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let (center_lon, center_lat) = match center_opt {
+                    Some(c) => c,
+                    None => {
+                        out.extend_from_slice(b"-ERR could not decode requested zset member\r\n");
+                        return false;
+                    }
+                };
+                let (shape, unit) = if let Some((rad, u)) = by_radius {
+                    (
+                        crate::geo::GeoSearchShape::Radius {
+                            radius_m: u.to_meters(*rad),
+                        },
+                        *u,
+                    )
+                } else if let Some((w, h, u)) = by_box {
+                    (
+                        crate::geo::GeoSearchShape::Box {
+                            width_m: u.to_meters(*w),
+                            height_m: u.to_meters(*h),
+                        },
+                        *u,
+                    )
+                } else {
+                    (
+                        crate::geo::GeoSearchShape::Radius { radius_m: 0.0 },
+                        crate::geo::GeoUnit::Meters,
+                    )
+                };
+                let results = crate::geo::execute_geo_query(
+                    db, key, center_lon, center_lat, shape, unit, *withdist, *withhash, *withcoord,
+                    *count, *any, *asc,
+                );
+                let has_options = *withcoord || *withdist || *withhash;
+                crate::geo::format_geo_results(out, &results, has_options);
+                false
+            }
+            Command::Geosearchstore {
+                dest,
+                key,
+                from_member,
+                from_lonlat,
+                by_radius,
+                by_box,
+                asc,
+                count,
+                any,
+                storedist,
+            } => {
+                let key_type = db.type_of(key);
+                if key_type != "none" && key_type != "zset" {
+                    out.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                    return false;
+                }
+                if key_type == "none" {
+                    db.del(dest);
+                    write_resp_integer(out, 0);
+                    return true;
+                }
+                let center_opt = if let Some((lon, lat)) = from_lonlat {
+                    Some((*lon, *lat))
+                } else if let Some(m) = from_member {
+                    match db.zscore(key, m) {
+                        Ok(Some(score)) => Some(crate::geo::decode_geohash(score as u64)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let (center_lon, center_lat) = match center_opt {
+                    Some(c) => c,
+                    None => {
+                        out.extend_from_slice(b"-ERR could not decode requested zset member\r\n");
+                        return false;
+                    }
+                };
+                let (shape, unit) = if let Some((rad, u)) = by_radius {
+                    (
+                        crate::geo::GeoSearchShape::Radius {
+                            radius_m: u.to_meters(*rad),
+                        },
+                        *u,
+                    )
+                } else if let Some((w, h, u)) = by_box {
+                    (
+                        crate::geo::GeoSearchShape::Box {
+                            width_m: u.to_meters(*w),
+                            height_m: u.to_meters(*h),
+                        },
+                        *u,
+                    )
+                } else {
+                    (
+                        crate::geo::GeoSearchShape::Radius { radius_m: 0.0 },
+                        crate::geo::GeoUnit::Meters,
+                    )
+                };
+                let results = crate::geo::execute_geo_query(
+                    db, key, center_lon, center_lat, shape, unit, false, false, false, *count,
+                    *any, *asc,
+                );
+                let prev_kind = db.type_of(dest.as_ref());
+                if results.is_empty() {
+                    db.del(dest);
+                    if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", dest.as_ref());
+                    }
+                    write_resp_integer(out, 0);
+                } else {
+                    db.del(dest);
+                    let mut zset_elements = Vec::with_capacity(results.len());
+                    for item in &results {
+                        let sc = if *storedist {
+                            unit.from_meters(item.dist_m)
+                        } else {
+                            item.score as f64
+                        };
+                        zset_elements.push((sc, item.member.clone()));
+                    }
+                    let _ = db.zadd(
+                        dest.clone(),
+                        zset_elements,
+                        crate::table::ZAddFlags::default(),
+                    );
+                    notify_set_key_events_local(prev_kind, "zset", dest.as_ref());
+                    write_resp_integer(out, results.len() as i64);
+                }
                 record_change!(cmd);
-                out.extend_from_slice(b":1\r\n");
-            } else {
-                out.extend_from_slice(b":0\r\n");
+                false
             }
-            false
-        }
-        Command::BfMadd { key, items } => {
-            let bf = db
-                .probabilistic_store
-                .bloom_filters
-                .entry(key.clone())
-                .or_insert_with(|| crate::probabilistic::BloomFilter::new(1000, 0.01));
-            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-            let mut any_added = false;
-            for it in items {
-                let added = bf.add(it);
+            // PROBABILISTIC COMMANDS
+            Command::BfReserve {
+                key,
+                error_rate,
+                capacity,
+            } => {
+                if db.probabilistic_store.bloom_filters.contains_key(key) {
+                    out.extend_from_slice(b"-ERR item exists\r\n");
+                } else {
+                    match crate::probabilistic::BloomFilter::try_new(*capacity, *error_rate) {
+                        Ok(bf) => {
+                            db.probabilistic_store.bloom_filters.insert(key.clone(), bf);
+                            record_change!(cmd);
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                        Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+                    }
+                }
+                false
+            }
+            Command::BfAdd { key, item } => {
+                let bf = db
+                    .probabilistic_store
+                    .bloom_filters
+                    .entry(key.clone())
+                    .or_insert_with(|| crate::probabilistic::BloomFilter::new(1000, 0.01));
+                let added = bf.add(item);
                 if added {
-                    any_added = true;
+                    record_change!(cmd);
                     out.extend_from_slice(b":1\r\n");
                 } else {
                     out.extend_from_slice(b":0\r\n");
                 }
+                false
             }
-            if any_added {
-                record_change!(cmd);
-            }
-            false
-        }
-        Command::BfExists { key, item } => {
-            if let Some(bf) = db.probabilistic_store.bloom_filters.get(key) {
-                if bf.contains(item) {
-                    out.extend_from_slice(b":1\r\n");
-                } else {
-                    out.extend_from_slice(b":0\r\n");
-                }
-            } else {
-                out.extend_from_slice(b":0\r\n");
-            }
-            false
-        }
-        Command::BfMexists { key, items } => {
-            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-            if let Some(bf) = db.probabilistic_store.bloom_filters.get(key) {
+            Command::BfMadd { key, items } => {
+                let bf = db
+                    .probabilistic_store
+                    .bloom_filters
+                    .entry(key.clone())
+                    .or_insert_with(|| crate::probabilistic::BloomFilter::new(1000, 0.01));
+                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                let mut any_added = false;
                 for it in items {
-                    if bf.contains(it) {
+                    let added = bf.add(it);
+                    if added {
+                        any_added = true;
                         out.extend_from_slice(b":1\r\n");
                     } else {
                         out.extend_from_slice(b":0\r\n");
                     }
                 }
-            } else {
-                for _ in items {
+                if any_added {
+                    record_change!(cmd);
+                }
+                false
+            }
+            Command::BfExists { key, item } => {
+                if let Some(bf) = db.probabilistic_store.bloom_filters.get(key) {
+                    if bf.contains(item) {
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                } else {
                     out.extend_from_slice(b":0\r\n");
                 }
+                false
             }
-            false
-        }
-        Command::BfInfo(key) => {
-            if let Some(bf) = db.probabilistic_store.bloom_filters.get(key) {
-                out.extend_from_slice(b"*8\r\n");
-                write_resp_bulk(out, b"Capacity");
-                write_resp_integer(out, bf.capacity as i64);
-                write_resp_bulk(out, b"Size");
-                write_resp_integer(out, (bf.bits.len() * 8) as i64);
-                write_resp_bulk(out, b"Number of filters");
-                write_resp_integer(out, 1);
-                write_resp_bulk(out, b"Number of items inserted");
-                write_resp_integer(out, bf.count as i64);
-            } else {
-                out.extend_from_slice(b"-ERR not found\r\n");
-            }
-            false
-        }
-        Command::CfReserve { key, capacity } => {
-            if db.probabilistic_store.cuckoo_filters.contains_key(key) {
-                out.extend_from_slice(b"-ERR item exists\r\n");
-            } else {
-                match crate::probabilistic::CuckooFilter::try_new(*capacity) {
-                    Ok(cf) => {
-                        db.probabilistic_store
-                            .cuckoo_filters
-                            .insert(key.clone(), cf);
-                        record_change!(cmd);
-                        out.extend_from_slice(b"+OK\r\n");
+            Command::BfMexists { key, items } => {
+                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                if let Some(bf) = db.probabilistic_store.bloom_filters.get(key) {
+                    for it in items {
+                        if bf.contains(it) {
+                            out.extend_from_slice(b":1\r\n");
+                        } else {
+                            out.extend_from_slice(b":0\r\n");
+                        }
                     }
-                    Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+                } else {
+                    for _ in items {
+                        out.extend_from_slice(b":0\r\n");
+                    }
                 }
+                false
             }
-            false
-        }
-        Command::CfAdd { key, item } => {
-            let cf = db
-                .probabilistic_store
-                .cuckoo_filters
-                .entry(key.clone())
-                .or_insert_with(|| crate::probabilistic::CuckooFilter::new(1000));
-            match cf.add(item) {
-                Ok(_) => {
-                    record_change!(cmd);
-                    out.extend_from_slice(b":1\r\n");
+            Command::BfInfo(key) => {
+                if let Some(bf) = db.probabilistic_store.bloom_filters.get(key) {
+                    out.extend_from_slice(b"*8\r\n");
+                    write_resp_bulk(out, b"Capacity");
+                    write_resp_integer(out, bf.capacity as i64);
+                    write_resp_bulk(out, b"Size");
+                    write_resp_integer(out, (bf.bits.len() * 8) as i64);
+                    write_resp_bulk(out, b"Number of filters");
+                    write_resp_integer(out, 1);
+                    write_resp_bulk(out, b"Number of items inserted");
+                    write_resp_integer(out, bf.count as i64);
+                } else {
+                    out.extend_from_slice(b"-ERR not found\r\n");
                 }
-                Err(e) => {
-                    // A failed insert has already kicked fingerprints
-                    // around (and dropped one); replaying it does the same.
-                    record_change!(cmd);
-                    out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
-                }
+                false
             }
-            false
-        }
-        Command::CfAddnx { key, item } => {
-            let cf = db
-                .probabilistic_store
-                .cuckoo_filters
-                .entry(key.clone())
-                .or_insert_with(|| crate::probabilistic::CuckooFilter::new(1000));
-            if cf.contains(item) {
-                out.extend_from_slice(b":0\r\n");
-            } else {
+            Command::CfReserve { key, capacity } => {
+                if db.probabilistic_store.cuckoo_filters.contains_key(key) {
+                    out.extend_from_slice(b"-ERR item exists\r\n");
+                } else {
+                    match crate::probabilistic::CuckooFilter::try_new(*capacity) {
+                        Ok(cf) => {
+                            db.probabilistic_store
+                                .cuckoo_filters
+                                .insert(key.clone(), cf);
+                            record_change!(cmd);
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                        Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+                    }
+                }
+                false
+            }
+            Command::CfAdd { key, item } => {
+                let cf = db
+                    .probabilistic_store
+                    .cuckoo_filters
+                    .entry(key.clone())
+                    .or_insert_with(|| crate::probabilistic::CuckooFilter::new(1000));
                 match cf.add(item) {
                     Ok(_) => {
                         record_change!(cmd);
                         out.extend_from_slice(b":1\r\n");
                     }
                     Err(e) => {
-                        // As in CF.ADD, the failed insert changed the filter.
+                        // A failed insert has already kicked fingerprints
+                        // around (and dropped one); replaying it does the same.
                         record_change!(cmd);
                         out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
                     }
                 }
+                false
             }
-            false
-        }
-        Command::CfExists { key, item } => {
-            if let Some(cf) = db.probabilistic_store.cuckoo_filters.get(key) {
+            Command::CfAddnx { key, item } => {
+                let cf = db
+                    .probabilistic_store
+                    .cuckoo_filters
+                    .entry(key.clone())
+                    .or_insert_with(|| crate::probabilistic::CuckooFilter::new(1000));
                 if cf.contains(item) {
-                    out.extend_from_slice(b":1\r\n");
-                } else {
                     out.extend_from_slice(b":0\r\n");
-                }
-            } else {
-                out.extend_from_slice(b":0\r\n");
-            }
-            false
-        }
-        Command::CfDel { key, item } => {
-            if let Some(cf) = db.probabilistic_store.cuckoo_filters.get_mut(key) {
-                if cf.delete(item) {
-                    record_change!(cmd);
-                    out.extend_from_slice(b":1\r\n");
                 } else {
-                    out.extend_from_slice(b":0\r\n");
+                    match cf.add(item) {
+                        Ok(_) => {
+                            record_change!(cmd);
+                            out.extend_from_slice(b":1\r\n");
+                        }
+                        Err(e) => {
+                            // As in CF.ADD, the failed insert changed the filter.
+                            record_change!(cmd);
+                            out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
+                        }
+                    }
                 }
-            } else {
-                out.extend_from_slice(b":0\r\n");
+                false
             }
-            false
-        }
-        Command::CfInfo(key) => {
-            if let Some(cf) = db.probabilistic_store.cuckoo_filters.get(key) {
-                out.extend_from_slice(b"*6\r\n");
-                write_resp_bulk(out, b"Size");
-                write_resp_integer(out, (cf.num_buckets * 4 * 2) as i64);
-                write_resp_bulk(out, b"Number of buckets");
-                write_resp_integer(out, cf.num_buckets as i64);
-                write_resp_bulk(out, b"Number of items inserted");
-                write_resp_integer(out, cf.count as i64);
-            } else {
-                out.extend_from_slice(b"-ERR not found\r\n");
-            }
-            false
-        }
-        Command::CmsInitbydim { key, width, depth } => {
-            match crate::probabilistic::CountMinSketch::try_new(*width, *depth) {
-                Ok(cms) => {
-                    db.probabilistic_store.cms_sketches.insert(key.clone(), cms);
-                    record_change!(cmd);
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
-            }
-            false
-        }
-        Command::CmsInitbyprob {
-            key,
-            error,
-            probability,
-        } => {
-            db.probabilistic_store.cms_sketches.insert(
-                key.clone(),
-                crate::probabilistic::CountMinSketch::from_prob(*error, *probability),
-            );
-            record_change!(cmd);
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::CmsIncrby { key, pairs } => {
-            let cms = db
-                .probabilistic_store
-                .cms_sketches
-                .entry(key.clone())
-                .or_insert_with(|| crate::probabilistic::CountMinSketch::new(2000, 5));
-            out.extend_from_slice(format!("*{}\r\n", pairs.len()).as_bytes());
-            for (item, delta) in pairs {
-                let count = cms.incr_by(item, *delta);
-                write_resp_integer(out, count as i64);
-            }
-            record_change!(cmd);
-            false
-        }
-        Command::CmsQuery { key, items } => {
-            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-            if let Some(cms) = db.probabilistic_store.cms_sketches.get(key) {
-                for it in items {
-                    let count = cms.query(it);
-                    write_resp_integer(out, count as i64);
-                }
-            } else {
-                for _ in items {
-                    write_resp_integer(out, 0);
-                }
-            }
-            false
-        }
-        Command::CmsInfo(key) => {
-            if let Some(cms) = db.probabilistic_store.cms_sketches.get(key) {
-                out.extend_from_slice(b"*6\r\n");
-                write_resp_bulk(out, b"width");
-                write_resp_integer(out, cms.width as i64);
-                write_resp_bulk(out, b"depth");
-                write_resp_integer(out, cms.depth as i64);
-                write_resp_bulk(out, b"count");
-                write_resp_integer(out, cms.total_count as i64);
-            } else {
-                out.extend_from_slice(b"-ERR not found\r\n");
-            }
-            false
-        }
-        Command::TopkReserve { key, topk } => {
-            db.probabilistic_store
-                .topk_trackers
-                .insert(key.clone(), crate::probabilistic::TopK::new(*topk));
-            record_change!(cmd);
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::TopkAdd { key, items } => {
-            let tk = db
-                .probabilistic_store
-                .topk_trackers
-                .entry(key.clone())
-                .or_insert_with(|| crate::probabilistic::TopK::new(50));
-            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-            for it in items {
-                if let Some(evicted) = tk.add(it.clone(), 1) {
-                    write_resp_bulk(out, &evicted);
-                } else {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-            }
-            record_change!(cmd);
-            false
-        }
-        Command::TopkQuery { key, items } => {
-            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-            if let Some(tk) = db.probabilistic_store.topk_trackers.get(key) {
-                for it in items {
-                    if tk.query(it) {
+            Command::CfExists { key, item } => {
+                if let Some(cf) = db.probabilistic_store.cuckoo_filters.get(key) {
+                    if cf.contains(item) {
                         out.extend_from_slice(b":1\r\n");
                     } else {
                         out.extend_from_slice(b":0\r\n");
                     }
-                }
-            } else {
-                for _ in items {
+                } else {
                     out.extend_from_slice(b":0\r\n");
                 }
+                false
             }
-            false
-        }
-        Command::TopkList(key) => {
-            if let Some(tk) = db.probabilistic_store.topk_trackers.get(key) {
-                let items = tk.list();
+            Command::CfDel { key, item } => {
+                if let Some(cf) = db.probabilistic_store.cuckoo_filters.get_mut(key) {
+                    if cf.delete(item) {
+                        record_change!(cmd);
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                } else {
+                    out.extend_from_slice(b":0\r\n");
+                }
+                false
+            }
+            Command::CfInfo(key) => {
+                if let Some(cf) = db.probabilistic_store.cuckoo_filters.get(key) {
+                    out.extend_from_slice(b"*6\r\n");
+                    write_resp_bulk(out, b"Size");
+                    write_resp_integer(out, (cf.num_buckets * 4 * 2) as i64);
+                    write_resp_bulk(out, b"Number of buckets");
+                    write_resp_integer(out, cf.num_buckets as i64);
+                    write_resp_bulk(out, b"Number of items inserted");
+                    write_resp_integer(out, cf.count as i64);
+                } else {
+                    out.extend_from_slice(b"-ERR not found\r\n");
+                }
+                false
+            }
+            Command::CmsInitbydim { key, width, depth } => {
+                match crate::probabilistic::CountMinSketch::try_new(*width, *depth) {
+                    Ok(cms) => {
+                        db.probabilistic_store.cms_sketches.insert(key.clone(), cms);
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+                }
+                false
+            }
+            Command::CmsInitbyprob {
+                key,
+                error,
+                probability,
+            } => {
+                db.probabilistic_store.cms_sketches.insert(
+                    key.clone(),
+                    crate::probabilistic::CountMinSketch::from_prob(*error, *probability),
+                );
+                record_change!(cmd);
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::CmsIncrby { key, pairs } => {
+                let cms = db
+                    .probabilistic_store
+                    .cms_sketches
+                    .entry(key.clone())
+                    .or_insert_with(|| crate::probabilistic::CountMinSketch::new(2000, 5));
+                out.extend_from_slice(format!("*{}\r\n", pairs.len()).as_bytes());
+                for (item, delta) in pairs {
+                    let count = cms.incr_by(item, *delta);
+                    write_resp_integer(out, count as i64);
+                }
+                record_change!(cmd);
+                false
+            }
+            Command::CmsQuery { key, items } => {
                 out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                for (item, _) in items {
-                    write_resp_bulk(out, &item);
+                if let Some(cms) = db.probabilistic_store.cms_sketches.get(key) {
+                    for it in items {
+                        let count = cms.query(it);
+                        write_resp_integer(out, count as i64);
+                    }
+                } else {
+                    for _ in items {
+                        write_resp_integer(out, 0);
+                    }
                 }
-            } else {
-                out.extend_from_slice(b"*0\r\n");
+                false
             }
-            false
-        }
-        Command::TopkInfo(key) => {
-            if let Some(tk) = db.probabilistic_store.topk_trackers.get(key) {
-                out.extend_from_slice(b"*4\r\n");
-                write_resp_bulk(out, b"k");
-                write_resp_integer(out, tk.k as i64);
-                write_resp_bulk(out, b"width");
-                write_resp_integer(out, tk.items.len() as i64);
-            } else {
-                out.extend_from_slice(b"-ERR not found\r\n");
-            }
-            false
-        }
-        Command::ProbRestore { kind, key, payload } => {
-            match db.probabilistic_store.restore(*kind, key.clone(), payload) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    out.extend_from_slice(b"+OK\r\n");
+            Command::CmsInfo(key) => {
+                if let Some(cms) = db.probabilistic_store.cms_sketches.get(key) {
+                    out.extend_from_slice(b"*6\r\n");
+                    write_resp_bulk(out, b"width");
+                    write_resp_integer(out, cms.width as i64);
+                    write_resp_bulk(out, b"depth");
+                    write_resp_integer(out, cms.depth as i64);
+                    write_resp_bulk(out, b"count");
+                    write_resp_integer(out, cms.total_count as i64);
+                } else {
+                    out.extend_from_slice(b"-ERR not found\r\n");
                 }
-                Err(e) => {
-                    out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
-                }
+                false
             }
-            false
-        }
-        Command::Memory(sub) => {
-            match sub {
-                MemorySubcommand::Usage { key } => {
-                    if let Some((val, _)) = db.get_entry(key) {
-                        let size = 24 + key.len() + val.approx_bytes();
-                        write_resp_integer(out, size as i64);
+            Command::TopkReserve { key, topk } => {
+                db.probabilistic_store
+                    .topk_trackers
+                    .insert(key.clone(), crate::probabilistic::TopK::new(*topk));
+                record_change!(cmd);
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::TopkAdd { key, items } => {
+                let tk = db
+                    .probabilistic_store
+                    .topk_trackers
+                    .entry(key.clone())
+                    .or_insert_with(|| crate::probabilistic::TopK::new(50));
+                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                for it in items {
+                    if let Some(evicted) = tk.add(it.clone(), 1) {
+                        write_resp_bulk(out, &evicted);
                     } else {
                         out.extend_from_slice(b"$-1\r\n");
                     }
                 }
-                MemorySubcommand::Stats => {
-                    out.extend_from_slice(b"*2\r\n$10\r\npeak.alloc\r\n:1048576\r\n");
-                }
-                _ => {
-                    out.extend_from_slice(b"+OK\r\n");
-                }
+                record_change!(cmd);
+                false
             }
-            false
-        }
-        Command::Debug(args) => {
-            if let Some(sub) = args.first() {
-                if sub.eq_ignore_ascii_case(b"object") {
-                    if let Some(key) = args.get(1) {
-                        if let Some(enc) = db.object_encoding(key) {
-                            let (lru, idle) = db.lru_and_idletime(key).unwrap_or((0, 0));
-                            out.extend_from_slice(format!("+Value at:0x12345678 refcount:1 encoding:{} serializedlength:10 lru:{} lru_seconds_idle:{}\r\n", enc, lru, idle).as_bytes());
+            Command::TopkQuery { key, items } => {
+                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                if let Some(tk) = db.probabilistic_store.topk_trackers.get(key) {
+                    for it in items {
+                        if tk.query(it) {
+                            out.extend_from_slice(b":1\r\n");
                         } else {
-                            out.extend_from_slice(b"-ERR no such key\r\n");
+                            out.extend_from_slice(b":0\r\n");
                         }
+                    }
+                } else {
+                    for _ in items {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+                false
+            }
+            Command::TopkList(key) => {
+                if let Some(tk) = db.probabilistic_store.topk_trackers.get(key) {
+                    let items = tk.list();
+                    out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                    for (item, _) in items {
+                        write_resp_bulk(out, &item);
+                    }
+                } else {
+                    out.extend_from_slice(b"*0\r\n");
+                }
+                false
+            }
+            Command::TopkInfo(key) => {
+                if let Some(tk) = db.probabilistic_store.topk_trackers.get(key) {
+                    out.extend_from_slice(b"*4\r\n");
+                    write_resp_bulk(out, b"k");
+                    write_resp_integer(out, tk.k as i64);
+                    write_resp_bulk(out, b"width");
+                    write_resp_integer(out, tk.items.len() as i64);
+                } else {
+                    out.extend_from_slice(b"-ERR not found\r\n");
+                }
+                false
+            }
+            Command::ProbRestore { kind, key, payload } => {
+                match db.probabilistic_store.restore(*kind, key.clone(), payload) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(e) => {
+                        out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
+                    }
+                }
+                false
+            }
+            Command::Memory(sub) => {
+                match sub {
+                    MemorySubcommand::Usage { key } => {
+                        if let Some((val, _)) = db.get_entry(key) {
+                            let size = 24 + key.len() + val.approx_bytes();
+                            write_resp_integer(out, size as i64);
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                    MemorySubcommand::Stats => {
+                        out.extend_from_slice(b"*2\r\n$10\r\npeak.alloc\r\n:1048576\r\n");
+                    }
+                    _ => {
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                }
+                false
+            }
+            Command::Debug(args) => {
+                if let Some(sub) = args.first() {
+                    if sub.eq_ignore_ascii_case(b"object") {
+                        if let Some(key) = args.get(1) {
+                            if let Some(enc) = db.object_encoding(key) {
+                                let (lru, idle) = db.lru_and_idletime(key).unwrap_or((0, 0));
+                                out.extend_from_slice(format!("+Value at:0x12345678 refcount:1 encoding:{} serializedlength:10 lru:{} lru_seconds_idle:{}\r\n", enc, lru, idle).as_bytes());
+                            } else {
+                                out.extend_from_slice(b"-ERR no such key\r\n");
+                            }
+                            return false;
+                        }
+                    } else if sub.eq_ignore_ascii_case(b"pause-cron") {
+                        let flag = args.get(1).map(|v| v.as_ref() == b"1").unwrap_or(false);
+                        PAUSE_CRON.store(flag, std::sync::atomic::Ordering::Relaxed);
+                        out.extend_from_slice(b"+OK\r\n");
                         return false;
-                    }
-                } else if sub.eq_ignore_ascii_case(b"pause-cron") {
-                    let flag = args.get(1).map(|v| v.as_ref() == b"1").unwrap_or(false);
-                    PAUSE_CRON.store(flag, std::sync::atomic::Ordering::Relaxed);
-                    out.extend_from_slice(b"+OK\r\n");
-                    return false;
-                } else if sub.eq_ignore_ascii_case(b"set-allow-access-expired") {
-                    let flag = args.get(1).map(|v| v.as_ref() == b"1").unwrap_or(false);
-                    ALLOW_ACCESS_EXPIRED.store(flag, std::sync::atomic::Ordering::Relaxed);
-                    out.extend_from_slice(b"+OK\r\n");
-                    return false;
-                } else if sub.eq_ignore_ascii_case(b"set-active-expire") {
-                    out.extend_from_slice(b"+OK\r\n");
-                    return false;
-                } else if sub.eq_ignore_ascii_case(b"sleep") {
-                    if let Some(arg) = args.get(1)
-                        && let Ok(s) = std::str::from_utf8(arg)
-                        && let Ok(secs) = s.parse::<f64>()
-                    {
-                        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
-                    }
-                    out.extend_from_slice(b"+OK\r\n");
-                    return false;
-                } else if sub.eq_ignore_ascii_case(b"panic") {
-                    panic!("DEBUG PANIC requested by client");
-                }
-            }
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::Digest(key) => {
-            match db.table.get(key) {
-                Ok(Some(bytes)) => {
-                    let digest = crate::table::compute_digest(&bytes);
-                    write_resp_bulk(out, digest.as_bytes());
-                }
-                Ok(None) => {
-                    out.extend_from_slice(b"$-1\r\n");
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Delex { key, condition } => {
-            let should_del = match condition {
-                None => db.exists(key),
-                Some((op, expected)) => match db.table.get(key) {
-                    Ok(Some(val)) => match op.to_uppercase().as_str() {
-                        "IFEQ" => val == *expected,
-                        "IFNE" => val != *expected,
-                        "IFDEQ" => {
-                            if expected.len() != 16
-                                || !expected.iter().all(|b| b.is_ascii_hexdigit())
-                            {
-                                write_resp_err(
-                                    out,
-                                    "ERR digest must be exactly 16 hexadecimal characters",
-                                );
-                                return false;
-                            }
-                            let d = crate::table::compute_digest(&val);
-                            d.eq_ignore_ascii_case(&String::from_utf8_lossy(expected))
+                    } else if sub.eq_ignore_ascii_case(b"set-allow-access-expired") {
+                        let flag = args.get(1).map(|v| v.as_ref() == b"1").unwrap_or(false);
+                        ALLOW_ACCESS_EXPIRED.store(flag, std::sync::atomic::Ordering::Relaxed);
+                        out.extend_from_slice(b"+OK\r\n");
+                        return false;
+                    } else if sub.eq_ignore_ascii_case(b"set-active-expire") {
+                        out.extend_from_slice(b"+OK\r\n");
+                        return false;
+                    } else if sub.eq_ignore_ascii_case(b"sleep") {
+                        if let Some(arg) = args.get(1)
+                            && let Ok(s) = std::str::from_utf8(arg)
+                            && let Ok(secs) = s.parse::<f64>()
+                        {
+                            std::thread::sleep(std::time::Duration::from_secs_f64(secs));
                         }
-                        "IFDNE" => {
-                            if expected.len() != 16
-                                || !expected.iter().all(|b| b.is_ascii_hexdigit())
-                            {
-                                write_resp_err(
-                                    out,
-                                    "ERR digest must be exactly 16 hexadecimal characters",
-                                );
-                                return false;
+                        out.extend_from_slice(b"+OK\r\n");
+                        return false;
+                    } else if sub.eq_ignore_ascii_case(b"panic") {
+                        panic!("DEBUG PANIC requested by client");
+                    }
+                }
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Digest(key) => {
+                match db.table.get(key) {
+                    Ok(Some(bytes)) => {
+                        let digest = crate::table::compute_digest(&bytes);
+                        write_resp_bulk(out, digest.as_bytes());
+                    }
+                    Ok(None) => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Delex { key, condition } => {
+                let should_del = match condition {
+                    None => db.exists(key),
+                    Some((op, expected)) => match db.table.get(key) {
+                        Ok(Some(val)) => match op.to_uppercase().as_str() {
+                            "IFEQ" => val == *expected,
+                            "IFNE" => val != *expected,
+                            "IFDEQ" => {
+                                if expected.len() != 16
+                                    || !expected.iter().all(|b| b.is_ascii_hexdigit())
+                                {
+                                    write_resp_err(
+                                        out,
+                                        "ERR digest must be exactly 16 hexadecimal characters",
+                                    );
+                                    return false;
+                                }
+                                let d = crate::table::compute_digest(&val);
+                                d.eq_ignore_ascii_case(&String::from_utf8_lossy(expected))
                             }
-                            let d = crate::table::compute_digest(&val);
-                            !d.eq_ignore_ascii_case(&String::from_utf8_lossy(expected))
+                            "IFDNE" => {
+                                if expected.len() != 16
+                                    || !expected.iter().all(|b| b.is_ascii_hexdigit())
+                                {
+                                    write_resp_err(
+                                        out,
+                                        "ERR digest must be exactly 16 hexadecimal characters",
+                                    );
+                                    return false;
+                                }
+                                let d = crate::table::compute_digest(&val);
+                                !d.eq_ignore_ascii_case(&String::from_utf8_lossy(expected))
+                            }
+                            "IFGT" => val > *expected,
+                            "IFLT" => val < *expected,
+                            _ => false,
+                        },
+                        Ok(None) => false,
+                        Err(_) => {
+                            write_resp_err(
+                                out,
+                                "ERR WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                            return false;
                         }
-                        "IFGT" => val > *expected,
-                        "IFLT" => val < *expected,
-                        _ => false,
                     },
-                    Ok(None) => false,
-                    Err(_) => {
-                        write_resp_err(
-                            out,
-                            "ERR WRONGTYPE Operation against a key holding the wrong kind of value",
-                        );
-                        return false;
+                };
+                if should_del {
+                    if db.del(key) {
+                        record_change!(cmd);
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
                     }
-                },
-            };
-            if should_del {
-                if db.del(key) {
-                    record_change!(cmd);
-                    out.extend_from_slice(b":1\r\n");
                 } else {
                     out.extend_from_slice(b":0\r\n");
                 }
-            } else {
-                out.extend_from_slice(b":0\r\n");
+                false
             }
-            false
-        }
-        Command::CrdtSet { key, val } => {
-            let ts = db.crdt_set(key.clone(), val.clone());
-            record_crdt_effect!(db.crdt_store.register_payload(key));
-            let s = format!("+OK {}:{}:{}\r\n", ts.physical_ms, ts.logical, ts.node_id);
-            out.extend_from_slice(s.as_bytes());
-            false
-        }
-        Command::CrdtGet(key) => {
-            if let Some(v) = db.crdt_get(key) {
-                write_resp_bulk(out, &v);
-            } else {
-                out.extend_from_slice(b"$-1\r\n");
-            }
-            false
-        }
-        Command::CrdtDel(key) => {
-            let removed = db.crdt_del(key);
-            if removed {
+            Command::CrdtSet { key, val } => {
+                let ts = db.crdt_set(key.clone(), val.clone());
                 record_crdt_effect!(db.crdt_store.register_payload(key));
-                write_resp_integer(out, 1);
-            } else {
-                write_resp_integer(out, 0);
+                let s = format!("+OK {}:{}:{}\r\n", ts.physical_ms, ts.logical, ts.node_id);
+                out.extend_from_slice(s.as_bytes());
+                false
             }
-            false
-        }
-        Command::CrdtIncrby { key, delta } => {
-            match db.crdt_incrby(key.clone(), *delta) {
-                Ok(val) => {
-                    record_crdt_effect!(db.crdt_store.counter_payload(key));
-                    write_resp_integer(out, val);
-                }
-                // Refused: the counter is unchanged, so nothing is logged.
-                Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
-            }
-            false
-        }
-        Command::CrdtSadd { key, member } => {
-            // Even a re-add changes the set: it adds another tag.
-            let added = db.crdt_sadd(key.clone(), member.clone());
-            record_crdt_effect!(db.crdt_store.set_member_payload(key, member));
-            write_resp_integer(out, if added { 1 } else { 0 });
-            false
-        }
-        Command::CrdtSmembers(key) => {
-            let members = db.crdt_smembers(key);
-            out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
-            for m in members {
-                write_resp_bulk(out, &m);
-            }
-            false
-        }
-        Command::CrdtSrem { key, member } => {
-            let removed = db.crdt_srem(key, member);
-            if !removed.is_empty() {
-                record_crdt_effect!(crate::crdt::CrdtStore::set_removal_payload(key, &removed));
-                write_resp_integer(out, 1);
-            } else {
-                write_resp_integer(out, 0);
-            }
-            false
-        }
-        Command::CrdtDump => {
-            let payload = db.crdt_dump();
-            write_resp_bulk(out, &payload);
-            false
-        }
-        Command::CrdtMerge(payload) => {
-            match db.crdt_merge(payload) {
-                Ok(count) => {
-                    // Merging is a pure function of the payload and the
-                    // current state, so it is logged as issued.
-                    record_change!(cmd);
-                    write_resp_integer(out, count as i64);
-                }
-                Err(e) => {
-                    let err_resp = format!("-ERR {}\r\n", e);
-                    out.extend_from_slice(err_resp.as_bytes());
-                }
-            }
-            false
-        }
-        Command::CrdtGc(horizon) => {
-            // Logged with its absolute cutoff: replaying a TTL later would
-            // prune more than this did.
-            let cutoff = horizon.cutoff_ms();
-            let (regs, set_tombstones) = db.crdt_gc(cutoff);
-            if regs + set_tombstones > 0 {
-                crate::replication::log_shard_mutation(db.port, db.shard_id, aof, || {
-                    Command::CrdtGc(crate::crdt::GcHorizon::Before(cutoff))
-                });
-            }
-            out.extend_from_slice(b"*4\r\n");
-            write_resp_bulk(out, b"registers_pruned");
-            write_resp_integer(out, regs as i64);
-            write_resp_bulk(out, b"set_tombstones_pruned");
-            write_resp_integer(out, set_tombstones as i64);
-            false
-        }
-        Command::SemanticSet {
-            namespace,
-            id,
-            prompt,
-            response,
-            vector,
-            ttl,
-            scope,
-            quantize,
-            tokens,
-        } => {
-            match db.semantic_set(
-                namespace.clone(),
-                id.clone(),
-                prompt.clone(),
-                response.clone(),
-                vector.clone(),
-                *ttl,
-                scope.clone(),
-                *quantize,
-                *tokens,
-            ) {
-                Ok(()) => {
-                    record_change!(cmd);
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(e) => {
-                    write_resp_err(out, &e);
-                }
-            }
-            false
-        }
-        Command::SemanticGet {
-            namespace,
-            query,
-            threshold,
-            scope,
-            with_score,
-            with_prompt,
-            with_id,
-        } => {
-            match db.semantic_get(namespace, query, *threshold, scope.as_deref()) {
-                Ok(Some(hit)) => {
-                    if !*with_score && !*with_prompt && !*with_id {
-                        write_resp_bulk(out, &hit.response);
-                    } else {
-                        let count = 1
-                            + usize::from(*with_score)
-                            + usize::from(*with_prompt)
-                            + usize::from(*with_id);
-                        write_resp_array_header(out, count);
-                        write_resp_bulk(out, &hit.response);
-                        if *with_score {
-                            let s = format!("{:.6}", hit.score);
-                            write_resp_bulk(out, s.as_bytes());
-                        }
-                        if *with_prompt {
-                            write_resp_bulk(out, &hit.prompt);
-                        }
-                        if *with_id {
-                            write_resp_bulk(out, &hit.id);
-                        }
-                    }
-                }
-                Ok(None) => {
+            Command::CrdtGet(key) => {
+                if let Some(v) = db.crdt_get(key) {
+                    write_resp_bulk(out, &v);
+                } else {
                     out.extend_from_slice(b"$-1\r\n");
                 }
-                Err(e) => {
-                    write_resp_err(out, &e);
+                false
+            }
+            Command::CrdtDel(key) => {
+                let removed = db.crdt_del(key);
+                if removed {
+                    record_crdt_effect!(db.crdt_store.register_payload(key));
+                    write_resp_integer(out, 1);
+                } else {
+                    write_resp_integer(out, 0);
                 }
+                false
             }
-            false
-        }
-        Command::SemanticDel { namespace, ids } => {
-            let removed = db.semantic_del(namespace, ids);
-            if removed > 0 {
-                record_change!(cmd);
-            }
-            write_resp_integer(out, removed as i64);
-            false
-        }
-        Command::SemanticFlush(namespace) => {
-            db.semantic_flush(namespace);
-            record_change!(cmd);
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::SemanticInfo(namespace) => {
-            let (entries, dim, hits, misses, tokens_saved, evicted_expired) =
-                db.semantic_info(namespace);
-            let total_lookups = hits + misses;
-            let hit_rate = if total_lookups > 0 {
-                format!("{:.4}", (hits as f64) / (total_lookups as f64))
-            } else {
-                "0.0000".to_string()
-            };
-            out.extend_from_slice(b"*18\r\n");
-            write_resp_bulk(out, b"namespace");
-            write_resp_bulk(out, namespace);
-            write_resp_bulk(out, b"entries");
-            write_resp_integer(out, entries as i64);
-            write_resp_bulk(out, b"dimension");
-            write_resp_integer(out, dim as i64);
-            write_resp_bulk(out, b"metric");
-            write_resp_bulk(out, b"COSINE");
-            write_resp_bulk(out, b"hits");
-            write_resp_integer(out, hits as i64);
-            write_resp_bulk(out, b"misses");
-            write_resp_integer(out, misses as i64);
-            write_resp_bulk(out, b"hit_rate");
-            write_resp_bulk(out, hit_rate.as_bytes());
-            write_resp_bulk(out, b"tokens_saved");
-            write_resp_integer(out, tokens_saved as i64);
-            write_resp_bulk(out, b"evicted_expired");
-            write_resp_integer(out, evicted_expired as i64);
-            false
-        }
-        Command::AgentMemAdd {
-            session,
-            role,
-            content,
-            tokens,
-            vector,
-            meta,
-        } => {
-            match db.agent_mem_add(
-                session.clone(),
-                role.clone(),
-                content.clone(),
-                *tokens,
-                vector.clone(),
-                meta.clone(),
-            ) {
-                Ok(id) => {
-                    record_change!(cmd);
-                    write_resp_integer(out, id as i64);
-                }
-                Err(e) => write_resp_err(out, &e),
-            }
-            false
-        }
-        Command::AgentMemContext {
-            session,
-            max_tokens,
-            query,
-            recall_k,
-        } => {
-            match db.agent_mem_context(session, *max_tokens, query.as_deref(), *recall_k) {
-                Ok(ctx) => {
-                    write_resp_array_header(out, 2);
-                    write_resp_array_header(out, ctx.recent_turns.len());
-                    for turn in ctx.recent_turns {
-                        write_resp_array_header(out, 5);
-                        write_resp_integer(out, turn.id as i64);
-                        write_resp_bulk(out, &turn.role);
-                        write_resp_bulk(out, &turn.content);
-                        write_resp_integer(out, turn.tokens as i64);
-                        match turn.meta {
-                            Some(m) => write_resp_bulk(out, &m),
-                            None => write_resp_null(out),
-                        }
+            Command::CrdtIncrby { key, delta } => {
+                match db.crdt_incrby(key.clone(), *delta) {
+                    Ok(val) => {
+                        record_crdt_effect!(db.crdt_store.counter_payload(key));
+                        write_resp_integer(out, val);
                     }
-                    write_resp_array_header(out, ctx.recalled_episodes.len());
-                    for ep in ctx.recalled_episodes {
-                        write_resp_array_header(out, 5);
-                        write_resp_integer(out, ep.id as i64);
-                        write_resp_bulk(out, &ep.role);
-                        write_resp_bulk(out, &ep.content);
-                        let s = format!("{:.6}", ep.score);
-                        write_resp_bulk(out, s.as_bytes());
-                        match ep.meta {
-                            Some(m) => write_resp_bulk(out, &m),
-                            None => write_resp_null(out),
-                        }
-                    }
+                    // Refused: the counter is unchanged, so nothing is logged.
+                    Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
                 }
-                Err(e) => write_resp_err(out, &e),
+                false
             }
-            false
-        }
-        Command::AgentMemCompact {
-            session,
-            keep_recent,
-            summary,
-            tokens,
-            vector,
-        } => {
-            match db.agent_mem_compact(
-                session,
-                *keep_recent,
-                summary.clone(),
-                *tokens,
-                vector.clone(),
-            ) {
-                Ok(compacted) => {
-                    if compacted > 0 {
+            Command::CrdtSadd { key, member } => {
+                // Even a re-add changes the set: it adds another tag.
+                let added = db.crdt_sadd(key.clone(), member.clone());
+                record_crdt_effect!(db.crdt_store.set_member_payload(key, member));
+                write_resp_integer(out, if added { 1 } else { 0 });
+                false
+            }
+            Command::CrdtSmembers(key) => {
+                let members = db.crdt_smembers(key);
+                out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                for m in members {
+                    write_resp_bulk(out, &m);
+                }
+                false
+            }
+            Command::CrdtSrem { key, member } => {
+                let removed = db.crdt_srem(key, member);
+                if !removed.is_empty() {
+                    record_crdt_effect!(crate::crdt::CrdtStore::set_removal_payload(key, &removed));
+                    write_resp_integer(out, 1);
+                } else {
+                    write_resp_integer(out, 0);
+                }
+                false
+            }
+            Command::CrdtDump => {
+                let payload = db.crdt_dump();
+                write_resp_bulk(out, &payload);
+                false
+            }
+            Command::CrdtMerge(payload) => {
+                match db.crdt_merge(payload) {
+                    Ok(count) => {
+                        // Merging is a pure function of the payload and the
+                        // current state, so it is logged as issued.
                         record_change!(cmd);
+                        write_resp_integer(out, count as i64);
                     }
-                    write_resp_integer(out, compacted as i64);
+                    Err(e) => {
+                        let err_resp = format!("-ERR {}\r\n", e);
+                        out.extend_from_slice(err_resp.as_bytes());
+                    }
                 }
-                Err(e) => write_resp_err(out, &e),
+                false
             }
-            false
-        }
-        Command::AgentMemInfo(session) => {
-            let (active_turns, total_turns, active_tokens, dim, vecs, compactions) =
-                db.agent_mem_info(session);
-            out.extend_from_slice(b"*14\r\n");
-            write_resp_bulk(out, b"session");
-            write_resp_bulk(out, session);
-            write_resp_bulk(out, b"active_turns");
-            write_resp_integer(out, active_turns as i64);
-            write_resp_bulk(out, b"total_turns");
-            write_resp_integer(out, total_turns as i64);
-            write_resp_bulk(out, b"active_tokens");
-            write_resp_integer(out, active_tokens as i64);
-            write_resp_bulk(out, b"vector_dim");
-            write_resp_integer(out, dim as i64);
-            write_resp_bulk(out, b"episodic_vectors");
-            write_resp_integer(out, vecs as i64);
-            write_resp_bulk(out, b"compactions");
-            write_resp_integer(out, compactions as i64);
-            false
-        }
-        Command::AgentMemClear(session) => {
-            let cleared = db.agent_mem_clear(session);
-            if cleared {
+            Command::CrdtGc(horizon) => {
+                // Logged with its absolute cutoff: replaying a TTL later would
+                // prune more than this did.
+                let cutoff = horizon.cutoff_ms();
+                let (regs, set_tombstones) = db.crdt_gc(cutoff);
+                if regs + set_tombstones > 0 {
+                    crate::replication::log_shard_mutation(db.port, db.shard_id, aof, || {
+                        Command::CrdtGc(crate::crdt::GcHorizon::Before(cutoff))
+                    });
+                }
+                out.extend_from_slice(b"*4\r\n");
+                write_resp_bulk(out, b"registers_pruned");
+                write_resp_integer(out, regs as i64);
+                write_resp_bulk(out, b"set_tombstones_pruned");
+                write_resp_integer(out, set_tombstones as i64);
+                false
+            }
+            Command::SemanticSet {
+                namespace,
+                id,
+                prompt,
+                response,
+                vector,
+                ttl,
+                scope,
+                quantize,
+                tokens,
+            } => {
+                match db.semantic_set(
+                    namespace.clone(),
+                    id.clone(),
+                    prompt.clone(),
+                    response.clone(),
+                    vector.clone(),
+                    *ttl,
+                    scope.clone(),
+                    *quantize,
+                    *tokens,
+                ) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(e) => {
+                        write_resp_err(out, &e);
+                    }
+                }
+                false
+            }
+            Command::SemanticGet {
+                namespace,
+                query,
+                threshold,
+                scope,
+                with_score,
+                with_prompt,
+                with_id,
+            } => {
+                match db.semantic_get(namespace, query, *threshold, scope.as_deref()) {
+                    Ok(Some(hit)) => {
+                        if !*with_score && !*with_prompt && !*with_id {
+                            write_resp_bulk(out, &hit.response);
+                        } else {
+                            let count = 1
+                                + usize::from(*with_score)
+                                + usize::from(*with_prompt)
+                                + usize::from(*with_id);
+                            write_resp_array_header(out, count);
+                            write_resp_bulk(out, &hit.response);
+                            if *with_score {
+                                let s = format!("{:.6}", hit.score);
+                                write_resp_bulk(out, s.as_bytes());
+                            }
+                            if *with_prompt {
+                                write_resp_bulk(out, &hit.prompt);
+                            }
+                            if *with_id {
+                                write_resp_bulk(out, &hit.id);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                    Err(e) => {
+                        write_resp_err(out, &e);
+                    }
+                }
+                false
+            }
+            Command::SemanticDel { namespace, ids } => {
+                let removed = db.semantic_del(namespace, ids);
+                if removed > 0 {
+                    record_change!(cmd);
+                }
+                write_resp_integer(out, removed as i64);
+                false
+            }
+            Command::SemanticFlush(namespace) => {
+                db.semantic_flush(namespace);
                 record_change!(cmd);
+                out.extend_from_slice(b"+OK\r\n");
+                false
             }
-            write_resp_integer(out, i64::from(cleared));
-            false
-        }
-        Command::LlmQuotaReserve {
-            key,
-            rpm,
-            tpm,
-            est_tokens,
-            window_ms,
-        } => {
-            let res = db.llm_quota_reserve(key.clone(), *rpm, *tpm, *est_tokens, *window_ms);
-            write_resp_array_header(out, 4);
-            write_resp_integer(out, i64::from(res.allowed));
-            match res.reservation_id {
-                Some(id) => write_resp_integer(out, id as i64),
-                None => write_resp_null(out),
+            Command::SemanticInfo(namespace) => {
+                let (entries, dim, hits, misses, tokens_saved, evicted_expired) =
+                    db.semantic_info(namespace);
+                let total_lookups = hits + misses;
+                let hit_rate = if total_lookups > 0 {
+                    format!("{:.4}", (hits as f64) / (total_lookups as f64))
+                } else {
+                    "0.0000".to_string()
+                };
+                out.extend_from_slice(b"*18\r\n");
+                write_resp_bulk(out, b"namespace");
+                write_resp_bulk(out, namespace);
+                write_resp_bulk(out, b"entries");
+                write_resp_integer(out, entries as i64);
+                write_resp_bulk(out, b"dimension");
+                write_resp_integer(out, dim as i64);
+                write_resp_bulk(out, b"metric");
+                write_resp_bulk(out, b"COSINE");
+                write_resp_bulk(out, b"hits");
+                write_resp_integer(out, hits as i64);
+                write_resp_bulk(out, b"misses");
+                write_resp_integer(out, misses as i64);
+                write_resp_bulk(out, b"hit_rate");
+                write_resp_bulk(out, hit_rate.as_bytes());
+                write_resp_bulk(out, b"tokens_saved");
+                write_resp_integer(out, tokens_saved as i64);
+                write_resp_bulk(out, b"evicted_expired");
+                write_resp_integer(out, evicted_expired as i64);
+                false
             }
-            write_resp_integer(out, res.remaining_tokens as i64);
-            write_resp_integer(out, res.retry_after_ms as i64);
-            false
-        }
-        Command::LlmQuotaSettle {
-            key,
-            reservation_id,
-            actual_tokens,
-        } => {
-            let (found, delta) = db.llm_quota_settle(key, *reservation_id, *actual_tokens);
-            write_resp_array_header(out, 2);
-            write_resp_integer(out, i64::from(found));
-            write_resp_integer(out, delta);
-            false
-        }
-        Command::LlmQuotaInfo(key) => {
-            let (active_reqs, used_tokens, reserved_tokens, active_res, window_ms) =
-                db.llm_quota_info(key);
-            out.extend_from_slice(b"*12\r\n");
-            write_resp_bulk(out, b"key");
-            write_resp_bulk(out, key);
-            write_resp_bulk(out, b"active_requests");
-            write_resp_integer(out, active_reqs as i64);
-            write_resp_bulk(out, b"used_tokens");
-            write_resp_integer(out, used_tokens as i64);
-            write_resp_bulk(out, b"reserved_tokens");
-            write_resp_integer(out, reserved_tokens as i64);
-            write_resp_bulk(out, b"active_reservations");
-            write_resp_integer(out, active_res as i64);
-            write_resp_bulk(out, b"window_ms");
-            write_resp_integer(out, window_ms as i64);
-            false
-        }
-        Command::AgentCheckpointPut {
-            key,
-            step_id,
-            parent_id,
-            state,
-            meta,
-        } => {
-            let seq = db.agent_checkpoint_put(
-                key.clone(),
-                step_id.clone(),
-                parent_id.clone(),
-                state.clone(),
-                meta.clone(),
-            );
-            record_change!(cmd);
-            write_resp_integer(out, seq as i64);
-            false
-        }
-        Command::AgentCheckpointGet { key, step_id } => {
-            match db.agent_checkpoint_get(key, step_id.as_ref()) {
-                Some(node) => {
+            Command::AgentMemAdd {
+                session,
+                role,
+                content,
+                tokens,
+                vector,
+                meta,
+            } => {
+                match db.agent_mem_add(
+                    session.clone(),
+                    role.clone(),
+                    content.clone(),
+                    *tokens,
+                    vector.clone(),
+                    meta.clone(),
+                ) {
+                    Ok(id) => {
+                        record_change!(cmd);
+                        write_resp_integer(out, id as i64);
+                    }
+                    Err(e) => write_resp_err(out, &e),
+                }
+                false
+            }
+            Command::AgentMemContext {
+                session,
+                max_tokens,
+                query,
+                recall_k,
+            } => {
+                match db.agent_mem_context(session, *max_tokens, query.as_deref(), *recall_k) {
+                    Ok(ctx) => {
+                        write_resp_array_header(out, 2);
+                        write_resp_array_header(out, ctx.recent_turns.len());
+                        for turn in ctx.recent_turns {
+                            write_resp_array_header(out, 5);
+                            write_resp_integer(out, turn.id as i64);
+                            write_resp_bulk(out, &turn.role);
+                            write_resp_bulk(out, &turn.content);
+                            write_resp_integer(out, turn.tokens as i64);
+                            match turn.meta {
+                                Some(m) => write_resp_bulk(out, &m),
+                                None => write_resp_null(out),
+                            }
+                        }
+                        write_resp_array_header(out, ctx.recalled_episodes.len());
+                        for ep in ctx.recalled_episodes {
+                            write_resp_array_header(out, 5);
+                            write_resp_integer(out, ep.id as i64);
+                            write_resp_bulk(out, &ep.role);
+                            write_resp_bulk(out, &ep.content);
+                            let s = format!("{:.6}", ep.score);
+                            write_resp_bulk(out, s.as_bytes());
+                            match ep.meta {
+                                Some(m) => write_resp_bulk(out, &m),
+                                None => write_resp_null(out),
+                            }
+                        }
+                    }
+                    Err(e) => write_resp_err(out, &e),
+                }
+                false
+            }
+            Command::AgentMemCompact {
+                session,
+                keep_recent,
+                summary,
+                tokens,
+                vector,
+            } => {
+                match db.agent_mem_compact(
+                    session,
+                    *keep_recent,
+                    summary.clone(),
+                    *tokens,
+                    vector.clone(),
+                ) {
+                    Ok(compacted) => {
+                        if compacted > 0 {
+                            record_change!(cmd);
+                        }
+                        write_resp_integer(out, compacted as i64);
+                    }
+                    Err(e) => write_resp_err(out, &e),
+                }
+                false
+            }
+            Command::AgentMemInfo(session) => {
+                let (active_turns, total_turns, active_tokens, dim, vecs, compactions) =
+                    db.agent_mem_info(session);
+                out.extend_from_slice(b"*14\r\n");
+                write_resp_bulk(out, b"session");
+                write_resp_bulk(out, session);
+                write_resp_bulk(out, b"active_turns");
+                write_resp_integer(out, active_turns as i64);
+                write_resp_bulk(out, b"total_turns");
+                write_resp_integer(out, total_turns as i64);
+                write_resp_bulk(out, b"active_tokens");
+                write_resp_integer(out, active_tokens as i64);
+                write_resp_bulk(out, b"vector_dim");
+                write_resp_integer(out, dim as i64);
+                write_resp_bulk(out, b"episodic_vectors");
+                write_resp_integer(out, vecs as i64);
+                write_resp_bulk(out, b"compactions");
+                write_resp_integer(out, compactions as i64);
+                false
+            }
+            Command::AgentMemClear(session) => {
+                let cleared = db.agent_mem_clear(session);
+                if cleared {
+                    record_change!(cmd);
+                }
+                write_resp_integer(out, i64::from(cleared));
+                false
+            }
+            Command::LlmQuotaReserve {
+                key,
+                rpm,
+                tpm,
+                est_tokens,
+                window_ms,
+            } => {
+                let res = db.llm_quota_reserve(key.clone(), *rpm, *tpm, *est_tokens, *window_ms);
+                write_resp_array_header(out, 4);
+                write_resp_integer(out, i64::from(res.allowed));
+                match res.reservation_id {
+                    Some(id) => write_resp_integer(out, id as i64),
+                    None => write_resp_null(out),
+                }
+                write_resp_integer(out, res.remaining_tokens as i64);
+                write_resp_integer(out, res.retry_after_ms as i64);
+                false
+            }
+            Command::LlmQuotaSettle {
+                key,
+                reservation_id,
+                actual_tokens,
+            } => {
+                let (found, delta) = db.llm_quota_settle(key, *reservation_id, *actual_tokens);
+                write_resp_array_header(out, 2);
+                write_resp_integer(out, i64::from(found));
+                write_resp_integer(out, delta);
+                false
+            }
+            Command::LlmQuotaInfo(key) => {
+                let (active_reqs, used_tokens, reserved_tokens, active_res, window_ms) =
+                    db.llm_quota_info(key);
+                out.extend_from_slice(b"*12\r\n");
+                write_resp_bulk(out, b"key");
+                write_resp_bulk(out, key);
+                write_resp_bulk(out, b"active_requests");
+                write_resp_integer(out, active_reqs as i64);
+                write_resp_bulk(out, b"used_tokens");
+                write_resp_integer(out, used_tokens as i64);
+                write_resp_bulk(out, b"reserved_tokens");
+                write_resp_integer(out, reserved_tokens as i64);
+                write_resp_bulk(out, b"active_reservations");
+                write_resp_integer(out, active_res as i64);
+                write_resp_bulk(out, b"window_ms");
+                write_resp_integer(out, window_ms as i64);
+                false
+            }
+            Command::AgentCheckpointPut {
+                key,
+                step_id,
+                parent_id,
+                state,
+                meta,
+            } => {
+                let seq = db.agent_checkpoint_put(
+                    key.clone(),
+                    step_id.clone(),
+                    parent_id.clone(),
+                    state.clone(),
+                    meta.clone(),
+                );
+                record_change!(cmd);
+                write_resp_integer(out, seq as i64);
+                false
+            }
+            Command::AgentCheckpointGet { key, step_id } => {
+                match db.agent_checkpoint_get(key, step_id.as_ref()) {
+                    Some(node) => {
+                        write_resp_array_header(out, 10);
+                        write_resp_bulk(out, b"step_id");
+                        write_resp_bulk(out, &node.step_id);
+                        write_resp_bulk(out, b"parent_id");
+                        match node.parent_id {
+                            Some(p) => write_resp_bulk(out, &p),
+                            None => write_resp_null(out),
+                        }
+                        write_resp_bulk(out, b"seq");
+                        write_resp_integer(out, node.seq as i64);
+                        write_resp_bulk(out, b"state");
+                        write_resp_bulk(out, &node.state);
+                        write_resp_bulk(out, b"meta");
+                        match node.metadata {
+                            Some(m) => write_resp_bulk(out, &m),
+                            None => write_resp_null(out),
+                        }
+                    }
+                    None => write_resp_null(out),
+                }
+                false
+            }
+            Command::AgentCheckpointHistory {
+                key,
+                from_step,
+                limit,
+            } => {
+                let history = db.agent_checkpoint_history(key, from_step.as_ref(), *limit);
+                write_resp_array_header(out, history.len());
+                for node in history {
                     write_resp_array_header(out, 10);
                     write_resp_bulk(out, b"step_id");
                     write_resp_bulk(out, &node.step_id);
@@ -22149,800 +22346,773 @@ pub fn execute_local_command(
                         None => write_resp_null(out),
                     }
                 }
-                None => write_resp_null(out),
+                false
             }
-            false
-        }
-        Command::AgentCheckpointHistory {
-            key,
-            from_step,
-            limit,
-        } => {
-            let history = db.agent_checkpoint_history(key, from_step.as_ref(), *limit);
-            write_resp_array_header(out, history.len());
-            for node in history {
-                write_resp_array_header(out, 10);
-                write_resp_bulk(out, b"step_id");
-                write_resp_bulk(out, &node.step_id);
-                write_resp_bulk(out, b"parent_id");
-                match node.parent_id {
-                    Some(p) => write_resp_bulk(out, &p),
-                    None => write_resp_null(out),
-                }
-                write_resp_bulk(out, b"seq");
-                write_resp_integer(out, node.seq as i64);
-                write_resp_bulk(out, b"state");
-                write_resp_bulk(out, &node.state);
-                write_resp_bulk(out, b"meta");
-                match node.metadata {
-                    Some(m) => write_resp_bulk(out, &m),
-                    None => write_resp_null(out),
-                }
-            }
-            false
-        }
-        Command::AgentToolClaim {
-            key,
-            call_id,
-            ttl_ms,
-            input,
-        } => {
-            let res = db.agent_tool_claim(key.clone(), call_id.clone(), *ttl_ms, input.clone());
-            if res.state == crate::agent::ToolClaimState::Claimed {
-                record_change!(cmd);
-            }
-            write_resp_array_header(out, 3);
-            let status_str = match res.state {
-                crate::agent::ToolClaimState::Claimed => b"CLAIMED" as &[u8],
-                crate::agent::ToolClaimState::InProgress => b"IN_PROGRESS" as &[u8],
-                crate::agent::ToolClaimState::Completed => b"COMPLETED" as &[u8],
-            };
-            write_resp_bulk(out, status_str);
-            match res.output {
-                Some(o) => write_resp_bulk(out, &o),
-                None => write_resp_null(out),
-            }
-            write_resp_integer(out, res.meta_int as i64);
-            false
-        }
-        Command::AgentToolComplete {
-            key,
-            call_id,
-            output,
-            ttl_ms,
-        } => {
-            let created =
-                db.agent_tool_complete(key.clone(), call_id.clone(), output.clone(), *ttl_ms);
-            record_change!(cmd);
-            write_resp_integer(out, i64::from(created));
-            false
-        }
-        Command::Vadd {
-            key,
-            element,
-            vector,
-            metric,
-            quantize,
-            pq,
-            tiered,
-            reduce,
-            quant,
-            ef,
-            setattr,
-            m,
-            cas: _,
-            is_redis_vset,
-        } => {
-            let index = String::from_utf8_lossy(key);
-            match db.vadd_ext(
-                &index,
-                element.clone(),
-                vector.clone(),
-                *metric,
-                *quantize,
-                *pq,
-                *tiered,
-                *reduce,
-                *quant,
-                *ef,
-                setattr.clone(),
-                *m,
-                *is_redis_vset,
-            ) {
-                Ok(added) => {
+            Command::AgentToolClaim {
+                key,
+                call_id,
+                ttl_ms,
+                input,
+            } => {
+                let res = db.agent_tool_claim(key.clone(), call_id.clone(), *ttl_ms, input.clone());
+                if res.state == crate::agent::ToolClaimState::Claimed {
                     record_change!(cmd);
-                    notify_key_invalidation(db.port, key.as_ref(), 0);
-                    notify_key_invalidation(db.port, element.as_ref(), 0);
-                    if *is_redis_vset {
-                        write_resp_integer(out, i64::from(added));
-                    } else {
-                        out.extend_from_slice(b"+OK\r\n");
+                }
+                write_resp_array_header(out, 3);
+                let status_str = match res.state {
+                    crate::agent::ToolClaimState::Claimed => b"CLAIMED" as &[u8],
+                    crate::agent::ToolClaimState::InProgress => b"IN_PROGRESS" as &[u8],
+                    crate::agent::ToolClaimState::Completed => b"COMPLETED" as &[u8],
+                };
+                write_resp_bulk(out, status_str);
+                match res.output {
+                    Some(o) => write_resp_bulk(out, &o),
+                    None => write_resp_null(out),
+                }
+                write_resp_integer(out, res.meta_int as i64);
+                false
+            }
+            Command::AgentToolComplete {
+                key,
+                call_id,
+                output,
+                ttl_ms,
+            } => {
+                let created =
+                    db.agent_tool_complete(key.clone(), call_id.clone(), output.clone(), *ttl_ms);
+                record_change!(cmd);
+                write_resp_integer(out, i64::from(created));
+                false
+            }
+            Command::Vadd {
+                key,
+                element,
+                vector,
+                metric,
+                quantize,
+                pq,
+                tiered,
+                reduce,
+                quant,
+                ef,
+                setattr,
+                m,
+                cas: _,
+                is_redis_vset,
+            } => {
+                let index = String::from_utf8_lossy(key);
+                match db.vadd_ext(
+                    &index,
+                    element.clone(),
+                    vector.clone(),
+                    *metric,
+                    *quantize,
+                    *pq,
+                    *tiered,
+                    *reduce,
+                    *quant,
+                    *ef,
+                    setattr.clone(),
+                    *m,
+                    *is_redis_vset,
+                ) {
+                    Ok(added) => {
+                        record_change!(cmd);
+                        notify_key_invalidation(db.port, key.as_ref(), 0);
+                        notify_key_invalidation(db.port, element.as_ref(), 0);
+                        if *is_redis_vset {
+                            write_resp_integer(out, i64::from(added));
+                        } else {
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(out, &err);
                     }
                 }
-                Err(err) => {
-                    write_resp_err(out, &err);
-                }
+                false
             }
-            false
-        }
-        Command::Vquery {
-            key,
-            k,
-            query,
-            rerank,
-        } => {
-            let index = String::from_utf8_lossy(key);
-            let results = db.vquery(&index, query, *k, *rerank);
-            out.extend_from_slice(format!("*{}\r\n", results.len() * 2).as_bytes());
-            for (elem, dist) in results {
-                write_resp_bulk(out, &elem);
-                let s = format!("{:.6}", dist);
-                write_resp_bulk(out, s.as_bytes());
-            }
-            false
-        }
-        Command::Vdist {
-            key,
-            k1,
-            k2,
-            metric,
-        } => {
-            let index = String::from_utf8_lossy(key);
-            match db.vsim(&index, k1, k2, *metric) {
-                Ok(dist) => {
+            Command::Vquery {
+                key,
+                k,
+                query,
+                rerank,
+            } => {
+                let index = String::from_utf8_lossy(key);
+                let results = db.vquery(&index, query, *k, *rerank);
+                out.extend_from_slice(format!("*{}\r\n", results.len() * 2).as_bytes());
+                for (elem, dist) in results {
+                    write_resp_bulk(out, &elem);
                     let s = format!("{:.6}", dist);
                     write_resp_bulk(out, s.as_bytes());
                 }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+                false
             }
-            false
-        }
-        Command::Vsim {
-            key,
-            target,
-            with_scores,
-            with_attribs,
-            count,
-            epsilon,
-            ef,
-            filter,
-            filter_ef,
-            truth,
-            no_thread: _,
-        } => {
-            let index = String::from_utf8_lossy(key);
-            match db.vsim_ext(
-                &index,
+            Command::Vdist {
+                key,
+                k1,
+                k2,
+                metric,
+            } => {
+                let index = String::from_utf8_lossy(key);
+                match db.vsim(&index, k1, k2, *metric) {
+                    Ok(dist) => {
+                        let s = format!("{:.6}", dist);
+                        write_resp_bulk(out, s.as_bytes());
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                false
+            }
+            Command::Vsim {
+                key,
                 target,
-                *with_attribs,
-                *count,
-                *epsilon,
-                *ef,
-                filter.as_deref(),
-                *filter_ef,
-                *truth,
-            ) {
-                Ok(hits) => {
-                    let is_resp3 = CURRENT_CLIENT_RESP3.get();
-                    if !*with_scores && !*with_attribs {
-                        write_resp_array_header(out, hits.len());
-                        for (elem, _, _) in hits {
-                            write_resp_bulk(out, &elem);
-                        }
-                    } else if *with_scores && !*with_attribs {
-                        if is_resp3 {
-                            out.extend_from_slice(format!("%{}\r\n", hits.len()).as_bytes());
-                            for (elem, score, _) in hits {
+                with_scores,
+                with_attribs,
+                count,
+                epsilon,
+                ef,
+                filter,
+                filter_ef,
+                truth,
+                no_thread: _,
+            } => {
+                let index = String::from_utf8_lossy(key);
+                match db.vsim_ext(
+                    &index,
+                    target,
+                    *with_attribs,
+                    *count,
+                    *epsilon,
+                    *ef,
+                    filter.as_deref(),
+                    *filter_ef,
+                    *truth,
+                ) {
+                    Ok(hits) => {
+                        let is_resp3 = CURRENT_CLIENT_RESP3.get();
+                        if !*with_scores && !*with_attribs {
+                            write_resp_array_header(out, hits.len());
+                            for (elem, _, _) in hits {
                                 write_resp_bulk(out, &elem);
+                            }
+                        } else if *with_scores && !*with_attribs {
+                            if is_resp3 {
+                                out.extend_from_slice(format!("%{}\r\n", hits.len()).as_bytes());
+                                for (elem, score, _) in hits {
+                                    write_resp_bulk(out, &elem);
+                                    write_resp_score(out, score as f64);
+                                }
+                            } else {
+                                write_resp_array_header(out, hits.len() * 2);
+                                for (elem, score, _) in hits {
+                                    write_resp_bulk(out, &elem);
+                                    write_resp_score(out, score as f64);
+                                }
+                            }
+                        } else if !*with_scores && *with_attribs {
+                            if is_resp3 {
+                                out.extend_from_slice(format!("%{}\r\n", hits.len()).as_bytes());
+                            } else {
+                                write_resp_array_header(out, hits.len() * 2);
+                            }
+                            for (elem, _, attr) in hits {
+                                write_resp_bulk(out, &elem);
+                                match attr {
+                                    Some(a) => write_resp_bulk(out, a.as_bytes()),
+                                    None => write_resp_null(out),
+                                }
+                            }
+                        } else if is_resp3 {
+                            out.extend_from_slice(format!("%{}\r\n", hits.len()).as_bytes());
+                            for (elem, score, attr) in hits {
+                                write_resp_bulk(out, &elem);
+                                out.extend_from_slice(b"*2\r\n");
                                 write_resp_score(out, score as f64);
+                                match attr {
+                                    Some(a) => write_resp_bulk(out, a.as_bytes()),
+                                    None => write_resp_null(out),
+                                }
                             }
                         } else {
-                            write_resp_array_header(out, hits.len() * 2);
-                            for (elem, score, _) in hits {
+                            write_resp_array_header(out, hits.len() * 3);
+                            for (elem, score, attr) in hits {
                                 write_resp_bulk(out, &elem);
                                 write_resp_score(out, score as f64);
-                            }
-                        }
-                    } else if !*with_scores && *with_attribs {
-                        if is_resp3 {
-                            out.extend_from_slice(format!("%{}\r\n", hits.len()).as_bytes());
-                        } else {
-                            write_resp_array_header(out, hits.len() * 2);
-                        }
-                        for (elem, _, attr) in hits {
-                            write_resp_bulk(out, &elem);
-                            match attr {
-                                Some(a) => write_resp_bulk(out, a.as_bytes()),
-                                None => write_resp_null(out),
-                            }
-                        }
-                    } else if is_resp3 {
-                        out.extend_from_slice(format!("%{}\r\n", hits.len()).as_bytes());
-                        for (elem, score, attr) in hits {
-                            write_resp_bulk(out, &elem);
-                            out.extend_from_slice(b"*2\r\n");
-                            write_resp_score(out, score as f64);
-                            match attr {
-                                Some(a) => write_resp_bulk(out, a.as_bytes()),
-                                None => write_resp_null(out),
-                            }
-                        }
-                    } else {
-                        write_resp_array_header(out, hits.len() * 3);
-                        for (elem, score, attr) in hits {
-                            write_resp_bulk(out, &elem);
-                            write_resp_score(out, score as f64);
-                            match attr {
-                                Some(a) => write_resp_bulk(out, a.as_bytes()),
-                                None => write_resp_null(out),
+                                match attr {
+                                    Some(a) => write_resp_bulk(out, a.as_bytes()),
+                                    None => write_resp_null(out),
+                                }
                             }
                         }
                     }
-                }
-                Err(err) => {
-                    write_resp_err(out, &err);
-                }
-            }
-            false
-        }
-        Command::Vdel { key, element } => {
-            if db.table.exists(key.as_ref()) {
-                write_resp_err(
-                    out,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-                return false;
-            }
-            let index = String::from_utf8_lossy(key);
-            let removed = db.vdel(&index, element);
-            if removed {
-                record_change!(cmd);
-                notify_key_invalidation(db.port, key.as_ref(), 0);
-                write_resp_integer(out, 1);
-            } else {
-                write_resp_integer(out, 0);
-            }
-            false
-        }
-        Command::Vinfo(key) => {
-            if db.table.exists(key.as_ref()) {
-                write_resp_err(
-                    out,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-                return false;
-            }
-            let index = String::from_utf8_lossy(key);
-            if let Some(idx) = db.vector_indexes.get(index.as_ref()) {
-                if idx.is_redis_vset {
-                    if CURRENT_CLIENT_RESP3.get() {
-                        out.extend_from_slice(b"%9\r\n");
-                    } else {
-                        out.extend_from_slice(b"*18\r\n");
+                    Err(err) => {
+                        write_resp_err(out, &err);
                     }
-                    write_resp_bulk(out, b"quant-type");
-                    write_resp_bulk(out, idx.quant.as_str().as_bytes());
-                    write_resp_bulk(out, b"hnsw-m");
-                    write_resp_integer(out, idx.m as i64);
-                    write_resp_bulk(out, b"vector-dim");
-                    write_resp_integer(out, idx.dim as i64);
-                    write_resp_bulk(out, b"projection-input-dim");
-                    write_resp_integer(out, idx.input_dim as i64);
-                    write_resp_bulk(out, b"size");
-                    write_resp_integer(out, idx.len() as i64);
-                    write_resp_bulk(out, b"max-level");
-                    write_resp_integer(out, idx.max_layer as i64);
-                    write_resp_bulk(out, b"attributes-count");
-                    write_resp_integer(out, idx.attributes.len() as i64);
-                    write_resp_bulk(out, b"vset-uid");
-                    write_resp_integer(out, idx.uid as i64);
-                    write_resp_bulk(out, b"hnsw-max-node-uid");
-                    write_resp_integer(out, idx.max_node_uid() as i64);
+                }
+                false
+            }
+            Command::Vdel { key, element } => {
+                if db.table.exists(key.as_ref()) {
+                    write_resp_err(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                    return false;
+                }
+                let index = String::from_utf8_lossy(key);
+                let removed = db.vdel(&index, element);
+                if removed {
+                    record_change!(cmd);
+                    notify_key_invalidation(db.port, key.as_ref(), 0);
+                    write_resp_integer(out, 1);
                 } else {
-                    out.extend_from_slice(b"*8\r\n");
-                    write_resp_bulk(out, b"num_elements");
-                    write_resp_integer(out, idx.len() as i64);
-                    write_resp_bulk(out, b"dimension");
-                    write_resp_integer(out, idx.dim as i64);
-                    write_resp_bulk(out, b"metric");
-                    write_resp_bulk(out, idx.metric.as_str().as_bytes());
-                    write_resp_bulk(out, b"max_layer");
-                    write_resp_integer(out, idx.max_layer as i64);
+                    write_resp_integer(out, 0);
                 }
-            } else {
-                write_resp_null(out);
+                false
             }
-            false
-        }
-        Command::Vcard(key) => {
-            if db.table.exists(key.as_ref()) {
-                write_resp_err(
-                    out,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-                return false;
-            }
-            let index = String::from_utf8_lossy(key);
-            let card = db
-                .vector_indexes
-                .get(index.as_ref())
-                .map(|idx| idx.len())
-                .unwrap_or(0);
-            write_resp_integer(out, card as i64);
-            false
-        }
-        Command::Vdim(key) => {
-            if db.table.exists(key.as_ref()) {
-                write_resp_err(
-                    out,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-                return false;
-            }
-            let index = String::from_utf8_lossy(key);
-            if let Some(idx) = db.vector_indexes.get(index.as_ref()) {
-                write_resp_integer(out, idx.client_dim() as i64);
-            } else {
-                write_resp_err(out, "key does not exist");
-            }
-            false
-        }
-        Command::Vemb { key, element, raw } => {
-            if db.table.exists(key.as_ref()) {
-                write_resp_err(
-                    out,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-                return false;
-            }
-            let index = String::from_utf8_lossy(key);
-            let Some(idx) = db.vector_indexes.get(index.as_ref()) else {
-                write_resp_null(out);
-                return false;
-            };
-            if *raw {
-                if let Some((qtype, blob, norm, q8_range)) = idx.raw_embedding(element) {
-                    let count = if q8_range.is_some() { 4 } else { 3 };
-                    write_resp_array_header(out, count);
-                    write_resp_bulk(out, qtype.as_bytes());
-                    write_resp_bulk(out, &blob);
-                    write_resp_score(out, norm as f64);
-                    if let Some(r) = q8_range {
-                        write_resp_score(out, r as f64);
+            Command::Vinfo(key) => {
+                if db.table.exists(key.as_ref()) {
+                    write_resp_err(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                    return false;
+                }
+                let index = String::from_utf8_lossy(key);
+                if let Some(idx) = db.vector_indexes.get(index.as_ref()) {
+                    if idx.is_redis_vset {
+                        if CURRENT_CLIENT_RESP3.get() {
+                            out.extend_from_slice(b"%9\r\n");
+                        } else {
+                            out.extend_from_slice(b"*18\r\n");
+                        }
+                        write_resp_bulk(out, b"quant-type");
+                        write_resp_bulk(out, idx.quant.as_str().as_bytes());
+                        write_resp_bulk(out, b"hnsw-m");
+                        write_resp_integer(out, idx.m as i64);
+                        write_resp_bulk(out, b"vector-dim");
+                        write_resp_integer(out, idx.dim as i64);
+                        write_resp_bulk(out, b"projection-input-dim");
+                        write_resp_integer(out, idx.input_dim as i64);
+                        write_resp_bulk(out, b"size");
+                        write_resp_integer(out, idx.len() as i64);
+                        write_resp_bulk(out, b"max-level");
+                        write_resp_integer(out, idx.max_layer as i64);
+                        write_resp_bulk(out, b"attributes-count");
+                        write_resp_integer(out, idx.attributes.len() as i64);
+                        write_resp_bulk(out, b"vset-uid");
+                        write_resp_integer(out, idx.uid as i64);
+                        write_resp_bulk(out, b"hnsw-max-node-uid");
+                        write_resp_integer(out, idx.max_node_uid() as i64);
+                    } else {
+                        out.extend_from_slice(b"*8\r\n");
+                        write_resp_bulk(out, b"num_elements");
+                        write_resp_integer(out, idx.len() as i64);
+                        write_resp_bulk(out, b"dimension");
+                        write_resp_integer(out, idx.dim as i64);
+                        write_resp_bulk(out, b"metric");
+                        write_resp_bulk(out, idx.metric.as_str().as_bytes());
+                        write_resp_bulk(out, b"max_layer");
+                        write_resp_integer(out, idx.max_layer as i64);
                     }
                 } else {
                     write_resp_null(out);
                 }
-            } else if let Some(vec) = idx.stored_vector(element) {
-                write_resp_array_header(out, vec.len());
-                for v in vec {
-                    write_resp_score(out, v as f64);
+                false
+            }
+            Command::Vcard(key) => {
+                if db.table.exists(key.as_ref()) {
+                    write_resp_err(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                    return false;
                 }
-            } else {
-                write_resp_null(out);
+                let index = String::from_utf8_lossy(key);
+                let card = db
+                    .vector_indexes
+                    .get(index.as_ref())
+                    .map(|idx| idx.len())
+                    .unwrap_or(0);
+                write_resp_integer(out, card as i64);
+                false
             }
-            false
-        }
-        Command::Vlinks {
-            key,
-            element,
-            with_scores,
-        } => {
-            if db.table.exists(key.as_ref()) {
-                write_resp_err(
-                    out,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-                return false;
-            }
-            let index = String::from_utf8_lossy(key);
-            let Some(idx) = db.vector_indexes.get(index.as_ref()) else {
-                write_resp_null(out);
-                return false;
-            };
-            if let Some(layers) = idx.links(element) {
-                let is_resp3 = CURRENT_CLIENT_RESP3.get();
-                write_resp_array_header(out, layers.len());
-                for layer in layers {
-                    if *with_scores {
-                        if is_resp3 {
-                            out.extend_from_slice(format!("%{}\r\n", layer.len()).as_bytes());
-                        } else {
-                            write_resp_array_header(out, layer.len() * 2);
-                        }
-                        for (nbr, score) in layer {
-                            write_resp_bulk(out, &nbr);
-                            write_resp_score(out, score as f64);
-                        }
-                    } else {
-                        write_resp_array_header(out, layer.len());
-                        for (nbr, _) in layer {
-                            write_resp_bulk(out, &nbr);
-                        }
-                    }
+            Command::Vdim(key) => {
+                if db.table.exists(key.as_ref()) {
+                    write_resp_err(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                    return false;
                 }
-            } else {
-                write_resp_null(out);
+                let index = String::from_utf8_lossy(key);
+                if let Some(idx) = db.vector_indexes.get(index.as_ref()) {
+                    write_resp_integer(out, idx.client_dim() as i64);
+                } else {
+                    write_resp_err(out, "key does not exist");
+                }
+                false
             }
-            false
-        }
-        Command::Vrandmember { key, count } => {
-            if db.table.exists(key.as_ref()) {
-                write_resp_err(
-                    out,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-                return false;
-            }
-            let index = String::from_utf8_lossy(key);
-            match count {
-                None => {
-                    if let Some(idx) = db.vector_indexes.get_mut(index.as_ref())
-                        && let Some(first) = idx.random_members(1).into_iter().next()
-                    {
-                        write_resp_bulk(out, &first);
+            Command::Vemb { key, element, raw } => {
+                if db.table.exists(key.as_ref()) {
+                    write_resp_err(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                    return false;
+                }
+                let index = String::from_utf8_lossy(key);
+                let Some(idx) = db.vector_indexes.get(index.as_ref()) else {
+                    write_resp_null(out);
+                    return false;
+                };
+                if *raw {
+                    if let Some((qtype, blob, norm, q8_range)) = idx.raw_embedding(element) {
+                        let count = if q8_range.is_some() { 4 } else { 3 };
+                        write_resp_array_header(out, count);
+                        write_resp_bulk(out, qtype.as_bytes());
+                        write_resp_bulk(out, &blob);
+                        write_resp_score(out, norm as f64);
+                        if let Some(r) = q8_range {
+                            write_resp_score(out, r as f64);
+                        }
                     } else {
                         write_resp_null(out);
                     }
-                }
-                Some(c) => {
-                    if let Some(idx) = db.vector_indexes.get_mut(index.as_ref()) {
-                        let members = idx.random_members(*c);
-                        write_resp_array_header(out, members.len());
-                        for m in members {
-                            write_resp_bulk(out, &m);
-                        }
-                    } else {
-                        out.extend_from_slice(b"*0\r\n");
+                } else if let Some(vec) = idx.stored_vector(element) {
+                    write_resp_array_header(out, vec.len());
+                    for v in vec {
+                        write_resp_score(out, v as f64);
                     }
-                }
-            }
-            false
-        }
-        Command::Vsetattr { key, element, attr } => {
-            let index = String::from_utf8_lossy(key);
-            match db.vsetattr(&index, element, attr.clone()) {
-                Ok(updated) => {
-                    if updated {
-                        record_change!(cmd);
-                        notify_key_invalidation(db.port, key.as_ref(), 0);
-                    }
-                    write_resp_integer(out, i64::from(updated));
-                }
-                Err(err) => {
-                    write_resp_err(out, &err);
-                }
-            }
-            false
-        }
-        Command::Vgetattr { key, element } => {
-            let index = String::from_utf8_lossy(key);
-            match db.vgetattr(&index, element) {
-                Ok(Some(attr)) => {
-                    write_resp_bulk(out, attr.as_bytes());
-                }
-                Ok(None) => {
+                } else {
                     write_resp_null(out);
                 }
-                Err(err) => {
-                    write_resp_err(out, &err);
-                }
+                false
             }
-            false
-        }
-        Command::Vismember { key, element } => {
-            if db.table.exists(key.as_ref()) {
-                write_resp_err(
-                    out,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-                return false;
-            }
-            let index = String::from_utf8_lossy(key);
-            let is_mem = db
-                .vector_indexes
-                .get(index.as_ref())
-                .is_some_and(|idx| idx.key_to_id.contains_key(element));
-            write_resp_integer(out, i64::from(is_mem));
-            false
-        }
-        Command::Latency(sub) => {
-            write_latency_response(sub, out);
-            false
-        }
-        Command::PubsubHelp => {
-            let help_lines = [
-                "PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-                "CHANNELS [<pattern>]",
-                "    Return the currently active channels matching a <pattern> (default: '*').",
-                "NUMPAT",
-                "    Return number of subscriptions to patterns (that are performed using",
-                "    the PSUBSCRIBE command).",
-                "NUMSUB [<channel> ...]",
-                "    Return the number of subscribers for the specified channels, excluding",
-                "    pattern subscriptions(default: no channels).",
-                "SHARDCHANNELS [<pattern>]",
-                "    Return the currently active shard level channels matching a <pattern> (default: '*').",
-                "SHARDNUMSUB [<shardchannel> ...]",
-                "    Return the number of subscribers for the specified shard level channels.",
-                "HELP",
-                "    Print this help.",
-            ];
-            out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
-            for line in help_lines {
-                out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
-            }
-            false
-        }
-        Command::FunctionStats => {
-            let libs = crate::scripting::list_functions();
-            let lib_count = libs.len();
-            let func_count: usize = libs.iter().map(|l| l.functions.len()).sum();
-            if CURRENT_CLIENT_RESP3.get() {
-                out.extend_from_slice(b"%2\r\n");
-            } else {
-                out.extend_from_slice(b"*4\r\n");
-            }
-            write_resp_bulk(out, b"running_script");
-            write_resp_null(out);
-            write_resp_bulk(out, b"engines");
-            if CURRENT_CLIENT_RESP3.get() {
-                out.extend_from_slice(b"%1\r\n");
-            } else {
-                out.extend_from_slice(b"*2\r\n");
-            }
-            write_resp_bulk(out, b"LUA");
-            if CURRENT_CLIENT_RESP3.get() {
-                out.extend_from_slice(b"%2\r\n");
-            } else {
-                out.extend_from_slice(b"*4\r\n");
-            }
-            write_resp_bulk(out, b"libraries_count");
-            write_resp_integer(out, lib_count as i64);
-            write_resp_bulk(out, b"functions_count");
-            write_resp_integer(out, func_count as i64);
-            false
-        }
-        Command::Hexpire {
-            key,
-            expire_ms,
-            is_at,
-            condition,
-            fields,
-        } => {
-            match db
-                .table
-                .hexpire(key, *expire_ms, *is_at, *condition, fields)
-            {
-                Ok(res) => {
-                    record_change!(cmd);
-                    write_resp_array_header(out, res.len());
-                    for code in res {
-                        write_resp_integer(out, code);
-                    }
-                }
-                Err(e) => write_resp_err(out, e),
-            }
-            false
-        }
-        Command::Httl {
-            key,
-            is_ms,
-            is_expiretime,
-            fields,
-        } => {
-            match db.table.httl(key, *is_ms, *is_expiretime, fields) {
-                Ok(res) => {
-                    write_resp_array_header(out, res.len());
-                    for code in res {
-                        write_resp_integer(out, code);
-                    }
-                }
-                Err(e) => write_resp_err(out, e),
-            }
-            false
-        }
-        Command::Hpersist { key, fields } => {
-            match db.table.hpersist(key, fields) {
-                Ok(res) => {
-                    record_change!(cmd);
-                    write_resp_array_header(out, res.len());
-                    for code in res {
-                        write_resp_integer(out, code);
-                    }
-                }
-                Err(e) => write_resp_err(out, e),
-            }
-            false
-        }
-        Command::Hgetex {
-            key,
-            expire,
-            fields,
-        } => {
-            match db.table.hgetex(key, *expire, fields) {
-                Ok((vals, modified)) => {
-                    if modified {
-                        record_change!(cmd);
-                    }
-                    write_resp_array_header(out, vals.len());
-                    for v in vals {
-                        match v {
-                            Some(val) => write_resp_bulk(out, &val),
-                            None => out.extend_from_slice(b"$-1\r\n"),
-                        }
-                    }
-                }
-                Err(e) => write_resp_err(out, e),
-            }
-            false
-        }
-        Command::Hsetex {
-            key,
-            condition,
-            expire,
-            pairs,
-        } => {
-            match db
-                .table
-                .hsetex(key.clone(), *condition, *expire, pairs.clone())
-            {
-                Ok(applied) => {
-                    if applied {
-                        record_change!(cmd);
-                        write_resp_integer(out, 1);
-                    } else {
-                        write_resp_integer(out, 0);
-                    }
-                }
-                Err(e) => write_resp_err(out, e),
-            }
-            false
-        }
-        Command::Xclaim {
-            key,
-            group,
-            consumer,
-            min_idle_time,
-            ids,
-            idle,
-            time,
-            retrycount,
-            force,
-            justid,
-        } => {
-            match db.table.xclaim(
+            Command::Vlinks {
                 key,
-                group,
-                consumer.clone(),
-                *min_idle_time,
-                ids,
-                *idle,
-                *time,
-                *retrycount,
-                *force,
-                *justid,
-            ) {
-                Ok((claimed, consumer_created)) => {
-                    if consumer_created {
-                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
-                    }
-                    write_resp_array_header(out, claimed.len());
-                    for (sid, fields) in claimed {
-                        let sid_str = sid.to_string();
-                        if *justid {
-                            write_resp_bulk(out, sid_str.as_bytes());
+                element,
+                with_scores,
+            } => {
+                if db.table.exists(key.as_ref()) {
+                    write_resp_err(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                    return false;
+                }
+                let index = String::from_utf8_lossy(key);
+                let Some(idx) = db.vector_indexes.get(index.as_ref()) else {
+                    write_resp_null(out);
+                    return false;
+                };
+                if let Some(layers) = idx.links(element) {
+                    let is_resp3 = CURRENT_CLIENT_RESP3.get();
+                    write_resp_array_header(out, layers.len());
+                    for layer in layers {
+                        if *with_scores {
+                            if is_resp3 {
+                                out.extend_from_slice(format!("%{}\r\n", layer.len()).as_bytes());
+                            } else {
+                                write_resp_array_header(out, layer.len() * 2);
+                            }
+                            for (nbr, score) in layer {
+                                write_resp_bulk(out, &nbr);
+                                write_resp_score(out, score as f64);
+                            }
                         } else {
-                            write_resp_array_header(out, 2);
-                            write_resp_bulk(out, sid_str.as_bytes());
-                            write_resp_array_header(out, fields.len() * 2);
-                            for (f, v) in fields {
-                                write_resp_bulk(out, &f);
-                                write_resp_bulk(out, &v);
+                            write_resp_array_header(out, layer.len());
+                            for (nbr, _) in layer {
+                                write_resp_bulk(out, &nbr);
                             }
                         }
                     }
+                } else {
+                    write_resp_null(out);
                 }
-                Err(e) => write_resp_err(out, e),
+                false
             }
-            false
-        }
-        Command::Xautoclaim {
-            key,
-            group,
-            consumer,
-            min_idle_time,
-            start,
-            count,
-            justid,
-        } => {
-            match db.table.xautoclaim(
-                key,
-                group,
-                consumer.clone(),
-                *min_idle_time,
-                start,
-                *count,
-                *justid,
-            ) {
-                Ok((next_cursor, claimed, deleted_ids, consumer_created)) => {
-                    if consumer_created {
-                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
-                    }
-                    write_resp_array_header(out, 3);
-                    write_resp_bulk(out, next_cursor.as_bytes());
-                    write_resp_array_header(out, claimed.len());
-                    for (sid, fields) in claimed {
-                        let sid_str = sid.to_string();
-                        if *justid {
-                            write_resp_bulk(out, sid_str.as_bytes());
+            Command::Vrandmember { key, count } => {
+                if db.table.exists(key.as_ref()) {
+                    write_resp_err(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                    return false;
+                }
+                let index = String::from_utf8_lossy(key);
+                match count {
+                    None => {
+                        if let Some(idx) = db.vector_indexes.get_mut(index.as_ref())
+                            && let Some(first) = idx.random_members(1).into_iter().next()
+                        {
+                            write_resp_bulk(out, &first);
                         } else {
-                            write_resp_array_header(out, 2);
-                            write_resp_bulk(out, sid_str.as_bytes());
-                            write_resp_array_header(out, fields.len() * 2);
-                            for (f, v) in fields {
-                                write_resp_bulk(out, &f);
-                                write_resp_bulk(out, &v);
-                            }
+                            write_resp_null(out);
                         }
                     }
-                    write_resp_array_header(out, deleted_ids.len());
-                    for del_sid in deleted_ids {
-                        let s = del_sid.to_string();
-                        write_resp_bulk(out, s.as_bytes());
+                    Some(c) => {
+                        if let Some(idx) = db.vector_indexes.get_mut(index.as_ref()) {
+                            let members = idx.random_members(*c);
+                            write_resp_array_header(out, members.len());
+                            for m in members {
+                                write_resp_bulk(out, &m);
+                            }
+                        } else {
+                            out.extend_from_slice(b"*0\r\n");
+                        }
                     }
                 }
-                Err(e) => write_resp_err(out, e),
+                false
             }
-            false
-        }
-        Command::FunctionKill => {
-            out.extend_from_slice(b"+OK\r\n");
-            false
-        }
-        Command::Publish { channel, message } => {
-            let count = publish_sync(channel.as_ref(), message.as_ref());
-            write_resp_integer(out, count as i64);
-            false
-        }
-        Command::Spublish { channel, message } => {
-            let count = spublish_sync(channel.as_ref(), message.as_ref());
-            write_resp_integer(out, count as i64);
-            false
-        }
-        Command::Unknown(cmd_name) => {
-            if let Some(cmd_prefix) = cmd_name.strip_suffix(" HELP") {
-                let first_line = format!(
-                    "{} <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-                    cmd_prefix
-                );
-                let help_lines = [first_line.as_str(), "HELP -- Print this help."];
-                write_resp_array_header(out, help_lines.len());
+            Command::Vsetattr { key, element, attr } => {
+                let index = String::from_utf8_lossy(key);
+                match db.vsetattr(&index, element, attr.clone()) {
+                    Ok(updated) => {
+                        if updated {
+                            record_change!(cmd);
+                            notify_key_invalidation(db.port, key.as_ref(), 0);
+                        }
+                        write_resp_integer(out, i64::from(updated));
+                    }
+                    Err(err) => {
+                        write_resp_err(out, &err);
+                    }
+                }
+                false
+            }
+            Command::Vgetattr { key, element } => {
+                let index = String::from_utf8_lossy(key);
+                match db.vgetattr(&index, element) {
+                    Ok(Some(attr)) => {
+                        write_resp_bulk(out, attr.as_bytes());
+                    }
+                    Ok(None) => {
+                        write_resp_null(out);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, &err);
+                    }
+                }
+                false
+            }
+            Command::Vismember { key, element } => {
+                if db.table.exists(key.as_ref()) {
+                    write_resp_err(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                    return false;
+                }
+                let index = String::from_utf8_lossy(key);
+                let is_mem = db
+                    .vector_indexes
+                    .get(index.as_ref())
+                    .is_some_and(|idx| idx.key_to_id.contains_key(element));
+                write_resp_integer(out, i64::from(is_mem));
+                false
+            }
+            Command::Latency(sub) => {
+                write_latency_response(sub, out);
+                false
+            }
+            Command::PubsubHelp => {
+                let help_lines = [
+                    "PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    "CHANNELS [<pattern>]",
+                    "    Return the currently active channels matching a <pattern> (default: '*').",
+                    "NUMPAT",
+                    "    Return number of subscriptions to patterns (that are performed using",
+                    "    the PSUBSCRIBE command).",
+                    "NUMSUB [<channel> ...]",
+                    "    Return the number of subscribers for the specified channels, excluding",
+                    "    pattern subscriptions(default: no channels).",
+                    "SHARDCHANNELS [<pattern>]",
+                    "    Return the currently active shard level channels matching a <pattern> (default: '*').",
+                    "SHARDNUMSUB [<shardchannel> ...]",
+                    "    Return the number of subscribers for the specified shard level channels.",
+                    "HELP",
+                    "    Print this help.",
+                ];
+                out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
                 for line in help_lines {
-                    write_resp_bulk(out, line.as_bytes());
+                    out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
                 }
-                return false;
+                false
             }
-            let resp = format!("-ERR unknown command '{}'\r\n", cmd_name);
-            out.extend_from_slice(resp.as_bytes());
-            false
+            Command::FunctionStats => {
+                let libs = crate::scripting::list_functions();
+                let lib_count = libs.len();
+                let func_count: usize = libs.iter().map(|l| l.functions.len()).sum();
+                if CURRENT_CLIENT_RESP3.get() {
+                    out.extend_from_slice(b"%2\r\n");
+                } else {
+                    out.extend_from_slice(b"*4\r\n");
+                }
+                write_resp_bulk(out, b"running_script");
+                write_resp_null(out);
+                write_resp_bulk(out, b"engines");
+                if CURRENT_CLIENT_RESP3.get() {
+                    out.extend_from_slice(b"%1\r\n");
+                } else {
+                    out.extend_from_slice(b"*2\r\n");
+                }
+                write_resp_bulk(out, b"LUA");
+                if CURRENT_CLIENT_RESP3.get() {
+                    out.extend_from_slice(b"%2\r\n");
+                } else {
+                    out.extend_from_slice(b"*4\r\n");
+                }
+                write_resp_bulk(out, b"libraries_count");
+                write_resp_integer(out, lib_count as i64);
+                write_resp_bulk(out, b"functions_count");
+                write_resp_integer(out, func_count as i64);
+                false
+            }
+            Command::Hexpire {
+                key,
+                expire_ms,
+                is_at,
+                condition,
+                fields,
+            } => {
+                match db
+                    .table
+                    .hexpire(key, *expire_ms, *is_at, *condition, fields)
+                {
+                    Ok(res) => {
+                        record_change!(cmd);
+                        write_resp_array_header(out, res.len());
+                        for code in res {
+                            write_resp_integer(out, code);
+                        }
+                    }
+                    Err(e) => write_resp_err(out, e),
+                }
+                false
+            }
+            Command::Httl {
+                key,
+                is_ms,
+                is_expiretime,
+                fields,
+            } => {
+                match db.table.httl(key, *is_ms, *is_expiretime, fields) {
+                    Ok(res) => {
+                        write_resp_array_header(out, res.len());
+                        for code in res {
+                            write_resp_integer(out, code);
+                        }
+                    }
+                    Err(e) => write_resp_err(out, e),
+                }
+                false
+            }
+            Command::Hpersist { key, fields } => {
+                match db.table.hpersist(key, fields) {
+                    Ok(res) => {
+                        record_change!(cmd);
+                        write_resp_array_header(out, res.len());
+                        for code in res {
+                            write_resp_integer(out, code);
+                        }
+                    }
+                    Err(e) => write_resp_err(out, e),
+                }
+                false
+            }
+            Command::Hgetex {
+                key,
+                expire,
+                fields,
+            } => {
+                match db.table.hgetex(key, *expire, fields) {
+                    Ok((vals, modified)) => {
+                        if modified {
+                            record_change!(cmd);
+                        }
+                        write_resp_array_header(out, vals.len());
+                        for v in vals {
+                            match v {
+                                Some(val) => write_resp_bulk(out, &val),
+                                None => out.extend_from_slice(b"$-1\r\n"),
+                            }
+                        }
+                    }
+                    Err(e) => write_resp_err(out, e),
+                }
+                false
+            }
+            Command::Hsetex {
+                key,
+                condition,
+                expire,
+                pairs,
+            } => {
+                match db
+                    .table
+                    .hsetex(key.clone(), *condition, *expire, pairs.clone())
+                {
+                    Ok(applied) => {
+                        if applied {
+                            record_change!(cmd);
+                            write_resp_integer(out, 1);
+                        } else {
+                            write_resp_integer(out, 0);
+                        }
+                    }
+                    Err(e) => write_resp_err(out, e),
+                }
+                false
+            }
+            Command::Xclaim {
+                key,
+                group,
+                consumer,
+                min_idle_time,
+                ids,
+                idle,
+                time,
+                retrycount,
+                force,
+                justid,
+            } => {
+                match db.table.xclaim(
+                    key,
+                    group,
+                    consumer.clone(),
+                    *min_idle_time,
+                    ids,
+                    *idle,
+                    *time,
+                    *retrycount,
+                    *force,
+                    *justid,
+                ) {
+                    Ok((claimed, consumer_created)) => {
+                        if consumer_created {
+                            notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
+                        }
+                        write_resp_array_header(out, claimed.len());
+                        for (sid, fields) in claimed {
+                            let sid_str = sid.to_string();
+                            if *justid {
+                                write_resp_bulk(out, sid_str.as_bytes());
+                            } else {
+                                write_resp_array_header(out, 2);
+                                write_resp_bulk(out, sid_str.as_bytes());
+                                write_resp_array_header(out, fields.len() * 2);
+                                for (f, v) in fields {
+                                    write_resp_bulk(out, &f);
+                                    write_resp_bulk(out, &v);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => write_resp_err(out, e),
+                }
+                false
+            }
+            Command::Xautoclaim {
+                key,
+                group,
+                consumer,
+                min_idle_time,
+                start,
+                count,
+                justid,
+            } => {
+                match db.table.xautoclaim(
+                    key,
+                    group,
+                    consumer.clone(),
+                    *min_idle_time,
+                    start,
+                    *count,
+                    *justid,
+                ) {
+                    Ok((next_cursor, claimed, deleted_ids, consumer_created)) => {
+                        if consumer_created {
+                            notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
+                        }
+                        write_resp_array_header(out, 3);
+                        write_resp_bulk(out, next_cursor.as_bytes());
+                        write_resp_array_header(out, claimed.len());
+                        for (sid, fields) in claimed {
+                            let sid_str = sid.to_string();
+                            if *justid {
+                                write_resp_bulk(out, sid_str.as_bytes());
+                            } else {
+                                write_resp_array_header(out, 2);
+                                write_resp_bulk(out, sid_str.as_bytes());
+                                write_resp_array_header(out, fields.len() * 2);
+                                for (f, v) in fields {
+                                    write_resp_bulk(out, &f);
+                                    write_resp_bulk(out, &v);
+                                }
+                            }
+                        }
+                        write_resp_array_header(out, deleted_ids.len());
+                        for del_sid in deleted_ids {
+                            let s = del_sid.to_string();
+                            write_resp_bulk(out, s.as_bytes());
+                        }
+                    }
+                    Err(e) => write_resp_err(out, e),
+                }
+                false
+            }
+            Command::FunctionKill => {
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Publish { channel, message } => {
+                let count = publish_sync(channel.as_ref(), message.as_ref());
+                write_resp_integer(out, count as i64);
+                false
+            }
+            Command::Spublish { channel, message } => {
+                let count = spublish_sync(channel.as_ref(), message.as_ref());
+                write_resp_integer(out, count as i64);
+                false
+            }
+            Command::Unknown(cmd_name) => {
+                if let Some(cmd_prefix) = cmd_name.strip_suffix(" HELP") {
+                    let first_line = format!(
+                        "{} <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                        cmd_prefix
+                    );
+                    let help_lines = [first_line.as_str(), "HELP -- Print this help."];
+                    write_resp_array_header(out, help_lines.len());
+                    for line in help_lines {
+                        write_resp_bulk(out, line.as_bytes());
+                    }
+                    return false;
+                }
+                let resp = format!("-ERR unknown command '{}'\r\n", cmd_name);
+                out.extend_from_slice(resp.as_bytes());
+                false
+            }
+            Command::Wait { .. } => {
+                out.extend_from_slice(b":0\r\n");
+                false
+            }
+            Command::WaitAof { .. } => {
+                out.extend_from_slice(b"*2\r\n:0\r\n:0\r\n");
+                false
+            }
+            Command::Quit => {
+                out.extend_from_slice(b"+OK\r\n");
+                true
+            }
+            _ => false,
         }
-        Command::Wait { .. } => {
-            out.extend_from_slice(b":0\r\n");
-            false
-        }
-        Command::WaitAof { .. } => {
-            out.extend_from_slice(b"*2\r\n:0\r\n:0\r\n");
-            false
-        }
-        Command::Quit => {
-            out.extend_from_slice(b"+OK\r\n");
-            true
-        }
-        _ => false,
-    }
+    })();
+    db.drain_dropped_tier();
+    ret
 }
 
 #[inline(always)]
@@ -23041,12 +23211,12 @@ async fn execute_commands_squashed(
         } else {
             None
         };
-        let acl_guard = acl.as_ref().map(|a| a.read().unwrap());
+        let acl_guard = acl.as_ref().map(|a| a.read());
         let user = acl_guard.as_ref().and_then(|g| g.users.get(auth_user));
 
         let hub = if crate::cluster::has_active_cluster(router.port) {
             let h = crate::cluster::get_cluster_hub(router.port);
-            if !h.nodes.read().unwrap().is_empty() {
+            if !h.nodes.read().is_empty() {
                 Some(h)
             } else {
                 None
@@ -23054,7 +23224,7 @@ async fn execute_commands_squashed(
         } else {
             None
         };
-        let my_slots_guard = hub.as_ref().map(|h| h.my_slots.read().unwrap());
+        let my_slots_guard = hub.as_ref().map(|h| h.my_slots.read());
         let is_cluster = router.cluster_enabled || my_slots_guard.is_some();
         if has_special || user.is_some() || is_cluster {
             for cmd in commands.iter() {
@@ -23194,6 +23364,7 @@ async fn execute_commands_squashed(
             stat_run.note(get_cmd_name(&cmd));
             if target == router.shard_id {
                 local_buf.clear();
+                local_db.hydrate_cmd_keys(&cmd);
                 if let Command::Get(ref key) = cmd {
                     let compact_res = local_db.table.get_compact_with_hash(key.as_ref(), key_hash);
                     match compact_res {
@@ -23879,7 +24050,7 @@ async fn flush_remote_batches(
     for (target_shard, items) in remote_batches.iter_mut().enumerate() {
         if !items.is_empty() {
             let responder = &responders[target_shard];
-            responder.prepare(resp_base_ptr);
+            responder.prepare(resp_base_ptr, responses.len());
             let next_items = items_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
             let msg = ShardMessage::Batch {
                 items: std::mem::replace(items, next_items),
@@ -24243,7 +24414,7 @@ async fn blmove_across_shards(
     let (tx, rx) = flume::bounded(1);
     {
         let hub_arc = crate::block::get_block_hub_for_port(router.port);
-        let mut hub = hub_arc.lock().unwrap();
+        let mut hub = hub_arc.lock();
         hub.register_blocked_client(client_id, tx.clone());
         hub.register_list_waiter(client_id, source.clone(), to_pop_type(where_from), 1, tx);
     }
@@ -24488,9 +24659,15 @@ async fn sum_remote_counts(router: &Router, cmds: Vec<(usize, Command)>) -> usiz
 
 pub(crate) struct RecvBytesMut(pub BytesMut);
 
+// SAFETY: `write_ptr` is the start of the BytesMut's spare capacity and
+// `bytes_total` is exactly its length, so that range is writable memory owned
+// by `self.0`; the heap buffer does not move when the wrapper is moved, and
+// `set_init` only extends `len` over bytes the kernel has written.
 unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
     #[inline(always)]
     fn write_ptr(&mut self) -> *mut u8 {
+        // SAFETY: `len <= capacity`, so the offset stays within (or one past the end
+        // of) the BytesMut's allocation.
         unsafe { self.0.as_mut_ptr().add(self.0.len()) }
     }
 
@@ -24499,8 +24676,14 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
         self.0.capacity() - self.0.len()
     }
 
+    /// # Safety
+    ///
+    /// The first `read_len` bytes at `write_ptr()` must have been initialized
+    /// (e.g. by a completed read) and `read_len <= bytes_total()`.
     #[inline(always)]
     unsafe fn set_init(&mut self, read_len: usize) {
+        // SAFETY: By the caller contract, `len + read_len <= capacity` and those
+        // `read_len` spare bytes are initialized.
         unsafe {
             self.0.set_len(self.0.len() + read_len);
         }
@@ -24510,6 +24693,21 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Client handlers run under `catch_unwind`; with std locks a panic
+    /// while holding a global lock poisoned it and every later `.lock()
+    /// .unwrap()` on any connection panicked too.
+    #[test]
+    fn test_panic_holding_global_lock_does_not_cascade() {
+        let r = std::thread::spawn(|| {
+            let _g = ERROR_STATS.write();
+            panic!("handler bug while holding ERROR_STATS");
+        })
+        .join();
+        assert!(r.is_err());
+        record_error_stat("POISONTEST", Some("get"));
+        assert!(ERROR_STATS.read().get("POISONTEST").copied().unwrap_or(0) >= 1);
+    }
     use crate::resp::Command;
     use bytes::Bytes;
 
@@ -24690,7 +24888,6 @@ mod tests {
         // Restricted user lacks the command.
         crate::acl::get_acl_for_port(port)
             .write()
-            .unwrap()
             .set_user(
                 "limited",
                 &["on", "nopass", "-@all", "+get", "+subscribe", "&ch"].map(String::from),
@@ -24932,7 +25129,7 @@ mod tests {
 
         // Flush and verify in global map
         flush_local_cmd_stats();
-        let map = CMD_STATS.read().unwrap();
+        let map = CMD_STATS.read();
         assert!(map.get("get").map_or(0, |s| s.calls) >= 2);
         assert!(map.get("set").map_or(0, |s| s.calls) >= 1);
     }
@@ -25032,7 +25229,6 @@ mod tests {
         assert_eq!((merged.calls, merged.nanos), (4, 203_500));
         CMD_STATS
             .write()
-            .unwrap()
             .insert("unittest|histo".to_string(), merged);
 
         let mut out = Vec::new();
@@ -25052,7 +25248,7 @@ mod tests {
             &mut out,
         );
         assert_eq!(out, b"*0\r\n");
-        CMD_STATS.write().unwrap().remove("unittest|histo");
+        CMD_STATS.write().remove("unittest|histo");
     }
 
     #[test]
@@ -25113,6 +25309,9 @@ mod tests {
         let mut recv_buf = RecvBytesMut(b);
         assert_eq!(recv_buf.bytes_total(), 64 - 13);
         let suffix = b"$4\r\nmyk1\r\n";
+        // SAFETY: `suffix.len()` (10) is within `bytes_total()` (51), the source is a
+        // separate static array so the ranges don't overlap, and `set_init` covers
+        // exactly the bytes just written.
         unsafe {
             std::ptr::copy_nonoverlapping(suffix.as_ptr(), recv_buf.write_ptr(), suffix.len());
             recv_buf.set_init(suffix.len());
@@ -25266,9 +25465,7 @@ mod tests {
     fn assert_commands_publish(
         cases: &'static [(&'static [&'static str], &'static [&'static str])],
     ) {
-        let _flags = NOTIFY_FLAGS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _flags = NOTIFY_FLAGS_TEST_LOCK.lock();
         // execute_command's future is too deep for the default test stack in debug builds.
         std::thread::Builder::new()
             .stack_size(256 << 20)
@@ -25608,7 +25805,7 @@ mod tests {
     fn test_squashed_pending_bitmask_polling() {
         let responder = std::sync::Arc::new(crate::mailbox::BatchResponder::new());
         let mut resp_slot = [crate::shard::CompactResp::NULL; 4];
-        responder.prepare(resp_slot.as_mut_ptr());
+        responder.prepare(resp_slot.as_mut_ptr(), resp_slot.len());
 
         let mut pending_mask: u64 = 0b101; // shards 0 and 2
         let responders = [responder.clone(), responder.clone(), responder.clone()];
@@ -26065,10 +26262,14 @@ mod tests {
         set_max_clients(5000);
         assert_eq!(get_max_clients(), 5000);
 
-        set_max_memory_policy("allkeys-lru");
-        assert_eq!(get_max_memory_policy(), "allkeys-lru");
-        set_max_memory_policy("volatile-random");
-        assert_eq!(get_max_memory_policy(), "volatile-random");
+        {
+            let _policy_guard = MAX_MEMORY_POLICY_TEST_LOCK.lock();
+            set_max_memory_policy("allkeys-lru");
+            assert_eq!(get_max_memory_policy(), "allkeys-lru");
+            set_max_memory_policy("volatile-random");
+            assert_eq!(get_max_memory_policy(), "volatile-random");
+            set_max_memory_policy("noeviction");
+        }
 
         // write_resp primitives
         let mut out = Vec::new();
@@ -26101,9 +26302,7 @@ mod tests {
     fn test_hostile_sizes_execute_with_bounded_replies() {
         // Thousands of commands, some slow, would land in the global slowlog
         // while the slowlog tests assert on its exact contents.
-        let _slowlog = crate::slowlog::tests::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _slowlog = crate::slowlog::tests::TEST_LOCK.lock();
         // execute_command's future is too deep for the default test stack in debug builds.
         std::thread::Builder::new()
             .stack_size(256 << 20)

@@ -184,12 +184,12 @@ mod tests {
     /// The census is process-global state, but cargo runs tests in parallel by
     /// default. Every test here mutates it, so they must be serialized against
     /// each other or they will observe one another's registrations.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// Takes the serialization lock, ignoring poisoning: an earlier test
     /// panicking on an assertion must not cascade into spurious failures here.
-    fn lock_census() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock_census() -> parking_lot::MutexGuard<'static, ()> {
+        TEST_LOCK.lock()
     }
 
     #[test]

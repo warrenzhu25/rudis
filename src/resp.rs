@@ -763,6 +763,9 @@ pub enum Command {
     // GENERIC & DATABASE COMMANDS
     Type(Bytes),
     Dbsize,
+    /// Internal (never parsed from the wire): per-shard `[keys, expires]`
+    /// for `INFO keyspace`.
+    KeyspaceStats,
     Select(u32),
     Slowlog(Vec<Bytes>),
     Debug(Vec<Bytes>),
@@ -2250,9 +2253,9 @@ pub fn bytes_to_uppercase_ascii<'a>(
         for (i, b) in bytes.iter().enumerate() {
             buf[i] = b.to_ascii_uppercase();
         }
-        // SAFETY: All input bytes were ASCII, and ASCII uppercase preserves ASCII values (< 128),
-        // which are guaranteed to be valid UTF-8.
-        unsafe { std::str::from_utf8_unchecked(&buf[..bytes.len()]) }
+        // All bytes are ASCII, so this never fails (and is a cheap scan of
+        // at most 64 bytes).
+        std::str::from_utf8(&buf[..bytes.len()]).unwrap_or_default()
     } else {
         *heap = String::from_utf8_lossy(bytes).to_uppercase();
         heap.as_str()
@@ -2261,6 +2264,13 @@ pub fn bytes_to_uppercase_ascii<'a>(
 
 pub static PROTO_MAX_BULK_LEN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(512 * 1024 * 1024);
+
+/// Command frames (or, for >16-argument commands, single arguments) up to
+/// this size are copied out of the connection's read buffer into their own
+/// allocation, so retained keys/values pin only their own bytes. Larger ones
+/// stay zero-copy: the copy would cost more, and the pinned buffer is then
+/// mostly the value itself.
+pub const DETACH_FRAME_MAX: usize = 64 * 1024;
 
 #[inline(always)]
 pub fn get_proto_max_bulk_len() -> usize {
@@ -2363,7 +2373,23 @@ fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Com
     }
 
     if is_small {
-        let frame = buf.split_to(scan_cursor).freeze();
+        // Arguments are sliced out of `frame`; any key or value the table
+        // keeps holds the frame's whole backing allocation alive. A slice of
+        // the shared read buffer would pin all of it (128 KB+), so a few
+        // surviving keys could keep every buffer ever read resident and
+        // invisible to `maxmemory`. Copy frames up to DETACH_FRAME_MAX into
+        // their own allocation instead. Plain GET never retains its argument,
+        // so it keeps the zero-copy slice.
+        let is_get = num_args == 2
+            && offsets[0].1 == 3
+            && buf[offsets[0].0..offsets[0].0 + 3].eq_ignore_ascii_case(b"GET");
+        let frame = if !is_get && scan_cursor <= DETACH_FRAME_MAX {
+            let f = Bytes::copy_from_slice(&buf[..scan_cursor]);
+            buf.advance(scan_cursor);
+            f
+        } else {
+            buf.split_to(scan_cursor).freeze()
+        };
         if num_args > 0 {
             let (cmd_start, cmd_len) = offsets[0];
             let cmd_bytes = &frame[cmd_start..cmd_start + cmd_len];
@@ -2597,7 +2623,15 @@ fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Com
             let arg_len: usize = parse_decimal_bytes(&buf[1..header_crlf]).unwrap_or(0);
 
             buf.advance(next_advance); // Consume "$len\r\n"
-            let data = buf.split_to(arg_len).freeze(); // Zero-copy slice!
+            // See DETACH_FRAME_MAX: small arguments get their own allocation
+            // so a retained one doesn't pin the shared read buffer.
+            let data = if arg_len <= DETACH_FRAME_MAX {
+                let d = Bytes::copy_from_slice(&buf[..arg_len]);
+                buf.advance(arg_len);
+                d
+            } else {
+                buf.split_to(arg_len).freeze()
+            };
             buf.advance(2); // Consume "\r\n"
             args.push(data);
         }
@@ -13994,6 +14028,9 @@ pub fn parse_redis_f64(s: &str) -> Option<f64> {
         return None;
     }
     if let Ok(c_str) = std::ffi::CString::new(s) {
+        // SAFETY: `c_str` is a NUL-terminated CString alive for the whole block;
+        // strtod reads up to the NUL and sets `end` to a pointer into that buffer
+        // (at most its NUL), so `*end` (after the null check) reads inside it.
         unsafe {
             let mut end: *mut libc::c_char = std::ptr::null_mut();
             let val = libc::strtod(c_str.as_ptr(), &mut end);
@@ -14053,6 +14090,152 @@ fn find_newline_at(buf: &[u8], start: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic byte-level mutator shared by the parser fuzz tests.
+    /// `RUDIS_FUZZ_ITERS` raises the iteration count for longer local runs.
+    struct Mutator(u64);
+
+    impl Mutator {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+
+        fn mutate(&mut self, input: &[u8]) -> Vec<u8> {
+            const NUMBERS: &[&[u8]] = &[
+                b"-1",
+                b"0",
+                b"-9223372036854775808",
+                b"9223372036854775807",
+                b"18446744073709551616",
+                b"4294967296",
+                b"536870912",
+                b"99999999999999999999999",
+            ];
+            let mut v = input.to_vec();
+            for _ in 0..=self.below(4) {
+                let len = v.len();
+                match self.below(8) {
+                    0 if len > 0 => {
+                        let i = self.below(len);
+                        v[i] ^= 1 << self.below(8);
+                    }
+                    1 if len > 0 => {
+                        let i = self.below(len);
+                        v[i] = [b'\r', b'\n', b'*', b'$', b'-', b' ', 0, 0xFF][self.below(8)];
+                    }
+                    2 => {
+                        let i = self.below(len + 1);
+                        let b = self.next() as u8;
+                        v.insert(i, b);
+                    }
+                    3 if len > 0 => {
+                        let i = self.below(len);
+                        let j = (i + 1 + self.below(8)).min(len);
+                        v.drain(i..j);
+                    }
+                    4 if len > 0 => v.truncate(self.below(len)),
+                    5 if len > 0 => {
+                        let i = self.below(len);
+                        let j = (i + 1 + self.below(16)).min(len);
+                        let chunk = v[i..j].to_vec();
+                        let at = self.below(v.len() + 1);
+                        v.splice(at..at, chunk);
+                    }
+                    _ => {
+                        // Replace a run of digits with a hostile number.
+                        let digits: Vec<usize> =
+                            (0..len).filter(|&i| v[i].is_ascii_digit()).collect();
+                        if let Some(&start) = digits.get(self.below(digits.len())) {
+                            let mut end = start;
+                            while end < len && v[end].is_ascii_digit() {
+                                end += 1;
+                            }
+                            let n = NUMBERS[self.below(NUMBERS.len())];
+                            v.splice(start..end, n.iter().copied());
+                        }
+                    }
+                }
+            }
+            v
+        }
+    }
+
+    fn fuzz_iters(default: usize) -> usize {
+        std::env::var("RUDIS_FUZZ_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Parses `buf` to exhaustion. Every `Ok(Some)` must consume input
+    /// (otherwise the connection loop would spin), and the parser must not
+    /// panic. Returns the commands and whether parsing ended in an error.
+    fn parse_all(buf: &mut BytesMut, out: &mut Vec<String>) -> bool {
+        loop {
+            let before = buf.len();
+            match parse_command(buf) {
+                Ok(Some(cmd)) => {
+                    assert!(buf.len() < before, "parsed {cmd:?} without consuming input");
+                    out.push(format!("{cmd:?}"));
+                }
+                Ok(None) => return false,
+                Err(_) => return true,
+            }
+        }
+    }
+
+    /// Untrusted client bytes through the framer (RESP arrays, inline and
+    /// memcached text): no panics, no zero-progress loops, and feeding the
+    /// same bytes in two pieces yields the same commands as all at once.
+    #[test]
+    fn test_parse_command_byte_fuzz() {
+        let mut many = b"*20\r\n$4\r\nMSET\r\n".to_vec();
+        for i in 0..19 {
+            many.extend_from_slice(format!("$2\r\nk{}\r\n", i % 10).as_bytes());
+        }
+        let corpus: Vec<Vec<u8>> = vec![
+            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n".to_vec(),
+            b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n".to_vec(),
+            b"SET a b\r\nGET a\r\nPING\r\n".to_vec(),
+            b"set k 0 0 5\r\nhello\r\nget k\r\ndelete k\r\n".to_vec(),
+            b"*5\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n".to_vec(),
+            b"*-1\r\n*0\r\n\r\n*1\r\n$4\r\nPING\r\n".to_vec(),
+            b"*4\r\n$4\r\nZADD\r\n$1\r\nz\r\n$3\r\ninf\r\n$1\r\nm\r\n".to_vec(),
+            many,
+        ];
+        let mut m = Mutator(0x2545_F491_4F6C_DD1D);
+        for iter in 0..fuzz_iters(20_000) {
+            let input = m.mutate(&corpus[iter % corpus.len()]);
+            let split = m.below(input.len() + 1);
+            let res = std::panic::catch_unwind(|| {
+                let mut whole = Vec::new();
+                let whole_err = parse_all(&mut BytesMut::from(&input[..]), &mut whole);
+
+                let mut pieces = Vec::new();
+                let mut buf = BytesMut::from(&input[..split]);
+                let mut piece_err = parse_all(&mut buf, &mut pieces);
+                if !piece_err {
+                    buf.extend_from_slice(&input[split..]);
+                    piece_err = parse_all(&mut buf, &mut pieces);
+                }
+                if !whole_err && !piece_err {
+                    assert_eq!(whole, pieces, "split at {split} changed the parse");
+                }
+            });
+            assert!(
+                res.is_ok(),
+                "parser panicked on {:?}",
+                String::from_utf8_lossy(&input)
+            );
+        }
+    }
 
     #[test]
     fn test_migrate_is_allowed_over_maxmemory() {

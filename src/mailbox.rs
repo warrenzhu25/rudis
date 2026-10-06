@@ -3,6 +3,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[derive(Debug, Default)]
 #[repr(align(64))]
 pub struct CachePadded<T>(pub T);
 
@@ -57,6 +58,102 @@ pub fn cross_shard_spin() -> usize {
     CROSS_SHARD_SPIN.load(Ordering::Relaxed)
 }
 
+const BELL_IDLE: u8 = 0;
+const BELL_WAITING: u8 = 1;
+const BELL_RUNG: u8 = 2;
+
+/// Cross-thread wake-up for a single waiting task (or thread).
+///
+/// Replaces `flume::bounded::<()>(1)` used purely as a signal. On the
+/// cross-shard GET/SET path flume cost ~11% of CPU (its `try_send` takes a
+/// lock and walks the waiter list on every completion, the waiter then
+/// drains with `try_recv`). Here a ring with nobody parked is one atomic
+/// swap; the waker slot's lock is only taken when the waiter actually
+/// parked, and then it is uncontended (one waiter, one waking ringer).
+///
+/// Any number of threads may `ring`; only one task waits at a time. A ring
+/// is never lost: it either finds the waiter parked and wakes it, or leaves
+/// the bell `RUNG` so the next `wait` returns at once.
+#[derive(Default)]
+pub struct Doorbell {
+    state: std::sync::atomic::AtomicU8,
+    waker: parking_lot::Mutex<Option<std::task::Waker>>,
+}
+
+impl Doorbell {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline(always)]
+    pub fn ring(&self) {
+        // AcqRel: publishes everything the ringer wrote before (the reply,
+        // the queued message) to the waiter that consumes this ring.
+        if self.state.swap(BELL_RUNG, Ordering::AcqRel) == BELL_WAITING {
+            let waker = self.waker.lock().take();
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+    }
+
+    /// Consumes a pending ring, if any, without waiting.
+    #[inline(always)]
+    pub fn try_consume(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == BELL_RUNG
+            && self.state.swap(BELL_IDLE, Ordering::AcqRel) == BELL_RUNG
+    }
+
+    fn poll_wait(&self, waker: &std::task::Waker) -> std::task::Poll<()> {
+        use std::task::Poll;
+        // Consume a ring that is already there (also the wake-up path).
+        if self.state.swap(BELL_IDLE, Ordering::AcqRel) == BELL_RUNG {
+            return Poll::Ready(());
+        }
+        {
+            let mut slot = self.waker.lock();
+            match &*slot {
+                Some(w) if w.will_wake(waker) => {}
+                _ => *slot = Some(waker.clone()),
+            }
+        }
+        // The waker is stored before WAITING is visible, so a ringer that
+        // sees WAITING always finds it.
+        match self.state.compare_exchange(
+            BELL_IDLE,
+            BELL_WAITING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Poll::Pending,
+            Err(_) => {
+                // Rung in between: consume it.
+                self.state.swap(BELL_IDLE, Ordering::AcqRel);
+                Poll::Ready(())
+            }
+        }
+    }
+
+    /// Waits for the next ring (or consumes one that is already pending).
+    pub async fn wait(&self) {
+        std::future::poll_fn(|cx| self.poll_wait(cx.waker())).await
+    }
+
+    /// Blocking [`Self::wait`] for plain threads (tests, sync helpers).
+    pub fn wait_blocking(&self) {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = std::task::Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+        while self.poll_wait(&waker).is_pending() {
+            std::thread::park();
+        }
+    }
+}
+
 /// Shared-memory Scatter-Gather Descriptor for multi-shard MGET.
 pub const DESC_RUNNING: u8 = 0;
 pub const DESC_COMPLETED: u8 = 1;
@@ -71,7 +168,16 @@ pub struct ScatterMgetDescriptor {
     pub recycled_keys: Box<[CachePadded<UnsafeCell<Vec<(usize, Bytes)>>>]>,
 }
 
+// SAFETY: Every field is itself Send (Bytes, Vec, flume::Sender, atomics);
+// `UnsafeCell<T>` is Send for `T: Send`, so this impl adds no new capability.
 unsafe impl Send for ScatterMgetDescriptor {}
+// SAFETY: The UnsafeCells follow the scatter-gather protocol: `results[i]` is
+// written only by the one remote shard that owns key `i`, and `recycled_keys[s]`
+// only by shard `s`, both before that shard's AcqRel `finish_shard`. The
+// coordinator reads them only after `wait_completed` observes DESC_COMPLETED
+// (Acquire), and calls `reset` (writing `notify` and the slots) only while no
+// remote shard holds the descriptor. `notify` is read only by the last
+// finisher, and only when the coordinator is parked in DESC_SLEEPING.
 unsafe impl Sync for ScatterMgetDescriptor {}
 
 impl ScatterMgetDescriptor {
@@ -112,10 +218,17 @@ impl ScatterMgetDescriptor {
             },
             Ordering::Relaxed,
         );
+        // SAFETY: `reset` runs on the coordinator before the descriptor is handed to
+        // any remote shard, so no other thread is reading `notify`. The router only
+        // reuses a pooled descriptor once `Arc::strong_count == 1`, i.e. after the
+        // last finisher dropped its clone, so a `finish_shard` still inside
+        // `try_send` on the old sender cannot overlap this write.
         unsafe {
             *self.notify.get() = notify;
         }
         for i in 0..total_keys.min(self.results.len()) {
+            // SAFETY: Same as above: no remote shard holds the descriptor yet, so the
+            // coordinator has exclusive access to every result slot.
             unsafe {
                 *self.results[i].get() = None;
             }
@@ -125,6 +238,9 @@ impl ScatterMgetDescriptor {
 
     #[inline(always)]
     pub fn write_result(&self, idx: usize, val: Option<Bytes>) {
+        // SAFETY: Each `idx` is owned by exactly one remote shard (the shard that owns
+        // that key) and is written once, before that shard calls `finish_shard`; the
+        // coordinator does not read it until DESC_COMPLETED is observed.
         unsafe {
             *self.results[idx].get() = val;
         }
@@ -132,6 +248,8 @@ impl ScatterMgetDescriptor {
 
     #[inline(always)]
     pub fn recycle_keys(&self, shard_id: usize, keys: Vec<(usize, Bytes)>) {
+        // SAFETY: `recycled_keys[shard_id]` is written only by shard `shard_id`, before
+        // its `finish_shard`; the coordinator reads it only after completion.
         unsafe {
             *self.recycled_keys[shard_id].get() = keys;
         }
@@ -142,6 +260,8 @@ impl ScatterMgetDescriptor {
         if self.pending.fetch_sub(1, Ordering::AcqRel) == 1
             && self.state.swap(DESC_COMPLETED, Ordering::AcqRel) == DESC_SLEEPING
         {
+            // SAFETY: We are the last finisher and saw DESC_SLEEPING, so the coordinator
+            // is parked on `notify_rx` and cannot be in `reset` writing `notify`.
             let tx = unsafe { &*self.notify.get() };
             let _ = tx.try_send(());
         }
@@ -181,6 +301,8 @@ impl ScatterMgetDescriptor {
         let n = total_keys.min(self.results.len());
         let mut out = Vec::with_capacity(n);
         for cell in self.results[..n].iter() {
+            // SAFETY: Called by the coordinator after `wait_completed`, so every remote
+            // write happened-before this read and no shard touches the slots anymore.
             out.push(unsafe { (*cell.get()).take() });
         }
         out
@@ -190,6 +312,8 @@ impl ScatterMgetDescriptor {
     pub fn take_recycled_keys(&self) -> Vec<Vec<(usize, Bytes)>> {
         let mut out = Vec::with_capacity(self.recycled_keys.len());
         for cell in self.recycled_keys.iter() {
+            // SAFETY: Called by the coordinator after `wait_completed`; no remote shard
+            // writes `recycled_keys` anymore.
             out.push(unsafe { std::mem::take(&mut *cell.get()) });
         }
         out
@@ -204,7 +328,13 @@ pub struct ScatterMsetDescriptor {
     pub recycled_pairs: Box<[CachePadded<UnsafeCell<Vec<(Bytes, Bytes)>>>]>,
 }
 
+// SAFETY: Every field is itself Send; `UnsafeCell<T>` is Send for `T: Send`.
 unsafe impl Send for ScatterMsetDescriptor {}
+// SAFETY: `recycled_pairs[s]` is written only by shard `s` before its AcqRel
+// `finish_shard` and read by the coordinator only after `wait_completed`
+// observes DESC_COMPLETED; `notify` is written in `reset` only while no remote
+// shard holds the descriptor, and read only by the last finisher while the
+// coordinator is parked in DESC_SLEEPING.
 unsafe impl Sync for ScatterMsetDescriptor {}
 
 impl ScatterMsetDescriptor {
@@ -235,6 +365,10 @@ impl ScatterMsetDescriptor {
             },
             Ordering::Relaxed,
         );
+        // SAFETY: `reset` runs before the descriptor is handed to any remote shard,
+        // so no other thread is reading `notify`. Pooled descriptors are reused only
+        // at `Arc::strong_count == 1` (see `Router::acquire_mset_descriptor`), so no
+        // finisher is still borrowing the old sender.
         unsafe {
             *self.notify.get() = notify;
         }
@@ -243,6 +377,8 @@ impl ScatterMsetDescriptor {
 
     #[inline(always)]
     pub fn recycle_pairs(&self, shard_id: usize, pairs: Vec<(Bytes, Bytes)>) {
+        // SAFETY: `recycled_pairs[shard_id]` is written only by shard `shard_id`,
+        // before its `finish_shard`; the coordinator reads it only after completion.
         unsafe {
             *self.recycled_pairs[shard_id].get() = pairs;
         }
@@ -253,6 +389,8 @@ impl ScatterMsetDescriptor {
         if self.pending.fetch_sub(1, Ordering::AcqRel) == 1
             && self.state.swap(DESC_COMPLETED, Ordering::AcqRel) == DESC_SLEEPING
         {
+            // SAFETY: We are the last finisher and saw DESC_SLEEPING, so the coordinator
+            // is parked on `notify_rx` and cannot be in `reset` writing `notify`.
             let tx = unsafe { &*self.notify.get() };
             let _ = tx.try_send(());
         }
@@ -286,6 +424,8 @@ impl ScatterMsetDescriptor {
     pub fn take_recycled_pairs(&self) -> Vec<Vec<(Bytes, Bytes)>> {
         let mut out = Vec::with_capacity(self.recycled_pairs.len());
         for cell in self.recycled_pairs.iter() {
+            // SAFETY: Called by the coordinator after `wait_completed`; no remote shard
+            // writes `recycled_pairs` anymore.
             out.push(unsafe { std::mem::take(&mut *cell.get()) });
         }
         out
@@ -300,21 +440,40 @@ pub struct FastGetDescriptor {
     /// non-string value.
     pub wrong_type: AtomicBool,
     pub done: AtomicBool,
-    pub notify: flume::Sender<()>,
+    pub bell: Doorbell,
 }
 
+// SAFETY: Every field is itself Send; `UnsafeCell<T>` is Send for `T: Send`.
 unsafe impl Send for FastGetDescriptor {}
+// SAFETY: `val` is written once by the remote shard in `finish`, before the
+// Release store of `done`; the requester reads it only after observing
+// `done == true` with Acquire (`wait_done`), and the writer never touches it
+// again, so the cell is never accessed concurrently.
 unsafe impl Sync for FastGetDescriptor {}
 
 impl FastGetDescriptor {
     #[inline(always)]
-    pub fn new(key: Bytes, notify: flume::Sender<()>) -> Self {
+    pub fn new(key: Bytes) -> Self {
         Self {
             key,
             val: CachePadded(UnsafeCell::new(None)),
             wrong_type: AtomicBool::new(false),
             done: AtomicBool::new(false),
-            notify,
+            bell: Doorbell::new(),
+        }
+    }
+
+    /// Waits (after `spin` polls) until a remote shard has called `finish`.
+    #[inline(always)]
+    pub async fn wait_done(&self, spin: usize) {
+        for _ in 0..spin {
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        while !self.done.load(Ordering::Acquire) {
+            self.bell.wait().await;
         }
     }
 
@@ -327,11 +486,14 @@ impl FastGetDescriptor {
 
     #[inline(always)]
     pub fn finish(&self, val: Option<Bytes>) {
+        // SAFETY: Only the single remote shard that received this descriptor calls
+        // `finish`, once; the requester does not read `val` until it observes the
+        // Release store of `done` below.
         unsafe {
             *self.val.get() = val;
         }
         self.done.store(true, Ordering::Release);
-        let _ = self.notify.try_send(());
+        self.bell.ring();
     }
 }
 
@@ -341,32 +503,44 @@ pub struct FastSetDescriptor {
     pub value: Bytes,
     pub expire_in: Option<Duration>,
     pub done: AtomicBool,
-    pub notify: flume::Sender<()>,
+    pub bell: Doorbell,
 }
 
+// SAFETY: Every field is Send (Bytes, Duration, atomics, Doorbell).
 unsafe impl Send for FastSetDescriptor {}
+// SAFETY: There is no interior mutability besides atomics and the Doorbell's
+// mutex, all of which are Sync; the other fields are immutable after `new`.
 unsafe impl Sync for FastSetDescriptor {}
 
 impl FastSetDescriptor {
-    pub fn new(
-        key: Bytes,
-        value: Bytes,
-        expire_in: Option<Duration>,
-        notify: flume::Sender<()>,
-    ) -> Self {
+    pub fn new(key: Bytes, value: Bytes, expire_in: Option<Duration>) -> Self {
         Self {
             key,
             value,
             expire_in,
             done: AtomicBool::new(false),
-            notify,
+            bell: Doorbell::new(),
         }
     }
 
     #[inline(always)]
     pub fn finish(&self) {
         self.done.store(true, Ordering::Release);
-        let _ = self.notify.try_send(());
+        self.bell.ring();
+    }
+
+    /// Waits (after `spin` polls) until a remote shard has called `finish`.
+    #[inline(always)]
+    pub async fn wait_done(&self, spin: usize) {
+        for _ in 0..spin {
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        while !self.done.load(Ordering::Acquire) {
+            self.bell.wait().await;
+        }
     }
 }
 
@@ -376,12 +550,21 @@ impl FastSetDescriptor {
 pub struct BatchResponder {
     pub state: CachePadded<std::sync::atomic::AtomicU8>,
     pub responses_ptr: std::sync::atomic::AtomicPtr<crate::shard::CompactResp>,
+    /// Length of the slice behind `responses_ptr`; `write_slot` bounds-checks
+    /// against it.
+    pub responses_len: AtomicUsize,
     pub recycled_items: CachePadded<UnsafeCell<Option<Vec<(usize, u64, crate::resp::Command)>>>>,
-    pub notify_tx: flume::Sender<()>,
-    pub notify_rx: flume::Receiver<()>,
+    pub bell: Doorbell,
 }
 
+// SAFETY: Every field is Send; `UnsafeCell<T>` is Send for `T: Send`, and the
+// raw pointer lives in an AtomicPtr, which is Send.
 unsafe impl Send for BatchResponder {}
+// SAFETY: Cross-thread access follows the BATCH_* handshake: the owner calls
+// `prepare` (Release) before handing the responder to one remote shard; that
+// shard writes response slots and `recycled_items` and then publishes
+// BATCH_COMPLETED with an AcqRel swap; the owner reads them only after an
+// Acquire load of BATCH_COMPLETED. The two sides never overlap.
 unsafe impl Sync for BatchResponder {}
 
 pub const BATCH_IDLE: u8 = 0;
@@ -391,13 +574,12 @@ pub const BATCH_COMPLETED: u8 = 3;
 
 impl BatchResponder {
     pub fn new() -> Self {
-        let (tx, rx) = flume::bounded(1);
         Self {
             state: CachePadded(std::sync::atomic::AtomicU8::new(BATCH_IDLE)),
             responses_ptr: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            responses_len: AtomicUsize::new(0),
             recycled_items: CachePadded(UnsafeCell::new(None)),
-            notify_tx: tx,
-            notify_rx: rx,
+            bell: Doorbell::new(),
         }
     }
 
@@ -407,13 +589,24 @@ impl BatchResponder {
     }
 
     #[inline(always)]
-    pub fn prepare(&self, responses_ptr: *mut crate::shard::CompactResp) {
+    pub fn prepare(&self, responses_ptr: *mut crate::shard::CompactResp, len: usize) {
         self.responses_ptr.store(responses_ptr, Ordering::Relaxed);
+        self.responses_len.store(len, Ordering::Relaxed);
         self.state.0.store(BATCH_RUNNING, Ordering::Release);
     }
 
     #[inline(always)]
     pub fn write_slot(&self, idx: usize, resp: crate::shard::CompactResp) {
+        // A bad index would be a write past the owner's slice: refuse it.
+        assert!(
+            idx < self.responses_len.load(Ordering::Relaxed),
+            "BatchResponder::write_slot index out of bounds"
+        );
+        // SAFETY: Relies on the caller protocol: `prepare` stored a pointer to (and
+        // the length of) the owner's initialized `responses` slice, which the owner
+        // keeps alive and untouched until it observes BATCH_COMPLETED; `idx` was
+        // bounds-checked above and each slot is written by exactly one remote shard,
+        // so the in-place assignment (which drops the old value) does not race.
         unsafe {
             let ptr = self.responses_ptr.load(Ordering::Relaxed);
             *ptr.add(idx) = resp;
@@ -422,11 +615,14 @@ impl BatchResponder {
 
     #[inline(always)]
     pub fn finish(&self, items: Vec<(usize, u64, crate::resp::Command)>) {
+        // SAFETY: Only the one remote shard serving this batch calls `finish`, once,
+        // and the owner reads `recycled_items` only after the AcqRel swap below
+        // publishes BATCH_COMPLETED.
         unsafe {
             *self.recycled_items.get() = Some(items);
         }
         if self.state.0.swap(BATCH_COMPLETED, Ordering::AcqRel) == BATCH_SLEEPING {
-            let _ = self.notify_tx.try_send(());
+            self.bell.ring();
         }
     }
 
@@ -434,6 +630,8 @@ impl BatchResponder {
     pub fn try_take(&self) -> Option<Vec<(usize, u64, crate::resp::Command)>> {
         if self.state.0.load(Ordering::Acquire) == BATCH_COMPLETED {
             self.state.0.store(BATCH_IDLE, Ordering::Relaxed);
+            // SAFETY: The Acquire load above saw BATCH_COMPLETED, so the remote shard's
+            // write in `finish` happened-before this and it no longer touches the cell.
             unsafe { (*self.recycled_items.get()).take() }
         } else {
             None
@@ -454,9 +652,16 @@ impl BatchResponder {
                 )
                 .is_ok()
         {
-            let _ = self.notify_rx.recv_async().await;
+            // Exactly one ring answers a successful RUNNING -> SLEEPING; the
+            // loop only guards against a stray ring from an earlier round.
+            while self.state.0.load(Ordering::Acquire) != BATCH_COMPLETED {
+                self.bell.wait().await;
+            }
         }
         self.state.0.store(BATCH_IDLE, Ordering::Relaxed);
+        // SAFETY: We either observed BATCH_COMPLETED with Acquire above, or the remote
+        // shard rang the bell after its AcqRel swap to BATCH_COMPLETED and the loop
+        // re-checked it with Acquire; either way `finish` is done with the cell.
         unsafe { (*self.recycled_items.get()).take() }
     }
 }
@@ -476,11 +681,19 @@ pub struct SpscQueue<T> {
     buffer: Box<[UnsafeCell<Option<T>>]>,
     capacity: usize,
     mask: usize,
-    overflow: std::sync::Mutex<std::collections::VecDeque<T>>,
+    overflow: parking_lot::Mutex<std::collections::VecDeque<T>>,
     has_overflow: AtomicBool,
 }
 
+// SAFETY: The queue owns its `T`s (ring slots and overflow); sending it to
+// another thread moves them, which `T: Send` permits.
 unsafe impl<T: Send> Send for SpscQueue<T> {}
+// SAFETY: Sound only under the SPSC discipline documented on `push`/`pop`: at
+// most one thread pushes and at most one thread pops at a time (enforced by
+// how `create_shard_mesh` hands out rings, not by the type). Under it, a slot
+// is written only by the producer while outside `[head, tail)` and read only
+// by the consumer while inside it, with `tail`/`head` Release/Acquire pairs
+// transferring each slot; the overflow queue is behind a mutex.
 unsafe impl<T: Send> Sync for SpscQueue<T> {}
 
 impl<T> SpscQueue<T> {
@@ -496,7 +709,7 @@ impl<T> SpscQueue<T> {
             buffer: buf.into_boxed_slice(),
             capacity: cap,
             mask: cap - 1,
-            overflow: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            overflow: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             has_overflow: AtomicBool::new(false),
         }
     }
@@ -511,6 +724,10 @@ impl<T> SpscQueue<T> {
         // overflow is empty, so `false` means every earlier item is in the
         // ring and appending to it keeps FIFO order.
         if !self.has_overflow.load(Ordering::Acquire) && tail.wrapping_sub(head) < self.capacity {
+            // SAFETY: Single producer: `tail - head < capacity`, so slot `tail & mask` is
+            // not in the consumer's readable range `[head, tail)` (the Acquire load of
+            // `head` saw the consumer finish taking it), and the consumer will not read
+            // it until the Release store of `tail + 1` below.
             unsafe {
                 *self.buffer[tail & self.mask].get() = Some(item);
             }
@@ -522,13 +739,15 @@ impl<T> SpscQueue<T> {
 
     #[cold]
     fn push_slow(&self, item: T) {
-        let mut q = self.overflow.lock().unwrap();
+        let mut q = self.overflow.lock();
         // Move older overflow entries into the ring first, oldest first, so
         // the overflow only ever holds items newer than everything in the ring.
         let mut tail = self.tail.load(Ordering::Relaxed);
         while !q.is_empty() && tail.wrapping_sub(self.head.load(Ordering::Acquire)) < self.capacity
         {
             let next = q.pop_front();
+            // SAFETY: Same as `push`: we are the single producer and the loop condition
+            // keeps `tail - head < capacity`, so this slot is outside `[head, tail)`.
             unsafe {
                 *self.buffer[tail & self.mask].get() = next;
             }
@@ -536,6 +755,8 @@ impl<T> SpscQueue<T> {
             self.tail.store(tail, Ordering::Release);
         }
         if q.is_empty() && tail.wrapping_sub(self.head.load(Ordering::Acquire)) < self.capacity {
+            // SAFETY: Same as `push`: single producer, and `tail - head < capacity` was
+            // just checked, so the consumer cannot be reading this slot.
             unsafe {
                 *self.buffer[tail & self.mask].get() = Some(item);
             }
@@ -552,6 +773,9 @@ impl<T> SpscQueue<T> {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
         if head != tail {
+            // SAFETY: Single consumer: `head != tail` with `tail` loaded Acquire, so the
+            // producer's write of this slot happened-before; the producer will not
+            // overwrite it until our Release store of `head + 1`.
             let item = unsafe { (*self.buffer[head & self.mask].get()).take() };
             self.head.store(head.wrapping_add(1), Ordering::Release);
             item
@@ -564,11 +788,13 @@ impl<T> SpscQueue<T> {
 
     #[cold]
     fn pop_overflow(&self, head: usize) -> Option<T> {
-        let mut q = self.overflow.lock().unwrap();
+        let mut q = self.overflow.lock();
         // The producer may have moved overflow entries into the ring before we
         // took the lock; those are older than the overflow front.
         if self.tail.load(Ordering::Acquire) != head {
             drop(q);
+            // SAFETY: Single consumer, and the Acquire load of `tail` above is `!= head`,
+            // so slot `head` was published by the producer and is ours to take.
             let item = unsafe { (*self.buffer[head & self.mask].get()).take() };
             self.head.store(head.wrapping_add(1), Ordering::Release);
             return item;
@@ -588,7 +814,7 @@ impl<T> SpscQueue<T> {
             return false;
         }
         if self.has_overflow.load(Ordering::Acquire) {
-            let q = self.overflow.lock().unwrap();
+            let q = self.overflow.lock();
             return q.is_empty();
         }
         true
@@ -607,14 +833,29 @@ pub struct SendError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecvError;
 
+/// Shared by every sender to one target shard. When the last of them is
+/// dropped the receiver is disconnected: the bell is rung so a parked
+/// receiver wakes up and returns `RecvError` (as the flume channel used
+/// for this did).
+pub struct SenderLife {
+    bell: std::sync::Arc<Doorbell>,
+}
+
+impl Drop for SenderLife {
+    fn drop(&mut self) {
+        self.bell.ring();
+    }
+}
+
 /// Sender handle from one shard to a specific target shard.
 /// Pushes to a dedicated lock-free SPSC ring and notifies the target thread.
 #[derive(Clone)]
 pub struct ShardSender {
     pub target_shard: usize,
     pub ring: std::sync::Arc<SpscQueue<crate::shard::ShardMessage>>,
-    pub target_notify: flume::Sender<()>,
+    pub target_notify: std::sync::Arc<Doorbell>,
     pub target_sleeping: std::sync::Arc<CachePadded<AtomicBool>>,
+    pub _life: std::sync::Arc<SenderLife>,
 }
 
 impl ShardSender {
@@ -629,7 +870,7 @@ impl ShardSender {
         // receiver sleeps with a message queued.
         std::sync::atomic::fence(Ordering::SeqCst);
         if self.target_sleeping.0.load(Ordering::SeqCst) {
-            let _ = self.target_notify.try_send(());
+            self.target_notify.ring();
         }
         Ok(())
     }
@@ -640,24 +881,14 @@ impl ShardSender {
 pub struct ShardReceiver {
     pub shard_id: usize,
     pub incoming_rings: Vec<std::sync::Arc<SpscQueue<crate::shard::ShardMessage>>>,
-    pub notify_rx: flume::Receiver<()>,
+    pub notify_rx: std::sync::Arc<Doorbell>,
+    /// Dead once every [`ShardSender`] to this shard is gone.
+    pub senders: std::sync::Weak<SenderLife>,
     pub sleeping: std::sync::Arc<CachePadded<AtomicBool>>,
     /// Ring that `try_recv` checks first; it moves past the ring that last
     /// delivered, so every producer shard gets a turn. Only the consumer
     /// touches it, so Relaxed is enough; it is atomic to keep the type Sync.
     pub next_ring: AtomicUsize,
-}
-
-impl Clone for ShardReceiver {
-    fn clone(&self) -> Self {
-        Self {
-            shard_id: self.shard_id,
-            incoming_rings: self.incoming_rings.clone(),
-            notify_rx: self.notify_rx.clone(),
-            sleeping: self.sleeping.clone(),
-            next_ring: AtomicUsize::new(self.next_ring.load(Ordering::Relaxed)),
-        }
-    }
 }
 
 impl ShardReceiver {
@@ -697,12 +928,12 @@ impl ShardReceiver {
                 return Ok(msg);
             }
 
-            let res = self.notify_rx.recv();
-            self.sleeping.0.store(false, Ordering::Relaxed);
-            if res.is_err() {
+            if self.senders.strong_count() == 0 {
+                self.sleeping.0.store(false, Ordering::Relaxed);
                 return self.try_recv();
             }
-            while self.notify_rx.try_recv().is_ok() {}
+            self.notify_rx.wait_blocking();
+            self.sleeping.0.store(false, Ordering::Relaxed);
 
             if let Ok(msg) = self.try_recv() {
                 return Ok(msg);
@@ -725,12 +956,12 @@ impl ShardReceiver {
                 return Ok(msg);
             }
 
-            let res = self.notify_rx.recv_async().await;
-            self.sleeping.0.store(false, Ordering::Relaxed);
-            if res.is_err() {
+            if self.senders.strong_count() == 0 {
+                self.sleeping.0.store(false, Ordering::Relaxed);
                 return self.try_recv();
             }
-            while self.notify_rx.try_recv().is_ok() {}
+            self.notify_rx.wait().await;
+            self.sleeping.0.store(false, Ordering::Relaxed);
 
             if let Ok(msg) = self.try_recv() {
                 return Ok(msg);
@@ -744,9 +975,13 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
     let mut notifiers = Vec::with_capacity(num_shards);
     let mut sleeping_flags = Vec::with_capacity(num_shards);
     for _ in 0..num_shards {
-        notifiers.push(flume::bounded::<()>(1));
+        notifiers.push(std::sync::Arc::new(Doorbell::new()));
         sleeping_flags.push(std::sync::Arc::new(CachePadded(AtomicBool::new(false))));
     }
+    let lives: Vec<std::sync::Arc<SenderLife>> = notifiers
+        .iter()
+        .map(|bell| std::sync::Arc::new(SenderLife { bell: bell.clone() }))
+        .collect();
 
     // Matrix of SPSC rings: rings[i][j] is the ring from producer shard i to consumer shard j
     let mut rings: Vec<Vec<std::sync::Arc<SpscQueue<crate::shard::ShardMessage>>>> =
@@ -766,8 +1001,9 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
             shard_senders.push(ShardSender {
                 target_shard: j,
                 ring: ring.clone(),
-                target_notify: notifiers[j].0.clone(),
+                target_notify: notifiers[j].clone(),
                 target_sleeping: sleeping_flags[j].clone(),
+                _life: lives[j].clone(),
             });
         }
         senders_mesh.push(shard_senders);
@@ -787,7 +1023,8 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
         receivers.push(ShardReceiver {
             shard_id: j,
             incoming_rings: incoming,
-            notify_rx: notifier.1,
+            notify_rx: notifier,
+            senders: std::sync::Arc::downgrade(&lives[j]),
             sleeping,
             next_ring: AtomicUsize::new(0),
         });
@@ -884,8 +1121,7 @@ mod tests {
 
     #[test]
     fn test_fast_get_descriptor() {
-        let (tx, rx) = flume::bounded(1);
-        let desc = Arc::new(FastGetDescriptor::new(Bytes::from("key1"), tx));
+        let desc = Arc::new(FastGetDescriptor::new(Bytes::from("key1")));
         assert!(!desc.done.load(Ordering::Acquire));
 
         let desc_clone = desc.clone();
@@ -893,23 +1129,24 @@ mod tests {
             desc_clone.finish(Some(Bytes::from("val1")));
         });
 
-        rx.recv_timeout(Duration::from_secs(1))
-            .expect("notification failed");
+        while !desc.done.load(Ordering::Acquire) {
+            desc.bell.wait_blocking();
+        }
         handle.join().unwrap();
 
         assert!(desc.done.load(Ordering::Acquire));
+        // SAFETY: The writer thread has been joined and `done` is set; nothing else
+        // accesses `val`.
         let val = unsafe { (*desc.val.get()).take() };
         assert_eq!(val, Some(Bytes::from("val1")));
     }
 
     #[test]
     fn test_fast_set_descriptor() {
-        let (tx, rx) = flume::bounded(1);
         let desc = Arc::new(FastSetDescriptor::new(
             Bytes::from("key_set"),
             Bytes::from("val_set"),
             Some(Duration::from_secs(10)),
-            tx,
         ));
         assert!(!desc.done.load(Ordering::Acquire));
         assert_eq!(desc.key, Bytes::from("key_set"));
@@ -921,8 +1158,9 @@ mod tests {
             desc_clone.finish();
         });
 
-        rx.recv_timeout(Duration::from_secs(1))
-            .expect("notification failed");
+        while !desc.done.load(Ordering::Acquire) {
+            desc.bell.wait_blocking();
+        }
         handle.join().unwrap();
         assert!(desc.done.load(Ordering::Acquire));
     }
@@ -1051,10 +1289,11 @@ mod tests {
         let mset_desc = ScatterMsetDescriptor::new(1, 1, tx.clone());
         mset_desc.finish_shard(); // must return immediately without blocking
 
-        let fast_get = FastGetDescriptor::new(Bytes::from("k"), tx.clone());
+        let fast_get = FastGetDescriptor::new(Bytes::from("k"));
         fast_get.finish(None); // must return immediately without blocking
+        fast_get.finish(None); // ringing an already-rung bell too
 
-        let fast_set = FastSetDescriptor::new(Bytes::from("k"), Bytes::from("v"), None, tx);
+        let fast_set = FastSetDescriptor::new(Bytes::from("k"), Bytes::from("v"), None);
         fast_set.finish(); // must return immediately without blocking
     }
 
@@ -1142,7 +1381,7 @@ mod tests {
                 keys: vec![Bytes::from("k1")],
             })
             .unwrap();
-        assert!(rx.notify_rx.try_recv().is_err());
+        assert!(!rx.notify_rx.try_consume());
         let msg = rx.try_recv().unwrap();
         if let crate::shard::ShardMessage::NotifyList { keys } = msg {
             assert_eq!(keys[0], Bytes::from("k1"));
@@ -1157,7 +1396,7 @@ mod tests {
                 keys: vec![Bytes::from("k2")],
             })
             .unwrap();
-        assert!(rx.notify_rx.try_recv().is_ok());
+        assert!(rx.notify_rx.try_consume());
         let msg = rx.try_recv().unwrap();
         if let crate::shard::ShardMessage::NotifyList { keys } = msg {
             assert_eq!(keys[0], Bytes::from("k2"));
@@ -1172,10 +1411,11 @@ mod tests {
         // the sleeping-flag handshake on every round. A lost wakeup leaves a
         // thread asleep with a message queued, and the watchdog fires.
         const ROUNDS: usize = 200_000;
-        let (mesh, receivers) = create_shard_mesh(2);
+        let (mesh, mut receivers) = create_shard_mesh(2);
         let msg = || crate::shard::ShardMessage::NotifyList { keys: Vec::new() };
-        let (tx_a, rx_a) = (mesh[0][1].clone(), receivers[0].clone());
-        let (tx_b, rx_b) = (mesh[1][0].clone(), receivers[1].clone());
+        let rx_b = receivers.pop().unwrap();
+        let rx_a = receivers.pop().unwrap();
+        let (tx_a, tx_b) = (mesh[0][1].clone(), mesh[1][0].clone());
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let done_b = done_tx.clone();
         thread::spawn(move || {
@@ -1197,5 +1437,85 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(60))
                 .expect("a shard slept through a queued message (lost wakeup)");
         }
+    }
+
+    #[test]
+    fn test_doorbell_ring_before_wait_is_kept() {
+        let bell = Doorbell::new();
+        bell.ring();
+        bell.ring(); // coalesces
+        bell.wait_blocking(); // returns at once
+        assert!(!bell.try_consume());
+    }
+
+    #[test]
+    fn test_doorbell_ping_pong_never_loses_wakeup() {
+        // Two threads hand a token back and forth 200k times through two
+        // bells; a single lost wake-up hangs the test.
+        let a = Arc::new(Doorbell::new());
+        let b = Arc::new(Doorbell::new());
+        let turn = Arc::new(AtomicUsize::new(0));
+        const N: usize = 200_000;
+        let (a2, b2, t2) = (a.clone(), b.clone(), turn.clone());
+        let h = thread::spawn(move || {
+            for i in 0..N {
+                while t2.load(Ordering::Acquire) != 2 * i + 1 {
+                    a2.wait_blocking();
+                }
+                t2.store(2 * i + 2, Ordering::Release);
+                b2.ring();
+            }
+        });
+        for i in 0..N {
+            turn.store(2 * i + 1, Ordering::Release);
+            a.ring();
+            while turn.load(Ordering::Acquire) != 2 * i + 2 {
+                b.wait_blocking();
+            }
+        }
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn test_doorbell_many_ringers_one_async_waiter() {
+        // 8 producer threads bump a counter and ring; a monoio task waits on
+        // the bell until it has seen every increment.
+        let bell = Arc::new(Doorbell::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        const PER: usize = 20_000;
+        const THREADS: usize = 8;
+        let producers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (bell, count) = (bell.clone(), count.clone());
+                thread::spawn(move || {
+                    for _ in 0..PER {
+                        count.fetch_add(1, Ordering::Release);
+                        bell.ring();
+                    }
+                })
+            })
+            .collect();
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            while count.load(Ordering::Acquire) < PER * THREADS {
+                bell.wait().await;
+            }
+        });
+        for p in producers {
+            p.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_receiver_disconnects_when_all_senders_drop() {
+        let (senders, mut receivers) = create_shard_mesh(2);
+        let rx = receivers.remove(1);
+        let h = thread::spawn(move || rx.recv().is_err());
+        thread::sleep(Duration::from_millis(50)); // let it park
+        drop(senders);
+        assert!(h.join().unwrap(), "parked receiver must see the disconnect");
     }
 }

@@ -44,16 +44,35 @@ pub struct RegisteredBufferPool {
     stats: Arc<ZeroCopyStats>,
 }
 
+// SAFETY: The pool exclusively owns the allocation behind `ptr` (freed only in
+// Drop) and `iovecs` only point into it, so moving the pool to another thread
+// moves that ownership with it.
 unsafe impl Send for RegisteredBufferPool {}
+// SAFETY: Every method that hands out mutable access takes `&mut self`; the
+// `&self` methods (`get_slot`, `iovecs`, getters) only read, so shared
+// references on several threads only ever produce shared reads.
 unsafe impl Sync for RegisteredBufferPool {}
 
 impl RegisteredBufferPool {
     /// Creates and aligns a new fixed buffer pool.
     pub fn new(slot_count: usize, slot_size: usize, stats: Arc<ZeroCopyStats>) -> io::Result<Self> {
-        let total_size = slot_count * slot_size;
+        if slot_count == 0 || slot_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "registered buffer pool needs a non-zero slot count and size",
+            ));
+        }
+        let total_size = slot_count.checked_mul(slot_size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "registered buffer pool too large",
+            )
+        })?;
         let layout = Layout::from_size_align(total_size, PAGE_SIZE)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
+        // SAFETY: `layout` is a valid Layout (PAGE_SIZE alignment) with a non-zero
+        // size (both factors were checked above); the null return is handled below.
         let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             return Err(io::Error::new(
@@ -67,6 +86,9 @@ impl RegisteredBufferPool {
 
         for i in 0..slot_count {
             let offset = i * slot_size;
+            // SAFETY: `offset = i * slot_size < slot_count * slot_size == layout.size()`,
+            // so the pointer stays inside the allocation (given the product did not
+            // overflow, which is not checked).
             let slot_ptr = unsafe { ptr.add(offset) };
             iovecs.push(libc::iovec {
                 iov_base: slot_ptr as *mut libc::c_void,
@@ -117,6 +139,9 @@ impl RegisteredBufferPool {
     pub fn get_slot_mut(&mut self, slot_idx: usize) -> Option<&mut [u8]> {
         if slot_idx < self.slot_count {
             let offset = slot_idx * self.slot_size;
+            // SAFETY: `slot_idx < slot_count`, so `[offset, offset + slot_size)` lies in
+            // the zero-initialized allocation, which lives as long as `self`; the `&mut
+            // self` borrow ensures no other slice into the pool is alive.
             unsafe {
                 Some(std::slice::from_raw_parts_mut(
                     self.ptr.add(offset),
@@ -132,6 +157,9 @@ impl RegisteredBufferPool {
     pub fn get_slot(&self, slot_idx: usize) -> Option<&[u8]> {
         if slot_idx < self.slot_count {
             let offset = slot_idx * self.slot_size;
+            // SAFETY: `slot_idx < slot_count`, so the range lies in the zero-initialized
+            // allocation owned by `self`; the `&self` borrow prevents any `&mut` slice
+            // from coexisting with it.
             unsafe {
                 Some(std::slice::from_raw_parts(
                     self.ptr.add(offset),
@@ -159,6 +187,8 @@ impl RegisteredBufferPool {
 impl Drop for RegisteredBufferPool {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // SAFETY: `ptr` was returned by `alloc_zeroed` with this same `layout` and is
+            // freed only here, once.
             unsafe {
                 dealloc(self.ptr, self.layout);
             }
@@ -179,6 +209,8 @@ impl ZeroCopyEngine {
     /// Enables `SO_ZEROCOPY` on the given raw socket file descriptor.
     pub fn enable_so_zerocopy(fd: RawFd) -> io::Result<()> {
         let enable: libc::c_int = 1;
+        // SAFETY: `enable` is a live c_int and optlen is its size; setsockopt only
+        // reads it.
         let ret = unsafe {
             libc::setsockopt(
                 fd,
@@ -197,7 +229,14 @@ impl ZeroCopyEngine {
 
     /// Attempts zero-copy send on a socket using `MSG_ZEROCOPY`.
     /// Falls back to standard non-blocking `send` if the kernel buffer is full or unsupported.
-    pub fn send_zc(&self, fd: RawFd, data: &[u8]) -> io::Result<usize> {
+    ///
+    /// # Safety
+    ///
+    /// For payloads of `PAGE_SIZE` or more the kernel may keep reading `data`'s
+    /// pages after this returns, until the zero-copy completion is reported on
+    /// the socket's error queue. The caller must keep `data` alive and
+    /// unmodified until then (or only pass smaller payloads, which are copied).
+    pub unsafe fn send_zc(&self, fd: RawFd, data: &[u8]) -> io::Result<usize> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -210,6 +249,10 @@ impl ZeroCopyEngine {
             libc::MSG_NOSIGNAL
         };
 
+        // SAFETY: `data` is a live slice of `data.len()` bytes, borrowed for the call.
+        // With MSG_ZEROCOPY the kernel may still read those pages after return, until
+        // the completion arrives on the socket error queue; keeping them alive that
+        // long is the caller's obligation (see `# Safety`).
         let ret =
             unsafe { libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), flags) };
 
@@ -225,6 +268,7 @@ impl ZeroCopyEngine {
             // Fall back to standard send on ENOBUFS or if MSG_ZEROCOPY is not supported
             if err.raw_os_error() == Some(libc::ENOBUFS) || flags & MSG_ZEROCOPY != 0 {
                 self.stats.fallback_sends.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: `data` is a live slice of `data.len()` bytes, borrowed for the call.
                 let fallback_ret = unsafe {
                     libc::send(
                         fd,
@@ -328,11 +372,14 @@ mod tests {
 
         // Send payload via zero-copy engine
         let msg = b"+PONG\r\n";
-        let sent = engine.send_zc(fd1, msg).expect("send_zc succeeded");
+        // SAFETY: below PAGE_SIZE, so the kernel copies the payload.
+        let sent = unsafe { engine.send_zc(fd1, msg) }.expect("send_zc succeeded");
         assert_eq!(sent, msg.len());
 
         // Receive on peer
         let mut recv_buf = [0u8; 32];
+        // SAFETY: `recv_buf` is a local 32-byte array and the length passed matches;
+        // `fd2` is owned by `s2`, which is alive.
         let n = unsafe {
             libc::recv(
                 fd2,

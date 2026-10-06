@@ -45,6 +45,9 @@ impl PushTarget {
     /// Delivers `msg` if there is room, dropping it otherwise (never blocks).
     pub fn push(&self, msg: &[u8]) {
         match self {
+            // SAFETY: `msg` is a live slice and the length matches; send only reads it,
+            // so even a stale fd cannot corrupt memory. The fd comes from a client
+            // registry entry, and the connection removes its registry entry (ClientCleanup / PubsubCleanup) before its socket is closed, so the fd is not a reused number.
             PushTarget::Fd(fd) => unsafe {
                 libc::send(
                     *fd,
@@ -133,6 +136,8 @@ pub(crate) fn recv_ready(fd: RawFd, buf: &mut BytesMut) -> (usize, usize) {
     }
     let spare = buf.spare_capacity_mut();
     let spare_len = spare.len();
+    // SAFETY: `spare` is `buf`'s spare capacity of `spare_len` bytes and recv
+    // writes at most that many; `fd` is the caller's live socket.
     let n = unsafe {
         libc::recv(
             fd,
@@ -142,6 +147,8 @@ pub(crate) fn recv_ready(fd: RawFd, buf: &mut BytesMut) -> (usize, usize) {
         )
     };
     if n > 0 {
+        // SAFETY: recv wrote `n > 0` bytes (at most `spare_len`) into the spare
+        // capacity, so the new length is within capacity and fully initialized.
         unsafe { buf.set_len(buf.len() + n as usize) };
         (n as usize, spare_len)
     } else {
@@ -202,6 +209,8 @@ impl ClientTransport for PlainTransport {
         mut set_omem: impl FnMut(usize),
     ) -> io::Result<()> {
         let len = out_buf.len();
+        // SAFETY: `out_buf` holds `len` initialized bytes, borrowed for the call;
+        // `self.fd` belongs to `self.stream`.
         let send_ret = unsafe {
             libc::send(
                 self.fd,

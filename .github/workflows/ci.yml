@@ -8,12 +8,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  MONOIO_FORCE_LEGACY_DRIVER: 1
 
 jobs:
   build_and_test:
     name: Build, Clippy, and Tests
     runs-on: ubuntu-latest
+    env:
+      # Many in-process servers per test binary; the legacy (epoll) driver
+      # avoids io_uring memlock exhaustion on older runner kernels. The
+      # production io_uring driver is covered by `io_uring_tests` and the
+      # TCL job below.
+      MONOIO_FORCE_LEGACY_DRIVER: 1
 
     steps:
       - name: Checkout repository
@@ -86,8 +91,49 @@ jobs:
         run: python3 scripts/check_perf_regression.py
 
 
+  io_uring_tests:
+    name: Tests on the io_uring driver (production default)
+    runs-on: ubuntu-latest
+    env:
+      MONOIO_FORCE_LEGACY_DRIVER: 0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Keep in sync with rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-uring-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-uring-
+
+      - name: Report io_uring availability
+        run: |
+          uname -r
+          echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo n/a)"
+          ulimit -l
+
+      - name: Run Unit Tests
+        run: cargo test --release --lib
+
+      - name: Run Cross-Thread Integration Tests
+        run: cargo test --release --test test_cross_thread
+
+      - name: Run End-to-End Integration Tests (serial)
+        run: cargo test --release --test test_server_e2e -- --test-threads=1
+
   redis_tcl_suites:
-    name: Redis TCL compatibility suites
+    name: Redis TCL compatibility suites (io_uring)
     runs-on: ubuntu-latest
 
     steps:

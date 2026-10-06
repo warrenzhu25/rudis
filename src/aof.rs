@@ -2399,13 +2399,13 @@ pub fn parse_appendfsync(v: &str) -> Result<bool, String> {
 }
 
 type FsyncFlags = std::collections::HashMap<u16, std::sync::Arc<std::sync::atomic::AtomicBool>>;
-static FSYNC_EVERY_SEC: std::sync::Mutex<Option<FsyncFlags>> = std::sync::Mutex::new(None);
+static FSYNC_EVERY_SEC: parking_lot::Mutex<Option<FsyncFlags>> = parking_lot::Mutex::new(None);
 
 /// Live `appendfsync` policy for the server on `port` (true = everysec). The
 /// AOF flusher reads it on every tick, so `CONFIG SET appendfsync` applies
 /// without a restart. Defaults to everysec.
 pub fn fsync_every_sec_flag(port: u16) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-    let mut map = FSYNC_EVERY_SEC.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = FSYNC_EVERY_SEC.lock();
     map.get_or_insert_with(Default::default)
         .entry(port)
         .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))

@@ -50,7 +50,9 @@ impl VectorMetric {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
+/// # Safety
+///
+/// The CPU must support AVX2.
 unsafe fn hsum256_ps(v: core::arch::x86_64::__m256) -> f32 {
     use core::arch::x86_64::*;
     let high = _mm256_extractf128_ps(v, 1);
@@ -66,336 +68,416 @@ unsafe fn hsum256_ps(v: core::arch::x86_64::__m256) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn hsum512_ps(v: core::arch::x86_64::__m512) -> f32 {
+/// Horizontal sum of the 16 lanes. Only callable from AVX-512F code.
+fn hsum512_ps(v: core::arch::x86_64::__m512) -> f32 {
     use core::arch::x86_64::*;
-    let low = _mm512_castps512_ps256(v);
-    let high = _mm512_extractf32x8_ps(v, 1);
-    let sum256 = _mm256_add_ps(low, high);
-    hsum256_ps(sum256)
+    // `_mm512_reduce_add_ps` is AVX-512F only (an earlier version used
+    // `_mm512_extractf32x8_ps`, which needs AVX-512DQ that the dispatchers
+    // never checked for). Register-only, so safe inside this target-feature fn.
+    _mm512_reduce_add_ps(v)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
+/// # Safety
+///
+/// The CPU must support the features in this function's `#[target_feature]`
+/// (callers check with `is_x86_feature_detected!`). All memory accesses are
+/// bounded by the shorter of the two slices, so any lengths are allowed.
 unsafe fn dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::*;
-    let len = a.len().min(b.len());
-    let mut i = 0;
-    let mut acc0 = _mm512_setzero_ps();
-    let mut acc1 = _mm512_setzero_ps();
+    // SAFETY: The caller guarantees the CPU features this function is compiled
+    // for. Every pointer load reads lanes `[i, i + W)` only after checking
+    // `i + W <= len`, and the scalar tail uses `get_unchecked(i)` with `i < len`,
+    // where `len` is the minimum of the slice lengths, so all reads are in bounds.
+    unsafe {
+        let len = a.len().min(b.len());
+        let mut i = 0;
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
 
-    while i + 32 <= len {
-        let va0 = _mm512_loadu_ps(a.as_ptr().add(i));
-        let vb0 = _mm512_loadu_ps(b.as_ptr().add(i));
-        acc0 = _mm512_fmadd_ps(va0, vb0, acc0);
+        while i + 32 <= len {
+            let va0 = _mm512_loadu_ps(a.as_ptr().add(i));
+            let vb0 = _mm512_loadu_ps(b.as_ptr().add(i));
+            acc0 = _mm512_fmadd_ps(va0, vb0, acc0);
 
-        let va1 = _mm512_loadu_ps(a.as_ptr().add(i + 16));
-        let vb1 = _mm512_loadu_ps(b.as_ptr().add(i + 16));
-        acc1 = _mm512_fmadd_ps(va1, vb1, acc1);
+            let va1 = _mm512_loadu_ps(a.as_ptr().add(i + 16));
+            let vb1 = _mm512_loadu_ps(b.as_ptr().add(i + 16));
+            acc1 = _mm512_fmadd_ps(va1, vb1, acc1);
 
-        i += 32;
+            i += 32;
+        }
+
+        if i + 16 <= len {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i));
+            acc0 = _mm512_fmadd_ps(va, vb, acc0);
+            i += 16;
+        }
+
+        let acc = _mm512_add_ps(acc0, acc1);
+        let mut sum = hsum512_ps(acc);
+
+        while i < len {
+            sum += *a.get_unchecked(i) * *b.get_unchecked(i);
+            i += 1;
+        }
+        sum
     }
-
-    if i + 16 <= len {
-        let va = _mm512_loadu_ps(a.as_ptr().add(i));
-        let vb = _mm512_loadu_ps(b.as_ptr().add(i));
-        acc0 = _mm512_fmadd_ps(va, vb, acc0);
-        i += 16;
-    }
-
-    let acc = _mm512_add_ps(acc0, acc1);
-    let mut sum = hsum512_ps(acc);
-
-    while i < len {
-        sum += *a.get_unchecked(i) * *b.get_unchecked(i);
-        i += 1;
-    }
-    sum
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
+/// # Safety
+///
+/// The CPU must support the features in this function's `#[target_feature]`
+/// (callers check with `is_x86_feature_detected!`). All memory accesses are
+/// bounded by the shorter of the two slices, so any lengths are allowed.
 unsafe fn l2_distance_sq_avx512(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::*;
-    let len = a.len().min(b.len());
-    let mut i = 0;
-    let mut acc0 = _mm512_setzero_ps();
-    let mut acc1 = _mm512_setzero_ps();
+    // SAFETY: The caller guarantees the CPU features this function is compiled
+    // for. Every pointer load reads lanes `[i, i + W)` only after checking
+    // `i + W <= len`, and the scalar tail uses `get_unchecked(i)` with `i < len`,
+    // where `len` is the minimum of the slice lengths, so all reads are in bounds.
+    unsafe {
+        let len = a.len().min(b.len());
+        let mut i = 0;
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
 
-    while i + 32 <= len {
-        let va0 = _mm512_loadu_ps(a.as_ptr().add(i));
-        let vb0 = _mm512_loadu_ps(b.as_ptr().add(i));
-        let diff0 = _mm512_sub_ps(va0, vb0);
-        acc0 = _mm512_fmadd_ps(diff0, diff0, acc0);
+        while i + 32 <= len {
+            let va0 = _mm512_loadu_ps(a.as_ptr().add(i));
+            let vb0 = _mm512_loadu_ps(b.as_ptr().add(i));
+            let diff0 = _mm512_sub_ps(va0, vb0);
+            acc0 = _mm512_fmadd_ps(diff0, diff0, acc0);
 
-        let va1 = _mm512_loadu_ps(a.as_ptr().add(i + 16));
-        let vb1 = _mm512_loadu_ps(b.as_ptr().add(i + 16));
-        let diff1 = _mm512_sub_ps(va1, vb1);
-        acc1 = _mm512_fmadd_ps(diff1, diff1, acc1);
+            let va1 = _mm512_loadu_ps(a.as_ptr().add(i + 16));
+            let vb1 = _mm512_loadu_ps(b.as_ptr().add(i + 16));
+            let diff1 = _mm512_sub_ps(va1, vb1);
+            acc1 = _mm512_fmadd_ps(diff1, diff1, acc1);
 
-        i += 32;
+            i += 32;
+        }
+
+        if i + 16 <= len {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i));
+            let diff = _mm512_sub_ps(va, vb);
+            acc0 = _mm512_fmadd_ps(diff, diff, acc0);
+            i += 16;
+        }
+
+        let acc = _mm512_add_ps(acc0, acc1);
+        let mut sum = hsum512_ps(acc);
+
+        while i < len {
+            let diff = *a.get_unchecked(i) - *b.get_unchecked(i);
+            sum += diff * diff;
+            i += 1;
+        }
+        sum
     }
-
-    if i + 16 <= len {
-        let va = _mm512_loadu_ps(a.as_ptr().add(i));
-        let vb = _mm512_loadu_ps(b.as_ptr().add(i));
-        let diff = _mm512_sub_ps(va, vb);
-        acc0 = _mm512_fmadd_ps(diff, diff, acc0);
-        i += 16;
-    }
-
-    let acc = _mm512_add_ps(acc0, acc1);
-    let mut sum = hsum512_ps(acc);
-
-    while i < len {
-        let diff = *a.get_unchecked(i) - *b.get_unchecked(i);
-        sum += diff * diff;
-        i += 1;
-    }
-    sum
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
+/// # Safety
+///
+/// The CPU must support the features in this function's `#[target_feature]`
+/// (callers check with `is_x86_feature_detected!`). All memory accesses are
+/// bounded by the shorter of the two slices, so any lengths are allowed.
 unsafe fn cosine_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::*;
-    let len = a.len().min(b.len());
-    let mut i = 0;
-    let mut acc_dot = _mm256_setzero_ps();
-    let mut acc_na = _mm256_setzero_ps();
-    let mut acc_nb = _mm256_setzero_ps();
+    // SAFETY: The caller guarantees the CPU features this function is compiled
+    // for. Every pointer load reads lanes `[i, i + W)` only after checking
+    // `i + W <= len`, and the scalar tail uses `get_unchecked(i)` with `i < len`,
+    // where `len` is the minimum of the slice lengths, so all reads are in bounds.
+    unsafe {
+        let len = a.len().min(b.len());
+        let mut i = 0;
+        let mut acc_dot = _mm256_setzero_ps();
+        let mut acc_na = _mm256_setzero_ps();
+        let mut acc_nb = _mm256_setzero_ps();
 
-    while i + 8 <= len {
-        let va = _mm256_loadu_ps(a.as_ptr().add(i));
-        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
-        acc_dot = _mm256_fmadd_ps(va, vb, acc_dot);
-        acc_na = _mm256_fmadd_ps(va, va, acc_na);
-        acc_nb = _mm256_fmadd_ps(vb, vb, acc_nb);
-        i += 8;
-    }
+        while i + 8 <= len {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+            acc_dot = _mm256_fmadd_ps(va, vb, acc_dot);
+            acc_na = _mm256_fmadd_ps(va, va, acc_na);
+            acc_nb = _mm256_fmadd_ps(vb, vb, acc_nb);
+            i += 8;
+        }
 
-    let mut dot = hsum256_ps(acc_dot);
-    let mut na = hsum256_ps(acc_na);
-    let mut nb = hsum256_ps(acc_nb);
+        let mut dot = hsum256_ps(acc_dot);
+        let mut na = hsum256_ps(acc_na);
+        let mut nb = hsum256_ps(acc_nb);
 
-    while i < len {
-        let x = *a.get_unchecked(i);
-        let y = *b.get_unchecked(i);
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-        i += 1;
-    }
+        while i < len {
+            let x = *a.get_unchecked(i);
+            let y = *b.get_unchecked(i);
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+            i += 1;
+        }
 
-    let norm = (na * nb).sqrt();
-    if norm == 0.0 {
-        1.0
-    } else {
-        (1.0 - (dot / norm)).max(0.0)
+        let norm = (na * nb).sqrt();
+        if norm == 0.0 {
+            1.0
+        } else {
+            (1.0 - (dot / norm)).max(0.0)
+        }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
+/// # Safety
+///
+/// The CPU must support the features in this function's `#[target_feature]`
+/// (callers check with `is_x86_feature_detected!`). All memory accesses are
+/// bounded by the shorter of the two slices, so any lengths are allowed.
 unsafe fn cosine_distance_avx512(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::*;
-    let len = a.len().min(b.len());
-    let mut i = 0;
-    let mut acc_dot = _mm512_setzero_ps();
-    let mut acc_na = _mm512_setzero_ps();
-    let mut acc_nb = _mm512_setzero_ps();
+    // SAFETY: The caller guarantees the CPU features this function is compiled
+    // for. Every pointer load reads lanes `[i, i + W)` only after checking
+    // `i + W <= len`, and the scalar tail uses `get_unchecked(i)` with `i < len`,
+    // where `len` is the minimum of the slice lengths, so all reads are in bounds.
+    unsafe {
+        let len = a.len().min(b.len());
+        let mut i = 0;
+        let mut acc_dot = _mm512_setzero_ps();
+        let mut acc_na = _mm512_setzero_ps();
+        let mut acc_nb = _mm512_setzero_ps();
 
-    while i + 16 <= len {
-        let va = _mm512_loadu_ps(a.as_ptr().add(i));
-        let vb = _mm512_loadu_ps(b.as_ptr().add(i));
-        acc_dot = _mm512_fmadd_ps(va, vb, acc_dot);
-        acc_na = _mm512_fmadd_ps(va, va, acc_na);
-        acc_nb = _mm512_fmadd_ps(vb, vb, acc_nb);
-        i += 16;
-    }
+        while i + 16 <= len {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i));
+            acc_dot = _mm512_fmadd_ps(va, vb, acc_dot);
+            acc_na = _mm512_fmadd_ps(va, va, acc_na);
+            acc_nb = _mm512_fmadd_ps(vb, vb, acc_nb);
+            i += 16;
+        }
 
-    let mut dot = hsum512_ps(acc_dot);
-    let mut na = hsum512_ps(acc_na);
-    let mut nb = hsum512_ps(acc_nb);
+        let mut dot = hsum512_ps(acc_dot);
+        let mut na = hsum512_ps(acc_na);
+        let mut nb = hsum512_ps(acc_nb);
 
-    while i < len {
-        let x = *a.get_unchecked(i);
-        let y = *b.get_unchecked(i);
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-        i += 1;
-    }
+        while i < len {
+            let x = *a.get_unchecked(i);
+            let y = *b.get_unchecked(i);
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+            i += 1;
+        }
 
-    let norm = (na * nb).sqrt();
-    if norm == 0.0 {
-        1.0
-    } else {
-        (1.0 - (dot / norm)).max(0.0)
+        let norm = (na * nb).sqrt();
+        if norm == 0.0 {
+            1.0
+        } else {
+            (1.0 - (dot / norm)).max(0.0)
+        }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
+/// # Safety
+///
+/// The CPU must support the features in this function's `#[target_feature]`
+/// (callers check with `is_x86_feature_detected!`). All memory accesses are
+/// bounded by the shorter of the two slices, so any lengths are allowed.
 unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::*;
-    let len = a.len().min(b.len());
-    let mut i = 0;
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
+    // SAFETY: The caller guarantees the CPU features this function is compiled
+    // for. Every pointer load reads lanes `[i, i + W)` only after checking
+    // `i + W <= len`, and the scalar tail uses `get_unchecked(i)` with `i < len`,
+    // where `len` is the minimum of the slice lengths, so all reads are in bounds.
+    unsafe {
+        let len = a.len().min(b.len());
+        let mut i = 0;
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
 
-    while i + 16 <= len {
-        let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
-        let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
-        acc0 = _mm256_fmadd_ps(va0, vb0, acc0);
+        while i + 16 <= len {
+            let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
+            acc0 = _mm256_fmadd_ps(va0, vb0, acc0);
 
-        let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
-        let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
-        acc1 = _mm256_fmadd_ps(va1, vb1, acc1);
+            let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
+            let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
+            acc1 = _mm256_fmadd_ps(va1, vb1, acc1);
 
-        i += 16;
+            i += 16;
+        }
+
+        if i + 8 <= len {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+            acc0 = _mm256_fmadd_ps(va, vb, acc0);
+            i += 8;
+        }
+
+        let acc = _mm256_add_ps(acc0, acc1);
+        let mut sum = hsum256_ps(acc);
+
+        while i < len {
+            sum += *a.get_unchecked(i) * *b.get_unchecked(i);
+            i += 1;
+        }
+        sum
     }
-
-    if i + 8 <= len {
-        let va = _mm256_loadu_ps(a.as_ptr().add(i));
-        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
-        acc0 = _mm256_fmadd_ps(va, vb, acc0);
-        i += 8;
-    }
-
-    let acc = _mm256_add_ps(acc0, acc1);
-    let mut sum = hsum256_ps(acc);
-
-    while i < len {
-        sum += *a.get_unchecked(i) * *b.get_unchecked(i);
-        i += 1;
-    }
-    sum
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
+/// # Safety
+///
+/// The CPU must support the features in this function's `#[target_feature]`
+/// (callers check with `is_x86_feature_detected!`). All memory accesses are
+/// bounded by the shorter of the two slices, so any lengths are allowed.
 unsafe fn l2_distance_sq_avx2(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::*;
-    let len = a.len().min(b.len());
-    let mut i = 0;
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
+    // SAFETY: The caller guarantees the CPU features this function is compiled
+    // for. Every pointer load reads lanes `[i, i + W)` only after checking
+    // `i + W <= len`, and the scalar tail uses `get_unchecked(i)` with `i < len`,
+    // where `len` is the minimum of the slice lengths, so all reads are in bounds.
+    unsafe {
+        let len = a.len().min(b.len());
+        let mut i = 0;
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
 
-    while i + 16 <= len {
-        let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
-        let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
-        let diff0 = _mm256_sub_ps(va0, vb0);
-        acc0 = _mm256_fmadd_ps(diff0, diff0, acc0);
+        while i + 16 <= len {
+            let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
+            let diff0 = _mm256_sub_ps(va0, vb0);
+            acc0 = _mm256_fmadd_ps(diff0, diff0, acc0);
 
-        let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
-        let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
-        let diff1 = _mm256_sub_ps(va1, vb1);
-        acc1 = _mm256_fmadd_ps(diff1, diff1, acc1);
+            let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
+            let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
+            let diff1 = _mm256_sub_ps(va1, vb1);
+            acc1 = _mm256_fmadd_ps(diff1, diff1, acc1);
 
-        i += 16;
+            i += 16;
+        }
+
+        if i + 8 <= len {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+            let diff = _mm256_sub_ps(va, vb);
+            acc0 = _mm256_fmadd_ps(diff, diff, acc0);
+            i += 8;
+        }
+
+        let acc = _mm256_add_ps(acc0, acc1);
+        let mut sum = hsum256_ps(acc);
+
+        while i < len {
+            let diff = *a.get_unchecked(i) - *b.get_unchecked(i);
+            sum += diff * diff;
+            i += 1;
+        }
+        sum
     }
-
-    if i + 8 <= len {
-        let va = _mm256_loadu_ps(a.as_ptr().add(i));
-        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
-        let diff = _mm256_sub_ps(va, vb);
-        acc0 = _mm256_fmadd_ps(diff, diff, acc0);
-        i += 8;
-    }
-
-    let acc = _mm256_add_ps(acc0, acc1);
-    let mut sum = hsum256_ps(acc);
-
-    while i < len {
-        let diff = *a.get_unchecked(i) - *b.get_unchecked(i);
-        sum += diff * diff;
-        i += 1;
-    }
-    sum
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
+/// # Safety
+///
+/// The CPU must support the features in this function's `#[target_feature]`
+/// (callers check with `is_x86_feature_detected!`). All memory accesses are
+/// bounded by the shorter of the two slices, so any lengths are allowed.
 unsafe fn dot_f32_u8_avx2(query: &[f32], u8_data: &[u8]) -> f32 {
     use core::arch::x86_64::*;
-    let len = query.len().min(u8_data.len());
-    let mut i = 0;
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
+    // SAFETY: The caller guarantees the CPU features this function is compiled
+    // for. Every pointer load reads lanes `[i, i + W)` only after checking
+    // `i + W <= len`, and the scalar tail uses `get_unchecked(i)` with `i < len`,
+    // where `len` is the minimum of the slice lengths, so all reads are in bounds.
+    unsafe {
+        let len = query.len().min(u8_data.len());
+        let mut i = 0;
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
 
-    while i + 16 <= len {
-        let raw8_0 = _mm_loadl_epi64(u8_data.as_ptr().add(i) as *const __m128i);
-        let i32_0 = _mm256_cvtepu8_epi32(raw8_0);
-        let f32_0 = _mm256_cvtepi32_ps(i32_0);
-        let q0 = _mm256_loadu_ps(query.as_ptr().add(i));
-        acc0 = _mm256_fmadd_ps(q0, f32_0, acc0);
+        while i + 16 <= len {
+            let raw8_0 = _mm_loadl_epi64(u8_data.as_ptr().add(i) as *const __m128i);
+            let i32_0 = _mm256_cvtepu8_epi32(raw8_0);
+            let f32_0 = _mm256_cvtepi32_ps(i32_0);
+            let q0 = _mm256_loadu_ps(query.as_ptr().add(i));
+            acc0 = _mm256_fmadd_ps(q0, f32_0, acc0);
 
-        let raw8_1 = _mm_loadl_epi64(u8_data.as_ptr().add(i + 8) as *const __m128i);
-        let i32_1 = _mm256_cvtepu8_epi32(raw8_1);
-        let f32_1 = _mm256_cvtepi32_ps(i32_1);
-        let q1 = _mm256_loadu_ps(query.as_ptr().add(i + 8));
-        acc1 = _mm256_fmadd_ps(q1, f32_1, acc1);
+            let raw8_1 = _mm_loadl_epi64(u8_data.as_ptr().add(i + 8) as *const __m128i);
+            let i32_1 = _mm256_cvtepu8_epi32(raw8_1);
+            let f32_1 = _mm256_cvtepi32_ps(i32_1);
+            let q1 = _mm256_loadu_ps(query.as_ptr().add(i + 8));
+            acc1 = _mm256_fmadd_ps(q1, f32_1, acc1);
 
-        i += 16;
+            i += 16;
+        }
+
+        if i + 8 <= len {
+            let raw8 = _mm_loadl_epi64(u8_data.as_ptr().add(i) as *const __m128i);
+            let i32_v = _mm256_cvtepu8_epi32(raw8);
+            let f32_v = _mm256_cvtepi32_ps(i32_v);
+            let q = _mm256_loadu_ps(query.as_ptr().add(i));
+            acc0 = _mm256_fmadd_ps(q, f32_v, acc0);
+            i += 8;
+        }
+
+        let acc = _mm256_add_ps(acc0, acc1);
+        let mut sum = hsum256_ps(acc);
+
+        while i < len {
+            sum += *query.get_unchecked(i) * (*u8_data.get_unchecked(i) as f32);
+            i += 1;
+        }
+        sum
     }
-
-    if i + 8 <= len {
-        let raw8 = _mm_loadl_epi64(u8_data.as_ptr().add(i) as *const __m128i);
-        let i32_v = _mm256_cvtepu8_epi32(raw8);
-        let f32_v = _mm256_cvtepi32_ps(i32_v);
-        let q = _mm256_loadu_ps(query.as_ptr().add(i));
-        acc0 = _mm256_fmadd_ps(q, f32_v, acc0);
-        i += 8;
-    }
-
-    let acc = _mm256_add_ps(acc0, acc1);
-    let mut sum = hsum256_ps(acc);
-
-    while i < len {
-        sum += *query.get_unchecked(i) * (*u8_data.get_unchecked(i) as f32);
-        i += 1;
-    }
-    sum
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
+/// # Safety
+///
+/// The CPU must support the features in this function's `#[target_feature]`
+/// (callers check with `is_x86_feature_detected!`). All memory accesses are
+/// bounded by the shorter of the two slices, so any lengths are allowed.
 unsafe fn l2_f32_u8_avx2(query: &[f32], u8_data: &[u8], min_val: f32, scale: f32) -> f32 {
     use core::arch::x86_64::*;
-    let len = query.len().min(u8_data.len());
-    let mut i = 0;
-    let mut acc0 = _mm256_setzero_ps();
-    let min_vec = _mm256_set1_ps(min_val);
-    let scale_vec = _mm256_set1_ps(scale);
+    // SAFETY: The caller guarantees the CPU features this function is compiled
+    // for. Every pointer load reads lanes `[i, i + W)` only after checking
+    // `i + W <= len`, and the scalar tail uses `get_unchecked(i)` with `i < len`,
+    // where `len` is the minimum of the slice lengths, so all reads are in bounds.
+    unsafe {
+        let len = query.len().min(u8_data.len());
+        let mut i = 0;
+        let mut acc0 = _mm256_setzero_ps();
+        let min_vec = _mm256_set1_ps(min_val);
+        let scale_vec = _mm256_set1_ps(scale);
 
-    while i + 8 <= len {
-        let raw8 = _mm_loadl_epi64(u8_data.as_ptr().add(i) as *const __m128i);
-        let i32_v = _mm256_cvtepu8_epi32(raw8);
-        let f32_v = _mm256_cvtepi32_ps(i32_v);
-        let b_v = _mm256_fmadd_ps(f32_v, scale_vec, min_vec);
-        let q = _mm256_loadu_ps(query.as_ptr().add(i));
-        let diff = _mm256_sub_ps(q, b_v);
-        acc0 = _mm256_fmadd_ps(diff, diff, acc0);
-        i += 8;
-    }
+        while i + 8 <= len {
+            let raw8 = _mm_loadl_epi64(u8_data.as_ptr().add(i) as *const __m128i);
+            let i32_v = _mm256_cvtepu8_epi32(raw8);
+            let f32_v = _mm256_cvtepi32_ps(i32_v);
+            let b_v = _mm256_fmadd_ps(f32_v, scale_vec, min_vec);
+            let q = _mm256_loadu_ps(query.as_ptr().add(i));
+            let diff = _mm256_sub_ps(q, b_v);
+            acc0 = _mm256_fmadd_ps(diff, diff, acc0);
+            i += 8;
+        }
 
-    let mut sum = hsum256_ps(acc0);
-    while i < len {
-        let b_val = min_val + (*u8_data.get_unchecked(i) as f32) * scale;
-        let diff = *query.get_unchecked(i) - b_val;
-        sum += diff * diff;
-        i += 1;
+        let mut sum = hsum256_ps(acc0);
+        while i < len {
+            let b_val = min_val + (*u8_data.get_unchecked(i) as f32) * scale;
+            let diff = *query.get_unchecked(i) - b_val;
+            sum += diff * diff;
+            i += 1;
+        }
+        sum
     }
-    sum
 }
 
 /// Computes SIMD-accelerated dot product of two float vectors with runtime AVX-512 / AVX2 detection.
@@ -404,9 +486,14 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: avx512f was detected at runtime just above, as required by the
+            // kernel's #[target_feature]; it bounds every access by min(a.len(), b.len()).
             return unsafe { dot_product_avx512(a, b) };
         }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: avx2 and fma were detected at runtime just above, as required by
+            // the kernel's #[target_feature]; it bounds every access by
+            // min(a.len(), b.len()).
             return unsafe { dot_product_avx2(a, b) };
         }
     }
@@ -438,9 +525,14 @@ pub fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: avx512f was detected at runtime just above, as required by the
+            // kernel's #[target_feature]; it bounds every access by min(a.len(), b.len()).
             return unsafe { l2_distance_sq_avx512(a, b) };
         }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: avx2 and fma were detected at runtime just above, as required by
+            // the kernel's #[target_feature]; it bounds every access by
+            // min(a.len(), b.len()).
             return unsafe { l2_distance_sq_avx2(a, b) };
         }
     }
@@ -474,9 +566,14 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: avx512f was detected at runtime just above, as required by the
+            // kernel's #[target_feature]; it bounds every access by min(a.len(), b.len()).
             return unsafe { cosine_distance_avx512(a, b) };
         }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: avx2 and fma were detected at runtime just above, as required by
+            // the kernel's #[target_feature]; it bounds every access by
+            // min(a.len(), b.len()).
             return unsafe { cosine_distance_avx2(a, b) };
         }
     }
@@ -619,6 +716,9 @@ impl QuantizedVector {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: avx2 and fma were detected at runtime just above, as required by
+                // the kernel's #[target_feature]; it bounds every access by
+                // min(query.len(), data.len()).
                 return unsafe { dot_f32_u8_avx2(query, &self.data) };
             }
         }
@@ -643,6 +743,9 @@ impl QuantizedVector {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: avx2 and fma were detected at runtime just above, as required by
+                // the kernel's #[target_feature]; it bounds every access by
+                // min(query.len(), data.len()).
                 return unsafe { l2_f32_u8_avx2(query, &self.data, self.min_val, self.scale) };
             }
         }

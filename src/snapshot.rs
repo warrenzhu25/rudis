@@ -2,9 +2,10 @@
 //! LASTSAVE and INFO persistence. Keyed by the server's base port because
 //! tests run several servers in one process.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 /// After a failed scheduled save, wait this long before trying again
 /// (Redis `CONFIG_BGSAVE_RETRY_DELAY`).
@@ -66,7 +67,7 @@ fn dirty_now() -> u64 {
 /// State for `port`, created on first use as if a save just happened (Redis
 /// sets `lastsave` to the start time).
 pub fn state(port: u16) -> Arc<SnapshotState> {
-    let mut map = STATES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = STATES.lock();
     map.get_or_insert_with(HashMap::new)
         .entry(port)
         .or_insert_with(|| {
@@ -163,7 +164,7 @@ pub struct AofRewriteState {
 static AOF_REWRITE_STATES: Mutex<Option<HashMap<u16, Arc<AofRewriteState>>>> = Mutex::new(None);
 
 pub fn aof_rewrite_state(port: u16) -> Arc<AofRewriteState> {
-    let mut map = AOF_REWRITE_STATES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = AOF_REWRITE_STATES.lock();
     map.get_or_insert_with(HashMap::new)
         .entry(port)
         .or_insert_with(|| {
@@ -180,7 +181,7 @@ static IS_SAVING: Mutex<Option<HashMap<u16, Arc<AtomicBool>>>> = Mutex::new(None
 /// Mutual exclusivity flag for SAVE / BGSAVE / BGREWRITEAOF, shared by all
 /// shard threads of the server (keyed by base port).
 pub fn is_saving(port: u16) -> Arc<AtomicBool> {
-    let mut map = IS_SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = IS_SAVING.lock();
     map.get_or_insert_with(HashMap::new)
         .entry(port)
         .or_insert_with(|| Arc::new(AtomicBool::new(false)))

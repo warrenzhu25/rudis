@@ -1,6 +1,7 @@
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplicationRole {
@@ -106,7 +107,7 @@ impl ConnectedReplica {
         if self.overflowed.load(Ordering::Relaxed) {
             return false;
         }
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock();
         pending.extend_from_slice(bytes);
         let buffered = pending.len() + self.inflight.load(Ordering::Relaxed);
         if self.over_output_limit(buffered) {
@@ -126,7 +127,7 @@ impl ConnectedReplica {
         if self.overflowed.load(Ordering::Relaxed) {
             return false;
         }
-        let mut pre = cut.pre.lock().unwrap();
+        let mut pre = cut.pre.lock();
         pre.extend_from_slice(bytes);
         if self.over_output_limit(pre.len()) {
             *pre = Vec::new();
@@ -183,21 +184,27 @@ impl ConnectedReplica {
     /// Lets `drop_link` shut down `fd`. Call `detach_fd` before the
     /// socket closes, so a reused fd number is never shut down.
     pub fn attach_fd(&self, fd: i32) {
-        let mut slot = self.conn_fd.lock().unwrap();
+        let mut slot = self.conn_fd.lock();
         *slot = Some(fd);
         if self.is_overflowed() {
+            // SAFETY: shutdown(2) takes no pointers. `fd` is the live socket being
+            // attached, and we hold the `conn_fd` lock that `detach_fd` takes before the
+            // socket closes.
             unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
         }
     }
 
     pub fn detach_fd(&self) {
-        *self.conn_fd.lock().unwrap() = None;
+        *self.conn_fd.lock() = None;
     }
 
     /// Shuts the replica's socket down; its writer and reader then fail
     /// and the replica reconnects.
     pub fn drop_link(&self) {
-        if let Some(fd) = *self.conn_fd.lock().unwrap() {
+        if let Some(fd) = *self.conn_fd.lock() {
+            // SAFETY: shutdown(2) takes no pointers. The `conn_fd` lock is held for the
+            // call and the owner runs `detach_fd` under it before closing the socket, so
+            // `fd` is still open and not a reused number.
             unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
         }
     }
@@ -214,7 +221,7 @@ impl ConnectedReplica {
         // Clear the flag first: an append racing with the take then either
         // lands in this batch or queues a new wakeup.
         self.wake_queued.store(false, Ordering::Release);
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock();
         let data = std::mem::take(&mut *pending);
         self.inflight.store(data.len(), Ordering::Relaxed);
         data
@@ -240,11 +247,13 @@ pub struct ShardReplicaFlow {
 impl ShardReplicaFlow {
     /// Forgets the socket; called before it closes.
     pub fn detach_fd(&self) {
-        *self.fd.lock().unwrap() = None;
+        *self.fd.lock() = None;
     }
 
     fn drop_link(&self) {
-        if let Some(fd) = *self.fd.lock().unwrap() {
+        if let Some(fd) = *self.fd.lock() {
+            // SAFETY: shutdown(2) takes no pointers. The `fd` lock is held for the call
+            // and `detach_fd` clears it under the same lock before the socket closes.
             unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
         }
     }
@@ -441,7 +450,7 @@ impl ReplicationHub {
         let h2 = hash64(&t.to_le_bytes());
         let new_replid = format!("{:016x}{:016x}{:08x}", h1, h2, self.port);
 
-        let mut role = self.role.write().unwrap();
+        let mut role = self.role.write();
         let (replid2, second_offset) = match &*role {
             ReplicationRole::Slave {
                 master_replid,
@@ -468,10 +477,9 @@ impl ReplicationHub {
     /// the master's replication id and offset, so the next attempt is a full
     /// resync. The dataset may not match any offset of the master's.
     fn forget_master_history(&self) {
-        let mut role = self.role.write().unwrap_or_else(|e| e.into_inner());
-        // A worker that panicked holding the lock poisoned it; the sync
-        // state it may have left half written is reset right here.
-        self.role.clear_poison();
+        // A worker that panicked holding the lock may have left the sync
+        // state half written; it is reset right here.
+        let mut role = self.role.write();
         if let ReplicationRole::Slave {
             ref mut link_status,
             ref mut master_replid,
@@ -488,13 +496,15 @@ impl ReplicationHub {
     }
 
     pub fn stop_sync(&self) {
-        if let Some(cancel) = self.cancel_sync.write().unwrap().take() {
+        if let Some(cancel) = self.cancel_sync.write().take() {
             let _ = cancel.send(());
         }
         // Wake a worker blocked reading from its master so it sees the
         // cancel now rather than after the master's next write. The worker
         // clears the slot before closing the socket, so the fd is open.
-        if let Some(fd) = *self.sync_conn.lock().unwrap() {
+        if let Some(fd) = *self.sync_conn.lock() {
+            // SAFETY: shutdown(2) takes no pointers. The `sync_conn` lock is held for the
+            // call and the worker clears the slot under it before closing the socket.
             unsafe {
                 libc::shutdown(fd, libc::SHUT_RDWR);
             }
@@ -512,7 +522,7 @@ impl ReplicationHub {
         sender: flume::Sender<Vec<u8>>,
     ) -> Arc<ConnectedReplica> {
         // Registering under the backlog lock orders it against propagation.
-        let _backlog = self.backlog.write().unwrap();
+        let _backlog = self.backlog.write();
         self.insert_replica(id, sender, None)
     }
 
@@ -536,7 +546,7 @@ impl ReplicationHub {
             soft_since_ms: AtomicU64::new(0),
             conn_fd: Mutex::new(None),
         });
-        self.replicas.write().unwrap().insert(id, rep.clone());
+        self.replicas.write().insert(id, rep.clone());
         self.has_replicas.store(true, Ordering::Release);
         self.backlog_active.store(true, Ordering::Release);
         HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
@@ -559,15 +569,15 @@ impl ReplicationHub {
             all_armed: std::sync::atomic::AtomicBool::new(false),
             pre: Mutex::new(Vec::new()),
         };
-        let _backlog = self.backlog.write().unwrap();
+        let _backlog = self.backlog.write();
         self.insert_replica(id, sender, Some(cut))
     }
 
     /// Called on shard `shard_id`'s thread right after it serialized its
     /// snapshot for replica `id`.
     pub fn arm_full_sync(&self, id: u64, shard_id: usize) {
-        let _backlog = self.backlog.write().unwrap();
-        if let Some(rep) = self.replicas.read().unwrap().get(&id)
+        let _backlog = self.backlog.write();
+        if let Some(rep) = self.replicas.read().get(&id)
             && let Some(cut) = &rep.full_sync
             && let Some(armed) = cut.armed.get(shard_id)
         {
@@ -580,12 +590,12 @@ impl ReplicationHub {
     /// right after the snapshot; from then on the replica gets the live
     /// stream, so its offset matches the master's.
     pub fn finish_full_sync(&self, id: u64) -> (u64, Vec<u8>) {
-        let _backlog = self.backlog.write().unwrap();
+        let _backlog = self.backlog.write();
         let offset = self.master_repl_offset.load(Ordering::SeqCst);
-        let pre = match self.replicas.read().unwrap().get(&id) {
+        let pre = match self.replicas.read().get(&id) {
             Some(rep) => match &rep.full_sync {
                 Some(cut) => {
-                    let pre = std::mem::take(&mut *cut.pre.lock().unwrap());
+                    let pre = std::mem::take(&mut *cut.pre.lock());
                     cut.all_armed.store(true, Ordering::Release);
                     pre
                 }
@@ -595,13 +605,13 @@ impl ReplicationHub {
         };
         let start = offset.saturating_sub(pre.len() as u64);
         if start < offset {
-            self.psync_holes.lock().unwrap().push((start, offset));
+            self.psync_holes.lock().push((start, offset));
         }
         (start, pre)
     }
 
     fn in_psync_hole(&self, replica_offset: u64, backlog_start: u64) -> bool {
-        let mut holes = self.psync_holes.lock().unwrap();
+        let mut holes = self.psync_holes.lock();
         holes.retain(|&(_, hi)| hi >= backlog_start);
         holes
             .iter()
@@ -609,7 +619,7 @@ impl ReplicationHub {
     }
 
     pub fn unregister_replica(&self, id: u64) {
-        let mut reps = self.replicas.write().unwrap();
+        let mut reps = self.replicas.write();
         reps.remove(&id);
         if reps.is_empty() {
             self.has_replicas.store(false, Ordering::Release);
@@ -623,7 +633,7 @@ impl ReplicationHub {
         if offset > self.master_repl_offset.load(Ordering::SeqCst) {
             return;
         }
-        if let Some(rep) = self.replicas.read().unwrap().get(&id) {
+        if let Some(rep) = self.replicas.read().get(&id) {
             rep.ack_offset.store(offset, Ordering::SeqCst);
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -634,7 +644,7 @@ impl ReplicationHub {
     }
 
     pub fn set_replica_port(&self, id: u64, port: u16) {
-        if let Some(rep) = self.replicas.read().unwrap().get(&id) {
+        if let Some(rep) = self.replicas.read().get(&id) {
             rep.listening_port.store(port as u64, Ordering::SeqCst);
         }
     }
@@ -654,7 +664,7 @@ impl ReplicationHub {
             lsn: AtomicU64::new(0),
             ack_lsn: AtomicU64::new(0),
         });
-        let mut flows = self.shard_flows.write().unwrap();
+        let mut flows = self.shard_flows.write();
         flows
             .entry(shard_id)
             .or_default()
@@ -665,7 +675,7 @@ impl ReplicationHub {
     }
 
     pub fn unregister_shard_flow(&self, shard_id: usize, client_id: u64) {
-        let mut flows = self.shard_flows.write().unwrap();
+        let mut flows = self.shard_flows.write();
         if let Some(map) = flows.get_mut(&shard_id) {
             map.remove(&client_id);
             if map.is_empty() {
@@ -677,7 +687,7 @@ impl ReplicationHub {
     }
 
     pub fn update_shard_flow_ack(&self, shard_id: usize, client_id: u64, ack_lsn: u64) {
-        let flows = self.shard_flows.read().unwrap();
+        let flows = self.shard_flows.read();
         if let Some(map) = flows.get(&shard_id)
             && let Some(flow) = map.get(&client_id)
         {
@@ -698,7 +708,7 @@ impl ReplicationHub {
         let target_offset = (req_offset as u64) + 1;
 
         let (current_replid, replid_matches) = {
-            let role = self.role.read().unwrap();
+            let role = self.role.read();
             match &*role {
                 ReplicationRole::Master {
                     replid,
@@ -723,7 +733,7 @@ impl ReplicationHub {
 
         // Hold the backlog lock until the replica is registered, so no
         // change lands between the diff and the live stream.
-        let backlog = self.backlog.write().unwrap();
+        let backlog = self.backlog.write();
         let current_offset = self.master_repl_offset.load(Ordering::SeqCst);
         if !backlog.can_partial_sync(target_offset, current_offset)
             || self.in_psync_hole(req_offset as u64, backlog.first_byte_offset)
@@ -742,7 +752,7 @@ impl ReplicationHub {
             return false;
         }
         let target_offset = (req_offset as u64) + 1;
-        let role = self.role.read().unwrap();
+        let role = self.role.read();
         let replid_matches = match &*role {
             ReplicationRole::Master {
                 replid,
@@ -763,7 +773,7 @@ impl ReplicationHub {
         if !replid_matches {
             return false;
         }
-        let backlog = self.backlog.read().unwrap();
+        let backlog = self.backlog.read();
         let current_offset = self.master_repl_offset.load(Ordering::SeqCst);
         backlog.can_partial_sync(target_offset, current_offset)
             && !self.in_psync_hole(req_offset as u64, backlog.first_byte_offset)
@@ -790,7 +800,7 @@ impl ReplicationHub {
         {
             let mut wake: Vec<Arc<ConnectedReplica>> = Vec::new();
             {
-                let mut backlog = self.backlog.write().unwrap();
+                let mut backlog = self.backlog.write();
                 if self.backlog_active.load(Ordering::Relaxed) {
                     let new_offset = self
                         .master_repl_offset
@@ -799,7 +809,7 @@ impl ReplicationHub {
                     backlog.append(bytes, new_offset);
                 }
                 if self.has_replicas.load(Ordering::Relaxed) {
-                    let reps = self.replicas.read().unwrap();
+                    let reps = self.replicas.read();
                     for rep in reps.values() {
                         match rep.delivery(shard) {
                             Delivery::Send => {
@@ -831,7 +841,7 @@ impl ReplicationHub {
                 .map(|rep| rep.id)
                 .collect();
             if !dead.is_empty() {
-                let mut reps = self.replicas.write().unwrap();
+                let mut reps = self.replicas.write();
                 for id in dead {
                     reps.remove(&id);
                 }
@@ -845,7 +855,7 @@ impl ReplicationHub {
             return;
         }
         let dead_flows: Vec<(usize, u64)> = {
-            let flows = self.shard_flows.read().unwrap();
+            let flows = self.shard_flows.read();
             let mut dead = Vec::new();
             for (&sid, map) in flows.iter() {
                 if shard.is_some_and(|s| s != sid) {
@@ -875,11 +885,11 @@ impl ReplicationHub {
     }
 
     pub fn format_role_resp(&self) -> Vec<u8> {
-        let role = self.role.read().unwrap().clone();
+        let role = self.role.read().clone();
         match role {
             ReplicationRole::Master { .. } => {
                 let offset = self.master_repl_offset.load(Ordering::SeqCst);
-                let reps = self.replicas.read().unwrap();
+                let reps = self.replicas.read();
                 let mut out = Vec::with_capacity(256);
                 out.extend_from_slice(b"*3\r\n$6\r\nmaster\r\n:");
                 out.extend_from_slice(offset.to_string().as_bytes());
@@ -926,16 +936,16 @@ impl ReplicationHub {
     }
 
     pub fn format_info_replication(&self) -> String {
-        let role = self.role.read().unwrap().clone();
+        let role = self.role.read().clone();
         match role {
             ReplicationRole::Master {
                 replid,
                 replid2,
                 second_offset,
             } => {
-                let reps = self.replicas.read().unwrap();
+                let reps = self.replicas.read();
                 let offset = self.master_repl_offset.load(Ordering::SeqCst);
-                let backlog = self.backlog.read().unwrap();
+                let backlog = self.backlog.read();
                 format!(
                     "# Replication\r\n\
                      role:master\r\n\
@@ -1036,12 +1046,12 @@ static REPLICATION_HUBS: LazyLock<RwLock<HashMap<u16, Arc<ReplicationHub>>>> =
 
 pub fn get_replication_hub(port: u16) -> Arc<ReplicationHub> {
     {
-        let hubs = REPLICATION_HUBS.read().unwrap();
+        let hubs = REPLICATION_HUBS.read();
         if let Some(hub) = hubs.get(&port) {
             return hub.clone();
         }
     }
-    let mut hubs = REPLICATION_HUBS.write().unwrap();
+    let mut hubs = REPLICATION_HUBS.write();
     hubs.entry(port)
         .or_insert_with(|| Arc::new(ReplicationHub::new(port)))
         .clone()
@@ -1060,8 +1070,8 @@ pub fn repl_backlog_size() -> usize {
 pub fn set_repl_backlog_size(bytes: usize) {
     let bytes = bytes.max(16 * 1024);
     REPL_BACKLOG_SIZE.store(bytes, Ordering::Relaxed);
-    for hub in REPLICATION_HUBS.read().unwrap().values() {
-        hub.backlog.write().unwrap().resize(bytes);
+    for hub in REPLICATION_HUBS.read().values() {
+        hub.backlog.write().resize(bytes);
     }
 }
 
@@ -1070,7 +1080,7 @@ pub fn has_connected_replicas(port: u16) -> bool {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
         return false;
     }
-    let hubs = REPLICATION_HUBS.read().unwrap();
+    let hubs = REPLICATION_HUBS.read();
     if let Some(hub) = hubs.get(&port) {
         hub.has_replicas.load(Ordering::Relaxed) || hub.backlog_active.load(Ordering::Relaxed)
     } else {
@@ -1083,10 +1093,10 @@ pub fn get_connected_replicas_count(port: u16) -> usize {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
         return 0;
     }
-    let hubs = REPLICATION_HUBS.read().unwrap();
+    let hubs = REPLICATION_HUBS.read();
     if let Some(hub) = hubs.get(&port) {
         if hub.has_replicas.load(Ordering::Relaxed) {
-            hub.replicas.read().unwrap().len()
+            hub.replicas.read().len()
         } else {
             0
         }
@@ -1105,7 +1115,7 @@ pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> us
     let target_offset = hub.master_repl_offset.load(Ordering::SeqCst);
     loop {
         let count = {
-            let reps = hub.replicas.read().unwrap();
+            let reps = hub.replicas.read();
             if reps.is_empty() {
                 return 0;
             }
@@ -1180,7 +1190,7 @@ pub fn start_replica_sync(
     HAS_SLAVE_INSTANCE.store(true, Ordering::Release);
 
     let (cached_replid, cached_offset) = {
-        let role = hub.role.read().unwrap();
+        let role = hub.role.read();
         if let ReplicationRole::Slave {
             master_host: ref prev_host,
             master_port: prev_port,
@@ -1199,7 +1209,7 @@ pub fn start_replica_sync(
         }
     };
 
-    *hub.role.write().unwrap() = ReplicationRole::Slave {
+    *hub.role.write() = ReplicationRole::Slave {
         master_host: master_host.clone(),
         master_port,
         link_status: "connecting".to_string(),
@@ -1209,9 +1219,9 @@ pub fn start_replica_sync(
     };
 
     let (cancel_tx, cancel_rx) = flume::bounded(1);
-    *hub.cancel_sync.write().unwrap() = Some(cancel_tx);
+    *hub.cancel_sync.write() = Some(cancel_tx);
     let (exit_tx, exit_rx) = flume::bounded::<()>(1);
-    let prev_exit = hub.worker_exit.lock().unwrap().replace(exit_rx);
+    let prev_exit = hub.worker_exit.lock().replace(exit_rx);
 
     let hub_clone = hub.clone();
     monoio::spawn(async move {
@@ -1282,19 +1292,19 @@ static MASTER_AUTH: LazyLock<RwLock<HashMap<u16, (Option<String>, Option<String>
 
 /// Sets `masterauth` (empty = none).
 pub fn set_masterauth(port: u16, pass: &str) {
-    let mut m = MASTER_AUTH.write().unwrap();
+    let mut m = MASTER_AUTH.write();
     m.entry(port).or_default().1 = (!pass.is_empty()).then(|| pass.to_string());
 }
 
 /// Sets `masteruser` (empty = none, i.e. AUTH as the default user).
 pub fn set_masteruser(port: u16, user: &str) {
-    let mut m = MASTER_AUTH.write().unwrap();
+    let mut m = MASTER_AUTH.write();
     m.entry(port).or_default().0 = (!user.is_empty()).then(|| user.to_string());
 }
 
 /// The AUTH command a replica sends to its master, if `masterauth` is set.
 fn master_auth_command(port: u16) -> Option<Vec<u8>> {
-    let m = MASTER_AUTH.read().unwrap();
+    let m = MASTER_AUTH.read();
     let (user, pass) = m.get(&port)?;
     let pass = pass.as_ref()?;
     let mut args: Vec<&[u8]> = vec![b"AUTH"];
@@ -1333,7 +1343,7 @@ static STARTUP_REPLICAOF: LazyLock<Mutex<HashMap<u16, (String, u16)>>> =
 /// `no one` clears it.
 pub fn set_startup_replicaof(port: u16, value: &str) -> Result<(), String> {
     let parts: Vec<&str> = value.split_whitespace().collect();
-    let mut m = STARTUP_REPLICAOF.lock().unwrap();
+    let mut m = STARTUP_REPLICAOF.lock();
     match parts.as_slice() {
         [no, one] if no.eq_ignore_ascii_case("no") && one.eq_ignore_ascii_case("one") => {
             m.remove(&port);
@@ -1351,7 +1361,7 @@ pub fn set_startup_replicaof(port: u16, value: &str) -> Result<(), String> {
 }
 
 pub fn take_startup_replicaof(port: u16) -> Option<(String, u16)> {
-    STARTUP_REPLICAOF.lock().unwrap().remove(&port)
+    STARTUP_REPLICAOF.lock().remove(&port)
 }
 
 #[inline]
@@ -1365,7 +1375,7 @@ struct SyncConnGuard<'a>(&'a ReplicationHub);
 
 impl Drop for SyncConnGuard<'_> {
     fn drop(&mut self) {
-        *self.0.sync_conn.lock().unwrap() = None;
+        *self.0.sync_conn.lock() = None;
     }
 }
 
@@ -1463,7 +1473,7 @@ async fn run_replica_worker(
                 if let ReplicationRole::Slave {
                     ref mut link_status,
                     ..
-                } = *hub.role.write().unwrap()
+                } = *hub.role.write()
                 {
                     *link_status = "down".to_string();
                 }
@@ -1474,7 +1484,7 @@ async fn run_replica_worker(
                 continue 'reconnect_loop;
             }
         };
-        *hub.sync_conn.lock().unwrap() = Some(std::os::unix::io::AsRawFd::as_raw_fd(&stream));
+        *hub.sync_conn.lock() = Some(std::os::unix::io::AsRawFd::as_raw_fd(&stream));
         // Declared after `stream`, so it is dropped (clearing the slot)
         // before the socket is closed.
         let _conn_guard = SyncConnGuard(&hub);
@@ -1491,7 +1501,7 @@ async fn run_replica_worker(
                     if let ReplicationRole::Slave {
                         ref mut link_status,
                         ..
-                    } = *hub.role.write().unwrap()
+                    } = *hub.role.write()
                     {
                         *link_status = "down".to_string();
                     }
@@ -1528,7 +1538,7 @@ async fn run_replica_worker(
                             if let ReplicationRole::Slave {
                                 ref mut link_status,
                                 ..
-                            } = *hub.role.write().unwrap()
+                            } = *hub.role.write()
                             {
                                 *link_status = "down".to_string();
                             }
@@ -1607,7 +1617,7 @@ async fn run_replica_worker(
 
         // 4. PSYNC
         let (cached_replid, cached_offset) = {
-            let role = hub.role.read().unwrap();
+            let role = hub.role.read();
             if let ReplicationRole::Slave {
                 ref master_replid,
                 master_repl_offset,
@@ -1640,7 +1650,7 @@ async fn run_replica_worker(
             if let ReplicationRole::Slave {
                 ref mut link_status,
                 ..
-            } = *hub.role.write().unwrap()
+            } = *hub.role.write()
             {
                 *link_status = "down".to_string();
             }
@@ -1673,7 +1683,7 @@ async fn run_replica_worker(
                     if let ReplicationRole::Slave {
                         ref mut link_status,
                         ..
-                    } = *hub.role.write().unwrap()
+                    } = *hub.role.write()
                     {
                         *link_status = "down".to_string();
                     }
@@ -1702,7 +1712,7 @@ async fn run_replica_worker(
                 if let ReplicationRole::Slave {
                     ref mut link_status,
                     ..
-                } = *hub.role.write().unwrap()
+                } = *hub.role.write()
                 {
                     *link_status = "down".to_string();
                 }
@@ -1738,7 +1748,7 @@ async fn run_replica_worker(
 
         // 8. Mark link_status up
         {
-            let mut role = hub.role.write().unwrap();
+            let mut role = hub.role.write();
             if let ReplicationRole::Slave {
                 ref mut link_status,
                 ref mut master_repl_offset,
@@ -1805,7 +1815,7 @@ async fn run_replica_worker(
             if let ReplicationRole::Slave {
                 ref mut master_repl_offset,
                 ..
-            } = *hub.role.write().unwrap()
+            } = *hub.role.write()
             {
                 *master_repl_offset = current_offset;
             }
@@ -1824,7 +1834,7 @@ async fn run_replica_worker(
         if let ReplicationRole::Slave {
             ref mut link_status,
             ..
-        } = *hub.role.write().unwrap()
+        } = *hub.role.write()
         {
             *link_status = "down".to_string();
         }
@@ -1838,7 +1848,7 @@ async fn run_replica_worker(
     if let ReplicationRole::Slave {
         ref mut link_status,
         ..
-    } = *hub.role.write().unwrap()
+    } = *hub.role.write()
     {
         *link_status = "down".to_string();
     }
@@ -2094,7 +2104,7 @@ mod tests {
             hub.propagate(&chunk);
         }
         assert!(rep.is_overflowed());
-        assert!(rep.pending.lock().unwrap().capacity() < (1 << 20));
+        assert!(rep.pending.lock().capacity() < (1 << 20));
         // The writer was woken to drop the link.
         assert!(rx.try_iter().count() >= 2);
         hub.propagate(b"more");
@@ -2213,7 +2223,7 @@ mod tests {
     fn test_replica_partial_resync_and_psync2_failover() {
         let hub = ReplicationHub::new(19997);
         let master_replid = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string();
-        *hub.role.write().unwrap() = ReplicationRole::Slave {
+        *hub.role.write() = ReplicationRole::Slave {
             master_host: "127.0.0.1".to_string(),
             master_port: 6379,
             link_status: "up".to_string(),
@@ -2237,7 +2247,7 @@ mod tests {
 
         // Verify replid2 and second_offset inherited
         {
-            let role = hub.role.read().unwrap();
+            let role = hub.role.read();
             match &*role {
                 ReplicationRole::Master {
                     replid,

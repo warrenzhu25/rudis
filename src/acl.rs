@@ -1,7 +1,8 @@
 use crate::acl_categories::{CATEGORIES, COMMANDS, NUM_COMMANDS, WORDS};
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock};
 
 pub static HAS_CUSTOM_ACL: AtomicBool = AtomicBool::new(false);
 
@@ -9,7 +10,7 @@ pub static PORT_ACLS: LazyLock<Mutex<HashMap<u16, Arc<RwLock<AclManager>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn get_acl_for_port(port: u16) -> Arc<RwLock<AclManager>> {
-    let mut map = PORT_ACLS.lock().unwrap();
+    let mut map = PORT_ACLS.lock();
     map.entry(port)
         .or_insert_with(|| Arc::new(RwLock::new(AclManager::new())))
         .clone()
@@ -25,7 +26,7 @@ pub fn share_acl_with_port(port: u16, base_port: u16) {
     if port == base_port {
         return;
     }
-    let mut map = PORT_ACLS.lock().unwrap();
+    let mut map = PORT_ACLS.lock();
     let base = map
         .entry(base_port)
         .or_insert_with(|| Arc::new(RwLock::new(AclManager::new())))
@@ -680,25 +681,15 @@ mod tests {
         let _ = get_acl_for_port(shard1);
         share_acl_with_port(shard1, base);
         share_acl_with_port(base, base); // no-op
-        get_acl_for_port(base)
-            .write()
-            .unwrap()
-            .set_requirepass("pw");
+        get_acl_for_port(base).write().set_requirepass("pw");
         let shard_acl = get_acl_for_port(shard1);
         assert!(Arc::ptr_eq(&shard_acl, &get_acl_for_port(base)));
-        assert!(shard_acl.read().unwrap().is_auth_required_for_default());
+        assert!(shard_acl.read().is_auth_required_for_default());
         shard_acl
             .write()
-            .unwrap()
             .set_user("zed", &["on".to_string(), ">z".to_string()])
             .unwrap();
-        assert!(
-            get_acl_for_port(base)
-                .read()
-                .unwrap()
-                .get_user("zed")
-                .is_some()
-        );
+        assert!(get_acl_for_port(base).read().get_user("zed").is_some());
     }
 
     #[test]

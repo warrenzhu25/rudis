@@ -51,6 +51,14 @@ start_server() {
         fi
     fi
     echo "Starting Rudis server on port $PORT (threads: $threads)..."
+    # The previous suite's server (killed with -9) may still hold the port
+    # for a moment; starting now would fail with "Address already in use".
+    for _ in $(seq 1 100); do
+        if ! timeout 1 bash -c "</dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
     # Run in a scratch dir: suites SAVE, and a dump.rdb left in the repo
     # would be loaded by every server later started there (e.g. e2e tests).
     rm -rf "$SERVER_DIR" && mkdir -p "$SERVER_DIR"

@@ -10,6 +10,19 @@ pub struct AllocatorStats {
     pub fragmentation_ratio: f64,
 }
 
+/// Turns jemalloc's background purge thread on or off. With it on, dirty
+/// pages are returned to the OS on the decay schedule even when the server
+/// is idle (otherwise purging only happens on later allocations). Returns
+/// whether jemalloc accepted the change.
+pub fn set_background_thread(on: bool) -> bool {
+    tikv_jemalloc_ctl::background_thread::write(on).is_ok()
+}
+
+/// Whether jemalloc's background purge thread is running.
+pub fn background_thread_enabled() -> bool {
+    tikv_jemalloc_ctl::background_thread::read().unwrap_or(false)
+}
+
 /// Query real-time jemalloc allocator statistics.
 pub fn get_allocator_stats() -> AllocatorStats {
     let _ = tikv_jemalloc_ctl::epoch::advance();
@@ -48,8 +61,9 @@ pub fn format_memory_info(
     } else {
         used_mem
     };
-    let frag = if stats.allocated > 0 {
-        stats.fragmentation_ratio
+    // Redis semantics: RSS relative to the logical dataset size.
+    let frag = if used_mem > 0 {
+        rss as f64 / used_mem as f64
     } else {
         1.00
     };
@@ -236,6 +250,14 @@ impl SmallCollectionArena {
 mod tests {
     use super::*;
     use crate::table::{OrderedScore, RudisTable, ZAddFlags};
+
+    #[test]
+    fn test_background_thread_switch_round_trips() {
+        assert!(set_background_thread(false));
+        assert!(!background_thread_enabled());
+        assert!(set_background_thread(true));
+        assert!(background_thread_enabled());
+    }
 
     #[test]
     fn test_small_collection_arena_lifecycle() {

@@ -1,6 +1,6 @@
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
@@ -47,7 +47,7 @@ static PER_CMD_SLOW_STATS: Mutex<Option<hashbrown::HashMap<String, CommandSlowSt
 
 pub fn record_cmd_slow_stat(cmd_name: &str, duration_us: u64) {
     let dur_ms = duration_us as f64 / 1000.0;
-    let mut guard = PER_CMD_SLOW_STATS.lock().unwrap();
+    let mut guard = PER_CMD_SLOW_STATS.lock();
     let map = guard.get_or_insert_with(hashbrown::HashMap::new);
     let entry = map.entry(cmd_name.to_lowercase()).or_default();
     entry.count += 1;
@@ -58,12 +58,12 @@ pub fn record_cmd_slow_stat(cmd_name: &str, duration_us: u64) {
 }
 
 pub fn get_cmd_slow_stat(cmd_name: &str) -> Option<CommandSlowStats> {
-    let guard = PER_CMD_SLOW_STATS.lock().unwrap();
+    let guard = PER_CMD_SLOW_STATS.lock();
     guard.as_ref()?.get(cmd_name).copied()
 }
 
 pub fn reset_cmd_slow_stats() {
-    let mut guard = PER_CMD_SLOW_STATS.lock().unwrap();
+    let mut guard = PER_CMD_SLOW_STATS.lock();
     if let Some(map) = guard.as_mut() {
         map.clear();
     }
@@ -81,18 +81,18 @@ static SLOWLOG_BUFFER: Mutex<VecDeque<SlowlogEntry>> = Mutex::new(VecDeque::new(
 
 /// Returns current length of the slowlog ring buffer
 pub fn slowlog_len() -> usize {
-    SLOWLOG_BUFFER.lock().unwrap().len()
+    SLOWLOG_BUFFER.lock().len()
 }
 
 /// Clears all entries from the slowlog ring buffer
 pub fn slowlog_reset() {
-    let mut buf = SLOWLOG_BUFFER.lock().unwrap();
+    let mut buf = SLOWLOG_BUFFER.lock();
     buf.clear();
 }
 
 /// Returns up to `count` entries from newest to oldest. If count is None or < 0, returns all.
 pub fn slowlog_get(count: Option<i64>) -> Vec<SlowlogEntry> {
-    let buf = SLOWLOG_BUFFER.lock().unwrap();
+    let buf = SLOWLOG_BUFFER.lock();
     let limit = match count {
         Some(c) if c >= 0 => c as usize,
         _ => buf.len(),
@@ -103,7 +103,7 @@ pub fn slowlog_get(count: Option<i64>) -> Vec<SlowlogEntry> {
 /// Trims slowlog ring buffer if max_len was decreased
 pub fn trim_slowlog_buffer() {
     let max_len = SLOWLOG_MAX_LEN.load(Ordering::Relaxed);
-    let mut buf = SLOWLOG_BUFFER.lock().unwrap();
+    let mut buf = SLOWLOG_BUFFER.lock();
     while buf.len() > max_len {
         buf.pop_front();
     }
@@ -176,7 +176,7 @@ pub fn log_command_if_slow(cmd: &Command, duration_us: u64, client_addr: &str, c
     };
 
     let max_len = SLOWLOG_MAX_LEN.load(Ordering::Relaxed);
-    let mut buf = SLOWLOG_BUFFER.lock().unwrap();
+    let mut buf = SLOWLOG_BUFFER.lock();
     if max_len == 0 {
         buf.clear();
         return;
@@ -358,6 +358,7 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
         Command::Echo(msg) => (vec![Bytes::from_static(b"echo"), msg.clone()], 2),
         Command::Type(key) => (vec![Bytes::from_static(b"type"), key.clone()], 2),
         Command::Dbsize => (vec![Bytes::from_static(b"dbsize")], 1),
+        Command::KeyspaceStats => (vec![Bytes::from_static(b"keyspacestats")], 1),
         Command::Select(db) => (
             vec![Bytes::from_static(b"select"), Bytes::from(db.to_string())],
             2,
@@ -761,11 +762,11 @@ pub(crate) mod tests {
 
     /// Held by tests that assert on the global slowlog, and by tests that run
     /// enough commands through `execute_command` to log into it meanwhile.
-    pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn test_slowlog_crud_and_ring_buffer() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock();
         slowlog_reset();
         assert_eq!(slowlog_len(), 0);
 
@@ -801,7 +802,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_slowlog_truncation_rules() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock();
         slowlog_reset();
         SLOWLOG_LOG_SLOWER_THAN.store(0, Ordering::Relaxed);
         SLOWLOG_ENTRY_MAX_ARGC.store(3, Ordering::Relaxed);

@@ -40,6 +40,7 @@ fn read_thp_status(path: &str) -> Option<String> {
 
 /// Queries current process max open file descriptor limit (`ulimit -n`).
 fn get_nofile_limit() -> Option<u64> {
+    // SAFETY: `rlim` is a valid, writable local; getrlimit only writes into it.
     unsafe {
         let mut rlim = libc::rlimit {
             rlim_cur: 0,

@@ -534,7 +534,7 @@ fn test_binary_serves_tls_with_pem_cert_files() {
             .arg("--tls-key-file")
             .arg(&key_path)
             .current_dir(&dir)
-            .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+            .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -584,4 +584,11 @@ fn test_binary_serves_tls_with_pem_cert_files() {
         thread::sleep(Duration::from_millis(50));
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Driver for spawned server binaries: inherits `MONOIO_FORCE_LEGACY_DRIVER`
+/// from the test process (CI runs one job per driver) and defaults to the
+/// legacy driver, which avoids io_uring memlock limits on old kernels.
+fn legacy_driver_env() -> String {
+    std::env::var("MONOIO_FORCE_LEGACY_DRIVER").unwrap_or_else(|_| "1".to_string())
 }

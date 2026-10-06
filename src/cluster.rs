@@ -1,8 +1,9 @@
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -133,14 +134,35 @@ pub struct ClusterHub {
 
 pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
 
+/// Bumped whenever a hub is added to `CLUSTER_HUBS` (hubs are never
+/// removed or replaced), so per-thread copies know when to refresh.
+static CLUSTER_HUBS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Per-thread copy of `CLUSTER_HUBS` and the generation it was taken at.
+    /// `has_active_cluster` runs on every keyed command; the global read
+    /// lock it used to take is an atomic RMW on a cache line shared by all
+    /// shards.
+    static CLUSTER_HUBS_TLS: std::cell::RefCell<(u64, Vec<(u16, Arc<ClusterHub>)>)> =
+        const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
+}
+
 #[inline]
 pub fn has_active_cluster(port: u16) -> bool {
-    let hubs = CLUSTER_HUBS.read().unwrap();
-    if let Some(hub) = hubs.get(&port) {
-        hub.has_nodes.load(Ordering::Relaxed) || hub.cluster_enabled.load(Ordering::Relaxed)
-    } else {
-        HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed)
-    }
+    CLUSTER_HUBS_TLS.with(|cache| {
+        let gen_now = CLUSTER_HUBS_GEN.load(Ordering::Acquire);
+        let mut c = cache.borrow_mut();
+        if c.0 != gen_now {
+            let hubs = CLUSTER_HUBS.read();
+            c.1 = hubs.iter().map(|(p, h)| (*p, h.clone())).collect();
+            c.0 = gen_now;
+        }
+        if let Some((_, hub)) = c.1.iter().find(|(p, _)| *p == port) {
+            hub.has_nodes.load(Ordering::Relaxed) || hub.cluster_enabled.load(Ordering::Relaxed)
+        } else {
+            HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed)
+        }
+    })
 }
 
 static CLUSTER_HUBS: LazyLock<RwLock<HashMap<u16, Arc<ClusterHub>>>> =
@@ -148,17 +170,18 @@ static CLUSTER_HUBS: LazyLock<RwLock<HashMap<u16, Arc<ClusterHub>>>> =
 
 pub fn get_cluster_hub(port: u16) -> Arc<ClusterHub> {
     {
-        let hubs = CLUSTER_HUBS.read().unwrap();
+        let hubs = CLUSTER_HUBS.read();
         if let Some(hub) = hubs.get(&port) {
             return hub.clone();
         }
     }
-    let mut hubs = CLUSTER_HUBS.write().unwrap();
+    let mut hubs = CLUSTER_HUBS.write();
     if let Some(hub) = hubs.get(&port) {
         return hub.clone();
     }
     let hub = Arc::new(ClusterHub::new(port));
     hubs.insert(port, hub.clone());
+    CLUSTER_HUBS_GEN.fetch_add(1, Ordering::Release);
     hub
 }
 
@@ -202,7 +225,7 @@ impl ClusterHub {
     }
 
     pub fn my_id(&self) -> String {
-        self.my_id.read().unwrap().clone()
+        self.my_id.read().clone()
     }
 
     /// Gives this node a new config epoch after its own slot set changed.
@@ -233,7 +256,7 @@ impl ClusterHub {
                 current_cfg
             ));
         }
-        let slots = self.my_slots.read().unwrap();
+        let slots = self.my_slots.read();
         let has_explicit_slots = !slots.is_empty() && !(slots.len() == 1 && slots[0] == (0, 16383));
         if has_explicit_slots {
             return Err(
@@ -243,7 +266,7 @@ impl ClusterHub {
         }
         drop(slots);
         {
-            let mut my_slots = self.my_slots.write().unwrap();
+            let mut my_slots = self.my_slots.write();
             if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
                 my_slots.clear();
             }
@@ -258,7 +281,7 @@ impl ClusterHub {
     pub fn assign_slot(&self, slot: u16, owner_id: &str) {
         let me = owner_id == self.my_id();
         {
-            let mut my_slots = self.my_slots.write().unwrap();
+            let mut my_slots = self.my_slots.write();
             if me {
                 if !my_slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
                     my_slots.push((slot, slot));
@@ -268,7 +291,7 @@ impl ClusterHub {
                 remove_slots(&mut my_slots, &[slot]);
             }
         }
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = self.nodes.write();
         for (id, node) in nodes.iter_mut() {
             if id == owner_id {
                 if !node.slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
@@ -287,8 +310,8 @@ impl ClusterHub {
             "PING {} {} {} {} GOSSIP {}\r\n",
             self.my_id(),
             self.config_epoch.load(Ordering::Relaxed),
-            self.role.read().unwrap(),
-            slots_repr(&self.my_slots.read().unwrap()),
+            self.role.read(),
+            slots_repr(&self.my_slots.read()),
             gossip
         )
     }
@@ -302,7 +325,7 @@ impl ClusterHub {
         let parts: Vec<&str> = resp.split_whitespace().collect();
         let epoch = parts.get(2).and_then(|v| v.parse::<u64>().ok());
         let slots = parts.get(4).map_or_else(Vec::new, |r| parse_slot_ranges(r));
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = self.nodes.write();
         let mut key = node_id;
         // A MEET whose handshake reply was lost leaves the peer under a
         // placeholder id; its PONG names it, so move the entry to the real id.
@@ -327,7 +350,7 @@ impl ClusterHub {
     /// other's current slots and epoch right away instead of on the next tick.
     pub async fn refresh_peer(&self, node_id: &str) {
         use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-        let addr = match self.nodes.read().unwrap().get(node_id) {
+        let addr = match self.nodes.read().get(node_id) {
             Some(n) => format!("{}:{}", n.ip, n.cport),
             None => return,
         };
@@ -356,16 +379,16 @@ impl ClusterHub {
 
         // 1. Myself entry
         let my_id = self.my_id();
-        let role = self.role.read().unwrap().clone();
-        let master_id = self.master_id.read().unwrap().clone();
+        let role = self.role.read().clone();
+        let master_id = self.master_id.read().clone();
         let cfg_epoch = self.config_epoch.load(Ordering::Relaxed);
         let is_cluster = self.cluster_enabled.load(Ordering::Relaxed);
         let num_shards = self.num_shards.load(Ordering::Relaxed).max(1);
-        let my_slots_str = if is_cluster && self.nodes.read().unwrap().is_empty() {
+        let my_slots_str = if is_cluster && self.nodes.read().is_empty() {
             let end_slot = 16384 / num_shards - 1;
             format!(" 0-{}", end_slot)
         } else {
-            let my_slots = self.my_slots.read().unwrap().clone();
+            let my_slots = self.my_slots.read().clone();
             let mut s_str = String::new();
             for (s, e) in &my_slots {
                 if s == e {
@@ -378,7 +401,7 @@ impl ClusterHub {
         };
 
         let migrating_str = {
-            let states = self.slot_states.read().unwrap();
+            let states = self.slot_states.read();
             let mut s = String::new();
             let mut sorted_slots: Vec<_> = states.keys().copied().collect();
             sorted_slots.sort();
@@ -408,7 +431,7 @@ impl ClusterHub {
         ));
 
         // 2. Peer entries
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = self.nodes.write();
         if is_cluster && nodes.is_empty() {
             for s in 1..num_shards {
                 let peer_port = self.port + s as u16;
@@ -432,7 +455,7 @@ impl ClusterHub {
             }
             return out;
         }
-        let pfail_reports = self.pfail_reports.read().unwrap();
+        let pfail_reports = self.pfail_reports.read();
         let mut keys: Vec<String> = nodes.keys().cloned().collect();
         keys.sort();
 
@@ -440,11 +463,7 @@ impl ClusterHub {
             .values()
             .filter(|n| n.master_id == "-" || (!n.flags.contains("slave") && !n.flags.is_empty()))
             .count()
-            + if *self.role.read().unwrap() == "master" {
-                1
-            } else {
-                0
-            };
+            + if *self.role.read() == "master" { 1 } else { 0 };
         let quorum = (total_masters / 2) + 1;
 
         for id in keys {
@@ -496,7 +515,7 @@ impl ClusterHub {
     }
 
     pub fn cluster_info(&self) -> String {
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read();
         let total_nodes = nodes.len() + 1; // peers + self
         let pfail_count = nodes.values().filter(|n| n.flags.contains("fail?")).count();
         let fail_count = nodes.values().filter(|n| n.flags == "fail").count();
@@ -526,7 +545,7 @@ impl ClusterHub {
 
         // Pre-insert peer into nodes table so it is known immediately
         {
-            let mut nodes = self.nodes.write().unwrap();
+            let mut nodes = self.nodes.write();
             if !nodes.values().any(|n| n.port == port) {
                 nodes.insert(
                     temp_id.clone(),
@@ -560,7 +579,7 @@ impl ClusterHub {
             let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
 
             let my_epoch = self.config_epoch.load(Ordering::Relaxed);
-            let my_slots = self.my_slots.read().unwrap().clone();
+            let my_slots = self.my_slots.read().clone();
             let mut slots_repr = String::new();
             for (s, e) in my_slots {
                 slots_repr.push_str(&format!("{}-{},", s, e));
@@ -588,7 +607,7 @@ impl ClusterHub {
                             let remote_role = parts[3].to_string();
                             let remote_slots =
                                 parts.get(4).map_or_else(Vec::new, |r| parse_slot_ranges(r));
-                            let mut nodes = self.nodes.write().unwrap();
+                            let mut nodes = self.nodes.write();
                             nodes.remove(&temp_id);
                             nodes.insert(
                                 remote_id.clone(),
@@ -616,9 +635,9 @@ impl ClusterHub {
     }
 
     pub fn cluster_forget(&self, node_id: &str) -> Result<(), String> {
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = self.nodes.write();
         nodes.remove(node_id);
-        let mut pfail = self.pfail_reports.write().unwrap();
+        let mut pfail = self.pfail_reports.write();
         pfail.remove(node_id);
         for reports in pfail.values_mut() {
             reports.remove(node_id);
@@ -627,28 +646,28 @@ impl ClusterHub {
     }
 
     pub fn cluster_replicate(&self, master_id: &str) -> Result<(), String> {
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read();
         if !nodes.contains_key(master_id) {
             return Err("ERR Unknown node".to_string());
         }
-        *self.role.write().unwrap() = "slave".to_string();
-        *self.master_id.write().unwrap() = master_id.to_string();
-        self.my_slots.write().unwrap().clear();
+        *self.role.write() = "slave".to_string();
+        *self.master_id.write() = master_id.to_string();
+        self.my_slots.write().clear();
         Ok(())
     }
 
     pub fn cluster_failover(&self, _force: bool) -> Result<(), String> {
         let new_epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.config_epoch.store(new_epoch, Ordering::SeqCst);
-        let old_master_id = self.master_id.write().unwrap().clone();
+        let old_master_id = self.master_id.write().clone();
         let my_id = self.my_id();
-        *self.role.write().unwrap() = "master".to_string();
-        *self.master_id.write().unwrap() = "-".to_string();
+        *self.role.write() = "master".to_string();
+        *self.master_id.write() = "-".to_string();
 
         // Inherit slots from old master if known
         let mut inherited_slots = Vec::new();
         {
-            let mut nodes = self.nodes.write().unwrap();
+            let mut nodes = self.nodes.write();
             if let Some(m) = nodes.get_mut(&old_master_id) {
                 inherited_slots = std::mem::take(&mut m.slots);
                 m.flags = "slave".to_string();
@@ -656,14 +675,14 @@ impl ClusterHub {
             }
         }
         if !inherited_slots.is_empty() {
-            *self.my_slots.write().unwrap() = inherited_slots.clone();
+            *self.my_slots.write() = inherited_slots.clone();
         }
 
         // Notify replication hub if active
         crate::replication::get_replication_hub(self.port).make_master();
 
         // Broadcast FAILOVER to all peers
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read();
         for peer in nodes.values() {
             let addr = format!("{}:{}", peer.ip, peer.cport);
             if let Ok(mut stream) =
@@ -685,7 +704,7 @@ impl ClusterHub {
     }
 
     pub fn cluster_slots(&self, out: &mut Vec<u8>, num_shards: usize) {
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read();
         if nodes.is_empty() {
             // Standalone node fallback: report slots divided across local num_shards
             out.extend_from_slice(format!("*{}\r\n", num_shards).as_bytes());
@@ -719,8 +738,8 @@ impl ClusterHub {
 
         // Multi-node cluster: collect slot ranges for all master nodes
         let my_id = self.my_id();
-        let my_role = self.role.read().unwrap().clone();
-        let my_slots = self.my_slots.read().unwrap().clone();
+        let my_role = self.role.read().clone();
+        let my_slots = self.my_slots.read().clone();
 
         struct MasterSlotEntry {
             start: u16,
@@ -810,10 +829,10 @@ impl ClusterHub {
     }
 
     pub fn cluster_shards(&self, out: &mut Vec<u8>) {
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read();
         let my_id = self.my_id();
-        let my_role = self.role.read().unwrap().clone();
-        let my_slots = self.my_slots.read().unwrap().clone();
+        let my_role = self.role.read().clone();
+        let my_slots = self.my_slots.read().clone();
 
         struct ShardItem {
             slots: Vec<(u16, u16)>,
@@ -887,7 +906,7 @@ impl ClusterHub {
                     }
                 }
                 // If myself is replica of this peer
-                if *self.master_id.read().unwrap() == peer.id {
+                if *self.master_id.read() == peer.id {
                     shard_nodes.push((
                         my_id.clone(),
                         self.port,
@@ -980,7 +999,7 @@ impl ClusterHub {
     }
 
     pub fn cluster_links(&self, out: &mut Vec<u8>) {
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1006,7 +1025,7 @@ impl ClusterHub {
                 return Err(format!("ERR Slot {} out of range", s));
             }
         }
-        let mut my_slots = self.my_slots.write().unwrap();
+        let mut my_slots = self.my_slots.write();
         if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
             my_slots.clear();
         }
@@ -1018,7 +1037,7 @@ impl ClusterHub {
     }
 
     pub fn cluster_delslots(&self, slots: &[u16]) -> Result<(), String> {
-        let mut my_slots = self.my_slots.write().unwrap();
+        let mut my_slots = self.my_slots.write();
         remove_slots(&mut my_slots, slots);
         Ok(())
     }
@@ -1029,7 +1048,7 @@ impl ClusterHub {
                 return Err(format!("ERR Invalid slot range {}-{}", start, end));
             }
         }
-        let mut my_slots = self.my_slots.write().unwrap();
+        let mut my_slots = self.my_slots.write();
         if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
             my_slots.clear();
         }
@@ -1041,7 +1060,7 @@ impl ClusterHub {
     }
 
     pub fn cluster_delslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
-        let mut my_slots = self.my_slots.write().unwrap();
+        let mut my_slots = self.my_slots.write();
         let mut to_remove = Vec::new();
         for &(start, end) in ranges {
             for s in start..=end {
@@ -1054,7 +1073,7 @@ impl ClusterHub {
 
     pub fn broadcast_to_peers(&self, msg: &str) {
         let peers: Vec<(String, u16)> = {
-            let nodes = self.nodes.read().unwrap();
+            let nodes = self.nodes.read();
             nodes.values().map(|n| (n.ip.clone(), n.cport)).collect()
         };
         for (ip, cport) in peers {
@@ -1074,9 +1093,9 @@ impl ClusterHub {
         let mut slot_owners: HashMap<u16, Vec<String>> = HashMap::new();
 
         let my_id = self.my_id();
-        let is_master = self.role.read().unwrap().contains("master");
+        let is_master = self.role.read().contains("master");
         if is_master {
-            let my_slots = self.my_slots.read().unwrap();
+            let my_slots = self.my_slots.read();
             for &(s, e) in my_slots.iter() {
                 for slot in s..=e {
                     slot_owners.entry(slot).or_default().push(my_id.clone());
@@ -1084,7 +1103,7 @@ impl ClusterHub {
             }
         }
 
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read();
         let mut masters_count = if is_master { 1 } else { 0 };
         let mut replicas_count = if is_master { 0 } else { 1 };
 
@@ -1136,7 +1155,7 @@ impl ClusterHub {
         let mut migrating_slots = Vec::new();
         let mut importing_slots = Vec::new();
         {
-            let states = self.slot_states.read().unwrap();
+            let states = self.slot_states.read();
             for (&slot, (state, target)) in states.iter() {
                 if state == "migrating" {
                     migrating_slots.push((slot, target.clone()));
@@ -1175,7 +1194,7 @@ impl ClusterHub {
         let my_id = self.my_id();
         let my_addr = format!("127.0.0.1:{}", self.port);
         let my_slots: Vec<u16> = {
-            let ranges = self.my_slots.read().unwrap();
+            let ranges = self.my_slots.read();
             let mut s = Vec::new();
             for &(start, end) in ranges.iter() {
                 for slot in start..=end {
@@ -1185,7 +1204,7 @@ impl ClusterHub {
             s
         };
 
-        if self.role.read().unwrap().contains("master") {
+        if self.role.read().contains("master") {
             masters.push(Master {
                 id: my_id.clone(),
                 addr: my_addr,
@@ -1195,7 +1214,7 @@ impl ClusterHub {
         }
 
         {
-            let nodes = self.nodes.read().unwrap();
+            let nodes = self.nodes.read();
             for n in nodes.values() {
                 if n.flags.contains("master") && n.id != my_id {
                     let mut s = Vec::new();
@@ -1370,7 +1389,7 @@ impl ClusterHub {
     ) -> Result<Vec<SlotMigrationPlan>, String> {
         let my_id = self.my_id();
         let (source_addr, mut source_slots) = if source_node_id == my_id {
-            let ranges = self.my_slots.read().unwrap();
+            let ranges = self.my_slots.read();
             let mut s = Vec::new();
             for &(start, end) in ranges.iter() {
                 for slot in start..=end {
@@ -1379,7 +1398,7 @@ impl ClusterHub {
             }
             (format!("127.0.0.1:{}", self.port), s)
         } else {
-            let nodes = self.nodes.read().unwrap();
+            let nodes = self.nodes.read();
             let node = nodes
                 .get(source_node_id)
                 .ok_or_else(|| format!("Source node {} not found", source_node_id))?;
@@ -1395,7 +1414,7 @@ impl ClusterHub {
         let target_addr = if target_node_id == my_id {
             format!("127.0.0.1:{}", self.port)
         } else {
-            let nodes = self.nodes.read().unwrap();
+            let nodes = self.nodes.read();
             let node = nodes
                 .get(target_node_id)
                 .ok_or_else(|| format!("Target node {} not found", target_node_id))?;
@@ -1419,7 +1438,7 @@ impl ClusterHub {
     }
 
     pub fn start_election(&self) {
-        let master_id = self.master_id.read().unwrap().clone();
+        let master_id = self.master_id.read().clone();
         if master_id == "-" || master_id.is_empty() {
             self.election_in_progress.store(false, Ordering::SeqCst);
             return;
@@ -1428,7 +1447,7 @@ impl ClusterHub {
         let req_epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
         let masters: Vec<(String, u16)> = {
-            let nodes = self.nodes.read().unwrap();
+            let nodes = self.nodes.read();
             nodes
                 .values()
                 .filter(|n| n.flags.contains("master") && !n.flags.contains("fail"))
@@ -1469,21 +1488,21 @@ impl ClusterHub {
         if votes >= majority {
             // Won the election!
             let my_id = self.my_id();
-            *self.role.write().unwrap() = "master".to_string();
-            *self.master_id.write().unwrap() = "-".to_string();
+            *self.role.write() = "master".to_string();
+            *self.master_id.write() = "-".to_string();
             self.config_epoch.store(req_epoch, Ordering::SeqCst);
 
             // Inherit old master's slots
             let mut inherited = Vec::new();
             {
-                let mut nodes = self.nodes.write().unwrap();
+                let mut nodes = self.nodes.write();
                 if let Some(m) = nodes.get_mut(&master_id) {
                     inherited = std::mem::take(&mut m.slots);
                     m.flags = "fail".to_string();
                 }
             }
             if !inherited.is_empty() {
-                *self.my_slots.write().unwrap() = inherited.clone();
+                *self.my_slots.write() = inherited.clone();
             }
 
             crate::replication::get_replication_hub(self.port).make_master();
@@ -1507,16 +1526,16 @@ impl ClusterHub {
     }
 
     pub fn cluster_reset(&self, hard: bool) -> Result<(), String> {
-        self.nodes.write().unwrap().clear();
-        self.pfail_reports.write().unwrap().clear();
+        self.nodes.write().clear();
+        self.pfail_reports.write().clear();
         if hard {
             let new_id = generate_node_id(self.port);
-            *self.my_id.write().unwrap() = new_id;
+            *self.my_id.write() = new_id;
             self.current_epoch.store(1, Ordering::SeqCst);
             self.config_epoch.store(0, Ordering::SeqCst);
-            *self.role.write().unwrap() = "master".to_string();
-            *self.master_id.write().unwrap() = "-".to_string();
-            self.my_slots.write().unwrap().clear();
+            *self.role.write() = "master".to_string();
+            *self.master_id.write() = "-".to_string();
+            self.my_slots.write().clear();
         }
         Ok(())
     }
@@ -1580,14 +1599,14 @@ impl ClusterHub {
 
         if !new_slots.is_empty() {
             compact_slots(&mut new_slots);
-            *self.my_slots.write().unwrap() = new_slots;
+            *self.my_slots.write() = new_slots;
         }
 
         Ok(())
     }
 
     pub fn dfly_slot_migration_status(&self, out: &mut Vec<u8>) {
-        let mig = self.active_migration.read().unwrap();
+        let mig = self.active_migration.read();
         match &*mig {
             None => {
                 out.extend_from_slice(
@@ -1609,7 +1628,7 @@ impl ClusterHub {
     }
 
     pub fn dfly_migrate_init(&self, source_id: &str, num_shards: usize, slots: &[(u16, u16)]) {
-        *self.active_migration.write().unwrap() = Some(ActiveMigration {
+        *self.active_migration.write() = Some(ActiveMigration {
             state: "MIGRATING".to_string(),
             source_id: source_id.to_string(),
             num_shards,
@@ -1619,14 +1638,14 @@ impl ClusterHub {
     }
 
     pub fn dfly_migrate_flow(&self, _source_id: &str, flow_id: u64) {
-        if let Some(ref mut m) = *self.active_migration.write().unwrap() {
+        if let Some(ref mut m) = *self.active_migration.write() {
             m.state = "SYNCING".to_string();
             m.keys_migrated += flow_id.max(1);
         }
     }
 
     pub fn dfly_migrate_ack(&self, _flow_id: u64) {
-        *self.active_migration.write().unwrap() = None;
+        *self.active_migration.write() = None;
     }
 }
 
@@ -1701,7 +1720,7 @@ pub fn start_cluster_bus(port: u16) {
 
     let cport = port + 10000;
     let (cancel_tx, cancel_rx) = flume::bounded(1);
-    *hub.cancel_bus.write().unwrap() = Some(cancel_tx);
+    *hub.cancel_bus.write() = Some(cancel_tx);
 
     let hub_clone = hub.clone();
     std::thread::Builder::new()
@@ -1797,8 +1816,8 @@ fn now_ms() -> u64 {
 
 fn pong_reply(hub: &ClusterHub) -> String {
     let my_epoch = hub.config_epoch.load(Ordering::Relaxed);
-    let role = hub.role.read().unwrap().clone();
-    let my_slots = hub.my_slots.read().unwrap().clone();
+    let role = hub.role.read().clone();
+    let my_slots = hub.my_slots.read().clone();
     let mut slots_repr = String::new();
     for (s, e) in my_slots {
         slots_repr.push_str(&format!("{}-{},", s, e));
@@ -1866,7 +1885,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             let peer_slots = parts.get(5).map_or_else(Vec::new, |r| parse_slot_ranges(r));
 
             {
-                let mut nodes = hub.nodes.write().unwrap();
+                let mut nodes = hub.nodes.write();
                 if !nodes.contains_key(&peer_id) && nodes.len() >= MAX_CLUSTER_NODES {
                     return Some("-ERR too many cluster nodes\r\n".to_string());
                 }
@@ -1900,7 +1919,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             let now = now_ms();
 
             {
-                let mut nodes = hub.nodes.write().unwrap();
+                let mut nodes = hub.nodes.write();
                 if let Some(node) = nodes.get_mut(&peer_id) {
                     node.pong_recv = now;
                     node.link_state = "connected".to_string();
@@ -1928,18 +1947,17 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                         let gcport: u16 = fields[3].parse().unwrap_or(0);
                         let gflags = fields[4].to_string();
                         if gid != hub.my_id() {
-                            let mut nodes = hub.nodes.write().unwrap();
+                            let mut nodes = hub.nodes.write();
                             // Failure reports only count for nodes we know.
                             if nodes.contains_key(&gid) {
                                 if gflags.contains("fail") {
                                     hub.pfail_reports
                                         .write()
-                                        .unwrap()
                                         .entry(gid.clone())
                                         .or_default()
                                         .insert(peer_id.clone());
                                 } else if let Some(reports) =
-                                    hub.pfail_reports.write().unwrap().get_mut(&gid)
+                                    hub.pfail_reports.write().get_mut(&gid)
                                 {
                                     reports.remove(&peer_id);
                                 }
@@ -1980,7 +1998,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                 return None;
             }
             let failed_id = parts[1];
-            let mut nodes = hub.nodes.write().unwrap();
+            let mut nodes = hub.nodes.write();
             if let Some(node) = nodes.get_mut(failed_id) {
                 node.flags = "fail".to_string();
                 node.link_state = "disconnected".to_string();
@@ -1995,7 +2013,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             let master_id = parts[1].to_string();
             let epoch: u64 = parts[2].parse().unwrap_or(1);
             let peer_slots = parts.get(3).map_or_else(Vec::new, |r| parse_slot_ranges(r));
-            let mut nodes = hub.nodes.write().unwrap();
+            let mut nodes = hub.nodes.write();
             if let Some(node) = nodes.get_mut(&master_id) {
                 node.flags = "master".to_string();
                 node.master_id = "-".to_string();
@@ -2013,10 +2031,10 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             }
             let req_epoch: u64 = parts[2].parse().unwrap_or(0);
             let claimed_master = parts[3];
-            let is_master = *hub.role.read().unwrap() == "master";
+            let is_master = *hub.role.read() == "master";
             let last_vote = hub.last_vote_epoch.load(Ordering::Relaxed);
             let master_is_down = {
-                let nodes = hub.nodes.read().unwrap();
+                let nodes = hub.nodes.read();
                 nodes
                     .get(claimed_master)
                     .map(|n| n.flags.contains("fail"))
@@ -2042,7 +2060,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             let new_master_id = parts[1].to_string();
             let epoch: u64 = parts[2].parse().unwrap_or(1);
             let peer_slots = parts.get(3).map_or_else(Vec::new, |r| parse_slot_ranges(r));
-            let mut nodes = hub.nodes.write().unwrap();
+            let mut nodes = hub.nodes.write();
             if let Some(node) = nodes.get_mut(&new_master_id) {
                 node.flags = "master".to_string();
                 node.master_id = "-".to_string();
@@ -2077,7 +2095,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         .as_millis() as u64;
 
     let (peers, quorum): (Vec<(String, String, u16, u16)>, usize) = {
-        let nodes = hub.nodes.read().unwrap();
+        let nodes = hub.nodes.read();
         let p = nodes
             .values()
             .map(|n| (n.id.clone(), n.ip.clone(), n.port, n.cport))
@@ -2086,18 +2104,14 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
             .values()
             .filter(|n| n.master_id == "-" || (!n.flags.contains("slave") && !n.flags.is_empty()))
             .count()
-            + if *hub.role.read().unwrap() == "master" {
-                1
-            } else {
-                0
-            };
+            + if *hub.role.read() == "master" { 1 } else { 0 };
         (p, (total_masters / 2) + 1)
     };
 
     // Prepare gossip payload of all known nodes
     let mut gossip_payload = String::new();
     {
-        let nodes = hub.nodes.read().unwrap();
+        let nodes = hub.nodes.read();
         for n in nodes.values() {
             gossip_payload.push_str(&format!(
                 "{},{},{},{},{},{};",
@@ -2117,9 +2131,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         };
 
         // Record ping_sent
-        if let Ok(mut nodes) = hub.nodes.write()
-            && let Some(node) = nodes.get_mut(&id)
-        {
+        if let Some(node) = hub.nodes.write().get_mut(&id) {
             node.ping_sent = now;
         }
 
@@ -2136,16 +2148,14 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
                     .read(&mut buf)
                     .is_ok_and(|n| hub.apply_pong(&id, &String::from_utf8_lossy(&buf[..n])));
 
-            if let Ok(mut nodes) = hub.nodes.write()
-                && let Some(node) = nodes.get_mut(&id)
-            {
+            if let Some(node) = hub.nodes.write().get_mut(&id) {
                 if success {
                     node.pong_recv = now;
                     node.link_state = "connected".to_string();
                     if node.flags == "fail?" || node.flags == "fail" {
                         node.flags = "master".to_string();
                     }
-                    if let Some(reports) = hub.pfail_reports.write().unwrap().get_mut(&id) {
+                    if let Some(reports) = hub.pfail_reports.write().get_mut(&id) {
                         reports.remove(&hub.my_id());
                     }
                 } else {
@@ -2154,7 +2164,6 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
                         let pfail_count = hub
                             .pfail_reports
                             .read()
-                            .unwrap()
                             .get(&id)
                             .map(|s| s.len())
                             .unwrap_or(0);
@@ -2169,15 +2178,12 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
                     }
                 }
             }
-        } else if let Ok(mut nodes) = hub.nodes.write()
-            && let Some(node) = nodes.get_mut(&id)
-        {
+        } else if let Some(node) = hub.nodes.write().get_mut(&id) {
             let elapsed = now.saturating_sub(node.pong_recv);
             if elapsed > 5000 {
                 let pfail_count = hub
                     .pfail_reports
                     .read()
-                    .unwrap()
                     .get(&id)
                     .map(|s| s.len())
                     .unwrap_or(0);
@@ -2195,10 +2201,10 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
 
     // Automated failover trigger for replicas
     let should_elect = {
-        let is_slave = *hub.role.read().unwrap() == "slave";
-        let master_id = hub.master_id.read().unwrap().clone();
+        let is_slave = *hub.role.read() == "slave";
+        let master_id = hub.master_id.read().clone();
         if is_slave && master_id != "-" && !master_id.is_empty() {
-            let nodes = hub.nodes.read().unwrap();
+            let nodes = hub.nodes.read();
             nodes
                 .get(&master_id)
                 .map(|n| n.flags.contains("fail"))
@@ -2233,7 +2239,7 @@ mod tests {
 
         // Insert Node 2 and Node 3 as masters
         {
-            let mut nodes = hub.nodes.write().unwrap();
+            let mut nodes = hub.nodes.write();
             nodes.insert(
                 node2_id.clone(),
                 ClusterNodeInfo {
@@ -2277,7 +2283,6 @@ mod tests {
         // 2. Node 3 reports Node 2 as failing
         hub.pfail_reports
             .write()
-            .unwrap()
             .entry(node2_id.clone())
             .or_default()
             .insert(node3_id.clone());
@@ -2292,12 +2297,11 @@ mod tests {
         // 3. Node 3 retracts report
         hub.pfail_reports
             .write()
-            .unwrap()
             .get_mut(&node2_id)
             .unwrap()
             .remove(&node3_id);
         {
-            let mut nodes = hub.nodes.write().unwrap();
+            let mut nodes = hub.nodes.write();
             nodes.get_mut(&node2_id).unwrap().flags = "master".to_string();
         }
         let nodes_output_retracted = hub.cluster_nodes();
@@ -2311,20 +2315,12 @@ mod tests {
         // 4. Test cluster_forget cleans up pfail_reports
         hub.pfail_reports
             .write()
-            .unwrap()
             .entry(node2_id.clone())
             .or_default()
             .insert(node3_id.clone());
-        assert!(
-            !hub.pfail_reports
-                .read()
-                .unwrap()
-                .get(&node2_id)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!hub.pfail_reports.read().get(&node2_id).unwrap().is_empty());
         hub.cluster_forget(&node2_id).unwrap();
-        assert!(!hub.pfail_reports.read().unwrap().contains_key(&node2_id));
+        assert!(!hub.pfail_reports.read().contains_key(&node2_id));
     }
 
     #[test]
@@ -2340,7 +2336,6 @@ mod tests {
         // Set slot 500 to migrating
         hub.slot_states
             .write()
-            .unwrap()
             .insert(500, ("migrating".to_string(), target_node_id.to_string()));
         let migrating_nodes = hub.cluster_nodes();
         assert!(migrating_nodes.contains(&format!("[500->-{}]", target_node_id)));
@@ -2348,15 +2343,14 @@ mod tests {
         // Set slot 600 to importing
         hub.slot_states
             .write()
-            .unwrap()
             .insert(600, ("importing".to_string(), target_node_id.to_string()));
         let dual_nodes = hub.cluster_nodes();
         assert!(dual_nodes.contains(&format!("[500->-{}]", target_node_id)));
         assert!(dual_nodes.contains(&format!("[600-<-{}]", target_node_id)));
 
         // Reset to stable
-        hub.slot_states.write().unwrap().remove(&500);
-        hub.slot_states.write().unwrap().remove(&600);
+        hub.slot_states.write().remove(&500);
+        hub.slot_states.write().remove(&600);
         let stable_nodes = hub.cluster_nodes();
         assert!(!stable_nodes.contains("->-"));
         assert!(!stable_nodes.contains("-<-"));
@@ -2381,7 +2375,7 @@ mod tests {
 
         // 2. Add peer master node with 0 slots initially
         let peer_id = "1111111111111111111111111111111111111111".to_string();
-        hub.nodes.write().unwrap().insert(
+        hub.nodes.write().insert(
             peer_id.clone(),
             ClusterNodeInfo {
                 id: peer_id.clone(),
@@ -2414,8 +2408,8 @@ mod tests {
 
         // 5. Update peer slots to simulate balanced cluster (each has 8192 slots)
         let peer_slots = vec![(8192, 16383)];
-        hub.nodes.write().unwrap().get_mut(&peer_id).unwrap().slots = peer_slots;
-        *hub.my_slots.write().unwrap() = vec![(0, 8191)];
+        hub.nodes.write().get_mut(&peer_id).unwrap().slots = peer_slots;
+        *hub.my_slots.write() = vec![(0, 8191)];
 
         // Re-check: cluster is fully covered with 2 masters
         let report2 = hub.cluster_check();
@@ -2430,7 +2424,7 @@ mod tests {
     }
 
     fn assert_sane(hub: &ClusterHub) {
-        let nodes = hub.nodes.read().unwrap();
+        let nodes = hub.nodes.read();
         assert!(nodes.len() <= MAX_CLUSTER_NODES);
         for n in nodes.values() {
             let mut total = 0usize;
@@ -2440,7 +2434,7 @@ mod tests {
             }
             assert!(total <= 16384, "{total}");
         }
-        for id in hub.pfail_reports.read().unwrap().keys() {
+        for id in hub.pfail_reports.read().keys() {
             assert!(
                 nodes.contains_key(id),
                 "failure report for unknown node {id}"
@@ -2476,18 +2470,18 @@ mod tests {
                 Some("-ERR invalid port\r\n".to_string())
             );
         }
-        assert!(hub.nodes.read().unwrap().is_empty());
+        assert!(hub.nodes.read().is_empty());
         assert!(
             handle_cluster_bus_line("MEET 1.2.3.4 7301 peer 1 0-65535,9-3,10-20", &hub)
                 .unwrap()
                 .starts_with("+PONG ")
         );
-        assert_eq!(hub.nodes.read().unwrap()["peer"].slots, vec![(10, 20)]);
-        assert_eq!(hub.nodes.read().unwrap()["peer"].cport, 17301);
+        assert_eq!(hub.nodes.read()["peer"].slots, vec![(10, 20)]);
+        assert_eq!(hub.nodes.read()["peer"].cport, 17301);
 
         // Failure reports about unknown nodes are not kept.
         handle_cluster_bus_line("PING peer 1 master 0-1 GOSSIP ghost,1.1.1.1,0,0,fail", &hub);
-        assert!(hub.pfail_reports.read().unwrap().is_empty());
+        assert!(hub.pfail_reports.read().is_empty());
 
         // Gossip and MEET stop adding nodes at the cap.
         let gossip: Vec<String> = (0..MAX_CLUSTER_NODES + 50)
@@ -2497,7 +2491,7 @@ mod tests {
             &format!("PING peer 1 master 0-1 GOSSIP {}", gossip.join(";")),
             &hub,
         );
-        assert_eq!(hub.nodes.read().unwrap().len(), MAX_CLUSTER_NODES);
+        assert_eq!(hub.nodes.read().len(), MAX_CLUSTER_NODES);
         assert_eq!(
             handle_cluster_bus_line("MEET 1.2.3.4 7302 another 1", &hub),
             Some("-ERR too many cluster nodes\r\n".to_string())
@@ -2508,9 +2502,9 @@ mod tests {
         let ranges = vec!["0-65535"; 5000].join(",");
         handle_cluster_bus_line(&format!("FAILOVER_ANNOUNCE peer 3 {ranges}"), &hub);
         handle_cluster_bus_line(&format!("FAILOVER peer 4 {ranges},1-2"), &hub);
-        assert_eq!(hub.nodes.read().unwrap()["peer"].slots, vec![(1, 2)]);
+        assert_eq!(hub.nodes.read()["peer"].slots, vec![(1, 2)]);
         assert_sane(&hub);
-        assert!(!hub.nodes.is_poisoned());
+        assert!(hub.nodes.try_write().is_some(), "node table lock left held");
         assert!(hub.cluster_check().masters > 0);
     }
 
@@ -2554,7 +2548,7 @@ mod tests {
             "",
         ];
         let hub = ClusterHub::new(7400);
-        *hub.role.write().unwrap() = "master".to_string();
+        *hub.role.write() = "master".to_string();
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = || {
             x ^= x << 13;
@@ -2599,7 +2593,7 @@ mod tests {
         let mut buf = [0u8; 256];
         let n = c.read(&mut buf).unwrap();
         assert!(buf[..n].starts_with(b"+PONG "));
-        assert_eq!(hub.nodes.read().unwrap()["split"].slots, vec![(0, 5)]);
+        assert_eq!(hub.nodes.read()["split"].slots, vec![(0, 5)]);
         drop(c);
 
         let mut c = TcpStream::connect(addr).unwrap();
