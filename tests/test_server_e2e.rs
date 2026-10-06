@@ -21348,3 +21348,110 @@ fn test_cluster_rebalance_pipeline_e2e() {
     let rebalance_resp = send_and_read(&mut c1, rebalance_cmd.as_bytes());
     assert_eq!(rebalance_resp, ":5\r\n");
 }
+
+/// Reads `allocator_allocated` (live jemalloc bytes) from `INFO memory`.
+fn info_allocated_bytes(c: &mut TcpStream) -> u64 {
+    let info = resp_cmd(c, &["INFO", "memory"]);
+    info.lines()
+        .find_map(|l| l.strip_prefix("allocator_allocated:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no allocator_allocated in INFO memory: {}", info))
+}
+
+fn proc_status_kb(pid: u32, field: &str) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix(field))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap_or_else(|| panic!("no {} in /proc/{}/status", field, pid))
+}
+
+/// A client that keeps its socket full (a `--pipe` bulk load) must not get its
+/// whole stream parsed into one batch, and the connection's buffers must not
+/// stay allocated on the shard after it disconnects. Before the batch limit, 1M
+/// pipelined commands were parsed into one ~256 MiB `Vec<Command>` that the
+/// pooled connection scratch then kept for the life of the process.
+#[test]
+fn test_pipeline_flood_memory_is_bounded_and_released_e2e() {
+    const N: usize = 1_000_000;
+    let port: u16 = 17391;
+    let args = [
+        "--port",
+        "17391",
+        "--threads",
+        "1",
+        "--no-pin",
+        "--bind",
+        "127.0.0.1",
+    ];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let pid = child.0.id();
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+
+    let base_alloc = info_allocated_bytes(&mut admin);
+    let base_rss_kb = proc_status_kb(pid, "VmRSS:");
+
+    // Flood: one writer streams N GETs of a missing key as fast as the socket
+    // takes them while this thread drains the N `$-1\r\n` replies.
+    let flood = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    flood
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let mut writer = flood.try_clone().unwrap();
+    let w = thread::spawn(move || {
+        let chunk = b"*2\r\n$3\r\nGET\r\n$7\r\nmissing\r\n".repeat(4096);
+        let mut sent = 0;
+        while sent < N {
+            let n = (N - sent).min(4096);
+            writer.write_all(&chunk[..n * 26]).unwrap();
+            sent += n;
+        }
+    });
+    let mut reader = flood;
+    let want = N * 5;
+    let mut got = 0usize;
+    let mut buf = vec![0u8; 1 << 16];
+    while got < want {
+        let n = reader.read(&mut buf).expect("flood reply");
+        assert!(n > 0, "server closed the flood connection");
+        got += n;
+    }
+    w.join().unwrap();
+    assert_eq!(got, want, "unexpected reply bytes");
+
+    // Peak RSS during the flood: the stream is ~26 MB, so anything near the
+    // old ~256 MiB batch means the input was not processed in bounded batches.
+    let peak_growth_mb = proc_status_kb(pid, "VmHWM:").saturating_sub(base_rss_kb) / 1024;
+    assert!(
+        peak_growth_mb < 96,
+        "peak RSS grew {} MiB while serving a pipelined flood",
+        peak_growth_mb
+    );
+
+    drop(reader);
+    // Let the shard notice the hang-up and recycle the connection.
+    let mut retained = 0;
+    for _ in 0..50 {
+        thread::sleep(Duration::from_millis(100));
+        retained = info_allocated_bytes(&mut admin).saturating_sub(base_alloc);
+        if retained < 16 << 20 {
+            break;
+        }
+    }
+    assert!(
+        retained < 16 << 20,
+        "{} MiB still allocated after the flood client disconnected",
+        retained >> 20
+    );
+}

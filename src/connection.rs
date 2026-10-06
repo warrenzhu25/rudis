@@ -16,6 +16,22 @@ use crate::shard::{CompactResp, ShardDb, ShardMessage};
 
 pub(crate) const READ_BUFFER_SIZE: usize = 65536;
 
+/// Limits on one parse/execute batch. While a frame is incomplete the read
+/// loop drains more bytes straight from the socket (`read_ready`) instead of
+/// going back to the event loop; past either limit it stops draining, runs
+/// what it has and leaves the rest for the next read. Without a limit a client
+/// that keeps the socket full (`--pipe`, a bulk loader) gets its whole stream
+/// parsed into one batch: memory grows with the stream and the shard serves
+/// nobody else until the batch is done.
+const MAX_DRAIN_BATCH_CMDS: usize = 1024;
+const MAX_DRAIN_BATCH_BYTES: usize = 1 << 20;
+
+/// Pooled connection scratch keeps its buffers' capacity for the next client;
+/// anything that grew past these is shrunk back first, so one burst does not
+/// pin memory on the shard for the life of the process.
+const SCRATCH_KEEP_ITEMS: usize = 1024;
+const SCRATCH_KEEP_BYTES: usize = 1 << 20;
+
 pub type ResponderChannel = (
     flume::Sender<(Vec<(usize, Command)>, Vec<(usize, CompactResp)>)>,
     flume::Receiver<(Vec<(usize, Command)>, Vec<(usize, CompactResp)>)>,
@@ -3525,6 +3541,7 @@ pub(crate) async fn handle_client<T: crate::transport::ClientTransport>(
                 commands.clear();
                 let mut should_quit = false;
                 let mut has_special = in_multi;
+                let mut batch_in_bytes = n;
                 while !buf.is_empty() {
                     match parse_command(&mut buf) {
                         Ok(Some(cmd)) => {
@@ -3539,9 +3556,18 @@ pub(crate) async fn handle_client<T: crate::transport::ClientTransport>(
                             }
                         }
                         Ok(None) => {
-                            // Incomplete frame: check if remaining bytes just arrived in kernel buffer
-                            let drain_n = transport.read_ready(&mut buf);
+                            // Incomplete frame: check if remaining bytes just arrived in kernel buffer.
+                            // Stop draining once the batch is full; the partial frame stays in `buf`
+                            // and the next `read` completes it after this batch has run.
+                            let batch_full = commands.len() >= MAX_DRAIN_BATCH_CMDS
+                                || batch_in_bytes >= MAX_DRAIN_BATCH_BYTES;
+                            let drain_n = if batch_full {
+                                0
+                            } else {
+                                transport.read_ready(&mut buf)
+                            };
                             if drain_n > 0 {
+                                batch_in_bytes += drain_n;
                                 stats.tot_net_in.fetch_add(
                                     drain_n as u64,
                                     std::sync::atomic::Ordering::Relaxed,
@@ -4081,12 +4107,38 @@ fn recycle_conn_scratch(mut s: ConnScratch) {
     for b in &mut s.results_pool {
         b.clear();
     }
+    trim_conn_scratch(&mut s);
     CONN_SCRATCH_POOL.with(|pool| {
         let mut p = pool.borrow_mut();
         if p.len() < 32 {
             p.push(s);
         }
     });
+}
+
+/// Shrinks (already cleared) scratch buffers that grew past what is worth
+/// keeping for the next connection back to their initial sizes.
+fn trim_conn_scratch(s: &mut ConnScratch) {
+    fn trim<T>(v: &mut Vec<T>, keep: usize, initial: usize) {
+        if v.capacity() > keep {
+            v.shrink_to(initial);
+        }
+    }
+    if s.buf.capacity() > SCRATCH_KEEP_BYTES {
+        s.buf = BytesMut::with_capacity(131072);
+    }
+    trim(&mut s.out_buf, SCRATCH_KEEP_BYTES, 65536);
+    trim(&mut s.commands, SCRATCH_KEEP_ITEMS, 64);
+    trim(&mut s.squashed_responses, SCRATCH_KEEP_ITEMS, 64);
+    for b in &mut s.remote_batches {
+        trim(b, SCRATCH_KEEP_ITEMS, 64);
+    }
+    for b in &mut s.items_pool {
+        trim(b, SCRATCH_KEEP_ITEMS, 64);
+    }
+    for b in &mut s.results_pool {
+        trim(b, SCRATCH_KEEP_ITEMS, 64);
+    }
 }
 
 pub fn reset_client_pubsub(router: &Router, client_id: u64) {
