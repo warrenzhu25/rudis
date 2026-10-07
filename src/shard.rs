@@ -719,7 +719,11 @@ impl ShardDb {
                     } else {
                         prefixes.iter().any(|p| k_str.starts_with(p))
                     };
-                    if matched { Some(e.key.clone()) } else { None }
+                    if matched {
+                        Some(e.key.to_bytes())
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             for key in matching_keys {
@@ -3076,7 +3080,7 @@ impl ShardDb {
             data = &data[consumed..];
 
             self.table.insert_entry(crate::table::RudisEntry {
-                key,
+                key: crate::compact::CompactKey::new(&key),
                 val,
                 expire_at: crate::table::Expiry::from(expire_at),
             });

@@ -14,6 +14,7 @@ pub mod cluster;
 #[rustfmt::skip]
 pub mod command_docs;
 pub mod command_info;
+pub mod compact;
 pub mod config;
 pub mod conn_balance;
 pub mod connection;
