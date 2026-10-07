@@ -1,0 +1,41 @@
+[package]
+name = "rudis-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+rudis = { path = ".." }
+
+# Keep the fuzz crate out of any parent workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_command"
+path = "fuzz_targets/parse_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dump_payload"
+path = "fuzz_targets/dump_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "load_rdb"
+path = "fuzz_targets/load_rdb.rs"
+test = false
+doc = false
+bench = false

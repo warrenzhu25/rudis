@@ -1,0 +1,5 @@
+add k 1 60 3 noreply
+abc
+replace k 0 0 0
+
+gets k j

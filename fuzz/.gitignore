@@ -1,0 +1,8 @@
+target/
+artifacts/
+coverage/
+# libFuzzer grows the corpus with hash-named inputs; only the hand-made
+# seeds (seed*) and live-server captures (real_*) are checked in.
+corpus/*/*
+!corpus/*/seed*
+!corpus/*/real_*

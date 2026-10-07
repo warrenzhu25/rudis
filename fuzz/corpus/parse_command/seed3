@@ -1,0 +1,4 @@
+set k 0 0 5
+hello
+get k
+delete k

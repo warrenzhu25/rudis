@@ -18309,7 +18309,11 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        for _ in 0..20_000 {
+        let iters = std::env::var("RUDIS_FUZZ_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000usize);
+        for _ in 0..iters {
             let mut p = vec![(next() % 8) as u8];
             for _ in 0..next() % 12 {
                 match next() % 4 {
