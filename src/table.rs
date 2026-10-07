@@ -1460,6 +1460,19 @@ impl RudisValue {
         }
     }
 
+    /// Bytes this value adds to `used_memory` (`data_bytes`), beyond the
+    /// table slot that holds it (slots are counted by `struct_bytes`).
+    /// Unlike [`Self::approx_bytes`] (logical size, used for `MEMORY USAGE`
+    /// and spill thresholds), inline strings and ints cost no heap here.
+    pub fn mem_bytes(&self) -> usize {
+        match self {
+            RudisValue::String(b) => heap_len(b.len()),
+            RudisValue::Int(_) => 0,
+            RudisValue::Cooled { val, .. } => 24 + val.mem_bytes(),
+            other => other.approx_bytes(),
+        }
+    }
+
     pub fn approx_bytes(&self) -> usize {
         match self {
             RudisValue::String(b) => b.len(),
@@ -1504,6 +1517,26 @@ impl RudisValue {
 
 /// Smallest value (by `approx_bytes`) worth spilling to the tier.
 pub const MIN_SPILL_VALUE_BYTES: usize = 64;
+
+/// Per-entry bytes added to `data_bytes` on top of the key/value heap bytes.
+///
+/// The entry's table slot is already counted by `struct_bytes`, so this only
+/// approximates allocator slack and bookkeeping. It must stay non-zero: the
+/// eviction loop (`evict_local_until_under`) stops once `used_memory` drops
+/// below target, and a fully inline key would otherwise free 0 accounted
+/// bytes, making the loop evict everything.
+pub const ENTRY_OVERHEAD: usize = 16;
+
+/// Heap bytes used by a key or string value of `n` bytes: zero when it fits
+/// inline in `CompactKey`/`CompactStr`.
+#[inline(always)]
+pub fn heap_len(n: usize) -> usize {
+    if n <= crate::compact::INLINE_CAP {
+        0
+    } else {
+        n
+    }
+}
 
 /// Base for [`Expiry`]: a little before the first use, so deadlines slightly
 /// in the past (e.g. restored already-expired keys) still round-trip.
@@ -3093,7 +3126,7 @@ impl RudisTable {
     pub fn recalculate_used_memory(&mut self) -> usize {
         let mut total = 0;
         for entry in self.entries() {
-            total += entry.key.len() + entry.val.approx_bytes() + 64;
+            total += heap_len(entry.key.len()) + entry.val.mem_bytes() + ENTRY_OVERHEAD;
         }
         self.data_bytes = total;
         self.used_memory()
@@ -3164,7 +3197,7 @@ impl RudisTable {
             if removed.expire_at().is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
-            let freed = removed.key.len() + removed.val.approx_bytes() + 64;
+            let freed = heap_len(removed.key.len()) + removed.val.mem_bytes() + ENTRY_OVERHEAD;
             self.data_bytes = self.data_bytes.saturating_sub(freed);
             inc_expired_keys();
             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3267,7 +3300,7 @@ impl RudisTable {
             if removed.expire_at().is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
-            let freed = removed.key.len() + removed.val.approx_bytes() + 64;
+            let freed = heap_len(removed.key.len()) + removed.val.mem_bytes() + ENTRY_OVERHEAD;
             self.data_bytes = self.data_bytes.saturating_sub(freed);
             inc_evicted_keys();
             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3627,12 +3660,12 @@ impl RudisTable {
             // small key, no SET throughput cost.
             RudisValue::String(CompactStr::new(&value))
         };
-        let val_bytes = val.approx_bytes();
+        let val_bytes = val.mem_bytes();
         let (existing, candidate_idx) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing
             && let Some(entry) = self.table.get_slot_mut(idx)
         {
-            let old_bytes = entry.val.approx_bytes();
+            let old_bytes = entry.val.mem_bytes();
             let old_tiered = match &entry.val {
                 RudisValue::Tiered(ptr) => Some((**ptr, false)),
                 RudisValue::Cooled { ptr, .. } => Some((**ptr, true)),
@@ -3664,7 +3697,7 @@ impl RudisTable {
         if expire_at.is_some() {
             self.num_expires += 1;
         }
-        let entry_mem = key.len() + val_bytes + 64;
+        let entry_mem = heap_len(key.len()) + val_bytes + ENTRY_OVERHEAD;
         let entry = RudisEntry {
             // Same as the value above: don't keep the frame alive through the key.
             key: CompactKey::new(&key),
@@ -3692,12 +3725,8 @@ impl RudisTable {
         }
         if self.num_expires == 0 {
             if let Some((idx, entry)) = self.table.find_entry(key, hash) {
-                let val_bytes = match &entry.val {
-                    RudisValue::String(b) => b.len(),
-                    RudisValue::Int(_) => 8,
-                    other => other.approx_bytes(),
-                };
-                let freed = entry.key.len() + val_bytes + 64;
+                let val_bytes = entry.val.mem_bytes();
+                let freed = heap_len(entry.key.len()) + val_bytes + ENTRY_OVERHEAD;
                 self.data_bytes = self.data_bytes.saturating_sub(freed);
                 let entry = self.table.remove_present(idx);
                 match entry.val {
@@ -3719,12 +3748,8 @@ impl RudisTable {
                 self.expire_slot(idx);
                 return false;
             }
-            let val_bytes = match &entry.val {
-                RudisValue::String(b) => b.len(),
-                RudisValue::Int(_) => 8,
-                other => other.approx_bytes(),
-            };
-            let freed = entry.key.len() + val_bytes + 64;
+            let val_bytes = entry.val.mem_bytes();
+            let freed = heap_len(entry.key.len()) + val_bytes + ENTRY_OVERHEAD;
             self.data_bytes = self.data_bytes.saturating_sub(freed);
             let entry = self.table.remove_present(idx);
             if entry.expire_at().is_some() {
@@ -3842,7 +3867,7 @@ impl RudisTable {
             expire_at: Expiry::from(None),
         };
         self.table.insert_prepared(entry, h, candidate_idx);
-        self.data_bytes += key.len() + 8 + 64;
+        self.data_bytes += heap_len(key.len()) + ENTRY_OVERHEAD;
         Ok(new_val)
     }
 
@@ -4285,9 +4310,9 @@ impl RudisTable {
         if let Some(idx) = self.table.find(key, h)
             && let Some(entry) = self.table.get_slot_mut(idx)
         {
-            let old_bytes = entry.val.approx_bytes();
+            let old_bytes = entry.val.mem_bytes();
             entry.val = RudisValue::Tiered(Box::new(ptr));
-            let new_bytes = entry.val.approx_bytes();
+            let new_bytes = entry.val.mem_bytes();
             self.data_bytes = self.data_bytes.saturating_sub(old_bytes) + new_bytes;
             return true;
         }
@@ -4342,7 +4367,7 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot_mut(idx)
             && let RudisValue::Tiered(ptr) = &entry.val
         {
-            let val_bytes = val.approx_bytes();
+            let val_bytes = val.mem_bytes();
             entry.val = RudisValue::Cooled {
                 ptr: ptr.clone(),
                 val: Box::new(val),
@@ -4361,8 +4386,9 @@ impl RudisTable {
         if let RudisValue::Cooled { ptr, val } = &entry.val {
             let p = **ptr;
             let freed = val.approx_bytes();
+            let freed_mem = val.mem_bytes();
             entry.val = RudisValue::Tiered(Box::new(p));
-            self.data_bytes = self.data_bytes.saturating_sub(freed);
+            self.data_bytes = self.data_bytes.saturating_sub(freed_mem);
             Some((p, freed))
         } else {
             None
@@ -4376,8 +4402,9 @@ impl RudisTable {
             if let RudisValue::Cooled { ptr, val } = &entry.val {
                 let p = **ptr;
                 let freed = val.approx_bytes() as u64;
+                let freed_mem = val.mem_bytes();
                 entry.val = RudisValue::Tiered(Box::new(p));
-                self.data_bytes = self.data_bytes.saturating_sub(freed as usize);
+                self.data_bytes = self.data_bytes.saturating_sub(freed_mem);
                 total_freed += freed;
                 count += 1;
             }
@@ -8700,7 +8727,7 @@ impl RudisTable {
             val: RudisValue::Set(Box::new(RudisSet::Small(v))),
             expire_at: Expiry::from(None),
         };
-        self.data_bytes += key.len() + 32 + 64;
+        self.data_bytes += heap_len(key.len()) + 32 + ENTRY_OVERHEAD;
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(1)
     }
@@ -8803,7 +8830,7 @@ impl RudisTable {
             val: RudisValue::Set(Box::new(set)),
             expire_at: Expiry::from(None),
         };
-        self.data_bytes += key.len() + added * 32 + 64;
+        self.data_bytes += heap_len(key.len()) + added * 32 + ENTRY_OVERHEAD;
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(added)
     }
@@ -8842,9 +8869,9 @@ impl RudisTable {
             };
 
             if is_empty && let Some(entry) = self.table.remove(idx) {
-                self.data_bytes = self
-                    .data_bytes
-                    .saturating_sub(entry.key.len() + removed_count * 32 + 64);
+                self.data_bytes = self.data_bytes.saturating_sub(
+                    heap_len(entry.key.len()) + removed_count * 32 + ENTRY_OVERHEAD,
+                );
                 self.recycle_value(entry.val);
             } else if removed_count > 0 {
                 self.data_bytes = self.data_bytes.saturating_sub(removed_count * 32);
@@ -11257,7 +11284,8 @@ impl RudisTable {
                             let grew = vec.len() <= byte_idx;
                             if grew {
                                 vec.resize(byte_idx + 1, 0);
-                                self.data_bytes += (byte_idx + 1).saturating_sub(old_len);
+                                self.data_bytes +=
+                                    heap_len(byte_idx + 1).saturating_sub(heap_len(old_len));
                             }
                             let old_byte = vec[byte_idx];
                             let old_bit = (old_byte >> bit_idx) & 1;
@@ -11278,7 +11306,6 @@ impl RudisTable {
                             if grew {
                                 vec.resize(byte_idx + 1, 0);
                             }
-                            self.data_bytes += vec.len().saturating_sub(8);
                             let old_byte = vec[byte_idx];
                             let old_bit = (old_byte >> bit_idx) & 1;
                             let changed = grew || (old_bit != value);
@@ -11288,6 +11315,7 @@ impl RudisTable {
                                 } else {
                                     vec[byte_idx] &= !(1 << bit_idx);
                                 }
+                                self.data_bytes += heap_len(vec.len());
                                 entry.val = RudisValue::String(CompactStr::from(vec));
                             }
                             return Ok((old_bit, changed));
@@ -11306,7 +11334,7 @@ impl RudisTable {
         if value == 1 {
             vec[byte_idx] |= 1 << bit_idx;
         }
-        let added_mem = key.len() + vec.len() + 64;
+        let added_mem = heap_len(key.len()) + heap_len(vec.len()) + ENTRY_OVERHEAD;
         let entry = RudisEntry {
             key: CompactKey::new(&key),
             val: RudisValue::String(CompactStr::from(vec)),
@@ -16196,6 +16224,91 @@ mod tests {
         assert_eq!(table.data_bytes, 0);
         assert_seg_heap_bytes_consistent(&table.table);
         assert!(table.used_memory() <= empty * 2);
+    }
+
+    #[test]
+    fn test_used_memory_inline_entries_cost_only_overhead() {
+        let mut table = RudisTable::new();
+        let n = 10_000usize;
+        for i in 0..n {
+            // 12-byte key and 16-byte value: both inline, no heap.
+            table.set(
+                Bytes::from(format!("key:{i:08}")),
+                Bytes::from(format!("{:016}", i)),
+                None,
+            );
+        }
+        assert_eq!(table.data_bytes, n * ENTRY_OVERHEAD);
+
+        // Heap keys/values are charged their full length.
+        let long_key = vec![b'k'; 40];
+        let long_val = vec![b'v'; 100];
+        table.set(Bytes::from(long_key.clone()), Bytes::from(long_val), None);
+        assert_eq!(table.data_bytes, (n + 1) * ENTRY_OVERHEAD + 40 + 100);
+        assert!(table.del(&long_key));
+        assert_eq!(table.data_bytes, n * ENTRY_OVERHEAD);
+    }
+
+    #[test]
+    fn test_used_memory_incremental_matches_recalculated() {
+        let mut table = RudisTable::new();
+        for i in 0..2_000usize {
+            let key = if i % 3 == 0 {
+                format!("a-much-longer-key-name-that-spills:{i}")
+            } else {
+                format!("k{i}")
+            };
+            let val = match i % 4 {
+                0 => format!("{i}"),
+                1 => "x".repeat(10),
+                2 => "y".repeat(30),
+                _ => "z".repeat(300),
+            };
+            table.set(Bytes::from(key), Bytes::from(val), None);
+        }
+        // Overwrites crossing the inline boundary in both directions.
+        for i in (0..2_000usize).step_by(5) {
+            let val = if i % 2 == 0 {
+                "s".repeat(5)
+            } else {
+                "L".repeat(50)
+            };
+            table.set(Bytes::from(format!("k{i}")), Bytes::from(val), None);
+        }
+        for i in 0..500usize {
+            let k = Bytes::from(format!("ctr{i}"));
+            table.incr_by_slice_fast(&k, 1).unwrap();
+            table.incr_by_slice_fast(&k, 1).unwrap();
+        }
+        for i in 0..200usize {
+            table.setbit(Bytes::from(format!("bits{i}")), i, 1).unwrap();
+            table
+                .setbit(Bytes::from(format!("bits{i}")), i * 3, 1)
+                .unwrap();
+            // SETBIT on an int value converts it to a string.
+            table.setbit(Bytes::from(format!("ctr{i}")), i, 1).unwrap();
+        }
+        for i in (0..2_000usize).step_by(7) {
+            table.del(format!("k{i}").as_bytes());
+        }
+        let incremental = table.data_bytes;
+        table.recalculate_used_memory();
+        assert_eq!(incremental, table.data_bytes);
+    }
+
+    #[test]
+    fn test_eviction_of_inline_keys_reduces_used_memory() {
+        let mut table = RudisTable::new();
+        for i in 0..1_000usize {
+            table.set(Bytes::from(format!("k{i}")), Bytes::from_static(b"v"), None);
+        }
+        // Each eviction must free accounted bytes, or the eviction loop
+        // would never reach its target before emptying the table.
+        for _ in 0..100 {
+            let before = table.used_memory();
+            assert!(table.try_evict_one_key("allkeys-random").is_some());
+            assert!(table.used_memory() < before);
+        }
     }
 
     /// RDB files are untrusted input (copied between hosts, received from a
