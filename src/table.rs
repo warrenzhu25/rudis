@@ -1723,12 +1723,39 @@ pub fn coarse_now_secs() -> u32 {
     ts.tv_sec as u32
 }
 
+/// Starts loading `r`'s cache line early. The probe's slot-index lookup
+/// depends only on the hash, so touching it alongside the control group
+/// overlaps what would otherwise be a second serial cache miss. A plain
+/// load kept alive by `black_box` (safe; no `_mm_prefetch`/`unsafe`).
+#[inline(always)]
+fn prefetch_read<T: Copy>(r: &T) {
+    std::hint::black_box(*r);
+}
+
+/// `slot_idx` value for a slot with no entry. Larger than any arena index
+/// (a segment holds at most `SEG_CAP + STASH_CAP` entries), so
+/// `entries.get(NO_ENTRY)` is `None`.
+const NO_ENTRY: u16 = u16::MAX;
+
 /// Fixed-size SwissTable segment with a 4-slot DashTable-style overflow stash,
 /// managed by `RudisFlatTable`'s extendible hashing directory.
+///
+/// Slots only hold a control byte and a 2-byte index; the entries live
+/// packed in `entries` (no holes, `entries.len() == items`). Segments split
+/// at 7/8 full, and with uniform hashing they all split together, so the
+/// table is often only ~45-60% full: keeping empty slots at 3 B instead of a
+/// full entry is what makes that cheap. `last_access` and `entry_slot` run
+/// parallel to `entries`; `entry_slot` lets a delete `swap_remove` and
+/// repoint the moved entry's slot in O(1).
 pub struct RawSegment {
     pub ctrl: Vec<u8>,
-    pub slots: Vec<Option<RudisEntry>>,
-    pub last_access: Vec<u16>,
+    /// Slot -> index into `entries`, or `NO_ENTRY`.
+    slot_idx: Vec<u16>,
+    entries: Vec<RudisEntry>,
+    /// Index into `entries` -> slot holding it.
+    entry_slot: Vec<u16>,
+    /// Access clock per entry (parallel to `entries`).
+    last_access: Vec<u16>,
     pub capacity: usize,
     mask: usize,
     pub items: usize,
@@ -1742,15 +1769,15 @@ impl RawSegment {
     pub fn new(capacity: usize, local_depth: u8) -> Self {
         let cap = capacity.next_power_of_two().clamp(GROUP_SIZE, SEG_CAP);
         let ctrl = vec![EMPTY; cap + GROUP_SIZE];
-        let mut slots = Vec::with_capacity(cap + STASH_CAP);
-        slots.resize_with(cap + STASH_CAP, || None);
-        let last_access = vec![0u16; cap + STASH_CAP];
+        let slot_idx = vec![NO_ENTRY; cap + STASH_CAP];
         let stash_bonus = if cap == SEG_CAP { STASH_CAP } else { 0 };
 
         Self {
             ctrl,
-            slots,
-            last_access,
+            slot_idx,
+            entries: Vec::new(),
+            entry_slot: Vec::new(),
+            last_access: Vec::new(),
             capacity: cap,
             mask: cap - 1,
             items: 0,
@@ -1775,6 +1802,160 @@ impl RawSegment {
         self.ctrl[idx] = byte;
         if idx < GROUP_SIZE {
             self.ctrl[self.capacity + idx] = byte;
+        }
+    }
+
+    /// Number of slots (main table plus stash), i.e. the positional range.
+    #[inline(always)]
+    pub fn slot_count(&self) -> usize {
+        self.slot_idx.len()
+    }
+
+    #[inline(always)]
+    pub fn slot_entry(&self, slot: usize) -> Option<&RudisEntry> {
+        let i = *self.slot_idx.get(slot)? as usize;
+        self.entries.get(i)
+    }
+
+    #[inline(always)]
+    pub fn slot_entry_mut(&mut self, slot: usize) -> Option<&mut RudisEntry> {
+        let i = *self.slot_idx.get(slot)? as usize;
+        self.entries.get_mut(i)
+    }
+
+    #[inline(always)]
+    pub fn slot_access(&self, slot: usize) -> Option<u16> {
+        let i = *self.slot_idx.get(slot)? as usize;
+        self.last_access.get(i).copied()
+    }
+
+    #[inline(always)]
+    pub fn slot_access_mut(&mut self, slot: usize) -> Option<&mut u16> {
+        let i = *self.slot_idx.get(slot)? as usize;
+        self.last_access.get_mut(i)
+    }
+
+    /// Stamps the slot's access clock and returns its entry.
+    #[inline(always)]
+    pub fn touch_entry_mut(&mut self, slot: usize) -> Option<&mut RudisEntry> {
+        let i = *self.slot_idx.get(slot)? as usize;
+        *self.last_access.get_mut(i)? = lru_now();
+        self.entries.get_mut(i)
+    }
+
+    /// Live entries, packed (arena order, not slot order).
+    #[inline]
+    pub fn iter_entries(&self) -> std::slice::Iter<'_, RudisEntry> {
+        self.entries.iter()
+    }
+
+    #[inline]
+    pub fn iter_entries_mut(&mut self) -> std::slice::IterMut<'_, RudisEntry> {
+        self.entries.iter_mut()
+    }
+
+    /// Takes every entry with its access stamp, leaving the segment empty
+    /// but with stale control bytes: callers replace the segment afterwards.
+    #[inline]
+    fn drain_entries(&mut self) -> impl Iterator<Item = (RudisEntry, u16)> + use<> {
+        let entries = std::mem::take(&mut self.entries);
+        let access = std::mem::take(&mut self.last_access);
+        self.entry_slot = Vec::new();
+        self.items = 0;
+        entries.into_iter().zip(access)
+    }
+
+    /// Makes room for one more entry. Grows the arena by an eighth (at
+    /// least 16) with `reserve_exact`, so slack stays bounded instead of
+    /// doubling. Returns the heap bytes added.
+    #[inline(always)]
+    fn reserve_entry(&mut self) -> usize {
+        if self.entries.len() < self.entries.capacity() {
+            return 0;
+        }
+        self.grow_arena()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_arena(&mut self) -> usize {
+        let before = self.heap_bytes();
+        let len = self.entries.len();
+        let max = self.slot_idx.len();
+        let extra = (len / 8).max(16).min(max.saturating_sub(len)).max(1);
+        self.entries.reserve_exact(extra);
+        self.entry_slot.reserve_exact(extra);
+        self.last_access.reserve_exact(extra);
+        self.heap_bytes() - before
+    }
+
+    /// Reserves exactly `n` more entries (used when building a segment
+    /// whose final size is known).
+    fn reserve_entries_exact(&mut self, n: usize) {
+        self.entries.reserve_exact(n);
+        self.entry_slot.reserve_exact(n);
+        self.last_access.reserve_exact(n);
+    }
+
+    /// Releases arena slack after deletes once less than half is used.
+    /// Returns the heap bytes freed.
+    #[inline(always)]
+    fn maybe_trim_arena(&mut self) -> usize {
+        let cap = self.entries.capacity();
+        if cap < 32 || self.entries.len() * 2 >= cap {
+            return 0;
+        }
+        self.trim_arena()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trim_arena(&mut self) -> usize {
+        let before = self.heap_bytes();
+        let len = self.entries.len();
+        let keep = len + len / 8;
+        self.entries.shrink_to(keep);
+        self.entry_slot.shrink_to(keep);
+        self.last_access.shrink_to(keep);
+        before - self.heap_bytes()
+    }
+
+    /// Removes the entry at arena index `i` (owned by `slot`), moving the
+    /// last entry into its place. Returns the entry and any heap bytes freed.
+    #[inline(always)]
+    fn take_entry(&mut self, slot: usize, i: usize) -> (RudisEntry, usize) {
+        self.slot_idx[slot] = NO_ENTRY;
+        let entry = self.entries.swap_remove(i);
+        self.entry_slot.swap_remove(i);
+        self.last_access.swap_remove(i);
+        if let Some(&moved) = self.entry_slot.get(i) {
+            self.slot_idx[moved as usize] = i as u16;
+        }
+        (entry, self.maybe_trim_arena())
+    }
+
+    /// Checks the slot/arena cross-links. Test and debug use only: O(slots).
+    #[cfg(test)]
+    pub fn check_invariants(&self) {
+        assert_eq!(self.entries.len(), self.items);
+        assert_eq!(self.entry_slot.len(), self.items);
+        assert_eq!(self.last_access.len(), self.items);
+        for (i, &slot) in self.entry_slot.iter().enumerate() {
+            assert_eq!(
+                self.slot_idx[slot as usize] as usize, i,
+                "slot {slot} -> {i}"
+            );
+        }
+        let linked = self.slot_idx.iter().filter(|&&i| i != NO_ENTRY).count();
+        assert_eq!(linked, self.items);
+        for (slot, &i) in self.slot_idx.iter().enumerate() {
+            if slot < self.capacity {
+                let full = self.ctrl[slot] != EMPTY && self.ctrl[slot] != DELETED;
+                assert_eq!(full, i != NO_ENTRY, "ctrl/slot mismatch at {slot}");
+            } else {
+                let full = self.stash_ctrl[slot - self.capacity] != EMPTY;
+                assert_eq!(full, i != NO_ENTRY, "stash/slot mismatch at {slot}");
+            }
         }
     }
 }
@@ -1822,6 +2003,7 @@ impl RawSegment {
         }
         let tag = fingerprint(h);
         let mut idx = (h as usize) & self.mask;
+        prefetch_read(&self.slot_idx[idx]);
         let mut step = 0;
 
         loop {
@@ -1830,7 +2012,7 @@ impl RawSegment {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                if let Some(entry) = self.slots[slot_idx].as_ref()
+                if let Some(entry) = self.slot_entry(slot_idx)
                     && fast_slice_eq(entry.key.as_ref(), key)
                 {
                     return Some((slot_idx, entry));
@@ -1847,7 +2029,7 @@ impl RawSegment {
                 for s in 0..STASH_CAP {
                     if self.stash_ctrl[s] == tag {
                         let slot_idx = self.capacity + s;
-                        if let Some(entry) = self.slots[slot_idx].as_ref()
+                        if let Some(entry) = self.slot_entry(slot_idx)
                             && fast_slice_eq(entry.key.as_ref(), key)
                         {
                             return Some((slot_idx, entry));
@@ -1874,6 +2056,7 @@ impl RawSegment {
         }
         let tag = fingerprint(h);
         let mut idx = (h as usize) & self.mask;
+        prefetch_read(&self.slot_idx[idx]);
         let mut step = 0;
 
         loop {
@@ -1882,10 +2065,10 @@ impl RawSegment {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                if let Some(entry) = self.slots[slot_idx].as_ref()
+                if let Some(entry) = self.slot_entry(slot_idx)
                     && fast_slice_eq(entry.key.as_ref(), key)
                 {
-                    return self.slots[slot_idx].as_mut().map(|e| (slot_idx, e));
+                    return self.slot_entry_mut(slot_idx).map(|e| (slot_idx, e));
                 }
                 bits &= bits - 1;
             }
@@ -1899,10 +2082,10 @@ impl RawSegment {
                 for s in 0..STASH_CAP {
                     if self.stash_ctrl[s] == tag {
                         let slot_idx = self.capacity + s;
-                        if let Some(entry) = self.slots[slot_idx].as_ref()
+                        if let Some(entry) = self.slot_entry(slot_idx)
                             && fast_slice_eq(entry.key.as_ref(), key)
                         {
-                            return self.slots[slot_idx].as_mut().map(|e| (slot_idx, e));
+                            return self.slot_entry_mut(slot_idx).map(|e| (slot_idx, e));
                         }
                     }
                 }
@@ -1921,6 +2104,7 @@ impl RawSegment {
         }
         let tag = fingerprint(h);
         let mut idx = (h as usize) & self.mask;
+        prefetch_read(&self.slot_idx[idx]);
         let mut step = 0;
         let mut first_free: Option<usize> = None;
 
@@ -1931,7 +2115,7 @@ impl RawSegment {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                if let Some(entry) = self.slots[slot_idx].as_ref()
+                if let Some(entry) = self.slot_entry(slot_idx)
                     && fast_slice_eq(entry.key.as_ref(), key)
                 {
                     return (Some(slot_idx), slot_idx);
@@ -1961,7 +2145,7 @@ impl RawSegment {
                     for s in 0..STASH_CAP {
                         if self.stash_ctrl[s] == tag {
                             let slot_idx = self.capacity + s;
-                            if let Some(entry) = self.slots[slot_idx].as_ref()
+                            if let Some(entry) = self.slot_entry(slot_idx)
                                 && fast_slice_eq(entry.key.as_ref(), key)
                             {
                                 return (Some(slot_idx), slot_idx);
@@ -1985,15 +2169,16 @@ impl RawSegment {
         }
     }
 
+    /// Places `entry` in the free slot `insert_idx` (from
+    /// `find_or_prepare_insert_raw`). Returns heap bytes added by arena
+    /// growth, for the table's `seg_heap_bytes`.
     #[inline(always)]
-    pub fn insert_at(&mut self, entry: RudisEntry, h: u64, insert_idx: usize) {
+    pub fn insert_at(&mut self, entry: RudisEntry, h: u64, insert_idx: usize) -> usize {
         let tag = fingerprint(h);
+        let grown = self.reserve_entry();
         if insert_idx < self.capacity {
             let was_empty = self.ctrl[insert_idx] == EMPTY;
             self.set_ctrl(insert_idx, tag);
-            self.slots[insert_idx] = Some(entry);
-            self.last_access[insert_idx] = lru_now();
-            self.items += 1;
             if was_empty {
                 self.growth_left = self.growth_left.saturating_sub(1);
             }
@@ -2001,23 +2186,35 @@ impl RawSegment {
             let s = insert_idx - self.capacity;
             self.stash_ctrl[s] = tag;
             self.stash_count += 1;
-            self.slots[insert_idx] = Some(entry);
-            self.last_access[insert_idx] = lru_now();
-            self.items += 1;
             self.growth_left = self.growth_left.saturating_sub(1);
         }
+        debug_assert_eq!(self.slot_idx[insert_idx], NO_ENTRY);
+        self.slot_idx[insert_idx] = self.entries.len() as u16;
+        self.entries.push(entry);
+        self.entry_slot.push(insert_idx as u16);
+        self.last_access.push(lru_now());
+        self.items += 1;
+        grown
     }
 
     #[inline(always)]
     fn insert_migrated(&mut self, entry: RudisEntry, h: u64, access: u16) {
         let (_, idx) = self.find_or_prepare_insert_raw(&entry.key, h);
         self.insert_at(entry, h, idx);
-        self.last_access[idx] = access;
+        if let Some(a) = self.last_access.last_mut() {
+            *a = access;
+        }
+    }
+
+    /// Replaces the entry in an occupied slot, stamping its access clock.
+    #[inline(always)]
+    pub fn replace_at(&mut self, slot: usize, entry: RudisEntry) -> Option<RudisEntry> {
+        let e = self.touch_entry_mut(slot)?;
+        Some(std::mem::replace(e, entry))
     }
 
     #[inline(always)]
-    pub fn remove(&mut self, slot_idx: usize) -> Option<RudisEntry> {
-        let entry = self.slots.get_mut(slot_idx)?.take()?;
+    fn mark_slot_free(&mut self, slot_idx: usize) {
         if slot_idx < self.capacity {
             self.set_ctrl(slot_idx, DELETED);
         } else {
@@ -2037,53 +2234,50 @@ impl RawSegment {
             };
             self.growth_left = (self.capacity * 7) / 8 + stash_bonus;
         }
-        Some(entry)
+    }
+
+    /// Removes the entry in `slot_idx`, if any. Also returns heap bytes
+    /// freed by trimming the arena.
+    #[inline(always)]
+    pub fn remove(&mut self, slot_idx: usize) -> Option<(RudisEntry, usize)> {
+        let i = *self.slot_idx.get(slot_idx)? as usize;
+        if i >= self.entries.len() {
+            return None;
+        }
+        self.mark_slot_free(slot_idx);
+        Some(self.take_entry(slot_idx, i))
     }
 
     #[inline(always)]
-    pub fn remove_present(&mut self, slot_idx: usize) -> RudisEntry {
-        if slot_idx < self.capacity {
-            self.set_ctrl(slot_idx, DELETED);
-        } else {
-            self.stash_ctrl[slot_idx - self.capacity] = EMPTY;
-            self.stash_count = self.stash_count.saturating_sub(1);
-            self.growth_left += 1;
-        }
-        self.items -= 1;
-        if self.items == 0 {
-            self.ctrl.fill(EMPTY);
-            self.stash_ctrl = [EMPTY; STASH_CAP];
-            self.stash_count = 0;
-            let stash_bonus = if self.capacity == SEG_CAP {
-                STASH_CAP
-            } else {
-                0
-            };
-            self.growth_left = (self.capacity * 7) / 8 + stash_bonus;
-        }
-        self.slots[slot_idx]
-            .take()
-            .expect("remove_present: slot must be occupied")
+    pub fn remove_present(&mut self, slot_idx: usize) -> (RudisEntry, usize) {
+        let i = self.slot_idx[slot_idx] as usize;
+        assert!(
+            i < self.entries.len(),
+            "remove_present: slot must be occupied"
+        );
+        self.mark_slot_free(slot_idx);
+        self.take_entry(slot_idx, i)
     }
 
     pub fn rebuild(&mut self, new_cap: usize) {
         let mut next = RawSegment::new(new_cap, self.local_depth);
-        let old_access = std::mem::take(&mut self.last_access);
-        for (i, opt_entry) in self.slots.drain(..).enumerate() {
-            if let Some(entry) = opt_entry {
-                let h = mix_hash(hash_key(&entry.key));
-                next.insert_migrated(entry, h, old_access.get(i).copied().unwrap_or(0));
-            }
+        next.reserve_entries_exact(self.entries.len());
+        for (entry, access) in self.drain_entries() {
+            let h = mix_hash(hash_key(&entry.key));
+            next.insert_migrated(entry, h, access);
         }
         *self = next;
     }
 
-    /// Heap bytes owned by this segment's arrays (slots, ctrl, access
-    /// stamps). Entries' own key/value allocations are not included.
+    /// Heap bytes owned by this segment's arrays (ctrl, slot index, entry
+    /// arena and its parallel arrays). Entries' own key/value allocations
+    /// are not included.
     #[inline]
     pub fn heap_bytes(&self) -> usize {
-        self.slots.capacity() * std::mem::size_of::<Option<RudisEntry>>()
-            + self.ctrl.capacity()
+        self.ctrl.capacity()
+            + self.slot_idx.capacity() * std::mem::size_of::<u16>()
+            + self.entries.capacity() * std::mem::size_of::<RudisEntry>()
+            + self.entry_slot.capacity() * std::mem::size_of::<u16>()
             + self.last_access.capacity() * std::mem::size_of::<u16>()
     }
 }
@@ -2192,16 +2386,25 @@ impl RudisFlatTable {
             let mut seg_one = RawSegment::new(SEG_CAP, d + 1);
             let bit_shift = SEG_SHIFT + (d as usize);
 
-            let old_access = std::mem::take(&mut self.segments[seg_id].last_access);
-            for (i, opt_entry) in self.segments[seg_id].slots.drain(..).enumerate() {
-                if let Some(entry) = opt_entry {
+            // Size each half's arena exactly: hash once, count, then move.
+            let moved: Vec<(RudisEntry, u16, u64)> = self.segments[seg_id]
+                .drain_entries()
+                .map(|(entry, acc)| {
                     let h = mix_hash(hash_key(&entry.key));
-                    let acc = old_access.get(i).copied().unwrap_or(0);
-                    if ((h >> bit_shift) & 1) == 0 {
-                        seg_zero.insert_migrated(entry, h, acc);
-                    } else {
-                        seg_one.insert_migrated(entry, h, acc);
-                    }
+                    (entry, acc, h)
+                })
+                .collect();
+            let ones = moved
+                .iter()
+                .filter(|(_, _, h)| (h >> bit_shift) & 1 == 1)
+                .count();
+            seg_zero.reserve_entries_exact(moved.len() - ones);
+            seg_one.reserve_entries_exact(ones);
+            for (entry, acc, h) in moved {
+                if ((h >> bit_shift) & 1) == 0 {
+                    seg_zero.insert_migrated(entry, h, acc);
+                } else {
+                    seg_one.insert_migrated(entry, h, acc);
                 }
             }
 
@@ -2260,8 +2463,7 @@ impl RudisFlatTable {
         let seg_id = self.directory[dir_idx] as usize;
         let seg = &mut self.segments[seg_id];
         let (local_idx, _) = seg.find_entry(key, h)?;
-        seg.last_access[local_idx] = lru_now();
-        let entry = seg.slots[local_idx].as_mut()?;
+        let entry = seg.touch_entry_mut(local_idx)?;
         Some(((seg_id << GLOBAL_IDX_SHIFT) | local_idx, entry))
     }
 
@@ -2314,12 +2516,11 @@ impl RudisFlatTable {
         let local_idx = global_idx & GLOBAL_IDX_MASK;
 
         if existing.is_some() {
-            self.segments[seg_id].last_access[local_idx] = lru_now();
-            self.segments[seg_id].slots[local_idx].replace(entry)
+            self.segments[seg_id].replace_at(local_idx, entry)
         } else {
             let slot = crate::router::key_slot(&entry.key) as usize;
             self.slot_counts[slot] += 1;
-            self.segments[seg_id].insert_at(entry, mix_hash(h), local_idx);
+            self.seg_heap_bytes += self.segments[seg_id].insert_at(entry, mix_hash(h), local_idx);
             self.items += 1;
             None
         }
@@ -2331,7 +2532,7 @@ impl RudisFlatTable {
         self.slot_counts[slot] += 1;
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
-        self.segments[seg_id].insert_at(entry, mix_hash(hash), local_idx);
+        self.seg_heap_bytes += self.segments[seg_id].insert_at(entry, mix_hash(hash), local_idx);
         self.items += 1;
     }
 
@@ -2348,7 +2549,8 @@ impl RudisFlatTable {
     pub fn remove(&mut self, global_idx: usize) -> Option<RudisEntry> {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
-        let entry = self.segments.get_mut(seg_id)?.remove(local_idx)?;
+        let (entry, freed) = self.segments.get_mut(seg_id)?.remove(local_idx)?;
+        self.seg_heap_bytes -= freed;
         self.items -= 1;
         let slot = crate::router::key_slot(&entry.key) as usize;
         self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
@@ -2359,7 +2561,8 @@ impl RudisFlatTable {
     pub fn remove_present(&mut self, global_idx: usize) -> RudisEntry {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
-        let entry = self.segments[seg_id].remove_present(local_idx);
+        let (entry, freed) = self.segments[seg_id].remove_present(local_idx);
+        self.seg_heap_bytes -= freed;
         self.items -= 1;
         let slot = crate::router::key_slot(&entry.key) as usize;
         self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
@@ -2370,7 +2573,7 @@ impl RudisFlatTable {
     pub fn get_slot(&self, global_idx: usize) -> Option<&RudisEntry> {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
-        self.segments.get(seg_id)?.slots.get(local_idx)?.as_ref()
+        self.segments.get(seg_id)?.slot_entry(local_idx)
     }
 
     /// Like [`Self::get_slot_mut`] but leaves `last_access` alone, for
@@ -2379,21 +2582,14 @@ impl RudisFlatTable {
     pub fn get_slot_mut_no_touch(&mut self, global_idx: usize) -> Option<&mut RudisEntry> {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
-        self.segments
-            .get_mut(seg_id)?
-            .slots
-            .get_mut(local_idx)?
-            .as_mut()
+        self.segments.get_mut(seg_id)?.slot_entry_mut(local_idx)
     }
 
     #[inline(always)]
     pub fn get_slot_mut(&mut self, global_idx: usize) -> Option<&mut RudisEntry> {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
-        let seg = self.segments.get_mut(seg_id)?;
-        let entry = seg.slots.get_mut(local_idx)?.as_mut()?;
-        seg.last_access[local_idx] = lru_now();
-        Some(entry)
+        self.segments.get_mut(seg_id)?.touch_entry_mut(local_idx)
     }
 
     #[inline(always)]
@@ -2401,7 +2597,7 @@ impl RudisFlatTable {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
         if let Some(seg) = self.segments.get_mut(seg_id)
-            && let Some(acc) = seg.last_access.get_mut(local_idx)
+            && let Some(acc) = seg.slot_access_mut(local_idx)
         {
             *acc = lru_now();
         }
@@ -2413,13 +2609,33 @@ impl RudisFlatTable {
         let local_idx = global_idx & GLOBAL_IDX_MASK;
         self.segments
             .get(seg_id)
-            .and_then(|s| s.last_access.get(local_idx).copied())
+            .and_then(|s| s.slot_access(local_idx))
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub fn set_slot_last_access(&mut self, global_idx: usize, access: u16) {
+        let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
+        let local_idx = global_idx & GLOBAL_IDX_MASK;
+        if let Some(a) = self.segments[seg_id].slot_access_mut(local_idx) {
+            *a = access;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn check_invariants(&self) {
+        for seg in &self.segments {
+            seg.check_invariants();
+        }
+        assert_eq!(
+            self.segments.iter().map(|s| s.items).sum::<usize>(),
+            self.items
+        );
     }
 
     #[inline]
     pub fn entries(&self) -> impl Iterator<Item = &RudisEntry> {
-        self.segments.iter().flat_map(|s| s.slots.iter().flatten())
+        self.segments.iter().flat_map(|s| s.iter_entries())
     }
 
     pub fn layout_epoch(&self) -> u64 {
@@ -2434,24 +2650,20 @@ impl RudisFlatTable {
         self.segments
             .get(seg)
             .into_iter()
-            .flat_map(|s| s.slots.iter().flatten())
+            .flat_map(|s| s.iter_entries())
     }
 
     #[inline]
     pub fn entries_mut(&mut self) -> impl Iterator<Item = &mut RudisEntry> {
-        self.segments
-            .iter_mut()
-            .flat_map(|s| s.slots.iter_mut().flatten())
+        self.segments.iter_mut().flat_map(|s| s.iter_entries_mut())
     }
 
     #[inline]
     pub fn enumerate_slots(&self) -> impl Iterator<Item = (usize, Option<&RudisEntry>)> {
         self.segments.iter().enumerate().flat_map(|(seg_id, seg)| {
             let base = seg_id << GLOBAL_IDX_SHIFT;
-            seg.slots
-                .iter()
-                .enumerate()
-                .map(move |(local_idx, opt)| (base | local_idx, opt.as_ref()))
+            (0..seg.slot_count())
+                .map(move |local_idx| (base | local_idx, seg.slot_entry(local_idx)))
         })
     }
 
@@ -2484,7 +2696,7 @@ impl RudisFlatTable {
     #[inline(always)]
     pub fn cursor_bound(&self) -> usize {
         if self.segments.len() == 1 {
-            self.segments[0].slots.len()
+            self.segments[0].slot_count()
         } else {
             self.segments.len() * (SEG_CAP + STASH_CAP)
         }
@@ -2528,13 +2740,11 @@ impl RudisFlatTable {
         {
             let target_cap = optimal_cap.clamp(64, SEG_CAP);
             let mut single = RawSegment::new(target_cap, 0);
+            single.reserve_entries_exact(self.items);
             for seg in self.segments.iter_mut() {
-                let old_access = std::mem::take(&mut seg.last_access);
-                for (i, opt_entry) in seg.slots.drain(..).enumerate() {
-                    if let Some(entry) = opt_entry {
-                        let h = mix_hash(hash_key(&entry.key));
-                        single.insert_migrated(entry, h, old_access.get(i).copied().unwrap_or(0));
-                    }
+                for (entry, access) in seg.drain_entries() {
+                    let h = mix_hash(hash_key(&entry.key));
+                    single.insert_migrated(entry, h, access);
                 }
             }
             self.layout_epoch += 1;
@@ -2629,14 +2839,11 @@ impl RudisFlatTable {
     fn merge_buddies(&mut self, a: usize, b: usize, d: u8, pattern: usize) {
         let (keep, hole) = if a > b { (a, b) } else { (b, a) };
         let mut merged = RawSegment::new(SEG_CAP, d - 1);
+        merged.reserve_entries_exact(self.segments[a].items + self.segments[b].items);
         for id in [hole, keep] {
-            let seg = &mut self.segments[id];
-            let old_access = std::mem::take(&mut seg.last_access);
-            for (i, opt_entry) in seg.slots.drain(..).enumerate() {
-                if let Some(entry) = opt_entry {
-                    let h = mix_hash(hash_key(&entry.key));
-                    merged.insert_migrated(entry, h, old_access.get(i).copied().unwrap_or(0));
-                }
+            for (entry, access) in self.segments[id].drain_entries() {
+                let h = mix_hash(hash_key(&entry.key));
+                merged.insert_migrated(entry, h, access);
             }
         }
         self.segments[keep] = merged;
@@ -16227,12 +16434,13 @@ mod tests {
         assert_eq!(table.used_memory(), table.data_bytes + structure);
         assert!(table.used_memory() > empty + n * slot);
 
-        // Deletes reduce data bytes but the table does not shrink.
+        // Deletes reduce data bytes; the slot arrays don't shrink, but the
+        // entry arenas may release slack, so structure never grows.
         for i in 0..n / 2 {
             table.del(format!("key:{i:08}").as_bytes());
         }
         assert_seg_heap_bytes_consistent(&table.table);
-        assert_eq!(table.table.struct_bytes(), structure);
+        assert!(table.table.struct_bytes() <= structure);
 
         table.table.defrag();
         assert_seg_heap_bytes_consistent(&table.table);
@@ -16333,7 +16541,7 @@ mod tests {
 
     fn set_key_access(table: &mut RudisTable, key: &[u8], access: u16) {
         let idx = table.table.find(key, hash_key(key)).unwrap();
-        table.table.segments[idx >> GLOBAL_IDX_SHIFT].last_access[idx & GLOBAL_IDX_MASK] = access;
+        table.table.set_slot_last_access(idx, access);
     }
 
     #[test]
@@ -16346,6 +16554,62 @@ mod tests {
         assert!((1000..=1001).contains(&idle), "idle {idle}");
         let (_, idle2) = table.lru_and_idletime(b"k").unwrap();
         assert!((1000..=1001).contains(&idle2));
+    }
+
+    #[test]
+    #[ignore]
+    fn microbench_table_get_set_2m() {
+        let n = 2_000_000usize;
+        let mut t = RudisTable::new();
+        let keys: Vec<Bytes> = (0..n)
+            .map(|i| Bytes::from(format!("key:{i:010}")))
+            .collect();
+        let val = Bytes::from_static(b"0123456789abcdef");
+        let t0 = std::time::Instant::now();
+        for k in &keys {
+            t.set(k.clone(), val.clone(), None);
+        }
+        let ins = t0.elapsed();
+        let mut rng: u64 = 0x1234_5678_9abc_def1;
+        let order: Vec<usize> = (0..4_000_000)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng % n as u64) as usize
+            })
+            .collect();
+        let mut best_get = f64::MAX;
+        let mut best_set = f64::MAX;
+        for _ in 0..5 {
+            let t0 = std::time::Instant::now();
+            let mut hits = 0usize;
+            for &i in &order {
+                hits += t.get(&keys[i]).unwrap().is_some() as usize;
+            }
+            assert_eq!(hits, order.len());
+            best_get = best_get.min(t0.elapsed().as_nanos() as f64 / order.len() as f64);
+            let t0 = std::time::Instant::now();
+            for &i in &order {
+                t.set(keys[i].clone(), val.clone(), None);
+            }
+            best_set = best_set.min(t0.elapsed().as_nanos() as f64 / order.len() as f64);
+        }
+        let mut best_del = f64::MAX;
+        {
+            let t0 = std::time::Instant::now();
+            for k in keys.iter().take(n / 2) {
+                t.del(k);
+            }
+            best_del = best_del.min(t0.elapsed().as_nanos() as f64 / (n / 2) as f64);
+        }
+        eprintln!(
+            "MICROBENCH insert {:.1} ns/op  get {:.1} ns/op  set(overwrite) {:.1} ns/op  del {:.1} ns/op",
+            ins.as_nanos() as f64 / n as f64,
+            best_get,
+            best_set,
+            best_del
+        );
     }
 
     #[test]
@@ -16383,6 +16647,69 @@ mod tests {
             idle_evicted >= 95,
             "only {idle_evicted}/100 evictions hit idle keys"
         );
+    }
+
+    /// Randomized differential test of the dense-arena segments against a
+    /// `HashMap` model: inserts, overwrites, deletes, splits, merges,
+    /// rebuilds and defrag, checking slot/arena cross-links throughout.
+    #[test]
+    fn test_flat_table_arena_matches_model() {
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut table = RudisTable::new();
+        let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+            std::collections::HashMap::new();
+        for round in 0..6 {
+            // Grow phase (forces splits), then shrink phase (merges/trims).
+            let space = if round % 2 == 0 { 40_000 } else { 4_000 };
+            for step in 0..60_000u32 {
+                let k = format!("key:{}", next() % space).into_bytes();
+                match next() % 10 {
+                    0..=5 => {
+                        let v = format!("v{}", next() % 1000).into_bytes();
+                        table.set(Bytes::from(k.clone()), Bytes::from(v.clone()), None);
+                        model.insert(k, v);
+                    }
+                    6..=8 => {
+                        assert_eq!(table.del(&k), model.remove(&k).is_some());
+                    }
+                    _ => {
+                        let got = table.get(&k).unwrap();
+                        assert_eq!(got.as_deref(), model.get(&k).map(|v| v.as_slice()));
+                    }
+                }
+                if step % 5_000 == 0 {
+                    table.table.check_invariants();
+                    assert_seg_heap_bytes_consistent(&table.table);
+                }
+            }
+            // Bulk delete most keys, then merge and defrag.
+            let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+            for k in keys.iter().take(keys.len() * 9 / 10) {
+                assert!(table.del(k));
+                model.remove(k);
+            }
+            while table.table.shrink_step(32) > 0 {}
+            table.table.check_invariants();
+            assert_seg_heap_bytes_consistent(&table.table);
+            if round == 3 {
+                table.table.defrag();
+                table.table.check_invariants();
+                assert_seg_heap_bytes_consistent(&table.table);
+            }
+            assert_eq!(table.dbsize(), model.len());
+            for (k, v) in &model {
+                assert_eq!(table.get(k).unwrap().as_deref(), Some(v.as_slice()));
+            }
+            assert_eq!(table.table.entries().count(), model.len());
+        }
+        let recalculated = table.recalculate_used_memory();
+        assert_eq!(recalculated, table.used_memory());
     }
 
     /// RDB files are untrusted input (copied between hosts, received from a
