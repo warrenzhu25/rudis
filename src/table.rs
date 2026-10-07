@@ -1701,6 +1701,15 @@ const MERGE_MAX_ITEMS: usize = SEG_CAP / 4;
 /// to it).
 const HOLE_DEPTH: u8 = u8::MAX;
 
+/// Per-slot access clock: seconds, truncated to 16 bits. Idle times are
+/// `lru_now().wrapping_sub(last)`, exact up to ~18.2 h; a key idle longer
+/// wraps and reads as more recently used (Redis's 24-bit clock has the same
+/// property at ~194 days). 2 B instead of 4 B per slot.
+#[inline(always)]
+pub fn lru_now() -> u16 {
+    coarse_now_secs() as u16
+}
+
 #[inline(always)]
 pub fn coarse_now_secs() -> u32 {
     let mut ts = libc::timespec {
@@ -1719,7 +1728,7 @@ pub fn coarse_now_secs() -> u32 {
 pub struct RawSegment {
     pub ctrl: Vec<u8>,
     pub slots: Vec<Option<RudisEntry>>,
-    pub last_access: Vec<u32>,
+    pub last_access: Vec<u16>,
     pub capacity: usize,
     mask: usize,
     pub items: usize,
@@ -1735,7 +1744,7 @@ impl RawSegment {
         let ctrl = vec![EMPTY; cap + GROUP_SIZE];
         let mut slots = Vec::with_capacity(cap + STASH_CAP);
         slots.resize_with(cap + STASH_CAP, || None);
-        let last_access = vec![0u32; cap + STASH_CAP];
+        let last_access = vec![0u16; cap + STASH_CAP];
         let stash_bonus = if cap == SEG_CAP { STASH_CAP } else { 0 };
 
         Self {
@@ -1983,7 +1992,7 @@ impl RawSegment {
             let was_empty = self.ctrl[insert_idx] == EMPTY;
             self.set_ctrl(insert_idx, tag);
             self.slots[insert_idx] = Some(entry);
-            self.last_access[insert_idx] = coarse_now_secs();
+            self.last_access[insert_idx] = lru_now();
             self.items += 1;
             if was_empty {
                 self.growth_left = self.growth_left.saturating_sub(1);
@@ -1993,14 +2002,14 @@ impl RawSegment {
             self.stash_ctrl[s] = tag;
             self.stash_count += 1;
             self.slots[insert_idx] = Some(entry);
-            self.last_access[insert_idx] = coarse_now_secs();
+            self.last_access[insert_idx] = lru_now();
             self.items += 1;
             self.growth_left = self.growth_left.saturating_sub(1);
         }
     }
 
     #[inline(always)]
-    fn insert_migrated(&mut self, entry: RudisEntry, h: u64, access: u32) {
+    fn insert_migrated(&mut self, entry: RudisEntry, h: u64, access: u16) {
         let (_, idx) = self.find_or_prepare_insert_raw(&entry.key, h);
         self.insert_at(entry, h, idx);
         self.last_access[idx] = access;
@@ -2075,7 +2084,7 @@ impl RawSegment {
     pub fn heap_bytes(&self) -> usize {
         self.slots.capacity() * std::mem::size_of::<Option<RudisEntry>>()
             + self.ctrl.capacity()
-            + self.last_access.capacity() * std::mem::size_of::<u32>()
+            + self.last_access.capacity() * std::mem::size_of::<u16>()
     }
 }
 
@@ -2251,7 +2260,7 @@ impl RudisFlatTable {
         let seg_id = self.directory[dir_idx] as usize;
         let seg = &mut self.segments[seg_id];
         let (local_idx, _) = seg.find_entry(key, h)?;
-        seg.last_access[local_idx] = coarse_now_secs();
+        seg.last_access[local_idx] = lru_now();
         let entry = seg.slots[local_idx].as_mut()?;
         Some(((seg_id << GLOBAL_IDX_SHIFT) | local_idx, entry))
     }
@@ -2305,7 +2314,7 @@ impl RudisFlatTable {
         let local_idx = global_idx & GLOBAL_IDX_MASK;
 
         if existing.is_some() {
-            self.segments[seg_id].last_access[local_idx] = coarse_now_secs();
+            self.segments[seg_id].last_access[local_idx] = lru_now();
             self.segments[seg_id].slots[local_idx].replace(entry)
         } else {
             let slot = crate::router::key_slot(&entry.key) as usize;
@@ -2383,7 +2392,7 @@ impl RudisFlatTable {
         let local_idx = global_idx & GLOBAL_IDX_MASK;
         let seg = self.segments.get_mut(seg_id)?;
         let entry = seg.slots.get_mut(local_idx)?.as_mut()?;
-        seg.last_access[local_idx] = coarse_now_secs();
+        seg.last_access[local_idx] = lru_now();
         Some(entry)
     }
 
@@ -2394,12 +2403,12 @@ impl RudisFlatTable {
         if let Some(seg) = self.segments.get_mut(seg_id)
             && let Some(acc) = seg.last_access.get_mut(local_idx)
         {
-            *acc = coarse_now_secs();
+            *acc = lru_now();
         }
     }
 
     #[inline(always)]
-    pub fn get_slot_last_access(&self, global_idx: usize) -> u32 {
+    pub fn get_slot_last_access(&self, global_idx: usize) -> u16 {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
         self.segments
@@ -3250,6 +3259,10 @@ impl RudisTable {
 
         let policy_lower = policy.to_lowercase();
         let is_volatile = policy_lower.starts_with("volatile");
+        // LFU has no frequency counter yet; recency is the closer proxy.
+        let by_age = policy_lower.contains("lru") || policy_lower.contains("lfu");
+        let now = lru_now();
+        let mut max_age: u16 = 0;
         // Nothing is evictable, and the sampling loop below would otherwise
         // walk the entire table before concluding that.
         if is_volatile && self.num_expires == 0 {
@@ -3281,8 +3294,17 @@ impl RudisTable {
                         min_ttl = Some(exp);
                         best_slot = Some(idx);
                     }
+                } else if by_age {
+                    // Sampled LRU (as Redis): evict the least recently
+                    // accessed of the sampled keys.
+                    let age = now.wrapping_sub(self.table.get_slot_last_access(idx));
+                    if best_slot.is_none() || age > max_age {
+                        max_age = age;
+                        best_slot = Some(idx);
+                    }
+                    checked += 1;
                 } else {
-                    // LRU / random sampling
+                    // Random sampling
                     best_slot = Some(idx);
                     checked += 1;
                 }
@@ -4489,8 +4511,7 @@ impl RudisTable {
             && !self.check_expired_slot(idx)
         {
             let last = self.table.get_slot_last_access(idx);
-            let now = coarse_now_secs();
-            Some(now.saturating_sub(last) as u64)
+            Some(lru_now().wrapping_sub(last) as u64)
         } else {
             None
         }
@@ -4502,8 +4523,7 @@ impl RudisTable {
             && !self.check_expired_slot(idx)
         {
             let last = self.table.get_slot_last_access(idx);
-            let now = coarse_now_secs();
-            Some((last, now.saturating_sub(last) as u64))
+            Some((last as u32, lru_now().wrapping_sub(last) as u64))
         } else {
             None
         }
@@ -16309,6 +16329,60 @@ mod tests {
             assert!(table.try_evict_one_key("allkeys-random").is_some());
             assert!(table.used_memory() < before);
         }
+    }
+
+    fn set_key_access(table: &mut RudisTable, key: &[u8], access: u16) {
+        let idx = table.table.find(key, hash_key(key)).unwrap();
+        table.table.segments[idx >> GLOBAL_IDX_SHIFT].last_access[idx & GLOBAL_IDX_MASK] = access;
+    }
+
+    #[test]
+    fn test_idletime_uses_wrapping_16bit_clock() {
+        let mut table = RudisTable::new();
+        table.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None);
+        // Written across the u16 boundary: still the right idle time.
+        set_key_access(&mut table, b"k", lru_now().wrapping_sub(1000));
+        let idle = table.idletime(b"k").unwrap();
+        assert!((1000..=1001).contains(&idle), "idle {idle}");
+        let (_, idle2) = table.lru_and_idletime(b"k").unwrap();
+        assert!((1000..=1001).contains(&idle2));
+    }
+
+    #[test]
+    fn test_lru_eviction_prefers_idle_keys() {
+        let mut table = RudisTable::new();
+        let n = 2_000usize;
+        let now = lru_now();
+        for i in 0..n {
+            let k = format!("k{i}");
+            table.set(Bytes::from(k.clone()), Bytes::from_static(b"v"), None);
+            // Odd keys idle for an hour, even keys just accessed.
+            let access = if i % 2 == 1 {
+                now.wrapping_sub(3600)
+            } else {
+                now
+            };
+            set_key_access(&mut table, k.as_bytes(), access);
+        }
+        let mut idle_evicted = 0;
+        for _ in 0..100 {
+            let before: Vec<bool> = (0..n)
+                .map(|i| table.key_is_live(format!("k{i}").as_bytes()))
+                .collect();
+            assert!(table.try_evict_one_key("allkeys-lru").is_some());
+            let gone = (0..n)
+                .find(|&i| before[i] && !table.key_is_live(format!("k{i}").as_bytes()))
+                .unwrap();
+            if gone % 2 == 1 {
+                idle_evicted += 1;
+            }
+        }
+        // Random eviction would give ~50; each 10-key sample holds an idle
+        // key with probability ~1 - 2^-10.
+        assert!(
+            idle_evicted >= 95,
+            "only {idle_evicted}/100 evictions hit idle keys"
+        );
     }
 
     /// RDB files are untrusted input (copied between hosts, received from a
