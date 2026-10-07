@@ -593,7 +593,7 @@ impl Router {
         .ok()?;
         let (val, _) = crate::table::RudisTable::deserialize_val_payload(&val_payload).ok()?;
         match val {
-            crate::table::RudisValue::String(s) => Some(s),
+            crate::table::RudisValue::String(s) => Some(s.to_bytes()),
             crate::table::RudisValue::Int(n) => Some(crate::table::RudisTable::format_i64(n)),
             _ => None,
         }

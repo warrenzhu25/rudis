@@ -3,7 +3,7 @@ use fxhash::{FxBuildHasher, hash64};
 use hashbrown::HashMap;
 
 pub type RudisHashMap = HashMap<Bytes, Bytes, FxBuildHasher>;
-use crate::compact::CompactKey;
+use crate::compact::{CompactKey, CompactStr};
 use crate::resp::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1412,23 +1412,54 @@ pub struct TieredPointer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RudisValue {
-    String(Bytes),
+    String(crate::compact::CompactStr),
     Int(i64),
-    SmallHash(Vec<(Bytes, Bytes)>),
+    SmallHash(Box<Vec<(Bytes, Bytes)>>),
     Hash(Box<RudisHashMap>),
-    List(std::collections::VecDeque<Bytes>),
+    List(Box<std::collections::VecDeque<Bytes>>),
     Set(Box<RudisSet>),
     ZSet(Box<RudisZSet>),
     HyperLogLog(Box<[u8; 16384]>),
     Stream(Box<RudisStream>),
-    Tiered(TieredPointer),
+    // Boxed so every variant fits beside `CompactStr`'s tag and the enum
+    // stays 24 bytes; tiered/cooled values are cold, so the extra
+    // allocation is off the hot path.
+    Tiered(Box<TieredPointer>),
     Cooled {
-        ptr: TieredPointer,
+        ptr: Box<TieredPointer>,
         val: Box<RudisValue>,
     },
 }
 
+const _: () = assert!(std::mem::size_of::<RudisValue>() == 24);
+
 impl RudisValue {
+    /// A string value (possibly cooled) that should be promoted to a shared
+    /// buffer before being read; see [`CompactStr::make_shared`].
+    #[inline(always)]
+    pub fn string_needs_share(&self) -> bool {
+        match self {
+            RudisValue::String(s) => s.needs_share(),
+            RudisValue::Cooled { val, .. } => {
+                matches!(&**val, RudisValue::String(s) if s.needs_share())
+            }
+            _ => false,
+        }
+    }
+
+    #[inline]
+    pub fn share_string(&mut self) {
+        match self {
+            RudisValue::String(s) => s.make_shared(),
+            RudisValue::Cooled { val, .. } => {
+                if let RudisValue::String(s) = &mut **val {
+                    s.make_shared();
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn approx_bytes(&self) -> usize {
         match self {
             RudisValue::String(b) => b.len(),
@@ -1570,7 +1601,7 @@ impl RudisEntry {
                 _ => unreachable!(),
             };
             self.val = v;
-            Some(p)
+            Some(*p)
         } else {
             None
         }
@@ -2300,6 +2331,19 @@ impl RudisFlatTable {
         self.segments.get(seg_id)?.slots.get(local_idx)?.as_ref()
     }
 
+    /// Like [`Self::get_slot_mut`] but leaves `last_access` alone, for
+    /// internal representation changes that aren't client accesses.
+    #[inline(always)]
+    pub fn get_slot_mut_no_touch(&mut self, global_idx: usize) -> Option<&mut RudisEntry> {
+        let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
+        let local_idx = global_idx & GLOBAL_IDX_MASK;
+        self.segments
+            .get_mut(seg_id)?
+            .slots
+            .get_mut(local_idx)?
+            .as_mut()
+    }
+
     #[inline(always)]
     pub fn get_slot_mut(&mut self, global_idx: usize) -> Option<&mut RudisEntry> {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
@@ -2977,8 +3021,8 @@ impl RudisTable {
     #[inline(always)]
     pub fn recycle_value(&mut self, val: RudisValue) {
         match val {
-            RudisValue::List(deque) => self.arena.recycle_list(deque),
-            RudisValue::SmallHash(pairs) => self.arena.recycle_small_hash(pairs),
+            RudisValue::List(deque) => self.arena.recycle_list(*deque),
+            RudisValue::SmallHash(pairs) => self.arena.recycle_small_hash(*pairs),
             RudisValue::Set(s) => {
                 if let RudisSet::Small(v) = *s {
                     self.arena.recycle_small_set(v);
@@ -3072,7 +3116,8 @@ impl RudisTable {
             match &mut entry.val {
                 RudisValue::String(b) => {
                     if !b.is_empty() {
-                        *b = Bytes::copy_from_slice(b.as_ref());
+                        let fresh = CompactStr::new(b);
+                        *b = fresh;
                     }
                 }
                 RudisValue::SmallHash(pairs) => {
@@ -3111,9 +3156,9 @@ impl RudisTable {
             return;
         }
         if let Some(removed) = self.table.remove(slot_idx) {
-            match removed.val {
-                RudisValue::Tiered(ptr) => self.dropped_tier.push((ptr, false)),
-                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((ptr, true)),
+            match &removed.val {
+                RudisValue::Tiered(ptr) => self.dropped_tier.push((**ptr, false)),
+                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((**ptr, true)),
                 _ => {}
             }
             if removed.expire_at().is_some() {
@@ -3214,9 +3259,9 @@ impl RudisTable {
         if let Some(slot_idx) = best_slot
             && let Some(removed) = self.table.remove(slot_idx)
         {
-            match removed.val {
-                RudisValue::Tiered(ptr) => self.dropped_tier.push((ptr, false)),
-                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((ptr, true)),
+            match &removed.val {
+                RudisValue::Tiered(ptr) => self.dropped_tier.push((**ptr, false)),
+                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((**ptr, true)),
                 _ => {}
             }
             if removed.expire_at().is_some() {
@@ -3287,12 +3332,23 @@ impl RudisTable {
                 return Ok(None);
             }
             crate::server_stats::note_key_lookup(true);
+            let entry = if entry.val.string_needs_share() {
+                if let Some(e) = self.table.get_slot_mut_no_touch(idx) {
+                    e.val.share_string();
+                }
+                match self.table.get_slot(idx) {
+                    Some(e) => e,
+                    None => return Ok(None),
+                }
+            } else {
+                entry
+            };
             let val_ref = match &entry.val {
                 RudisValue::Cooled { val, .. } => val.as_ref(),
                 other => other,
             };
             let res = match val_ref {
-                RudisValue::String(b) => Ok(Some(b.clone())),
+                RudisValue::String(b) => Ok(Some(b.to_bytes())),
                 RudisValue::Int(n) => Ok(Some(Self::format_i64(*n))),
                 RudisValue::HyperLogLog(regs) => Ok(Some(Bytes::copy_from_slice(&regs[..]))),
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -3334,12 +3390,23 @@ impl RudisTable {
                 return Ok(None);
             }
             crate::server_stats::note_key_lookup(true);
+            let entry = if entry.val.string_needs_share() {
+                if let Some(e) = self.table.get_slot_mut_no_touch(idx) {
+                    e.val.share_string();
+                }
+                match self.table.get_slot(idx) {
+                    Some(e) => e,
+                    None => return Ok(None),
+                }
+            } else {
+                entry
+            };
             let val_ref = match &entry.val {
                 RudisValue::Cooled { val, .. } => val.as_ref(),
                 other => other,
             };
             let res = match val_ref {
-                RudisValue::String(b) => Ok(Some(crate::shard::CompactResp::from_bulk(b))),
+                RudisValue::String(b) => Ok(Some(crate::shard::CompactResp::from_compact_str(b))),
                 RudisValue::Int(n) => {
                     let formatted = Self::format_i64(*n);
                     Ok(Some(crate::shard::CompactResp::from_bulk(&formatted)))
@@ -3558,7 +3625,7 @@ impl RudisTable {
             // frame (plus a shared refcount header), which would otherwise stay
             // allocated as long as the key lives. Measured: -21% memory per
             // small key, no SET throughput cost.
-            RudisValue::String(Bytes::copy_from_slice(&value))
+            RudisValue::String(CompactStr::new(&value))
         };
         let val_bytes = val.approx_bytes();
         let (existing, candidate_idx) = self.table.find_or_prepare_insert(&key, h);
@@ -3567,8 +3634,8 @@ impl RudisTable {
         {
             let old_bytes = entry.val.approx_bytes();
             let old_tiered = match &entry.val {
-                RudisValue::Tiered(ptr) => Some((*ptr, false)),
-                RudisValue::Cooled { ptr, .. } => Some((*ptr, true)),
+                RudisValue::Tiered(ptr) => Some((**ptr, false)),
+                RudisValue::Cooled { ptr, .. } => Some((**ptr, true)),
                 _ => None,
             };
             entry.val = val;
@@ -3634,8 +3701,8 @@ impl RudisTable {
                 self.data_bytes = self.data_bytes.saturating_sub(freed);
                 let entry = self.table.remove_present(idx);
                 match entry.val {
-                    RudisValue::Tiered(ptr) => self.dropped_tier.push((ptr, false)),
-                    RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((ptr, true)),
+                    RudisValue::Tiered(ptr) => self.dropped_tier.push((*ptr, false)),
+                    RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((*ptr, true)),
                     RudisValue::String(_) | RudisValue::Int(_) => {}
                     other => self.recycle_value(other),
                 }
@@ -3664,8 +3731,8 @@ impl RudisTable {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
             match entry.val {
-                RudisValue::Tiered(ptr) => self.dropped_tier.push((ptr, false)),
-                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((ptr, true)),
+                RudisValue::Tiered(ptr) => self.dropped_tier.push((*ptr, false)),
+                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((*ptr, true)),
                 RudisValue::String(_) | RudisValue::Int(_) => {}
                 other => self.recycle_value(other),
             }
@@ -4172,8 +4239,8 @@ impl RudisTable {
             return None;
         }
         let entry = self.table.get_slot(idx)?;
-        if let RudisValue::Tiered(ptr) = entry.val {
-            Some(ptr)
+        if let RudisValue::Tiered(ptr) = &entry.val {
+            Some(**ptr)
         } else {
             None
         }
@@ -4205,8 +4272,8 @@ impl RudisTable {
             return None;
         }
         let entry = self.table.get_slot(idx)?;
-        if let RudisValue::Cooled { ptr, .. } = entry.val {
-            Some(ptr)
+        if let RudisValue::Cooled { ptr, .. } = &entry.val {
+            Some(**ptr)
         } else {
             None
         }
@@ -4219,7 +4286,7 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot_mut(idx)
         {
             let old_bytes = entry.val.approx_bytes();
-            entry.val = RudisValue::Tiered(ptr);
+            entry.val = RudisValue::Tiered(Box::new(ptr));
             let new_bytes = entry.val.approx_bytes();
             self.data_bytes = self.data_bytes.saturating_sub(old_bytes) + new_bytes;
             return true;
@@ -4257,9 +4324,9 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot_mut(idx)
             && !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. })
         {
-            let old_val = std::mem::replace(&mut entry.val, RudisValue::Tiered(ptr));
+            let old_val = std::mem::replace(&mut entry.val, RudisValue::Tiered(Box::new(ptr)));
             entry.val = RudisValue::Cooled {
-                ptr,
+                ptr: Box::new(ptr),
                 val: Box::new(old_val),
             };
             self.data_bytes += 24;
@@ -4273,11 +4340,11 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h)
             && let Some(entry) = self.table.get_slot_mut(idx)
-            && let RudisValue::Tiered(ptr) = entry.val
+            && let RudisValue::Tiered(ptr) = &entry.val
         {
             let val_bytes = val.approx_bytes();
             entry.val = RudisValue::Cooled {
-                ptr,
+                ptr: ptr.clone(),
                 val: Box::new(val),
             };
             self.data_bytes += val_bytes;
@@ -4292,9 +4359,9 @@ impl RudisTable {
         let idx = self.table.find(key, h)?;
         let entry = self.table.get_slot_mut(idx)?;
         if let RudisValue::Cooled { ptr, val } = &entry.val {
-            let p = *ptr;
+            let p = **ptr;
             let freed = val.approx_bytes();
-            entry.val = RudisValue::Tiered(p);
+            entry.val = RudisValue::Tiered(Box::new(p));
             self.data_bytes = self.data_bytes.saturating_sub(freed);
             Some((p, freed))
         } else {
@@ -4307,9 +4374,9 @@ impl RudisTable {
         let mut total_freed = 0u64;
         for entry in self.table.entries_mut() {
             if let RudisValue::Cooled { ptr, val } = &entry.val {
-                let p = *ptr;
+                let p = **ptr;
                 let freed = val.approx_bytes() as u64;
-                entry.val = RudisValue::Tiered(p);
+                entry.val = RudisValue::Tiered(Box::new(p));
                 self.data_bytes = self.data_bytes.saturating_sub(freed as usize);
                 total_freed += freed;
                 count += 1;
@@ -4545,8 +4612,8 @@ impl RudisTable {
             if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::String(old) => {
-                        let prev = old.clone();
-                        *old = value;
+                        let prev = old.to_bytes();
+                        *old = value.into();
                         if entry.take_expire_at().is_some() {
                             self.num_expires = self.num_expires.saturating_sub(1);
                         }
@@ -4557,7 +4624,7 @@ impl RudisTable {
                         if let Some(int_val) = Self::parse_i64_bytes(&value) {
                             entry.val = RudisValue::Int(int_val);
                         } else {
-                            entry.val = RudisValue::String(value);
+                            entry.val = RudisValue::String(value.into());
                         }
                         if entry.take_expire_at().is_some() {
                             self.num_expires = self.num_expires.saturating_sub(1);
@@ -4583,7 +4650,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.get_slot_mut_warm(idx) {
                 let val = match &entry.val {
-                    RudisValue::String(s) => s.clone(),
+                    RudisValue::String(s) => s.to_bytes(),
                     RudisValue::Int(n) => Self::format_i64(*n),
                     _ => {
                         return Err(
@@ -4617,7 +4684,7 @@ impl RudisTable {
                         combined.extend_from_slice(s);
                         combined.extend_from_slice(val_to_append);
                         let len = combined.len();
-                        *s = Bytes::from(combined);
+                        *s = CompactStr::from(combined);
                         Ok(len)
                     }
                     RudisValue::Int(n) => {
@@ -4626,14 +4693,14 @@ impl RudisTable {
                         combined.extend_from_slice(&s);
                         combined.extend_from_slice(val_to_append);
                         let len = combined.len();
-                        entry.val = RudisValue::String(Bytes::from(combined));
+                        entry.val = RudisValue::String(CompactStr::from(combined));
                         Ok(len)
                     }
                     RudisValue::HyperLogLog(regs) => {
                         let mut combined = crate::hll::hll_create_from_regs(regs, None);
                         combined.extend_from_slice(val_to_append);
                         let len = combined.len();
-                        entry.val = RudisValue::String(Bytes::from(combined));
+                        entry.val = RudisValue::String(CompactStr::from(combined));
                         Ok(len)
                     }
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -4769,7 +4836,7 @@ impl RudisTable {
             }
             bytes[offset..offset + value.len()].copy_from_slice(value);
             let len = bytes.len();
-            entry.val = RudisValue::String(Bytes::from(bytes));
+            entry.val = RudisValue::String(CompactStr::from(bytes));
             return Ok(len);
         }
         if value.is_empty() && offset == 0 {
@@ -4780,7 +4847,7 @@ impl RudisTable {
         let len = bytes.len();
         let entry = RudisEntry {
             key: CompactKey::new(&key),
-            val: RudisValue::String(Bytes::from(bytes)),
+            val: RudisValue::String(CompactStr::from(bytes)),
             expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
@@ -4813,7 +4880,7 @@ impl RudisTable {
             if new_val.is_nan() || new_val.is_infinite() {
                 return Err("ERR increment would produce NaN or Infinity");
             }
-            entry.val = RudisValue::String(Bytes::from(new_val.to_string()));
+            entry.val = RudisValue::String(CompactStr::from(new_val.to_string()));
             return Ok(new_val);
         }
         if delta.is_nan() || delta.is_infinite() {
@@ -4821,7 +4888,7 @@ impl RudisTable {
         }
         let entry = RudisEntry {
             key: CompactKey::new(&key),
-            val: RudisValue::String(Bytes::from(delta.to_string())),
+            val: RudisValue::String(CompactStr::from(delta.to_string())),
             expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
@@ -5297,12 +5364,12 @@ impl RudisTable {
                 let val_str = val.to_string();
                 if let Some(idx) = existing_slot {
                     let entry = self.table.get_slot_mut(idx).unwrap();
-                    entry.val = RudisValue::String(Bytes::from(val_str.clone()));
+                    entry.val = RudisValue::String(CompactStr::from(val_str.clone()));
                     entry.set_expire_at(new_expire_at);
                 } else {
                     self.table.insert(RudisEntry {
                         key: CompactKey::new(&key),
-                        val: RudisValue::String(Bytes::from(val_str.clone())),
+                        val: RudisValue::String(CompactStr::from(val_str.clone())),
                         expire_at: Expiry::from(new_expire_at),
                     });
                 }
@@ -5458,7 +5525,7 @@ impl RudisTable {
         let val = if field.len() <= max_value && val.len() <= max_value {
             let mut pairs = self.arena.acquire_small_hash(1);
             pairs.push((field.clone(), val.clone()));
-            RudisValue::SmallHash(pairs)
+            RudisValue::SmallHash(Box::new(pairs))
         } else {
             let mut map = RudisHashMap::with_capacity_and_hasher(1, FxBuildHasher::default());
             map.insert(field.clone(), val.clone());
@@ -5624,7 +5691,7 @@ impl RudisTable {
                 }
                 a
             };
-            (RudisValue::SmallHash(pairs), added)
+            (RudisValue::SmallHash(Box::new(pairs)), added)
         } else {
             let mut map =
                 RudisHashMap::with_capacity_and_hasher(fields.len(), FxBuildHasher::default());
@@ -5701,7 +5768,7 @@ impl RudisTable {
             map.insert(field, value);
             RudisValue::Hash(Box::new(map))
         } else {
-            RudisValue::SmallHash(vec![(field, value)])
+            RudisValue::SmallHash(Box::new(vec![(field, value)]))
         };
         let entry = RudisEntry {
             key: CompactKey::new(&key),
@@ -6403,7 +6470,7 @@ impl RudisTable {
             match &entry.val {
                 RudisValue::SmallHash(pairs) => {
                     let f_len = field.len();
-                    for (k, v) in pairs {
+                    for (k, v) in pairs.iter() {
                         if k.len() == f_len && k.as_ref() == field {
                             return Ok(Some(v.clone()));
                         }
@@ -6463,7 +6530,7 @@ impl RudisTable {
                             }
                         }
                         _ => {
-                            for (k, v) in pairs {
+                            for (k, v) in pairs.iter() {
                                 if k.len() == f_len && k.as_ref() == field {
                                     return Ok(crate::shard::CompactResp::from_bulk(v));
                                 }
@@ -6523,7 +6590,7 @@ impl RudisTable {
                             }
                         }
                         _ => {
-                            for (k, v) in pairs {
+                            for (k, v) in pairs.iter() {
                                 if k.len() == f_len && k.as_ref() == field {
                                     crate::connection::write_resp_bulk(out, v);
                                     return Ok(());
@@ -6701,7 +6768,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(pairs) => Ok(pairs.clone()),
+                    RudisValue::SmallHash(pairs) => Ok(pairs.to_vec()),
                     RudisValue::Hash(map) => {
                         Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     }
@@ -6969,7 +7036,7 @@ impl RudisTable {
         let val_bytes = Bytes::from(delta.to_string());
         let entry = RudisEntry {
             key: CompactKey::new(&key),
-            val: RudisValue::SmallHash(vec![(field, val_bytes)]),
+            val: RudisValue::SmallHash(Box::new(vec![(field, val_bytes)])),
             expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
@@ -7056,7 +7123,7 @@ impl RudisTable {
         let val_bytes = Bytes::from(delta.to_string());
         let entry = RudisEntry {
             key: CompactKey::new(&key),
-            val: RudisValue::SmallHash(vec![(field, val_bytes)]),
+            val: RudisValue::SmallHash(Box::new(vec![(field, val_bytes)])),
             expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
@@ -7076,7 +7143,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(p) => p.clone(),
+                    RudisValue::SmallHash(p) => p.to_vec(),
                     RudisValue::Hash(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                     _ => {
                         return Err(
@@ -7147,7 +7214,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(p) => p.clone(),
+                    RudisValue::SmallHash(p) => p.to_vec(),
                     RudisValue::Hash(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                     _ => {
                         return Err(
@@ -7270,7 +7337,7 @@ impl RudisTable {
         let len = deque.len();
         let entry = RudisEntry {
             key: CompactKey::new(key),
-            val: RudisValue::List(deque),
+            val: RudisValue::List(Box::new(deque)),
             expire_at: Expiry::from(None),
         };
         self.table.insert_prepared(entry, h, insert_idx);
@@ -7350,7 +7417,7 @@ impl RudisTable {
         let len = deque.len();
         let entry = RudisEntry {
             key: CompactKey::new(key),
-            val: RudisValue::List(deque),
+            val: RudisValue::List(Box::new(deque)),
             expire_at: Expiry::from(None),
         };
         self.table.insert_prepared(entry, h, insert_idx);
@@ -8049,7 +8116,7 @@ impl RudisTable {
                             } else {
                                 let start_u = start.max(0) as usize;
                                 let stop_u = (stop.min(n - 1) as usize).max(start_u);
-                                *deque = deque
+                                **deque = deque
                                     .drain(..)
                                     .skip(start_u)
                                     .take(stop_u - start_u + 1)
@@ -8354,7 +8421,7 @@ impl RudisTable {
         }
         self.table.insert(RudisEntry {
             key: CompactKey::new(&destination),
-            val: RudisValue::List(deque),
+            val: RudisValue::List(Box::new(deque)),
             expire_at: Expiry::from(None),
         });
         Ok(Some(val))
@@ -8528,7 +8595,7 @@ impl RudisTable {
         }
         self.table.insert(RudisEntry {
             key: CompactKey::new(&destination),
-            val: RudisValue::List(deque),
+            val: RudisValue::List(Box::new(deque)),
             expire_at: Expiry::from(None),
         });
         Ok(Some(vals))
@@ -11201,7 +11268,7 @@ impl RudisTable {
                                 } else {
                                     vec[byte_idx] &= !(1 << bit_idx);
                                 }
-                                *b = Bytes::from(vec);
+                                *b = CompactStr::from(vec);
                             }
                             return Ok((old_bit, changed));
                         }
@@ -11221,7 +11288,7 @@ impl RudisTable {
                                 } else {
                                     vec[byte_idx] &= !(1 << bit_idx);
                                 }
-                                entry.val = RudisValue::String(Bytes::from(vec));
+                                entry.val = RudisValue::String(CompactStr::from(vec));
                             }
                             return Ok((old_bit, changed));
                         }
@@ -11242,7 +11309,7 @@ impl RudisTable {
         let added_mem = key.len() + vec.len() + 64;
         let entry = RudisEntry {
             key: CompactKey::new(&key),
-            val: RudisValue::String(Bytes::from(vec)),
+            val: RudisValue::String(CompactStr::from(vec)),
             expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
@@ -11662,12 +11729,12 @@ impl RudisTable {
                 if let Some(idx) = self.table.find(&key, h)
                     && let Some(entry) = self.table.get_slot_mut(idx)
                 {
-                    entry.val = RudisValue::String(Bytes::from(current_vec));
+                    entry.val = RudisValue::String(CompactStr::from(current_vec));
                 }
             } else {
                 let entry = RudisEntry {
                     key: CompactKey::new(&key),
-                    val: RudisValue::String(Bytes::from(current_vec)),
+                    val: RudisValue::String(CompactStr::from(current_vec)),
                     expire_at: Expiry::from(None),
                 };
                 self.table.insert(entry);
@@ -11841,7 +11908,7 @@ impl RudisTable {
                         let mut bytes = s.to_vec();
                         let updated = crate::hll::hll_add(&mut bytes, elements)?;
                         if updated {
-                            *s = Bytes::from(bytes);
+                            *s = CompactStr::from(bytes);
                         }
                         Ok(updated)
                     }
@@ -11902,7 +11969,7 @@ impl RudisTable {
                         let mut bytes = s.to_vec();
                         let count = crate::hll::hll_count(&mut bytes)?;
                         if &bytes[..] != s.as_ref() {
-                            *s = Bytes::from(bytes);
+                            *s = CompactStr::from(bytes);
                         }
                         Ok(count)
                     }
@@ -12107,7 +12174,7 @@ impl RudisTable {
                         hdr[4] = crate::hll::HLL_DENSE;
                         hdr[8..16].copy_from_slice(&s[8..16]);
                         hdr.extend_from_slice(&dense);
-                        *s = Bytes::from(hdr);
+                        *s = CompactStr::from(hdr);
                         Ok(true)
                     }
                 }
@@ -13145,7 +13212,7 @@ impl RudisTable {
             RudisValue::List(l) => {
                 payload.push(1u8);
                 payload.extend_from_slice(&(l.len() as u32).to_le_bytes());
-                for item in l {
+                for item in l.iter() {
                     payload.extend_from_slice(&(item.len() as u32).to_le_bytes());
                     payload.extend_from_slice(item);
                 }
@@ -13170,7 +13237,7 @@ impl RudisTable {
             RudisValue::SmallHash(pairs) => {
                 payload.push(4u8);
                 payload.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
-                for (f, v) in pairs {
+                for (f, v) in pairs.iter() {
                     payload.extend_from_slice(&(f.len() as u32).to_le_bytes());
                     payload.extend_from_slice(f);
                     payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
@@ -13307,7 +13374,7 @@ impl RudisTable {
                 if cursor + len > data.len() {
                     return Err("DUMP payload version or checksum are wrong");
                 }
-                let val = Bytes::copy_from_slice(&data[cursor..cursor + len]);
+                let val = CompactStr::new(&data[cursor..cursor + len]);
                 cursor += len;
                 RudisValue::String(val)
             }
@@ -13334,7 +13401,7 @@ impl RudisTable {
                     list.push_back(Bytes::copy_from_slice(&data[cursor..cursor + len]));
                     cursor += len;
                 }
-                RudisValue::List(list)
+                RudisValue::List(Box::new(list))
             }
             2 => {
                 if cursor + 4 > data.len() {
@@ -13432,7 +13499,7 @@ impl RudisTable {
                         }
                         pairs.push((f, v));
                     }
-                    RudisValue::SmallHash(pairs)
+                    RudisValue::SmallHash(Box::new(pairs))
                 } else {
                     let mut hash = RudisHashMap::with_capacity_and_hasher(
                         claimed_capacity(count, data, cursor, 8),
@@ -16287,9 +16354,9 @@ mod tests {
             "Option<RudisEntry> = {}",
             std::mem::size_of::<Option<RudisEntry>>()
         );
-        assert_eq!(std::mem::size_of::<RudisValue>(), 40);
-        assert_eq!(std::mem::size_of::<RudisEntry>(), 72);
-        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 72);
+        assert_eq!(std::mem::size_of::<RudisValue>(), 24);
+        assert_eq!(std::mem::size_of::<RudisEntry>(), 56);
+        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 56);
     }
 
     #[test]
@@ -16697,7 +16764,7 @@ mod tests {
             let val = Bytes::from(format!("val_{}", i));
             let entry = RudisEntry {
                 key: CompactKey::new(&key),
-                val: RudisValue::String(val),
+                val: RudisValue::String(val.into()),
                 expire_at: Expiry::from(None),
             };
             table.insert(entry);
@@ -17557,7 +17624,7 @@ mod tests {
         let (entry_val, _) = table.get_entry(b"k1").unwrap();
         assert_eq!(
             entry_val,
-            RudisValue::String(Bytes::from_static(b"hello_tiered_storage_world"))
+            RudisValue::String(CompactStr::from(b"hello_tiered_storage_world"))
         );
 
         // 3. Instant Zero-I/O Decommit: Cooled -> Cold (Tiered)
@@ -17569,7 +17636,7 @@ mod tests {
         assert!(table.is_tiered(b"k1").is_some());
 
         // 4. Restore Cold -> Cooled (Read hit)
-        let restored_val = RudisValue::String(Bytes::from_static(b"hello_tiered_storage_world"));
+        let restored_val = RudisValue::String(CompactStr::from(b"hello_tiered_storage_world"));
         assert!(table.restore_tiered_value(b"k1", restored_val));
         assert!(table.is_cooled(b"k1").is_some());
         assert_eq!(
@@ -18172,6 +18239,39 @@ mod tests {
     }
 
     #[test]
+    fn test_get_shares_large_values_lazily() {
+        let mut table = RudisTable::new();
+        let k = Bytes::from("big");
+        let h = hash_key(k.as_ref());
+        let val = Bytes::from(vec![b'x'; 1024]);
+        table.set(k.clone(), val.clone(), None);
+        let is_heap = |t: &RudisTable| {
+            let (_, e) = t.table.find_entry(k.as_ref(), h).unwrap();
+            matches!(&e.val, RudisValue::String(CompactStr::Heap(_)))
+        };
+        // Written as one exact-size buffer.
+        assert!(is_heap(&table));
+        // First read converts it in place; reads then share one buffer.
+        let a = table.get_with_hash(k.as_ref(), h).unwrap().unwrap();
+        assert!(!is_heap(&table));
+        let b = table.get_with_hash(k.as_ref(), h).unwrap().unwrap();
+        assert_eq!(a, val);
+        assert_eq!(a.as_ptr(), b.as_ptr());
+        let c = table.get_compact_with_hash(k.as_ref(), h).unwrap().unwrap();
+        assert!(matches!(c, crate::shard::CompactResp::Bulk(ref x) if x.as_ptr() == a.as_ptr()));
+        // Overwriting drops the shared value; old readers keep theirs.
+        table.set(k.clone(), Bytes::from(vec![b'y'; 1024]), None);
+        assert!(is_heap(&table));
+        assert_eq!(a, val);
+        // Small values stay inline and are never promoted.
+        table.set(k.clone(), Bytes::from("small"), None);
+        assert_eq!(
+            table.get_with_hash(k.as_ref(), h),
+            Ok(Some(Bytes::from("small")))
+        );
+    }
+
+    #[test]
     fn test_get_with_hash() {
         let mut table = RudisTable::new();
         let k = Bytes::from("mykey");
@@ -18281,7 +18381,7 @@ mod tests {
         let total_inserted = 3000;
         for i in 0..total_inserted {
             let key = Bytes::from(format!("key_{:04}", i));
-            let val = RudisValue::String(Bytes::from("val"));
+            let val = RudisValue::String(CompactStr::from("val"));
             table.insert(RudisEntry {
                 key: CompactKey::new(&key),
                 val,
@@ -18311,7 +18411,7 @@ mod tests {
 
         for k in (0..total_inserted).step_by(2) {
             let key = Bytes::from(format!("key_{:04}", k));
-            let val = RudisValue::String(Bytes::from("val2"));
+            let val = RudisValue::String(CompactStr::from("val2"));
             table.insert(RudisEntry {
                 key: CompactKey::new(&key),
                 val,

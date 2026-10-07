@@ -94,6 +94,18 @@ impl CompactResp {
 
     #[inline(always)]
     pub fn from_bulk(bytes: &Bytes) -> Self {
+        Self::from_bulk_with(bytes, || bytes.clone())
+    }
+
+    /// Like [`Self::from_bulk`] for a table string value: short values are
+    /// encoded inline, long ones share the value's allocation.
+    #[inline(always)]
+    pub fn from_compact_str(s: &crate::compact::CompactStr) -> Self {
+        Self::from_bulk_with(s, || s.to_bytes())
+    }
+
+    #[inline(always)]
+    fn from_bulk_with(bytes: &[u8], owned: impl FnOnce() -> Bytes) -> Self {
         let n = bytes.len();
         if n <= 20 {
             let mut data = [0u8; 30];
@@ -123,7 +135,7 @@ impl CompactResp {
             data[len] = b'\r';
             data[len + 1] = b'\n';
             len += 2;
-            data[len..len + n].copy_from_slice(bytes.as_ref());
+            data[len..len + n].copy_from_slice(bytes);
             len += n;
             data[len] = b'\r';
             data[len + 1] = b'\n';
@@ -133,7 +145,7 @@ impl CompactResp {
                 data,
             }
         } else {
-            CompactResp::Bulk(bytes.clone())
+            CompactResp::Bulk(owned())
         }
     }
 
@@ -2393,7 +2405,7 @@ impl ShardDb {
         // entry: a failed read has to skip the whole entry, never leave an
         // expiry opcode or a key without a value behind.
         let tiered_payload = match &entry.val {
-            crate::table::RudisValue::Tiered(ptr) => match self.read_tiered_payload(*ptr) {
+            crate::table::RudisValue::Tiered(ptr) => match self.read_tiered_payload(**ptr) {
                 Some(raw) => Some(raw),
                 None => {
                     tracing::error!(

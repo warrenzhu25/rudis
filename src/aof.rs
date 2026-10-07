@@ -2801,7 +2801,7 @@ fn write_rewritten_aof(
         let hydrated_val;
         let val_ref = match &entry.val {
             crate::table::RudisValue::Cooled { val, .. } => val.as_ref(),
-            crate::table::RudisValue::Tiered(ptr) => match db.hydrate_tiered(*ptr) {
+            crate::table::RudisValue::Tiered(ptr) => match db.hydrate_tiered(**ptr) {
                 Some(v) => {
                     hydrated_val = v;
                     &hydrated_val
@@ -2866,7 +2866,7 @@ fn write_rewritten_aof(
                 )?;
                 writer.write_all(k)?;
                 writer.write_all(b"\r\n")?;
-                for (field, v) in pairs {
+                for (field, v) in pairs.iter() {
                     writer.write_all(format!("${}\r\n", field.len()).as_bytes())?;
                     writer.write_all(field.as_ref())?;
                     writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
@@ -2896,7 +2896,7 @@ fn write_rewritten_aof(
                 )?;
                 writer.write_all(k)?;
                 writer.write_all(b"\r\n")?;
-                for item in list {
+                for item in list.iter() {
                     writer.write_all(format!("${}\r\n", item.len()).as_bytes())?;
                     writer.write_all(item.as_ref())?;
                     writer.write_all(b"\r\n")?;
