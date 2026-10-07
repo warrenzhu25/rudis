@@ -711,7 +711,7 @@ impl ShardDb {
             let matching_keys: Vec<Bytes> = self
                 .table
                 .entries()
-                .filter(|e| e.expire_at.is_none_or(|exp| exp > now))
+                .filter(|e| e.expire_at().is_none_or(|exp| exp > now))
                 .filter_map(|e| {
                     let k_str = String::from_utf8_lossy(&e.key);
                     let matched = if prefixes.is_empty() {
@@ -2378,7 +2378,7 @@ impl ShardDb {
         clock: &RdbClock,
         buf: &mut Vec<u8>,
     ) {
-        if let Some(exp) = entry.expire_at
+        if let Some(exp) = entry.expire_at()
             && exp <= clock.now
         {
             return;
@@ -2401,7 +2401,7 @@ impl ShardDb {
             },
             _ => None,
         };
-        if let Some(exp) = entry.expire_at {
+        if let Some(exp) = entry.expire_at() {
             let rem_ms = exp.duration_since(clock.now).as_millis() as u64;
             let expire_unix_ms = clock.unix_ms + rem_ms;
             buf.push(0xFC);
@@ -3078,7 +3078,7 @@ impl ShardDb {
             self.table.insert_entry(crate::table::RudisEntry {
                 key,
                 val,
-                expire_at,
+                expire_at: crate::table::Expiry::from(expire_at),
             });
         }
         Ok(())

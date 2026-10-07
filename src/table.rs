@@ -1473,14 +1473,92 @@ impl RudisValue {
 /// Smallest value (by `approx_bytes`) worth spilling to the tier.
 pub const MIN_SPILL_VALUE_BYTES: usize = 64;
 
+/// Base for [`Expiry`]: a little before the first use, so deadlines slightly
+/// in the past (e.g. restored already-expired keys) still round-trip.
+fn expiry_base() -> Instant {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| {
+        let now = Instant::now();
+        now.checked_sub(Duration::from_secs(3600)).unwrap_or(now)
+    })
+}
+
+/// An `Option<Instant>` deadline packed into 8 bytes: nanoseconds since
+/// [`expiry_base`] plus one, with 0 meaning "no expiry". `Option<Instant>`
+/// takes 16 bytes, and this sits in every table slot. Deadlines before the
+/// base clamp to it (they are expired either way); ordering is preserved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Expiry(Option<std::num::NonZeroU64>);
+
+impl Expiry {
+    pub const NONE: Expiry = Expiry(None);
+
+    #[inline(always)]
+    pub fn get(self) -> Option<Instant> {
+        self.0
+            .map(|n| expiry_base() + Duration::from_nanos(n.get() - 1))
+    }
+
+    #[inline(always)]
+    pub fn is_some(self) -> bool {
+        self.0.is_some()
+    }
+
+    #[inline(always)]
+    pub fn is_none(self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl From<Option<Instant>> for Expiry {
+    #[inline(always)]
+    fn from(at: Option<Instant>) -> Self {
+        Expiry(at.map(|at| {
+            let nanos = at
+                .saturating_duration_since(expiry_base())
+                .as_nanos()
+                .min(u64::MAX as u128 - 1) as u64;
+            // nanos + 1 <= u64::MAX, so never zero.
+            std::num::NonZeroU64::MIN.saturating_add(nanos)
+        }))
+    }
+}
+
+impl From<Instant> for Expiry {
+    #[inline(always)]
+    fn from(at: Instant) -> Self {
+        Expiry::from(Some(at))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RudisEntry {
     pub key: Bytes,
     pub val: RudisValue,
-    pub expire_at: Option<Instant>,
+    /// Packed deadline; use [`RudisEntry::expire_at`] / [`RudisEntry::set_expire_at`].
+    pub expire_at: Expiry,
 }
 
 impl RudisEntry {
+    /// The key's expiry deadline, if it has one.
+    #[inline(always)]
+    pub fn expire_at(&self) -> Option<Instant> {
+        self.expire_at.get()
+    }
+
+    #[inline(always)]
+    pub fn set_expire_at(&mut self, at: Option<Instant>) {
+        self.expire_at = Expiry::from(at);
+    }
+
+    /// Clears the expiry and returns the old deadline.
+    #[inline(always)]
+    pub fn take_expire_at(&mut self) -> Option<Instant> {
+        let old = self.expire_at.get();
+        self.expire_at = Expiry::NONE;
+        old
+    }
+
     /// If this entry holds a [`RudisValue::Cooled`], warms it back up to its
     /// in-memory [`RudisValue`] in place and returns its stale on-disk pointer.
     #[inline(always)]
@@ -2917,7 +2995,7 @@ impl RudisTable {
     #[inline]
     pub fn insert_entry(&mut self, entry: RudisEntry) {
         self.del(&entry.key);
-        if entry.expire_at.is_some() {
+        if entry.expire_at().is_some() {
             self.num_expires += 1;
         }
         self.table.insert(entry);
@@ -3037,7 +3115,7 @@ impl RudisTable {
                 RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((ptr, true)),
                 _ => {}
             }
-            if removed.expire_at.is_some() {
+            if removed.expire_at().is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
             let freed = removed.key.len() + removed.val.approx_bytes() + 64;
@@ -3066,7 +3144,7 @@ impl RudisTable {
             return false;
         }
         let is_exp = if let Some(entry) = self.table.get_slot(slot_idx) {
-            if let Some(expire_at) = entry.expire_at {
+            if let Some(expire_at) = entry.expire_at() {
                 Instant::now() >= expire_at
             } else {
                 false
@@ -3113,12 +3191,12 @@ impl RudisTable {
 
             if let Some(entry) = self.table.get_slot(idx) {
                 // If volatile policy, key must have an expiration
-                if is_volatile && entry.expire_at.is_none() {
+                if is_volatile && entry.expire_at().is_none() {
                     continue;
                 }
 
                 if policy_lower.contains("ttl") {
-                    if let Some(exp) = entry.expire_at
+                    if let Some(exp) = entry.expire_at()
                         && (min_ttl.is_none() || Some(exp) < min_ttl)
                     {
                         min_ttl = Some(exp);
@@ -3140,7 +3218,7 @@ impl RudisTable {
                 RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((ptr, true)),
                 _ => {}
             }
-            if removed.expire_at.is_some() {
+            if removed.expire_at().is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
             let freed = removed.key.len() + removed.val.approx_bytes() + 64;
@@ -3167,7 +3245,7 @@ impl RudisTable {
     /// deleting it if expired.
     pub fn key_is_live(&self, key: &[u8]) -> bool {
         match self.table.find_entry(key, hash_key(key)) {
-            Some((_, entry)) => match entry.expire_at {
+            Some((_, entry)) => match entry.expire_at() {
                 Some(expire_at) => {
                     crate::connection::ALLOW_ACCESS_EXPIRED
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -3198,7 +3276,7 @@ impl RudisTable {
     pub fn get_with_hash(&mut self, key: &[u8], h: u64) -> Result<Option<Bytes>, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -3245,7 +3323,7 @@ impl RudisTable {
     ) -> Result<Option<crate::shard::CompactResp>, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -3284,7 +3362,7 @@ impl RudisTable {
     pub fn write_get_resp(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool, &'static str> {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
-            if let Some(expire_at) = entry.expire_at
+            if let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -3332,7 +3410,7 @@ impl RudisTable {
                 return None;
             }
             if let Some(entry) = self.table.get_slot(idx) {
-                let ttl = entry.expire_at.and_then(|exp| {
+                let ttl = entry.expire_at().and_then(|exp| {
                     let now = Instant::now();
                     if exp > now {
                         Some(exp.duration_since(now))
@@ -3494,14 +3572,14 @@ impl RudisTable {
             };
             entry.val = val;
             if !keepttl {
-                let had_exp = entry.expire_at.is_some();
+                let had_exp = entry.expire_at().is_some();
                 let will_exp = expire_in.is_some();
                 if had_exp && !will_exp {
                     self.num_expires = self.num_expires.saturating_sub(1);
                 } else if !had_exp && will_exp {
                     self.num_expires += 1;
                 }
-                entry.expire_at = expire_in.map(|d| Instant::now() + d);
+                entry.set_expire_at(expire_in.map(|d| Instant::now() + d));
             }
             self.data_bytes = self.data_bytes.saturating_sub(old_bytes) + val_bytes;
             if let Some((ptr, is_cooled)) = old_tiered {
@@ -3523,7 +3601,7 @@ impl RudisTable {
             // Same as the value above: don't keep the frame alive through the key.
             key: Bytes::copy_from_slice(&key),
             val,
-            expire_at,
+            expire_at: Expiry::from(expire_at),
         };
         self.table.insert_prepared(entry, h, candidate_idx);
         self.data_bytes += entry_mem;
@@ -3565,7 +3643,7 @@ impl RudisTable {
             return false;
         }
         if let Some((idx, entry)) = self.table.find_entry(key, hash) {
-            if let Some(expire_at) = entry.expire_at
+            if let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -3581,7 +3659,7 @@ impl RudisTable {
             let freed = entry.key.len() + val_bytes + 64;
             self.data_bytes = self.data_bytes.saturating_sub(freed);
             let entry = self.table.remove_present(idx);
-            if entry.expire_at.is_some() {
+            if entry.expire_at().is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
             match entry.val {
@@ -3607,7 +3685,7 @@ impl RudisTable {
             return self.table.contains(key, hash);
         }
         if let Some((idx, entry)) = self.table.find_entry(key, hash) {
-            if let Some(expire_at) = entry.expire_at
+            if let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -3651,7 +3729,7 @@ impl RudisTable {
     ) -> Result<i64, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -3695,7 +3773,7 @@ impl RudisTable {
                 .cloned()
                 .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val: RudisValue::Int(new_val),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert_prepared(entry, h, candidate_idx);
         self.data_bytes += key.len() + 8 + 64;
@@ -3721,24 +3799,24 @@ impl RudisTable {
             }
             let target_instant = Instant::now() + duration;
             if let Some(entry) = self.table.get_slot_mut(idx) {
-                if opts.nx && entry.expire_at.is_some() {
+                if opts.nx && entry.expire_at().is_some() {
                     return false;
                 }
-                if opts.xx && entry.expire_at.is_none() {
+                if opts.xx && entry.expire_at().is_none() {
                     return false;
                 }
                 if opts.gt {
-                    if entry.expire_at.is_none() {
+                    if entry.expire_at().is_none() {
                         return false;
                     }
-                    if let Some(cur_exp) = entry.expire_at
+                    if let Some(cur_exp) = entry.expire_at()
                         && target_instant <= cur_exp
                     {
                         return false;
                     }
                 }
                 if opts.lt
-                    && let Some(cur_exp) = entry.expire_at
+                    && let Some(cur_exp) = entry.expire_at()
                     && target_instant >= cur_exp
                 {
                     return false;
@@ -3747,10 +3825,10 @@ impl RudisTable {
                     self.expire_slot(idx);
                     return true;
                 }
-                if entry.expire_at.is_none() {
+                if entry.expire_at().is_none() {
                     self.num_expires += 1;
                 }
-                entry.expire_at = Some(target_instant);
+                entry.set_expire_at(Some(target_instant));
                 return true;
             }
         }
@@ -3764,9 +3842,9 @@ impl RudisTable {
                 return false;
             }
             if let Some(entry) = self.table.get_slot_mut(idx)
-                && entry.expire_at.is_some()
+                && entry.expire_at().is_some()
             {
-                entry.expire_at = None;
+                entry.set_expire_at(None);
                 self.num_expires = self.num_expires.saturating_sub(1);
                 return true;
             }
@@ -3781,7 +3859,7 @@ impl RudisTable {
                 return -2;
             }
             if let Some(entry) = self.table.get_slot(idx) {
-                match entry.expire_at {
+                match entry.expire_at() {
                     Some(expire_at) => {
                         let now = Instant::now();
                         if now >= expire_at {
@@ -3813,7 +3891,7 @@ impl RudisTable {
                 return -2;
             }
             if let Some(entry) = self.table.get_slot(idx) {
-                match entry.expire_at {
+                match entry.expire_at() {
                     Some(expire_at) => {
                         let now = Instant::now();
                         if now >= expire_at {
@@ -4420,7 +4498,7 @@ impl RudisTable {
             RudisValue::Cooled { val, .. } => (**val).clone(),
             other => other.clone(),
         };
-        let expire_at = entry.expire_at;
+        let expire_at = entry.expire_at();
 
         let h_dst = hash_key(&dst);
         if let Some(dst_idx) = self.table.find(&dst, h_dst) {
@@ -4429,7 +4507,7 @@ impl RudisTable {
             } else if !replace {
                 return Ok(false);
             } else if let Some(removed) = self.table.remove(dst_idx)
-                && removed.expire_at.is_some()
+                && removed.expire_at().is_some()
             {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
@@ -4441,7 +4519,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key: dst,
             val,
-            expire_at,
+            expire_at: Expiry::from(expire_at),
         };
         self.table.insert(entry);
         Ok(true)
@@ -4470,7 +4548,7 @@ impl RudisTable {
                     RudisValue::String(old) => {
                         let prev = old.clone();
                         *old = value;
-                        if entry.expire_at.take().is_some() {
+                        if entry.take_expire_at().is_some() {
                             self.num_expires = self.num_expires.saturating_sub(1);
                         }
                         Ok(Some(prev))
@@ -4482,7 +4560,7 @@ impl RudisTable {
                         } else {
                             entry.val = RudisValue::String(value);
                         }
-                        if entry.expire_at.take().is_some() {
+                        if entry.take_expire_at().is_some() {
                             self.num_expires = self.num_expires.saturating_sub(1);
                         }
                         Ok(Some(prev))
@@ -4704,7 +4782,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key,
             val: RudisValue::String(Bytes::from(bytes)),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
         Ok(len)
@@ -4745,7 +4823,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key,
             val: RudisValue::String(Bytes::from(delta.to_string())),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
         Ok(delta)
@@ -4776,7 +4854,7 @@ impl RudisTable {
             } else if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &entry.val {
                     RudisValue::String(_) | RudisValue::Int(_) | RudisValue::HyperLogLog(_) => {
-                        (true, entry.expire_at, Some(idx))
+                        (true, entry.expire_at(), Some(idx))
                     }
                     _ => {
                         return Err(
@@ -4977,12 +5055,12 @@ impl RudisTable {
                 if let Some(idx) = existing_slot {
                     let entry = self.table.get_slot_mut(idx).unwrap();
                     entry.val = RudisValue::Int(val);
-                    entry.expire_at = new_expire_at;
+                    entry.set_expire_at(new_expire_at);
                 } else {
                     self.table.insert(RudisEntry {
                         key: key.clone(),
                         val: RudisValue::Int(val),
-                        expire_at: new_expire_at,
+                        expire_at: Expiry::from(new_expire_at),
                     });
                 }
                 // Keep `num_expires` in step: it gates lazy and active expiry.
@@ -5221,12 +5299,12 @@ impl RudisTable {
                 if let Some(idx) = existing_slot {
                     let entry = self.table.get_slot_mut(idx).unwrap();
                     entry.val = RudisValue::String(Bytes::from(val_str.clone()));
-                    entry.expire_at = new_expire_at;
+                    entry.set_expire_at(new_expire_at);
                 } else {
                     self.table.insert(RudisEntry {
                         key: key.clone(),
                         val: RudisValue::String(Bytes::from(val_str.clone())),
-                        expire_at: new_expire_at,
+                        expire_at: Expiry::from(new_expire_at),
                     });
                 }
                 // Keep `num_expires` in step: it gates lazy and active expiry.
@@ -5320,7 +5398,7 @@ impl RudisTable {
             crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
         if let Some((idx, entry)) = self.table.find_entry_mut(key.as_ref(), h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -5390,7 +5468,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key: key.clone(),
             val,
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(1)
@@ -5430,7 +5508,7 @@ impl RudisTable {
         }
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -5564,7 +5642,7 @@ impl RudisTable {
                 .cloned()
                 .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val,
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(added)
@@ -5631,7 +5709,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key,
             val,
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
         Ok(1)
@@ -6317,7 +6395,7 @@ impl RudisTable {
         if let Some(idx) = self.table.find(key, h)
             && let Some(entry) = self.table.get_slot(idx)
         {
-            if let Some(expire_at) = entry.expire_at
+            if let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -6365,7 +6443,7 @@ impl RudisTable {
         }
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -6424,7 +6502,7 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -6895,7 +6973,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key,
             val: RudisValue::SmallHash(vec![(field, val_bytes)]),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
         Ok(delta)
@@ -6982,7 +7060,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key,
             val: RudisValue::SmallHash(vec![(field, val_bytes)]),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
         Ok(delta)
@@ -7152,7 +7230,7 @@ impl RudisTable {
     ) -> Result<usize, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -7198,7 +7276,7 @@ impl RudisTable {
                 .cloned()
                 .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val: RudisValue::List(deque),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(len)
@@ -7234,7 +7312,7 @@ impl RudisTable {
     ) -> Result<usize, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -7280,7 +7358,7 @@ impl RudisTable {
                 .cloned()
                 .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val: RudisValue::List(deque),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(len)
@@ -7361,7 +7439,7 @@ impl RudisTable {
     ) -> Result<bool, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -7386,7 +7464,7 @@ impl RudisTable {
                         let val = deque.pop_front().unwrap();
                         crate::connection::write_resp_bulk(out, &val);
                         let entry = self.table.remove_present(idx);
-                        if self.num_expires > 0 && entry.expire_at.is_some() {
+                        if self.num_expires > 0 && entry.expire_at().is_some() {
                             self.num_expires = self.num_expires.saturating_sub(1);
                         }
                         self.recycle_value(entry.val);
@@ -7418,7 +7496,7 @@ impl RudisTable {
 
             if is_empty {
                 let entry = self.table.remove_present(idx);
-                if self.num_expires > 0 && entry.expire_at.is_some() {
+                if self.num_expires > 0 && entry.expire_at().is_some() {
                     self.num_expires = self.num_expires.saturating_sub(1);
                 }
                 self.recycle_value(entry.val);
@@ -7455,7 +7533,7 @@ impl RudisTable {
     ) -> Result<bool, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -7480,7 +7558,7 @@ impl RudisTable {
                         let val = deque.pop_back().unwrap();
                         crate::connection::write_resp_bulk(out, &val);
                         let entry = self.table.remove_present(idx);
-                        if self.num_expires > 0 && entry.expire_at.is_some() {
+                        if self.num_expires > 0 && entry.expire_at().is_some() {
                             self.num_expires = self.num_expires.saturating_sub(1);
                         }
                         self.recycle_value(entry.val);
@@ -7512,7 +7590,7 @@ impl RudisTable {
 
             if is_empty {
                 let entry = self.table.remove_present(idx);
-                if self.num_expires > 0 && entry.expire_at.is_some() {
+                if self.num_expires > 0 && entry.expire_at().is_some() {
                     self.num_expires = self.num_expires.saturating_sub(1);
                 }
                 self.recycle_value(entry.val);
@@ -7553,7 +7631,7 @@ impl RudisTable {
     ) -> Result<Option<Bytes>, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -7570,7 +7648,7 @@ impl RudisTable {
                     if deque.len() == 1 {
                         let val = deque.pop_front();
                         let entry = self.table.remove_present(idx);
-                        if self.num_expires > 0 && entry.expire_at.is_some() {
+                        if self.num_expires > 0 && entry.expire_at().is_some() {
                             self.num_expires = self.num_expires.saturating_sub(1);
                         }
                         self.recycle_value(entry.val);
@@ -7589,7 +7667,7 @@ impl RudisTable {
 
             if is_empty {
                 let entry = self.table.remove_present(idx);
-                if self.num_expires > 0 && entry.expire_at.is_some() {
+                if self.num_expires > 0 && entry.expire_at().is_some() {
                     self.num_expires = self.num_expires.saturating_sub(1);
                 }
                 self.recycle_value(entry.val);
@@ -7614,7 +7692,7 @@ impl RudisTable {
     ) -> Result<Option<Bytes>, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -7631,7 +7709,7 @@ impl RudisTable {
                     if deque.len() == 1 {
                         let val = deque.pop_back();
                         let entry = self.table.remove_present(idx);
-                        if self.num_expires > 0 && entry.expire_at.is_some() {
+                        if self.num_expires > 0 && entry.expire_at().is_some() {
                             self.num_expires = self.num_expires.saturating_sub(1);
                         }
                         self.recycle_value(entry.val);
@@ -7650,7 +7728,7 @@ impl RudisTable {
 
             if is_empty {
                 let entry = self.table.remove_present(idx);
-                if self.num_expires > 0 && entry.expire_at.is_some() {
+                if self.num_expires > 0 && entry.expire_at().is_some() {
                     self.num_expires = self.num_expires.saturating_sub(1);
                 }
                 self.recycle_value(entry.val);
@@ -7844,7 +7922,7 @@ impl RudisTable {
         crate::server_stats::note_key_lookup(self.key_is_live(key));
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -7905,7 +7983,7 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -8284,7 +8362,7 @@ impl RudisTable {
         self.table.insert(RudisEntry {
             key: destination,
             val: RudisValue::List(deque),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         });
         Ok(Some(val))
     }
@@ -8458,7 +8536,7 @@ impl RudisTable {
         self.table.insert(RudisEntry {
             key: destination,
             val: RudisValue::List(deque),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         });
         Ok(Some(vals))
     }
@@ -8493,7 +8571,7 @@ impl RudisTable {
     ) -> Result<usize, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key.as_ref(), h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -8560,7 +8638,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key: key.clone(),
             val: RudisValue::Set(Box::new(RudisSet::Small(v))),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.data_bytes += key.len() + 32 + 64;
         self.table.insert_prepared(entry, h, insert_idx);
@@ -8582,7 +8660,7 @@ impl RudisTable {
     ) -> Result<usize, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -8665,7 +8743,7 @@ impl RudisTable {
                 .cloned()
                 .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val: RudisValue::Set(Box::new(set)),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.data_bytes += key.len() + added * 32 + 64;
         self.table.insert_prepared(entry, h, insert_idx);
@@ -8742,7 +8820,7 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -8781,7 +8859,7 @@ impl RudisTable {
     ) -> Result<crate::shard::CompactResp, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -8818,7 +8896,7 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -9408,7 +9486,7 @@ impl RudisTable {
             self.table.insert(RudisEntry {
                 key: destination,
                 val: RudisValue::Set(Box::new(new_set)),
-                expire_at: None,
+                expire_at: Expiry::from(None),
             });
             true
         };
@@ -9508,7 +9586,7 @@ impl RudisTable {
             let entry = RudisEntry {
                 key: dest,
                 val: RudisValue::ZSet(Box::new(zset)),
-                expire_at: None,
+                expire_at: Expiry::from(None),
             };
             self.table.insert(entry);
         }
@@ -9533,7 +9611,7 @@ impl RudisTable {
             let entry = RudisEntry {
                 key: dest,
                 val: RudisValue::ZSet(Box::new(zset)),
-                expire_at: None,
+                expire_at: Expiry::from(None),
             };
             self.table.insert(entry);
         }
@@ -9552,7 +9630,7 @@ impl RudisTable {
             let entry = RudisEntry {
                 key: dest,
                 val: RudisValue::ZSet(Box::new(zset)),
-                expire_at: None,
+                expire_at: Expiry::from(None),
             };
             self.table.insert(entry);
         }
@@ -9910,7 +9988,7 @@ impl RudisTable {
             if let Some(entry) = opt
                 && crate::router::key_slot(&entry.key) == slot
             {
-                if let Some(exp) = entry.expire_at
+                if let Some(exp) = entry.expire_at()
                     && now >= exp
                 {
                     expired_indices.push(idx);
@@ -9921,7 +9999,7 @@ impl RudisTable {
         }
         for idx in expired_indices {
             if let Some(removed) = self.table.remove(idx)
-                && removed.expire_at.is_some()
+                && removed.expire_at().is_some()
             {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
@@ -9944,7 +10022,7 @@ impl RudisTable {
             if let Some(entry) = opt
                 && crate::router::key_slot(&entry.key) == slot
             {
-                if let (Some(now_inst), Some(exp)) = (now, entry.expire_at)
+                if let (Some(now_inst), Some(exp)) = (now, entry.expire_at())
                     && now_inst >= exp
                 {
                     expired_indices.push(idx);
@@ -9958,7 +10036,7 @@ impl RudisTable {
         }
         for idx in expired_indices {
             if let Some(removed) = self.table.remove(idx)
-                && removed.expire_at.is_some()
+                && removed.expire_at().is_some()
             {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
@@ -9982,7 +10060,7 @@ impl RudisTable {
         let count = to_remove.len();
         for idx in to_remove {
             if let Some(removed) = self.table.remove(idx)
-                && removed.expire_at.is_some()
+                && removed.expire_at().is_some()
             {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
@@ -10037,7 +10115,7 @@ impl RudisTable {
     ) -> Result<(usize, Option<f64>), &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -10140,7 +10218,7 @@ impl RudisTable {
                 .cloned()
                 .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val: RudisValue::ZSet(Box::new(zset)),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert_prepared(entry, h, insert_idx);
         Ok((added_count, new_score_incr))
@@ -10294,7 +10372,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key,
             val: RudisValue::ZSet(Box::new(zset)),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
         Ok(delta)
@@ -10336,7 +10414,7 @@ impl RudisTable {
         if !opts.by_score && !opts.by_lex {
             if let Some((idx, entry)) = self.table.find_entry(key, h) {
                 if self.num_expires > 0
-                    && let Some(expire_at) = entry.expire_at
+                    && let Some(expire_at) = entry.expire_at()
                     && !crate::connection::ALLOW_ACCESS_EXPIRED
                         .load(std::sync::atomic::Ordering::Relaxed)
                     && Instant::now() >= expire_at
@@ -10470,7 +10548,7 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+                && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -10646,7 +10724,7 @@ impl RudisTable {
         self.table.insert(RudisEntry {
             key: Bytes::copy_from_slice(dst),
             val: RudisValue::ZSet(Box::new(zset)),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         });
         Ok(count)
     }
@@ -11074,7 +11152,7 @@ impl RudisTable {
             self.sample_cursor = (self.sample_cursor + 1) % bound;
             let idx = self.table.cursor_to_global_idx(cur);
             if let Some(entry) = self.table.get_slot(idx)
-                && entry.expire_at.is_some()
+                && entry.expire_at().is_some()
             {
                 if self.check_expired_slot(idx) {
                     expired_count += 1;
@@ -11176,7 +11254,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key,
             val: RudisValue::String(Bytes::from(vec)),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
         self.data_bytes += added_mem;
@@ -11601,7 +11679,7 @@ impl RudisTable {
                 let entry = RudisEntry {
                     key,
                     val: RudisValue::String(Bytes::from(current_vec)),
-                    expire_at: None,
+                    expire_at: Expiry::from(None),
                 };
                 self.table.insert(entry);
             }
@@ -12341,7 +12419,7 @@ impl RudisTable {
                 let entry = RudisEntry {
                     key,
                     val: RudisValue::Stream(Box::new(stream)),
-                    expire_at: None,
+                    expire_at: Expiry::from(None),
                 };
                 self.table.insert(entry);
                 return Ok(StreamAddResult::Added(final_id));
@@ -12401,7 +12479,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key,
             val: RudisValue::Stream(Box::new(stream)),
-            expire_at: None,
+            expire_at: Expiry::from(None),
         };
         self.table.insert(entry);
         Ok(StreamAddResult::Added(final_id))
@@ -14003,7 +14081,7 @@ impl RudisTable {
         let entry = RudisEntry {
             key,
             val: decoded_value,
-            expire_at,
+            expire_at: Expiry::from(expire_at),
         };
         self.table.insert(entry);
         Ok(())
@@ -14024,7 +14102,7 @@ impl RudisTable {
                     continue;
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
-                    if let Some(exp) = entry.expire_at {
+                    if let Some(exp) = entry.expire_at() {
                         if exp <= now {
                             continue;
                         }
@@ -14152,7 +14230,7 @@ impl RudisTable {
             self.table.insert(RudisEntry {
                 key,
                 val,
-                expire_at,
+                expire_at: Expiry::from(expire_at),
             });
         }
         Ok(())
@@ -14179,7 +14257,7 @@ impl RudisTable {
             let entry = RudisEntry {
                 key: key.clone(),
                 val: RudisValue::Stream(Box::new(stream)),
-                expire_at: None,
+                expire_at: Expiry::from(None),
             };
             self.table.insert(entry);
         }
@@ -15776,7 +15854,7 @@ pub fn load_rdb_bytes(
             db.table.table.insert(RudisEntry {
                 key,
                 val,
-                expire_at,
+                expire_at: Expiry::from(expire_at),
             });
             count += 1;
         }
@@ -15812,6 +15890,48 @@ mod tests {
         let crc = crc64(&v);
         v.extend_from_slice(&crc.to_le_bytes());
         v
+    }
+
+    #[test]
+    fn test_expiry_roundtrip_and_ordering() {
+        assert_eq!(std::mem::size_of::<Expiry>(), 8);
+        assert!(Expiry::NONE.is_none());
+        assert_eq!(Expiry::from(None).get(), None);
+        assert_eq!(Expiry::default(), Expiry::NONE);
+
+        let now = Instant::now();
+        // Exact round trip (nanosecond resolution) for past, present, future.
+        for at in [
+            now,
+            now - Duration::from_secs(5),
+            now + Duration::from_millis(1),
+            now + Duration::from_secs(86_400 * 365 * 10),
+        ] {
+            let e = Expiry::from(at);
+            assert!(e.is_some());
+            assert_eq!(e.get(), Some(at));
+        }
+
+        // Ordering is preserved.
+        let a = Expiry::from(now).get().unwrap();
+        let b = Expiry::from(now + Duration::from_nanos(1)).get().unwrap();
+        assert!(a < b);
+
+        // Far in the past clamps to the base: still Some, still expired.
+        if let Some(old) = now.checked_sub(Duration::from_secs(86_400 * 30)) {
+            let e = Expiry::from(old);
+            assert!(e.is_some());
+            let got = e.get().unwrap();
+            assert!(got >= old && got <= now);
+        }
+
+        // Far future (~1170y, past u64 nanos) saturates instead of wrapping
+        // to "no expiry".
+        if let Some(far) = now.checked_add(Duration::from_secs(u64::MAX / 500_000_000)) {
+            let e = Expiry::from(far);
+            assert!(e.is_some());
+            assert!(e.get().unwrap() > now + Duration::from_secs(86_400 * 365 * 100));
+        }
     }
 
     fn assert_seg_heap_bytes_consistent(t: &RudisFlatTable) {
@@ -16179,8 +16299,8 @@ mod tests {
             std::mem::size_of::<Option<RudisEntry>>()
         );
         assert_eq!(std::mem::size_of::<RudisValue>(), 40);
-        assert_eq!(std::mem::size_of::<RudisEntry>(), 88);
-        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 88);
+        assert_eq!(std::mem::size_of::<RudisEntry>(), 80);
+        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 80);
     }
 
     #[test]
@@ -16589,7 +16709,7 @@ mod tests {
             let entry = RudisEntry {
                 key,
                 val: RudisValue::String(val),
-                expire_at: None,
+                expire_at: Expiry::from(None),
             };
             table.insert(entry);
         }
@@ -18176,7 +18296,7 @@ mod tests {
             table.insert(RudisEntry {
                 key,
                 val,
-                expire_at: None,
+                expire_at: Expiry::from(None),
             });
         }
 
@@ -18206,7 +18326,7 @@ mod tests {
             table.insert(RudisEntry {
                 key,
                 val,
-                expire_at: None,
+                expire_at: Expiry::from(None),
             });
         }
         assert_eq!(table.len(), total_inserted);

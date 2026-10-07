@@ -2792,7 +2792,7 @@ fn write_rewritten_aof(
 
     // 1. Snapshot all non-expired entries in RudisTable as canonical RESP commands
     for entry in db.table.entries() {
-        if let Some(exp) = entry.expire_at
+        if let Some(exp) = entry.expire_at()
             && exp <= now
         {
             continue;
@@ -2818,7 +2818,7 @@ fn write_rewritten_aof(
         };
         match val_ref {
             crate::table::RudisValue::String(val) => {
-                if let Some(exp) = entry.expire_at {
+                if let Some(exp) = entry.expire_at() {
                     let rem_ms_str = unix_ms_after(exp.saturating_duration_since(now)).to_string();
                     writer.write_all(b"*5\r\n$3\r\nSET\r\n$")?;
                     writer.write_all(k.len().to_string().as_bytes())?;
@@ -3087,7 +3087,7 @@ fn write_rewritten_aof(
         }
 
         if !matches!(val_ref, crate::table::RudisValue::String(_))
-            && let Some(exp) = entry.expire_at
+            && let Some(exp) = entry.expire_at()
         {
             let rem_ms_str = unix_ms_after(exp.saturating_duration_since(now)).to_string();
             writer.write_all(b"*3\r\n$9\r\nPEXPIREAT\r\n$")?;
@@ -3850,7 +3850,7 @@ mod tests {
         assert!(
             db.table
                 .entries()
-                .any(|e| e.key == key && e.expire_at.is_some())
+                .any(|e| e.key == key && e.expire_at().is_some())
         );
 
         let _ = std::fs::remove_dir_all(&dir);
