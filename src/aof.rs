@@ -2800,7 +2800,7 @@ fn write_rewritten_aof(
         let k = entry.key.as_ref();
         let hydrated_val;
         let val_ref = match &entry.val {
-            crate::table::RudisValue::Cooled { val, .. } => val.as_ref(),
+            crate::table::RudisValue::Cooled(cv) => &cv.val,
             crate::table::RudisValue::Tiered(ptr) => match db.hydrate_tiered(**ptr) {
                 Some(v) => {
                     hydrated_val = v;
@@ -2827,7 +2827,7 @@ fn write_rewritten_aof(
                     writer.write_all(b"\r\n$")?;
                     writer.write_all(val.len().to_string().as_bytes())?;
                     writer.write_all(b"\r\n")?;
-                    writer.write_all(val.as_ref())?;
+                    writer.write_all(&val.view())?;
                     writer.write_all(b"\r\n$4\r\nPXAT\r\n$")?;
                     writer.write_all(rem_ms_str.len().to_string().as_bytes())?;
                     writer.write_all(b"\r\n")?;
@@ -2841,7 +2841,7 @@ fn write_rewritten_aof(
                     writer.write_all(b"\r\n$")?;
                     writer.write_all(val.len().to_string().as_bytes())?;
                     writer.write_all(b"\r\n")?;
-                    writer.write_all(val.as_ref())?;
+                    writer.write_all(&val.view())?;
                     writer.write_all(b"\r\n")?;
                 }
                 count += 1;

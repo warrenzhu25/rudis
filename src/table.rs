@@ -1422,16 +1422,20 @@ pub enum RudisValue {
     HyperLogLog(Box<[u8; 16384]>),
     Stream(Box<RudisStream>),
     // Boxed so every variant fits beside `CompactStr`'s tag and the enum
-    // stays 24 bytes; tiered/cooled values are cold, so the extra
+    // stays 16 bytes; tiered/cooled values are cold, so the extra
     // allocation is off the hot path.
     Tiered(Box<TieredPointer>),
-    Cooled {
-        ptr: Box<TieredPointer>,
-        val: Box<RudisValue>,
-    },
+    Cooled(Box<CooledValue>),
 }
 
-const _: () = assert!(std::mem::size_of::<RudisValue>() == 24);
+/// A value kept in memory that also has a copy on disk at `ptr`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CooledValue {
+    pub ptr: TieredPointer,
+    pub val: RudisValue,
+}
+
+const _: () = assert!(std::mem::size_of::<RudisValue>() == 16);
 
 impl RudisValue {
     /// A string value (possibly cooled) that should be promoted to a shared
@@ -1440,8 +1444,8 @@ impl RudisValue {
     pub fn string_needs_share(&self) -> bool {
         match self {
             RudisValue::String(s) => s.needs_share(),
-            RudisValue::Cooled { val, .. } => {
-                matches!(&**val, RudisValue::String(s) if s.needs_share())
+            RudisValue::Cooled(cv) => {
+                matches!(&cv.val, RudisValue::String(s) if s.needs_share())
             }
             _ => false,
         }
@@ -1451,8 +1455,8 @@ impl RudisValue {
     pub fn share_string(&mut self) {
         match self {
             RudisValue::String(s) => s.make_shared(),
-            RudisValue::Cooled { val, .. } => {
-                if let RudisValue::String(s) = &mut **val {
+            RudisValue::Cooled(cv) => {
+                if let RudisValue::String(s) = &mut cv.val {
                     s.make_shared();
                 }
             }
@@ -1466,9 +1470,9 @@ impl RudisValue {
     /// and spill thresholds), inline strings and ints cost no heap here.
     pub fn mem_bytes(&self) -> usize {
         match self {
-            RudisValue::String(b) => heap_len(b.len()),
+            RudisValue::String(b) => b.heap_bytes(),
             RudisValue::Int(_) => 0,
-            RudisValue::Cooled { val, .. } => 24 + val.mem_bytes(),
+            RudisValue::Cooled(cv) => 24 + cv.val.mem_bytes(),
             other => other.approx_bytes(),
         }
     }
@@ -1485,7 +1489,7 @@ impl RudisValue {
             RudisValue::HyperLogLog(_) => 16384,
             RudisValue::Stream(s) => s.len() * 64,
             RudisValue::Tiered(_) => 24,
-            RudisValue::Cooled { val, .. } => 24 + val.approx_bytes(),
+            RudisValue::Cooled(cv) => 24 + cv.val.approx_bytes(),
         }
     }
 
@@ -1510,7 +1514,7 @@ impl RudisValue {
                 6 => "stream",
                 _ => "raw",
             },
-            RudisValue::Cooled { val, .. } => val.encoding_str(),
+            RudisValue::Cooled(cv) => cv.val.encoding_str(),
         }
     }
 }
@@ -1625,7 +1629,7 @@ pub struct RudisEntry {
     pub val: RudisValue,
 }
 
-const _: () = assert!(std::mem::size_of::<RudisEntry>() == 48);
+const _: () = assert!(std::mem::size_of::<RudisEntry>() == 40);
 
 impl RudisEntry {
     #[inline(always)]
@@ -1658,13 +1662,16 @@ impl RudisEntry {
     /// in-memory [`RudisValue`] in place and returns its stale on-disk pointer.
     #[inline(always)]
     pub fn uncool(&mut self) -> Option<TieredPointer> {
-        if matches!(self.val, RudisValue::Cooled { .. }) {
+        if matches!(self.val, RudisValue::Cooled(_)) {
             let (p, v) = match std::mem::replace(&mut self.val, RudisValue::Int(0)) {
-                RudisValue::Cooled { ptr, val } => (ptr, *val),
+                RudisValue::Cooled(cv) => {
+                    let CooledValue { ptr, val } = *cv;
+                    (ptr, val)
+                }
                 _ => unreachable!(),
             };
             self.val = v;
-            Some(*p)
+            Some(p)
         } else {
             None
         }
@@ -3478,7 +3485,7 @@ impl RudisTable {
             match &mut entry.val {
                 RudisValue::String(b) => {
                     if !b.is_empty() {
-                        let fresh = CompactStr::new(b);
+                        let fresh = CompactStr::new(&b.view());
                         *b = fresh;
                     }
                 }
@@ -3520,7 +3527,7 @@ impl RudisTable {
         if let Some(removed) = self.table.remove(slot_idx) {
             match &removed.val {
                 RudisValue::Tiered(ptr) => self.dropped_tier.push((**ptr, false)),
-                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((**ptr, true)),
+                RudisValue::Cooled(cv) => self.dropped_tier.push((cv.ptr, true)),
                 _ => {}
             }
             if removed.expire_at().is_some() {
@@ -3636,7 +3643,7 @@ impl RudisTable {
         {
             match &removed.val {
                 RudisValue::Tiered(ptr) => self.dropped_tier.push((**ptr, false)),
-                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((**ptr, true)),
+                RudisValue::Cooled(cv) => self.dropped_tier.push((cv.ptr, true)),
                 _ => {}
             }
             if removed.expire_at().is_some() {
@@ -3719,7 +3726,7 @@ impl RudisTable {
                 entry
             };
             let val_ref = match &entry.val {
-                RudisValue::Cooled { val, .. } => val.as_ref(),
+                RudisValue::Cooled(cv) => &cv.val,
                 other => other,
             };
             let res = match val_ref {
@@ -3777,7 +3784,7 @@ impl RudisTable {
                 entry
             };
             let val_ref = match &entry.val {
-                RudisValue::Cooled { val, .. } => val.as_ref(),
+                RudisValue::Cooled(cv) => &cv.val,
                 other => other,
             };
             let res = match val_ref {
@@ -3817,12 +3824,12 @@ impl RudisTable {
             }
             crate::server_stats::note_key_lookup(true);
             let val_ref = match &entry.val {
-                RudisValue::Cooled { val, .. } => val.as_ref(),
+                RudisValue::Cooled(cv) => &cv.val,
                 other => other,
             };
             let res = match val_ref {
                 RudisValue::String(b) => {
-                    crate::connection::write_resp_bulk(out, b);
+                    crate::connection::write_resp_bulk(out, &b.view());
                     Ok(true)
                 }
                 RudisValue::Int(n) => {
@@ -3862,7 +3869,7 @@ impl RudisTable {
                     }
                 });
                 let val = match &entry.val {
-                    RudisValue::Cooled { val, .. } => (**val).clone(),
+                    RudisValue::Cooled(cv) => cv.val.clone(),
                     other => other.clone(),
                 };
                 return Some((val, ttl));
@@ -4010,7 +4017,7 @@ impl RudisTable {
             let old_bytes = entry.val.mem_bytes();
             let old_tiered = match &entry.val {
                 RudisValue::Tiered(ptr) => Some((**ptr, false)),
-                RudisValue::Cooled { ptr, .. } => Some((**ptr, true)),
+                RudisValue::Cooled(cv) => Some((cv.ptr, true)),
                 _ => None,
             };
             entry.val = val;
@@ -4071,7 +4078,7 @@ impl RudisTable {
                 let entry = self.table.remove_present(idx);
                 match entry.val {
                     RudisValue::Tiered(ptr) => self.dropped_tier.push((*ptr, false)),
-                    RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((*ptr, true)),
+                    RudisValue::Cooled(cv) => self.dropped_tier.push((cv.ptr, true)),
                     RudisValue::String(_) | RudisValue::Int(_) => {}
                     other => self.recycle_value(other),
                 }
@@ -4097,7 +4104,7 @@ impl RudisTable {
             }
             match entry.val {
                 RudisValue::Tiered(ptr) => self.dropped_tier.push((*ptr, false)),
-                RudisValue::Cooled { ptr, .. } => self.dropped_tier.push((*ptr, true)),
+                RudisValue::Cooled(cv) => self.dropped_tier.push((cv.ptr, true)),
                 RudisValue::String(_) | RudisValue::Int(_) => {}
                 other => self.recycle_value(other),
             }
@@ -4182,7 +4189,7 @@ impl RudisTable {
                         return Ok(nv);
                     }
                     RudisValue::String(b) => {
-                        let current = Self::parse_i64_bytes(b)
+                        let current = Self::parse_i64_bytes(&b.view())
                             .ok_or("value is not an integer or out of range")?;
                         let nv = current
                             .checked_add(delta)
@@ -4424,7 +4431,7 @@ impl RudisTable {
                                     6 => "stream",
                                     _ => "none",
                                 },
-                                RudisValue::Cooled { val, .. } => match &**val {
+                                RudisValue::Cooled(cv) => match &cv.val {
                                     RudisValue::String(_) | RudisValue::Int(_) => "string",
                                     RudisValue::Hash(_) | RudisValue::SmallHash(_) => "hash",
                                     RudisValue::List(_) => "list",
@@ -4490,7 +4497,7 @@ impl RudisTable {
                                 6 => "stream",
                                 _ => "none",
                             },
-                            RudisValue::Cooled { val, .. } => match &**val {
+                            RudisValue::Cooled(cv) => match &cv.val {
                                 RudisValue::String(_) | RudisValue::Int(_) => "string",
                                 RudisValue::Hash(_) | RudisValue::SmallHash(_) => "hash",
                                 RudisValue::List(_) => "list",
@@ -4565,7 +4572,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 let val_ref = match &entry.val {
-                    RudisValue::Cooled { val, .. } => val.as_ref(),
+                    RudisValue::Cooled(cv) => &cv.val,
                     other => other,
                 };
                 match val_ref {
@@ -4586,7 +4593,7 @@ impl RudisTable {
                         6 => "stream",
                         _ => "string",
                     },
-                    RudisValue::Cooled { .. } => unreachable!(),
+                    RudisValue::Cooled(_) => unreachable!(),
                 }
             } else {
                 "none"
@@ -4619,7 +4626,7 @@ impl RudisTable {
             Some(idx)
                 if matches!(
                     self.table.get_slot(idx).map(|e| &e.val),
-                    Some(RudisValue::Cooled { .. })
+                    Some(RudisValue::Cooled(_))
                 ) =>
             {
                 self.warm_slot(idx);
@@ -4637,8 +4644,8 @@ impl RudisTable {
             return None;
         }
         let entry = self.table.get_slot(idx)?;
-        if let RudisValue::Cooled { ptr, .. } = &entry.val {
-            Some(**ptr)
+        if let RudisValue::Cooled(cv) = &entry.val {
+            Some(cv.ptr)
         } else {
             None
         }
@@ -4687,13 +4694,10 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h)
             && let Some(entry) = self.table.get_slot_mut(idx)
-            && !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. })
+            && !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled(_))
         {
             let old_val = std::mem::replace(&mut entry.val, RudisValue::Tiered(Box::new(ptr)));
-            entry.val = RudisValue::Cooled {
-                ptr: Box::new(ptr),
-                val: Box::new(old_val),
-            };
+            entry.val = RudisValue::Cooled(Box::new(CooledValue { ptr, val: old_val }));
             self.data_bytes += 24;
             return true;
         }
@@ -4708,10 +4712,7 @@ impl RudisTable {
             && let RudisValue::Tiered(ptr) = &entry.val
         {
             let val_bytes = val.mem_bytes();
-            entry.val = RudisValue::Cooled {
-                ptr: ptr.clone(),
-                val: Box::new(val),
-            };
+            entry.val = RudisValue::Cooled(Box::new(CooledValue { ptr: **ptr, val }));
             self.data_bytes += val_bytes;
             return true;
         }
@@ -4723,8 +4724,9 @@ impl RudisTable {
         let h = hash_key(key);
         let idx = self.table.find(key, h)?;
         let entry = self.table.get_slot_mut(idx)?;
-        if let RudisValue::Cooled { ptr, val } = &entry.val {
-            let p = **ptr;
+        if let RudisValue::Cooled(cv) = &entry.val {
+            let p = cv.ptr;
+            let val = &cv.val;
             let freed = val.approx_bytes();
             let freed_mem = val.mem_bytes();
             entry.val = RudisValue::Tiered(Box::new(p));
@@ -4739,8 +4741,9 @@ impl RudisTable {
         let mut count = 0;
         let mut total_freed = 0u64;
         for entry in self.table.entries_mut() {
-            if let RudisValue::Cooled { ptr, val } = &entry.val {
-                let p = **ptr;
+            if let RudisValue::Cooled(cv) = &entry.val {
+                let p = cv.ptr;
+                let val = &cv.val;
                 let freed = val.approx_bytes() as u64;
                 let freed_mem = val.mem_bytes();
                 entry.val = RudisValue::Tiered(Box::new(p));
@@ -4765,7 +4768,7 @@ impl RudisTable {
         for _ in 0..total_slots.min(limit.saturating_mul(64).max(4096)) {
             let idx = self.table.cursor_to_global_idx(cur);
             if let Some(entry) = self.table.get_slot(idx)
-                && !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. })
+                && !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled(_))
                 // Spilling a value smaller than this grows memory: the tier
                 // pointer left behind outweighs it.
                 && entry.val.approx_bytes() >= MIN_SPILL_VALUE_BYTES
@@ -4791,7 +4794,7 @@ impl RudisTable {
         }
         let entry = self.table.get_slot(idx)?;
         let val_ref = match &entry.val {
-            RudisValue::Tiered(_) | RudisValue::Cooled { .. } => return None,
+            RudisValue::Tiered(_) | RudisValue::Cooled(_) => return None,
             other => other,
         };
         let mut payload = Vec::new();
@@ -4927,7 +4930,7 @@ impl RudisTable {
                 Some(v) => v,
                 None => return Ok(false),
             },
-            RudisValue::Cooled { val, .. } => (**val).clone(),
+            RudisValue::Cooled(cv) => cv.val.clone(),
             other => other.clone(),
         };
         let expire_at = entry.expire_at();
@@ -5043,7 +5046,7 @@ impl RudisTable {
                 match &mut entry.val {
                     RudisValue::String(s) => {
                         let mut combined = Vec::with_capacity(s.len() + val_to_append.len());
-                        combined.extend_from_slice(s);
+                        combined.extend_from_slice(&s.view());
                         combined.extend_from_slice(val_to_append);
                         let len = combined.len();
                         *s = CompactStr::from(combined);
@@ -5143,8 +5146,12 @@ impl RudisTable {
                 return Ok(Bytes::new());
             }
             if let Some(entry) = self.table.get_slot(idx) {
+                let sv;
                 let slice = match &entry.val {
-                    RudisValue::String(s) => s.as_ref(),
+                    RudisValue::String(s) => {
+                        sv = s.view();
+                        &*sv
+                    }
                     RudisValue::Int(n) => {
                         let formatted = Self::format_i64(*n);
                         return Self::slice_range(&formatted, start, end);
@@ -5225,8 +5232,9 @@ impl RudisTable {
         {
             let curr: f64 = match &entry.val {
                 RudisValue::String(s) => {
+                    let sv = s.view();
                     let str_val =
-                        std::str::from_utf8(s).map_err(|_| "ERR value is not a valid float")?;
+                        std::str::from_utf8(&sv).map_err(|_| "ERR value is not a valid float")?;
                     str_val
                         .parse::<f64>()
                         .map_err(|_| "ERR value is not a valid float")?
@@ -5304,7 +5312,8 @@ impl RudisTable {
                     match &entry.val {
                         RudisValue::Int(n) => *n,
                         RudisValue::String(s) => {
-                            let str_val = std::str::from_utf8(s)
+                            let sv = s.view();
+                            let str_val = std::str::from_utf8(&sv)
                                 .map_err(|_| "ERR value is not an integer or out of range")?;
                             str_val
                                 .parse::<i64>()
@@ -5551,7 +5560,8 @@ impl RudisTable {
                     match &entry.val {
                         RudisValue::Int(n) => *n as f64,
                         RudisValue::String(s) => {
-                            let str_val = std::str::from_utf8(s)
+                            let sv = s.view();
+                            let str_val = std::str::from_utf8(&sv)
                                 .map_err(|_| "ERR value is not a valid float")?;
                             if str_val.eq_ignore_ascii_case("inf")
                                 || str_val.eq_ignore_ascii_case("+inf")
@@ -7286,7 +7296,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 return match &entry.val {
                     RudisValue::String(s) => {
-                        if std::str::from_utf8(s)
+                        if std::str::from_utf8(&s.view())
                             .ok()
                             .and_then(|t| t.parse::<i64>().ok())
                             .is_some()
@@ -11602,13 +11612,13 @@ impl RudisTable {
                 if let Some(entry) = self.table.get_slot_mut(idx) {
                     match &mut entry.val {
                         RudisValue::String(b) => {
-                            let old_len = b.len();
+                            // Packing depends on content, so a flipped bit
+                            // can move the value between inline and heap.
+                            let old_heap = b.heap_bytes();
                             let mut vec = b.to_vec();
                             let grew = vec.len() <= byte_idx;
                             if grew {
                                 vec.resize(byte_idx + 1, 0);
-                                self.data_bytes +=
-                                    heap_len(byte_idx + 1).saturating_sub(heap_len(old_len));
                             }
                             let old_byte = vec[byte_idx];
                             let old_bit = (old_byte >> bit_idx) & 1;
@@ -11620,6 +11630,8 @@ impl RudisTable {
                                     vec[byte_idx] &= !(1 << bit_idx);
                                 }
                                 *b = CompactStr::from(vec);
+                                self.data_bytes =
+                                    self.data_bytes.saturating_sub(old_heap) + b.heap_bytes();
                             }
                             return Ok((old_bit, changed));
                         }
@@ -11638,8 +11650,9 @@ impl RudisTable {
                                 } else {
                                     vec[byte_idx] &= !(1 << bit_idx);
                                 }
-                                self.data_bytes += heap_len(vec.len());
-                                entry.val = RudisValue::String(CompactStr::from(vec));
+                                let s = CompactStr::from(vec);
+                                self.data_bytes += s.heap_bytes();
+                                entry.val = RudisValue::String(s);
                             }
                             return Ok((old_bit, changed));
                         }
@@ -11657,10 +11670,11 @@ impl RudisTable {
         if value == 1 {
             vec[byte_idx] |= 1 << bit_idx;
         }
-        let added_mem = heap_len(key.len()) + heap_len(vec.len()) + ENTRY_OVERHEAD;
+        let val = CompactStr::from(vec);
+        let added_mem = heap_len(key.len()) + val.heap_bytes() + ENTRY_OVERHEAD;
         let entry = RudisEntry::new(
             CompactKey::new(&key),
-            RudisValue::String(CompactStr::from(vec)),
+            RudisValue::String(val),
             Expiry::from(None),
         );
         self.table.insert(entry);
@@ -11682,7 +11696,7 @@ impl RudisTable {
                             return Ok(0);
                         }
                         let bit_idx = 7 - (offset % 8);
-                        let bit = (b[byte_idx] >> bit_idx) & 1;
+                        let bit = (b.view()[byte_idx] >> bit_idx) & 1;
                         return Ok(bit);
                     }
                     RudisValue::Int(n) => {
@@ -11721,7 +11735,10 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 let bytes_cow: Option<std::borrow::Cow<[u8]>> = match &entry.val {
-                    RudisValue::String(b) => Some(std::borrow::Cow::Borrowed(b.as_ref())),
+                    RudisValue::String(b) => Some(b.as_contiguous().map_or_else(
+                        || std::borrow::Cow::Owned(b.to_vec()),
+                        std::borrow::Cow::Borrowed,
+                    )),
                     RudisValue::Int(n) => {
                         Some(std::borrow::Cow::Owned(Self::format_i64(*n).to_vec()))
                     }
@@ -11829,7 +11846,10 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 let bytes_cow: Option<std::borrow::Cow<[u8]>> = match &entry.val {
-                    RudisValue::String(b) => Some(std::borrow::Cow::Borrowed(b.as_ref())),
+                    RudisValue::String(b) => Some(b.as_contiguous().map_or_else(
+                        || std::borrow::Cow::Owned(b.to_vec()),
+                        std::borrow::Cow::Borrowed,
+                    )),
                     RudisValue::Int(n) => {
                         Some(std::borrow::Cow::Owned(Self::format_i64(*n).to_vec()))
                     }
@@ -12252,7 +12272,7 @@ impl RudisTable {
             if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::String(s) => {
-                        crate::hll::hll_validate(s)?;
+                        crate::hll::hll_validate(&s.view())?;
                         if elements.is_empty() {
                             return Ok(false);
                         }
@@ -12316,10 +12336,10 @@ impl RudisTable {
             {
                 match &mut entry.val {
                     RudisValue::String(s) => {
-                        crate::hll::hll_validate(s)?;
+                        crate::hll::hll_validate(&s.view())?;
                         let mut bytes = s.to_vec();
                         let count = crate::hll::hll_count(&mut bytes)?;
-                        if &bytes[..] != s.as_ref() {
+                        if bytes[..] != *s.view() {
                             *s = CompactStr::from(bytes);
                         }
                         Ok(count)
@@ -12341,7 +12361,7 @@ impl RudisTable {
                 {
                     match &entry.val {
                         RudisValue::String(s) => {
-                            let regs = crate::hll::hll_decode_registers(s)?;
+                            let regs = crate::hll::hll_decode_registers(&s.view())?;
                             has_hll = true;
                             for i in 0..16384 {
                                 if regs[i] > merged[i] {
@@ -12381,7 +12401,7 @@ impl RudisTable {
         {
             match &entry.val {
                 RudisValue::String(s) => {
-                    crate::hll::hll_validate(s)?;
+                    crate::hll::hll_validate(&s.view())?;
                 }
                 RudisValue::HyperLogLog(_) => {}
                 _ => {
@@ -12399,7 +12419,7 @@ impl RudisTable {
             {
                 match &entry.val {
                     RudisValue::String(s) => {
-                        crate::hll::hll_validate(s)?;
+                        crate::hll::hll_validate(&s.view())?;
                     }
                     RudisValue::HyperLogLog(_) => {}
                     _ => {
@@ -12418,7 +12438,7 @@ impl RudisTable {
         {
             match &entry.val {
                 RudisValue::String(s) => {
-                    let regs = crate::hll::hll_decode_registers(s)?;
+                    let regs = crate::hll::hll_decode_registers(&s.view())?;
                     for i in 0..16384 {
                         if regs[i] > merged[i] {
                             merged[i] = regs[i];
@@ -12443,7 +12463,7 @@ impl RudisTable {
             {
                 match &entry.val {
                     RudisValue::String(s) => {
-                        let regs = crate::hll::hll_decode_registers(s)?;
+                        let regs = crate::hll::hll_decode_registers(&s.view())?;
                         for i in 0..16384 {
                             if regs[i] > merged[i] {
                                 merged[i] = regs[i];
@@ -12474,7 +12494,7 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot(idx)
         {
             match &entry.val {
-                RudisValue::String(s) => crate::hll::hll_decode_registers(s),
+                RudisValue::String(s) => crate::hll::hll_decode_registers(&s.view()),
                 RudisValue::HyperLogLog(regs) => Ok(**regs),
                 _ => Err("WRONGTYPE Key is not a valid HyperLogLog string value."),
             }
@@ -12491,7 +12511,7 @@ impl RudisTable {
         {
             match &entry.val {
                 RudisValue::String(s) => {
-                    let enc = crate::hll::hll_validate(s)?;
+                    let enc = crate::hll::hll_validate(&s.view())?;
                     if enc == crate::hll::HLL_DENSE {
                         Ok("dense")
                     } else {
@@ -12514,16 +12534,16 @@ impl RudisTable {
         {
             match &mut entry.val {
                 RudisValue::String(s) => {
-                    let enc = crate::hll::hll_validate(s)?;
+                    let enc = crate::hll::hll_validate(&s.view())?;
                     if enc == crate::hll::HLL_DENSE {
                         Ok(false)
                     } else {
-                        let regs = crate::hll::hll_decode_registers(s)?;
+                        let regs = crate::hll::hll_decode_registers(&s.view())?;
                         let dense = crate::hll::hll_encode_dense(&regs);
                         let mut hdr = vec![0u8; crate::hll::HLL_HDR_SIZE];
                         hdr[0..4].copy_from_slice(b"HYLL");
                         hdr[4] = crate::hll::HLL_DENSE;
-                        hdr[8..16].copy_from_slice(&s[8..16]);
+                        hdr[8..16].copy_from_slice(&s.view()[8..16]);
                         hdr.extend_from_slice(&dense);
                         *s = CompactStr::from(hdr);
                         Ok(true)
@@ -13552,7 +13572,7 @@ impl RudisTable {
             RudisValue::String(b) => {
                 payload.push(0u8);
                 payload.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                payload.extend_from_slice(b);
+                payload.extend_from_slice(&b.view());
             }
             RudisValue::Int(n) => {
                 payload.push(0u8);
@@ -13705,7 +13725,7 @@ impl RudisTable {
                 }
             }
             RudisValue::Tiered(_) => {}
-            RudisValue::Cooled { val, .. } => Self::serialize_val_payload(val, payload),
+            RudisValue::Cooled(cv) => Self::serialize_val_payload(&cv.val, payload),
         }
     }
 
@@ -16990,9 +17010,9 @@ mod tests {
             "Option<RudisEntry> = {}",
             std::mem::size_of::<Option<RudisEntry>>()
         );
-        assert_eq!(std::mem::size_of::<RudisValue>(), 24);
-        assert_eq!(std::mem::size_of::<RudisEntry>(), 48);
-        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 48);
+        assert_eq!(std::mem::size_of::<RudisValue>(), 16);
+        assert_eq!(std::mem::size_of::<RudisEntry>(), 40);
+        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 40);
     }
 
     #[test]
@@ -18883,7 +18903,7 @@ mod tests {
         table.set(k.clone(), val.clone(), None);
         let is_heap = |t: &RudisTable| {
             let (_, e) = t.table.find_entry(k.as_ref(), h).unwrap();
-            matches!(&e.val, RudisValue::String(CompactStr::Heap(_)))
+            matches!(&e.val, RudisValue::String(s) if s.is_heap())
         };
         // Written as one exact-size buffer.
         assert!(is_heap(&table));

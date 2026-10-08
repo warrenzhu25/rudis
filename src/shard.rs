@@ -101,7 +101,7 @@ impl CompactResp {
     /// encoded inline, long ones share the value's allocation.
     #[inline(always)]
     pub fn from_compact_str(s: &crate::compact::CompactStr) -> Self {
-        Self::from_bulk_with(s, || s.to_bytes())
+        Self::from_bulk_with(&s.view(), || s.to_bytes())
     }
 
     #[inline(always)]
@@ -2427,8 +2427,8 @@ impl ShardDb {
         buf.extend_from_slice(&entry.key);
         match (&entry.val, tiered_payload) {
             (_, Some(raw)) => buf.extend_from_slice(&raw),
-            (crate::table::RudisValue::Cooled { val, .. }, None) => {
-                crate::table::RudisTable::serialize_val_payload(val, buf);
+            (crate::table::RudisValue::Cooled(cv), None) => {
+                crate::table::RudisTable::serialize_val_payload(&cv.val, buf);
             }
             (other, None) => crate::table::RudisTable::serialize_val_payload(other, buf),
         }
