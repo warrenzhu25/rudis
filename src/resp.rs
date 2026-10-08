@@ -2,6 +2,19 @@ use bytes::{Buf, Bytes, BytesMut};
 use smallvec::{SmallVec, smallvec};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Time left until the absolute Unix time `ts_ms` (milliseconds), measured
+/// against the current time at full precision. Subtracting a whole-ms (or
+/// whole-second) "now" instead would put the deadline up to 1 ms (1 s) late,
+/// and `PEXPIRETIME` would then not return the `PXAT`/`PEXPIREAT` value.
+pub(crate) fn until_unix_ms(ts_ms: i128) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i128;
+    let left = ts_ms.saturating_mul(1_000_000) - now;
+    Duration::from_nanos(left.clamp(0, u64::MAX as i128) as u64)
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SetSlotSubcommand {
     Migrating(String),
@@ -3035,7 +3048,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let dur = if ts <= now_unix {
                             Duration::ZERO
                         } else {
-                            Duration::from_secs((ts - now_unix) as u64)
+                            until_unix_ms(ts as i128 * 1000)
                         };
                         expire_in = Some(dur);
                         i += 2;
@@ -3055,7 +3068,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let dur = if ts_ms <= now_unix_ms {
                             Duration::ZERO
                         } else {
-                            Duration::from_millis((ts_ms - now_unix_ms) as u64)
+                            until_unix_ms(ts_ms as i128)
                         };
                         expire_in = Some(dur);
                         i += 2;
@@ -3206,7 +3219,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .unwrap_or_default()
                             .as_secs() as i64;
                         if ts > now_sec {
-                            expire_in = Some(Duration::from_secs((ts - now_sec) as u64));
+                            expire_in = Some(until_unix_ms(ts as i128 * 1000));
                         } else {
                             past_expired = true;
                         }
@@ -3230,7 +3243,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .unwrap_or_default()
                             .as_millis() as i128;
                         if ts > now_ms {
-                            expire_in = Some(Duration::from_millis((ts - now_ms) as u64));
+                            expire_in = Some(until_unix_ms(ts as i128));
                         } else {
                             past_expired = true;
                         }
@@ -3366,7 +3379,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .unwrap_or_default()
                             .as_millis();
                         let dur = if ts > now_epoch {
-                            Duration::from_millis((ts - now_epoch) as u64)
+                            until_unix_ms(ts as i128)
                         } else {
                             Duration::from_millis(1)
                         };
@@ -6049,7 +6062,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let dur = if ts <= now_unix {
                 Duration::ZERO
             } else {
-                Duration::from_secs((ts - now_unix) as u64)
+                until_unix_ms(ts as i128 * 1000)
             };
             Ok(Some(Command::Expire {
                 key: args[1].clone(),
@@ -6073,7 +6086,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let dur = if ts_ms <= now_unix_ms {
                 Duration::ZERO
             } else {
-                Duration::from_millis((ts_ms - now_unix_ms) as u64)
+                until_unix_ms(ts_ms as i128)
             };
             Ok(Some(Command::Expire {
                 key: args[1].clone(),

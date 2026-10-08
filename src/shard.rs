@@ -3091,11 +3091,11 @@ impl ShardDb {
             let (val, consumed) = crate::table::RudisTable::deserialize_val_payload(data)?;
             data = &data[consumed..];
 
-            self.table.insert_entry(crate::table::RudisEntry {
-                key: crate::compact::CompactKey::new(&key),
+            self.table.insert_entry(crate::table::RudisEntry::new(
+                crate::compact::CompactKey::new(&key),
                 val,
-                expire_at: crate::table::Expiry::from(expire_at),
-            });
+                crate::table::Expiry::from(expire_at),
+            ));
         }
         Ok(())
     }

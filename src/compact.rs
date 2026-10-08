@@ -16,10 +16,60 @@ use std::ops::Deref;
 /// 1 B tag + 1 B length + 22 B data.
 pub const INLINE_CAP: usize = 22;
 
+/// Longest key stored inline together with an expiry deadline:
+/// 1 B tag + 1 B length + 17 B data + 5 B deadline.
+pub const INLINE_TTL_CAP: usize = 17;
+
+const NANOS_PER_MS: u64 = 1_000_000;
+
+/// Packs a deadline (`table::Expiry` raw form: nanoseconds since its base,
+/// plus one) into 40 bits of milliseconds, rounded to the nearest one (at
+/// most 0.5 ms off, so PTTL never reports more than the TTL that was set).
+/// The `Expiry` base is aligned to a wall-clock millisecond, so absolute
+/// deadlines (`PXAT`/`PEXPIREAT`) land on the grid and round-trip exactly
+/// through `PEXPIRETIME`. `None` past ~34.8 years from the base; those keys
+/// use the heap form.
+#[inline(always)]
+fn pack_ttl_ms(ttl: u64) -> Option<[u8; 5]> {
+    let ns = ttl - 1;
+    let ms = ns / NANOS_PER_MS + u64::from(ns % NANOS_PER_MS >= NANOS_PER_MS / 2) + 1;
+    if ms >> 40 != 0 {
+        return None;
+    }
+    let b = ms.to_le_bytes();
+    Some([b[0], b[1], b[2], b[3], b[4]])
+}
+
+#[inline(always)]
+fn unpack_ttl_ms(b: [u8; 5]) -> u64 {
+    let ms = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], 0, 0, 0]);
+    (ms - 1) * NANOS_PER_MS + 1
+}
+
+/// A table key, optionally carrying the key's packed expiry deadline (a
+/// non-zero `u64`, see `table::Expiry`).
+///
+/// Keeping the deadline here instead of in every table entry saves 8 B per
+/// key without a TTL. Keys with a TTL pay nothing extra when they fit in
+/// [`INLINE_TTL_CAP`] (the deadline is then kept at millisecond precision,
+/// Redis's own expiry precision); longer ones store the exact deadline as an 8-byte prefix of
+/// their heap allocation, which a lookup reads anyway to compare the key.
 #[derive(Clone)]
 pub enum CompactKey {
-    Inline { len: u8, data: [u8; INLINE_CAP] },
+    Inline {
+        len: u8,
+        data: [u8; INLINE_CAP],
+    },
+    InlineTtl {
+        len: u8,
+        data: [u8; INLINE_TTL_CAP],
+        /// Deadline in milliseconds, see `pack_ttl_ms`.
+        ttl: [u8; 5],
+    },
     Heap(Box<[u8]>),
+    /// Heap key with a deadline: bytes `[..8]` are the deadline, the key
+    /// follows.
+    HeapTtl(Box<[u8]>),
 }
 
 const _: () = assert!(std::mem::size_of::<CompactKey>() == 24);
@@ -40,19 +90,78 @@ impl CompactKey {
         }
     }
 
+    /// A key carrying the packed deadline `ttl` (0 = none).
+    #[inline]
+    pub fn with_ttl(s: &[u8], ttl: u64) -> Self {
+        if ttl == 0 {
+            Self::new(s)
+        } else if s.len() <= INLINE_TTL_CAP
+            && let Some(packed) = pack_ttl_ms(ttl)
+        {
+            let mut data = [0u8; INLINE_TTL_CAP];
+            data[..s.len()].copy_from_slice(s);
+            CompactKey::InlineTtl {
+                len: s.len() as u8,
+                data,
+                ttl: packed,
+            }
+        } else {
+            let mut v = Vec::with_capacity(8 + s.len());
+            v.extend_from_slice(&ttl.to_ne_bytes());
+            v.extend_from_slice(s);
+            CompactKey::HeapTtl(v.into_boxed_slice())
+        }
+    }
+
+    /// The packed deadline, or 0 if the key has none. Inline keys return it
+    /// rounded to the nearest millisecond.
+    #[inline(always)]
+    pub fn ttl(&self) -> u64 {
+        match self {
+            CompactKey::Inline { .. } | CompactKey::Heap(_) => 0,
+            CompactKey::InlineTtl { ttl, .. } => unpack_ttl_ms(*ttl),
+            CompactKey::HeapTtl(b) => {
+                u64::from_ne_bytes(b[..8].try_into().expect("8-byte ttl prefix"))
+            }
+        }
+    }
+
+    /// Sets the packed deadline (0 clears it). Updates in place when the
+    /// representation doesn't change, otherwise re-encodes the key.
+    #[inline]
+    pub fn set_ttl(&mut self, ttl: u64) {
+        match self {
+            CompactKey::InlineTtl { ttl: t, .. }
+                if ttl != 0
+                    && let Some(packed) = pack_ttl_ms(ttl) =>
+            {
+                *t = packed
+            }
+            CompactKey::HeapTtl(b) if ttl != 0 => b[..8].copy_from_slice(&ttl.to_ne_bytes()),
+            CompactKey::Inline { .. } | CompactKey::Heap(_) if ttl == 0 => {}
+            _ => {
+                let new = Self::with_ttl(self.as_slice(), ttl);
+                *self = new;
+            }
+        }
+    }
+
     #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
         match self {
             CompactKey::Inline { len, data } => &data[..*len as usize],
             CompactKey::Heap(b) => b,
+            CompactKey::InlineTtl { len, data, .. } => &data[..*len as usize],
+            CompactKey::HeapTtl(b) => &b[8..],
         }
     }
 
     #[inline(always)]
     pub fn len(&self) -> usize {
         match self {
-            CompactKey::Inline { len, .. } => *len as usize,
+            CompactKey::Inline { len, .. } | CompactKey::InlineTtl { len, .. } => *len as usize,
             CompactKey::Heap(b) => b.len(),
+            CompactKey::HeapTtl(b) => b.len() - 8,
         }
     }
 
@@ -63,15 +172,18 @@ impl CompactKey {
 
     #[inline(always)]
     pub fn is_inline(&self) -> bool {
-        matches!(self, CompactKey::Inline { .. })
+        matches!(
+            self,
+            CompactKey::Inline { .. } | CompactKey::InlineTtl { .. }
+        )
     }
 
     /// Bytes held on the heap beyond the 24-byte struct itself.
     #[inline(always)]
     pub fn heap_bytes(&self) -> usize {
         match self {
-            CompactKey::Inline { .. } => 0,
-            CompactKey::Heap(b) => b.len(),
+            CompactKey::Inline { .. } | CompactKey::InlineTtl { .. } => 0,
+            CompactKey::Heap(b) | CompactKey::HeapTtl(b) => b.len(),
         }
     }
 
@@ -543,6 +655,51 @@ mod tests {
             assert_eq!(k, CompactKey::from(Bytes::from(s.clone())));
             assert!(k == s[..]);
         }
+    }
+
+    #[test]
+    fn compact_key_ttl_round_trips_across_representations() {
+        assert_eq!(std::mem::size_of::<CompactKey>(), 24);
+        // Raw deadlines on a millisecond boundary round-trip exactly inline.
+        let ms_exact = 3_600_000 * NANOS_PER_MS + 1;
+        for n in [0usize, 1, 13, 14, 17, 18, 22, 23, 100] {
+            let s: Vec<u8> = (0..n).map(|i| b'a' + (i % 26) as u8).collect();
+            let mut k = CompactKey::new(&s);
+            assert_eq!(k.ttl(), 0);
+            k.set_ttl(ms_exact);
+            assert_eq!(k.ttl(), ms_exact);
+            assert_eq!(k.as_slice(), &s[..]);
+            assert_eq!(k.len(), n);
+            assert_eq!(k.is_inline(), n <= INLINE_TTL_CAP);
+            assert_eq!(k.heap_bytes(), if n <= INLINE_TTL_CAP { 0 } else { n + 8 });
+            // Off-boundary deadlines round to the nearest millisecond inline,
+            // and stay exact on the heap.
+            k.set_ttl(ms_exact + 5);
+            let want = if n <= INLINE_TTL_CAP {
+                ms_exact
+            } else {
+                ms_exact + 5
+            };
+            assert_eq!(k.ttl(), want);
+            // Too far out for 40 bits of ms: falls back to the exact heap form.
+            k.set_ttl(u64::MAX);
+            assert_eq!(k.ttl(), u64::MAX);
+            assert!(!k.is_inline());
+            assert_eq!(k.as_slice(), &s[..]);
+            let c = k.clone();
+            assert_eq!(c, k);
+            assert_eq!(c.ttl(), u64::MAX);
+            k.set_ttl(0);
+            assert_eq!(k.ttl(), 0);
+            assert_eq!(k.as_slice(), &s[..]);
+            assert_eq!(k.is_inline(), n <= INLINE_CAP);
+            assert_eq!(
+                Bytes::from(CompactKey::with_ttl(&s, 7)),
+                Bytes::from(s.clone())
+            );
+        }
+        // Smallest deadline (raw 1) survives packing.
+        assert_eq!(CompactKey::with_ttl(b"k", 1).ttl(), 1);
     }
 
     #[test]

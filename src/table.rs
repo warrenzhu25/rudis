@@ -1540,11 +1540,19 @@ pub fn heap_len(n: usize) -> usize {
 
 /// Base for [`Expiry`]: a little before the first use, so deadlines slightly
 /// in the past (e.g. restored already-expired keys) still round-trip.
+///
+/// Aligned to a whole wall-clock millisecond: keys stored with a
+/// millisecond-precision deadline (see `CompactKey`) then sit on the same
+/// grid as absolute `PXAT`/`PEXPIREAT` times, which round-trip exactly.
 fn expiry_base() -> Instant {
     static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     *BASE.get_or_init(|| {
         let now = Instant::now();
-        now.checked_sub(Duration::from_secs(3600)).unwrap_or(now)
+        let sub_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() % 1_000_000);
+        let back = Duration::from_secs(3600) + Duration::from_nanos(sub_ms as u64);
+        now.checked_sub(back).unwrap_or(now)
     })
 }
 
@@ -1573,6 +1581,18 @@ impl Expiry {
     pub fn is_none(self) -> bool {
         self.0.is_none()
     }
+
+    /// The packed representation (0 = no expiry), as stored in
+    /// [`crate::compact::CompactKey`].
+    #[inline(always)]
+    pub fn to_raw(self) -> u64 {
+        self.0.map_or(0, |n| n.get())
+    }
+
+    #[inline(always)]
+    pub fn from_raw(raw: u64) -> Self {
+        Expiry(std::num::NonZeroU64::new(raw))
+    }
 }
 
 impl From<Option<Instant>> for Expiry {
@@ -1596,31 +1616,41 @@ impl From<Instant> for Expiry {
     }
 }
 
+/// A table entry. The expiry deadline lives in the key (see
+/// [`crate::compact::CompactKey`]), so keys without a TTL don't pay for it;
+/// use [`RudisEntry::expire_at`] / [`RudisEntry::set_expire_at`].
 #[derive(Clone, Debug)]
 pub struct RudisEntry {
     pub key: crate::compact::CompactKey,
     pub val: RudisValue,
-    /// Packed deadline; use [`RudisEntry::expire_at`] / [`RudisEntry::set_expire_at`].
-    pub expire_at: Expiry,
 }
 
+const _: () = assert!(std::mem::size_of::<RudisEntry>() == 48);
+
 impl RudisEntry {
+    #[inline(always)]
+    pub fn new(key: crate::compact::CompactKey, val: RudisValue, expire_at: Expiry) -> Self {
+        let mut key = key;
+        key.set_ttl(expire_at.to_raw());
+        RudisEntry { key, val }
+    }
+
     /// The key's expiry deadline, if it has one.
     #[inline(always)]
     pub fn expire_at(&self) -> Option<Instant> {
-        self.expire_at.get()
+        Expiry::from_raw(self.key.ttl()).get()
     }
 
     #[inline(always)]
     pub fn set_expire_at(&mut self, at: Option<Instant>) {
-        self.expire_at = Expiry::from(at);
+        self.key.set_ttl(Expiry::from(at).to_raw());
     }
 
     /// Clears the expiry and returns the old deadline.
     #[inline(always)]
     pub fn take_expire_at(&mut self) -> Option<Instant> {
-        let old = self.expire_at.get();
-        self.expire_at = Expiry::NONE;
+        let old = self.expire_at();
+        self.key.set_ttl(0);
         old
     }
 
@@ -3927,11 +3957,9 @@ impl RudisTable {
             self.num_expires += 1;
         }
         let entry_mem = heap_len(key.len()) + val_bytes + ENTRY_OVERHEAD;
-        let entry = RudisEntry {
+        let entry = {
             // Same as the value above: don't keep the frame alive through the key.
-            key: CompactKey::new(&key),
-            val,
-            expire_at: Expiry::from(expire_at),
+            RudisEntry::new(CompactKey::new(&key), val, Expiry::from(expire_at))
         };
         self.table.insert_prepared(entry, h, candidate_idx);
         self.data_bytes += entry_mem;
@@ -4090,11 +4118,11 @@ impl RudisTable {
 
         let (_, candidate_idx) = self.table.find_or_prepare_insert(key, h);
         let new_val = delta;
-        let entry = RudisEntry {
-            key: CompactKey::new(key),
-            val: RudisValue::Int(new_val),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(key),
+            RudisValue::Int(new_val),
+            Expiry::from(None),
+        );
         self.table.insert_prepared(entry, h, candidate_idx);
         self.data_bytes += heap_len(key.len()) + ENTRY_OVERHEAD;
         Ok(new_val)
@@ -4223,11 +4251,11 @@ impl RudisTable {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or(Duration::ZERO);
                             let target_epoch = now_epoch + diff;
-                            if in_millis {
-                                target_epoch.as_millis() as i64
-                            } else {
-                                target_epoch.as_secs() as i64
-                            }
+                            // Nearest millisecond: the round trip through two
+                            // clock reads can land a few µs either side of an
+                            // absolute PXAT/PEXPIREAT time.
+                            let ms = ((target_epoch.as_nanos() + 500_000) / 1_000_000) as i64;
+                            if in_millis { ms } else { ms / 1000 }
                         }
                     }
                     None => -1,
@@ -4776,8 +4804,9 @@ impl RudisTable {
             self.table.remove(dst_idx);
         }
 
-        // Update entry key to dst and insert
-        entry.key = CompactKey::new(&dst);
+        // Update entry key to dst and insert. The TTL lives in the key, so
+        // carry it over.
+        entry.key = CompactKey::with_ttl(&dst, entry.key.ttl());
         self.table.insert(entry);
 
         Ok(true)
@@ -4836,11 +4865,7 @@ impl RudisTable {
         if expire_at.is_some() {
             self.num_expires += 1;
         }
-        let entry = RudisEntry {
-            key: CompactKey::new(&dst),
-            val,
-            expire_at: Expiry::from(expire_at),
-        };
+        let entry = RudisEntry::new(CompactKey::new(&dst), val, Expiry::from(expire_at));
         self.table.insert(entry);
         Ok(true)
     }
@@ -5099,11 +5124,11 @@ impl RudisTable {
         let mut bytes = vec![0u8; offset];
         bytes.extend_from_slice(value);
         let len = bytes.len();
-        let entry = RudisEntry {
-            key: CompactKey::new(&key),
-            val: RudisValue::String(CompactStr::from(bytes)),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(&key),
+            RudisValue::String(CompactStr::from(bytes)),
+            Expiry::from(None),
+        );
         self.table.insert(entry);
         Ok(len)
     }
@@ -5140,11 +5165,11 @@ impl RudisTable {
         if delta.is_nan() || delta.is_infinite() {
             return Err("ERR increment would produce NaN or Infinity");
         }
-        let entry = RudisEntry {
-            key: CompactKey::new(&key),
-            val: RudisValue::String(CompactStr::from(delta.to_string())),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(&key),
+            RudisValue::String(CompactStr::from(delta.to_string())),
+            Expiry::from(None),
+        );
         self.table.insert(entry);
         Ok(delta)
     }
@@ -5377,11 +5402,11 @@ impl RudisTable {
                     entry.val = RudisValue::Int(val);
                     entry.set_expire_at(new_expire_at);
                 } else {
-                    self.table.insert(RudisEntry {
-                        key: CompactKey::new(&key),
-                        val: RudisValue::Int(val),
-                        expire_at: Expiry::from(new_expire_at),
-                    });
+                    self.table.insert(RudisEntry::new(
+                        CompactKey::new(&key),
+                        RudisValue::Int(val),
+                        Expiry::from(new_expire_at),
+                    ));
                 }
                 // Keep `num_expires` in step: it gates lazy and active expiry.
                 match (prior_expire_at.is_some(), new_expire_at.is_some()) {
@@ -5621,11 +5646,11 @@ impl RudisTable {
                     entry.val = RudisValue::String(CompactStr::from(val_str.clone()));
                     entry.set_expire_at(new_expire_at);
                 } else {
-                    self.table.insert(RudisEntry {
-                        key: CompactKey::new(&key),
-                        val: RudisValue::String(CompactStr::from(val_str.clone())),
-                        expire_at: Expiry::from(new_expire_at),
-                    });
+                    self.table.insert(RudisEntry::new(
+                        CompactKey::new(&key),
+                        RudisValue::String(CompactStr::from(val_str.clone())),
+                        Expiry::from(new_expire_at),
+                    ));
                 }
                 // Keep `num_expires` in step: it gates lazy and active expiry.
                 match (prior_expire_at.is_some(), new_expire_at.is_some()) {
@@ -5785,11 +5810,7 @@ impl RudisTable {
             map.insert(field.clone(), val.clone());
             RudisValue::Hash(Box::new(map))
         };
-        let entry = RudisEntry {
-            key: CompactKey::new(key),
-            val,
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(CompactKey::new(key), val, Expiry::from(None));
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(1)
     }
@@ -5957,11 +5978,7 @@ impl RudisTable {
             }
             (RudisValue::Hash(Box::new(map)), added)
         };
-        let entry = RudisEntry {
-            key: CompactKey::new(key),
-            val,
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(CompactKey::new(key), val, Expiry::from(None));
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(added)
     }
@@ -6024,11 +6041,7 @@ impl RudisTable {
         } else {
             RudisValue::SmallHash(Box::new(vec![(field, value)]))
         };
-        let entry = RudisEntry {
-            key: CompactKey::new(&key),
-            val,
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(CompactKey::new(&key), val, Expiry::from(None));
         self.table.insert(entry);
         Ok(1)
     }
@@ -7288,11 +7301,11 @@ impl RudisTable {
             }
         }
         let val_bytes = Bytes::from(delta.to_string());
-        let entry = RudisEntry {
-            key: CompactKey::new(&key),
-            val: RudisValue::SmallHash(Box::new(vec![(field, val_bytes)])),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(&key),
+            RudisValue::SmallHash(Box::new(vec![(field, val_bytes)])),
+            Expiry::from(None),
+        );
         self.table.insert(entry);
         Ok(delta)
     }
@@ -7375,11 +7388,11 @@ impl RudisTable {
             return Err("ERR increment would produce NaN or Infinity");
         }
         let val_bytes = Bytes::from(delta.to_string());
-        let entry = RudisEntry {
-            key: CompactKey::new(&key),
-            val: RudisValue::SmallHash(Box::new(vec![(field, val_bytes)])),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(&key),
+            RudisValue::SmallHash(Box::new(vec![(field, val_bytes)])),
+            Expiry::from(None),
+        );
         self.table.insert(entry);
         Ok(delta)
     }
@@ -7589,11 +7602,11 @@ impl RudisTable {
             }
         }
         let len = deque.len();
-        let entry = RudisEntry {
-            key: CompactKey::new(key),
-            val: RudisValue::List(Box::new(deque)),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(key),
+            RudisValue::List(Box::new(deque)),
+            Expiry::from(None),
+        );
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(len)
     }
@@ -7669,11 +7682,11 @@ impl RudisTable {
             }
         }
         let len = deque.len();
-        let entry = RudisEntry {
-            key: CompactKey::new(key),
-            val: RudisValue::List(Box::new(deque)),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(key),
+            RudisValue::List(Box::new(deque)),
+            Expiry::from(None),
+        );
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(len)
     }
@@ -8673,11 +8686,11 @@ impl RudisTable {
             ListDirection::Left => deque.push_front(val.clone()),
             ListDirection::Right => deque.push_back(val.clone()),
         }
-        self.table.insert(RudisEntry {
-            key: CompactKey::new(&destination),
-            val: RudisValue::List(Box::new(deque)),
-            expire_at: Expiry::from(None),
-        });
+        self.table.insert(RudisEntry::new(
+            CompactKey::new(&destination),
+            RudisValue::List(Box::new(deque)),
+            Expiry::from(None),
+        ));
         Ok(Some(val))
     }
 
@@ -8847,11 +8860,11 @@ impl RudisTable {
         for v in &vals {
             deque.push_back(v.clone());
         }
-        self.table.insert(RudisEntry {
-            key: CompactKey::new(&destination),
-            val: RudisValue::List(Box::new(deque)),
-            expire_at: Expiry::from(None),
-        });
+        self.table.insert(RudisEntry::new(
+            CompactKey::new(&destination),
+            RudisValue::List(Box::new(deque)),
+            Expiry::from(None),
+        ));
         Ok(Some(vals))
     }
 
@@ -8949,11 +8962,11 @@ impl RudisTable {
             hash: m_hash,
             member: member.clone(),
         });
-        let entry = RudisEntry {
-            key: CompactKey::new(key),
-            val: RudisValue::Set(Box::new(RudisSet::Small(v))),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(key),
+            RudisValue::Set(Box::new(RudisSet::Small(v))),
+            Expiry::from(None),
+        );
         self.data_bytes += heap_len(key.len()) + 32 + ENTRY_OVERHEAD;
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(1)
@@ -9052,11 +9065,11 @@ impl RudisTable {
             RudisSet::Full(set)
         };
         let added = set.len();
-        let entry = RudisEntry {
-            key: CompactKey::new(key),
-            val: RudisValue::Set(Box::new(set)),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(key),
+            RudisValue::Set(Box::new(set)),
+            Expiry::from(None),
+        );
         self.data_bytes += heap_len(key.len()) + added * 32 + ENTRY_OVERHEAD;
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(added)
@@ -9795,11 +9808,11 @@ impl RudisTable {
         } else {
             let mut new_set = RudisSet::new();
             new_set.insert(member);
-            self.table.insert(RudisEntry {
-                key: CompactKey::new(&destination),
-                val: RudisValue::Set(Box::new(new_set)),
-                expire_at: Expiry::from(None),
-            });
+            self.table.insert(RudisEntry::new(
+                CompactKey::new(&destination),
+                RudisValue::Set(Box::new(new_set)),
+                Expiry::from(None),
+            ));
             true
         };
 
@@ -9895,11 +9908,11 @@ impl RudisTable {
             for (m, s) in items {
                 zset.insert(s, m);
             }
-            let entry = RudisEntry {
-                key: CompactKey::new(&dest),
-                val: RudisValue::ZSet(Box::new(zset)),
-                expire_at: Expiry::from(None),
-            };
+            let entry = RudisEntry::new(
+                CompactKey::new(&dest),
+                RudisValue::ZSet(Box::new(zset)),
+                Expiry::from(None),
+            );
             self.table.insert(entry);
         }
         Ok(count)
@@ -9920,11 +9933,11 @@ impl RudisTable {
             for (m, s) in items {
                 zset.insert(s, m);
             }
-            let entry = RudisEntry {
-                key: CompactKey::new(&dest),
-                val: RudisValue::ZSet(Box::new(zset)),
-                expire_at: Expiry::from(None),
-            };
+            let entry = RudisEntry::new(
+                CompactKey::new(&dest),
+                RudisValue::ZSet(Box::new(zset)),
+                Expiry::from(None),
+            );
             self.table.insert(entry);
         }
         Ok(count)
@@ -9939,11 +9952,11 @@ impl RudisTable {
             for (m, s) in items {
                 zset.insert(s, m);
             }
-            let entry = RudisEntry {
-                key: CompactKey::new(&dest),
-                val: RudisValue::ZSet(Box::new(zset)),
-                expire_at: Expiry::from(None),
-            };
+            let entry = RudisEntry::new(
+                CompactKey::new(&dest),
+                RudisValue::ZSet(Box::new(zset)),
+                Expiry::from(None),
+            );
             self.table.insert(entry);
         }
         Ok(count)
@@ -10525,11 +10538,11 @@ impl RudisTable {
             }
         }
 
-        let entry = RudisEntry {
-            key: CompactKey::new(key),
-            val: RudisValue::ZSet(Box::new(zset)),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(key),
+            RudisValue::ZSet(Box::new(zset)),
+            Expiry::from(None),
+        );
         self.table.insert_prepared(entry, h, insert_idx);
         Ok((added_count, new_score_incr))
     }
@@ -10679,11 +10692,11 @@ impl RudisTable {
 
         let mut zset = RudisZSet::new();
         zset.insert(delta, member);
-        let entry = RudisEntry {
-            key: CompactKey::new(&key),
-            val: RudisValue::ZSet(Box::new(zset)),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(&key),
+            RudisValue::ZSet(Box::new(zset)),
+            Expiry::from(None),
+        );
         self.table.insert(entry);
         Ok(delta)
     }
@@ -11031,11 +11044,11 @@ impl RudisTable {
             zset.insert(*score, member.clone());
         }
         let count = items.len();
-        self.table.insert(RudisEntry {
-            key: CompactKey::new(dst),
-            val: RudisValue::ZSet(Box::new(zset)),
-            expire_at: Expiry::from(None),
-        });
+        self.table.insert(RudisEntry::new(
+            CompactKey::new(dst),
+            RudisValue::ZSet(Box::new(zset)),
+            Expiry::from(None),
+        ));
         Ok(count)
     }
 
@@ -11562,11 +11575,11 @@ impl RudisTable {
             vec[byte_idx] |= 1 << bit_idx;
         }
         let added_mem = heap_len(key.len()) + heap_len(vec.len()) + ENTRY_OVERHEAD;
-        let entry = RudisEntry {
-            key: CompactKey::new(&key),
-            val: RudisValue::String(CompactStr::from(vec)),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(&key),
+            RudisValue::String(CompactStr::from(vec)),
+            Expiry::from(None),
+        );
         self.table.insert(entry);
         self.data_bytes += added_mem;
         Ok((0, true))
@@ -11987,11 +12000,11 @@ impl RudisTable {
                     entry.val = RudisValue::String(CompactStr::from(current_vec));
                 }
             } else {
-                let entry = RudisEntry {
-                    key: CompactKey::new(&key),
-                    val: RudisValue::String(CompactStr::from(current_vec)),
-                    expire_at: Expiry::from(None),
-                };
+                let entry = RudisEntry::new(
+                    CompactKey::new(&key),
+                    RudisValue::String(CompactStr::from(current_vec)),
+                    Expiry::from(None),
+                );
                 self.table.insert(entry);
             }
             if changes > 0 { changes } else { 1 }
@@ -12727,11 +12740,11 @@ impl RudisTable {
                 }
                 Self::apply_stream_trim(&mut stream, maxlen, minid, approx, trim_strategy, limit);
 
-                let entry = RudisEntry {
-                    key: CompactKey::new(&key),
-                    val: RudisValue::Stream(Box::new(stream)),
-                    expire_at: Expiry::from(None),
-                };
+                let entry = RudisEntry::new(
+                    CompactKey::new(&key),
+                    RudisValue::Stream(Box::new(stream)),
+                    Expiry::from(None),
+                );
                 self.table.insert(entry);
                 return Ok(StreamAddResult::Added(final_id));
             }
@@ -12787,11 +12800,11 @@ impl RudisTable {
         }
         Self::apply_stream_trim(&mut stream, maxlen, minid, approx, trim_strategy, limit);
 
-        let entry = RudisEntry {
-            key: CompactKey::new(&key),
-            val: RudisValue::Stream(Box::new(stream)),
-            expire_at: Expiry::from(None),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(&key),
+            RudisValue::Stream(Box::new(stream)),
+            Expiry::from(None),
+        );
         self.table.insert(entry);
         Ok(StreamAddResult::Added(final_id))
     }
@@ -14389,11 +14402,11 @@ impl RudisTable {
         if expire_at.is_some() {
             self.num_expires += 1;
         }
-        let entry = RudisEntry {
-            key: CompactKey::new(&key),
-            val: decoded_value,
-            expire_at: Expiry::from(expire_at),
-        };
+        let entry = RudisEntry::new(
+            CompactKey::new(&key),
+            decoded_value,
+            Expiry::from(expire_at),
+        );
         self.table.insert(entry);
         Ok(())
     }
@@ -14538,11 +14551,11 @@ impl RudisTable {
             data = &data[consumed..];
 
             self.del(&key);
-            self.table.insert(RudisEntry {
-                key: CompactKey::new(&key),
+            self.table.insert(RudisEntry::new(
+                CompactKey::new(&key),
                 val,
-                expire_at: Expiry::from(expire_at),
-            });
+                Expiry::from(expire_at),
+            ));
         }
         Ok(())
     }
@@ -14565,11 +14578,11 @@ impl RudisTable {
                 return Err("ERR The XGROUP subcommand requires the key to exist");
             }
             let stream = RudisStream::new();
-            let entry = RudisEntry {
-                key: CompactKey::new(&key),
-                val: RudisValue::Stream(Box::new(stream)),
-                expire_at: Expiry::from(None),
-            };
+            let entry = RudisEntry::new(
+                CompactKey::new(&key),
+                RudisValue::Stream(Box::new(stream)),
+                Expiry::from(None),
+            );
             self.table.insert(entry);
         }
 
@@ -16162,11 +16175,11 @@ pub fn load_rdb_bytes(
             if expire_at.is_some() {
                 db.table.num_expires += 1;
             }
-            db.table.table.insert(RudisEntry {
-                key: CompactKey::new(&key),
+            db.table.table.insert(RudisEntry::new(
+                CompactKey::new(&key),
                 val,
-                expire_at: Expiry::from(expire_at),
-            });
+                Expiry::from(expire_at),
+            ));
             count += 1;
         }
     }
@@ -16861,6 +16874,32 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_keeps_ttl_stored_in_key() {
+        let mut t = RudisTable::new();
+        // Short (inline TTL), medium (inline key, heap with TTL) and long keys.
+        for (src, dst) in [
+            ("a", "b"),
+            ("src-key-of-20-bytes!", "dst-key-of-20-bytes!"),
+            ("a-much-longer-source-key-name", "short"),
+        ] {
+            t.set(
+                Bytes::from(src),
+                Bytes::from_static(b"v"),
+                Some(Duration::from_secs(100)),
+            );
+            assert_eq!(t.rename(src.as_bytes(), Bytes::from(dst), false), Ok(true));
+            let h = hash_key(dst.as_bytes());
+            let (_, e) = t.table.find_entry(dst.as_bytes(), h).unwrap();
+            let left = e
+                .expire_at()
+                .expect("TTL kept")
+                .saturating_duration_since(Instant::now());
+            assert!(left > Duration::from_secs(95), "{src}->{dst}: {left:?}");
+            assert_eq!(e.key.as_slice(), dst.as_bytes());
+        }
+    }
+
+    #[test]
     fn test_rudis_entry_size() {
         println!("RudisValue = {}", std::mem::size_of::<RudisValue>());
         println!("RudisEntry = {}", std::mem::size_of::<RudisEntry>());
@@ -16869,8 +16908,8 @@ mod tests {
             std::mem::size_of::<Option<RudisEntry>>()
         );
         assert_eq!(std::mem::size_of::<RudisValue>(), 24);
-        assert_eq!(std::mem::size_of::<RudisEntry>(), 56);
-        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 56);
+        assert_eq!(std::mem::size_of::<RudisEntry>(), 48);
+        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 48);
     }
 
     #[test]
@@ -17276,11 +17315,11 @@ mod tests {
         for i in 0..100 {
             let key = Bytes::from(format!("key_{}", i));
             let val = Bytes::from(format!("val_{}", i));
-            let entry = RudisEntry {
-                key: CompactKey::new(&key),
-                val: RudisValue::String(val.into()),
-                expire_at: Expiry::from(None),
-            };
+            let entry = RudisEntry::new(
+                CompactKey::new(&key),
+                RudisValue::String(val.into()),
+                Expiry::from(None),
+            );
             table.insert(entry);
         }
         assert_eq!(table.len(), 100);
@@ -18896,11 +18935,11 @@ mod tests {
         for i in 0..total_inserted {
             let key = Bytes::from(format!("key_{:04}", i));
             let val = RudisValue::String(CompactStr::from("val"));
-            table.insert(RudisEntry {
-                key: CompactKey::new(&key),
+            table.insert(RudisEntry::new(
+                CompactKey::new(&key),
                 val,
-                expire_at: Expiry::from(None),
-            });
+                Expiry::from(None),
+            ));
         }
 
         assert!(table.segments.len() >= 4);
@@ -18926,11 +18965,11 @@ mod tests {
         for k in (0..total_inserted).step_by(2) {
             let key = Bytes::from(format!("key_{:04}", k));
             let val = RudisValue::String(CompactStr::from("val2"));
-            table.insert(RudisEntry {
-                key: CompactKey::new(&key),
+            table.insert(RudisEntry::new(
+                CompactKey::new(&key),
                 val,
-                expire_at: Expiry::from(None),
-            });
+                Expiry::from(None),
+            ));
         }
         assert_eq!(table.len(), total_inserted);
     }
