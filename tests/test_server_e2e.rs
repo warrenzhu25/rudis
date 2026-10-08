@@ -3936,8 +3936,10 @@ fn test_auto_tiering_memory_pressure_e2e() {
 
     // Set maxmemory a little above current usage. Tiered keys still keep their
     // key and pointer in RAM, so leave room for that metadata while the values
-    // (10 x 1000 bytes) far exceed the headroom and must be spilled to NVMe.
-    let limit = cur_used + 4096;
+    // (100 x 8000 bytes) far exceed the headroom and must be spilled to NVMe.
+    // `used_memory` is the allocator's count, which also moves by tens of KB
+    // with connection buffers and replies, so the headroom covers that too.
+    let limit = cur_used + 256 * 1024;
     assert_eq!(
         send_and_read(
             &mut client,
@@ -3947,8 +3949,8 @@ fn test_auto_tiering_memory_pressure_e2e() {
     );
 
     // Insert multiple keys that will exceed the threshold
-    for i in 0..10 {
-        let val = "Z".repeat(1000);
+    for i in 0..100 {
+        let val = "Z".repeat(8000);
         let resp = send_and_read(
             &mut client,
             format!("SET autotier:{} {}\r\n", i, val).as_bytes(),
@@ -3963,8 +3965,8 @@ fn test_auto_tiering_memory_pressure_e2e() {
     assert!(!tier_info_auto.contains("disk_writes:1\r\n"));
 
     // Verify all keys remain accessible and return correct data
-    for i in 0..10 {
-        let expected = "Z".repeat(1000);
+    for i in 0..100 {
+        let expected = "Z".repeat(8000);
         let resp = send_and_read(&mut client, format!("GET autotier:{}\r\n", i).as_bytes());
         assert_eq!(resp, format!("${}\r\n{}\r\n", expected.len(), expected));
     }
@@ -7407,9 +7409,23 @@ fn test_maxclients_and_memory_eviction_e2e() {
     let policy_resp = send_and_read(&mut client1, b"CONFIG GET maxmemory-policy\r\n");
     assert!(policy_resp.contains("allkeys-lru"));
 
-    // Set maxmemory to small value and verify keys can still be set under allkeys-lru (eviction succeeds)
+    // Set maxmemory just above current usage and verify keys can still be
+    // set under allkeys-lru (eviction succeeds). `used_memory` is the
+    // allocator's count, which includes the server's fixed buffers, so an
+    // absolute limit like 1mb would be below an empty server.
+    let info = send_and_read(&mut client1, b"INFO memory\r\n");
+    let used: u64 = info
+        .lines()
+        .find_map(|l| l.strip_prefix("used_memory:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     assert_eq!(
-        send_and_read(&mut client1, b"CONFIG SET maxmemory 1mb\r\n"),
+        send_and_read(
+            &mut client1,
+            format!("CONFIG SET maxmemory {}\r\n", used + (1 << 20)).as_bytes()
+        ),
         "+OK\r\n"
     );
     assert_eq!(
@@ -21801,4 +21817,111 @@ fn test_info_keyspace_counts_all_shards_e2e() {
 /// legacy driver, which avoids io_uring memlock limits on old kernels.
 fn legacy_driver_env() -> String {
     std::env::var("MONOIO_FORCE_LEGACY_DRIVER").unwrap_or_else(|_| "1".to_string())
+}
+
+fn info_u64(c: &mut TcpStream, section: &str, field: &str) -> u64 {
+    let info = resp_cmd_full(c, &["INFO", section]);
+    info.lines()
+        .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
+        .unwrap_or_else(|| panic!("{field} missing from INFO {section}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// `maxmemory` holds for collection writes too: the limit is checked against
+/// the allocator's count, not the per-command estimate (which drifts for
+/// hashes, lists and sorted sets), so filling the server with hashes far past
+/// the limit keeps what the allocator holds near it.
+#[test]
+fn test_maxmemory_enforced_by_allocator_count_for_hashes() {
+    let port = 17935u16;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--bind",
+            "127.0.0.1",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    // Let the first calibration against jemalloc's process count run.
+    thread::sleep(Duration::from_millis(300));
+    let base = info_u64(&mut c, "memory", "used_memory");
+    let base_alloc = info_u64(&mut c, "memory", "allocator_allocated");
+    let headroom = 8u64 << 20;
+    let limit = base + headroom;
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "maxmemory-policy", "allkeys-lru"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", &limit.to_string()]),
+        "+OK\r\n"
+    );
+    // ~4x the headroom in hashes, pipelined 100 commands at a time.
+    let val = "x".repeat(32);
+    let mut buf = vec![0u8; 1 << 16];
+    for batch in 0..80 {
+        let mut pipe = String::new();
+        for k in 0..100 {
+            let key = format!("h:{batch}:{k}");
+            pipe.push_str(&format!(
+                "*{}\r\n$4\r\nHSET\r\n${}\r\n{key}\r\n",
+                2 + 2 * 20,
+                key.len()
+            ));
+            for f in 0..20 {
+                let field = format!("field{f}");
+                pipe.push_str(&format!(
+                    "${}\r\n{field}\r\n${}\r\n{val}\r\n",
+                    field.len(),
+                    val.len()
+                ));
+            }
+        }
+        c.write_all(pipe.as_bytes()).unwrap();
+        let mut replies = 0;
+        let mut got = Vec::new();
+        while replies < 100 {
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed");
+            got.extend_from_slice(&buf[..n]);
+            replies = got.iter().filter(|&&b| b == b'\n').count();
+        }
+        assert!(
+            !String::from_utf8_lossy(&got).contains("OOM"),
+            "write refused"
+        );
+    }
+    thread::sleep(Duration::from_millis(300));
+    let used = info_u64(&mut c, "memory", "used_memory");
+    let alloc = info_u64(&mut c, "memory", "allocator_allocated");
+    let evicted = info_u64(&mut c, "stats", "evicted_keys");
+    assert!(evicted > 0, "nothing evicted");
+    assert!(
+        used <= limit + (1 << 20),
+        "used_memory {used} vs limit {limit}"
+    );
+    assert!(
+        alloc <= base_alloc + headroom + headroom / 4,
+        "allocator holds {} MiB over the base for an {} MiB headroom",
+        (alloc - base_alloc) >> 20,
+        headroom >> 20
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "0"]),
+        "+OK\r\n"
+    );
+    drop(c);
+    shutdown_and_wait(port, &mut child);
 }

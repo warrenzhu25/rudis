@@ -232,6 +232,37 @@ fn eviction_target(max_mem: usize) -> usize {
     max_mem - (max_mem / 64).min(1 << 20)
 }
 
+/// The calling shard thread's memory by the allocator's count, as the pair
+/// (allocated minus freed by this thread, table arena space allocated but
+/// free for reuse). Call on the shard's own thread. Without
+/// `real_accounting` (routers built outside a server), the table's
+/// estimate and no slack.
+#[inline]
+pub fn local_real_parts(
+    stats: &crate::tiering::TieringStats,
+    table: &crate::table::RudisTable,
+) -> (i64, usize) {
+    if stats.real_accounting.load(Ordering::Relaxed) {
+        (
+            crate::allocator::thread_net_bytes(),
+            table.free_arena_bytes(),
+        )
+    } else {
+        (table.used_memory() as i64, 0)
+    }
+}
+
+/// [`local_real_parts`] as one number: the shard's contribution to
+/// [`crate::tiering::TieringStats::real_used_total`].
+#[inline]
+pub fn local_real_used(
+    stats: &crate::tiering::TieringStats,
+    table: &crate::table::RudisTable,
+) -> i64 {
+    let (net, slack) = local_real_parts(stats, table);
+    net - slack as i64
+}
+
 impl Router {
     /// Logs a mutation applied to this shard's data to the AOF and the
     /// replication stream (see `replication::log_shard_mutation`).
@@ -705,18 +736,29 @@ impl Router {
         }
     }
 
+    /// Server-wide used memory by the allocator's count, after every shard
+    /// republished its usage (a mesh round trip per shard; for INFO).
     pub async fn get_total_used_memory(&self) -> usize {
-        let mut total = self.local_db.borrow().table.used_memory();
         for s in 0..self.num_shards {
             if s != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
                 let msg = ShardMessage::GetUsedMemory { responder: tx };
-                if self.senders[s].send(msg).is_ok() {
-                    total += rx.recv_async().await.unwrap_or(0);
+                if self.senders[s].send(msg).is_ok()
+                    && let Ok(used) = rx.recv_async().await
+                {
+                    self.tier_stats.publish_shard_used(s, used);
                 }
             }
         }
-        total
+        self.publish_memory_state();
+        self.real_used_total()
+    }
+
+    /// Server-wide used memory by the allocator's count, from what every
+    /// shard last published (see [`crate::tiering::TieringStats::real_used_total`]).
+    #[inline]
+    pub fn real_used_total(&self) -> usize {
+        self.tier_stats.real_used_total(None).max(0) as usize
     }
 
     /// This shard's share of `maxmemory`, or `None` when no limit is set.
@@ -726,22 +768,37 @@ impl Router {
         (max_mem > 0).then(|| (max_mem / self.num_shards.max(1) as u64).max(1) as usize)
     }
 
-    /// Server-wide used memory: this shard's fresh value plus what the other
-    /// shards last published.
-    #[inline]
-    fn total_used_with_local(&self, local: usize) -> usize {
-        local + self.tier_stats.published_used_total(Some(self.shard_id))
-    }
-
-    /// Publishes this shard's `used_memory` for the other shards and returns
-    /// whether the server as a whole is over `maxmemory` (Redis semantics:
-    /// the limit is global, not per shard).
+    /// Publishes this shard's usage for the other shards (the table's
+    /// estimate, for splitting eviction between shards, and the allocator's
+    /// count) and returns whether the server as a whole is over `maxmemory`
+    /// (Redis semantics: the limit is global, not per shard), judged by the
+    /// allocator's count.
     #[inline]
     pub fn publish_memory_state(&self) -> bool {
-        let local = self.local_db.borrow().table.used_memory();
-        self.tier_stats.publish_shard_used(self.shard_id, local);
-        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed) as usize;
-        max_mem > 0 && self.total_used_with_local(local) > max_mem
+        let (estimate, (net, slack)) = {
+            let db = self.local_db.borrow();
+            (
+                db.table.used_memory(),
+                local_real_parts(&self.tier_stats, &db.table),
+            )
+        };
+        self.tier_stats.publish_shard_used(self.shard_id, estimate);
+        self.tier_stats
+            .publish_shard_real(self.shard_id, net, slack);
+        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed) as i64;
+        max_mem > 0 && self.tier_stats.real_used_total(None) > max_mem
+    }
+
+    /// Recalibrates the memory not charged to any shard thread against
+    /// jemalloc's process-wide count (~15 µs; one shard calls this from its
+    /// cron). Skipped when other servers share the process, whose memory
+    /// the process-wide count would include.
+    pub fn calibrate_real_memory(&self) {
+        if crate::tiering::sole_server_in_process()
+            && let Some(global) = crate::allocator::global_allocated()
+        {
+            self.tier_stats.calibrate_unattributed(global);
+        }
     }
 
     /// Clears the eviction/spill back-offs if `maxmemory`, the policy or the
@@ -773,12 +830,16 @@ impl Router {
         if policy != "noeviction" {
             // Once over the limit, evict a little below it so the next
             // writes don't each trigger another (possibly remote) round.
-            let target = eviction_target(max_mem);
-            let others = self.tier_stats.published_used_total(Some(self.shard_id));
+            // The limit is checked by the allocator's count, which drops as
+            // soon as a key is evicted (its heap memory goes back to the
+            // allocator, its arena position becomes reusable slack); `floor`
+            // is about this shard's fair share, by the table's estimate.
+            let target = eviction_target(max_mem) as i64;
+            let others = self.tier_stats.real_used_total(Some(self.shard_id));
             let mut db = self.local_db.borrow_mut();
             loop {
-                let local = db.table.used_memory();
-                if others + local <= target || local <= floor {
+                let local = local_real_used(&self.tier_stats, &db.table);
+                if others + local <= target || db.table.used_memory() <= floor {
                     break;
                 }
                 if db.table.try_evict_one_key(policy).is_none() {
@@ -895,7 +956,7 @@ impl Router {
             &[share, 0]
         };
         let regrowth = (max_mem / 1024).max(1024);
-        let total = || self.tier_stats.published_used_total(None);
+        let total = || self.real_used_total();
         for &floor in floors {
             let (under, track) = crate::connection::with_evict_capture(client_id, || {
                 self.evict_local_until_under(policy, floor)
@@ -955,9 +1016,8 @@ impl Router {
             .tier_stats
             .offload_threshold_pct
             .load(Ordering::Relaxed);
-        let used_mem = self.local_db.borrow().table.used_memory();
-        let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
-        used_mem >= (shard_threshold * offload_pct as usize) / 100
+        // Server-wide, by the allocator's count as last published.
+        self.real_used_total() as u64 >= max_mem / 100 * offload_pct
     }
 
     /// Decommit cooled keys, then spill hot keys to NVMe while the server is
@@ -973,7 +1033,7 @@ impl Router {
         // the limit, wait a second (or for the total to grow) before the next.
         let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed) as usize;
         let regrowth = (max_mem / 1024).max(1024);
-        let total = || self.tier_stats.published_used_total(None);
+        let total = || self.real_used_total();
         if let Some((until, at_total)) = self.remote_spill_backoff.get()
             && total() < at_total.saturating_add(regrowth)
             && std::time::Instant::now() < until
@@ -1053,13 +1113,14 @@ impl Router {
             self.is_auto_tiering.set(false);
             return under();
         }
-        // Local target so that, with the other shards' published usage, the
-        // server ends a little below the limit.
-        let others = self.tier_stats.published_used_total(Some(self.shard_id));
-        let target_mem = max_mem
-            .saturating_sub((max_mem / 20).max(128 * 1024))
-            .saturating_sub(others);
+        // Spill until the table's estimate has dropped by the server's
+        // excess (by the allocator's count) over a target a little below the
+        // limit. The estimate, not the allocator count, measures progress:
+        // spilled values sit in the tier's write buffer until it flushes.
+        let target_total = max_mem.saturating_sub((max_mem / 20).max(128 * 1024));
+        let excess = self.real_used_total().saturating_sub(target_total);
         let start_used = self.local_db.borrow().table.used_memory();
+        let target_mem = start_used.saturating_sub(excess);
         let mut attempts = 0usize;
         let mut exhausted = false;
         while attempts < MAX_SPILL_ATTEMPTS_PER_CALL {
@@ -1455,22 +1516,8 @@ impl Router {
                     &key,
                 );
             }
-            let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
-            if max_mem > 0 {
-                let used = self.local_db.borrow().table.used_memory();
-                let shard_max_mem = (max_mem / self.num_shards.max(1) as u64) as usize;
-                if used > shard_max_mem && !self.is_auto_tiering.get() {
-                    let decommitted = self.decommit_local(None);
-                    let used_after = self.local_db.borrow().table.used_memory();
-                    if (decommitted == 0 || used_after > shard_max_mem)
-                        && !self.is_auto_tiering.get()
-                    {
-                        let r = self.clone();
-                        monoio::spawn(async move {
-                            r.check_auto_tier_local().await;
-                        });
-                    }
-                }
+            if self.tier_stats.max_memory.load(Ordering::Relaxed) > 0 {
+                self.start_auto_tier_if_over();
             }
         } else {
             let desc = Arc::new(crate::mailbox::FastSetDescriptor::new(
@@ -1489,27 +1536,33 @@ impl Router {
     pub(crate) fn check_auto_tier_after_write(&self) {
         let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
         if max_mem > 0 {
-            let used = self.local_db.borrow().table.used_memory();
-            let shard_max_mem = (max_mem / self.num_shards.max(1) as u64) as usize;
-            if used > shard_max_mem
-                && !self.is_auto_tiering.get()
-                && crate::connection::max_memory_policy_is_noeviction()
-            {
-                let decommitted = self.decommit_local(None);
-                let used_after = self.local_db.borrow().table.used_memory();
-                if (decommitted == 0 || used_after > shard_max_mem) && !self.is_auto_tiering.get() {
-                    let r = self.clone();
-                    monoio::spawn(async move {
-                        r.check_auto_tier_local().await;
-                    });
-                }
+            if crate::connection::max_memory_policy_is_noeviction() {
+                self.start_auto_tier_if_over();
+            } else {
+                // Publish this shard's usage for the other shards' gates. No
+                // eviction here: like Redis, keys are evicted only before a
+                // command runs (the gate in `execute_command`; squashed
+                // batches fall back to it when over the limit). Evicting
+                // after a write would send tracking invalidations ahead of
+                // that write's reply.
+                self.publish_memory_state();
             }
-            // Publish this shard's usage for the other shards' gates. No
-            // eviction here: like Redis, keys are evicted only before a
-            // command runs (the gate in `execute_command`; squashed batches
-            // fall back to it when over the limit). Evicting after a write
-            // would send tracking invalidations ahead of that write's reply.
-            self.publish_memory_state();
+        }
+    }
+
+    /// Publishes this shard's usage and, if the server is over
+    /// `maxmemory`, decommits cooled keys and, if that is not enough,
+    /// starts spilling in the background.
+    #[inline]
+    fn start_auto_tier_if_over(&self) {
+        if self.publish_memory_state() && !self.is_auto_tiering.get() {
+            let decommitted = self.decommit_local(None);
+            if (decommitted == 0 || self.over_maxmemory()) && !self.is_auto_tiering.get() {
+                let r = self.clone();
+                monoio::spawn(async move {
+                    r.check_auto_tier_local().await;
+                });
+            }
         }
     }
 

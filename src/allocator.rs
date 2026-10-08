@@ -48,6 +48,41 @@ pub fn get_allocator_stats() -> AllocatorStats {
     }
 }
 
+thread_local! {
+    /// jemalloc's per-thread cumulative allocated/deallocated byte counters.
+    /// Reading them is two plain loads (~1 ns), cheap enough for the write
+    /// path. `None` if the allocator doesn't provide them.
+    static THREAD_COUNTERS: Option<(
+        tikv_jemalloc_ctl::thread::ThreadLocal<u64>,
+        tikv_jemalloc_ctl::thread::ThreadLocal<u64>,
+    )> = tikv_jemalloc_ctl::thread::allocatedp::read()
+        .ok()
+        .zip(tikv_jemalloc_ctl::thread::deallocatedp::read().ok());
+}
+
+/// Bytes this thread allocated minus bytes it freed, since it started.
+/// Memory freed by another thread stays charged to the allocating thread
+/// (and goes negative on the freeing one), so only the sum over all
+/// threads is meaningful as a total; the change across a stretch of code
+/// on one thread is exact for what that code allocated and freed.
+#[inline]
+pub fn thread_net_bytes() -> i64 {
+    THREAD_COUNTERS
+        .try_with(|c| {
+            c.as_ref()
+                .map_or(0, |(a, d)| a.get().wrapping_sub(d.get()) as i64)
+        })
+        .unwrap_or(0)
+}
+
+/// Bytes currently allocated by the whole process (jemalloc
+/// `stats.allocated`, refreshed first). Costs ~15 µs: call from a cron, not
+/// per command.
+pub fn global_allocated() -> Option<usize> {
+    tikv_jemalloc_ctl::epoch::advance().ok()?;
+    tikv_jemalloc_ctl::stats::allocated::read().ok()
+}
+
 /// Format memory section for INFO command.
 pub fn format_memory_info(
     used_mem: usize,
@@ -250,6 +285,22 @@ impl SmallCollectionArena {
 mod tests {
     use super::*;
     use crate::table::{OrderedScore, RudisTable, ZAddFlags};
+
+    #[test]
+    fn test_thread_net_bytes_tracks_local_allocations() {
+        let before = thread_net_bytes();
+        let v: Vec<u8> = vec![1u8; 1 << 20];
+        let grown = thread_net_bytes() - before;
+        assert!(grown >= 1 << 20, "grew by {grown}");
+        // Freed on another thread: still charged here.
+        std::thread::spawn(move || drop(v)).join().unwrap();
+        assert!(thread_net_bytes() - before >= 1 << 20);
+        let w: Vec<u8> = vec![1u8; 1 << 20];
+        let mid = thread_net_bytes();
+        drop(w);
+        assert!(mid - thread_net_bytes() >= 1 << 20);
+        assert!(global_allocated().is_some_and(|g| g >= 1 << 20));
+    }
 
     #[test]
     fn test_background_thread_switch_round_trips() {

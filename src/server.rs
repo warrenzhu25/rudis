@@ -243,8 +243,16 @@ pub fn run_shard_worker(
         );
         r.set_base_port(base_port);
         r.cluster_enabled = cluster_enabled;
+        // Judge maxmemory by allocator counts (see TieringStats::shard_real).
+        r.tier_stats
+            .real_accounting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let router = Rc::new(r);
         crate::connection::set_current_router(router.clone());
+
+        if shard_id == 0 {
+            crate::tiering::register_server();
+        }
 
         // Active expiration cycle: run every 100ms
         let active_db = local_db.clone();
@@ -262,6 +270,9 @@ pub fn run_shard_worker(
                 // Deletes, flushes and CONFIG SET maxmemory don't go through
                 // the post-write check; publish this shard's usage here.
                 mem_router.publish_memory_state();
+                if shard_id == 0 {
+                    mem_router.calibrate_real_memory();
+                }
                 // Rates for INFO instantaneous_*; extra calls are no-ops.
                 crate::server_stats::sample();
             }
@@ -1933,6 +1944,8 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         });
                     }
                     ShardMessage::GetUsedMemory { responder } => {
+                        // Also republishes this shard's allocator count.
+                        cross_shard_router.publish_memory_state();
                         let used = cross_shard_db.borrow().table.used_memory();
                         let _ = responder.send(used);
                     }

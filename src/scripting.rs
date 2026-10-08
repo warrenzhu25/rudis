@@ -2244,12 +2244,12 @@ fn register_redis_module<'scope, 'env: 'scope>(
             && cmd.is_write_command()
             && !cmd.allows_oom()
         {
-            let used = db_call.borrow().table.used_memory();
-            // Server-wide: other shards' published usage plus ours.
-            let total = used
-                + crate::tiering::get_tier_stats(port)
-                    .published_used_total(Some(crate::connection::current_shard_id()));
-            if total > max_mem as usize {
+            // Server-wide, by the allocator's count: other shards' published
+            // usage plus ours.
+            let stats = crate::tiering::get_tier_stats(port);
+            let total = crate::router::local_real_used(&stats, &db_call.borrow().table)
+                + stats.real_used_total(Some(crate::connection::current_shard_id()));
+            if total > max_mem as i64 {
                 crate::connection::record_rejected_stat(cmd_name);
                 crate::connection::record_error_stat("OOM", None);
                 SCRIPT_RECORDED_ERROR.set(true);
@@ -2419,12 +2419,12 @@ fn register_redis_module<'scope, 'env: 'scope>(
             && cmd.is_write_command()
             && !cmd.allows_oom()
         {
-            let used = db_pcall.borrow().table.used_memory();
-            // Server-wide: other shards' published usage plus ours.
-            let total = used
-                + crate::tiering::get_tier_stats(port)
-                    .published_used_total(Some(crate::connection::current_shard_id()));
-            if total > max_mem as usize {
+            // Server-wide, by the allocator's count: other shards' published
+            // usage plus ours.
+            let stats = crate::tiering::get_tier_stats(port);
+            let total = crate::router::local_real_used(&stats, &db_pcall.borrow().table)
+                + stats.real_used_total(Some(crate::connection::current_shard_id()));
+            if total > max_mem as i64 {
                 crate::connection::record_rejected_stat(cmd_name);
                 crate::connection::record_error_stat("OOM", None);
                 SCRIPT_RECORDED_ERROR.set(true);

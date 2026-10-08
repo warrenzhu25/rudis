@@ -2400,7 +2400,17 @@ impl RawSegment {
             + self.last_access.capacity() * std::mem::size_of::<u16>()
             + self.holes.capacity() * std::mem::size_of::<u64>()
     }
+
+    /// The part of [`RawSegment::heap_bytes`] that doesn't change as entries
+    /// come and go: everything but the entry arena and its access array.
+    #[inline]
+    pub fn fixed_heap_bytes(&self) -> usize {
+        self.heap_bytes() - self.entries.capacity() * ARENA_SLOT_BYTES
+    }
 }
+
+/// Heap bytes per entry arena position (the entry plus its access clock).
+const ARENA_SLOT_BYTES: usize = std::mem::size_of::<RudisEntry>() + std::mem::size_of::<u16>();
 
 /// Dragonfly-style Extendible Hashing Table (`Directory` + Fixed-Size SIMD `RawSegment`s).
 /// Eliminates monolithic stop-the-world resizes and `old_table` double-lookup overhead.
@@ -2420,6 +2430,10 @@ pub struct RudisFlatTable {
     /// Sum of `RawSegment::heap_bytes` over `segments`, kept current by every
     /// path that adds, replaces or rebuilds a segment.
     seg_heap_bytes: usize,
+    /// Sum of `RawSegment::fixed_heap_bytes` over `segments`. Entry inserts
+    /// and deletes only change the arenas, so this moves only when a
+    /// segment is added, replaced or rebuilt.
+    seg_fixed_bytes: usize,
 }
 
 impl RudisFlatTable {
@@ -2427,6 +2441,7 @@ impl RudisFlatTable {
         let init_cap = capacity.next_power_of_two().clamp(GROUP_SIZE, SEG_CAP);
         let seg = RawSegment::new(init_cap, 0);
         let seg_heap_bytes = seg.heap_bytes();
+        let seg_fixed_bytes = seg.fixed_heap_bytes();
         Self {
             segments: vec![seg],
             directory: vec![0],
@@ -2437,6 +2452,7 @@ impl RudisFlatTable {
             slot_counts: vec![0u32; 16384].into_boxed_slice().try_into().unwrap(),
             layout_epoch: 0,
             seg_heap_bytes,
+            seg_fixed_bytes,
         }
     }
 
@@ -2451,8 +2467,18 @@ impl RudisFlatTable {
             + std::mem::size_of::<[u32; 16384]>()
     }
 
+    /// Bytes of entry arena allocated but not holding a live entry (holes
+    /// left by deletes and growth slack). Inserts reuse them, so they are
+    /// free memory as far as the dataset is concerned even though the
+    /// allocator still counts them. O(1).
+    #[inline]
+    pub fn free_arena_bytes(&self) -> usize {
+        (self.seg_heap_bytes - self.seg_fixed_bytes).saturating_sub(self.items * ARENA_SLOT_BYTES)
+    }
+
     fn recompute_seg_heap_bytes(&mut self) {
         self.seg_heap_bytes = self.segments.iter().map(RawSegment::heap_bytes).sum();
+        self.seg_fixed_bytes = self.segments.iter().map(RawSegment::fixed_heap_bytes).sum();
     }
 
     #[inline(always)]
@@ -2466,12 +2492,15 @@ impl RudisFlatTable {
             let seg_items = self.segments[seg_id].items;
             let seg_cap = self.segments[seg_id].capacity;
             let old_heap = self.segments[seg_id].heap_bytes();
+            let old_fixed = self.segments[seg_id].fixed_heap_bytes();
 
             // 1. If < 50% full (dominated by DELETED tombstones), compact segment in-place.
             if seg_items * 2 < seg_cap {
                 self.segments[seg_id].rebuild(seg_cap);
                 self.seg_heap_bytes =
                     self.seg_heap_bytes - old_heap + self.segments[seg_id].heap_bytes();
+                self.seg_fixed_bytes =
+                    self.seg_fixed_bytes - old_fixed + self.segments[seg_id].fixed_heap_bytes();
                 break;
             }
 
@@ -2481,6 +2510,8 @@ impl RudisFlatTable {
                 self.segments[seg_id].rebuild(new_cap);
                 self.seg_heap_bytes =
                     self.seg_heap_bytes - old_heap + self.segments[seg_id].heap_bytes();
+                self.seg_fixed_bytes =
+                    self.seg_fixed_bytes - old_fixed + self.segments[seg_id].fixed_heap_bytes();
                 self.capacity = if self.segments.len() == 1 {
                     new_cap
                 } else {
@@ -2530,6 +2561,9 @@ impl RudisFlatTable {
 
             self.seg_heap_bytes =
                 self.seg_heap_bytes - old_heap + seg_zero.heap_bytes() + seg_one.heap_bytes();
+            self.seg_fixed_bytes = self.seg_fixed_bytes - old_fixed
+                + seg_zero.fixed_heap_bytes()
+                + seg_one.fixed_heap_bytes();
             self.segments[seg_id] = seg_zero;
             let new_seg_id = self.segments.len();
             self.segments.push(seg_one);
@@ -3451,12 +3485,22 @@ impl RudisTable {
     #[inline(always)]
     pub fn prepare_key_lookup(&mut self, _key: &[u8], _hash: u64) {}
 
-    /// Memory this shard's keyspace holds: entry data plus the table's own
-    /// slot arrays, directory and counters. O(1); this is what `maxmemory`,
-    /// eviction and tiering compare against.
+    /// Estimated memory this shard's keyspace holds: entry data plus the
+    /// table's own slot arrays, directory and counters. O(1). An estimate
+    /// kept by each command; it splits eviction fairly between shards and
+    /// paces per-shard tiering, while the `maxmemory` limit itself is
+    /// checked against allocator counters (see
+    /// [`crate::tiering::TieringStats::real_used_total`]).
     #[inline]
     pub fn used_memory(&self) -> usize {
         self.data_bytes + self.table.struct_bytes()
+    }
+
+    /// Entry arena bytes allocated but free for reuse. See
+    /// [`RudisFlatTable::free_arena_bytes`].
+    #[inline]
+    pub fn free_arena_bytes(&self) -> usize {
+        self.table.free_arena_bytes()
     }
 
     pub fn recalculate_used_memory(&mut self) -> usize {
@@ -16411,6 +16455,17 @@ mod tests {
     fn assert_seg_heap_bytes_consistent(t: &RudisFlatTable) {
         let full: usize = t.segments.iter().map(RawSegment::heap_bytes).sum();
         assert_eq!(t.seg_heap_bytes, full, "incremental seg_heap_bytes drifted");
+        let fixed: usize = t.segments.iter().map(RawSegment::fixed_heap_bytes).sum();
+        assert_eq!(
+            t.seg_fixed_bytes, fixed,
+            "incremental seg_fixed_bytes drifted"
+        );
+        let free: usize = t
+            .segments
+            .iter()
+            .map(|s| (s.entries.capacity() - s.items) * ARENA_SLOT_BYTES)
+            .sum();
+        assert_eq!(t.free_arena_bytes(), free, "free_arena_bytes drifted");
     }
 
     #[test]
@@ -16721,6 +16776,237 @@ mod tests {
         let incremental = table.data_bytes;
         table.recalculate_used_memory();
         assert_eq!(incremental, table.data_bytes);
+    }
+
+    /// Runs a random mix of write commands over a small keyspace and checks
+    /// after each one that the incremental `data_bytes` equals a full
+    /// recount. Collects every command that drifts, so one run lists all
+    /// broken paths.
+    ///
+    /// Ignored: many collection paths (HSET, LPUSH, ZADD, SETRANGE, COPY,
+    /// RESTORE, ...) don't keep the estimate exact, and that is tolerated
+    /// because `maxmemory` is enforced by allocator counts; the estimate
+    /// only splits eviction between shards. Run with `--ignored` to list
+    /// the drifting commands.
+    #[test]
+    #[ignore]
+    fn test_used_memory_matches_recount_across_commands() {
+        fn recount(t: &RudisTable) -> usize {
+            t.entries()
+                .map(|e| e.key.heap_bytes() + e.val.mem_bytes() + ENTRY_OVERHEAD)
+                .sum()
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        // Short and long (heap) key names; small and large values/members.
+        let keys: Vec<Bytes> = (0..24)
+            .map(|i| {
+                if i % 3 == 0 {
+                    Bytes::from(format!("a-long-key-name-that-is-on-the-heap:{i}"))
+                } else {
+                    Bytes::from(format!("k{i}"))
+                }
+            })
+            .collect();
+        let vals: Vec<Bytes> = [1usize, 5, 14, 16, 20, 30, 70, 300]
+            .iter()
+            .map(|&n| Bytes::from("v".repeat(n)))
+            .collect();
+        let mut table = RudisTable::new();
+        let mut drift: std::collections::BTreeMap<&'static str, usize> = Default::default();
+        let mut signed: std::collections::BTreeMap<&'static str, (i64, i64)> = Default::default();
+        let ttl = Duration::from_secs(3600);
+        for _ in 0..20_000 {
+            let k = keys[rnd(keys.len())].clone();
+            let k2 = keys[rnd(keys.len())].clone();
+            let v = vals[rnd(vals.len())].clone();
+            let v2 = vals[rnd(vals.len())].clone();
+            let name: &'static str = match rnd(40) {
+                0 => {
+                    table.set(k, v, None);
+                    "set"
+                }
+                1 => {
+                    table.set(k, v, Some(ttl));
+                    "set_ttl"
+                }
+                2 => {
+                    table.del(&k);
+                    "del"
+                }
+                3 => {
+                    let _ = table.append(k, &v);
+                    "append"
+                }
+                4 => {
+                    let _ = table.setrange(k, rnd(40), &v);
+                    "setrange"
+                }
+                5 => {
+                    let _ = table.incr_by(k, 3);
+                    "incr_by"
+                }
+                6 => {
+                    let _ = table.incrbyfloat(k, 1.5);
+                    "incrbyfloat"
+                }
+                7 => {
+                    let _ = table.getset(k, v);
+                    "getset"
+                }
+                8 => {
+                    let _ = table.getdel(&k);
+                    "getdel"
+                }
+                9 => {
+                    let _ = table.setbit(k, rnd(300), 1);
+                    "setbit"
+                }
+                10 => {
+                    let _ = table.hset(k, vec![(v, v2)]);
+                    "hset"
+                }
+                11 => {
+                    let fields: Vec<(Bytes, Bytes)> = (0..rnd(150))
+                        .map(|i| (Bytes::from(format!("f{i}")), v.clone()))
+                        .collect();
+                    let _ = table.hset(k, fields);
+                    "hset_many"
+                }
+                12 => {
+                    let _ = table.hsetnx(k, v, v2);
+                    "hsetnx"
+                }
+                13 => {
+                    let _ = table.hdel(&k, &[v]);
+                    "hdel"
+                }
+                14 => {
+                    let _ = table.hincrby(k, v, 2);
+                    "hincrby"
+                }
+                15 => {
+                    let _ = table.hincrbyfloat(k, v, 0.5);
+                    "hincrbyfloat"
+                }
+                16 => {
+                    let _ = table.hgetdel(&k, &[v]);
+                    "hgetdel"
+                }
+                17 => {
+                    let _ = table.lpush(k, vec![v, v2]);
+                    "lpush"
+                }
+                18 => {
+                    let _ = table.rpush(k, vec![v]);
+                    "rpush"
+                }
+                19 => {
+                    let _ = table.lpop(&k, 1 + rnd(3));
+                    "lpop"
+                }
+                20 => {
+                    let _ = table.rpop(&k, 1);
+                    "rpop"
+                }
+                21 => {
+                    let _ = table.lmove(&k, k2, ListDirection::Left, ListDirection::Right);
+                    "lmove"
+                }
+                22 => {
+                    let _ = table.ltrim(&k, 1, -2);
+                    "ltrim"
+                }
+                23 => {
+                    let _ = table.lset(&k, 0, v);
+                    "lset"
+                }
+                24 => {
+                    let _ = table.lrem(&k, 1, &v);
+                    "lrem"
+                }
+                25 => {
+                    let _ = table.linsert(k, true, &v, v2);
+                    "linsert"
+                }
+                26 => {
+                    let _ = table.sadd(k, vec![v, v2]);
+                    "sadd"
+                }
+                27 => {
+                    let members: Vec<Bytes> = (0..rnd(150))
+                        .map(|i| Bytes::from(format!("m{i}")))
+                        .collect();
+                    let _ = table.sadd(k, members);
+                    "sadd_many"
+                }
+                28 => {
+                    let _ = table.srem(&k, &[v]);
+                    "srem"
+                }
+                29 => {
+                    let _ = table.spop(&k, 1);
+                    "spop"
+                }
+                30 => {
+                    let _ = table.smove(&k, k2, v);
+                    "smove"
+                }
+                31 => {
+                    let _ = table.sunionstore(k, &[k2]);
+                    "sunionstore"
+                }
+                32 => {
+                    let _ = table.zadd(k, vec![(rnd(100) as f64, v)], ZAddFlags::default());
+                    "zadd"
+                }
+                33 => {
+                    let _ = table.zincrby(k, 1.0, v);
+                    "zincrby"
+                }
+                34 => {
+                    let _ = table.zrem(&k, &[v]);
+                    "zrem"
+                }
+                35 => {
+                    let _ = table.zunionstore(k, &[k2], &[], Aggregate::Sum);
+                    "zunionstore"
+                }
+                36 => {
+                    let _ = table.rename(&k, k2, false);
+                    "rename"
+                }
+                37 => {
+                    let _ = table.copy(&k, k2, rnd(2) == 0);
+                    "copy"
+                }
+                38 => {
+                    let _ = table.pfadd(k, &[v, v2]);
+                    "pfadd"
+                }
+                _ => {
+                    table.expire(&k, ttl, Default::default());
+                    "expire"
+                }
+            };
+            let expected = recount(&table);
+            if table.data_bytes != expected {
+                *drift.entry(name).or_default() += 1;
+                let d = table.data_bytes as i64 - expected as i64;
+                let e = signed.entry(name).or_insert((0i64, 0i64));
+                e.0 += d;
+                e.1 = e.1.max(d.abs());
+                // Resync so the next command is judged on its own.
+                table.data_bytes = expected;
+            }
+        }
+        println!("SIGNED (sum, max_abs): {signed:?}");
+        assert!(drift.is_empty(), "used_memory drifted after: {drift:?}");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use crate::table::TieredPointer;
 
@@ -50,6 +50,35 @@ pub struct TieringStats {
     pub shard_used: Box<[crate::mailbox::CachePadded<AtomicU64>]>,
     /// Number of shards publishing into `shard_used`.
     pub num_shards: AtomicUsize,
+    /// Each shard thread's allocator-measured memory, published alongside
+    /// `shard_used`. Unlike `shard_used` (the table's estimate, used to
+    /// split eviction fairly between shards), this counts every byte the
+    /// thread allocated, so the server-wide total can't drift from what the
+    /// allocator holds. See [`TieringStats::real_used_total`].
+    pub shard_real: Box<[crate::mailbox::CachePadded<ShardRealMem>]>,
+    /// Allocated bytes not charged to any shard thread (other threads,
+    /// allocator caches), recalibrated every 100 ms against jemalloc's
+    /// process-wide `stats.allocated` while this is the only server in the
+    /// process. Zero otherwise.
+    pub unattributed: AtomicI64,
+    /// Whether shards publish allocator counts into `shard_real`. Set by a
+    /// running server; routers built directly (unit tests) publish the
+    /// table's estimate there instead, since their thread's allocator
+    /// counts include whatever else the test thread allocated.
+    pub real_accounting: AtomicBool,
+}
+
+/// One shard's published allocator usage.
+#[derive(Debug, Default)]
+pub struct ShardRealMem {
+    /// The shard thread's allocated minus freed bytes since it started (see
+    /// [`crate::allocator::thread_net_bytes`]). Negative when it freed more
+    /// than it allocated (memory allocated elsewhere and freed here).
+    pub net: AtomicI64,
+    /// Bytes the shard's table holds allocated but free for reuse (arena
+    /// holes and slack), which an eviction makes available without handing
+    /// back to the allocator. Subtracted so evicting a key counts at once.
+    pub slack: AtomicI64,
 }
 
 /// Shards beyond this share the last `shard_used` slot (sums stay correct
@@ -84,6 +113,11 @@ impl Default for TieringStats {
                 .map(|_| crate::mailbox::CachePadded(AtomicU64::new(0)))
                 .collect(),
             num_shards: AtomicUsize::new(1),
+            shard_real: (0..MAX_PUBLISHED_SHARDS)
+                .map(|_| crate::mailbox::CachePadded(ShardRealMem::default()))
+                .collect(),
+            unattributed: AtomicI64::new(0),
+            real_accounting: AtomicBool::new(false),
         }
     }
 }
@@ -119,6 +153,56 @@ impl TieringStats {
             .filter(|(i, _)| Some(*i) != skip)
             .map(|(_, v)| v.load(Ordering::Relaxed) as usize)
             .sum()
+    }
+
+    /// Publishes `shard`'s allocator usage (see [`ShardRealMem`]).
+    #[inline]
+    pub fn publish_shard_real(&self, shard: usize, net: i64, slack: usize) {
+        let slot = &self.shard_real[shard.min(MAX_PUBLISHED_SHARDS - 1)];
+        if slot.net.load(Ordering::Relaxed) != net {
+            slot.net.store(net, Ordering::Relaxed);
+        }
+        let slack = slack as i64;
+        if slot.slack.load(Ordering::Relaxed) != slack {
+            slot.slack.store(slack, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn published_shards(&self) -> &[crate::mailbox::CachePadded<ShardRealMem>] {
+        let n = self
+            .num_shards
+            .load(Ordering::Relaxed)
+            .clamp(1, MAX_PUBLISHED_SHARDS);
+        &self.shard_real[..n]
+    }
+
+    /// Server-wide memory in use by the allocator's count: every shard's
+    /// published net minus its reusable table slack, plus the unattributed
+    /// remainder, optionally skipping one shard (whose fresh value the
+    /// caller adds itself). Can be negative only transiently when a shard
+    /// is skipped.
+    #[inline]
+    pub fn real_used_total(&self, skip: Option<usize>) -> i64 {
+        self.published_shards()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != skip)
+            .map(|(_, m)| m.net.load(Ordering::Relaxed) - m.slack.load(Ordering::Relaxed))
+            .sum::<i64>()
+            + self.unattributed.load(Ordering::Relaxed)
+    }
+
+    /// Sets the unattributed remainder so the shard nets plus it equal
+    /// `global_allocated` (jemalloc's process-wide count).
+    pub fn calibrate_unattributed(&self, global_allocated: usize) {
+        let nets: i64 = self
+            .published_shards()
+            .iter()
+            .map(|m| m.net.load(Ordering::Relaxed))
+            .sum();
+        self.unattributed
+            .store(global_allocated as i64 - nets, Ordering::Relaxed);
     }
 
     pub fn reset_counters(&self) {
@@ -231,6 +315,20 @@ pub fn parse_memory_bytes(s: &str) -> Option<u64> {
         (lower.as_str(), 1)
     };
     num_part.trim().parse::<u64>().ok().map(|n| n * multiplier)
+}
+
+/// Servers started in this process (tests run several in-process).
+static SERVERS_IN_PROCESS: AtomicUsize = AtomicUsize::new(0);
+
+/// Records that a server started in this process.
+pub fn register_server() {
+    SERVERS_IN_PROCESS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether exactly one server ever started in this process, so jemalloc's
+/// process-wide counters describe it alone.
+pub fn sole_server_in_process() -> bool {
+    SERVERS_IN_PROCESS.load(Ordering::Relaxed) == 1
 }
 
 static TIER_STATS: RwLock<Option<HashMap<u16, Arc<TieringStats>>>> = RwLock::new(None);
