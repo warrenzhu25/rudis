@@ -3462,7 +3462,7 @@ impl RudisTable {
     pub fn recalculate_used_memory(&mut self) -> usize {
         let mut total = 0;
         for entry in self.entries() {
-            total += heap_len(entry.key.len()) + entry.val.mem_bytes() + ENTRY_OVERHEAD;
+            total += entry.key.heap_bytes() + entry.val.mem_bytes() + ENTRY_OVERHEAD;
         }
         self.data_bytes = total;
         self.used_memory()
@@ -3533,7 +3533,7 @@ impl RudisTable {
             if removed.expire_at().is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
-            let freed = heap_len(removed.key.len()) + removed.val.mem_bytes() + ENTRY_OVERHEAD;
+            let freed = removed.key.heap_bytes() + removed.val.mem_bytes() + ENTRY_OVERHEAD;
             self.data_bytes = self.data_bytes.saturating_sub(freed);
             inc_expired_keys();
             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3649,7 +3649,7 @@ impl RudisTable {
             if removed.expire_at().is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
-            let freed = heap_len(removed.key.len()) + removed.val.mem_bytes() + ENTRY_OVERHEAD;
+            let freed = removed.key.heap_bytes() + removed.val.mem_bytes() + ENTRY_OVERHEAD;
             self.data_bytes = self.data_bytes.saturating_sub(freed);
             inc_evicted_keys();
             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -4021,6 +4021,7 @@ impl RudisTable {
                 _ => None,
             };
             entry.val = val;
+            let old_key = entry.key.heap_bytes();
             if !keepttl {
                 let had_exp = entry.expire_at().is_some();
                 let will_exp = expire_in.is_some();
@@ -4031,7 +4032,9 @@ impl RudisTable {
                 }
                 entry.set_expire_at(expire_in.map(|d| Instant::now() + d));
             }
-            self.data_bytes = self.data_bytes.saturating_sub(old_bytes) + val_bytes;
+            self.data_bytes = self.data_bytes.saturating_sub(old_bytes + old_key)
+                + val_bytes
+                + entry.key.heap_bytes();
             if let Some((ptr, is_cooled)) = old_tiered {
                 self.dropped_tier.push((ptr, is_cooled));
             }
@@ -4046,13 +4049,12 @@ impl RudisTable {
         if expire_at.is_some() {
             self.num_expires += 1;
         }
-        let entry_mem = heap_len(key.len()) + val_bytes + ENTRY_OVERHEAD;
         let entry = {
             // Same as the value above: don't keep the frame alive through the key.
             RudisEntry::new(CompactKey::new(&key), val, Expiry::from(expire_at))
         };
+        self.data_bytes += entry.key.heap_bytes() + val_bytes + ENTRY_OVERHEAD;
         self.table.insert_prepared(entry, h, candidate_idx);
-        self.data_bytes += entry_mem;
         None
     }
 
@@ -4073,7 +4075,7 @@ impl RudisTable {
         if self.num_expires == 0 {
             if let Some((idx, entry)) = self.table.find_entry(key, hash) {
                 let val_bytes = entry.val.mem_bytes();
-                let freed = heap_len(entry.key.len()) + val_bytes + ENTRY_OVERHEAD;
+                let freed = entry.key.heap_bytes() + val_bytes + ENTRY_OVERHEAD;
                 self.data_bytes = self.data_bytes.saturating_sub(freed);
                 let entry = self.table.remove_present(idx);
                 match entry.val {
@@ -4096,7 +4098,7 @@ impl RudisTable {
                 return false;
             }
             let val_bytes = entry.val.mem_bytes();
-            let freed = heap_len(entry.key.len()) + val_bytes + ENTRY_OVERHEAD;
+            let freed = entry.key.heap_bytes() + val_bytes + ENTRY_OVERHEAD;
             self.data_bytes = self.data_bytes.saturating_sub(freed);
             let entry = self.table.remove_present(idx);
             if entry.expire_at().is_some() {
@@ -4266,7 +4268,9 @@ impl RudisTable {
                 if entry.expire_at().is_none() {
                     self.num_expires += 1;
                 }
+                let old_key = entry.key.heap_bytes();
                 entry.set_expire_at(Some(target_instant));
+                self.data_bytes = self.data_bytes.saturating_sub(old_key) + entry.key.heap_bytes();
                 return true;
             }
         }
@@ -4282,7 +4286,9 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot_mut(idx)
                 && entry.expire_at().is_some()
             {
+                let old_key = entry.key.heap_bytes();
                 entry.set_expire_at(None);
+                self.data_bytes = self.data_bytes.saturating_sub(old_key) + entry.key.heap_bytes();
                 self.num_expires = self.num_expires.saturating_sub(1);
                 return true;
             }
@@ -4884,15 +4890,29 @@ impl RudisTable {
         // Remove src
         let mut entry = self.table.remove(src_idx).unwrap();
 
-        // If dst exists, remove it first
+        // If dst exists, remove it first (releasing its accounting).
         let h_dst = hash_key(&dst);
-        if let Some(dst_idx) = self.table.find(&dst, h_dst) {
-            self.table.remove(dst_idx);
+        if let Some(dst_idx) = self.table.find(&dst, h_dst)
+            && let Some(old) = self.table.remove(dst_idx)
+        {
+            match &old.val {
+                RudisValue::Tiered(ptr) => self.dropped_tier.push((**ptr, false)),
+                RudisValue::Cooled(cv) => self.dropped_tier.push((cv.ptr, true)),
+                _ => {}
+            }
+            if old.expire_at().is_some() {
+                self.num_expires = self.num_expires.saturating_sub(1);
+            }
+            let freed = old.key.heap_bytes() + old.val.mem_bytes() + ENTRY_OVERHEAD;
+            self.data_bytes = self.data_bytes.saturating_sub(freed);
+            self.recycle_value(old.val);
         }
 
         // Update entry key to dst and insert. The TTL lives in the key, so
-        // carry it over.
+        // carry it over; the new key may differ in heap size.
+        let old_key = entry.key.heap_bytes();
         entry.key = CompactKey::with_ttl(&dst, entry.key.ttl());
+        self.data_bytes = self.data_bytes.saturating_sub(old_key) + entry.key.heap_bytes();
         self.table.insert(entry);
 
         Ok(true)
@@ -4978,10 +4998,17 @@ impl RudisTable {
                 match &mut entry.val {
                     RudisValue::String(old) => {
                         let prev = old.to_bytes();
+                        let old_val = old.heap_bytes();
                         *old = value.into();
-                        if entry.take_expire_at().is_some() {
+                        let new_val = old.heap_bytes();
+                        let old_key = entry.key.heap_bytes();
+                        let had_exp = entry.take_expire_at().is_some();
+                        let new_key = entry.key.heap_bytes();
+                        if had_exp {
                             self.num_expires = self.num_expires.saturating_sub(1);
                         }
+                        self.data_bytes =
+                            self.data_bytes.saturating_sub(old_val + old_key) + new_val + new_key;
                         Ok(Some(prev))
                     }
                     RudisValue::Int(n) => {
@@ -4991,9 +5018,15 @@ impl RudisTable {
                         } else {
                             entry.val = RudisValue::String(value.into());
                         }
-                        if entry.take_expire_at().is_some() {
+                        let new_val = entry.val.mem_bytes();
+                        let old_key = entry.key.heap_bytes();
+                        let had_exp = entry.take_expire_at().is_some();
+                        let new_key = entry.key.heap_bytes();
+                        if had_exp {
                             self.num_expires = self.num_expires.saturating_sub(1);
                         }
+                        self.data_bytes =
+                            self.data_bytes.saturating_sub(old_key) + new_val + new_key;
                         Ok(Some(prev))
                     }
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -5491,14 +5524,21 @@ impl RudisTable {
 
                 if let Some(idx) = existing_slot {
                     let entry = self.table.get_slot_mut(idx).unwrap();
+                    let old_bytes = entry.val.mem_bytes() + entry.key.heap_bytes();
                     entry.val = RudisValue::Int(val);
                     entry.set_expire_at(new_expire_at);
+                    self.data_bytes = self.data_bytes.saturating_sub(old_bytes)
+                        + entry.val.mem_bytes()
+                        + entry.key.heap_bytes();
                 } else {
-                    self.table.insert(RudisEntry::new(
+                    let entry = RudisEntry::new(
                         CompactKey::new(&key),
                         RudisValue::Int(val),
                         Expiry::from(new_expire_at),
-                    ));
+                    );
+                    self.data_bytes +=
+                        entry.key.heap_bytes() + entry.val.mem_bytes() + ENTRY_OVERHEAD;
+                    self.table.insert(entry);
                 }
                 // Keep `num_expires` in step: it gates lazy and active expiry.
                 match (prior_expire_at.is_some(), new_expire_at.is_some()) {
@@ -5736,14 +5776,21 @@ impl RudisTable {
                 let val_str = val.to_string();
                 if let Some(idx) = existing_slot {
                     let entry = self.table.get_slot_mut(idx).unwrap();
+                    let old_bytes = entry.val.mem_bytes() + entry.key.heap_bytes();
                     entry.val = RudisValue::String(CompactStr::from(val_str.clone()));
                     entry.set_expire_at(new_expire_at);
+                    self.data_bytes = self.data_bytes.saturating_sub(old_bytes)
+                        + entry.val.mem_bytes()
+                        + entry.key.heap_bytes();
                 } else {
-                    self.table.insert(RudisEntry::new(
+                    let entry = RudisEntry::new(
                         CompactKey::new(&key),
                         RudisValue::String(CompactStr::from(val_str.clone())),
                         Expiry::from(new_expire_at),
-                    ));
+                    );
+                    self.data_bytes +=
+                        entry.key.heap_bytes() + entry.val.mem_bytes() + ENTRY_OVERHEAD;
+                    self.table.insert(entry);
                 }
                 // Keep `num_expires` in step: it gates lazy and active expiry.
                 match (prior_expire_at.is_some(), new_expire_at.is_some()) {
@@ -9202,9 +9249,9 @@ impl RudisTable {
             };
 
             if is_empty && let Some(entry) = self.table.remove(idx) {
-                self.data_bytes = self.data_bytes.saturating_sub(
-                    heap_len(entry.key.len()) + removed_count * 32 + ENTRY_OVERHEAD,
-                );
+                self.data_bytes = self
+                    .data_bytes
+                    .saturating_sub(entry.key.heap_bytes() + removed_count * 32 + ENTRY_OVERHEAD);
                 self.recycle_value(entry.val);
             } else if removed_count > 0 {
                 self.data_bytes = self.data_bytes.saturating_sub(removed_count * 32);
@@ -16634,6 +16681,42 @@ mod tests {
         }
         for i in (0..2_000usize).step_by(7) {
             table.del(format!("k{i}").as_bytes());
+        }
+        // Keys of 18-22 bytes are inline without a TTL and heap with one.
+        let ttl = Duration::from_secs(3600);
+        for i in 0..300usize {
+            let k = Bytes::from(format!("ttl-key-{i:012}"));
+            match i % 6 {
+                0 => table.set(k.clone(), Bytes::from_static(b"v"), Some(ttl)),
+                1 => {
+                    table.set(k.clone(), Bytes::from_static(b"v"), None);
+                    table.expire(&k, ttl, Default::default());
+                }
+                2 => {
+                    table.set(k.clone(), Bytes::from_static(b"v"), Some(ttl));
+                    table.persist(&k);
+                }
+                3 => {
+                    table.set(k.clone(), Bytes::from_static(b"v"), Some(ttl));
+                    table.getset(k.clone(), Bytes::from_static(b"w")).unwrap();
+                }
+                4 => {
+                    table.set(k.clone(), Bytes::from_static(b"v"), Some(ttl));
+                    table.set(k.clone(), Bytes::from_static(b"x"), None);
+                }
+                _ => {
+                    // Rename onto an existing key, short <-> long names.
+                    table.set(k.clone(), Bytes::from_static(b"v"), Some(ttl));
+                    table.set(
+                        Bytes::from(format!("d{i}")),
+                        Bytes::from("y".repeat(40)),
+                        Some(ttl),
+                    );
+                    table
+                        .rename(&k, Bytes::from(format!("d{i}")), false)
+                        .unwrap();
+                }
+            }
         }
         let incremental = table.data_bytes;
         table.recalculate_used_memory();
