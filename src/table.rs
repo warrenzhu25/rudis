@@ -1770,22 +1770,26 @@ const NO_ENTRY: u16 = u16::MAX;
 /// Fixed-size SwissTable segment with a 4-slot DashTable-style overflow stash,
 /// managed by `RudisFlatTable`'s extendible hashing directory.
 ///
-/// Slots only hold a control byte and a 2-byte index; the entries live
-/// packed in `entries` (no holes, `entries.len() == items`). Segments split
+/// Slots only hold a control byte and a 2-byte index; the entries live in
+/// the `entries` arena. Segments split
 /// at 7/8 full, and with uniform hashing they all split together, so the
 /// table is often only ~45-60% full: keeping empty slots at 3 B instead of a
-/// full entry is what makes that cheap. `last_access` and `entry_slot` run
-/// parallel to `entries`; `entry_slot` lets a delete `swap_remove` and
-/// repoint the moved entry's slot in O(1).
+/// full entry is what makes that cheap. `last_access` runs parallel to
+/// `entries`. A delete leaves a hole (marked in the `holes` bitmap) that the
+/// next insert reuses, so no entry moves and no per-entry back-pointer to its
+/// slot is needed (2 B/key saved; the bitmap is 1 bit per arena entry). The
+/// arena is compacted once less than half of it is live.
 pub struct RawSegment {
     pub ctrl: Vec<u8>,
     /// Slot -> index into `entries`, or `NO_ENTRY`.
     slot_idx: Vec<u16>,
     entries: Vec<RudisEntry>,
-    /// Index into `entries` -> slot holding it.
-    entry_slot: Vec<u16>,
     /// Access clock per entry (parallel to `entries`).
     last_access: Vec<u16>,
+    /// Bit `i` set: `entries[i]` is a hole (a dead placeholder);
+    /// `entries.len() - items` bits are set. Sized with the segment, so it
+    /// never reallocates and `heap_bytes` only changes with the arena.
+    holes: Vec<u64>,
     pub capacity: usize,
     mask: usize,
     pub items: usize,
@@ -1806,8 +1810,8 @@ impl RawSegment {
             ctrl,
             slot_idx,
             entries: Vec::new(),
-            entry_slot: Vec::new(),
             last_access: Vec::new(),
+            holes: vec![0; (cap + STASH_CAP).div_ceil(64)],
             capacity: cap,
             mask: cap - 1,
             items: 0,
@@ -1873,15 +1877,31 @@ impl RawSegment {
         self.entries.get_mut(i)
     }
 
-    /// Live entries, packed (arena order, not slot order).
+    /// Whether arena index `i` holds a live entry (not a hole).
+    #[inline(always)]
+    fn is_live(holes: &[u64], i: usize) -> bool {
+        holes.get(i / 64).is_none_or(|w| w & (1 << (i % 64)) == 0)
+    }
+
+    /// Live entries (arena order, not slot order).
     #[inline]
-    pub fn iter_entries(&self) -> std::slice::Iter<'_, RudisEntry> {
-        self.entries.iter()
+    pub fn iter_entries(&self) -> impl Iterator<Item = &RudisEntry> {
+        let holes = &self.holes;
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| Self::is_live(holes, *i))
+            .map(|(_, e)| e)
     }
 
     #[inline]
-    pub fn iter_entries_mut(&mut self) -> std::slice::IterMut<'_, RudisEntry> {
-        self.entries.iter_mut()
+    pub fn iter_entries_mut(&mut self) -> impl Iterator<Item = &mut RudisEntry> {
+        let holes = &self.holes;
+        self.entries
+            .iter_mut()
+            .enumerate()
+            .filter(move |(i, _)| Self::is_live(holes, *i))
+            .map(|(_, e)| e)
     }
 
     /// Takes every entry with its access stamp, leaving the segment empty
@@ -1890,12 +1910,17 @@ impl RawSegment {
     fn drain_entries(&mut self) -> impl Iterator<Item = (RudisEntry, u16)> + use<> {
         let entries = std::mem::take(&mut self.entries);
         let access = std::mem::take(&mut self.last_access);
-        self.entry_slot = Vec::new();
+        let holes = std::mem::take(&mut self.holes);
         self.items = 0;
-        entries.into_iter().zip(access)
+        entries
+            .into_iter()
+            .zip(access)
+            .enumerate()
+            .filter(move |(i, _)| Self::is_live(&holes, *i))
+            .map(|(_, ea)| ea)
     }
 
-    /// Makes room for one more entry. Grows the arena by an eighth (at
+    /// Makes room for one more entry. Grows the arena by a sixteenth (at
     /// least 16) with `reserve_exact`, so slack stays bounded instead of
     /// doubling. Returns the heap bytes added.
     #[inline(always)]
@@ -1912,9 +1937,8 @@ impl RawSegment {
         let before = self.heap_bytes();
         let len = self.entries.len();
         let max = self.slot_idx.len();
-        let extra = (len / 8).max(16).min(max.saturating_sub(len)).max(1);
+        let extra = (len / 16).max(16).min(max.saturating_sub(len)).max(1);
         self.entries.reserve_exact(extra);
-        self.entry_slot.reserve_exact(extra);
         self.last_access.reserve_exact(extra);
         self.heap_bytes() - before
     }
@@ -1923,16 +1947,15 @@ impl RawSegment {
     /// whose final size is known).
     fn reserve_entries_exact(&mut self, n: usize) {
         self.entries.reserve_exact(n);
-        self.entry_slot.reserve_exact(n);
         self.last_access.reserve_exact(n);
     }
 
-    /// Releases arena slack after deletes once less than half is used.
-    /// Returns the heap bytes freed.
+    /// Compacts the arena (dropping holes and slack) after deletes once less
+    /// than half of it is live. Returns the heap bytes freed.
     #[inline(always)]
     fn maybe_trim_arena(&mut self) -> usize {
         let cap = self.entries.capacity();
-        if cap < 32 || self.entries.len() * 2 >= cap {
+        if cap < 32 || self.items * 2 >= cap {
             return 0;
         }
         self.trim_arena()
@@ -1942,39 +1965,88 @@ impl RawSegment {
     #[inline(never)]
     fn trim_arena(&mut self) -> usize {
         let before = self.heap_bytes();
-        let len = self.entries.len();
-        let keep = len + len / 8;
-        self.entries.shrink_to(keep);
-        self.entry_slot.shrink_to(keep);
-        self.last_access.shrink_to(keep);
+        let keep = self.items + self.items / 16;
+        let mut entries = Vec::with_capacity(keep);
+        let mut access = Vec::with_capacity(keep);
+        // Walk slots, not the arena, so each live entry's slot is repointed
+        // as it moves.
+        for slot in 0..self.slot_idx.len() {
+            let i = self.slot_idx[slot];
+            if i == NO_ENTRY {
+                continue;
+            }
+            self.slot_idx[slot] = entries.len() as u16;
+            entries.push(std::mem::replace(
+                &mut self.entries[i as usize],
+                Self::hole(),
+            ));
+            access.push(self.last_access[i as usize]);
+        }
+        self.entries = entries;
+        self.last_access = access;
+        self.holes.fill(0);
         before - self.heap_bytes()
     }
 
-    /// Removes the entry at arena index `i` (owned by `slot`), moving the
-    /// last entry into its place. Returns the entry and any heap bytes freed.
+    /// The placeholder left in a deleted entry's arena position.
+    #[inline(always)]
+    fn hole() -> RudisEntry {
+        RudisEntry {
+            key: crate::compact::CompactKey::default(),
+            val: RudisValue::Int(0),
+        }
+    }
+
+    /// Removes the entry at arena index `i` (owned by `slot`). The last
+    /// entry is popped; any other leaves a hole for the next insert. Call
+    /// after `mark_slot_free` (which updates `items`). Returns the entry
+    /// and any heap bytes freed.
     #[inline(always)]
     fn take_entry(&mut self, slot: usize, i: usize) -> (RudisEntry, usize) {
         self.slot_idx[slot] = NO_ENTRY;
-        let entry = self.entries.swap_remove(i);
-        self.entry_slot.swap_remove(i);
-        self.last_access.swap_remove(i);
-        if let Some(&moved) = self.entry_slot.get(i) {
-            self.slot_idx[moved as usize] = i as u16;
+        let entry = if i + 1 == self.entries.len() {
+            self.last_access.pop();
+            self.entries.pop().expect("arena entry")
+        } else {
+            self.holes[i / 64] |= 1 << (i % 64);
+            std::mem::replace(&mut self.entries[i], Self::hole())
+        };
+        if self.items == 0 {
+            self.entries.clear();
+            self.last_access.clear();
+            self.holes.fill(0);
         }
         (entry, self.maybe_trim_arena())
+    }
+
+    /// Takes the lowest hole, if any, for reuse.
+    #[inline(always)]
+    fn take_hole(&mut self) -> Option<usize> {
+        if self.entries.len() == self.items {
+            return None;
+        }
+        for (w, word) in self.holes.iter_mut().enumerate() {
+            if *word != 0 {
+                let b = word.trailing_zeros() as usize;
+                *word &= !(1 << b);
+                return Some(w * 64 + b);
+            }
+        }
+        None
     }
 
     /// Checks the slot/arena cross-links. Test and debug use only: O(slots).
     #[cfg(test)]
     pub fn check_invariants(&self) {
-        assert_eq!(self.entries.len(), self.items);
-        assert_eq!(self.entry_slot.len(), self.items);
-        assert_eq!(self.last_access.len(), self.items);
-        for (i, &slot) in self.entry_slot.iter().enumerate() {
-            assert_eq!(
-                self.slot_idx[slot as usize] as usize, i,
-                "slot {slot} -> {i}"
-            );
+        let holes: usize = self.holes.iter().map(|w| w.count_ones() as usize).sum();
+        assert_eq!(self.entries.len(), self.items + holes);
+        assert_eq!(self.last_access.len(), self.entries.len());
+        let mut seen = vec![false; self.entries.len()];
+        for &i in self.slot_idx.iter().filter(|&&i| i != NO_ENTRY) {
+            let i = i as usize;
+            assert!(Self::is_live(&self.holes, i), "slot points at hole {i}");
+            assert!(!seen[i], "arena index {i} linked twice");
+            seen[i] = true;
         }
         let linked = self.slot_idx.iter().filter(|&&i| i != NO_ENTRY).count();
         assert_eq!(linked, self.items);
@@ -2205,7 +2277,12 @@ impl RawSegment {
     #[inline(always)]
     pub fn insert_at(&mut self, entry: RudisEntry, h: u64, insert_idx: usize) -> usize {
         let tag = fingerprint(h);
-        let grown = self.reserve_entry();
+        let hole = self.take_hole();
+        let grown = if hole.is_none() {
+            self.reserve_entry()
+        } else {
+            0
+        };
         if insert_idx < self.capacity {
             let was_empty = self.ctrl[insert_idx] == EMPTY;
             self.set_ctrl(insert_idx, tag);
@@ -2219,10 +2296,16 @@ impl RawSegment {
             self.growth_left = self.growth_left.saturating_sub(1);
         }
         debug_assert_eq!(self.slot_idx[insert_idx], NO_ENTRY);
-        self.slot_idx[insert_idx] = self.entries.len() as u16;
-        self.entries.push(entry);
-        self.entry_slot.push(insert_idx as u16);
-        self.last_access.push(lru_now());
+        let i = if let Some(i) = hole {
+            self.entries[i] = entry;
+            self.last_access[i] = lru_now();
+            i
+        } else {
+            self.entries.push(entry);
+            self.last_access.push(lru_now());
+            self.entries.len() - 1
+        };
+        self.slot_idx[insert_idx] = i as u16;
         self.items += 1;
         grown
     }
@@ -2231,7 +2314,7 @@ impl RawSegment {
     fn insert_migrated(&mut self, entry: RudisEntry, h: u64, access: u16) {
         let (_, idx) = self.find_or_prepare_insert_raw(&entry.key, h);
         self.insert_at(entry, h, idx);
-        if let Some(a) = self.last_access.last_mut() {
+        if let Some(a) = self.slot_access_mut(idx) {
             *a = access;
         }
     }
@@ -2291,7 +2374,7 @@ impl RawSegment {
 
     pub fn rebuild(&mut self, new_cap: usize) {
         let mut next = RawSegment::new(new_cap, self.local_depth);
-        next.reserve_entries_exact(self.entries.len());
+        next.reserve_entries_exact(self.items);
         for (entry, access) in self.drain_entries() {
             let h = mix_hash(hash_key(&entry.key));
             next.insert_migrated(entry, h, access);
@@ -2307,8 +2390,8 @@ impl RawSegment {
         self.ctrl.capacity()
             + self.slot_idx.capacity() * std::mem::size_of::<u16>()
             + self.entries.capacity() * std::mem::size_of::<RudisEntry>()
-            + self.entry_slot.capacity() * std::mem::size_of::<u16>()
             + self.last_access.capacity() * std::mem::size_of::<u16>()
+            + self.holes.capacity() * std::mem::size_of::<u64>()
     }
 }
 
