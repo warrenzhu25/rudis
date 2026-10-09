@@ -297,9 +297,11 @@ mod tests {
         assert!(thread_net_bytes() - before >= 1 << 20);
         let w: Vec<u8> = vec![1u8; 1 << 20];
         let mid = thread_net_bytes();
+        // While `w` is live, so the process-wide count can't depend on what
+        // other tests happen to hold.
+        assert!(global_allocated().is_some_and(|g| g >= 1 << 20));
         drop(w);
         assert!(mid - thread_net_bytes() >= 1 << 20);
-        assert!(global_allocated().is_some_and(|g| g >= 1 << 20));
     }
 
     #[test]
