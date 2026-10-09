@@ -45,3 +45,8 @@ lto = "fat"
 codegen-units = 1
 
 
+
+# monoio 0.2.4 with Rudis's cross-thread wake and idle-poll changes; see
+# vendor/monoio/RUDIS_PATCHES.md. Upstream: https://github.com/bytedance/monoio
+[patch.crates-io]
+monoio = { path = "vendor/monoio" }
