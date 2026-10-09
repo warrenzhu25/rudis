@@ -2263,7 +2263,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
         if cmd.is_write_command() && !crate::connection::dirty_counted_on_change(&cmd) {
             crate::snapshot::note_write();
         }
-        crate::connection::inc_active_client_tot_cmds();
+        crate::connection::inc_active_client_tot_cmds(port);
         if crate::connection::has_monitor_clients() {
             let monitor_argv = crate::slowlog::command_to_monitor_argv(&cmd);
             crate::connection::broadcast_monitor(port, "lua", &monitor_argv);
@@ -2441,7 +2441,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
         if cmd.is_write_command() && !crate::connection::dirty_counted_on_change(&cmd) {
             crate::snapshot::note_write();
         }
-        crate::connection::inc_active_client_tot_cmds();
+        crate::connection::inc_active_client_tot_cmds(port);
         if crate::connection::has_monitor_clients() {
             let monitor_argv = crate::slowlog::command_to_monitor_argv(&cmd);
             crate::connection::broadcast_monitor(port, "lua", &monitor_argv);

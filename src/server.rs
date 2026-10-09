@@ -455,7 +455,9 @@ pub fn run_shard_worker(
                         let _ = responder.send(());
                     }
                     ShardMessage::FastGet { descriptor } => {
+                        let prev_no_touch = crate::connection::CLIENT_NO_TOUCH.replace(descriptor.no_touch);
                         let val = cross_shard_db.borrow_mut().get_checked(&descriptor.key);
+                        crate::connection::CLIENT_NO_TOUCH.set(prev_no_touch);
                         if let Ok(Some(v)) = val {
                             descriptor.finish(Some(v));
                         } else if val.is_err() {
@@ -652,6 +654,8 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         responder,
                         is_resp3,
                         client_id,
+                        no_touch,
+                        defer_bcast,
                     } => {
                         let has_tier_manager = cross_shard_db.borrow().tier_manager.is_some();
                         let needs_async = false;
@@ -1050,16 +1054,13 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             });
                         } else {
                             crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
+                            let prev_no_touch = crate::connection::CLIENT_NO_TOUCH.replace(no_touch);
+                            let prev_defer = crate::connection::DEFER_BCAST_FLUSH.replace(defer_bcast);
                             let has_tracking = crate::connection::HAS_TRACKING_CLIENTS
                                 .load(std::sync::atomic::Ordering::Relaxed);
-                            // Run as the requesting client: with 0, reads would
-                            // be charged to whichever client last ran a command
-                            // on any shard (`ACTIVE_COMMAND_CLIENT_ID`).
-                            let prev_cid = if has_tracking {
-                                crate::connection::CURRENT_CLIENT_ID.replace(client_id)
-                            } else {
-                                0
-                            };
+                            // Run as the requesting client (tracked reads, NOLOOP,
+                            // script stats).
+                            let prev_cid = crate::connection::CURRENT_CLIENT_ID.replace(client_id);
                             let mut db = cross_shard_db.borrow_mut();
                             let aof_ref = cross_shard_aof.as_deref();
                             let mut temp_buf = Vec::new();
@@ -1473,9 +1474,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             }
                             db.drain_dropped_tier();
                             drop(db);
-                            if has_tracking {
-                                crate::connection::CURRENT_CLIENT_ID.set(prev_cid);
-                            }
+                            crate::connection::CURRENT_CLIENT_ID.set(prev_cid);
+                            crate::connection::CLIENT_NO_TOUCH.set(prev_no_touch);
+                            crate::connection::DEFER_BCAST_FLUSH.set(prev_defer);
                             if has_writes {
                                 cross_shard_router.check_auto_tier_after_write();
                             }
@@ -1561,7 +1562,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         shard_id,
                         mut keys,
                         descriptor,
+                        no_touch,
                     } => {
+                        let prev_no_touch = crate::connection::CLIENT_NO_TOUCH.replace(no_touch);
                         let mut db = cross_shard_db.borrow_mut();
                         let has_tiering = db.tier_manager.is_some();
                         let mut cold_keys = None;
@@ -1584,6 +1587,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                 }
                             }
                         }
+                        crate::connection::CLIENT_NO_TOUCH.set(prev_no_touch);
 
                         if let Some(cold_keys) = cold_keys {
                             drop(db);

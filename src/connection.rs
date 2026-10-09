@@ -299,6 +299,9 @@ thread_local! {
     pub static EXECUTING_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static DEFER_BCAST_FLUSH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub static PRE_CMD_TRACK_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// `CLIENT NO-TOUCH` of the client whose command runs (per client, like
+    /// Redis: reads by this client leave LRU/LFU data untouched).
+    pub static CLIENT_NO_TOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Clients of this shard thread whose EXEC is running. A transaction
     /// awaits cross-shard work mid-way, letting other connections' tasks run
     /// on this thread, so "in a transaction" has to be per client, not a
@@ -309,9 +312,9 @@ thread_local! {
 }
 
 /// The client whose command this shard thread is running, from
-/// thread-local state only (0 if none). Unlike `ACTIVE_COMMAND_CLIENT_ID`,
-/// which every shard thread overwrites, this can't name another thread's
-/// client; pass it along with work sent to other shards.
+/// thread-local state only (0 if none). Pass it along with work sent to
+/// other shards; there is deliberately no process-wide "active client"
+/// (every shard thread would overwrite it).
 #[inline]
 pub fn requesting_client_id() -> u64 {
     let c = CURRENT_CLIENT_ID.get();
@@ -337,11 +340,6 @@ fn exit_tx(client_id: u64) {
         }
     });
 }
-
-pub static ACTIVE_COMMAND_CLIENT_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static DEFER_BCAST_FLUSH_GLOBAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// While maxmemory eviction runs on behalf of a client (locally or for
@@ -1521,11 +1519,9 @@ static GLOBAL_CLIENTS: std::sync::LazyLock<
     parking_lot::RwLock<hashbrown::HashMap<(u16, u64), GlobalClientEntry>>,
 > = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 
-pub static ACTIVE_COMMAND_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-
-pub fn inc_active_client_tot_cmds() {
-    let port = ACTIVE_COMMAND_PORT.load(std::sync::atomic::Ordering::Relaxed);
-    let cid = ACTIVE_COMMAND_CLIENT_ID.load(std::sync::atomic::Ordering::Relaxed);
+/// Counts a command a script ran towards its calling client's `tot_cmds`.
+pub fn inc_active_client_tot_cmds(port: u16) {
+    let cid = requesting_client_id();
     if cid > 0
         && let Some(entry) = GLOBAL_CLIENTS.read().get(&(port, cid))
     {
@@ -1939,7 +1935,8 @@ fn send_raw_to_client_entry(target_id: u64, entry: &GlobalClientEntry, msg: Vec<
         if local != 0 {
             local
         } else {
-            ACTIVE_COMMAND_CLIENT_ID.load(std::sync::atomic::Ordering::Relaxed)
+            // A shard running another shard's batch for this client.
+            CURRENT_CLIENT_ID.get()
         }
     };
     if target_id == exec_cid {
@@ -2120,8 +2117,7 @@ pub fn notify_key_invalidation(port: u16, key: &[u8], sender_client_id: u64) {
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let defer_bcast = DEFER_BCAST_FLUSH.get()
-        || DEFER_BCAST_FLUSH_GLOBAL.load(std::sync::atomic::Ordering::Relaxed);
+    let defer_bcast = DEFER_BCAST_FLUSH.get();
     let mut map = TRACKING_CLIENTS.write();
     let clients = GLOBAL_CLIENTS.read();
     for tracker in map.values_mut() {
@@ -2488,8 +2484,6 @@ pub static HASH_MAX_ENTRIES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(512);
 pub static HASH_MAX_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 pub static ALLOW_ACCESS_EXPIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-pub static CLIENT_NO_TOUCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub static PAUSE_CRON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static ACTIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -3164,6 +3158,7 @@ async fn execute_tx_step(
                         .tot_cmds
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                CLIENT_NO_TOUCH.set(false);
                 update_global_client_resp3(router.port, client_id, false);
                 update_global_client_auth(router.port, client_id, "default");
                 unregister_client_tracking(router.port, client_id);
@@ -3262,10 +3257,7 @@ async fn execute_tx_step(
                     let mut should_quit = false;
                     enter_tx(client_id);
                     DEFER_BCAST_FLUSH.set(true);
-                    DEFER_BCAST_FLUSH_GLOBAL.store(true, std::sync::atomic::Ordering::Relaxed);
                     EXECUTING_CLIENT_ID.set(client_id);
-                    ACTIVE_COMMAND_PORT.store(router.port, std::sync::atomic::Ordering::Relaxed);
-                    ACTIVE_COMMAND_CLIENT_ID.store(client_id, std::sync::atomic::Ordering::Relaxed);
                     for q_cmd in queued {
                         let quit = execute_command(
                             q_cmd,
@@ -3287,11 +3279,9 @@ async fn execute_tx_step(
                         broadcast_monitor(router.port, addr_s, &[Bytes::from_static(b"exec")]);
                     }
                     DEFER_BCAST_FLUSH.set(false);
-                    DEFER_BCAST_FLUSH_GLOBAL.store(false, std::sync::atomic::Ordering::Relaxed);
                     exit_tx(client_id);
                     flush_pending_bcast(router.port);
                     EXECUTING_CLIENT_ID.set(0);
-                    ACTIVE_COMMAND_CLIENT_ID.store(0, std::sync::atomic::Ordering::Relaxed);
                     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                         c.last_active = Instant::now();
                         c.last_cmd = "EXEC";
@@ -3448,13 +3438,17 @@ const REPLICATION_NEEDS_PLAINTEXT: &[u8] =
 /// tasks on a shard thread interleave at every await (a cross-shard hop, a
 /// blocking wait), so each task swaps its own copy in for the duration of
 /// each poll; otherwise a RESP3 client's protocol or one client's id would
-/// leak into another client's replies and tracking.
+/// leak into another client's replies and tracking, and a script could be
+/// ACL-checked as another client's user.
 #[derive(Default)]
 struct ClientThreadLocals {
     resp3: bool,
     client_id: u64,
     executing_client_id: u64,
     defer_bcast_flush: bool,
+    no_touch: bool,
+    /// ACL user scripts check their commands against.
+    auth_user: String,
 }
 
 impl ClientThreadLocals {
@@ -3464,6 +3458,8 @@ impl ClientThreadLocals {
         self.client_id = CURRENT_CLIENT_ID.replace(self.client_id);
         self.executing_client_id = EXECUTING_CLIENT_ID.replace(self.executing_client_id);
         self.defer_bcast_flush = DEFER_BCAST_FLUSH.replace(self.defer_bcast_flush);
+        self.no_touch = CLIENT_NO_TOUCH.replace(self.no_touch);
+        CURRENT_AUTH_USER.with(|u| std::mem::swap(&mut *u.borrow_mut(), &mut self.auth_user));
     }
 }
 
@@ -4491,6 +4487,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                     *authenticated = !default_requires_auth;
                     *auth_user = "default".to_string();
 
+                    CLIENT_NO_TOUCH.set(false);
                     out.extend_from_slice(b"+RESET\r\n");
                     return false;
                 }
@@ -4922,6 +4919,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                 *authenticated = !default_requires_auth;
                 *auth_user = "default".to_string();
 
+                CLIENT_NO_TOUCH.set(false);
                 out.extend_from_slice(b"+RESET\r\n");
                 false
             }
@@ -7771,38 +7769,23 @@ async fn execute_command(
     struct ExecutingClientGuard {
         prev_local: u64,
         prev_exec: u64,
-        has_active_global: bool,
         stats: Option<std::sync::Arc<ClientStats>>,
     }
     impl Drop for ExecutingClientGuard {
         fn drop(&mut self) {
             CURRENT_CLIENT_ID.set(self.prev_local);
             EXECUTING_CLIENT_ID.set(self.prev_exec);
-            if self.has_active_global {
-                ACTIVE_COMMAND_CLIENT_ID
-                    .store(self.prev_exec, std::sync::atomic::Ordering::Relaxed);
-            }
             if let Some(ref st) = self.stats {
                 st.tot_cmds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
-    let has_active_global = HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
-        || matches!(
-            cmd,
-            Command::Eval { .. } | Command::Evalsha { .. } | Command::Fcall { .. }
-        );
     let _exec_client_guard = ExecutingClientGuard {
         prev_local: CURRENT_CLIENT_ID.replace(client_id),
         prev_exec: EXECUTING_CLIENT_ID.replace(client_id),
-        has_active_global,
         stats: client_stats,
     };
-    if has_active_global {
-        ACTIVE_COMMAND_PORT.store(router.port, std::sync::atomic::Ordering::Relaxed);
-        ACTIVE_COMMAND_CLIENT_ID.store(client_id, std::sync::atomic::Ordering::Relaxed);
-    }
 
     let is_caching_or_trackinginfo = matches!(
         cmd,
@@ -8394,12 +8377,10 @@ async fn execute_command(
             // Each owner shard logs and replicates its part of the MSET.
             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                 let was_defer = DEFER_BCAST_FLUSH.replace(true);
-                DEFER_BCAST_FLUSH_GLOBAL.store(true, std::sync::atomic::Ordering::Relaxed);
                 for (key, _) in &pairs {
                     notify_key_invalidation(router.port, key.as_ref(), client_id);
                 }
                 DEFER_BCAST_FLUSH.set(was_defer);
-                DEFER_BCAST_FLUSH_GLOBAL.store(was_defer, std::sync::atomic::Ordering::Relaxed);
                 if !was_defer {
                     flush_pending_bcast(router.port);
                 }
@@ -10884,7 +10865,7 @@ async fn execute_command(
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 ClientSubcommand::NoTouch(enabled) => {
-                    CLIENT_NO_TOUCH.store(enabled, std::sync::atomic::Ordering::Relaxed);
+                    CLIENT_NO_TOUCH.set(enabled);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 ClientSubcommand::NoEvict(_) => {
@@ -12366,9 +12347,6 @@ async fn execute_command(
                 wait_for_blocked_result(&rx, timeout, raw_fd).await;
             CURRENT_CLIENT_ID.set(client_id);
             EXECUTING_CLIENT_ID.set(client_id);
-            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                ACTIVE_COMMAND_CLIENT_ID.store(client_id, std::sync::atomic::Ordering::Relaxed);
-            }
             if client_disconnected {
                 return true;
             }
@@ -13237,6 +13215,7 @@ async fn execute_command(
             let default_requires_auth = acl.read().is_auth_required_for_default();
             *authenticated = !default_requires_auth;
             *auth_user = "default".to_string();
+            CLIENT_NO_TOUCH.set(false);
             out.extend_from_slice(b"+RESET\r\n");
             false
         }
@@ -16530,16 +16509,9 @@ pub fn execute_local_command(
     aof: Option<&RefCell<crate::aof::AofWriter>>,
 ) -> bool {
     db.hydrate_cmd_keys(cmd);
-    let cid = {
-        let local = CURRENT_CLIENT_ID.get();
-        if local != 0 {
-            local
-        } else if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-            ACTIVE_COMMAND_CLIENT_ID.load(std::sync::atomic::Ordering::Relaxed)
-        } else {
-            0
-        }
-    };
+    // The client this command runs for, 0 for internal work (replication,
+    // expiry, eviction); the connection path and shard batches set it.
+    let cid = CURRENT_CLIENT_ID.get();
     macro_rules! record_change {
         ($cmd_expr:expr) => {
             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed)
@@ -24142,6 +24114,8 @@ async fn flush_remote_batches(
                 responder: responder.clone(),
                 is_resp3,
                 client_id: requesting_client_id(),
+                no_touch: CLIENT_NO_TOUCH.get(),
+                defer_bcast: DEFER_BCAST_FLUSH.get(),
             };
             if router.senders[target_shard].send(msg).is_ok() {
                 pending_mask |= 1u64 << target_shard;
@@ -24511,9 +24485,6 @@ async fn blmove_across_shards(
     let (recv_res, client_disconnected) = wait_for_blocked_result(&rx, timeout, raw_fd).await;
     CURRENT_CLIENT_ID.set(client_id);
     EXECUTING_CLIENT_ID.set(client_id);
-    if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-        ACTIVE_COMMAND_CLIENT_ID.store(client_id, std::sync::atomic::Ordering::Relaxed);
-    }
 
     let push = |key: &Bytes, dir: crate::table::ListDirection, elem: Bytes| {
         let values = smallvec::smallvec![elem];

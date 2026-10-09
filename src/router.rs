@@ -1743,6 +1743,7 @@ impl Router {
                     shard_id: target_shard,
                     keys: items,
                     descriptor: descriptor.clone(),
+                    no_touch: crate::connection::CLIENT_NO_TOUCH.get(),
                 };
                 if self.senders[target_shard].send(msg).is_err() {
                     descriptor.finish_shard();
@@ -1858,6 +1859,7 @@ impl Router {
                     shard_id: target_shard,
                     keys: items,
                     descriptor: descriptor.clone(),
+                    no_touch: crate::connection::CLIENT_NO_TOUCH.get(),
                 };
                 if self.senders[target_shard].send(msg).is_err() {
                     descriptor.finish_shard();
@@ -2801,6 +2803,8 @@ impl Router {
             responder: responder.clone(),
             is_resp3,
             client_id: crate::connection::requesting_client_id(),
+            no_touch: crate::connection::CLIENT_NO_TOUCH.get(),
+            defer_bcast: crate::connection::DEFER_BCAST_FLUSH.get(),
         };
         let res = if self.senders[target].send(msg).is_ok() {
             let mut completed = false;
@@ -2880,6 +2884,8 @@ impl Router {
                 responder: responder.clone(),
                 is_resp3,
                 client_id: crate::connection::requesting_client_id(),
+                no_touch: crate::connection::CLIENT_NO_TOUCH.get(),
+                defer_bcast: crate::connection::DEFER_BCAST_FLUSH.get(),
             };
             let sent = self.senders[target].send(msg).is_ok();
             pending.push((responder, sent));
@@ -4718,6 +4724,7 @@ mod tests {
                         shard_id,
                         mut keys,
                         descriptor,
+                        ..
                     } => {
                         for (idx, key) in &keys {
                             let val = db.get(key);
@@ -4882,6 +4889,7 @@ mod tests {
                         shard_id,
                         mut keys,
                         descriptor,
+                        ..
                     } => {
                         for (idx, key) in &keys {
                             let val = remote_db.get(key);
@@ -4979,6 +4987,7 @@ mod tests {
                         shard_id,
                         mut keys,
                         descriptor,
+                        ..
                     } => {
                         for (idx, key) in &keys {
                             let val = remote_db.get(key);
@@ -5165,6 +5174,7 @@ mod tests {
                         shard_id,
                         mut keys,
                         descriptor,
+                        ..
                     } => {
                         for (idx, key) in &keys {
                             let val = remote_db.get(key);
@@ -5296,6 +5306,7 @@ mod tests {
                         shard_id,
                         mut keys,
                         descriptor,
+                        ..
                     } => {
                         for (idx, key) in &keys {
                             let val = remote_db.get(key);
@@ -5402,6 +5413,7 @@ mod tests {
                         shard_id,
                         mut keys,
                         descriptor,
+                        ..
                     } => {
                         for (idx, key) in &keys {
                             let val = remote_db.get(key);

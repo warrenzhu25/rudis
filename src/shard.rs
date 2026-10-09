@@ -406,6 +406,11 @@ pub enum ShardMessage {
         /// The client the commands run for (0 if none), so the owning shard
         /// records tracked reads and NOLOOP writes against it.
         client_id: u64,
+        /// The requesting client's `CLIENT NO-TOUCH`.
+        no_touch: bool,
+        /// Defer tracking broadcasts until the requesting client's EXEC
+        /// ends (it flushes them).
+        defer_bcast: bool,
     },
     Mget {
         keys: Vec<(usize, Option<Bytes>)>,
@@ -415,6 +420,8 @@ pub enum ShardMessage {
         shard_id: usize,
         keys: Vec<(usize, Bytes)>,
         descriptor: std::sync::Arc<crate::mailbox::ScatterMgetDescriptor>,
+        /// The requesting client's `CLIENT NO-TOUCH`.
+        no_touch: bool,
     },
     Mset {
         pairs: Vec<(Bytes, Bytes)>,

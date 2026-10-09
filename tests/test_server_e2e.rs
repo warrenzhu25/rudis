@@ -21925,3 +21925,67 @@ fn test_maxmemory_enforced_by_allocator_count_for_hashes() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+/// `CLIENT NO-TOUCH` is per client: it used to be a process-wide flag, so one
+/// client turning it on stopped every client's reads from updating LRU data.
+/// Keys span all shards, so reads also go through other shards' batches.
+#[test]
+fn test_client_no_touch_is_per_client_e2e() {
+    let port = 17936u16;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--bind",
+            "127.0.0.1",
+        ],
+        port,
+    );
+    let mut a = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut b = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    a.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(resp_cmd(&mut a, &["CLIENT", "NO-TOUCH", "ON"]), "+OK\r\n");
+    let keys: Vec<String> = (0..16).map(|i| format!("nt:{i}")).collect();
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut b, &["SET", k, "v"]), "+OK\r\n");
+    }
+    thread::sleep(Duration::from_millis(2100));
+    for (i, k) in keys.iter().enumerate() {
+        // Even keys read by the NO-TOUCH client, odd ones by the other.
+        let c = if i % 2 == 0 { &mut a } else { &mut b };
+        assert_eq!(resp_cmd(c, &["GET", k]), "$1\r\nv\r\n");
+    }
+    for (i, k) in keys.iter().enumerate() {
+        let idle: u64 = resp_cmd(&mut b, &["OBJECT", "IDLETIME", k])
+            .trim()
+            .trim_start_matches(':')
+            .parse()
+            .unwrap();
+        if i % 2 == 0 {
+            assert!(
+                idle >= 2,
+                "{k}: NO-TOUCH read touched the key (idle {idle})"
+            );
+        } else {
+            assert!(
+                idle <= 1,
+                "{k}: normal read did not touch the key (idle {idle})"
+            );
+        }
+    }
+    // RESET turns NO-TOUCH off.
+    assert_eq!(resp_cmd(&mut a, &["RESET"]), "+RESET\r\n");
+    assert_eq!(resp_cmd(&mut a, &["GET", &keys[0]]), "$1\r\nv\r\n");
+    assert_eq!(
+        resp_cmd(&mut b, &["OBJECT", "IDLETIME", &keys[0]]),
+        ":0\r\n"
+    );
+    drop(a);
+    drop(b);
+    shutdown_and_wait(port, &mut child);
+}

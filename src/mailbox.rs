@@ -441,6 +441,8 @@ pub struct FastGetDescriptor {
     pub wrong_type: AtomicBool,
     pub done: AtomicBool,
     pub bell: Doorbell,
+    /// The requesting client's `CLIENT NO-TOUCH`.
+    pub no_touch: bool,
 }
 
 // SAFETY: Every field is itself Send; `UnsafeCell<T>` is Send for `T: Send`.
@@ -460,6 +462,7 @@ impl FastGetDescriptor {
             wrong_type: AtomicBool::new(false),
             done: AtomicBool::new(false),
             bell: Doorbell::new(),
+            no_touch: crate::connection::CLIENT_NO_TOUCH.get(),
         }
     }
 

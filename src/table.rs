@@ -3779,7 +3779,7 @@ impl RudisTable {
                 RudisValue::HyperLogLog(regs) => Ok(Some(Bytes::copy_from_slice(&regs[..]))),
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             };
-            if !crate::connection::CLIENT_NO_TOUCH.load(std::sync::atomic::Ordering::Relaxed) {
+            if !crate::connection::CLIENT_NO_TOUCH.get() {
                 self.table.touch_slot(idx);
             }
             res
@@ -3842,7 +3842,7 @@ impl RudisTable {
                 ))),
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             };
-            if !crate::connection::CLIENT_NO_TOUCH.load(std::sync::atomic::Ordering::Relaxed) {
+            if !crate::connection::CLIENT_NO_TOUCH.get() {
                 self.table.touch_slot(idx);
             }
             res
@@ -3887,7 +3887,7 @@ impl RudisTable {
                 }
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             };
-            if !crate::connection::CLIENT_NO_TOUCH.load(std::sync::atomic::Ordering::Relaxed) {
+            if !crate::connection::CLIENT_NO_TOUCH.get() {
                 self.table.touch_slot(idx);
             }
             res
