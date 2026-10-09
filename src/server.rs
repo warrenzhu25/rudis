@@ -1880,14 +1880,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     ShardMessage::ReleaseTxLock { tx_id } => {
                         let mut lock = cross_shard_tx_lock.borrow_mut();
                         if *lock == Some(tx_id) {
-                            if let Some((next_tx, next_resp)) =
-                                cross_shard_tx_waiters.borrow_mut().pop_front()
-                            {
-                                *lock = Some(next_tx);
-                                let _ = next_resp.send(());
-                            } else {
-                                *lock = None;
-                            }
+                            *lock = crate::router::grant_next_tx_lock(
+                                &mut cross_shard_tx_waiters.borrow_mut(),
+                            );
                         }
                     }
                     ShardMessage::RestoreRdbChunk {

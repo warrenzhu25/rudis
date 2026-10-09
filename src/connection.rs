@@ -341,6 +341,52 @@ fn exit_tx(client_id: u64) {
     });
 }
 
+/// Undoes what a running EXEC set up: the in-transaction mark, deferred
+/// tracking broadcasts, the cross-shard (VLL) locks and the pause of
+/// blocking-client notifications. Runs on drop, so it also happens when the
+/// EXEC future is dropped part-way: connection tasks run under
+/// `catch_unwind`, and a panicking queued command used to leave the port's
+/// blocked clients never woken again and the locked shards closed to every
+/// later multi-shard transaction.
+struct ExecCleanup<'a> {
+    router: &'a Router,
+    client_id: u64,
+    locks: Option<(Vec<usize>, u64)>,
+    hub: Option<std::sync::Arc<parking_lot::Mutex<crate::block::BlockHub>>>,
+}
+
+impl Drop for ExecCleanup<'_> {
+    fn drop(&mut self) {
+        DEFER_BCAST_FLUSH.set(false);
+        exit_tx(self.client_id);
+        flush_pending_bcast(self.router.port);
+        EXECUTING_CLIENT_ID.set(0);
+        if let Some((shards, tx_id)) = self.locks.take() {
+            self.router.release_tx_locks_now(&shards, tx_id);
+        }
+        if let Some(hub_arc) = self.hub.take() {
+            let pending = hub_arc.lock().resume();
+            for k in pending {
+                let shard_id = self.router.target_shard(&k);
+                // `try_borrow_mut`: when unwinding, a borrow may still be
+                // live higher up; hand the key to the shard's own mailbox.
+                let local = (shard_id == self.router.shard_id)
+                    .then(|| self.router.local_db.try_borrow_mut().ok())
+                    .flatten();
+                if let Some(mut local_db) = local {
+                    let mut hub = hub_arc.lock();
+                    hub.notify_stream(&mut local_db, &k);
+                    hub.notify_list(&mut local_db.table, &k);
+                    hub.notify_zset(&mut local_db.table, &k);
+                } else {
+                    let _ = self.router.senders[shard_id]
+                        .send(ShardMessage::NotifyList { keys: vec![k] });
+                }
+            }
+        }
+    }
+}
+
 thread_local! {
     /// While maxmemory eviction runs on behalf of a client (locally or for
     /// a remote shard's request), that client's id and the tracking
@@ -3241,16 +3287,24 @@ async fn execute_tx_step(
                     sorted_shards.sort_unstable();
 
                     let use_vll = sorted_shards.len() > 1;
-                    let tx_id = if use_vll {
-                        let id = next_tx_id();
-                        router.acquire_tx_locks(&sorted_shards, id).await;
-                        id
-                    } else {
-                        0
+                    // Armed before anything it undoes, so a drop at any await
+                    // below (a panicking queued command isolates the
+                    // connection) still releases everything.
+                    let mut cleanup = ExecCleanup {
+                        router,
+                        client_id,
+                        locks: None,
+                        hub: None,
                     };
+                    if use_vll {
+                        let id = next_tx_id();
+                        cleanup.locks = Some((sorted_shards.clone(), id));
+                        router.acquire_tx_locks(&sorted_shards, id).await;
+                    }
 
                     let hub_arc = crate::block::get_block_hub_for_port(router.port);
                     hub_arc.lock().pause();
+                    cleanup.hub = Some(hub_arc);
 
                     let count = tx_queue.len();
                     out_buf.extend_from_slice(format!("*{}\r\n", count).as_bytes());
@@ -3279,33 +3333,11 @@ async fn execute_tx_step(
                     if let Some(ref addr_s) = monitor_addr {
                         broadcast_monitor(router.port, addr_s, &[Bytes::from_static(b"exec")]);
                     }
-                    DEFER_BCAST_FLUSH.set(false);
-                    exit_tx(client_id);
-                    flush_pending_bcast(router.port);
-                    EXECUTING_CLIENT_ID.set(0);
                     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                         c.last_active = Instant::now();
                         c.last_cmd = "EXEC";
                     }
-
-                    if use_vll {
-                        router.release_tx_locks(&sorted_shards, tx_id).await;
-                    }
-
-                    let pending = hub_arc.lock().resume();
-                    for k in pending {
-                        let shard_id = router.target_shard(&k);
-                        if shard_id == router.shard_id {
-                            let mut local_db = router.local_db.borrow_mut();
-                            let mut hub = hub_arc.lock();
-                            hub.notify_stream(&mut local_db, &k);
-                            hub.notify_list(&mut local_db.table, &k);
-                            hub.notify_zset(&mut local_db.table, &k);
-                        } else {
-                            let _ = router.senders[shard_id]
-                                .send(ShardMessage::NotifyList { keys: vec![k] });
-                        }
-                    }
+                    drop(cleanup);
                     should_quit
                 }
             }

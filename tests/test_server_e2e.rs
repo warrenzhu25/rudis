@@ -21989,3 +21989,77 @@ fn test_client_no_touch_is_per_client_e2e() {
     drop(b);
     shutdown_and_wait(port, &mut child);
 }
+
+/// A queued command that panics inside EXEC isolates (drops) the connection
+/// mid-transaction. EXEC must still undo its side effects: the pause of
+/// blocking-client notifications (else blocked clients on the port are never
+/// woken again) and its cross-shard locks (else every later multi-shard
+/// transaction on those shards waits forever).
+#[test]
+fn test_exec_dropped_by_panic_releases_pause_and_locks_e2e() {
+    let port = 17937u16;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--bind",
+            "127.0.0.1",
+        ],
+        port,
+    );
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    // Eight keys span the shards, so EXEC takes VLL locks.
+    let keys: Vec<String> = (0..8).map(|i| format!("vll:{i}")).collect();
+
+    let mut blocked = connect();
+    blocked
+        .write_all(b"*3\r\n$5\r\nBLPOP\r\n$9\r\nexec:list\r\n$1\r\n0\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    let mut a = connect();
+    assert_eq!(resp_cmd(&mut a, &["MULTI"]), "+OK\r\n");
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut a, &["SET", k, "1"]), "+QUEUED\r\n");
+    }
+    assert_eq!(resp_cmd(&mut a, &["DEBUG", "PANIC"]), "+QUEUED\r\n");
+    a.write_all(b"*1\r\n$4\r\nEXEC\r\n").unwrap();
+    // The connection is isolated: closed (or reset) without a full reply.
+    let mut buf = [0u8; 4096];
+    let mut got = Vec::new();
+    loop {
+        match a.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    drop(a);
+
+    let mut c = connect();
+    // The blocked client is woken.
+    assert_eq!(resp_cmd(&mut c, &["LPUSH", "exec:list", "x"]), ":1\r\n");
+    let mut reply = Vec::new();
+    while !reply.ends_with(b"x\r\n") {
+        let n = blocked.read(&mut buf).expect("blocked client never woken");
+        assert!(n > 0, "blocked client connection closed");
+        reply.extend_from_slice(&buf[..n]);
+    }
+    // A later multi-shard transaction on the same shards gets the locks.
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut c, &["SET", k, "2"]), "+QUEUED\r\n");
+    }
+    let exec = resp_cmd(&mut c, &["EXEC"]);
+    assert!(exec.starts_with("*8\r\n"), "EXEC reply: {exec:?}");
+    drop(blocked);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

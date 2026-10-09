@@ -263,6 +263,20 @@ pub fn local_real_used(
     net - slack as i64
 }
 
+/// Hands a released VLL lock to the next waiter still waiting. A waiter whose
+/// transaction was dropped while queued (its receiver is gone) is skipped;
+/// granting it would leave the lock held by nobody, forever.
+pub(crate) fn grant_next_tx_lock(
+    waiters: &mut std::collections::VecDeque<(u64, flume::Sender<()>)>,
+) -> Option<u64> {
+    while let Some((next_tx, resp)) = waiters.pop_front() {
+        if resp.send(()).is_ok() {
+            return Some(next_tx);
+        }
+    }
+    None
+}
+
 impl Router {
     /// Logs a mutation applied to this shard's data to the AOF and the
     /// replication stream (see `replication::log_shard_mutation`).
@@ -3720,16 +3734,18 @@ impl Router {
     }
 
     pub async fn release_tx_locks(&self, shard_ids: &[usize], tx_id: u64) {
+        self.release_tx_locks_now(shard_ids, tx_id);
+    }
+
+    /// [`Router::release_tx_locks`] without the `async`; it never waits, so
+    /// it can also run from a drop guard. Releasing a lock `tx_id` does not
+    /// hold is a no-op.
+    pub fn release_tx_locks_now(&self, shard_ids: &[usize], tx_id: u64) {
         for &sid in shard_ids.iter().rev() {
             if sid == self.shard_id {
                 let mut lock = self.tx_lock.borrow_mut();
                 if *lock == Some(tx_id) {
-                    if let Some((next_tx, next_resp)) = self.tx_waiters.borrow_mut().pop_front() {
-                        *lock = Some(next_tx);
-                        let _ = next_resp.send(());
-                    } else {
-                        *lock = None;
-                    }
+                    *lock = grant_next_tx_lock(&mut self.tx_waiters.borrow_mut());
                 }
             } else {
                 let _ = self.senders[sid].send(ShardMessage::ReleaseTxLock { tx_id });
