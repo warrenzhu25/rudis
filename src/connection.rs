@@ -2656,6 +2656,7 @@ pub fn apply_config_value(
         "cross-shard-spin" => {
             crate::mailbox::set_cross_shard_spin(parse_config_num(name, val_str)?)
         }
+        "idle-poll-us" => monoio::set_idle_poll_us(parse_config_num(name, val_str)?),
         "appendfsync" => {
             crate::aof::set_fsync_every_sec(base_port, crate::aof::parse_appendfsync(val_str)?)
         }
@@ -9496,8 +9497,9 @@ async fn execute_command(
                     } else {
                         "no"
                     };
-                    let all_configs: [(&str, String); 50] = [
+                    let all_configs: [(&str, String); 51] = [
                         ("port", port_str),
+                        ("idle-poll-us", monoio::idle_poll_us().to_string()),
                         (
                             "protected-mode",
                             if crate::netsec::protected_mode(router.base_port) {

@@ -46,6 +46,19 @@ pub use driver::LegacyDriver;
 #[cfg(feature = "macros")]
 pub use monoio_macros::{main, test, test_all};
 pub use runtime::{spawn, Runtime};
+
+/// Rudis patch: how long (µs) an io_uring runtime thread busy-polls for new
+/// work before it sleeps in the kernel; 0 (the default) sleeps at once.
+/// While a thread polls it counts as awake, so cross-thread wakes skip the
+/// eventfd write and the woken work starts without a kernel wake-up.
+pub fn set_idle_poll_us(us: u64) {
+    driver::IDLE_POLL_US.store(us, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current [`set_idle_poll_us`] value.
+pub fn idle_poll_us() -> u64 {
+    driver::IDLE_POLL_US.load(std::sync::atomic::Ordering::Relaxed)
+}
 #[cfg(any(all(target_os = "linux", feature = "iouring"), feature = "legacy"))]
 pub use {builder::FusionDriver, runtime::FusionRuntime};
 

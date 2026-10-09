@@ -266,3 +266,6 @@ impl UnparkHandle {
         })
     }
 }
+
+/// Rudis patch: see `crate::set_idle_poll_us`.
+pub(crate) static IDLE_POLL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

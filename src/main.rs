@@ -57,6 +57,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_pin: bool,
 
+    /// Microseconds a shard thread busy-polls for work before sleeping
+    /// (default 0: sleep at once). Overrides `idle-poll-us` in the config file.
+    #[arg(long)]
+    idle_poll_us: Option<u64>,
+
     /// Optional TLS port to listen for secure TLS connections
     #[arg(long)]
     tls_port: Option<u16>,
@@ -234,6 +239,7 @@ fn main() {
 
     rudis::aof::set_aof_load_truncated(server_config.aof_load_truncated);
     rudis::mailbox::set_cross_shard_spin(server_config.cross_shard_spin);
+    monoio::set_idle_poll_us(args.idle_poll_us.unwrap_or(server_config.idle_poll_us));
     if let Some(v) = args.enable_experimental_commands {
         server_config.enable_experimental_commands = match v.to_lowercase().as_str() {
             "yes" => true,

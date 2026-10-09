@@ -64,6 +64,28 @@ fn fatal_startup_error(shard_id: usize, msg: &str) -> ! {
     std::process::exit(1);
 }
 
+/// io_uring settings for shard runtimes. With `COOP_TASKRUN` the kernel
+/// runs a ring's completions when its thread next enters the kernel instead
+/// of interrupting it, and `TASKRUN_FLAG` shows that some are pending, which
+/// the runtime's idle poll (`idle-poll-us`) watches. Both need Linux 5.19;
+/// older kernels get the default ring.
+fn shard_uring_builder() -> io_uring::Builder {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let flags = |b: &mut io_uring::Builder| {
+        b.setup_coop_taskrun().setup_taskrun_flag();
+    };
+    let supported = *SUPPORTED.get_or_init(|| {
+        let mut b = io_uring::IoUring::builder();
+        flags(&mut b);
+        b.build(8).is_ok()
+    });
+    let mut b = io_uring::IoUring::builder();
+    if supported {
+        flags(&mut b);
+    }
+    b
+}
+
 pub fn run_shard_worker(
     shard_id: usize,
     num_shards: usize,
@@ -83,6 +105,7 @@ pub fn run_shard_worker(
 
     let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
         .enable_timer()
+        .uring_builder(shard_uring_builder())
         .build()
         .expect("Failed to initialize Monoio io_uring runtime");
 

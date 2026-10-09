@@ -19,6 +19,10 @@ pub struct RudisConfig {
     pub appendfsync_every_sec: bool,
     /// `cross-shard-spin`: polls before parking on a cross-shard reply.
     pub cross_shard_spin: usize,
+    /// `idle-poll-us`: how long a shard thread busy-polls for work before it
+    /// sleeps (0 = sleep at once). Cuts cross-shard hop latency on a partly
+    /// idle server at the cost of CPU spent polling.
+    pub idle_poll_us: u64,
     /// `enable-experimental-commands`: accept the non-Redis command families
     /// (JSON., BF., FT., CRDT., ...; see `resp::is_experimental_command_name`).
     pub enable_experimental_commands: bool,
@@ -63,6 +67,7 @@ impl Default for RudisConfig {
             appendonly: false,
             appendfsync_every_sec: true,
             cross_shard_spin: 0,
+            idle_poll_us: 0,
             enable_experimental_commands: false,
             aof_load_truncated: true,
             dir: PathBuf::from("."),
@@ -552,6 +557,11 @@ impl RudisConfig {
                         format!("Invalid cross-shard-spin at line {}: {}", line_num + 1, e)
                     })?;
                 }
+                "idle-poll-us" => {
+                    config.idle_poll_us = rest[0].parse::<u64>().map_err(|e| {
+                        format!("Invalid idle-poll-us at line {}: {}", line_num + 1, e)
+                    })?;
+                }
                 "enable-experimental-commands" => {
                     config.enable_experimental_commands = match rest[0].to_lowercase().as_str() {
                         "yes" => true,
@@ -966,6 +976,18 @@ mod tests {
         assert_eq!(c.metrics_bind.to_string(), "0.0.0.0");
         assert!(RudisConfig::parse_str("metrics-port 70000").is_err());
         assert!(RudisConfig::parse_str("metrics-bind localhost:1").is_err());
+    }
+
+    #[test]
+    fn test_parse_idle_poll_us() {
+        assert_eq!(RudisConfig::parse_str("").unwrap().idle_poll_us, 0);
+        assert_eq!(
+            RudisConfig::parse_str("idle-poll-us 50")
+                .unwrap()
+                .idle_poll_us,
+            50
+        );
+        assert!(RudisConfig::parse_str("idle-poll-us -1").is_err());
     }
 
     #[test]

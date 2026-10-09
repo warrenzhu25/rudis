@@ -231,6 +231,16 @@ impl IoUringDriver {
                 need_wait = false;
             }
 
+            // Rudis patch: busy-poll for up to `IDLE_POLL_US` before
+            // sleeping. We stay "awake", so other threads' wakes only queue
+            // the waker (no eventfd write) and run without a kernel wake-up.
+            if need_wait && Self::idle_poll(inner, timeout) {
+                need_wait = false;
+                while let Ok(w) = inner.waker_receiver.try_recv() {
+                    w.wake();
+                }
+            }
+
             // Set status as not awake if we are going to sleep
             if need_wait {
                 inner
@@ -321,6 +331,71 @@ impl IoUringDriver {
         Ok(())
     }
 
+    /// Rudis patch: spins until there is work (a foreign waker or a
+    /// completion), the idle-poll window or `timeout` ends; returns whether
+    /// work arrived. Socket completions are task_work that the kernel runs
+    /// only when this thread enters it (always so with `COOP_TASKRUN`, and
+    /// not reliably while spinning otherwise), so pending task_work (the
+    /// `TASKRUN` flag) and, as a fallback, a periodic tick enter the kernel
+    /// without waiting.
+    #[cfg(feature = "sync")]
+    fn idle_poll(inner: &mut UringInner, timeout: Option<Duration>) -> bool {
+        // From the io_uring uapi; `io_uring::sys` is private.
+        const IORING_ENTER_GETEVENTS: u32 = 1;
+        let us = super::IDLE_POLL_US.load(std::sync::atomic::Ordering::Relaxed);
+        if us == 0 {
+            return false;
+        }
+        let mut limit = Duration::from_micros(us);
+        if let Some(t) = timeout {
+            if t.is_zero() {
+                return false;
+            }
+            limit = limit.min(t);
+        }
+        // Submit what the tasks queued (e.g. a reply's write) first: the
+        // poll must not hold it back for the whole window.
+        if inner.uring.submit().is_err() {
+            return false;
+        }
+        let start = std::time::Instant::now();
+        let mut last_enter = start;
+        let mut spins = 0u32;
+        loop {
+            if !inner.waker_receiver.is_empty() || !inner.uring.completion().is_empty() {
+                return true;
+            }
+            spins = spins.wrapping_add(1);
+            let taskrun = inner.uring.submission().taskrun();
+            if taskrun || spins % 64 == 0 {
+                let now = std::time::Instant::now();
+                if taskrun || now.duration_since(last_enter) >= Duration::from_micros(20) {
+                    last_enter = now;
+                    // SAFETY: a plain io_uring_enter with no submissions and
+                    // no wait, on the ring this thread owns.
+                    let _ = unsafe {
+                        inner.uring.submitter().enter::<libc::sigset_t>(
+                            0,
+                            0,
+                            IORING_ENTER_GETEVENTS,
+                            None,
+                        )
+                    };
+                    continue;
+                }
+                if now.duration_since(start) >= limit {
+                    return false;
+                }
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    #[cfg(not(feature = "sync"))]
+    fn idle_poll(_inner: &mut UringInner, _timeout: Option<Duration>) -> bool {
+        false
+    }
+
     #[cfg(feature = "poll-io")]
     #[inline]
     pub(crate) fn register_poll_io(
@@ -356,6 +431,14 @@ impl Driver for IoUringDriver {
         let inner = unsafe { &mut *self.inner.get() };
         inner.submit()?;
         inner.tick()?;
+        // Rudis patch: run wakes queued by other threads here too. Upstream
+        // runs them only when the thread parks, so a thread that always has
+        // local work delays every cross-thread wake (cross-shard replies)
+        // until its queue drains.
+        #[cfg(feature = "sync")]
+        while let Ok(w) = inner.waker_receiver.try_recv() {
+            w.wake();
+        }
         Ok(())
     }
 
