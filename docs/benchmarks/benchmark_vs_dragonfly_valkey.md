@@ -18,25 +18,18 @@ It is produced by [`scripts/benchmark_vs_dragonfly_valkey.py`](../../scripts/ben
 
 ## 1. Executive Summary
 
-Reading directly from the current result file, Rudis and Dragonfly split the nine workloads: Dragonfly leads
-on single-key, unpipelined operations and on both scattered multi-key workloads, while Rudis leads on
-pipelined throughput at depth 16 and on the co-located multi-key read.
+Measured at Rudis `98ece39` (October 2026; `idle-poll-us 50`, the default) against Dragonfly v1.39.0, both with
+8 threads on cores 0-7. **Rudis matches or beats Dragonfly on all nine workloads.**
 
-* **Pipelined SET (`SET 100% Pipeline 16, 1KB`)**: Rudis **1,485,688 ops/sec** vs. Dragonfly **1,207,022
-  ops/sec** — **+23.1%** for Rudis, with lower p99 tail latency (**1.411 ms** vs. **1.979 ms**).
-* **Pipelined Mixed 50:50 (`Pipeline 16, 1KB`)**: Rudis **1,423,247 ops/sec** vs. Dragonfly **1,006,959
-  ops/sec** — **+41.3%** for Rudis.
-* **Pipelined GET (`Pipeline 16, 1KB`)**: Rudis **1,498,605 ops/sec** vs. Dragonfly **1,527,352 ops/sec** —
-  within **2%**, effectively a statistical tie; this workload also carries the highest measurement noise in
-  the suite (Rudis run-to-run CV ≈ 36%, see Section 3), so the sign of this delta should not be over-read.
-* **Unpipelined single-key ops (`Pipeline 1, 1KB`)**: Dragonfly leads on all three — `SET` by 37.3%, `GET` by
-  25.8%, and `Mixed` by 34.8%. Unpipelined throughput at this payload size is dominated by per-request
-  round-trip and syscall overhead rather than by server-side processing, which favors Dragonfly's proactor
-  model in this configuration.
-* **Scattered multi-key fan-out (`MSET`/`MGET`, 10 keys)**: Dragonfly leads both — `MSET` by 12.3% and `MGET`
-  by 21.7%.
-* **Co-located multi-key read (`MGET 10 Keys {tag}`)**: Rudis **178,046 ops/sec** vs. Dragonfly **175,368
-  ops/sec** — a statistical tie (+1.5%).
+* **Pipelined (depth 16)**: Rudis leads by a wide margin: `SET` 1.60M vs 1.06M
+  (+51%), `GET` 3.25M vs 1.48M
+  (+120%), `Mixed` 2.25M vs 1.18M
+  (+91%), with lower p99 latency.
+* **Unpipelined single-key (depth 1)**: a tie on `SET` (+0.3%), small Rudis leads on `GET` (+4.4%) and `Mixed`
+  (+6.7%). An earlier revision of this document showed Dragonfly ahead by 26-37% here; the cross-shard work
+  since then (Section 5.1) closed that gap.
+* **Multi-key (10 keys)**: Rudis leads scattered `MGET` (+17.7%, previously -21.7%), scattered `MSET` (+33.7%)
+  and co-located `MGET` (+21.2%).
 
 ---
 
@@ -46,7 +39,8 @@ pipelined throughput at depth 16 and on the co-located multi-key read.
 * **Host Machine**: 64 vCPUs (AMD EPYC 7B13 64-Core Processor, 32 physical cores / 64 threads, 1 socket)
 * **Memory**: 117 GiB RAM (100+ GiB available)
 * **OS / Kernel**: Linux 7.1.6-1rodete1-amd64 (`x86_64`)
-* **Host Load**: Verified idle (<1.50 1-minute load average, >98% CPU idle) prior to benchmark execution.
+* **Host Load**: Idle before each run (1-minute load average 0.3-2.7). Background load is the reason the
+  unpipelined cells are measured interleaved (Section 4.1).
 * **CPU Pinning & Isolation**:
   * **Server Processes**: Pinned strictly to cores `0-7` (8 dedicated CPU cores) via `taskset -c 0-7`.
   * **Benchmark Client (`memtier_benchmark`)**: Pinned strictly to cores `32-47` (16 dedicated CPU cores) via `taskset -c 32-47`.
@@ -55,7 +49,7 @@ pipelined throughput at depth 16 and on the co-located multi-key read.
 ### Software & Engine Binaries
 | Engine | Version / Commit | Architecture / Concurrency Model | Flags / Configuration |
 | :--- | :--- | :--- | :--- |
-| **Rudis** | `v0.1.0` (`target/release/rudis`) | Shared-Nothing, Thread-per-Core (8 Monoio `io_uring` reactors) | `--threads 8 --port 6379` |
+| **Rudis** | `98ece39` (`target/release/rudis`) | Shared-Nothing, Thread-per-Core (8 Monoio `io_uring` reactors) | `--threads 8 --port 6379` |
 | **Dragonfly** | `v1.39.0` (commit `699862e5da7c`) | Multi-threaded shared memory fiber proactor (8 threads) | `--proactor_threads=8 --cache_mode=false --dbfilename="" --port 6381` |
 | **Valkey** *(historical only — see notice above)* | `v8.1.9` GA (commit `a9245aaf3`, jemalloc 5.3.0) | Single main execution thread + 8 I/O read/write threads | `--io-threads 8 --io-threads-do-reads yes --protected-mode no --save "" --appendonly no --port 6380` |
 | **Benchmark Tool** | `memtier_benchmark` v2.2.1 | 8 client threads, 8 connections/thread (64 concurrent connections) | `taskset -c 32-47 memtier_benchmark ...` |
@@ -109,43 +103,49 @@ This script:
 
 ## 4. Benchmark Results
 
-### 4.1 Master Throughput & Latency Summary (5 Runs, Mean ± Std)
+### 4.1 Unpipelined and Multi-Key Workloads (interleaved, medians)
 
-Source: `docs/benchmarks/benchmark_comparison_results.json`, `Dragonfly v1.39.0` and `Rudis (Thread-per-core)`
-entries. `Δ` is Rudis relative to Dragonfly.
+These cells are dominated by run-to-run noise when the two engines run back to back: in two 5- and 10-iteration
+runs of `benchmark_vs_dragonfly_valkey.py` the unpipelined means moved by 10-25% between runs for both engines
+(Dragonfly `GET` p1 read 242K, 292K and 319K). They are therefore measured with
+[`scripts/benchmark_interleaved_vs_dragonfly.sh`](../../scripts/benchmark_interleaved_vs_dragonfly.sh): the
+same setup (8 server threads on cores 0-7, memtier 8 threads x 8 connections on cores 32-47, 1 KB values, 64K
+keys), but 10 s timed runs and the engines alternating every round, so host drift hits both equally. Medians of
+5 rounds; "spread" is (max - min) / median.
+
+| Workload | Rudis ops/sec | Dragonfly ops/sec | Δ | Spread (Rudis / Dragonfly) |
+| :--- | :---: | :---: | :---: | :---: |
+| **SET 100% (Pipeline 1, 1KB)** | 274,564 | 273,697 | +0.3% (tie) | 4% / 12% |
+| **GET 100% (Pipeline 1, 1KB)** | **285,500** | 273,525 | **+4.4%** | 6% / 19% |
+| **Mixed 50:50 (Pipeline 1, 1KB)** | **278,013** | 260,521 | **+6.7%** | 7% / 14% |
+| **MSET 10 Keys (Scattered)** | **165,525** | 123,798 | **+33.7%** | 13% / 12% |
+| **MGET 10 Keys (Scattered)** | **152,372** | 129,499 | **+17.7%** | 13% / 20% |
+| **MGET 10 Keys (Co-located `{tag}`)** | **238,016** | 196,397 | **+21.2%** | 14% / 14% |
+
+### 4.2 Pipelined Workloads (`benchmark_vs_dragonfly_valkey.py --df-only -i 10`, mean ± std)
+
+Source: `docs/benchmarks/benchmark_comparison_results.json`. `Δ` is Rudis relative to Dragonfly. The deltas
+here are far larger than the noise.
 
 | Workload | Rudis Ops/sec (Mean ± Std) | Dragonfly Ops/sec (Mean ± Std) | Δ | Rudis p99 | Dragonfly p99 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **SET 100% (Pipeline 1, 1KB)** | 204,822 ± 15,477 | **326,403 ± 31,606** | -37.3% | 0.691 ms | **0.575 ms** |
-| **GET 100% (Pipeline 1, 1KB)** | 238,117 ± 38,393 | **320,829 ± 22,718** | -25.8% | 0.731 ms | **0.719 ms** |
-| **Mixed 50:50 (Pipeline 1, 1KB)** | 224,679 ± 1,534 | **344,438 ± 11,351** | -34.8% | 0.667 ms | **0.487 ms** |
-| **SET 100% (Pipeline 16, 1KB)** | **1,485,688 ± 171,417** | 1,207,022 ± 120,635 | **+23.1%** | **1.411 ms** | 1.979 ms |
-| **GET 100% (Pipeline 16, 1KB)** | 1,498,605 ± 533,044\* | **1,527,352 ± 188,276** | -1.9% | 2.019 ms | **1.947 ms** |
-| **Mixed 50:50 (Pipeline 16, 1KB)** | **1,423,247 ± 96,270** | 1,006,959 ± 75,124 | **+41.3%** | 2.559 ms | **2.895 ms** |
-| **MSET 10 Keys (Scattered)** | 137,203 ± 26,160 | **156,405 ± 20,507** | -12.3% | 1.251 ms | **0.999 ms** |
-| **MGET 10 Keys (Scattered)** | 150,775 ± 18,048 | **192,658 ± 7,021** | -21.7% | 0.859 ms | **0.575 ms** |
-| **MGET 10 Keys (Co-located `{tag}`)** | **178,046 ± 11,759** | 175,368 ± 9,210 | +1.5% | **0.819 ms** | 0.939 ms |
+| **SET 100% (Pipeline 16, 1KB)** | **1,604,125 ± 303,440** | 1,062,850 ± 137,674 | **+50.9%** | **1.973 ms** | 3.492 ms |
+| **GET 100% (Pipeline 16, 1KB)** | **3,247,474 ± 523,692** | 1,479,369 ± 216,519 | **+119.5%** | **1.037 ms** | 2.486 ms |
+| **Mixed 50:50 (Pipeline 16, 1KB)** | **2,252,226 ± 325,593** | 1,180,613 ± 100,805 | **+90.8%** | **1.814 ms** | 2.922 ms |
 
-\* The Rudis `GET 100% (Pipeline 16, 1KB)` run carries a ±533,044 standard deviation on a 1,498,605 mean — a
-coefficient of variation of ~36%, by far the noisiest cell in this table. Treat the -1.9% delta on this row as
-inconclusive rather than a real regression; re-running with a higher iteration count (`-i 10` or more) is
-recommended before drawing a conclusion from this workload specifically.
+The same JSON also holds that run's unpipelined and multi-key cells; use Section 4.1 for those.
 
-### 4.2 Reading the Table
+### 4.3 Reading the Tables
 
-* **Unpipelined workloads (Pipeline 1) favor Dragonfly** by 26-37%, with Dragonfly holding lower p99 latency
-  on `SET` and `Mixed`. At pipeline depth 1, each request is a full round trip, so the server's syscall and
-  scheduling overhead per request dominates; Dragonfly's fiber proactor model apparently amortizes that
-  better than Rudis's shared-nothing shard dispatch in this configuration.
-* **Pipelined workloads (Pipeline 16) mostly favor Rudis**: `SET` (+23.1%) and `Mixed` (+41.3%) both show
-  clear wins with lower tail latency; `GET` is a statistical tie once the noise in that cell (see note above)
-  is accounted for.
-* **Scattered multi-key commands favor Dragonfly**: fanning a single client command out across independently
-  owned shards and re-assembling the reply currently costs Rudis more than it costs Dragonfly for both
-  `MSET` and `MGET`.
-* **Co-located multi-key reads (`{tag}`) are a tie**: when all ten keys hash to the same shard, Rudis's
-  single-pass local lookup removes the cross-shard fan-out cost entirely, closing the gap seen in the
-  scattered case.
+* **Unpipelined (depth 1)** throughput at 64 connections is bounded by per-request network syscalls on both
+  engines, so they land close together. Rudis's remaining cost here was the cross-shard hop: with 7 of 8
+  keys owned by another shard, a remote `GET` cost ~58 µs of server time against ~1 µs locally, almost all of
+  it threads waking from sleep. Idle polling (Section 5.1) cut it to ~39 µs and raised 64-connection `GET`
+  throughput by 26% over the same build with polling off.
+* **Pipelined (depth 16)**: Rudis squashes each connection's pipeline into one message per target shard and
+  coalesces replies into few writes, so it pays the hop once per batch.
+* **Multi-key**: scattered `MGET`/`MSET` fan out to up to 8 shards per command; with threads that rarely
+  sleep the fan-out is cheap, and co-located keys (`{tag}`) skip it entirely.
 
 ---
 
@@ -154,13 +154,17 @@ recommended before drawing a conclusion from this workload specifically.
 ### 5.1 Where Rudis Currently Leads
 1. **Thread-per-Core Shared-Nothing Isolation**: Rudis runs an independent Monoio event loop on every pinned
    CPU core, so each core owns its subset of the keyspace and avoids lock contention entirely during reads.
-   Combined with pipelining, this shows up as the +23.1% (`SET`) and +41.3% (`Mixed`) advantages in Section 4.
+   Combined with pipelining, this shows up as the large pipelined leads in Section 4.2.
 2. **`io_uring` Response Batching**: pipelined writes benefit from Monoio's submit-and-wait ring mechanics,
    aggregating incoming command frames and coalescing outgoing responses into fewer network writes — the
    likely reason pipelined workloads behave differently from unpipelined ones in this comparison.
 3. **Co-located multi-key reads**: when all keys in a batch hash to the same shard (the `{tag}` case),
-   Rudis's local-ownership fast path removes cross-shard fan-out entirely, turning what is otherwise a Rudis
-   deficit (see scattered `MGET`, Section 4.2) into a tie.
+   Rudis's local-ownership fast path removes cross-shard fan-out entirely (+21.2% in Section 4.1).
+4. **Cheap cross-shard hops** (`e76bf42`, `98ece39`): Rudis vendors monoio (`vendor/monoio`, changes listed in
+   `RUDIS_PATCHES.md`). Wakes from other threads run on every event-loop pass instead of only when a thread
+   is about to sleep; shard rings use `COOP_TASKRUN | TASKRUN_FLAG`; and threads busy-poll for 50 µs before
+   sleeping (`idle-poll-us`, 0 disables it), so a remote request or reply usually finds its thread awake and
+   needs no kernel wake-up. Idle CPU cost: ~0.14 cores on 8 threads vs 0.06 with polling off.
 
 ### 5.2 Historical Write-Path Optimization (commit `2c80413`)
 The following bottlenecks were identified and fixed by commit `2c80413` (`perf(core): optimize write path
@@ -200,17 +204,15 @@ at the top of this document regarding Valkey).
 | Dimension | Rudis | Dragonfly |
 | :--- | :--- | :--- |
 | **Execution Model** | Thread-per-core shared-nothing | Multi-threaded fiber proactor |
-| **I/O Engine** | Linux `io_uring` (Monoio) | Linux `epoll` / `io_uring` (Helio) |
-| **Inter-Thread IPC** | Channel actor messages (`flume`) | Shared memory fibers & mutexes |
-| **Unpipelined SET/GET/Mixed (P1, 1KB)** | 205-239K ops/s | **321-344K ops/s** (lower latency) |
-| **Pipelined SET (P16, 1KB)** | **1.49M ops/s** (p99 **1.41ms**) | 1.21M ops/s (p99 1.98ms) |
-| **Pipelined GET (P16, 1KB)** | 1.50M ops/s (p99 2.02ms)\* | 1.53M ops/s (p99 **1.95ms**)\* |
-| **Pipelined Mixed 50:50 (P16, 1KB)** | **1.42M ops/s** (p99 2.56ms) | 1.01M ops/s (p99 2.90ms) |
-| **Co-located MGET (10 keys, `{tag}`)** | 178K ops/s (p99 **0.82ms**) | 175K ops/s (p99 0.94ms) — statistical tie |
-| **Scattered MGET / MSET (10 keys)** | 137-151K ops/s | **156-193K ops/s** |
-| **Primary Strength** | Pipelined write and mixed throughput | Unpipelined single-key latency and scattered multi-key fan-out |
+| **I/O Engine** | Linux `io_uring` (Monoio, vendored with patches) | Linux `epoll` / `io_uring` (Helio) |
+| **Inter-Thread IPC** | Lock-free SPSC rings per shard pair, doorbell wake-ups, 50 µs idle polling | Shared memory fibers & mutexes |
+| **Unpipelined SET/GET/Mixed (P1, 1KB)** | 275-286K ops/s | 261-274K ops/s |
+| **Pipelined SET (P16, 1KB)** | **1.60M ops/s** | 1.06M ops/s |
+| **Pipelined GET (P16, 1KB)** | **3.25M ops/s** | 1.48M ops/s |
+| **Pipelined Mixed 50:50 (P16, 1KB)** | **2.25M ops/s** | 1.18M ops/s |
+| **Co-located MGET (10 keys, `{tag}`)** | **238K ops/s** | 196K ops/s |
+| **Scattered MGET / MSET (10 keys)** | **152K / 166K ops/s** | 129K / 124K ops/s |
+| **Primary Strength** | Pipelined and multi-key throughput; ties or leads unpipelined | Close on unpipelined single-key |
 
-\* Statistical tie; see the noise note in Section 4.1.
-
-Both engines have room for improvement highlighted directly by this data: Rudis on unpipelined single-key
-latency and scattered multi-key fan-out, Dragonfly on pipelined mixed-workload throughput.
+Unpipelined single-key throughput is close for both engines because per-request network syscalls dominate
+at depth 1.
