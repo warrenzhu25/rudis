@@ -188,7 +188,10 @@ impl<T: Clone + Default> XskRing<T> {
     }
 }
 
-/// Pre-allocated UMEM area representing pinned DMA-capable memory frames.
+/// UMEM area representing pinned DMA-capable memory frames. Frames are
+/// allocated on first write (sized to the packet): the engine runs in SKB
+/// mode on any Linux host, and pre-allocating 4096 x 2 KiB frames cost every
+/// shard 8 MiB even with the (experimental) XDP commands disabled.
 pub struct XskUmem {
     pub frame_size: usize,
     pub num_frames: usize,
@@ -197,10 +200,7 @@ pub struct XskUmem {
 
 impl XskUmem {
     pub fn new(frame_size: usize, num_frames: usize) -> Self {
-        let mut frames = Vec::with_capacity(num_frames);
-        for _ in 0..num_frames {
-            frames.push(vec![0u8; frame_size]);
-        }
+        let frames = (0..num_frames).map(|_| Vec::new()).collect();
         Self {
             frame_size,
             num_frames,
@@ -212,7 +212,8 @@ impl XskUmem {
         let mut frames = self.frames.write();
         if let Some(frame) = frames.get_mut(frame_idx) {
             let len = data.len().min(self.frame_size);
-            frame[..len].copy_from_slice(&data[..len]);
+            frame.clear();
+            frame.extend_from_slice(&data[..len]);
         }
     }
 

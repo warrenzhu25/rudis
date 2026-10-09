@@ -368,7 +368,14 @@ pub fn run_shard_worker(
                         }
                     }
                 } else {
-                    monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    // Packets only arrive through the experimental XDP.*
+                    // commands; poll rarely while those are disabled.
+                    let idle_ms = if crate::resp::experimental_commands_enabled() {
+                        5
+                    } else {
+                        200
+                    };
+                    monoio::time::sleep(std::time::Duration::from_millis(idle_ms)).await;
                 }
             }
         });
