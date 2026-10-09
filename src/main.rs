@@ -58,7 +58,7 @@ struct Args {
     no_pin: bool,
 
     /// Microseconds a shard thread busy-polls for work before sleeping
-    /// (default 0: sleep at once). Overrides `idle-poll-us` in the config file.
+    /// (default 50; 0 sleeps at once). Overrides `idle-poll-us` in the config file.
     #[arg(long)]
     idle_poll_us: Option<u64>,
 

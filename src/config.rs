@@ -20,7 +20,7 @@ pub struct RudisConfig {
     /// `cross-shard-spin`: polls before parking on a cross-shard reply.
     pub cross_shard_spin: usize,
     /// `idle-poll-us`: how long a shard thread busy-polls for work before it
-    /// sleeps (0 = sleep at once). Cuts cross-shard hop latency on a partly
+    /// sleeps (default 50; 0 = sleep at once). Cuts cross-shard hop latency on a partly
     /// idle server at the cost of CPU spent polling.
     pub idle_poll_us: u64,
     /// `enable-experimental-commands`: accept the non-Redis command families
@@ -67,7 +67,7 @@ impl Default for RudisConfig {
             appendonly: false,
             appendfsync_every_sec: true,
             cross_shard_spin: 0,
-            idle_poll_us: 0,
+            idle_poll_us: 50,
             enable_experimental_commands: false,
             aof_load_truncated: true,
             dir: PathBuf::from("."),
@@ -980,7 +980,13 @@ mod tests {
 
     #[test]
     fn test_parse_idle_poll_us() {
-        assert_eq!(RudisConfig::parse_str("").unwrap().idle_poll_us, 0);
+        assert_eq!(RudisConfig::parse_str("").unwrap().idle_poll_us, 50);
+        assert_eq!(
+            RudisConfig::parse_str("idle-poll-us 0")
+                .unwrap()
+                .idle_poll_us,
+            0
+        );
         assert_eq!(
             RudisConfig::parse_str("idle-poll-us 50")
                 .unwrap()
