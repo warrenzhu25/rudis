@@ -14579,15 +14579,17 @@ impl RudisTable {
         let expire_at = if ttl_ms == 0 {
             None
         } else if absttl {
+            // Sub-millisecond "now": truncating it to whole milliseconds
+            // pushed the deadline up to 1 ms late, so PTTL right after a
+            // cross-shard RENAME/COPY could report more than was set.
             let now_unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            if ttl_ms <= now_unix {
+                .unwrap_or_default();
+            let deadline = Duration::from_millis(ttl_ms);
+            if deadline <= now_unix {
                 return Ok(());
             } else {
-                let remaining_ms = ttl_ms - now_unix;
-                Some(Instant::now() + Duration::from_millis(remaining_ms))
+                Some(Instant::now() + (deadline - now_unix))
             }
         } else {
             Some(Instant::now() + Duration::from_millis(ttl_ms))

@@ -1082,6 +1082,14 @@ impl Router {
             self.refresh_published_usage().await;
         }
         let under = || !self.over_maxmemory();
+        // Another task on this shard is already spilling: wait (bounded) for
+        // it to finish rather than reporting "over" while it is about to
+        // make room, which would fail a noeviction write with OOM.
+        let mut waits = 0;
+        while self.is_auto_tiering.get() && !under() && waits < 100 {
+            monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+            waits += 1;
+        }
         // Without a tier there is nothing to spill to; the scan below would
         // walk every key and fail on each one.
         if self.is_auto_tiering.get() || under() || self.local_db.borrow().tier_manager.is_none() {
@@ -2792,6 +2800,7 @@ impl Router {
             items: vec![(0, h, cmd)],
             responder: responder.clone(),
             is_resp3,
+            client_id: crate::connection::requesting_client_id(),
         };
         let res = if self.senders[target].send(msg).is_ok() {
             let mut completed = false;
@@ -2870,6 +2879,7 @@ impl Router {
                 items: vec![(0, h, cmd)],
                 responder: responder.clone(),
                 is_resp3,
+                client_id: crate::connection::requesting_client_id(),
             };
             let sent = self.senders[target].send(msg).is_ok();
             pending.push((responder, sent));

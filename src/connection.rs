@@ -299,8 +299,43 @@ thread_local! {
     pub static EXECUTING_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static DEFER_BCAST_FLUSH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub static PRE_CMD_TRACK_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-    pub static IN_TX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Clients of this shard thread whose EXEC is running. A transaction
+    /// awaits cross-shard work mid-way, letting other connections' tasks run
+    /// on this thread, so "in a transaction" has to be per client, not a
+    /// thread-wide flag (that made a concurrent BLPOP return nil at once and
+    /// let other clients skip cross-shard locks).
+    static TX_CLIENTS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
     pub static CURRENT_ROUTER: std::cell::RefCell<Option<std::rc::Rc<Router>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The client whose command this shard thread is running, from
+/// thread-local state only (0 if none). Unlike `ACTIVE_COMMAND_CLIENT_ID`,
+/// which every shard thread overwrites, this can't name another thread's
+/// client; pass it along with work sent to other shards.
+#[inline]
+pub fn requesting_client_id() -> u64 {
+    let c = CURRENT_CLIENT_ID.get();
+    if c != 0 { c } else { EXECUTING_CLIENT_ID.get() }
+}
+
+/// Whether `client_id`'s EXEC is running (its queued commands execute
+/// without blocking, pausing or taking cross-shard locks again).
+#[inline]
+pub fn in_tx(client_id: u64) -> bool {
+    client_id != 0 && TX_CLIENTS.with(|t| t.borrow().contains(&client_id))
+}
+
+fn enter_tx(client_id: u64) {
+    TX_CLIENTS.with(|t| t.borrow_mut().push(client_id));
+}
+
+fn exit_tx(client_id: u64) {
+    TX_CLIENTS.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(i) = t.iter().position(|&c| c == client_id) {
+            t.swap_remove(i);
+        }
+    });
 }
 
 pub static ACTIVE_COMMAND_CLIENT_ID: std::sync::atomic::AtomicU64 =
@@ -1276,7 +1311,7 @@ impl Drop for PausedClientGuard {
 }
 
 pub async fn wait_if_client_paused(port: u16, client_id: u64, cmd: &Command) {
-    if IN_TX.get() {
+    if in_tx(client_id) {
         return;
     }
     while let Some((rem_ms, write_only)) = is_client_paused() {
@@ -3059,7 +3094,7 @@ async fn execute_tx_step(
     tx_queue: &mut Vec<Command>,
     tx_has_error: &mut bool,
 ) -> bool {
-    if !IN_TX.get()
+    if !in_tx(client_id)
         && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
     {
         c.last_active = Instant::now();
@@ -3112,9 +3147,6 @@ async fn execute_tx_step(
                 tx_queue.clear();
                 *tx_has_error = false;
                 unwatch_keys(router.port, client_id);
-                crate::block::get_block_hub_for_port(router.port)
-                    .lock()
-                    .clear_pending_notifies();
                 out_buf.extend_from_slice(b"+OK\r\n");
                 false
             }
@@ -3124,9 +3156,6 @@ async fn execute_tx_step(
                 tx_queue.clear();
                 *tx_has_error = false;
                 unwatch_keys(router.port, client_id);
-                crate::block::get_block_hub_for_port(router.port)
-                    .lock()
-                    .clear_pending_notifies();
                 if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                     c.name = None;
                     c.is_resp3 = false;
@@ -3177,9 +3206,6 @@ async fn execute_tx_step(
                     tx_queue.clear();
                     *tx_has_error = false;
                     unwatch_keys(router.port, client_id);
-                    crate::block::get_block_hub_for_port(router.port)
-                        .lock()
-                        .clear_pending_notifies();
                     out_buf.extend_from_slice(
                         b"-EXECABORT Transaction discarded because of previous errors.\r\n",
                     );
@@ -3193,9 +3219,6 @@ async fn execute_tx_step(
                     tx_queue.clear();
                     *tx_has_error = false;
                     unwatch_keys(router.port, client_id);
-                    crate::block::get_block_hub_for_port(router.port)
-                        .lock()
-                        .clear_pending_notifies();
                     out_buf.extend_from_slice(
                         b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
                     );
@@ -3207,9 +3230,6 @@ async fn execute_tx_step(
                     tx_queue.clear();
                     *tx_has_error = false;
                     unwatch_keys(router.port, client_id);
-                    crate::block::get_block_hub_for_port(router.port)
-                        .lock()
-                        .clear_pending_notifies();
                     write_resp_null_array(out_buf);
                     false
                 } else {
@@ -3240,7 +3260,7 @@ async fn execute_tx_step(
                     out_buf.extend_from_slice(format!("*{}\r\n", count).as_bytes());
                     let queued = std::mem::take(tx_queue);
                     let mut should_quit = false;
-                    IN_TX.set(true);
+                    enter_tx(client_id);
                     DEFER_BCAST_FLUSH.set(true);
                     DEFER_BCAST_FLUSH_GLOBAL.store(true, std::sync::atomic::Ordering::Relaxed);
                     EXECUTING_CLIENT_ID.set(client_id);
@@ -3268,7 +3288,7 @@ async fn execute_tx_step(
                     }
                     DEFER_BCAST_FLUSH.set(false);
                     DEFER_BCAST_FLUSH_GLOBAL.store(false, std::sync::atomic::Ordering::Relaxed);
-                    IN_TX.set(false);
+                    exit_tx(client_id);
                     flush_pending_bcast(router.port);
                     EXECUTING_CLIENT_ID.set(0);
                     ACTIVE_COMMAND_CLIENT_ID.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -3424,10 +3444,75 @@ pub async fn handle_connection(
 const REPLICATION_NEEDS_PLAINTEXT: &[u8] =
     b"-ERR replication links are only supported on the plaintext port\r\n";
 
+/// Per-client values the command path keeps in thread-locals. Connection
+/// tasks on a shard thread interleave at every await (a cross-shard hop, a
+/// blocking wait), so each task swaps its own copy in for the duration of
+/// each poll; otherwise a RESP3 client's protocol or one client's id would
+/// leak into another client's replies and tracking.
+#[derive(Default)]
+struct ClientThreadLocals {
+    resp3: bool,
+    client_id: u64,
+    executing_client_id: u64,
+    defer_bcast_flush: bool,
+}
+
+impl ClientThreadLocals {
+    #[inline]
+    fn swap_with_thread(&mut self) {
+        self.resp3 = CURRENT_CLIENT_RESP3.replace(self.resp3);
+        self.client_id = CURRENT_CLIENT_ID.replace(self.client_id);
+        self.executing_client_id = EXECUTING_CLIENT_ID.replace(self.executing_client_id);
+        self.defer_bcast_flush = DEFER_BCAST_FLUSH.replace(self.defer_bcast_flush);
+    }
+}
+
+/// Runs a client's future with its own [`ClientThreadLocals`] installed
+/// while it is polled, and the thread's previous values restored after.
+struct ClientScope<F> {
+    inner: std::pin::Pin<Box<F>>,
+    locals: ClientThreadLocals,
+}
+
+impl<F: std::future::Future> std::future::Future for ClientScope<F> {
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let this = &mut *self;
+        this.locals.swap_with_thread();
+        let res = this.inner.as_mut().poll(cx);
+        this.locals.swap_with_thread();
+        res
+    }
+}
+
 /// The client connection loop, shared by every transport (see
 /// `crate::transport`): parsing, transactions, pipeline squashing, Pub/Sub
 /// and replication mode switches, output-buffer limits and client stats.
 pub(crate) async fn handle_client<T: crate::transport::ClientTransport>(
+    transport: T,
+    client_addr: SocketAddr,
+    client_id: u64,
+    client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+    router: Rc<Router>,
+) {
+    ClientScope {
+        inner: Box::pin(handle_client_loop(
+            transport,
+            client_addr,
+            client_id,
+            client_registry,
+            router,
+        )),
+        locals: ClientThreadLocals::default(),
+    }
+    .await
+}
+
+async fn handle_client_loop<T: crate::transport::ClientTransport>(
     mut transport: T,
     client_addr: SocketAddr,
     client_id: u64,
@@ -7116,7 +7201,7 @@ async fn handle_bzpop(
         return false;
     }
 
-    if IN_TX.get() {
+    if in_tx(client_id) {
         write_resp_null_array(out);
         return false;
     }
@@ -11022,7 +11107,7 @@ async fn execute_command(
                     out.extend_from_slice(&res);
                 }
             }
-            if had_waiters && !IN_TX.get() {
+            if had_waiters && !in_tx(client_id) {
                 monoio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
             false
@@ -11177,7 +11262,7 @@ async fn execute_command(
                 if let Some(wait_ms) = block_ms
                     && produced_empty
                     && can_block
-                    && !IN_TX.get()
+                    && !in_tx(client_id)
                 {
                     out.truncate(start_len);
                     let _guard = BlockedClientGuard {
@@ -11380,7 +11465,7 @@ async fn execute_command(
                             Command::Xreadgroup { ids, .. } => ids.iter().all(|id| id == ">"),
                             _ => false,
                         })
-                        && !IN_TX.get()
+                        && !in_tx(client_id)
                     {
                         let _guard = BlockedClientGuard {
                             port: router.port,
@@ -11676,7 +11761,7 @@ async fn execute_command(
                 return false;
             }
 
-            if IN_TX.get() {
+            if in_tx(client_id) {
                 write_resp_null_array(out);
                 return false;
             }
@@ -11820,7 +11905,7 @@ async fn execute_command(
                 return false;
             }
 
-            if IN_TX.get() {
+            if in_tx(client_id) {
                 write_resp_null_array(out);
                 return false;
             }
@@ -11904,7 +11989,7 @@ async fn execute_command(
                         member: member.clone(),
                     };
                     out.extend_from_slice(
-                        &move_element_across_shards(router, source, destination, op).await,
+                        &move_element_across_shards(router, source, destination, op, in_tx(client_id)).await,
                     );
                 }
                 return false;
@@ -12164,7 +12249,7 @@ async fn execute_command(
                         to: where_to,
                     };
                     out.extend_from_slice(
-                        &move_element_across_shards(router, source, destination, op).await,
+                        &move_element_across_shards(router, source, destination, op, in_tx(client_id)).await,
                     );
                 }
                 return false;
@@ -12243,7 +12328,7 @@ async fn execute_command(
             if &out[start_len..] != b"$-1\r\n" && &out[start_len..] != b"_\r\n" {
                 return false;
             }
-            if IN_TX.get() {
+            if in_tx(client_id) {
                 return false;
             }
             out.truncate(start_len);
@@ -12449,7 +12534,7 @@ async fn execute_command(
                 }
                 return false;
             }
-            if IN_TX.get() {
+            if in_tx(client_id) {
                 return false;
             }
             out.truncate(start_len);
@@ -12742,7 +12827,7 @@ async fn execute_command(
                 return false;
             }
 
-            if IN_TX.get() {
+            if in_tx(client_id) {
                 write_resp_null_array(out);
                 return false;
             }
@@ -12989,7 +13074,7 @@ async fn execute_command(
                 return false;
             }
 
-            if IN_TX.get() {
+            if in_tx(client_id) {
                 write_resp_null_array(out);
                 return false;
             }
@@ -14027,7 +14112,7 @@ async fn execute_command(
                     }
                 }
             }
-            if !IN_TX.get() {
+            if !in_tx(client_id) {
                 let n = router.dbsize().await;
                 if n > 0 {
                     crate::table::add_lazyfreed_objects(n as u64);
@@ -14074,7 +14159,7 @@ async fn execute_command(
                     } else {
                         CrossShardMove::Rename
                     };
-                    out.extend_from_slice(&move_key_across_shards(router, key, newkey, mode).await);
+                    out.extend_from_slice(&move_key_across_shards(router, key, newkey, mode, in_tx(client_id)).await);
                 }
                 return false;
             }
@@ -14111,7 +14196,7 @@ async fn execute_command(
                         CrossShardMove::Copy
                     };
                     out.extend_from_slice(
-                        &move_key_across_shards(router, source, destination, mode).await,
+                        &move_key_across_shards(router, source, destination, mode, in_tx(client_id)).await,
                     );
                 }
                 return false;
@@ -14144,7 +14229,7 @@ async fn execute_command(
                         b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
                     );
                 } else {
-                    out.extend_from_slice(&msetnx_across_shards(router, pairs).await);
+                    out.extend_from_slice(&msetnx_across_shards(router, pairs, in_tx(client_id)).await);
                 }
                 return false;
             }
@@ -14232,7 +14317,7 @@ async fn execute_command(
                         b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
                     );
                 } else {
-                    out.extend_from_slice(&bitop_across_shards(router, op, destkey, srckeys).await);
+                    out.extend_from_slice(&bitop_across_shards(router, op, destkey, srckeys, in_tx(client_id)).await);
                 }
                 return false;
             }
@@ -24056,6 +24141,7 @@ async fn flush_remote_batches(
                 items: std::mem::replace(items, next_items),
                 responder: responder.clone(),
                 is_resp3,
+                client_id: requesting_client_id(),
             };
             if router.senders[target_shard].send(msg).is_ok() {
                 pending_mask |= 1u64 << target_shard;
@@ -24183,6 +24269,7 @@ async fn move_key_across_shards(
     src: &Bytes,
     dst: &Bytes,
     mode: CrossShardMove,
+    in_tx: bool,
 ) -> Vec<u8> {
     router.ensure_loaded(src).await;
     router.ensure_loaded(dst).await;
@@ -24190,7 +24277,7 @@ async fn move_key_across_shards(
     let mut shards = [s, d];
     shards.sort_unstable();
     // Inside EXEC the transaction already holds the locks of all its keys.
-    let lock = !IN_TX.get();
+    let lock = !in_tx;
     let tx_id = next_tx_id();
     if lock {
         router.acquire_tx_locks(&shards, tx_id).await;
@@ -24274,6 +24361,7 @@ async fn move_element_across_shards(
     src: &Bytes,
     dst: &Bytes,
     op: CrossShardElementMove,
+    in_tx: bool,
 ) -> Vec<u8> {
     router.ensure_loaded(src).await;
     router.ensure_loaded(dst).await;
@@ -24281,7 +24369,7 @@ async fn move_element_across_shards(
     let mut shards = [s, d];
     shards.sort_unstable();
     // Inside EXEC the transaction already holds the locks of all its keys.
-    let lock = !IN_TX.get();
+    let lock = !in_tx;
     let tx_id = next_tx_id();
     if lock {
         router.acquire_tx_locks(&shards, tx_id).await;
@@ -24396,9 +24484,9 @@ async fn blmove_across_shards(
         from: where_from,
         to: where_to,
     };
-    let reply = move_element_across_shards(router, source, destination, op).await;
+    let reply = move_element_across_shards(router, source, destination, op, in_tx(client_id)).await;
     let is_nil = reply == b"$-1\r\n" || reply == b"_\r\n";
-    if !is_nil || IN_TX.get() {
+    if !is_nil || in_tx(client_id) {
         out.extend_from_slice(&reply);
         return false;
     }
@@ -24514,7 +24602,7 @@ async fn exec_on_shards(router: &Router, cmds: Vec<(usize, Command)>) -> Vec<Vec
 /// keys exists, then MSETs each shard's pairs. Like EXEC, it is atomic
 /// against transactions and other cross-shard moves, not against plain
 /// commands. Returns the command's reply.
-async fn msetnx_across_shards(router: &Router, pairs: &[(Bytes, Bytes)]) -> Vec<u8> {
+async fn msetnx_across_shards(router: &Router, pairs: &[(Bytes, Bytes)], in_tx: bool) -> Vec<u8> {
     let mut groups: Vec<(usize, Vec<(Bytes, Bytes)>)> = Vec::new();
     for (k, v) in pairs {
         router.ensure_loaded(k).await;
@@ -24526,7 +24614,7 @@ async fn msetnx_across_shards(router: &Router, pairs: &[(Bytes, Bytes)]) -> Vec<
     }
     let mut shards: Vec<usize> = groups.iter().map(|(s, _)| *s).collect();
     shards.sort_unstable();
-    let lock = !IN_TX.get();
+    let lock = !in_tx;
     let tx_id = next_tx_id();
     if lock {
         router.acquire_tx_locks(&shards, tx_id).await;
@@ -24577,6 +24665,7 @@ async fn bitop_across_shards(
     op: &str,
     destkey: &Bytes,
     srckeys: &[Bytes],
+    in_tx: bool,
 ) -> Vec<u8> {
     let mut shards = Vec::with_capacity(srckeys.len() + 1);
     for k in std::iter::once(destkey).chain(srckeys) {
@@ -24585,7 +24674,7 @@ async fn bitop_across_shards(
     }
     shards.sort_unstable();
     shards.dedup();
-    let lock = !IN_TX.get();
+    let lock = !in_tx;
     let tx_id = next_tx_id();
     if lock {
         router.acquire_tx_locks(&shards, tx_id).await;

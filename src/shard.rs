@@ -403,6 +403,9 @@ pub enum ShardMessage {
         items: Vec<(usize, u64, Command)>,
         responder: std::sync::Arc<crate::mailbox::BatchResponder>,
         is_resp3: bool,
+        /// The client the commands run for (0 if none), so the owning shard
+        /// records tracked reads and NOLOOP writes against it.
+        client_id: u64,
     },
     Mget {
         keys: Vec<(usize, Option<Bytes>)>,

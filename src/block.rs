@@ -205,14 +205,6 @@ impl BlockHub {
         }
     }
 
-    pub fn clear_pending_notifies(&mut self) {
-        if self.paused_count > 0 {
-            self.paused_count -= 1;
-        }
-        self.pending_notifies.clear();
-        self.sync_atomic_waiters_count();
-    }
-
     pub fn blocked_clients_count(&self) -> usize {
         self.blocked_clients.len()
             + self.blocked_zset_clients.len()

@@ -651,6 +651,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         mut items,
                         responder,
                         is_resp3,
+                        client_id,
                     } => {
                         let has_tier_manager = cross_shard_db.borrow().tier_manager.is_some();
                         let needs_async = false;
@@ -1051,8 +1052,11 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
                             let has_tracking = crate::connection::HAS_TRACKING_CLIENTS
                                 .load(std::sync::atomic::Ordering::Relaxed);
+                            // Run as the requesting client: with 0, reads would
+                            // be charged to whichever client last ran a command
+                            // on any shard (`ACTIVE_COMMAND_CLIENT_ID`).
                             let prev_cid = if has_tracking {
-                                crate::connection::CURRENT_CLIENT_ID.replace(0)
+                                crate::connection::CURRENT_CLIENT_ID.replace(client_id)
                             } else {
                                 0
                             };
