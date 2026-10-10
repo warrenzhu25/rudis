@@ -24,7 +24,8 @@ fi
 TEST_LOG="/tmp/rudis_tcl_test_${PORT}.log"
 SERVER_DIR="/tmp/rudis_tcl_server_${PORT}"
 rm -f "$TEST_LOG"
-killall -9 rudis 2>/dev/null || true
+# Only this runner's port: other rudis instances (parallel test runs) are left alone.
+pkill -9 -f "target/release/rudis --port $PORT " 2>/dev/null || true
 sleep 0.5
 
 RUDIS_PID=""
