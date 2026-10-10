@@ -1419,6 +1419,11 @@ pub fn start_replica_sync(
     hub.is_slave_atomic.store(true, Ordering::Release);
     HAS_SLAVE_INSTANCE.store(true, Ordering::Release);
     crate::log::set_role_replica(true);
+    // Like Redis: a blocked BLPOP & co. served here would change data the
+    // master doesn't know about.
+    crate::block::get_block_hub_for_port(port)
+        .lock()
+        .unblock_writers();
 
     let (cached_replid, cached_offset) = {
         let role = hub.role.read();
@@ -1443,7 +1448,7 @@ pub fn start_replica_sync(
     *hub.role.write() = ReplicationRole::Slave {
         master_host: master_host.clone(),
         master_port,
-        link_status: "connecting".to_string(),
+        link_status: "down".to_string(),
         master_repl_offset: cached_offset,
         master_replid: cached_replid,
         sync_in_progress: true,
