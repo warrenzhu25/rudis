@@ -96,6 +96,85 @@ struct Args {
     metrics_bind: Option<std::net::IpAddr>,
 }
 
+/// Long options handled by `Args` (with whether they take a value).
+const RUDIS_FLAGS: &[(&str, bool)] = &[
+    ("config", true),
+    ("port", true),
+    ("bind", true),
+    ("protected-mode", true),
+    ("threads", true),
+    ("aof", true),
+    ("aof-dir", true),
+    ("maxmemory", true),
+    ("tiered-offload-threshold", true),
+    ("tiered-upload-threshold", true),
+    ("no-pin", false),
+    ("idle-poll-us", true),
+    ("tls-port", true),
+    ("tls-cert-file", true),
+    ("tls-key-file", true),
+    ("cluster-enabled", true),
+    ("enable-experimental-commands", true),
+    ("metrics-port", true),
+    ("metrics-bind", true),
+    ("help", false),
+    ("version", false),
+];
+
+/// Accepts redis-server's command line too: `rudis /path/redis.conf` and
+/// any config directive as `--name value [value ...]` (e.g. `--appendonly
+/// yes`, `--save ""`, `--save 900 1 300 10`), as container images and init
+/// scripts pass them. Returns the arguments for `Args`, a positional config
+/// file, and the extra directives as config-file lines (applied after the
+/// file, like Redis).
+fn split_redis_server_args(raw: Vec<String>) -> (Vec<String>, Option<std::path::PathBuf>, String) {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut config_file = None;
+    let mut extra = String::new();
+    let mut it = raw.into_iter().peekable();
+    if let Some(prog) = it.next() {
+        out.push(prog);
+    }
+    if let Some(first) = it.peek()
+        && !first.starts_with('-')
+    {
+        config_file = it.next().map(std::path::PathBuf::from);
+    }
+    while let Some(arg) = it.next() {
+        let Some(long) = arg.strip_prefix("--") else {
+            out.push(arg);
+            continue;
+        };
+        let name = long.split('=').next().unwrap_or(long);
+        if let Some(&(_, takes_value)) = RUDIS_FLAGS
+            .iter()
+            .find(|(n, _)| *n == name || n.replace('-', "_") == name)
+        {
+            out.push(arg.clone());
+            if takes_value
+                && !long.contains('=')
+                && let Some(v) = it.next()
+            {
+                out.push(v);
+            }
+            continue;
+        }
+        // A config directive: its values run up to the next `--option`.
+        extra.push_str(name);
+        let mut any = false;
+        while let Some(v) = it.next_if(|v| !v.starts_with("--")) {
+            any = true;
+            extra.push(' ');
+            extra.push_str(if v.is_empty() { "\"\"" } else { &v });
+        }
+        if !any {
+            extra.push_str(" \"\"");
+        }
+        extra.push('\n');
+    }
+    (out, config_file, extra)
+}
+
 fn get_process_affinity_cores() -> Vec<usize> {
     // On Linux this is `sched_getaffinity` on the calling (main) thread, i.e.
     // the cores the process may run on (honours taskset/cgroup cpusets).
@@ -118,11 +197,21 @@ fn main() {
 
     rudis::telemetry::init_telemetry();
     rudis::shutdown::install_signal_handlers();
-    let args = Args::parse();
+    let (clap_args, positional_config, extra_directives) =
+        split_redis_server_args(std::env::args().collect());
+    let mut args = Args::parse_from(clap_args);
+    if args.config.is_none() {
+        args.config = positional_config;
+    }
 
-    // 1. Load initial config from file if provided, else use defaults
+    // 1. Load initial config from file if provided, else use defaults;
+    // directives given on the command line apply after the file.
     let mut server_config = if let Some(ref config_path) = args.config {
-        let loaded = rudis::config::RudisConfig::load_file(config_path)
+        let loaded = std::fs::read_to_string(config_path)
+            .map_err(|e| format!("Failed to read config file {:?}: {}", config_path, e))
+            .and_then(|content| {
+                rudis::config::RudisConfig::parse_str(&format!("{content}\n{extra_directives}"))
+            })
             .and_then(|cfg| rudis::config::set_active_config_file(config_path).map(|()| cfg));
         match loaded {
             Ok(cfg) => cfg,
@@ -131,6 +220,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    } else if !extra_directives.is_empty() {
+        rudis::config::RudisConfig::parse_str(&extra_directives).unwrap_or_else(|e| {
+            log_fatal!("FATAL CONFIG: invalid command line directive: {}", e);
+            std::process::exit(1);
+        })
     } else {
         rudis::config::RudisConfig::default()
     };
@@ -476,4 +570,53 @@ fn main() {
     }
     log_notice!("Redis is now ready to exit, bye bye...");
     log_notice!("rudis server gracefully stopped. Goodbye!");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_redis_server_args;
+
+    fn split(args: &[&str]) -> (Vec<String>, Option<std::path::PathBuf>, String) {
+        split_redis_server_args(args.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn test_redis_server_style_arguments() {
+        let (clap, conf, extra) = split(&[
+            "rudis",
+            "/etc/redis.conf",
+            "--port",
+            "6380",
+            "--appendonly",
+            "yes",
+            "--save",
+            "900",
+            "1",
+            "300",
+            "10",
+            "--no-pin",
+            "--threads=2",
+            "--loglevel",
+            "warning",
+            "--save",
+            "",
+        ]);
+        assert_eq!(clap, ["rudis", "--port", "6380", "--no-pin", "--threads=2"]);
+        assert_eq!(
+            conf.as_deref(),
+            Some(std::path::Path::new("/etc/redis.conf"))
+        );
+        assert_eq!(
+            extra,
+            "appendonly yes\nsave 900 1 300 10\nloglevel warning\nsave \"\"\n"
+        );
+    }
+
+    #[test]
+    fn test_plain_rudis_arguments_pass_through() {
+        let (clap, conf, extra) = split(&["rudis", "-c", "x.conf", "--port", "1", "-t", "4"]);
+        assert_eq!(clap, ["rudis", "-c", "x.conf", "--port", "1", "-t", "4"]);
+        assert!(conf.is_none());
+        assert!(extra.is_empty());
+    }
 }
