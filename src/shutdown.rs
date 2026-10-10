@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -18,12 +18,17 @@ pub fn reset_shutdown() {
     SHARDS_DRAINED.store(0, Ordering::SeqCst);
 }
 
-/// Installs OS signal handlers (SIGINT, SIGTERM) to trigger graceful server shutdown.
+/// Installs OS signal handlers (SIGINT, SIGTERM) to trigger graceful server
+/// shutdown, and SIGHUP to reopen the log file (logrotate).
 pub fn install_signal_handlers() {
     // SAFETY: signal(2) with SIG_IGN or an `extern "C" fn(c_int)` handler is
-    // valid, and `handle_signal` only stores to an AtomicBool, which is
+    // valid, and the handlers only store to atomics, which is
     // async-signal-safe.
     unsafe {
+        libc::signal(
+            libc::SIGHUP,
+            handle_sighup as *const () as libc::sighandler_t,
+        );
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         libc::signal(
             libc::SIGINT,
@@ -36,13 +41,29 @@ pub fn install_signal_handlers() {
     }
 }
 
-extern "C" fn handle_signal(_sig: libc::c_int) {
+extern "C" fn handle_signal(sig: libc::c_int) {
     // Async-signal-safe: only set a flag. A shard task picks it up, saves
     // if configured, and then calls `request_shutdown`.
+    LAST_SHUTDOWN_SIGNAL.store(sig, Ordering::SeqCst);
     SHUTDOWN_SIGNALLED.store(true, Ordering::SeqCst);
 }
 
+extern "C" fn handle_sighup(_sig: libc::c_int) {
+    // Async-signal-safe: only sets a flag the next log write checks.
+    crate::log::request_reopen();
+}
+
 static SHUTDOWN_SIGNALLED: AtomicBool = AtomicBool::new(false);
+static LAST_SHUTDOWN_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// Name of the last shutdown signal received, for the log.
+pub fn last_shutdown_signal_name() -> &'static str {
+    match LAST_SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
+        libc::SIGINT => "SIGINT",
+        libc::SIGTERM => "SIGTERM",
+        _ => "shutdown signal",
+    }
+}
 
 /// Takes a pending SIGTERM/SIGINT, if any.
 pub fn take_shutdown_signal() -> bool {
