@@ -3495,6 +3495,16 @@ impl RudisTable {
         self.table.entries()
     }
 
+    /// The entry for `key` as stored, without lazy expiry, LRU updates or
+    /// warming a cooled value: for read-only inspection (`DEBUG DIGEST-VALUE`).
+    /// The caller decides what a passed deadline means.
+    #[inline]
+    pub fn peek_entry(&self, key: &[u8]) -> Option<&RudisEntry> {
+        self.table
+            .find_entry(key, hash_key(key))
+            .map(|(_, entry)| entry)
+    }
+
     /// See [`RudisFlatTable::segment_pattern`].
     pub fn segment_pattern(&self, seg: usize) -> Option<(u8, u64)> {
         self.table.segment_pattern(seg)
