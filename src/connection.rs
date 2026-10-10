@@ -22068,7 +22068,9 @@ pub fn execute_local_command(
                 let is_storedist = storedist.is_some();
                 if key_type == "none" {
                     if let Some(store_dest) = storekey {
-                        db.del(store_dest);
+                        if db.del(store_dest) {
+                            record_change!(&Command::Del(smallvec::smallvec![store_dest.clone()]));
+                        }
                         write_resp_integer(out, 0);
                         return true;
                     } else {
@@ -22086,13 +22088,17 @@ pub fn execute_local_command(
                 if let Some(store_dest) = storekey {
                     let prev_kind = db.type_of(store_dest.as_ref());
                     if results.is_empty() {
-                        db.del(store_dest);
+                        if db.del(store_dest) {
+                            record_change!(&Command::Del(smallvec::smallvec![store_dest.clone()]));
+                        }
                         if prev_kind != "none" {
                             notify_keyspace_event(NOTIFY_GENERIC, "del", store_dest.as_ref());
                         }
                         write_resp_integer(out, 0);
                     } else {
-                        db.del(store_dest);
+                        if db.del(store_dest) {
+                            record_change!(&Command::Del(smallvec::smallvec![store_dest.clone()]));
+                        }
                         let mut zset_elements = Vec::with_capacity(results.len());
                         for item in &results {
                             let sc = if is_storedist {
@@ -22102,15 +22108,22 @@ pub fn execute_local_command(
                             };
                             zset_elements.push((sc, item.member.clone()));
                         }
+                        let zadd = Command::Zadd {
+                            key: store_dest.clone(),
+                            elements: zset_elements.iter().cloned().collect(),
+                            flags: crate::table::ZAddFlags::default(),
+                        };
                         let _ = db.zadd(
                             store_dest.clone(),
                             zset_elements,
                             crate::table::ZAddFlags::default(),
                         );
+                        record_change!(&zadd);
                         notify_set_key_events_local(prev_kind, "zset", store_dest.as_ref());
                         write_resp_integer(out, results.len() as i64);
                     }
-                    record_change!(cmd);
+                    // Propagated above as its effect (DEL, ZADD): GEORADIUS
+                    // itself has no serializer and is read-only in Redis 6.2+.
                 } else {
                     crate::geo::format_geo_results(out, &results, has_options);
                 }
@@ -22141,7 +22154,9 @@ pub fn execute_local_command(
                 let is_storedist = storedist.is_some();
                 if key_type == "none" {
                     if let Some(store_dest) = storekey {
-                        db.del(store_dest);
+                        if db.del(store_dest) {
+                            record_change!(&Command::Del(smallvec::smallvec![store_dest.clone()]));
+                        }
                         write_resp_integer(out, 0);
                         return true;
                     } else {
@@ -22166,13 +22181,17 @@ pub fn execute_local_command(
                 if let Some(store_dest) = storekey {
                     let prev_kind = db.type_of(store_dest.as_ref());
                     if results.is_empty() {
-                        db.del(store_dest);
+                        if db.del(store_dest) {
+                            record_change!(&Command::Del(smallvec::smallvec![store_dest.clone()]));
+                        }
                         if prev_kind != "none" {
                             notify_keyspace_event(NOTIFY_GENERIC, "del", store_dest.as_ref());
                         }
                         write_resp_integer(out, 0);
                     } else {
-                        db.del(store_dest);
+                        if db.del(store_dest) {
+                            record_change!(&Command::Del(smallvec::smallvec![store_dest.clone()]));
+                        }
                         let mut zset_elements = Vec::with_capacity(results.len());
                         for item in &results {
                             let sc = if is_storedist {
@@ -22182,15 +22201,22 @@ pub fn execute_local_command(
                             };
                             zset_elements.push((sc, item.member.clone()));
                         }
+                        let zadd = Command::Zadd {
+                            key: store_dest.clone(),
+                            elements: zset_elements.iter().cloned().collect(),
+                            flags: crate::table::ZAddFlags::default(),
+                        };
                         let _ = db.zadd(
                             store_dest.clone(),
                             zset_elements,
                             crate::table::ZAddFlags::default(),
                         );
+                        record_change!(&zadd);
                         notify_set_key_events_local(prev_kind, "zset", store_dest.as_ref());
                         write_resp_integer(out, results.len() as i64);
                     }
-                    record_change!(cmd);
+                    // Propagated above as its effect (DEL, ZADD): GEORADIUS
+                    // itself has no serializer and is read-only in Redis 6.2+.
                 } else {
                     crate::geo::format_geo_results(out, &results, has_options);
                 }
@@ -22286,7 +22312,9 @@ pub fn execute_local_command(
                     return false;
                 }
                 if key_type == "none" {
-                    db.del(dest);
+                    if db.del(dest) {
+                        record_change!(&Command::Del(smallvec::smallvec![dest.clone()]));
+                    }
                     write_resp_integer(out, 0);
                     return true;
                 }

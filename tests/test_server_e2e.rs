@@ -23420,7 +23420,36 @@ fn test_functions_sort_store_and_zadd_updates_replicate_and_persist_e2e() {
     // A score update adds nothing (reply 0) but is a change.
     assert_eq!(resp_cmd(&mut m, &["ZADD", "zup", "1", "a"]), ":1\r\n");
     assert_eq!(resp_cmd(&mut m, &["ZADD", "zup", "2", "a"]), ":0\r\n");
+    assert_eq!(
+        resp_cmd(
+            &mut m,
+            &[
+                "GEOADD", "geo", "13.36", "38.11", "pa", "15.08", "37.5", "ca"
+            ]
+        ),
+        ":2\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut m,
+            &[
+                "GEORADIUS",
+                "geo",
+                "15",
+                "37",
+                "200",
+                "km",
+                "STORE",
+                "geo:st"
+            ]
+        ),
+        ":2\r\n"
+    );
     synced(&mut m, &mut r);
+    assert_eq!(
+        resp_cmd(&mut r, &["ZRANGE", "geo:st", "0", "-1"]),
+        resp_cmd(&mut m, &["ZRANGE", "geo:st", "0", "-1"])
+    );
     assert_eq!(resp_cmd(&mut r, &["ZSCORE", "zup", "a"]), "$1\r\n2\r\n");
     assert!(resp_cmd(&mut r, &["FUNCTION", "LIST"]).contains("replib"));
     let sorted = "*3\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n";
