@@ -1905,7 +1905,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let mut db = cross_shard_db.borrow_mut();
                         let mut dummy_out = Vec::new();
                         let aof_ref = cross_shard_aof.as_deref();
-                        execute_local_command(&cmd, &mut db, &mut dummy_out, aof_ref);
+                        crate::connection::apply_replicated_command(&cmd, &mut db, &mut dummy_out, aof_ref);
                         let _ = responder.send(());
                     }
                     ShardMessage::ExecuteReplicaCmds { cmds, responder } => {
@@ -1913,8 +1913,12 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let mut dummy_out = Vec::new();
                         let aof_ref = cross_shard_aof.as_deref();
                         for cmd in &cmds {
-                            dummy_out.clear();
-                            execute_local_command(cmd, &mut db, &mut dummy_out, aof_ref);
+                            crate::connection::apply_replicated_command(
+                                cmd,
+                                &mut db,
+                                &mut dummy_out,
+                                aof_ref,
+                            );
                         }
                         let _ = responder.send(());
                     }
@@ -2101,6 +2105,18 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                 .join(", "),
             crate::connection::io_driver_name()
         );
+        // Redis's readiness line (log scrapers, supervisors and the Redis
+        // test harness wait for it), once every shard of this server is up.
+        {
+            static READY: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<u16, usize>>> =
+                std::sync::LazyLock::new(Default::default);
+            let mut ready = READY.lock();
+            let n = ready.entry(base_port).or_insert(0);
+            *n += 1;
+            if *n == num_shards {
+                println!("Ready to accept connections tcp");
+            }
+        }
 
         // 4.9 Spawn TLS Accept loop if enabled
         if !tls_listeners.is_empty()

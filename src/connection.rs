@@ -895,6 +895,26 @@ pub static CMD_STATS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 pub static MIN_REPLICAS_TO_WRITE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// `min-replicas-max-lag`: seconds since its last ack within which a
+/// replica counts towards `min-replicas-to-write`.
+pub static MIN_REPLICAS_MAX_LAG: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(10);
+
+/// Whether `min-replicas-to-write` rejects writes on this server now: it
+/// is set, this is a master, and fewer replicas than that acked within
+/// `min-replicas-max-lag` seconds (Redis's NOREPLICAS).
+pub fn not_enough_good_replicas(port: u16) -> bool {
+    let min = MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed);
+    if min == 0 {
+        return false;
+    }
+    let hub = crate::replication::get_replication_hub(port);
+    if hub.is_slave() {
+        return false;
+    }
+    let lag = MIN_REPLICAS_MAX_LAG.load(std::sync::atomic::Ordering::Relaxed);
+    hub.good_replicas(lag) < min
+}
 
 thread_local! {
     static LOCAL_CMD_STATS: RefCell<hashbrown::HashMap<&'static str, CmdStat>> = RefCell::new(hashbrown::HashMap::new());
@@ -2682,8 +2702,13 @@ pub fn apply_config_value(
             parse_config_num::<i64>(name, val_str)? as usize,
             Ordering::Relaxed,
         ),
-        "min-replicas-to-write" => {
+        "min-replicas-to-write" | "min-slaves-to-write" => {
             MIN_REPLICAS_TO_WRITE.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "repl-backlog-ttl" => crate::replication::REPL_BACKLOG_TTL
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "min-replicas-max-lag" | "min-slaves-max-lag" => {
+            MIN_REPLICAS_MAX_LAG.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
         "slowlog-log-slower-than" => crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
@@ -5325,6 +5350,9 @@ async fn run_master_replica_stream(
 ) {
     let hub = crate::replication::get_replication_hub(router.port);
     let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
+    if let Ok(peer) = stream.peer_addr() {
+        hub.note_replica_ip(client_id, peer.ip());
+    }
     let (mut reader, mut writer) = stream.into_split();
     let _unregister = UnregisterFdOnDrop {
         port: router.port,
@@ -8046,6 +8074,7 @@ async fn execute_command(
 
     if MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0
         && cmd.is_write_command()
+        && not_enough_good_replicas(router.port)
     {
         out.extend_from_slice(b"-NOREPLICAS Not enough good replicas to write.\r\n");
         return false;
@@ -9678,7 +9707,13 @@ async fn execute_command(
                     } else {
                         "no"
                     };
-                    let all_configs: [(&str, String); 53] = [
+                    let min_replicas = MIN_REPLICAS_TO_WRITE
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let min_replicas_lag = MIN_REPLICAS_MAX_LAG
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let all_configs: [(&str, String); 58] = [
                         ("port", port_str),
                         ("idle-poll-us", monoio::idle_poll_us().to_string()),
                         (
@@ -9783,6 +9818,16 @@ async fn execute_command(
                         ),
                         ("replica-read-only", ro.to_string()),
                         ("slave-read-only", ro.to_string()),
+                        ("min-replicas-to-write", min_replicas.clone()),
+                        ("min-slaves-to-write", min_replicas),
+                        ("min-replicas-max-lag", min_replicas_lag.clone()),
+                        ("min-slaves-max-lag", min_replicas_lag),
+                        (
+                            "repl-backlog-ttl",
+                            crate::replication::REPL_BACKLOG_TTL
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .to_string(),
+                        ),
                     ];
                     let hidden_configs: [(&str, String); 2] = [
                         ("key-load-delay", key_load_delay),
@@ -9858,6 +9903,10 @@ async fn execute_command(
                             "busy-reply-threshold" | "lua-time-limit" => "lua-time-limit",
                             "slaveof" | "replicaof" => "replicaof",
                             "slave-read-only" | "replica-read-only" => "replica-read-only",
+                            "min-slaves-to-write" | "min-replicas-to-write" => {
+                                "min-replicas-to-write"
+                            }
+                            "min-slaves-max-lag" | "min-replicas-max-lag" => "min-replicas-max-lag",
                             "hash-max-ziplist-entries" | "hash-max-listpack-entries" => {
                                 "hash-max-listpack-entries"
                             }
@@ -10110,10 +10159,17 @@ async fn execute_command(
                                     return false;
                                 }
                             }
-                        } else if p_str == "min-replicas-to-write" {
-                            if val_str.parse::<usize>().is_err() {
+                        } else if matches!(
+                            p_str.as_str(),
+                            "min-replicas-to-write"
+                                | "min-slaves-to-write"
+                                | "min-replicas-max-lag"
+                                | "min-slaves-max-lag"
+                        ) {
+                            if val_str.parse::<u32>().is_err() {
                                 out.extend_from_slice(
-                                    b"-ERR Invalid argument for CONFIG SET min-replicas-to-write\r\n",
+                                    format!("-ERR Invalid argument for CONFIG SET {p_str}\r\n")
+                                        .as_bytes(),
                                 );
                                 return false;
                             }
@@ -10818,7 +10874,14 @@ async fn execute_command(
                             }
                         }
                         if killed_cids.is_empty() {
-                            out.extend_from_slice(b"-ERR No such client\r\n");
+                            // A replica's link to its master is a client in
+                            // Redis, listed under the master's address.
+                            let hub = crate::replication::get_replication_hub(router.port);
+                            if hub.drop_master_link_to(&target_addr) {
+                                out.extend_from_slice(b"+OK\r\n");
+                            } else {
+                                out.extend_from_slice(b"-ERR No such client\r\n");
+                            }
                         } else {
                             let map = GLOBAL_CLIENTS.read();
                             for cid in killed_cids {
@@ -16701,6 +16764,31 @@ pub fn dirty_counted_on_change(cmd: &Command) -> bool {
     )
 }
 
+/// Applies a command received from this replica's master on the local
+/// shard. Like Redis, it counts in INFO commandstats, and an error reply
+/// (which goes nowhere: the master never reads replies) is logged, since it
+/// means the replica's data may now differ from the master's.
+pub fn apply_replicated_command(
+    cmd: &Command,
+    db: &mut ShardDb,
+    out: &mut Vec<u8>,
+    aof: Option<&RefCell<crate::aof::AofWriter>>,
+) {
+    out.clear();
+    let start = std::time::Instant::now();
+    execute_local_command(cmd, db, out, aof);
+    let name = get_cmd_name(cmd);
+    record_cmd_stats(name, 1, start.elapsed().as_nanos() as u64);
+    if out.first() == Some(&b'-') {
+        let end = out.iter().position(|&b| b == b'\r').unwrap_or(out.len());
+        println!(
+            "== CRITICAL == This replica is sending an error to its master: '{}' after processing the command '{}'",
+            String::from_utf8_lossy(&out[1..end]),
+            name.to_ascii_lowercase(),
+        );
+    }
+}
+
 pub fn execute_local_command(
     cmd: &Command,
     db: &mut ShardDb,
@@ -17785,11 +17873,16 @@ pub fn execute_local_command(
                 match db.spop(key, n) {
                     Ok(popped) => {
                         if !popped.is_empty() {
-                            let srem_cmd = Command::Srem {
-                                key: key.clone(),
-                                members: popped.clone(),
-                            };
-                            record_change!(&srem_cmd);
+                            // Like Redis, replicate as SREMs of at most
+                            // 1024 members each, so no single propagated
+                            // command grows with the count.
+                            for chunk in popped.chunks(1024) {
+                                let srem_cmd = Command::Srem {
+                                    key: key.clone(),
+                                    members: chunk.to_vec(),
+                                };
+                                record_change!(&srem_cmd);
+                            }
                             notify_keyspace_event(NOTIFY_SET, "spop", key);
                             notify_del_if_emptied(db, key);
                         }

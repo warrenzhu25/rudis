@@ -4030,7 +4030,7 @@ impl Router {
         match crate::connection::target_shard_of_cmd(&cmd, self.num_shards) {
             Some(target) if target == self.shard_id => {
                 let mut dummy_out = Vec::new();
-                crate::connection::execute_local_command(
+                crate::connection::apply_replicated_command(
                     &cmd,
                     &mut self.local_db.borrow_mut(),
                     &mut dummy_out,
@@ -4074,7 +4074,7 @@ impl Router {
     async fn apply_replica_on(&self, target: usize, cmd: Command) {
         if target == self.shard_id {
             let mut dummy_out = Vec::new();
-            crate::connection::execute_local_command(
+            crate::connection::apply_replicated_command(
                 &cmd,
                 &mut self.local_db.borrow_mut(),
                 &mut dummy_out,

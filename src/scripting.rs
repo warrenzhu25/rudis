@@ -2218,6 +2218,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
         }
         if crate::connection::MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0
             && cmd.is_write_command()
+            && crate::connection::not_enough_good_replicas(port)
         {
             return Err(mlua::Error::RuntimeError(
                 "NOREPLICAS Not enough good replicas to write.".to_string(),
@@ -2390,6 +2391,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
         }
         if crate::connection::MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0
             && cmd.is_write_command()
+            && crate::connection::not_enough_good_replicas(port)
         {
             let tbl = lua.create_table()?;
             tbl.set("err", "NOREPLICAS Not enough good replicas to write.")?;

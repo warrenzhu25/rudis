@@ -6113,7 +6113,8 @@ fn test_psync_partial_resync_continue_e2e() {
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
 
-    let psync_cmd = format!("PSYNC {} {}\r\n", replid, offset1);
+    // Like a Redis replica, ask for the next byte after what it has.
+    let psync_cmd = format!("PSYNC {} {}\r\n", replid, offset1 + 1);
     replica.write_all(psync_cmd.as_bytes()).unwrap();
 
     // 5. Read response from master on replica connection
@@ -20479,6 +20480,101 @@ fn test_replica_ack_beyond_master_offset_does_not_satisfy_wait_e2e() {
         .unwrap();
     assert_eq!(resp_cmd(&mut c, &["WAIT", "1", "5000"]), ":1\r\n");
 
+    drop(replica);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
+
+#[test]
+fn test_min_replicas_to_write_counts_good_replicas_and_info_lists_them_e2e() {
+    let port: u16 = 17099;
+    let port_s = port.to_string();
+    let args = ["--port", &port_s, "--threads", "2", "--no-pin"];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    // Without replicas, min-slaves-to-write (the old name) blocks writes.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "min-slaves-to-write", "1"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "min-replicas-to-write"]),
+        "*2\r\n$21\r\nmin-replicas-to-write\r\n$1\r\n1\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["SET", "mr:k", "v"]).starts_with("-NOREPLICAS"));
+    assert_eq!(resp_cmd(&mut c, &["GET", "mr:k"]), "$-1\r\n");
+
+    // A replica announces its port before PSYNC, as Redis replicas do.
+    let mut replica = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    replica
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(
+        resp_cmd(&mut replica, &["REPLCONF", "listening-port", "7777"]),
+        "+OK\r\n"
+    );
+    replica
+        .write_all(&format_resp_cmd(&["PSYNC", "?", "-1"]))
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let n = replica.read(&mut buf).unwrap();
+    assert!(buf[..n].starts_with(b"+FULLRESYNC"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = resp_cmd(&mut c, &["INFO", "replication"]);
+        if info.contains("slave0:ip=127.0.0.1,port=7777,state=online,") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{info}");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // One fresh replica satisfies 1 but not 2.
+    assert_eq!(resp_cmd(&mut c, &["SET", "mr:k", "v"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "min-replicas-to-write", "2"]),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["SET", "mr:k", "v2"]).starts_with("-NOREPLICAS"));
+    assert!(
+        resp_cmd(
+            &mut c,
+            &["EVAL", "return redis.call('set','mr:k','v3')", "0"]
+        )
+        .contains("NOREPLICAS")
+    );
+
+    // With max-lag 1, a replica whose last ack is 2+ seconds old is no
+    // longer good (this fake replica never acks on its own).
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "min-replicas-to-write", "1"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "min-slaves-max-lag", "1"]),
+        "+OK\r\n"
+    );
+    thread::sleep(Duration::from_millis(2500));
+    assert!(resp_cmd(&mut c, &["SET", "mr:k", "v4"]).starts_with("-NOREPLICAS"));
+    let offset = resp_cmd(&mut c, &["INFO", "replication"])
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("master_repl_offset:")
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap();
+    replica
+        .write_all(&format_resp_cmd(&["REPLCONF", "ACK", &offset]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(resp_cmd(&mut c, &["SET", "mr:k", "v5"]), "+OK\r\n");
+
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "min-replicas-to-write", "0"]),
+        "+OK\r\n"
+    );
     drop(replica);
     drop(c);
     shutdown_and_wait(port, &mut child);

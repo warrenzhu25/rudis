@@ -27,6 +27,8 @@ pub struct ConnectedReplica {
     pub listening_port: AtomicU64,
     pub ack_offset: AtomicU64,
     pub last_ack_time: AtomicU64,
+    /// The replica's address as seen by the master (INFO and ROLE).
+    pub ip: Option<std::net::IpAddr>,
     /// Set while the replica's full-sync snapshot is being taken.
     pub full_sync: Option<FullSyncCut>,
     /// Stream bytes not yet taken by the writer task, appended in offset
@@ -84,7 +86,22 @@ enum Delivery {
     Skip,
 }
 
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl ConnectedReplica {
+    /// False while the replica's full-sync snapshot is still being taken
+    /// (Redis's `wait_bgsave`).
+    pub fn is_online(&self) -> bool {
+        self.full_sync
+            .as_ref()
+            .is_none_or(|cut| cut.all_armed.load(Ordering::Acquire))
+    }
+
     /// What to do with bytes replicated by `shard` (None: unknown shard).
     fn delivery(&self, shard: Option<usize>) -> Delivery {
         let Some(cut) = &self.full_sync else {
@@ -288,6 +305,14 @@ impl ReplicationBacklog {
         self.len == 0
     }
 
+    /// Drops the history; the next byte appended has offset
+    /// `current_master_offset + 1`.
+    pub fn clear(&mut self, current_master_offset: u64) {
+        self.write_idx = 0;
+        self.len = 0;
+        self.first_byte_offset = current_master_offset + 1;
+    }
+
     pub fn append(&mut self, data: &[u8], current_master_offset: u64) {
         let n = data.len();
         if n == 0 {
@@ -393,7 +418,29 @@ pub struct ReplicationHub {
     worker_exit: Mutex<Option<flume::Receiver<()>>>,
     /// Set while this server loads a master's full-sync RDB.
     loading: AtomicBool,
+    /// Address details a connection reported before its PSYNC registered
+    /// it as a replica (REPLCONF listening-port comes first), by client id.
+    pending_peers: Mutex<HashMap<u64, PendingPeer>>,
+    /// When the last replica disconnected (unix seconds), 0 while replicas
+    /// are connected or before the first one: `repl-backlog-ttl` counts
+    /// from it.
+    no_replicas_since: AtomicU64,
 }
+
+/// `repl-backlog-ttl`: seconds without replicas after which a master drops
+/// its backlog (0: never), so a replica returning after that full-syncs.
+pub static REPL_BACKLOG_TTL: AtomicU64 = AtomicU64::new(3600);
+
+/// See `ReplicationHub::pending_peers`.
+#[derive(Default, Clone, Copy)]
+struct PendingPeer {
+    port: u16,
+    ip: Option<std::net::IpAddr>,
+}
+
+/// Bound on `pending_peers`, which only clients that never send PSYNC
+/// leave entries in.
+const MAX_PENDING_PEERS: usize = 4096;
 
 impl ReplicationHub {
     pub fn new(port: u16) -> Self {
@@ -427,6 +474,8 @@ impl ReplicationHub {
             loading: AtomicBool::new(false),
             sync_conn: Mutex::new(None),
             worker_exit: Mutex::new(None),
+            pending_peers: Mutex::new(HashMap::new()),
+            no_replicas_since: AtomicU64::new(0),
         }
     }
 
@@ -511,6 +560,34 @@ impl ReplicationHub {
         }
     }
 
+    /// CLIENT KILL of a replica's master link (`addr` is `host:port` of
+    /// the configured master): breaks the link without stopping
+    /// replication, so the worker reconnects and tries a partial resync.
+    /// Returns whether there was such a link.
+    pub fn drop_master_link_to(&self, addr: &str) -> bool {
+        let matches = match &*self.role.read() {
+            ReplicationRole::Slave {
+                master_host,
+                master_port,
+                ..
+            } => addr == format!("{master_host}:{master_port}"),
+            ReplicationRole::Master { .. } => false,
+        };
+        if !matches {
+            return false;
+        }
+        let conn = self.sync_conn.lock();
+        let Some(fd) = *conn else {
+            return false;
+        };
+        // SAFETY: shutdown(2) takes no pointers. The `sync_conn` lock is held for the
+        // call and the worker clears the slot under it before closing the socket.
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_RDWR);
+        }
+        true
+    }
+
     pub fn activate_backlog(&self) {
         self.backlog_active.store(true, Ordering::Release);
         HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
@@ -532,12 +609,16 @@ impl ReplicationHub {
         sender: flume::Sender<Vec<u8>>,
         full_sync: Option<FullSyncCut>,
     ) -> Arc<ConnectedReplica> {
+        let peer = self.pending_peers.lock().remove(&id).unwrap_or_default();
         let rep = Arc::new(ConnectedReplica {
             id,
             sender,
-            listening_port: AtomicU64::new(0),
+            listening_port: AtomicU64::new(peer.port as u64),
             ack_offset: AtomicU64::new(0),
-            last_ack_time: AtomicU64::new(0),
+            // Like Redis, the lag clock starts at registration, so a new
+            // replica counts as good until it misses acks.
+            last_ack_time: AtomicU64::new(unix_secs()),
+            ip: peer.ip,
             full_sync,
             pending: Mutex::new(Vec::new()),
             wake_queued: AtomicBool::new(false),
@@ -547,6 +628,7 @@ impl ReplicationHub {
             conn_fd: Mutex::new(None),
         });
         self.replicas.write().insert(id, rep.clone());
+        self.no_replicas_since.store(0, Ordering::Relaxed);
         self.has_replicas.store(true, Ordering::Release);
         self.backlog_active.store(true, Ordering::Release);
         HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
@@ -620,7 +702,9 @@ impl ReplicationHub {
 
     pub fn unregister_replica(&self, id: u64) {
         let mut reps = self.replicas.write();
-        reps.remove(&id);
+        if reps.remove(&id).is_some() && reps.is_empty() {
+            self.no_replicas_since.store(unix_secs(), Ordering::Relaxed);
+        }
         if reps.is_empty() {
             self.has_replicas.store(false, Ordering::Release);
         }
@@ -635,18 +719,46 @@ impl ReplicationHub {
         }
         if let Some(rep) = self.replicas.read().get(&id) {
             rep.ack_offset.store(offset, Ordering::SeqCst);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            rep.last_ack_time.store(now, Ordering::SeqCst);
+            rep.last_ack_time.store(unix_secs(), Ordering::SeqCst);
         }
     }
 
     pub fn set_replica_port(&self, id: u64, port: u16) {
         if let Some(rep) = self.replicas.read().get(&id) {
             rep.listening_port.store(port as u64, Ordering::SeqCst);
+            return;
         }
+        // REPLCONF listening-port normally comes before PSYNC registers
+        // the replica; keep it for `insert_replica`.
+        self.note_pending_peer(id, |p| p.port = port);
+    }
+
+    /// Records the address of connection `id`, which is about to register
+    /// as a replica.
+    pub fn note_replica_ip(&self, id: u64, ip: std::net::IpAddr) {
+        self.note_pending_peer(id, |p| p.ip = Some(ip));
+    }
+
+    fn note_pending_peer(&self, id: u64, f: impl FnOnce(&mut PendingPeer)) {
+        let mut peers = self.pending_peers.lock();
+        if peers.len() >= MAX_PENDING_PEERS && !peers.contains_key(&id) {
+            peers.clear();
+        }
+        f(peers.entry(id).or_default());
+    }
+
+    /// Replicas whose last ack is at most `max_lag` seconds old: the
+    /// "good" replicas `min-replicas-to-write` counts.
+    pub fn good_replicas(&self, max_lag: u64) -> usize {
+        let now = unix_secs();
+        self.replicas
+            .read()
+            .values()
+            .filter(|r| {
+                r.is_online()
+                    && now.saturating_sub(r.last_ack_time.load(Ordering::SeqCst)) <= max_lag
+            })
+            .count()
     }
 
     pub fn register_shard_flow(
@@ -695,6 +807,23 @@ impl ReplicationHub {
         }
     }
 
+    /// Applies `repl-backlog-ttl`: once no replica has been connected for
+    /// that long, the backlog is dropped. Checked when a replica asks for a
+    /// partial resync, the only time the backlog is read.
+    fn expire_idle_backlog(&self, backlog: &mut ReplicationBacklog) {
+        if !self.backlog_idle_expired() {
+            return;
+        }
+        backlog.clear(self.master_repl_offset.load(Ordering::SeqCst));
+        self.no_replicas_since.store(0, Ordering::Relaxed);
+    }
+
+    fn backlog_idle_expired(&self) -> bool {
+        let since = self.no_replicas_since.load(Ordering::Relaxed);
+        let ttl = REPL_BACKLOG_TTL.load(Ordering::Relaxed);
+        since != 0 && ttl != 0 && unix_secs().saturating_sub(since) >= ttl
+    }
+
     pub fn try_partial_resync(
         &self,
         client_id: u64,
@@ -702,10 +831,13 @@ impl ReplicationHub {
         req_replid: &str,
         req_offset: i64,
     ) -> Option<(String, Vec<u8>, Arc<ConnectedReplica>)> {
-        if req_offset < 0 {
+        // Like Redis, a replica asks for the offset of the next byte it
+        // needs: one past what it applied.
+        if req_offset < 1 {
             return None;
         }
-        let target_offset = (req_offset as u64) + 1;
+        let target_offset = req_offset as u64;
+        let req_offset = req_offset - 1;
 
         let (current_replid, replid_matches) = {
             let role = self.role.read();
@@ -733,7 +865,8 @@ impl ReplicationHub {
 
         // Hold the backlog lock until the replica is registered, so no
         // change lands between the diff and the live stream.
-        let backlog = self.backlog.write();
+        let mut backlog = self.backlog.write();
+        self.expire_idle_backlog(&mut backlog);
         let current_offset = self.master_repl_offset.load(Ordering::SeqCst);
         if !backlog.can_partial_sync(target_offset, current_offset)
             || self.in_psync_hole(req_offset as u64, backlog.first_byte_offset)
@@ -748,10 +881,12 @@ impl ReplicationHub {
     }
 
     pub fn can_partial_resync(&self, req_replid: &str, req_offset: i64) -> bool {
-        if req_offset < 0 {
+        // See `try_partial_resync`: `req_offset` is the next byte wanted.
+        if req_offset < 1 {
             return false;
         }
-        let target_offset = (req_offset as u64) + 1;
+        let target_offset = req_offset as u64;
+        let req_offset = req_offset - 1;
         let role = self.role.read();
         let replid_matches = match &*role {
             ReplicationRole::Master {
@@ -771,6 +906,9 @@ impl ReplicationHub {
             _ => false,
         };
         if !replid_matches {
+            return false;
+        }
+        if self.backlog_idle_expired() {
             return false;
         }
         let backlog = self.backlog.read();
@@ -897,7 +1035,10 @@ impl ReplicationHub {
                 for rep in reps.values() {
                     let rport = rep.listening_port.load(Ordering::SeqCst);
                     let rack = rep.ack_offset.load(Ordering::SeqCst);
-                    out.extend_from_slice(b"*3\r\n$9\r\n127.0.0.1\r\n$");
+                    let ip = rep
+                        .ip
+                        .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string());
+                    out.extend_from_slice(format!("*3\r\n${}\r\n{}\r\n$", ip.len(), ip).as_bytes());
                     let rport_s = rport.to_string();
                     out.extend_from_slice(rport_s.len().to_string().as_bytes());
                     out.extend_from_slice(b"\r\n");
@@ -946,10 +1087,37 @@ impl ReplicationHub {
                 let reps = self.replicas.read();
                 let offset = self.master_repl_offset.load(Ordering::SeqCst);
                 let backlog = self.backlog.read();
+                // One `slaveN:` line per replica, oldest first, as Redis.
+                let mut sorted: Vec<_> = reps.values().collect();
+                sorted.sort_by_key(|r| r.id);
+                let now = unix_secs();
+                let mut slaves = String::new();
+                for (i, rep) in sorted.iter().enumerate() {
+                    let ip = rep
+                        .ip
+                        .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string());
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut slaves,
+                        format_args!(
+                            "slave{}:ip={},port={},state={},offset={},lag={}\r\n",
+                            i,
+                            ip,
+                            rep.listening_port.load(Ordering::SeqCst),
+                            if rep.is_online() {
+                                "online"
+                            } else {
+                                "wait_bgsave"
+                            },
+                            rep.ack_offset.load(Ordering::SeqCst),
+                            now.saturating_sub(rep.last_ack_time.load(Ordering::SeqCst)),
+                        ),
+                    );
+                }
                 format!(
                     "# Replication\r\n\
                      role:master\r\n\
                      connected_slaves:{}\r\n\
+                     {}\
                      master_replid:{}\r\n\
                      master_replid2:{}\r\n\
                      master_repl_offset:{}\r\n\
@@ -959,10 +1127,17 @@ impl ReplicationHub {
                      repl_backlog_first_byte_offset:{}\r\n\
                      repl_backlog_histlen:{}\r\n",
                     reps.len(),
+                    slaves,
                     replid,
                     replid2,
                     offset,
-                    second_offset,
+                    // Redis shows the first offset replid2 no longer
+                    // covers: one past the switch offset.
+                    if second_offset >= 0 {
+                        second_offset + 1
+                    } else {
+                        -1
+                    },
                     backlog.max_size,
                     backlog.first_byte_offset,
                     backlog.len()
@@ -1631,12 +1806,14 @@ async fn run_replica_worker(
         };
 
         let psync_payload = if !cached_replid.is_empty() {
+            // Like Redis, ask for the next byte: one past what was applied.
+            let next = (cached_offset + 1).to_string();
             format!(
                 "*3\r\n$5\r\nPSYNC\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
                 cached_replid.len(),
                 cached_replid,
-                cached_offset.to_string().len(),
-                cached_offset
+                next.len(),
+                next
             )
             .into_bytes()
         } else {
@@ -1769,6 +1946,36 @@ async fn run_replica_worker(
         // shard; the offset advances once the whole batch is applied.
         let mut current_offset = initial_offset;
         let mut batch: Vec<Vec<crate::resp::Command>> = vec![Vec::new(); router.num_shards];
+        // Like a Redis replica, acknowledge the applied offset every second
+        // (and at once on REPLCONF GETACK): the master needs it for replica
+        // lag in INFO and for min-replicas-max-lag. A separate writer task
+        // owns the write half, so waiting for the next ack never interrupts
+        // a read of the stream.
+        let (mut stream, mut ack_writer) = monoio::io::Splitable::into_split(stream);
+        let applied = std::rc::Rc::new(std::cell::Cell::new(initial_offset));
+        // Wakes the writer for an immediate ack (REPLCONF GETACK).
+        let (ack_tx, ack_rx) = flume::unbounded::<()>();
+        let applied_w = applied.clone();
+        monoio::spawn(async move {
+            loop {
+                match monoio::time::timeout(std::time::Duration::from_secs(1), ack_rx.recv_async())
+                    .await
+                {
+                    Ok(Ok(())) | Err(_) => {}
+                    Ok(Err(_)) => break,
+                }
+                while ack_rx.try_recv().is_ok() {}
+                let off = applied_w.get().to_string();
+                let ack = format!(
+                    "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
+                    off.len(),
+                    off
+                );
+                if ack_writer.write_all(ack.into_bytes()).await.0.is_err() {
+                    break;
+                }
+            }
+        });
         loop {
             if is_sync_cancelled(&cancel_rx) {
                 break 'reconnect_loop;
@@ -1787,13 +1994,8 @@ async fn run_replica_worker(
                                 if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"getack") {
                                     // Acknowledge only what is applied.
                                     router.flush_replica_batch(&mut batch).await;
-                                    let off_str = current_offset.to_string();
-                                    let ack_reply = format!(
-                                        "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
-                                        off_str.len(),
-                                        off_str
-                                    );
-                                    let _ = stream.write_all(ack_reply.into_bytes()).await.0;
+                                    applied.set(current_offset);
+                                    let _ = ack_tx.send(());
                                 }
                             }
                             crate::resp::Command::Ping(_) => {}
@@ -1819,6 +2021,8 @@ async fn run_replica_worker(
             {
                 *master_repl_offset = current_offset;
             }
+            // The periodic ack reports this from its next tick.
+            applied.set(current_offset);
             if protocol_error {
                 break;
             }
@@ -1957,7 +2161,7 @@ mod tests {
         assert!(hub.try_partial_resync(1, tx.clone(), &replid, -1).is_none());
 
         // Offset 0 succeeds with empty diff
-        let res = hub.try_partial_resync(1, tx.clone(), &replid, 0);
+        let res = hub.try_partial_resync(1, tx.clone(), &replid, 1);
         assert!(res.is_some());
         let (out_id, diff, rep) = res.unwrap();
         assert_eq!(out_id, replid);
@@ -1971,14 +2175,14 @@ mod tests {
         assert!(current_offset > 0);
 
         // Can partial resync from offset 0 (wants diff from byte 1)
-        let res2 = hub.try_partial_resync(2, tx.clone(), &replid, 0);
+        let res2 = hub.try_partial_resync(2, tx.clone(), &replid, 1);
         assert!(res2.is_some());
         let (_, diff2, _) = res2.unwrap();
         assert_eq!(diff2, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
         hub.unregister_replica(2);
 
         // Replay from current offset (up to date)
-        let res3 = hub.try_partial_resync(3, tx.clone(), &replid, current_offset as i64);
+        let res3 = hub.try_partial_resync(3, tx.clone(), &replid, current_offset as i64 + 1);
         assert!(res3.is_some());
         let (_, diff3, _) = res3.unwrap();
         assert!(diff3.is_empty());
@@ -1986,7 +2190,7 @@ mod tests {
 
         // Offset beyond master fails
         assert!(
-            hub.try_partial_resync(4, tx.clone(), &replid, (current_offset + 10) as i64)
+            hub.try_partial_resync(4, tx.clone(), &replid, (current_offset + 11) as i64)
                 .is_none()
         );
     }
@@ -2047,14 +2251,14 @@ mod tests {
         // so a partial resync from inside it must be refused.
         let replid = hub.master_replid.clone();
         let (tx2, _rx2) = flume::unbounded();
-        assert!(!hub.can_partial_resync(&replid, start as i64));
+        assert!(!hub.can_partial_resync(&replid, start as i64 + 1));
         assert!(
-            hub.try_partial_resync(8, tx2.clone(), &replid, (start + 1) as i64)
+            hub.try_partial_resync(8, tx2.clone(), &replid, (start + 2) as i64)
                 .is_none()
         );
         let now = hub.master_repl_offset.load(Ordering::SeqCst);
         assert!(
-            hub.try_partial_resync(8, tx2, &replid, now as i64)
+            hub.try_partial_resync(8, tx2, &replid, now as i64 + 1)
                 .is_some()
         );
     }
@@ -2065,7 +2269,7 @@ mod tests {
         let hub = ReplicationHub::new(19995);
         let replid = hub.master_replid.clone();
         let (tx, _rx) = flume::unbounded();
-        let (_, _, rep) = hub.try_partial_resync(1, tx, &replid, 0).unwrap();
+        let (_, _, rep) = hub.try_partial_resync(1, tx, &replid, 1).unwrap();
         let limit = BufferLimit::new(1000, 500, 1);
         assert!(!rep.over_limit(499, limit));
         // Above the soft limit: allowed for soft_seconds, then not.
@@ -2076,7 +2280,7 @@ mod tests {
         assert!(rep.is_overflowed());
 
         let (tx, _rx) = flume::unbounded();
-        let (_, _, rep) = hub.try_partial_resync(2, tx, &replid, 0).unwrap();
+        let (_, _, rep) = hub.try_partial_resync(2, tx, &replid, 1).unwrap();
         // Dropping below the soft limit restarts the soft timer.
         assert!(!rep.over_limit(600, limit));
         assert!(!rep.over_limit(100, limit));
@@ -2084,7 +2288,7 @@ mod tests {
         assert!(rep.over_limit(1000, limit));
         // 0 disables a limit.
         let (tx, _rx) = flume::unbounded();
-        let (_, _, rep) = hub.try_partial_resync(3, tx, &replid, 0).unwrap();
+        let (_, _, rep) = hub.try_partial_resync(3, tx, &replid, 1).unwrap();
         assert!(!rep.over_limit(usize::MAX / 2, BufferLimit::new(0, 0, 0)));
         // soft_seconds 0: over the soft limit at all is too much.
         assert!(rep.over_limit(600, BufferLimit::new(0, 500, 0)));
@@ -2095,7 +2299,7 @@ mod tests {
         let hub = ReplicationHub::new(19994);
         let replid = hub.master_replid.clone();
         let (tx, rx) = flume::unbounded();
-        let (_, _, rep) = hub.try_partial_resync(1, tx, &replid, 0).unwrap();
+        let (_, _, rep) = hub.try_partial_resync(1, tx, &replid, 1).unwrap();
         TEST_REPLICA_LIMIT
             .with(|l| l.set(Some(crate::connection::BufferLimit::new(4 << 20, 0, 0))));
         // The writer is stuck, so the stream piles up past the hard limit.
@@ -2136,7 +2340,7 @@ mod tests {
         hub.propagate(b"a");
         let replid = hub.master_replid.clone();
         let (tx, rx) = flume::unbounded();
-        let (_, diff, rep) = hub.try_partial_resync(1, tx, &replid, 0).unwrap();
+        let (_, diff, rep) = hub.try_partial_resync(1, tx, &replid, 1).unwrap();
         assert_eq!(diff, b"a");
         hub.propagate(b"b");
         hub.propagate(b"c");
@@ -2208,6 +2412,9 @@ mod tests {
         let rep = hub.register_replica(11, tx);
         hub.propagate(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
         let offset = hub.master_repl_offset.load(Ordering::SeqCst);
+        // Registration starts the clock; zero it to see that bad acks
+        // do not touch it.
+        rep.last_ack_time.store(0, Ordering::SeqCst);
 
         hub.update_replica_ack(rep.id, offset + 1);
         hub.update_replica_ack(rep.id, u64::MAX);
@@ -2217,6 +2424,54 @@ mod tests {
         hub.update_replica_ack(rep.id, offset);
         assert_eq!(rep.ack_offset.load(Ordering::SeqCst), offset);
         hub.unregister_replica(rep.id);
+    }
+
+    #[test]
+    fn test_good_replicas_counts_recent_online_acks() {
+        let hub = ReplicationHub::new(19993);
+        let (tx, _rx) = flume::unbounded();
+        let fresh = hub.register_replica(21, tx.clone());
+        let stale = hub.register_replica(22, tx.clone());
+        let syncing = hub.register_full_sync_replica(23, tx, 2);
+        assert!(fresh.is_online() && !syncing.is_online());
+        assert_eq!(hub.good_replicas(10), 2);
+        stale
+            .last_ack_time
+            .store(unix_secs() - 11, Ordering::SeqCst);
+        assert_eq!(hub.good_replicas(10), 1);
+        assert_eq!(hub.good_replicas(20), 2);
+        let _ = hub.finish_full_sync(23);
+        assert!(syncing.is_online());
+        assert_eq!(hub.good_replicas(10), 2);
+        for id in [21, 22, 23] {
+            hub.unregister_replica(id);
+        }
+        assert_eq!(hub.good_replicas(10), 0);
+    }
+
+    #[test]
+    fn test_replica_address_reported_before_psync_shows_in_info_and_role() {
+        let hub = ReplicationHub::new(19994);
+        // REPLCONF listening-port arrives before PSYNC registers it.
+        hub.set_replica_port(31, 6380);
+        hub.note_replica_ip(31, "10.1.2.3".parse().unwrap());
+        let (tx, _rx) = flume::unbounded();
+        let rep = hub.register_replica(31, tx);
+        assert_eq!(rep.listening_port.load(Ordering::SeqCst), 6380);
+        assert!(hub.pending_peers.lock().is_empty());
+        let info = hub.format_info_replication();
+        assert!(
+            info.contains(
+                "connected_slaves:1\r\nslave0:ip=10.1.2.3,port=6380,state=online,offset=0,lag=0\r\n"
+            ),
+            "{info}"
+        );
+        let role = hub.format_role_resp();
+        assert!(
+            role.windows(b"$8\r\n10.1.2.3\r\n$4\r\n6380\r\n".len())
+                .any(|w| w == b"$8\r\n10.1.2.3\r\n$4\r\n6380\r\n")
+        );
+        hub.unregister_replica(31);
     }
 
     #[test]
@@ -2265,14 +2520,14 @@ mod tests {
         // Test that try_partial_resync succeeds for a client asking for replid2 at offset <= second_offset
         let (tx, _rx) = flume::unbounded();
         assert!(
-            hub.try_partial_resync(100, tx.clone(), &master_replid, 120)
+            hub.try_partial_resync(100, tx.clone(), &master_replid, 121)
                 .is_some()
         );
         hub.unregister_replica(100);
 
         // Asking for replid2 at offset > second_offset fails
         assert!(
-            hub.try_partial_resync(101, tx, &master_replid, 121)
+            hub.try_partial_resync(101, tx, &master_replid, 122)
                 .is_none()
         );
     }
