@@ -646,7 +646,15 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             let age = now.duration_since(client.connected_at).as_secs();
                             let idle = now.duration_since(client.last_active).as_secs();
                             let is_blocked = crate::block::get_block_hub_for_port(port).lock().is_blocked(client.id);
-                            let flags = if client.is_monitor { "O" } else if is_blocked { "b" } else { "N" };
+                            let flags = if client.is_monitor {
+                                "O"
+                            } else if client.stats.is_replica.load(std::sync::atomic::Ordering::Relaxed) {
+                                "S"
+                            } else if is_blocked {
+                                "b"
+                            } else {
+                                "N"
+                            };
                             let (qbuf, qbuf_free) = client.effective_qbuf(idle);
                             let tot_net_in = client.stats.tot_net_in.load(std::sync::atomic::Ordering::Relaxed);
                             let tot_net_out = client.stats.tot_net_out.load(std::sync::atomic::Ordering::Relaxed);

@@ -2749,6 +2749,12 @@ impl Router {
                 .is_blocked(client.id);
             let flags = if client.is_monitor {
                 "O"
+            } else if client
+                .stats
+                .is_replica
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                "S"
             } else if is_blocked {
                 "b"
             } else {

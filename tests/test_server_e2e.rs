@@ -20576,6 +20576,27 @@ fn test_min_replicas_to_write_counts_good_replicas_and_info_lists_them_e2e() {
         resp_cmd(&mut c, &["CONFIG", "SET", "min-replicas-to-write", "0"]),
         "+OK\r\n"
     );
+
+    // The link shows as a replica client and CLIENT KILL TYPE replica
+    // drops it.
+    let list = resp_cmd(&mut c, &["CLIENT", "LIST"]);
+    assert!(
+        list.lines()
+            .any(|l| l.contains("flags=S") && l.contains("cmd=psync")),
+        "{list}"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CLIENT", "KILL", "TYPE", "replica"]),
+        ":1\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !resp_cmd(&mut c, &["INFO", "replication"]).contains("connected_slaves:0") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica link survived the kill"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     drop(replica);
     drop(c);
     shutdown_and_wait(port, &mut child);

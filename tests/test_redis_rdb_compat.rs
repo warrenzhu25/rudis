@@ -1020,6 +1020,61 @@ fn full_sync_with_valkey_both_directions() {
     assert_same(&expected, &snapshot(&mut v));
 }
 
+/// After a broken link, a replica resumes with a partial resync in both
+/// directions; a PSYNC offset off by one would skip or repeat a byte.
+#[test]
+fn partial_resync_with_valkey_both_directions() {
+    require_valkey!();
+    let info_field = |c: &mut Client, section: &str, field: &str| -> String {
+        let text = c.c(&format!("INFO {section}")).text();
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{field}:")))
+            .unwrap_or_else(|| panic!("{field} missing in {text}"))
+            .trim()
+            .to_string()
+    };
+    for (rudis_is_master, mport, rport) in [(false, 18173u16, 18174u16), (true, 18175, 18176)] {
+        let mdir = scratch_dir(&format!("psync-m{mport}"));
+        let rdir = scratch_dir(&format!("psync-r{rport}"));
+        let (master, replica) = if rudis_is_master {
+            let m = start_rudis(mport, &mdir, 2);
+            let r = start_valkey(rport, &rdir, &[]);
+            (m, r)
+        } else {
+            let m = start_valkey(mport, &mdir, &["--repl-diskless-sync", "no"]);
+            let r = start_rudis(rport, &rdir, 2);
+            (m, r)
+        };
+        let mut m = master.client();
+        let mut r = replica.client();
+        populate(&mut m);
+        r.ok(&["REPLICAOF", "127.0.0.1", &mport.to_string()]);
+        wait_for("initial sync", || {
+            info_field(&mut r, "replication", "master_link_status") == "up"
+                && info_field(&mut r, "replication", "slave_repl_offset")
+                    == info_field(&mut m, "replication", "master_repl_offset")
+        });
+        let partial_before = info_field(&mut m, "stats", "sync_partial_ok");
+        assert!(m.c("CLIENT KILL TYPE replica").int() >= 1);
+        for i in 0..200 {
+            m.ok(&["SET", &format!("after:{i}"), &format!("v{i}")]);
+            m.c("INCR psync:ctr");
+        }
+        wait_for("partial resync", || {
+            info_field(&mut m, "stats", "sync_partial_ok") != partial_before
+                && info_field(&mut r, "replication", "master_link_status") == "up"
+                && info_field(&mut r, "replication", "slave_repl_offset")
+                    == info_field(&mut m, "replication", "master_repl_offset")
+        });
+        assert_eq!(info_field(&mut m, "stats", "sync_full"), "1");
+        assert_same(&snapshot(&mut m), &snapshot(&mut r));
+        drop(m);
+        drop(r);
+        master.kill();
+        replica.kill();
+    }
+}
+
 /// A server asked to SHUTDOWN after loading a Valkey file exits cleanly.
 #[test]
 fn rudis_shutdown_after_valkey_load() {

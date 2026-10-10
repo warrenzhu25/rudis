@@ -48,6 +48,9 @@ pub struct ClientStats {
     pub pipeline_len_sum: std::sync::atomic::AtomicU64,
     pub pipeline_len_cnt: std::sync::atomic::AtomicU64,
     pub killed: std::sync::atomic::AtomicBool,
+    /// The connection became a replica's replication link (PSYNC, SYNC or
+    /// a DFLY FLOW): CLIENT LIST flag `S`, CLIENT KILL TYPE replica.
+    pub is_replica: std::sync::atomic::AtomicBool,
 }
 
 impl ClientStats {
@@ -62,6 +65,7 @@ impl ClientStats {
             pipeline_len_sum: std::sync::atomic::AtomicU64::new(0),
             pipeline_len_cnt: std::sync::atomic::AtomicU64::new(0),
             killed: std::sync::atomic::AtomicBool::new(false),
+            is_replica: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -4001,6 +4005,17 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         let _ = transport.write_all(write_chunk).await.0;
                     }
                     let switch_cmd = commands.remove(0);
+                    if matches!(
+                        switch_cmd,
+                        Command::Psync { .. } | Command::Sync | Command::DflyFlow { .. }
+                    ) {
+                        stats
+                            .is_replica
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                            c.last_cmd = get_cmd_name(&switch_cmd);
+                        }
+                    }
                     match switch_cmd {
                         Command::Psync { .. } | Command::Sync => {
                             match transport.into_tcp_stream() {
@@ -11057,9 +11072,13 @@ async fn execute_command(
                                 }
                                 if let Some(ref f_type) = filter_type {
                                     let is_ps = entry_opt.map(|e| e.is_pubsub).unwrap_or(false);
+                                    let is_rep = entry_opt.is_some_and(|e| {
+                                        e.stats.is_replica.load(std::sync::atomic::Ordering::Relaxed)
+                                    });
                                     let matches_type = match f_type.as_str() {
                                         "pubsub" => is_ps,
-                                        "normal" => !is_ps,
+                                        "replica" | "slave" => is_rep,
+                                        "normal" => !is_ps && !is_rep,
                                         _ => false,
                                     };
                                     if !matches_type {
@@ -11069,7 +11088,31 @@ async fn execute_command(
                                 killed_cids.push(cid);
                             }
 
-                            let killed_count = killed_cids.len();
+                            let mut killed_count = killed_cids.len();
+                            // A replica's master link is not in the client
+                            // registry; TYPE master (alone or with ADDR)
+                            // reaches it.
+                            if filter_type.as_deref() == Some("master")
+                                && filter_ids.is_empty()
+                                && filter_user.is_none()
+                                && filter_laddr.is_none()
+                            {
+                                let hub = crate::replication::get_replication_hub(router.port);
+                                let addr = match &*hub.role.read() {
+                                    crate::replication::ReplicationRole::Slave {
+                                        master_host,
+                                        master_port,
+                                        ..
+                                    } => Some(format!("{master_host}:{master_port}")),
+                                    _ => None,
+                                };
+                                if let Some(addr) = addr
+                                    && filter_addr.as_ref().is_none_or(|a| *a == addr)
+                                    && hub.drop_master_link_to(&addr)
+                                {
+                                    killed_count += 1;
+                                }
+                            }
                             for cid in killed_cids {
                                 if cid == client_id {
                                     close_conn = true;
