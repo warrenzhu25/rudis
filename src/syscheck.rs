@@ -126,12 +126,12 @@ pub fn run_system_sanity_checks() -> SystemSanityReport {
     )
 }
 
-/// Emits warnings to console if any system sanity checks fail.
+/// Logs a warning for each failed system sanity check.
 pub fn print_sanity_warnings(report: &SystemSanityReport) {
     if !report.is_optimal() {
-        println!("  System Kernel Checks:");
+        crate::log_warning!("  System Kernel Checks:");
         for w in &report.warnings {
-            println!("  [!] {}", w);
+            crate::log_warning!("  [!] {}", w);
         }
     }
 }

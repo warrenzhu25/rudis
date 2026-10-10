@@ -2829,6 +2829,11 @@ pub fn apply_config_value(
         "jemalloc-bg-thread" => {
             crate::allocator::set_background_thread(parse_config_bool(name, val_str)?);
         }
+        "loglevel" => crate::log::set_loglevel(val_str)?,
+        "log-format" => crate::log::set_log_format(val_str)?,
+        "log-timestamp-format" => crate::log::set_log_timestamp_format(val_str)?,
+        // Config file only (immutable in CONFIG SET, as in Redis).
+        "logfile" => crate::log::set_logfile(val_str)?,
         _ => return Ok(false),
     }
     Ok(true)
@@ -3209,6 +3214,20 @@ pub fn spublish_sync(channel: &[u8], message: &[u8]) -> usize {
             0
         }
     })
+}
+
+/// Warns (at most once a minute) that writes are being refused with -OOM,
+/// which Redis only reports to the client: operators should see it too.
+#[cold]
+fn log_oom_rejection(max_mem: u64, policy: &str) {
+    static LOG_LIMIT: crate::log::RateLimit = crate::log::RateLimit::new();
+    if LOG_LIMIT.allow(std::time::Duration::from_secs(60)) {
+        crate::log_warning!(
+            "WARNING: used memory is over 'maxmemory' ({} bytes) and maxmemory-policy '{}' cannot free enough: write commands are refused with -OOM",
+            max_mem,
+            policy
+        );
+    }
 }
 
 pub static ISOLATED_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4545,20 +4564,14 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
 
             let ps_limits = get_client_output_buffer_limit(ClientClass::Pubsub);
             if ps_limits.hard_limit > 0 && queued_bytes as u64 >= ps_limits.hard_limit {
-                crate::server_stats::add(
-                    crate::server_stats::Stat::ClientOutputBufferLimitDisconnections,
-                    1,
-                );
+                client_output_limit_reached(client_id, queued_bytes);
                 break;
             }
             if ps_limits.soft_limit > 0 && queued_bytes as u64 >= ps_limits.soft_limit {
                 let now = Instant::now();
                 if let Some(st) = soft_start {
                     if now.duration_since(st).as_secs() >= ps_limits.soft_seconds {
-                        crate::server_stats::add(
-                            crate::server_stats::Stat::ClientOutputBufferLimitDisconnections,
-                            1,
-                        );
+                        client_output_limit_reached(client_id, queued_bytes);
                         break;
                     }
                 } else {
@@ -5256,14 +5269,32 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
     }
 }
 
-fn replica_output_limit_reached(client_id: u64) {
+/// Counts and logs a client dropped for breaking its output buffer limit
+/// (Redis's wording; rate-limited, as many clients may break it at once).
+fn client_output_limit_reached(client_id: u64, omem: usize) {
+    static LOG_LIMIT: crate::log::RateLimit = crate::log::RateLimit::new();
     crate::server_stats::add(
         crate::server_stats::Stat::ClientOutputBufferLimitDisconnections,
         1,
     );
-    eprintln!(
-        "Client id={} flags=S closed for overcoming of output buffer limits.",
-        client_id
+    if LOG_LIMIT.allow(std::time::Duration::from_secs(1)) {
+        crate::log_warning!(
+            "Client id={} flags=P omem={} scheduled to be closed ASAP for overcoming of output buffer limits.",
+            client_id,
+            omem
+        );
+    }
+}
+
+fn replica_output_limit_reached(client_id: u64, name: &str) {
+    crate::server_stats::add(
+        crate::server_stats::Stat::ClientOutputBufferLimitDisconnections,
+        1,
+    );
+    crate::log_warning!(
+        "Client id={} addr={} flags=S scheduled to be closed ASAP for overcoming of output buffer limits.",
+        client_id,
+        name
     );
 }
 
@@ -5329,6 +5360,8 @@ struct ReplicaLink {
     hub: std::sync::Arc<crate::replication::ReplicationHub>,
     client_id: u64,
     repl: Option<std::sync::Arc<crate::replication::ConnectedReplica>>,
+    /// The replica's `ip:port`, for "Connection with replica ... lost.".
+    name: String,
 }
 
 impl Drop for ReplicaLink {
@@ -5337,6 +5370,7 @@ impl Drop for ReplicaLink {
             r.detach_fd();
         }
         self.hub.unregister_replica(self.client_id);
+        crate::log_notice!("Connection with replica {} lost.", self.name);
     }
 }
 
@@ -5368,6 +5402,8 @@ async fn run_master_replica_stream(
     if let Ok(peer) = stream.peer_addr() {
         hub.note_replica_ip(client_id, peer.ip());
     }
+    let name = hub.replica_name(client_id);
+    crate::log_notice!("Replica {} asks for synchronization", name);
     let (mut reader, mut writer) = stream.into_split();
     let _unregister = UnregisterFdOnDrop {
         port: router.port,
@@ -5378,6 +5414,7 @@ async fn run_master_replica_stream(
         hub: hub.clone(),
         client_id,
         repl: None,
+        name: name.clone(),
     };
 
     let is_sync = matches!(&psync_cmd, Command::Sync);
@@ -5395,6 +5432,12 @@ async fn run_master_replica_stream(
         if let Some((replid, diff, rep)) = partial {
             repl = rep;
             crate::server_stats::add(crate::server_stats::Stat::SyncPartialOk, 1);
+            crate::log_notice!(
+                "Partial resynchronization request from {} accepted. Sending {} bytes of backlog starting from offset {}.",
+                name,
+                diff.len(),
+                req_offset
+            );
             let mut initial_msg = format!("+CONTINUE {}\r\n", replid).into_bytes();
             initial_msg.extend_from_slice(&diff);
             if writer.write_all(initial_msg).await.0.is_err() {
@@ -5406,7 +5449,17 @@ async fn run_master_replica_stream(
             // when the replica asked for a specific history.
             if req_replid != "?" {
                 crate::server_stats::add(crate::server_stats::Stat::SyncPartialErr, 1);
+                crate::log_notice!(
+                    "Partial resynchronization not accepted: replica {} asked for '{}' offset {}, my replication ID is '{}' and the offset is not in the backlog",
+                    name,
+                    req_replid,
+                    req_offset,
+                    hub.master_replid
+                );
+            } else {
+                crate::log_notice!("Full resync requested by replica {}", name);
             }
+            crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
             crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
             // Register before any shard serializes, so each shard's changes
             // after its snapshot reach the replica (see FullSyncCut).
@@ -5414,7 +5467,7 @@ async fn run_master_replica_stream(
             let rdb = router.generate_full_rdb(Some(client_id)).await;
             let (offset, after_snapshot) = hub.finish_full_sync(client_id);
             if repl.is_overflowed() {
-                replica_output_limit_reached(client_id);
+                replica_output_limit_reached(client_id, &name);
                 hub.unregister_replica(client_id);
                 return;
             }
@@ -5430,12 +5483,14 @@ async fn run_master_replica_stream(
             }
         }
     } else {
+        crate::log_notice!("Full resync requested by replica {}", name);
+        crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
         crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
         repl = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards);
         let rdb = router.generate_full_rdb(Some(client_id)).await;
         let (_, after_snapshot) = hub.finish_full_sync(client_id);
         if repl.is_overflowed() {
-            replica_output_limit_reached(client_id);
+            replica_output_limit_reached(client_id, &name);
             hub.unregister_replica(client_id);
             return;
         }
@@ -5449,6 +5504,9 @@ async fn run_master_replica_stream(
         }
     }
 
+    if repl.full_sync.is_some() {
+        crate::log_notice!("Synchronization with replica {} succeeded", name);
+    }
     repl.attach_fd(raw_fd);
     link.repl = Some(repl.clone());
     let writer_hub = hub.clone();
@@ -5472,7 +5530,7 @@ async fn run_master_replica_stream(
         if repl.is_overflowed() {
             // Like Redis, drop the link; the replica reconnects and
             // resyncs. Shutting the socket down also ends the reader.
-            replica_output_limit_reached(client_id);
+            replica_output_limit_reached(client_id, &name);
             repl.drop_link();
         }
         repl.detach_fd();
@@ -8256,6 +8314,7 @@ async fn execute_command(
                     let c_name = get_cmd_name(&cmd);
                     record_rejected_stat(c_name);
                     record_error_stat("OOM", Some(c_name));
+                    log_oom_rejection(max_mem, &policy);
                     out.extend_from_slice(
                         b"-OOM command not allowed when used memory > 'maxmemory'.\r\n",
                     );
@@ -8275,6 +8334,7 @@ async fn execute_command(
                 let c_name = get_cmd_name(&cmd);
                 record_rejected_stat(c_name);
                 record_error_stat("OOM", Some(c_name));
+                log_oom_rejection(max_mem, &policy);
                 out.extend_from_slice(
                     b"-OOM command not allowed when used memory > 'maxmemory'.\r\n",
                 );
@@ -9490,11 +9550,18 @@ async fn execute_command(
             if host.eq_ignore_ascii_case(b"no") && port.eq_ignore_ascii_case(b"one") {
                 hub.stop_sync();
                 hub.make_master();
+                crate::log_notice!("MASTER MODE enabled (user request from 'id={}')", client_id);
                 out.extend_from_slice(b"+OK\r\n");
             } else {
                 let host_str = String::from_utf8_lossy(&host).to_string();
                 let port_str = String::from_utf8_lossy(&port);
                 if let Ok(mport) = port_str.parse::<u16>() {
+                    crate::log_notice!(
+                        "REPLICAOF {}:{} enabled (user request from 'id={}')",
+                        host_str,
+                        mport,
+                        client_id
+                    );
                     crate::replication::start_replica_sync(
                         router.port,
                         host_str,
@@ -9728,8 +9795,15 @@ async fn execute_command(
                     let min_replicas_lag = MIN_REPLICAS_MAX_LAG
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let all_configs: [(&str, String); 58] = [
+                    let all_configs: [(&str, String); 62] = [
                         ("port", port_str),
+                        ("loglevel", crate::log::loglevel().to_string()),
+                        ("logfile", crate::log::logfile()),
+                        ("log-format", crate::log::log_format().to_string()),
+                        (
+                            "log-timestamp-format",
+                            crate::log::log_timestamp_format().to_string(),
+                        ),
                         ("idle-poll-us", monoio::idle_poll_us().to_string()),
                         (
                             "latency-tracking",
@@ -9901,6 +9975,7 @@ async fn execute_command(
                             match crate::config::rewrite_config_file(router.port) {
                                 Ok(()) => out.extend_from_slice(b"+OK\r\n"),
                                 Err(e) => {
+                                    crate::log_warning!("CONFIG REWRITE failed: {}", e);
                                     out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes())
                                 }
                             }
@@ -9937,9 +10012,29 @@ async fn execute_command(
                             return false;
                         }
 
-                        if p_str == "daemonize" {
+                        if matches!(p_str.as_str(), "daemonize" | "logfile") {
                             out.extend_from_slice(
-                                b"-ERR CONFIG SET failed (possibly related to argument 'daemonize') - can't set immutable config\r\n",
+                                format!(
+                                    "-ERR CONFIG SET failed (possibly related to argument '{}') - can't set immutable config\r\n",
+                                    p_str
+                                )
+                                .as_bytes(),
+                            );
+                            return false;
+                        } else if let Some(Err(e)) = match p_str.as_str() {
+                            "loglevel" => Some(crate::log::validate_loglevel(&val_str)),
+                            "log-format" => Some(crate::log::validate_log_format(&val_str)),
+                            "log-timestamp-format" => {
+                                Some(crate::log::validate_log_timestamp_format(&val_str))
+                            }
+                            _ => None,
+                        } {
+                            out.extend_from_slice(
+                                format!(
+                                    "-ERR CONFIG SET failed (possibly related to argument '{}') - {}\r\n",
+                                    p_str, e
+                                )
+                                .as_bytes(),
                             );
                             return false;
                         } else if p_str == "aof-load-truncated" {
@@ -16042,8 +16137,12 @@ async fn execute_command(
         }
         Command::MemcachedQuit => true,
         Command::Shutdown { save } => {
+            crate::log_warning!("User requested shutdown...");
             if let Err(e) = router.save_before_shutdown(save).await {
-                eprintln!("Error trying to save the DB, can't exit: {}", e);
+                crate::log_warning!("Error trying to save the DB, can't exit: {}", e);
+                crate::log_warning!(
+                    "Errors trying to shut down the server. Check the logs for more information."
+                );
                 out.extend_from_slice(b"-ERR Errors trying to SHUTDOWN. Check logs.\r\n");
                 false
             } else {
@@ -16824,7 +16923,7 @@ pub fn apply_replicated_command(
     record_cmd_stats(name, 1, start.elapsed().as_nanos() as u64);
     if out.first() == Some(&b'-') {
         let end = out.iter().position(|&b| b == b'\r').unwrap_or(out.len());
-        println!(
+        crate::log_warning!(
             "== CRITICAL == This replica is sending an error to its master: '{}' after processing the command '{}'",
             String::from_utf8_lossy(&out[1..end]),
             name.to_ascii_lowercase(),

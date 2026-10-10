@@ -57,11 +57,63 @@ pub const SHARD_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 /// like Redis does when it cannot load its data files. Serving an empty
 /// dataset instead would let the next save overwrite the original files.
 fn fatal_startup_error(shard_id: usize, msg: &str) -> ! {
-    eprintln!(
+    crate::log_fatal!(
         "[Shard {}] FATAL: {}. Refusing to start so existing data files are not overwritten.",
-        shard_id, msg
+        shard_id,
+        msg
     );
     std::process::exit(1);
+}
+
+/// Startup loading of one server, summed over its shards so the summary
+/// (Redis's "DB loaded from disk") is logged once, by the last shard.
+struct StartupLoad {
+    started: std::time::Instant,
+    shards_done: usize,
+    loaded: u64,
+}
+
+static STARTUP_LOADS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<(u16, bool), StartupLoad>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Records that a shard of the server on `base_port` finished loading
+/// `loaded` keys (RDB) or commands (AOF), having started at `started`.
+fn note_startup_load(
+    base_port: u16,
+    num_shards: usize,
+    aof: bool,
+    started: std::time::Instant,
+    loaded: u64,
+) {
+    let mut loads = STARTUP_LOADS.lock();
+    let entry = loads.entry((base_port, aof)).or_insert(StartupLoad {
+        started,
+        shards_done: 0,
+        loaded: 0,
+    });
+    entry.started = entry.started.min(started);
+    entry.shards_done += 1;
+    entry.loaded += loaded;
+    if entry.shards_done < num_shards {
+        return;
+    }
+    let StartupLoad {
+        started, loaded, ..
+    } = loads.remove(&(base_port, aof)).expect("entry just updated");
+    let secs = started.elapsed().as_secs_f64();
+    if aof {
+        if loaded > 0 {
+            crate::log_notice!("Done loading AOF, commands replayed: {}", loaded);
+            crate::log_notice!("DB loaded from append only file: {:.3} seconds", secs);
+        }
+    } else {
+        crate::log_notice!(
+            "Done loading RDB, keys loaded: {}, keys expired: 0.",
+            loaded
+        );
+        crate::log_notice!("DB loaded from disk: {:.3} seconds", secs);
+    }
 }
 
 /// io_uring settings for shard runtimes. With `COOP_TASKRUN` the kernel
@@ -157,11 +209,13 @@ pub fn run_shard_worker(
         if !aof_config.enabled {
             let rdb_path = aof_config.dir.join(crate::config::dbfilename(base_port));
             if rdb_path.exists() {
+                let started = std::time::Instant::now();
                 match crate::table::load_rdb(&rdb_path, &mut local_db.borrow_mut(), shard_id, num_shards) {
                     Ok(n) => {
                         if n > 0 {
-                            println!("[Shard {}/{}] Restored {} keys from {:?}", shard_id, num_shards, n, rdb_path);
+                            crate::log_verbose!("[Shard {}/{}] Restored {} keys from {:?}", shard_id, num_shards, n, rdb_path);
                         }
+                        note_startup_load(base_port, num_shards, false, started, n as u64);
                     }
                     Err(e) => fatal_startup_error(
                         shard_id,
@@ -174,14 +228,16 @@ pub fn run_shard_worker(
         // 3. AOF Replay on startup & Open AofWriter
         let aof_path = aof_config.dir.join(format!("appendonly-{}.aof", shard_id));
         if aof_config.enabled {
+            let started = std::time::Instant::now();
             match crate::aof::replay_aof(&aof_path, &mut local_db.borrow_mut()) {
                 Ok(n) => {
                     if n > 0 {
-                        println!(
+                        crate::log_verbose!(
                             "[Shard {}] Replayed {} commands from {:?}",
                             shard_id, n, aof_path
                         );
                     }
+                    note_startup_load(base_port, num_shards, true, started, n as u64);
                 }
                 Err(e) => fatal_startup_error(
                     shard_id,
@@ -245,7 +301,7 @@ pub fn run_shard_worker(
                 local_db.borrow_mut().tier_manager = Some(Rc::new(tm));
             }
             Err(e) => {
-                eprintln!("[Shard {}] Failed to open Tier manager: {}", shard_id, e);
+                crate::log_warning!("[Shard {}] Failed to open Tier manager: {}", shard_id, e);
             }
         }
 
@@ -429,10 +485,10 @@ pub fn run_shard_worker(
                                     crate::conn_balance::unregister_conn(shard_id);
                                     if let Err(e) = res {
                                         crate::connection::inc_isolated_panics();
-                                        tracing::error!(
-                                            client_id = client_id,
-                                            "Panic isolated in adopted connection: {:?}",
-                                            e
+                                        crate::log_warning!(
+                                            "Panic isolated in adopted connection id={}: {}",
+                                            client_id,
+                                            crate::log::panic_message(&*e)
                                         );
                                     }
                                 });
@@ -441,9 +497,9 @@ pub fn run_shard_worker(
                                 // The connection never starts, so release the
                                 // slot the sender reserved for it.
                                 crate::conn_balance::unregister_conn(shard_id);
-                                tracing::error!(
-                                    shard_id = shard_id,
-                                    "Failed to adopt handed-off connection: {}",
+                                crate::log_warning!(
+                                    "[Shard {}] Failed to adopt handed-off connection: {}",
+                                    shard_id,
                                     e
                                 );
                             }
@@ -2102,7 +2158,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
         }
     });
 
-        println!(
+        crate::log_verbose!(
             "[Shard {}/{}] Worker started and listening on {} via {}",
             shard_id,
             num_shards,
@@ -2122,7 +2178,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             let n = ready.entry(base_port).or_insert(0);
             *n += 1;
             if *n == num_shards {
-                println!("Ready to accept connections tcp");
+                crate::log_notice!("Ready to accept connections tcp");
             }
         }
 
@@ -2161,7 +2217,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     let mut session = match crate::tls::TlsSession::new(s_cfg) {
                                         Ok(s) => s,
                                         Err(e) => {
-                                            tracing::error!("[Shard {}] Failed to create TlsSession: {}", shard_id, e);
+                                            crate::log_warning!("[Shard {}] Failed to create TlsSession: {}", shard_id, e);
                                             return;
                                         }
                                     };
@@ -2173,11 +2229,13 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     {
                                         Ok(Ok(())) => {}
                                         Ok(Err(e)) => {
-                                            tracing::warn!("[Shard {}] TLS handshake error: {}", shard_id, e);
+                                            // Like Redis, failed handshakes are verbose: any
+                                            // port scanner would flood the log otherwise.
+                                            crate::log_verbose!("[Shard {}] TLS handshake error: {}", shard_id, e);
                                             return;
                                         }
                                         Err(_) => {
-                                            tracing::warn!("[Shard {}] TLS handshake timed out", shard_id);
+                                            crate::log_verbose!("[Shard {}] TLS handshake timed out", shard_id);
                                             return;
                                         }
                                     }
@@ -2206,12 +2264,16 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                 .await;
                                 if let Err(e) = res {
                                     crate::connection::inc_isolated_panics();
-                                    tracing::error!(client_id = client_id, "Panic isolated in TLS client connection: {:?}", e);
+                                    crate::log_warning!(
+                                        "Panic isolated in TLS client connection id={}: {}",
+                                        client_id,
+                                        crate::log::panic_message(&*e)
+                                    );
                                 }
                             });
                         }
                         Err(e) => {
-                            eprintln!("[Shard {}] TLS accept error: {}", shard_id, e);
+                            crate::log_warning!("[Shard {}] TLS accept error: {}", shard_id, e);
                         }
                     }
                 }
@@ -2224,7 +2286,6 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
         if shard_id == 0
             && let Some((host, mport)) = crate::replication::take_startup_replicaof(base_port)
         {
-            println!("Connecting to MASTER {}:{}", host, mport);
             crate::replication::start_replica_sync(router.port, host, mport, (*router).clone());
         }
 
@@ -2248,7 +2309,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     }
                     let now = crate::snapshot::unix_now();
                     if snap.save_due(&points, now) {
-                        println!(
+                        crate::log_notice!(
                             "{} changes in {} seconds. Saving...",
                             snap.changes_since_last_save(),
                             now.saturating_sub(snap.last_save_unix())
@@ -2269,10 +2330,13 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     if !crate::shutdown::take_shutdown_signal() {
                         continue;
                     }
-                    println!("Received SIGTERM/SIGINT, scheduling shutdown...");
+                    crate::log_warning!(
+                        "Received {} scheduling shutdown...",
+                        crate::shutdown::last_shutdown_signal_name()
+                    );
                     match r.save_before_shutdown(None).await {
                         Ok(()) => crate::shutdown::request_shutdown(),
-                        Err(e) => eprintln!(
+                        Err(e) => crate::log_warning!(
                             "Error trying to save the DB, can't exit: {}. Fix the problem and send the signal again, or use SHUTDOWN NOSAVE.",
                             e
                         ),
@@ -2518,17 +2582,17 @@ async fn accept_loop(
                         crate::conn_balance::unregister_conn(shard_id);
                         if let Err(e) = res {
                             crate::connection::inc_isolated_panics();
-                            tracing::error!(
-                                client_id = client_id,
-                                "Panic isolated in client connection: {:?}",
-                                e
+                            crate::log_warning!(
+                                "Panic isolated in client connection id={}: {}",
+                                client_id,
+                                crate::log::panic_message(&*e)
                             );
                         }
                     });
                 }
             }
             Err(e) => {
-                eprintln!("[Shard {}] Accept error: {}", shard_id, e);
+                crate::log_warning!("[Shard {}] Accept error: {}", shard_id, e);
             }
         }
     }

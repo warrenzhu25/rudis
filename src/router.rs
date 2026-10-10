@@ -3842,9 +3842,9 @@ impl Router {
         while self.is_saving.load(Ordering::SeqCst) {
             monoio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        println!("Saving the final RDB snapshot before exiting.");
+        crate::log_notice!("Saving the final RDB snapshot before exiting.");
+        // `perform_save_rdb` logs "DB saved on disk".
         self.save_rdb().await?;
-        println!("DB saved on disk");
         Ok(())
     }
 
@@ -3859,10 +3859,14 @@ impl Router {
         // Begin before replying so INFO right after +OK shows the save.
         let dirty_before = crate::snapshot::state(self.base_port).begin();
         let router_clone = self.clone();
+        crate::log_notice!("Background saving started");
         monoio::spawn(async move {
             let guard = SaveFlagGuard::new(&router_clone, Some(dirty_before));
             router_clone.sync_aof().await;
-            let _ = router_clone.perform_save_rdb(dirty_before).await;
+            match router_clone.perform_save_rdb(dirty_before).await {
+                Ok(()) => crate::log_notice!("Background saving terminated with success"),
+                Err(_) => crate::log_warning!("Background saving error"),
+            }
             guard.disarm();
         });
         Ok(())
@@ -3879,6 +3883,7 @@ impl Router {
         // Begin before replying so INFO right after +OK shows the rewrite
         // instead of the previous one's status.
         crate::snapshot::aof_rewrite_state(self.base_port).begin();
+        crate::log_notice!("Background append only file rewriting started");
         let router_clone = self.clone();
         monoio::spawn(async move {
             let guard = SaveFlagGuard::new(&router_clone, None);
@@ -3894,8 +3899,12 @@ impl Router {
     /// new BGREWRITEAOF must be accepted.
     pub async fn perform_rewrite_aof(&self) -> Result<usize, String> {
         let res = self.rewrite_all_shard_aofs().await;
-        if let Err(e) = &res {
-            eprintln!("[Shard {}] BGREWRITEAOF failed: {}", self.shard_id, e);
+        match &res {
+            Ok(_) => {
+                crate::log_notice!("Background AOF rewrite terminated with success");
+                crate::log_notice!("Background AOF rewrite finished successfully");
+            }
+            Err(e) => crate::log_warning!("[Shard {}] BGREWRITEAOF failed: {}", self.shard_id, e),
         }
         self.is_saving.store(false, Ordering::SeqCst);
         crate::snapshot::aof_rewrite_state(self.base_port).finish(res.is_ok());
@@ -4168,9 +4177,12 @@ impl Router {
             .db_dir
             .join(format!("temp-{}-{}.rdb", std::process::id(), tmp_id));
         let res = self.write_rdb_file(&tmp_filename).await;
-        if let Err(ref e) = res {
-            eprintln!("Error saving DB on disk: {}", e);
-            let _ = std::fs::remove_file(&tmp_filename);
+        match res {
+            Ok(()) => crate::log_notice!("DB saved on disk"),
+            Err(ref e) => {
+                crate::log_warning!("Error saving DB on disk: {}", e);
+                let _ = std::fs::remove_file(&tmp_filename);
+            }
         }
         // Clear the flag on every path, or one failed save blocks all later ones.
         // Clear it before `finish` so a save seen as finished is not still

@@ -520,6 +520,7 @@ impl ReplicationHub {
             second_offset,
         };
         self.is_slave_atomic.store(false, Ordering::Release);
+        crate::log::set_role_replica(false);
     }
 
     /// After a failed or interrupted sync: marks the link down and drops
@@ -731,6 +732,28 @@ impl ReplicationHub {
         // REPLCONF listening-port normally comes before PSYNC registers
         // the replica; keep it for `insert_replica`.
         self.note_pending_peer(id, |p| p.port = port);
+    }
+
+    /// Redis's name for replica connection `id` in the log: `ip:port`, with
+    /// the port it announced (REPLCONF listening-port).
+    pub fn replica_name(&self, id: u64) -> String {
+        let (ip, port) = match self.replicas.read().get(&id) {
+            Some(r) => (r.ip, r.listening_port.load(Ordering::Relaxed) as u16),
+            None => {
+                let peer = self
+                    .pending_peers
+                    .lock()
+                    .get(&id)
+                    .copied()
+                    .unwrap_or_default();
+                (peer.ip, peer.port)
+            }
+        };
+        match ip {
+            Some(std::net::IpAddr::V6(ip)) => format!("[{ip}]:{port}"),
+            Some(ip) => format!("{ip}:{port}"),
+            None => format!("?:{port}"),
+        }
     }
 
     /// Records the address of connection `id`, which is about to register
@@ -1363,6 +1386,7 @@ pub fn start_replica_sync(
 
     hub.is_slave_atomic.store(true, Ordering::Release);
     HAS_SLAVE_INSTANCE.store(true, Ordering::Release);
+    crate::log::set_role_replica(true);
 
     let (cached_replid, cached_offset) = {
         let role = hub.role.read();
@@ -1420,7 +1444,9 @@ pub fn start_replica_sync(
                 )
             },
             |msg| {
-                eprintln!("Replication with MASTER {master_host}:{master_port} panicked: {msg}");
+                crate::log_warning!(
+                    "Replication with MASTER {master_host}:{master_port} panicked: {msg}"
+                );
                 crate::connection::inc_isolated_panics();
                 // Stopped meanwhile (REPLICAOF NO ONE or another master):
                 // the role belongs to whoever stopped us now.
@@ -1630,21 +1656,35 @@ async fn run_replica_worker(
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
     use monoio::net::TcpStream;
 
+    // Failed attempts are retried every 50ms; like Redis (which retries once
+    // a second) log at most one attempt's progress and errors per second.
+    let mut last_logged_attempt: Option<std::time::Instant> = None;
+
     'reconnect_loop: loop {
         if is_sync_cancelled(&cancel_rx) {
             break 'reconnect_loop;
+        }
+
+        let log_attempt = last_logged_attempt.is_none_or(|t| t.elapsed().as_secs() >= 1);
+        if log_attempt {
+            last_logged_attempt = Some(std::time::Instant::now());
+            crate::log_notice!("Connecting to MASTER {}:{}", master_host, master_port);
+            crate::log_notice!("MASTER <-> REPLICA sync started");
         }
 
         // Resolved on every attempt, so a master behind a DNS name (e.g. a
         // Kubernetes service) is found again after it moves.
         let addr = resolve_master_addr(&master_host, master_port);
         let connected = match addr {
-            Some(addr) => TcpStream::connect(&addr).await.ok(),
-            None => None,
+            Some(addr) => TcpStream::connect(&addr).await.map_err(|e| e.to_string()),
+            None => Err(format!("Unable to resolve '{}'", master_host)),
         };
         let mut stream = match connected {
-            Some(s) => s,
-            None => {
+            Ok(s) => s,
+            Err(e) => {
+                if log_attempt {
+                    crate::log_warning!("Error condition on socket for SYNC: {}", e);
+                }
                 if let ReplicationRole::Slave {
                     ref mut link_status,
                     ..
@@ -1710,6 +1750,15 @@ async fn run_replica_worker(
                     };
                     match res {
                         Ok(0) | Err(_) => {
+                            if log_attempt {
+                                crate::log_warning!(
+                                    "Master did not respond to command during SYNC handshake: {}",
+                                    match res {
+                                        Ok(_) => "connection closed".to_string(),
+                                        Err(e) => e.to_string(),
+                                    }
+                                );
+                            }
                             if let ReplicationRole::Slave {
                                 ref mut link_status,
                                 ..
@@ -1739,6 +1788,12 @@ async fn run_replica_worker(
         // which Redis accepts here too.
         let line = send_and_expect_line!(b"*1\r\n$4\r\nPING\r\n");
         if !line.starts_with(b"+PONG") && !line.starts_with(b"-NOAUTH") {
+            if log_attempt {
+                crate::log_warning!(
+                    "Error reply to PING from master: '{}'",
+                    String::from_utf8_lossy(&line).trim_end()
+                );
+            }
             if is_sync_cancelled(&cancel_rx) {
                 break 'reconnect_loop;
             }
@@ -1750,7 +1805,7 @@ async fn run_replica_worker(
         if let Some(auth) = master_auth_command(hub.port) {
             let line = send_and_expect_line!(auth);
             if !line.starts_with(b"+OK") {
-                eprintln!(
+                crate::log_warning!(
                     "Unable to AUTH to MASTER {}:{}: {}",
                     master_host,
                     master_port,
@@ -1771,8 +1826,17 @@ async fn run_replica_worker(
             my_port_s.len(),
             my_port_s
         );
+        if log_attempt {
+            crate::log_notice!("Master replied to PING, replication can continue...");
+        }
         let line = send_and_expect_line!(replconf_port.into_bytes());
         if !line.starts_with(b"+OK") {
+            if log_attempt {
+                crate::log_warning!(
+                    "Master replied to REPLCONF listening-port with an error: {}",
+                    String::from_utf8_lossy(&line).trim_end()
+                );
+            }
             if is_sync_cancelled(&cancel_rx) {
                 break 'reconnect_loop;
             }
@@ -1783,6 +1847,12 @@ async fn run_replica_worker(
         // 3. REPLCONF capa psync2
         let line = send_and_expect_line!(b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n");
         if !line.starts_with(b"+OK") {
+            if log_attempt {
+                crate::log_warning!(
+                    "Master replied to REPLCONF capa with an error: {}",
+                    String::from_utf8_lossy(&line).trim_end()
+                );
+            }
             if is_sync_cancelled(&cancel_rx) {
                 break 'reconnect_loop;
             }
@@ -1808,6 +1878,13 @@ async fn run_replica_worker(
         let psync_payload = if !cached_replid.is_empty() {
             // Like Redis, ask for the next byte: one past what was applied.
             let next = (cached_offset + 1).to_string();
+            if log_attempt {
+                crate::log_notice!(
+                    "Trying a partial resynchronization (request {}:{}).",
+                    cached_replid,
+                    next
+                );
+            }
             format!(
                 "*3\r\n$5\r\nPSYNC\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
                 cached_replid.len(),
@@ -1817,6 +1894,9 @@ async fn run_replica_worker(
             )
             .into_bytes()
         } else {
+            if log_attempt {
+                crate::log_notice!("Partial resynchronization not possible (no cached master)");
+            }
             b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n".to_vec()
         };
 
@@ -1824,6 +1904,12 @@ async fn run_replica_worker(
         let Some((is_continue, new_replid, initial_offset)) =
             parse_psync_reply(&line, &cached_replid, cached_offset)
         else {
+            if log_attempt {
+                crate::log_warning!(
+                    "Unexpected reply to PSYNC from master: {}",
+                    String::from_utf8_lossy(&line).trim_end()
+                );
+            }
             if let ReplicationRole::Slave {
                 ref mut link_status,
                 ..
@@ -1838,7 +1924,13 @@ async fn run_replica_worker(
             continue 'reconnect_loop;
         };
 
-        if !is_continue {
+        if is_continue {
+            crate::log_notice!("Successful partial resynchronization with master.");
+            crate::log_notice!(
+                "MASTER <-> REPLICA sync: Master accepted a Partial Resynchronization."
+            );
+        } else {
+            crate::log_notice!("Full resync from master: {}:{}", new_replid, initial_offset);
             // 5. Read RDB header: $<len>\r\n
             let rdb_len = loop {
                 match take_rdb_header(&mut buf) {
@@ -1857,6 +1949,9 @@ async fn run_replica_worker(
             let rdb_len = match rdb_len {
                 Some(l) => l,
                 None => {
+                    crate::log_warning!(
+                        "I/O error reading bulk count from MASTER: connection lost or bad header"
+                    );
                     if let ReplicationRole::Slave {
                         ref mut link_status,
                         ..
@@ -1872,6 +1967,10 @@ async fn run_replica_worker(
                 }
             };
 
+            crate::log_notice!(
+                "MASTER <-> REPLICA sync: receiving {} bytes from master to memory",
+                rdb_len
+            );
             // 6. Read rdb_len bytes
             let mut read_failed = false;
             while buf.len() < rdb_len {
@@ -1886,6 +1985,7 @@ async fn run_replica_worker(
                 }
             }
             if read_failed {
+                crate::log_warning!("I/O error trying to sync with MASTER: connection lost");
                 if let ReplicationRole::Slave {
                     ref mut link_status,
                     ..
@@ -1905,14 +2005,18 @@ async fn run_replica_worker(
             // 7. Restore RDB into router. A failed load leaves the dataset
             // empty; forget the master's history too, so the next attempt
             // is a full resync rather than a partial one on top of nothing.
+            crate::log_notice!("MASTER <-> REPLICA sync: Flushing old data");
+            crate::log_notice!("MASTER <-> REPLICA sync: Loading DB in memory");
             let loaded = {
                 let _loading = LoadingGuard::new(&hub);
                 router.restore_rdb_bytes(rdb_bytes).await
             };
             if let Err(e) = loaded {
-                eprintln!(
+                crate::log_warning!(
                     "Failed to load the RDB from MASTER {}:{}: {}",
-                    master_host, master_port, e
+                    master_host,
+                    master_port,
+                    e
                 );
                 hub.forget_master_history();
                 if is_sync_cancelled(&cancel_rx) {
@@ -1940,6 +2044,12 @@ async fn run_replica_worker(
                 *sync_in_progress = false;
             }
         }
+        if !is_continue {
+            crate::log_notice!("MASTER <-> REPLICA sync: Finished with success");
+        }
+        // Only repeated failures are throttled: after a working link breaks,
+        // the next attempt is logged in full.
+        last_logged_attempt = None;
 
         // 9. Streaming loop: receive and apply mutations. Commands for other
         // shards are batched per read and applied with one message per
@@ -2024,6 +2134,11 @@ async fn run_replica_worker(
             // The periodic ack reports this from its next tick.
             applied.set(current_offset);
             if protocol_error {
+                crate::log_warning!(
+                    "Protocol error in the replication stream from MASTER {}:{}",
+                    master_host,
+                    master_port
+                );
                 break;
             }
 
@@ -2046,6 +2161,8 @@ async fn run_replica_worker(
         if is_sync_cancelled(&cancel_rx) {
             break 'reconnect_loop;
         }
+        crate::log_notice!("Connection with master lost.");
+        crate::log_notice!("Caching the disconnected master state.");
         monoio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 

@@ -22192,3 +22192,319 @@ fn test_exec_dropped_by_panic_releases_pause_and_locks_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+/// Whether `line` is a Redis legacy-format log line:
+/// `<pid>:<role> <dd> <Mon> <yyyy> <HH:MM:SS.mmm> <level> <message>`.
+fn is_redis_log_line(line: &str, pid: u32) -> bool {
+    let Some((head, rest)) = line.split_once(' ') else {
+        return false;
+    };
+    let Some((p, role)) = head.split_once(':') else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.splitn(6, ' ').collect();
+    if parts.len() < 6 {
+        return false;
+    }
+    let [day, mon, year, time, level, _msg] = parts[..] else {
+        return false;
+    };
+    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    let t: Vec<&str> = time.split([':', '.']).collect();
+    p == pid.to_string()
+        && matches!(role, "M" | "S")
+        && digits(day, 2)
+        && [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ]
+        .contains(&mon)
+        && digits(year, 4)
+        && t.len() == 4
+        && digits(t[0], 2)
+        && digits(t[1], 2)
+        && digits(t[2], 2)
+        && digits(t[3], 3)
+        && matches!(level, "." | "-" | "*" | "#")
+}
+
+/// Waits until the log file at `path` has a line containing `needle`;
+/// returns the whole file.
+fn wait_for_log(path: &std::path::Path, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let log = std::fs::read_to_string(path).unwrap_or_default();
+        if log.lines().any(|l| l.contains(needle)) {
+            return log;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{needle:?} never logged to {}:\n{log}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+struct KillRudisOnDrop(std::process::Child);
+
+impl Drop for KillRudisOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn test_redis_log_file_format_and_loglevel_e2e() {
+    let port = 18510u16;
+    let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("rudis.log");
+    let conf = dir.join("rudis.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "dir {}\nsave \"\"\nloglevel verbose\nlogfile \"{}\"\n",
+            dir.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    let mut child = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let pid = child.0.id();
+
+    let text = wait_for_log(&log, "Ready to accept connections tcp");
+    for line in text.lines() {
+        assert!(
+            is_redis_log_line(line, pid),
+            "not a Redis log line: {line:?}"
+        );
+    }
+    assert!(
+        text.contains(" * Ready to accept connections tcp\n"),
+        "{text}"
+    );
+    // Verbose lines are written at `loglevel verbose`, and --no-pin shows.
+    assert!(text.contains(" - [Shard 0/2] Worker started"), "{text}");
+    assert!(
+        text.contains("worker threads (not pinned to CPU cores)"),
+        "{text}"
+    );
+    assert!(text.contains(" * Server initialized\n"), "{text}");
+    assert!(text.contains(":M "), "{text}");
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "loglevel"]),
+        "*2\r\n$8\r\nloglevel\r\n$7\r\nverbose\r\n"
+    );
+    let path = log.display().to_string();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "logfile"]),
+        format!("*2\r\n$7\r\nlogfile\r\n${}\r\n{}\r\n", path.len(), path)
+    );
+    assert!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "logfile", "/tmp/x.log"])
+            .contains("can't set immutable config")
+    );
+    assert!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "loglevel", "loud"]).contains(
+            "argument(s) must be one of the following: debug, verbose, notice, warning, nothing"
+        )
+    );
+
+    // Filtered by the runtime level: SAVE's notice is dropped at warning.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "loglevel", "warning"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "loglevel", "notice"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "loglevel"]),
+        "*2\r\n$8\r\nloglevel\r\n$6\r\nnotice\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["BGSAVE"]),
+        "+Background saving started\r\n"
+    );
+    let text = wait_for_log(&log, "Background saving terminated with success");
+    assert_eq!(
+        text.matches("DB saved on disk").count(),
+        1,
+        "the SAVE at loglevel warning must not be logged:\n{text}"
+    );
+    assert!(text.contains(" * Background saving started\n"), "{text}");
+
+    // logrotate: the file is renamed away; the next line recreates it.
+    let rotated = dir.join("rudis.log.1");
+    std::fs::rename(&log, &rotated).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    let text = wait_for_log(&log, "DB saved on disk");
+    assert!(
+        is_redis_log_line(text.lines().next().unwrap(), pid),
+        "{text}"
+    );
+
+    // Valkey's logfmt format.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "log-format", "logfmt"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    let text = wait_for_log(&log, "message=\"DB saved on disk\"");
+    assert!(
+        text.contains(&format!("pid={pid} role=primary timestamp=\"")),
+        "{text}"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "log-format", "legacy"]),
+        "+OK\r\n"
+    );
+
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains(" # User requested shutdown...\n"), "{text}");
+    assert!(
+        text.contains(" * Redis is now ready to exit, bye bye...\n"),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_redis_log_replication_messages_e2e() {
+    let master_port = 18520u16;
+    let replica_port = 18521u16;
+    let base =
+        std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), master_port));
+    let _ = std::fs::remove_dir_all(&base);
+    let start = |port: u16, extra: &str| {
+        let dir = base.join(port.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("rudis.log");
+        let conf = dir.join("rudis.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "dir {}\nsave \"\"\nlogfile {}\n{extra}",
+                dir.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        let port_s = port.to_string();
+        let args = [
+            "--port",
+            &port_s,
+            "--threads",
+            "2",
+            "--no-pin",
+            "-c",
+            conf.to_str().unwrap(),
+        ];
+        (KillRudisOnDrop(spawn_rudis_listening(&args, port)), log)
+    };
+    let (master, master_log) = start(master_port, "");
+    let mut m = TcpStream::connect(("127.0.0.1", master_port)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(resp_cmd(&mut m, &["SET", "k", "v"]), "+OK\r\n");
+
+    let (replica, replica_log) = start(
+        replica_port,
+        &format!("replicaof 127.0.0.1 {master_port}\n"),
+    );
+    let text = wait_for_log(
+        &replica_log,
+        "MASTER <-> REPLICA sync: Finished with success",
+    );
+    for needle in [
+        &format!(" * Connecting to MASTER 127.0.0.1:{master_port}\n"),
+        " * MASTER <-> REPLICA sync started\n",
+        " * Partial resynchronization not possible (no cached master)\n",
+        " * Full resync from master: ",
+        " * MASTER <-> REPLICA sync: Loading DB in memory\n",
+    ] {
+        assert!(text.contains(needle), "{needle:?} missing:\n{text}");
+    }
+    // Lines written while replicating show the replica role.
+    let finished = text
+        .lines()
+        .find(|l| l.contains("Finished with success"))
+        .unwrap();
+    assert!(is_redis_log_line(finished, replica.0.id()), "{finished}");
+    assert!(
+        finished.split(' ').next().unwrap().ends_with(":S"),
+        "{finished}"
+    );
+
+    let name = format!("127.0.0.1:{replica_port}");
+    let text = wait_for_log(
+        &master_log,
+        &format!("Synchronization with replica {name} succeeded"),
+    );
+    assert!(
+        text.contains(&format!(" * Replica {name} asks for synchronization\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(" * Full resync requested by replica {name}\n")),
+        "{text}"
+    );
+
+    // Breaking the link: the replica reconnects with a partial resync.
+    let mut r = TcpStream::connect(("127.0.0.1", replica_port)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(
+        resp_cmd(
+            &mut r,
+            &["CLIENT", "KILL", &format!("127.0.0.1:{master_port}")]
+        ),
+        "+OK\r\n"
+    );
+    let text = wait_for_log(
+        &replica_log,
+        "Successful partial resynchronization with master.",
+    );
+    assert!(text.contains(" * Connection with master lost.\n"), "{text}");
+    assert!(
+        text.contains(" * Trying a partial resynchronization (request "),
+        "{text}"
+    );
+    let text = wait_for_log(
+        &master_log,
+        &format!("Partial resynchronization request from {name} accepted."),
+    );
+    assert!(
+        text.contains(&format!(" * Connection with replica {name} lost.\n")),
+        "{text}"
+    );
+
+    // Promotion back to master shows in the role of later lines.
+    assert_eq!(resp_cmd(&mut r, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    let text = wait_for_log(&replica_log, "MASTER MODE enabled");
+    let line = text
+        .lines()
+        .find(|l| l.contains("MASTER MODE enabled"))
+        .unwrap();
+    assert!(line.split(' ').next().unwrap().ends_with(":M"), "{line}");
+
+    drop((m, r, master, replica));
+    let _ = std::fs::remove_dir_all(&base);
+}

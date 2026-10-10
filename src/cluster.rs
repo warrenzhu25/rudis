@@ -1731,7 +1731,7 @@ pub fn start_cluster_bus(port: u16) {
                 match crate::netsec::bind_all(&crate::netsec::bind_addrs(port), cport, 128) {
                     Ok(v) => v.into_iter().map(|(_, l)| l).collect(),
                     Err(e) => {
-                        eprintln!("[ClusterBus {}] {}", cport, e);
+                        crate::log_warning!("[ClusterBus {}] {}", cport, e);
                         return;
                     }
                 };

@@ -4,22 +4,22 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 static TELEMETRY_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Initializes structured logging with `tracing` and `EnvFilter` (default: INFO level).
+/// Initializes `tracing`: events go through the Redis-format server log
+/// (`crate::log`), filtered by `loglevel`. `RUST_LOG`, when set, filters
+/// them further by target.
 pub fn init_telemetry() {
     if !TELEMETRY_INITIALIZED.swap(true, Ordering::SeqCst) {
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rudis=info"));
+        let env_filter = EnvFilter::try_from_default_env().ok();
 
-        let _ = fmt()
-            .with_env_filter(env_filter)
-            .with_target(false)
-            .with_thread_ids(false)
-            .with_thread_names(false)
-            .compact()
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(crate::log::RedisLogLayer)
             .try_init();
     }
 }

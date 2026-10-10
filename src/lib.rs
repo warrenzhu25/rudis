@@ -22,6 +22,7 @@ pub mod crdt;
 pub mod geo;
 pub mod hll;
 pub mod json;
+pub mod log;
 pub mod mailbox;
 pub mod mcp;
 pub mod netsec;
