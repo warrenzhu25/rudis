@@ -3940,8 +3940,8 @@ impl Router {
     /// `replication::FullSyncCut`).
     pub async fn generate_full_rdb(&self, arm_replica: Option<u64>) -> Vec<u8> {
         let mut full_rdb = Vec::new();
-        full_rdb.extend_from_slice(b"REDIS0011");
-        full_rdb.extend_from_slice(&[0xFE, 0x00]);
+        let used_mem = self.local_db.borrow().table.used_memory() as u64;
+        crate::redis_rdb::write_file_header(&mut full_rdb, used_mem);
 
         // Local shard chunk
         self.local_db.borrow_mut().save_rdb_chunk(&mut full_rdb);
@@ -4184,10 +4184,13 @@ impl Router {
         let (chunk_tx, chunk_rx) = flume::bounded::<Option<Vec<u8>>>(0);
         let (done_tx, done_rx) = flume::bounded::<Result<(), String>>(1);
         let tmp_path = tmp_filename.to_path_buf();
+        let mut header = Vec::new();
+        let used_mem = self.local_db.borrow().table.used_memory() as u64;
+        crate::redis_rdb::write_file_header(&mut header, used_mem);
         std::thread::Builder::new()
             .name("rdb-writer".into())
             .spawn(move || {
-                let _ = done_tx.send(Self::rdb_writer(&tmp_path, &filename, chunk_rx));
+                let _ = done_tx.send(Self::rdb_writer(&tmp_path, &filename, &header, chunk_rx));
             })
             .map_err(|e| e.to_string())?;
 
@@ -4246,13 +4249,13 @@ impl Router {
     fn rdb_writer(
         tmp_filename: &std::path::Path,
         filename: &std::path::Path,
+        header: &[u8],
         chunks: flume::Receiver<Option<Vec<u8>>>,
     ) -> Result<(), String> {
         use std::io::Write;
         let file = std::fs::File::create(tmp_filename).map_err(|e| e.to_string())?;
         let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
 
-        let header = b"REDIS0011\xFE\x00";
         out.write_all(header).map_err(|e| e.to_string())?;
         let mut crc = crate::table::crc64(header);
         loop {

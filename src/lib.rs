@@ -27,6 +27,7 @@ pub mod mcp;
 pub mod netsec;
 pub mod probabilistic;
 pub mod pubsub;
+pub mod redis_rdb;
 pub mod replication;
 pub mod resp;
 pub mod router;

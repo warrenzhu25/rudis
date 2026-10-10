@@ -121,6 +121,18 @@ pub fn count_libraries() -> usize {
     FUNCTION_LIBS.read().len()
 }
 
+/// The source of every loaded function library (as given to FUNCTION
+/// LOAD), in name order, for the RDB's `FUNCTION2` records.
+pub fn library_codes() -> Vec<String> {
+    let cache = FUNCTION_LIBS.read();
+    let mut libs: Vec<&FunctionLib> = cache
+        .values()
+        .filter(|l| !l.original_code.is_empty())
+        .collect();
+    libs.sort_by(|a, b| a.name.cmp(&b.name));
+    libs.iter().map(|l| l.original_code.clone()).collect()
+}
+
 /// Where a script that declared no keys may still run. With several shards
 /// such a script runs on the client's shard; if its very first command
 /// touches a key of another shard, nothing has happened yet, so the

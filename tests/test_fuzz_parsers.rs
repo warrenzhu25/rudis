@@ -4,6 +4,7 @@
 //! 1. Zero-Copy RESP2 / RESP3 Protocol Parser (`src/resp.rs`)
 //! 2. RedisJSON JSONPath Syntax Parser (`src/json.rs`)
 //! 3. RediSearch Query AST Parser (`src/search.rs`)
+//! 4. Redis/Valkey RDB files and DUMP payloads (`src/redis_rdb.rs`)
 
 use bytes::Bytes;
 use rudis::json::parse_json_path;
@@ -319,5 +320,136 @@ fn parse_raw_resp_arguments(frame: &[u8]) -> Vec<Bytes> {
             .filter(|chunk| !chunk.is_empty())
             .map(Bytes::copy_from_slice)
             .collect()
+    }
+}
+
+/// Seed RDB-encoded values covering every type Rudis writes plus the compact
+/// encodings it only reads.
+fn rdb_seed_payloads() -> Vec<Vec<u8>> {
+    use rudis::table::RudisValue;
+    let mut db = rudis::shard::ShardDb::new(0);
+    let mut c = |args: &[&str]| {
+        let cmd = build_command(args.iter().map(|a| Bytes::from(a.to_string())).collect())
+            .ok()
+            .flatten()
+            .expect("command");
+        let mut out = Vec::new();
+        rudis::connection::execute_local_command(&cmd, &mut db, &mut out, None);
+    };
+    c(&["SET", "s", "hello"]);
+    c(&["SET", "i", "123456"]);
+    c(&["RPUSH", "l", "a", "b", "1"]);
+    c(&["SADD", "set", "x", "y", "7"]);
+    c(&["ZADD", "z", "1.5", "m", "-2", "n"]);
+    c(&["HSET", "h", "f", "v", "g", "1"]);
+    c(&["PFADD", "hll", "a", "b"]);
+    c(&["XADD", "x", "1-1", "f", "v", "g", "w"]);
+    c(&["XADD", "x", "1-2", "other", "v"]);
+    c(&["XGROUP", "CREATE", "x", "grp", "0"]);
+    c(&[
+        "XREADGROUP",
+        "GROUP",
+        "grp",
+        "alice",
+        "COUNT",
+        "1",
+        "STREAMS",
+        "x",
+        ">",
+    ]);
+    let mut seeds = Vec::new();
+    for k in ["s", "i", "l", "set", "z", "h", "hll", "x"] {
+        let dump = db.dump(k.as_bytes()).expect("dump");
+        seeds.push(dump[..dump.len() - 10].to_vec());
+    }
+    // A whole file in the Redis encoding.
+    let mut file = Vec::new();
+    rudis::redis_rdb::write_file_header(&mut file, 0);
+    db.save_rdb_chunk(&mut file);
+    file.push(0xFF);
+    let crc = rudis::table::crc64(&file);
+    file.extend_from_slice(&crc.to_le_bytes());
+    seeds.push(file);
+    // Hash listpack, zset ziplist-ish and quicklist bodies.
+    let v = RudisValue::Int(5);
+    let mut p = Vec::new();
+    rudis::redis_rdb::write_value_payload(&v, &mut p);
+    seeds.push([vec![0u8], p].concat());
+    seeds.push(vec![
+        16, 0x16, 0x16, 0, 0, 0, 2, 0, 0x81, b'f', 2, 0x82, b'v', b'v', 3, 0xFF, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0,
+    ]);
+    seeds
+}
+
+#[test]
+fn test_fuzz_rdb_and_dump_decoders() {
+    let mut rng = SimplePrng::new(0xA11CE5EED);
+    let seeds = rdb_seed_payloads();
+    for seed in &seeds {
+        for _ in 0..3000 {
+            let mut m = seed.clone();
+            match rng.next_usize(4) {
+                0 => {
+                    let cut = rng.next_usize(m.len() + 1);
+                    m.truncate(cut);
+                }
+                1 => {
+                    for _ in 0..1 + rng.next_usize(4) {
+                        if m.is_empty() {
+                            break;
+                        }
+                        let at = rng.next_usize(m.len());
+                        m[at] = rng.next_u64() as u8;
+                    }
+                }
+                2 => {
+                    let at = rng.next_usize(m.len() + 1);
+                    let n = 1 + rng.next_usize(16);
+                    let extra = rng.random_bytes(n);
+                    m.splice(at..at, extra);
+                }
+                _ => {
+                    // Huge lengths in place of small ones.
+                    if !m.is_empty() {
+                        let at = rng.next_usize(m.len());
+                        m[at] = 0x81;
+                        m.splice(at + 1..at + 1, [0xFF; 8]);
+                    }
+                }
+            }
+            let _ = rudis::redis_rdb::decode_dump_body(&m, 0);
+            let mut r = rudis::redis_rdb::Reader::new(&m);
+            if let Ok(t) = r.u8() {
+                let _ = rudis::redis_rdb::skip_value(t, &mut r);
+            }
+            // As a DUMP payload with a valid trailer, through RESTORE.
+            let mut payload = m.clone();
+            payload.extend_from_slice(&11u16.to_le_bytes());
+            let crc = rudis::table::crc64(&payload);
+            payload.extend_from_slice(&crc.to_le_bytes());
+            let mut db = rudis::shard::ShardDb::new(0);
+            let _ = db.restore(Bytes::from_static(b"k"), 0, &payload, true, false);
+            // As a whole file (with a valid CRC), and as a shard chunk.
+            let mut file = if m.starts_with(b"REDIS") {
+                m.clone()
+            } else {
+                [b"REDIS0011".to_vec(), m.clone(), vec![0xFF]].concat()
+            };
+            if file.len() >= 8 {
+                let n = file.len() - 8;
+                let crc = rudis::table::crc64(&file[..n]);
+                file[n..].copy_from_slice(&crc.to_le_bytes());
+            }
+            let mut db = rudis::shard::ShardDb::new(0);
+            let _ = rudis::table::load_rdb_bytes(&file, &mut db, 0, 1);
+            let mut db = rudis::shard::ShardDb::new(0);
+            let _ = db.restore_rdb_chunk(&m);
+        }
+    }
+    for _ in 0..20000 {
+        let len = rng.next_usize(64);
+        let junk = rng.random_bytes(len);
+        let _ = rudis::redis_rdb::decode_dump_body(&junk, 0);
     }
 }
