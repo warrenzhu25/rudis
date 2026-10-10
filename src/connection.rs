@@ -15342,6 +15342,10 @@ async fn execute_command(
             let code_str = String::from_utf8_lossy(&code);
             match crate::scripting::load_function(&code_str, replace) {
                 Ok(lib_name) => {
+                    router.log_mutation(|| Command::FunctionLoad {
+                        replace,
+                        code: code.clone(),
+                    });
                     write_resp_bulk(out, lib_name.as_bytes());
                 }
                 Err(err) => {
@@ -15463,6 +15467,7 @@ async fn execute_command(
         }
         Command::FunctionDelete(lib) => {
             if crate::scripting::delete_function(&lib) {
+                router.log_mutation(|| Command::FunctionDelete(lib.clone()));
                 out.extend_from_slice(b"+OK\r\n");
             } else {
                 write_resp_err(out, "ERR Library not found");
@@ -15476,13 +15481,20 @@ async fn execute_command(
         }
         Command::FunctionRestore { payload, policy } => {
             match crate::scripting::restore_functions(&payload, &policy) {
-                Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                Ok(()) => {
+                    router.log_mutation(|| Command::FunctionRestore {
+                        payload: payload.clone(),
+                        policy: policy.clone(),
+                    });
+                    out.extend_from_slice(b"+OK\r\n")
+                }
                 Err(e) => write_resp_err(out, e),
             }
             false
         }
         Command::FunctionFlush => {
             crate::scripting::flush_functions();
+            router.log_mutation(|| Command::FunctionFlush);
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -21120,10 +21132,14 @@ pub fn execute_local_command(
                 }
 
                 if let Some(dest) = store {
-                    record_change!(cmd);
+                    // Propagated as its effect (DEL, then RPUSH of the
+                    // result), which replays the same on a replica or from
+                    // the AOF whatever the BY/GET keys hold there.
                     let prev_kind = db.type_of(dest);
                     if results.is_empty() {
-                        db.del(dest);
+                        if db.del(dest) {
+                            record_change!(&Command::Del(smallvec::smallvec![dest.clone()]));
+                        }
                         if prev_kind != "none" {
                             notify_keyspace_event(NOTIFY_GENERIC, "del", dest.as_ref());
                         }
@@ -21134,8 +21150,15 @@ pub fn execute_local_command(
                             .into_iter()
                             .map(|opt| opt.unwrap_or_else(|| Bytes::from_static(b"")))
                             .collect();
-                        db.del(dest);
+                        if db.del(dest) {
+                            record_change!(&Command::Del(smallvec::smallvec![dest.clone()]));
+                        }
+                        let rpush = Command::Rpush {
+                            key: dest.clone(),
+                            values: list_items.clone().into(),
+                        };
                         let _ = db.rpush(dest.clone(), list_items);
+                        record_change!(&rpush);
                         notify_list_or_defer(db, dest);
                         notify_set_key_events_local(prev_kind, "list", dest.as_ref());
                         out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
@@ -23642,6 +23665,42 @@ pub fn execute_local_command(
                             let s = del_sid.to_string();
                             write_resp_bulk(out, s.as_bytes());
                         }
+                    }
+                    Err(e) => write_resp_err(out, e),
+                }
+                false
+            }
+            // From a master or the AOF: function libraries are server-wide.
+            Command::FunctionLoad { replace, code } => {
+                match crate::scripting::load_function(&String::from_utf8_lossy(code), *replace) {
+                    Ok(lib_name) => {
+                        record_change!(cmd);
+                        write_resp_bulk(out, lib_name.as_bytes());
+                    }
+                    Err(err) => write_resp_err(out, err),
+                }
+                false
+            }
+            Command::FunctionDelete(lib) => {
+                if crate::scripting::delete_function(lib) {
+                    record_change!(cmd);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    write_resp_err(out, "ERR Library not found");
+                }
+                false
+            }
+            Command::FunctionFlush => {
+                crate::scripting::flush_functions();
+                record_change!(cmd);
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::FunctionRestore { payload, policy } => {
+                match crate::scripting::restore_functions(payload, policy) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
                     }
                     Err(e) => write_resp_err(out, e),
                 }

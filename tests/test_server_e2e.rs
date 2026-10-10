@@ -22893,3 +22893,102 @@ fn test_debug_digest_replica_matches_master_e2e() {
     assert_ne!(debug_digest(&mut m), debug_digest(&mut r));
     resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
 }
+
+/// FUNCTION LOAD/DELETE and SORT ... STORE reach a replica and survive an
+/// AOF restart (they used to be applied on the master only).
+#[test]
+fn test_functions_and_sort_store_replicate_and_persist_e2e() {
+    let (mport, rport) = (17109u16, 17110u16);
+    let dir = std::env::temp_dir().join(format!("rudis-fnrepl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap();
+    let (mport_s, rport_s) = (mport.to_string(), rport.to_string());
+    let margs = [
+        "--port",
+        &mport_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir_s,
+    ];
+    let mut master = spawn_rudis_listening(&margs, mport);
+    let mut replica =
+        spawn_rudis_listening(&["--port", &rport_s, "--threads", "2", "--no-pin"], rport);
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &mport_s]),
+        "+OK\r\n"
+    );
+    let offset = |c: &mut TcpStream, field: &str| -> String {
+        resp_cmd(c, &["INFO", "replication"])
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix(&format!("{field}:"))
+                    .map(|v| v.trim().to_string())
+            })
+            .unwrap_or_default()
+    };
+    let synced = |m: &mut TcpStream, r: &mut TcpStream| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let link_up = resp_cmd(r, &["INFO", "replication"]).contains("master_link_status:up");
+            if link_up && offset(r, "slave_repl_offset") == offset(m, "master_repl_offset") {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replica never caught up"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    synced(&mut m, &mut r);
+
+    let lib = "#!lua name=replib\nredis.register_function('rf', function(keys, args) return 1 end)";
+    assert_eq!(
+        resp_cmd(&mut m, &["FUNCTION", "LOAD", lib]),
+        "$6\r\nreplib\r\n"
+    );
+    assert_eq!(resp_cmd(&mut m, &["RPUSH", "srt", "3", "1", "2"]), ":3\r\n");
+    assert_eq!(
+        resp_cmd(&mut m, &["SORT", "srt", "STORE", "srt:out"]),
+        ":3\r\n"
+    );
+    synced(&mut m, &mut r);
+    assert!(resp_cmd(&mut r, &["FUNCTION", "LIST"]).contains("replib"));
+    let sorted = "*3\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n";
+    assert_eq!(resp_cmd(&mut r, &["LRANGE", "srt:out", "0", "-1"]), sorted);
+
+    assert_eq!(
+        resp_cmd(&mut m, &["FUNCTION", "DELETE", "replib"]),
+        "+OK\r\n"
+    );
+    synced(&mut m, &mut r);
+    assert_eq!(resp_cmd(&mut r, &["FUNCTION", "LIST"]), "*0\r\n");
+
+    // From the AOF alone (no RDB written): the library and the stored list.
+    assert_eq!(
+        resp_cmd(&mut m, &["FUNCTION", "LOAD", lib]),
+        "$6\r\nreplib\r\n"
+    );
+    drop(r);
+    shutdown_and_wait(rport, &mut replica);
+    let _ = m.write_all(&format_resp_cmd(&["SHUTDOWN", "NOSAVE"]));
+    drop(m);
+    let _ = master.wait();
+    let mut master = spawn_rudis_listening(&margs, mport);
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert!(resp_cmd(&mut m, &["FUNCTION", "LIST"]).contains("replib"));
+    assert_eq!(resp_cmd(&mut m, &["LRANGE", "srt:out", "0", "-1"]), sorted);
+    drop(m);
+    shutdown_and_wait(mport, &mut master);
+    let _ = std::fs::remove_dir_all(&dir);
+}
