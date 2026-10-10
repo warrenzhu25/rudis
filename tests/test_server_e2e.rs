@@ -22893,3 +22893,459 @@ fn test_debug_digest_replica_matches_master_e2e() {
     assert_ne!(debug_digest(&mut m), debug_digest(&mut r));
     resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
 }
+
+/// Flattens a RESP reply into its scalar values, dropping the nesting.
+fn resp_scalars(reply: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut lines = reply.split("\r\n");
+    while let Some(l) = lines.next() {
+        match l.as_bytes().first() {
+            None | Some(b'*') | Some(b'%') | Some(b'~') => {}
+            Some(b'$') if l == "$-1" => out.push("(nil)".to_string()),
+            Some(b'$') => out.push(lines.next().unwrap_or_default().to_string()),
+            Some(_) => out.push(l[1..].to_string()),
+        }
+    }
+    out
+}
+
+/// What a replica (or an AOF replay) must reproduce of a stream with
+/// consumer groups: entries, XINFO STREAM FULL, groups, consumers and the
+/// PEL with delivery counts and times. Only times a replica sets with its
+/// own clock (consumer seen/active times, idle times) are left out.
+fn stream_repl_state(c: &mut TcpStream, key: &str) -> Vec<String> {
+    let drop_after = |tokens: Vec<String>, keys: &[&str]| {
+        let mut out = Vec::new();
+        let mut skip = false;
+        for t in tokens {
+            if skip {
+                skip = false;
+                continue;
+            }
+            skip = keys.contains(&t.as_str());
+            out.push(t);
+        }
+        out.join(" ")
+    };
+    let mut state = vec![
+        format!("XRANGE {}", resp_cmd_all(c, &["XRANGE", key, "-", "+"])),
+        drop_after(
+            resp_scalars(&resp_cmd_all(c, &["XINFO", "STREAM", key, "FULL"])),
+            &["seen-time", "active-time"],
+        ),
+    ];
+    let groups = resp_cmd_all(c, &["XINFO", "GROUPS", key]);
+    state.push(format!("GROUPS {groups}"));
+    let tokens = resp_scalars(&groups);
+    let names: Vec<String> = tokens
+        .iter()
+        .zip(tokens.iter().skip(1))
+        .filter(|(k, _)| *k == "name")
+        .map(|(_, v)| v.clone())
+        .collect();
+    for g in &names {
+        let pending = resp_scalars(&resp_cmd_all(c, &["XPENDING", key, g, "-", "+", "1000"]));
+        // id, consumer, idle, delivery count: idle is time-dependent.
+        let rows: Vec<String> = pending
+            .chunks(4)
+            .map(|r| format!("{} {} count={}", r[0], r[1], r[3]))
+            .collect();
+        state.push(format!("XPENDING {g} {rows:?}"));
+        state.push(drop_after(
+            resp_scalars(&resp_cmd_all(c, &["XINFO", "CONSUMERS", key, g])),
+            &["idle", "inactive"],
+        ));
+    }
+    state
+}
+
+/// Consumer-group writes reach a replica, and the AOF, the way Redis
+/// propagates them (XREADGROUP/XAUTOCLAIM as XCLAIM + XGROUP SETID /
+/// CREATECONSUMER, approximate trims as exact ones), so both end with the
+/// master's groups, PELs, delivery counts and times.
+#[test]
+fn test_stream_consumer_groups_replicate_and_persist_e2e() {
+    let (mport, rport) = (18301u16, 18302u16);
+    let (ms, rs) = (mport.to_string(), rport.to_string());
+    let dir = std::env::temp_dir().join(format!("rudis-stream-repl-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("master.conf");
+    std::fs::write(&conf, format!("dir {}\nsave \"\"\n", dir.display())).unwrap();
+    let rdir = dir.join("replica");
+    std::fs::create_dir_all(&rdir).unwrap();
+    let rconf = dir.join("replica.conf");
+    std::fs::write(&rconf, format!("dir {}\nsave \"\"\n", rdir.display())).unwrap();
+    let aof_dir = dir.join("aof");
+    let master_args = [
+        "--port",
+        &ms,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        aof_dir.to_str().unwrap(),
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut master = KillOnDrop(spawn_rudis_listening(&master_args, mport));
+    let _replica = KillOnDrop(spawn_rudis_listening(
+        &[
+            "--port",
+            &rs,
+            "--threads",
+            "3",
+            "--no-pin",
+            "-c",
+            rconf.to_str().unwrap(),
+        ],
+        rport,
+    ));
+    let connect = |port: u16| {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    };
+    let mut m = connect(mport);
+    let mut r = connect(rport);
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !resp_cmd_all(&mut r, &["INFO", "replication"]).contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never synced");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let keys = ["s1", "s2", "s3", "s4"];
+    let ok = |c: &mut TcpStream, args: &[&str]| {
+        let reply = resp_cmd_all(c, args);
+        assert!(!reply.starts_with('-'), "{args:?}: {reply}");
+        reply
+    };
+    // Waits for the replica to apply everything so far, then compares.
+    let check = |m: &mut TcpStream, r: &mut TcpStream, step: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while debug_digest(m) != debug_digest(r) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        // The digest leaves delivery counts and times out: compare those.
+        thread::sleep(Duration::from_millis(100));
+        for k in keys {
+            assert_eq!(
+                stream_repl_state(m, k),
+                stream_repl_state(r, k),
+                "after {step}: {k} differs on the replica"
+            );
+        }
+        assert_eq!(debug_digest(m), debug_digest(r), "after {step}");
+    };
+
+    for i in 1..=10 {
+        ok(
+            &mut m,
+            &["XADD", "s1", &format!("{i}-0"), "f", &i.to_string()],
+        );
+    }
+    ok(&mut m, &["XGROUP", "CREATE", "s1", "g", "0"]);
+    check(&mut m, &mut r, "XGROUP CREATE");
+
+    // XREADGROUP: a new consumer reading new entries.
+    let reply = ok(
+        &mut m,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "alice",
+            "COUNT",
+            "3",
+            "STREAMS",
+            "s1",
+            ">",
+        ],
+    );
+    assert!(reply.contains("3-0"), "{reply}");
+    check(&mut m, &mut r, "XREADGROUP >");
+    // NOACK: no PEL, but the consumer and the group's last id move.
+    ok(
+        &mut m,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "bob",
+            "NOACK",
+            "COUNT",
+            "2",
+            "STREAMS",
+            "s1",
+            ">",
+        ],
+    );
+    check(&mut m, &mut r, "XREADGROUP NOACK");
+    // History reads bump delivery counts and times.
+    ok(
+        &mut m,
+        &["XREADGROUP", "GROUP", "g", "alice", "STREAMS", "s1", "0"],
+    );
+    ok(
+        &mut m,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "alice",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "s1",
+            "0",
+        ],
+    );
+    check(&mut m, &mut r, "XREADGROUP history");
+    // A consumer created by a read that delivers nothing.
+    ok(
+        &mut m,
+        &["XREADGROUP", "GROUP", "g", "carol", "STREAMS", "s1", "0"],
+    );
+    check(&mut m, &mut r, "XREADGROUP empty history");
+
+    // XCLAIM, with each option the propagation uses.
+    ok(&mut m, &["XCLAIM", "s1", "g", "dave", "0", "1-0", "2-0"]);
+    ok(
+        &mut m,
+        &[
+            "XCLAIM", "s1", "g", "dave", "0", "3-0", "JUSTID", "LASTID", "6-0",
+        ],
+    );
+    ok(
+        &mut m,
+        &[
+            "XCLAIM",
+            "s1",
+            "g",
+            "erin",
+            "0",
+            "9-0",
+            "FORCE",
+            "RETRYCOUNT",
+            "5",
+            "IDLE",
+            "1000",
+        ],
+    );
+    ok(
+        &mut m,
+        &[
+            "XCLAIM",
+            "s1",
+            "g",
+            "erin",
+            "0",
+            "1-0",
+            "TIME",
+            "1700000000000",
+        ],
+    );
+    check(&mut m, &mut r, "XCLAIM");
+    // XAUTOCLAIM claims and drops the PEL entry of a deleted entry.
+    ok(&mut m, &["XDEL", "s1", "2-0"]);
+    let reply = ok(
+        &mut m,
+        &["XAUTOCLAIM", "s1", "g", "frank", "0", "0-0", "COUNT", "10"],
+    );
+    assert!(reply.contains("2-0"), "{reply}");
+    check(&mut m, &mut r, "XAUTOCLAIM");
+    ok(&mut m, &["XACK", "s1", "g", "1-0"]);
+    check(&mut m, &mut r, "XACK");
+    ok(&mut m, &["XACKDEL", "s1", "g", "IDS", "1", "3-0"]);
+    check(&mut m, &mut r, "XACKDEL");
+    ok(&mut m, &["XDELEX", "s1", "DELREF", "IDS", "1", "9-0"]);
+    check(&mut m, &mut r, "XDELEX");
+    assert_eq!(
+        ok(&mut m, &["XGROUP", "CREATECONSUMER", "s1", "g", "gina"]),
+        ":1\r\n"
+    );
+    ok(&mut m, &["XGROUP", "DELCONSUMER", "s1", "g", "carol"]);
+    check(&mut m, &mut r, "XGROUP CREATECONSUMER/DELCONSUMER");
+    // Moving the group back re-delivers pending entries to a new owner.
+    ok(
+        &mut m,
+        &["XGROUP", "SETID", "s1", "g", "0", "ENTRIESREAD", "0"],
+    );
+    check(&mut m, &mut r, "XGROUP SETID");
+    ok(
+        &mut m,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "alice",
+            "COUNT",
+            "4",
+            "STREAMS",
+            "s1",
+            ">",
+        ],
+    );
+    check(&mut m, &mut r, "XREADGROUP after SETID");
+
+    // Approximate trims: the master trims whole nodes, the replica must
+    // trim the very same entries.
+    for i in 1..=250 {
+        ok(&mut m, &["XADD", "s2", &format!("{i}-0"), "f", "v"]);
+    }
+    ok(&mut m, &["XGROUP", "CREATE", "s2", "g2", "0"]);
+    ok(
+        &mut m,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g2",
+            "c",
+            "COUNT",
+            "120",
+            "STREAMS",
+            "s2",
+            ">",
+        ],
+    );
+    ok(&mut m, &["XADD", "s2", "MAXLEN", "~", "100", "*", "f", "v"]);
+    assert_eq!(ok(&mut m, &["XLEN", "s2"]), ":151\r\n");
+    check(&mut m, &mut r, "XADD MAXLEN ~");
+    ok(
+        &mut m,
+        &["XADD", "s2", "MINID", "~", "240-0", "*", "f", "v"],
+    );
+    check(&mut m, &mut r, "XADD MINID ~");
+    ok(&mut m, &["XTRIM", "s2", "MAXLEN", "~", "10"]);
+    check(&mut m, &mut r, "XTRIM MAXLEN ~");
+    for _ in 0..150 {
+        ok(&mut m, &["XADD", "s2", "*", "f", "v"]);
+    }
+    ok(
+        &mut m,
+        &[
+            "XTRIM",
+            "s2",
+            "MINID",
+            "~",
+            "999999999999999-0",
+            "LIMIT",
+            "100",
+        ],
+    );
+    check(&mut m, &mut r, "XTRIM MINID ~ LIMIT");
+    ok(
+        &mut m,
+        &[
+            "XADD", "s2", "ACKED", "MAXLEN", "~", "5", "LIMIT", "3", "*", "f", "v",
+        ],
+    );
+    check(&mut m, &mut r, "XADD ACKED MAXLEN ~ LIMIT");
+
+    // Blocked XREADGROUPs served by a later XADD.
+    ok(&mut m, &["XGROUP", "CREATE", "s3", "g3", "$", "MKSTREAM"]);
+    let waiters: Vec<_> = [("hank", false), ("ivan", true)]
+        .into_iter()
+        .map(|(consumer, noack)| {
+            thread::spawn(move || {
+                let mut c = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut args = vec!["XREADGROUP", "GROUP", "g3", consumer, "BLOCK", "5000"];
+                if noack {
+                    args.push("NOACK");
+                }
+                args.extend(["COUNT", "1", "STREAMS", "s3", ">"]);
+                resp_cmd_all(&mut c, &args)
+            })
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !resp_cmd_all(&mut m, &["INFO", "clients"]).contains("blocked_clients:2") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "readers never blocked"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    ok(&mut m, &["XADD", "s3", "1-0", "f", "v"]);
+    ok(&mut m, &["XADD", "s3", "2-0", "f", "v"]);
+    for w in waiters {
+        let reply = w.join().unwrap();
+        assert!(reply.contains("-0"), "{reply}");
+    }
+    check(&mut m, &mut r, "blocked XREADGROUP");
+    // One XREADGROUP over streams of different shards.
+    ok(&mut m, &["XGROUP", "CREATE", "s2", "g", "0"]);
+    ok(
+        &mut m,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "zed",
+            "COUNT",
+            "2",
+            "STREAMS",
+            "s1",
+            "s2",
+            ">",
+            ">",
+        ],
+    );
+    check(&mut m, &mut r, "multi-stream XREADGROUP");
+
+    // IDMP and its configuration.
+    ok(&mut m, &["XADD", "s4", "*", "f", "v"]);
+    ok(
+        &mut m,
+        &[
+            "XCFGSET",
+            "s4",
+            "IDMP-DURATION",
+            "600",
+            "IDMP-MAXSIZE",
+            "10",
+        ],
+    );
+    ok(&mut m, &["XADD", "s4", "IDMP", "p1", "i1", "*", "f", "v"]);
+    ok(
+        &mut m,
+        &[
+            "XADD", "s4", "IDMPAUTO", "p2", "MAXLEN", "~", "1", "*", "f", "w",
+        ],
+    );
+    check(&mut m, &mut r, "XADD IDMP / XCFGSET");
+    assert_eq!(info_field(&mut m, "unpropagated_changes"), "0");
+
+    // An AOF restart rebuilds the same groups, PELs, counts and times.
+    let before: Vec<Vec<String>> = keys.iter().map(|k| stream_repl_state(&mut m, k)).collect();
+    let digest = debug_digest(&mut m);
+    drop(m);
+    shutdown_and_wait(mport, &mut master.0);
+    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+        if e.path().extension().is_some_and(|x| x == "rdb") {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+    }
+    master = KillOnDrop(spawn_rudis_listening(&master_args, mport));
+    let mut m = connect(mport);
+    let after: Vec<Vec<String>> = keys.iter().map(|k| stream_repl_state(&mut m, k)).collect();
+    assert_eq!(before, after, "AOF replay differs");
+    assert_eq!(debug_digest(&mut m), digest);
+    drop(m);
+    shutdown_and_wait(mport, &mut master.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

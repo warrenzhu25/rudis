@@ -2,7 +2,7 @@
 //! server (`~/valkey-stable/src/valkey-server`, or `$VALKEY_SERVER`). Tests
 //! that need it skip (pass with a note) when it is not installed.
 //!
-//! Ports 18100-18199 are used.
+//! Ports 18100-18199 and 18390-18399 are used.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -1094,4 +1094,171 @@ fn rudis_shutdown_after_valkey_load() {
     // The file Rudis wrote on the way out loads in Valkey.
     let valkey = start_valkey(18180, &dir, &[]);
     assert_eq!(valkey.client().c("GET k").text(), "v");
+}
+
+/// A Valkey replica of a Rudis master follows consumer-group traffic:
+/// Rudis propagates XREADGROUP, XCLAIM and XAUTOCLAIM as Redis does (XCLAIM
+/// ... FORCE JUSTID LASTID, XGROUP SETID/CREATECONSUMER) and approximate
+/// trims as exact ones, so Valkey ends with the same entries and PEL.
+#[test]
+fn valkey_replica_follows_rudis_stream_groups() {
+    require_valkey!();
+    let (mport, rport) = (18390u16, 18391u16);
+    let mdir = scratch_dir("stream-repl-m");
+    let rdir = scratch_dir("stream-repl-r");
+    let master = start_rudis(mport, &mdir, 2);
+    let replica = start_valkey(rport, &rdir, &[]);
+    let mut m = master.client();
+    let mut v = replica.client();
+    let field = |c: &mut Client, section: &str, name: &str| -> String {
+        let text = c.c(&format!("INFO {section}")).text();
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("{name} missing in {text}"))
+            .trim()
+            .to_string()
+    };
+    v.ok(&["REPLICAOF", "127.0.0.1", &mport.to_string()]);
+    wait_for("Valkey to sync from Rudis", || {
+        field(&mut v, "replication", "master_link_status") == "up"
+    });
+
+    for i in 1..=250 {
+        m.ok(&["XADD", "s", &format!("{i}-0"), "f", &i.to_string()]);
+    }
+    m.ok(&["XGROUP", "CREATE", "s", "g", "0"]);
+    m.ok(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "alice",
+        "COUNT",
+        "5",
+        "STREAMS",
+        "s",
+        ">",
+    ]);
+    m.ok(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "bob",
+        "NOACK",
+        "COUNT",
+        "3",
+        "STREAMS",
+        "s",
+        ">",
+    ]);
+    m.ok(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "alice",
+        "COUNT",
+        "2",
+        "STREAMS",
+        "s",
+        "0",
+    ]);
+    m.ok(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "carol",
+        "COUNT",
+        "4",
+        "STREAMS",
+        "s",
+        ">",
+    ]);
+    m.ok(&["XCLAIM", "s", "g", "dave", "0", "1-0", "2-0"]);
+    m.ok(&[
+        "XCLAIM", "s", "g", "dave", "0", "3-0", "JUSTID", "LASTID", "20-0",
+    ]);
+    m.ok(&[
+        "XCLAIM",
+        "s",
+        "g",
+        "erin",
+        "0",
+        "30-0",
+        "FORCE",
+        "RETRYCOUNT",
+        "4",
+    ]);
+    m.ok(&["XDEL", "s", "10-0"]);
+    m.ok(&["XAUTOCLAIM", "s", "g", "frank", "0", "0-0", "COUNT", "100"]);
+    m.ok(&["XACK", "s", "g", "1-0"]);
+    m.ok(&["XADD", "s", "MAXLEN", "~", "100", "*", "f", "v"]);
+    m.ok(&["XTRIM", "s", "MINID", "~", "180-0"]);
+    m.ok(&["XGROUP", "CREATECONSUMER", "s", "g", "gina"]);
+    m.ok(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "hank",
+        "COUNT",
+        "2",
+        "STREAMS",
+        "s",
+        ">",
+    ]);
+    m.ok(&["SET", "done", "1"]);
+
+    wait_for("Valkey to apply the stream traffic", || {
+        field(&mut v, "replication", "slave_repl_offset")
+            == field(&mut m, "replication", "master_repl_offset")
+            && v.c("EXISTS done").int() == 1
+    });
+    assert_eq!(m.c("XLEN s"), v.c("XLEN s"));
+    assert_eq!(m.c("XRANGE s - +").render(), v.c("XRANGE s - +").render());
+    // XPENDING rows: id, owner, delivery count, and an idle time showing
+    // the replica has the master's delivery time.
+    let pending = |c: &mut Client| -> Vec<(String, String, i64, i64)> {
+        c.c("XPENDING s g - + 1000")
+            .array()
+            .iter()
+            .map(|row| {
+                let row = row.array();
+                (row[0].text(), row[1].text(), row[2].int(), row[3].int())
+            })
+            .collect()
+    };
+    let (pm, pv) = (pending(&mut m), pending(&mut v));
+    assert_eq!(pm.len(), pv.len(), "{pm:?} vs {pv:?}");
+    assert!(!pm.is_empty());
+    for (a, b) in pm.iter().zip(&pv) {
+        assert_eq!((&a.0, &a.1, a.3), (&b.0, &b.1, b.3), "{pm:?} vs {pv:?}");
+        assert!(
+            (a.2 - b.2).abs() < 2_000,
+            "delivery time differs: {a:?} vs {b:?}"
+        );
+    }
+    let group = |c: &mut Client| {
+        let g = c.c("XINFO GROUPS s").array()[0].map();
+        [
+            "name",
+            "consumers",
+            "pending",
+            "last-delivered-id",
+            "entries-read",
+        ]
+        .map(|k| g[k].render())
+    };
+    assert_eq!(group(&mut m), group(&mut v));
+    let consumers = |c: &mut Client| -> Vec<(String, i64)> {
+        let mut out: Vec<(String, i64)> = c
+            .c("XINFO CONSUMERS s g")
+            .array()
+            .iter()
+            .map(|x| {
+                let x = x.map();
+                (x["name"].text(), x["pending"].int())
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(consumers(&mut m), consumers(&mut v));
 }

@@ -530,6 +530,160 @@ pub fn notify_stream_or_defer(db: &mut ShardDb, key: &Bytes) {
     }
 }
 
+/// The idempotent XCLAIM Redis propagates for a PEL entry that XREADGROUP,
+/// XCLAIM or XAUTOCLAIM created or changed (`streamPropagateXCLAIM`):
+///
+/// `XCLAIM <key> <group> <consumer> 0 <id> TIME <ms> RETRYCOUNT <count> FORCE JUSTID LASTID <last-id>`
+///
+/// On the replica it recreates the entry with its owner, delivery time and
+/// count, or drops it if the stream entry no longer exists.
+fn stream_xclaim_cmd(
+    key: &Bytes,
+    group: &Bytes,
+    consumer: Bytes,
+    id: crate::table::StreamId,
+    pel: &crate::table::StreamPelEntry,
+    last_id: crate::table::StreamId,
+) -> Command {
+    Command::Xclaim {
+        key: key.clone(),
+        group: group.clone(),
+        consumer,
+        min_idle_time: 0,
+        ids: vec![Bytes::from(id.to_string())],
+        idle: None,
+        time: Some(pel.delivery_time_ms),
+        retrycount: Some(pel.delivery_count),
+        force: true,
+        justid: true,
+        lastid: Some(last_id),
+    }
+}
+
+/// `XGROUP SETID <key> <group> <last-id> ENTRIESREAD <n>`, which Redis
+/// propagates when a group's last-delivered-id moved without an XCLAIM
+/// carrying it (`streamPropagateGroupID`). ENTRIESREAD is left out when
+/// the counter is invalid, which SETID then also sets on the replica.
+fn stream_setid_cmd(
+    key: &Bytes,
+    group: &Bytes,
+    snap: &crate::table::StreamGroupSnapshot,
+) -> Command {
+    Command::XgroupSetId {
+        key: key.clone(),
+        group: group.clone(),
+        id: snap.last_delivered_id.to_string(),
+        entries_read: snap.entries_read,
+    }
+}
+
+fn stream_createconsumer_cmd(key: &Bytes, group: &Bytes, consumer: &Bytes) -> Command {
+    Command::XgroupCreateConsumer {
+        key: key.clone(),
+        group: group.clone(),
+        consumer: consumer.clone(),
+    }
+}
+
+/// The commands that propagate what an XREADGROUP did to `key`, in place of
+/// the command itself (which would block or deliver differently on a
+/// replica): consumer creation, an XCLAIM for every entry it now has
+/// pending (new deliveries, CLAIMed entries and re-read history), and an
+/// XGROUP SETID if the group's last-delivered-id moved.
+///
+/// Unlike Redis, the consumer creation is propagated with or without NOACK
+/// and history reads propagate their new delivery count and time, so the
+/// replica and the AOF match the master exactly.
+pub(crate) fn stream_read_propagation(
+    db: &mut ShardDb,
+    key: &Bytes,
+    group: &Bytes,
+    consumer: &Bytes,
+    consumer_created: bool,
+    delivered: &[crate::table::StreamId],
+    prev_last_id: crate::table::StreamId,
+) -> Vec<Command> {
+    let mut cmds = Vec::new();
+    if consumer_created {
+        cmds.push(stream_createconsumer_cmd(key, group, consumer));
+    }
+    let Some(snap) = db.table.stream_group_snapshot(key, group, delivered) else {
+        return cmds;
+    };
+    for (id, pe) in &snap.pel {
+        if pe.consumer == *consumer {
+            cmds.push(stream_xclaim_cmd(
+                key,
+                group,
+                consumer.clone(),
+                *id,
+                pe,
+                snap.last_delivered_id,
+            ));
+        }
+    }
+    if snap.last_delivered_id != prev_last_id {
+        cmds.push(stream_setid_cmd(key, group, &snap));
+    }
+    cmds
+}
+
+/// The commands that propagate an XCLAIM or XAUTOCLAIM, as Redis does: an
+/// XCLAIM per claimed entry and per PEL entry dropped because its stream
+/// entry is gone, and XGROUP SETID if XCLAIM's LASTID moved the group
+/// without any XCLAIM carrying it. A consumer the command created is
+/// propagated too, even when nothing was claimed.
+pub(crate) fn stream_claim_propagation(
+    db: &mut ShardDb,
+    key: &Bytes,
+    group: &Bytes,
+    consumer: &Bytes,
+    outcome: &crate::table::StreamClaimOutcome,
+) -> Vec<Command> {
+    let mut cmds = Vec::new();
+    if outcome.consumer_created {
+        cmds.push(stream_createconsumer_cmd(key, group, consumer));
+    }
+    let ids: Vec<crate::table::StreamId> = outcome.claimed.iter().map(|(id, _)| *id).collect();
+    let Some(snap) = db.table.stream_group_snapshot(key, group, &ids) else {
+        return cmds;
+    };
+    let mut claims = 0;
+    for (id, pe) in &snap.pel {
+        cmds.push(stream_xclaim_cmd(
+            key,
+            group,
+            pe.consumer.clone(),
+            *id,
+            pe,
+            snap.last_delivered_id,
+        ));
+        claims += 1;
+    }
+    for (id, pe) in &outcome.deleted {
+        // XNACKed entries have no owner: name the claiming consumer, which
+        // exists on the replica too.
+        let owner = if pe.consumer.is_empty() {
+            consumer.clone()
+        } else {
+            pe.consumer.clone()
+        };
+        cmds.push(stream_xclaim_cmd(
+            key,
+            group,
+            owner,
+            *id,
+            pe,
+            snap.last_delivered_id,
+        ));
+        claims += 1;
+    }
+    if outcome.last_id_advanced && claims == 0 {
+        cmds.push(stream_setid_cmd(key, group, &snap));
+    }
+    cmds
+}
+
 #[inline]
 pub fn tx_has_cross_slot(tx_queue: &[Command]) -> bool {
     let mut expected_slot: Option<u16> = None;
@@ -9264,7 +9418,7 @@ async fn execute_command(
             let snap = crate::snapshot::state(router.base_port);
             let aof_rw = crate::snapshot::aof_rewrite_state(router.base_port);
             let persistence_str = format!(
-                "# Persistence\r\nloading:{}\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_last_bgrewrite_status:{}\r\n",
+                "# Persistence\r\nloading:{}\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_last_bgrewrite_status:{}\r\nunpropagated_changes:{}\r\n",
                 u8::from(crate::replication::is_loading(router.port)),
                 snap.changes_since_last_save(),
                 u8::from(
@@ -9275,7 +9429,8 @@ async fn execute_command(
                 if snap.last_save_ok() { "ok" } else { "err" },
                 u8::from(router.aof.is_some()),
                 u8::from(aof_rw.in_progress()),
-                if aof_rw.last_ok() { "ok" } else { "err" }
+                if aof_rw.last_ok() { "ok" } else { "err" },
+                crate::aof::unpropagated_changes()
             );
             let cmdstat_str = {
                 router.flush_all_command_stats().await;
@@ -17033,26 +17188,34 @@ pub fn execute_local_command(
     // expiry, eviction); the connection path and shard batches set it.
     let cid = CURRENT_CLIENT_ID.get();
     macro_rules! record_change {
-        ($cmd_expr:expr) => {
+        // `$warn`: whether a change `command_to_resp` cannot encode (and so
+        // never reaches the AOF or the replicas) is reported.
+        (@log $cmd_expr:expr, $warn:expr) => {{
+            let changed: &Command = $cmd_expr;
             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed)
                 || HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
             {
-                for_each_cmd_key($cmd_expr, |k| {
+                for_each_cmd_key(changed, |k| {
                     notify_key_invalidation(db.port, k, cid);
                 });
             }
             let need_aof = aof.is_some();
             let need_rep = crate::replication::has_connected_replicas(db.port);
             if need_aof || need_rep {
-                if let Some(bytes) = crate::aof::command_to_resp($cmd_expr) {
+                if let Some(bytes) = crate::aof::command_to_resp(changed) {
                     if let Some(aof_w) = aof {
                         aof_w.borrow_mut().append(&bytes);
                     }
                     if need_rep {
                         crate::replication::propagate_shard_bytes(db.port, db.shard_id, &bytes);
                     }
+                } else if $warn {
+                    crate::aof::note_unpropagated(changed);
                 }
             }
+        }};
+        ($cmd_expr:expr) => {
+            record_change!(@log $cmd_expr, true)
         };
     }
     // CRDT writes are logged as their effect, a CRDT.MERGE of the changed
@@ -17061,7 +17224,7 @@ pub fn execute_local_command(
     // key invalidation; it logs nothing for these commands.
     macro_rules! record_crdt_effect {
         ($payload:expr) => {
-            record_change!(cmd);
+            record_change!(@log cmd, false);
             crate::replication::log_shard_mutation(db.port, db.shard_id, aof, || {
                 Command::CrdtMerge(bytes::Bytes::from($payload))
             });
@@ -19781,19 +19944,78 @@ pub fn execute_local_command(
                     *limit,
                 ) {
                     Ok(crate::table::StreamAddResult::Added(generated_id)) => {
-                        let explicit_cmd = Command::Xadd {
-                            key: key.clone(),
-                            nomkstream: *nomkstream,
-                            maxlen: *maxlen,
-                            minid: *minid,
-                            approx: *approx,
-                            trim_strategy: *trim_strategy,
-                            idmp: idmp.clone(),
-                            id: crate::table::StreamAddId::Explicit(generated_id),
-                            fields: fields.clone(),
-                            limit: *limit,
-                        };
-                        record_change!(&explicit_cmd);
+                        // An approximate (or LIMITed) trim depends on how the
+                        // stream is split into nodes, so like Redis it is
+                        // propagated as the exact trim it amounted to.
+                        let trims = maxlen.is_some() || minid.is_some();
+                        let (p_maxlen, p_minid, p_approx, p_limit) =
+                            if trims && (*approx || limit.is_some()) {
+                                let (m, n) = db.table.stream_exact_trim_args(
+                                    key,
+                                    *maxlen,
+                                    *minid,
+                                    *trim_strategy,
+                                );
+                                (m, n, false, None)
+                            } else {
+                                (*maxlen, *minid, *approx, *limit)
+                            };
+                        let explicit_id = crate::table::StreamAddId::Explicit(generated_id);
+                        if let Some(idmp) = idmp {
+                            // IDMP needs an auto ID, and the replica must not
+                            // judge duplicates with its own clock: log the
+                            // entry, its IID, then the trim.
+                            let (pid, iid) = match idmp {
+                                crate::table::StreamIdmpOption::Manual { producer, iid } => {
+                                    (producer.clone(), iid.clone())
+                                }
+                                crate::table::StreamIdmpOption::Auto { producer } => (
+                                    producer.clone(),
+                                    crate::table::compute_stream_auto_iid(fields),
+                                ),
+                            };
+                            record_change!(&Command::Xadd {
+                                key: key.clone(),
+                                nomkstream: *nomkstream,
+                                maxlen: None,
+                                minid: None,
+                                approx: false,
+                                trim_strategy: crate::table::StreamTrimStrategy::KeepRef,
+                                idmp: None,
+                                id: explicit_id,
+                                fields: fields.clone(),
+                                limit: None,
+                            });
+                            record_change!(&Command::Xidmprecord {
+                                key: key.clone(),
+                                pid,
+                                iid,
+                                id_raw: Bytes::from(generated_id.to_string()),
+                            });
+                            if trims {
+                                record_change!(&Command::Xtrim {
+                                    key: key.clone(),
+                                    maxlen: p_maxlen,
+                                    minid: p_minid,
+                                    approx: p_approx,
+                                    trim_strategy: *trim_strategy,
+                                    limit: p_limit,
+                                });
+                            }
+                        } else {
+                            record_change!(&Command::Xadd {
+                                key: key.clone(),
+                                nomkstream: *nomkstream,
+                                maxlen: p_maxlen,
+                                minid: p_minid,
+                                approx: p_approx,
+                                trim_strategy: *trim_strategy,
+                                idmp: None,
+                                id: explicit_id,
+                                fields: fields.clone(),
+                                limit: p_limit,
+                            });
+                        }
                         let s = generated_id.to_string();
                         notify_stream_or_defer(db, key);
                         notify_keyspace_event(NOTIFY_STREAM, "xadd", key);
@@ -19982,7 +20204,26 @@ pub fn execute_local_command(
                     Ok(count) => {
                         if count > 0 {
                             crate::snapshot::note_changes(count as u64);
-                            record_change!(cmd);
+                            if *approx || limit.is_some() {
+                                // Propagated as the exact trim it amounted to,
+                                // as Redis does.
+                                let (m, n) = db.table.stream_exact_trim_args(
+                                    key,
+                                    *maxlen,
+                                    *minid,
+                                    *trim_strategy,
+                                );
+                                record_change!(&Command::Xtrim {
+                                    key: key.clone(),
+                                    maxlen: m,
+                                    minid: n,
+                                    approx: false,
+                                    trim_strategy: *trim_strategy,
+                                    limit: None,
+                                });
+                            } else {
+                                record_change!(cmd);
+                            }
                             notify_keyspace_event(NOTIFY_STREAM, "xtrim", key);
                         }
                         out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
@@ -20120,6 +20361,8 @@ pub fn execute_local_command(
                 match db.xgroup_createconsumer(key, group, consumer.clone()) {
                     Ok(created) => {
                         if created {
+                            crate::snapshot::note_changes(1);
+                            record_change!(cmd);
                             notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
                             out.extend_from_slice(b":1\r\n");
                         } else {
@@ -20196,7 +20439,7 @@ pub fn execute_local_command(
             } => {
                 let mut all_results = Vec::new();
                 let mut err = None;
-                let mut any_modified = false;
+                let mut props: Vec<Command> = Vec::new();
                 let per_stream_limit = count.unwrap_or(usize::MAX);
                 let max_total = maxcount.unwrap_or(usize::MAX);
                 let max_bytes = maxsize.unwrap_or(usize::MAX);
@@ -20209,6 +20452,11 @@ pub fn execute_local_command(
                         break;
                     }
                     let remaining_count = per_stream_limit.min(max_total - total_entries);
+                    let prev_last_id = db
+                        .table
+                        .stream_group_snapshot(k, group, &[])
+                        .map(|s| s.last_delivered_id);
+                    let had_consumer = db.table.stream_has_consumer(k, group, consumer);
                     match db.xreadgroup(
                         k,
                         group,
@@ -20226,8 +20474,20 @@ pub fn execute_local_command(
                                 // Reading the pending list only updates delivery
                                 // metadata, which (like Redis) is no change.
                                 crate::snapshot::note_changes(1);
-                                any_modified = true;
                                 notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", k);
+                            }
+                            if let Some(prev_last_id) = prev_last_id {
+                                let delivered: Vec<crate::table::StreamId> =
+                                    entries.iter().map(|(id, _, _)| *id).collect();
+                                props.extend(stream_read_propagation(
+                                    db,
+                                    k,
+                                    group,
+                                    consumer,
+                                    !had_consumer,
+                                    &delivered,
+                                    prev_last_id,
+                                ));
                             }
                             if !entries.is_empty() {
                                 all_results.push((k.clone(), entries));
@@ -20288,8 +20548,10 @@ pub fn execute_local_command(
                         }
                     }
                 }
-                if any_modified {
-                    record_change!(cmd);
+                // Never XREADGROUP itself: with BLOCK it would hang the
+                // replica's link, and it would deliver differently there.
+                for p in &props {
+                    record_change!(p);
                 }
                 false
             }
@@ -23561,6 +23823,7 @@ pub fn execute_local_command(
                 retrycount,
                 force,
                 justid,
+                lastid,
             } => {
                 match db.table.xclaim(
                     key,
@@ -23573,13 +23836,23 @@ pub fn execute_local_command(
                     *retrycount,
                     *force,
                     *justid,
+                    *lastid,
                 ) {
-                    Ok((claimed, consumer_created)) => {
-                        if consumer_created {
+                    Ok(outcome) => {
+                        if outcome.consumer_created {
                             notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
                         }
-                        write_resp_array_header(out, claimed.len());
-                        for (sid, fields) in claimed {
+                        // Like Redis, XCLAIM is never propagated itself, but
+                        // as one idempotent XCLAIM per changed PEL entry.
+                        let props = stream_claim_propagation(db, key, group, consumer, &outcome);
+                        if !props.is_empty() {
+                            crate::snapshot::note_changes(props.len() as u64);
+                        }
+                        for p in &props {
+                            record_change!(p);
+                        }
+                        write_resp_array_header(out, outcome.claimed.len());
+                        for (sid, fields) in outcome.claimed {
                             let sid_str = sid.to_string();
                             if *justid {
                                 write_resp_bulk(out, sid_str.as_bytes());
@@ -23616,14 +23889,21 @@ pub fn execute_local_command(
                     *count,
                     *justid,
                 ) {
-                    Ok((next_cursor, claimed, deleted_ids, consumer_created)) => {
-                        if consumer_created {
+                    Ok((next_cursor, outcome)) => {
+                        if outcome.consumer_created {
                             notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
+                        }
+                        let props = stream_claim_propagation(db, key, group, consumer, &outcome);
+                        if !props.is_empty() {
+                            crate::snapshot::note_changes(props.len() as u64);
+                        }
+                        for p in &props {
+                            record_change!(p);
                         }
                         write_resp_array_header(out, 3);
                         write_resp_bulk(out, next_cursor.as_bytes());
-                        write_resp_array_header(out, claimed.len());
-                        for (sid, fields) in claimed {
+                        write_resp_array_header(out, outcome.claimed.len());
+                        for (sid, fields) in outcome.claimed {
                             let sid_str = sid.to_string();
                             if *justid {
                                 write_resp_bulk(out, sid_str.as_bytes());
@@ -23637,8 +23917,8 @@ pub fn execute_local_command(
                                 }
                             }
                         }
-                        write_resp_array_header(out, deleted_ids.len());
-                        for del_sid in deleted_ids {
+                        write_resp_array_header(out, outcome.deleted.len());
+                        for (del_sid, _) in outcome.deleted {
                             let s = del_sid.to_string();
                             write_resp_bulk(out, s.as_bytes());
                         }
@@ -26785,6 +27065,7 @@ mod tests {
                 retrycount: None,
                 force: false,
                 justid: true,
+                lastid: None,
             },
             &mut db,
             &mut out,
