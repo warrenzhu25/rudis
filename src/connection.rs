@@ -2997,6 +2997,73 @@ pub fn set_max_clients(limit: usize) {
     MAX_CLIENTS.store(limit, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When this process started, for INFO uptime.
+static SERVER_START: std::sync::LazyLock<(std::time::Instant, String)> =
+    std::sync::LazyLock::new(|| {
+        // INFO run_id: 40 random hex characters, fixed for the process.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let a = fxhash::hash64(&(seed, std::process::id()));
+        let b = fxhash::hash64(&(a, seed.rotate_left(17)));
+        let c = fxhash::hash64(&(b, a));
+        let run_id = format!("{a:016x}{b:016x}{c:016x}")[..40].to_string();
+        (std::time::Instant::now(), run_id)
+    });
+
+/// Called at startup so uptime counts from then, not from the first INFO.
+pub fn mark_server_start() {
+    std::sync::LazyLock::force(&SERVER_START);
+}
+
+/// The process fields of Redis's INFO server section (process_id, run_id,
+/// uptime, executable, config_file, ...), which monitoring relies on.
+fn server_info_process_fields() -> String {
+    let (started, run_id) = &*SERVER_START;
+    let uptime = started.elapsed().as_secs();
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let executable = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let config_file = crate::config::ACTIVE_CONFIG_FILE
+        .read()
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    format!(
+        "process_id:{}\r\nprocess_supervised:no\r\nrun_id:{}\r\nserver_time_usec:{}\r\nuptime_in_seconds:{}\r\nuptime_in_days:{}\r\nhz:10\r\nconfigured_hz:10\r\nlru_clock:{}\r\nexecutable:{}\r\nconfig_file:{}\r\nio_threads_active:0\r\n",
+        std::process::id(),
+        run_id,
+        now_us,
+        uptime,
+        uptime / 86400,
+        (now_us / 1_000_000) as u64 & ((1 << 24) - 1),
+        executable,
+        config_file,
+    )
+}
+
+/// INFO cpu from getrusage: the whole process (all shard threads).
+fn info_cpu_section() -> String {
+    let secs = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage writes one `rusage` into the pointer it is given;
+    // `ru` is a valid, writable, properly aligned `rusage`. A zeroed
+    // `rusage` is a valid value, so reading it after a failed call is fine.
+    let ru = unsafe {
+        libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr());
+        ru.assume_init()
+    };
+    let (sys, user) = (secs(ru.ru_stime), secs(ru.ru_utime));
+    format!(
+        "# CPU\r\nused_cpu_sys:{sys:.6}\r\nused_cpu_user:{user:.6}\r\nused_cpu_sys_children:0.000000\r\nused_cpu_user_children:0.000000\r\nused_cpu_sys_main_thread:{sys:.6}\r\nused_cpu_user_main_thread:{user:.6}\r\n"
+    )
+}
+
 pub fn get_max_clients() -> usize {
     MAX_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -9523,15 +9590,19 @@ async fn execute_command(
                 s
             };
             let server_str = format!(
-                "# Server\r\nredis_version:7.2.4\r\nredis_git_sha1:00000000\r\nredis_git_dirty:0\r\nredis_build_id:0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\nmultiplexing_api:{}\r\nrudis_version:0.1.0\r\narch:shared-nothing-{}\r\nshard_id:{}\r\nnum_shards:{}\r\ntcp_port:{}\r\n",
+                "# Server\r\nredis_version:7.2.4\r\nredis_git_sha1:00000000\r\nredis_git_dirty:0\r\nredis_build_id:0\r\nredis_mode:{}\r\nos:Linux\r\narch_bits:64\r\nmultiplexing_api:{}\r\n{}rudis_version:{}\r\narch:shared-nothing-{}\r\nshard_id:{}\r\nnum_shards:{}\r\ntcp_port:{}\r\n",
+                if router.cluster_enabled { "cluster" } else { "standalone" },
                 io_driver_name(),
+                server_info_process_fields(),
+                env!("CARGO_PKG_VERSION"),
                 io_driver_name(),
                 router.shard_id,
                 router.num_shards,
                 router.port,
             );
-            let cpu_str = "# CPU\r\nused_cpu_sys:0.000000\r\nused_cpu_user:0.000000\r\nused_cpu_sys_children:0.000000\r\nused_cpu_user_children:0.000000\r\nused_cpu_sys_main_thread:0.000000\r\nused_cpu_user_main_thread:0.000000\r\n";
-            let repl_str = format!("# Replication\r\n{}", hub.format_info_replication());
+            let cpu_str = info_cpu_section();
+            // `format_info_replication` starts with its own header.
+            let repl_str = hub.format_info_replication();
             let sec_raw = section.as_deref().unwrap_or(b"default");
             let sec_text = String::from_utf8_lossy(sec_raw);
             let tokens: Vec<String> = sec_text
@@ -9613,7 +9684,7 @@ async fn execute_command(
                             "persistence" => acc.push_str(&persistence_str),
                             "stats" => acc.push_str(&stats_str),
                             "replication" => acc.push_str(&repl_str),
-                            "cpu" => acc.push_str(cpu_str),
+                            "cpu" => acc.push_str(&cpu_str),
                             "storage" => acc.push_str(&storage_str),
                             "commandstats" => acc.push_str(&cmdstat_str),
                             "latencystats" => acc.push_str(&latencystat_str),
@@ -15497,6 +15568,10 @@ async fn execute_command(
             let code_str = String::from_utf8_lossy(&code);
             match crate::scripting::load_function(&code_str, replace) {
                 Ok(lib_name) => {
+                    router.log_mutation(|| Command::FunctionLoad {
+                        replace,
+                        code: code.clone(),
+                    });
                     write_resp_bulk(out, lib_name.as_bytes());
                 }
                 Err(err) => {
@@ -15618,6 +15693,7 @@ async fn execute_command(
         }
         Command::FunctionDelete(lib) => {
             if crate::scripting::delete_function(&lib) {
+                router.log_mutation(|| Command::FunctionDelete(lib.clone()));
                 out.extend_from_slice(b"+OK\r\n");
             } else {
                 write_resp_err(out, "ERR Library not found");
@@ -15631,13 +15707,20 @@ async fn execute_command(
         }
         Command::FunctionRestore { payload, policy } => {
             match crate::scripting::restore_functions(&payload, &policy) {
-                Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                Ok(()) => {
+                    router.log_mutation(|| Command::FunctionRestore {
+                        payload: payload.clone(),
+                        policy: policy.clone(),
+                    });
+                    out.extend_from_slice(b"+OK\r\n")
+                }
                 Err(e) => write_resp_err(out, e),
             }
             false
         }
         Command::FunctionFlush => {
             crate::scripting::flush_functions();
+            router.log_mutation(|| Command::FunctionFlush);
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -18432,15 +18515,17 @@ pub fn execute_local_command(
                 elements,
                 flags,
             } => {
-                match db.zadd_slice(key.as_ref(), elements, *flags) {
-                    Ok((count, incr_score)) => {
+                match db.zadd_slice_changes(key.as_ref(), elements, *flags) {
+                    Ok((count, changed, incr_score)) => {
                         if flags.incr {
                             if incr_score.is_some() {
                                 record_change!(cmd);
                                 notify_zset_or_defer(db, key);
                                 notify_keyspace_event(NOTIFY_ZSET, "zadd", key);
                             }
-                        } else if count > 0 {
+                        } else if changed > 0 {
+                            // Not `count`: without CH it only counts new
+                            // members, and a score update must replicate too.
                             record_change!(cmd);
                             notify_zset_or_defer(db, key);
                             notify_keyspace_event(NOTIFY_ZSET, "zadd", key);
@@ -21382,10 +21467,14 @@ pub fn execute_local_command(
                 }
 
                 if let Some(dest) = store {
-                    record_change!(cmd);
+                    // Propagated as its effect (DEL, then RPUSH of the
+                    // result), which replays the same on a replica or from
+                    // the AOF whatever the BY/GET keys hold there.
                     let prev_kind = db.type_of(dest);
                     if results.is_empty() {
-                        db.del(dest);
+                        if db.del(dest) {
+                            record_change!(&Command::Del(smallvec::smallvec![dest.clone()]));
+                        }
                         if prev_kind != "none" {
                             notify_keyspace_event(NOTIFY_GENERIC, "del", dest.as_ref());
                         }
@@ -21396,8 +21485,15 @@ pub fn execute_local_command(
                             .into_iter()
                             .map(|opt| opt.unwrap_or_else(|| Bytes::from_static(b"")))
                             .collect();
-                        db.del(dest);
+                        if db.del(dest) {
+                            record_change!(&Command::Del(smallvec::smallvec![dest.clone()]));
+                        }
+                        let rpush = Command::Rpush {
+                            key: dest.clone(),
+                            values: list_items.clone().into(),
+                        };
                         let _ = db.rpush(dest.clone(), list_items);
+                        record_change!(&rpush);
                         notify_list_or_defer(db, dest);
                         notify_set_key_events_local(prev_kind, "list", dest.as_ref());
                         out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
@@ -23922,6 +24018,42 @@ pub fn execute_local_command(
                             let s = del_sid.to_string();
                             write_resp_bulk(out, s.as_bytes());
                         }
+                    }
+                    Err(e) => write_resp_err(out, e),
+                }
+                false
+            }
+            // From a master or the AOF: function libraries are server-wide.
+            Command::FunctionLoad { replace, code } => {
+                match crate::scripting::load_function(&String::from_utf8_lossy(code), *replace) {
+                    Ok(lib_name) => {
+                        record_change!(cmd);
+                        write_resp_bulk(out, lib_name.as_bytes());
+                    }
+                    Err(err) => write_resp_err(out, err),
+                }
+                false
+            }
+            Command::FunctionDelete(lib) => {
+                if crate::scripting::delete_function(lib) {
+                    record_change!(cmd);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    write_resp_err(out, "ERR Library not found");
+                }
+                false
+            }
+            Command::FunctionFlush => {
+                crate::scripting::flush_functions();
+                record_change!(cmd);
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::FunctionRestore { payload, policy } => {
+                match crate::scripting::restore_functions(payload, policy) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
                     }
                     Err(e) => write_resp_err(out, e),
                 }

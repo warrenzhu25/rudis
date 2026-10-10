@@ -1805,6 +1805,25 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         | Command::CrdtSadd { .. }
         | Command::CrdtSrem { .. } => None,
         Command::CrdtMerge(payload) => Some(resp_argv(&[b"CRDT.MERGE".as_slice(), payload])),
+        // Function libraries are server-wide; like Redis, the commands that
+        // change them are replicated and written to the AOF as sent.
+        Command::FunctionLoad { replace, code } => Some(if *replace {
+            resp_argv(&[b"FUNCTION".as_slice(), b"LOAD", b"REPLACE", code])
+        } else {
+            resp_argv(&[b"FUNCTION".as_slice(), b"LOAD", code])
+        }),
+        Command::FunctionDelete(lib) => Some(resp_argv(&[
+            b"FUNCTION".as_slice(),
+            b"DELETE",
+            lib.as_bytes(),
+        ])),
+        Command::FunctionFlush => Some(resp_argv(&[b"FUNCTION".as_slice(), b"FLUSH"])),
+        Command::FunctionRestore { payload, policy } => Some(resp_argv(&[
+            b"FUNCTION".as_slice(),
+            b"RESTORE",
+            payload,
+            policy.as_bytes(),
+        ])),
         Command::CrdtGc(horizon) => Some(match horizon {
             crate::crdt::GcHorizon::Ttl(None) => resp_argv(&[b"CRDT.GC"]),
             crate::crdt::GcHorizon::Ttl(Some(ttl)) => {

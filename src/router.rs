@@ -1460,11 +1460,20 @@ impl Router {
     pub async fn rpush(&self, key: Bytes, elements: Vec<Bytes>) -> usize {
         let target = self.target_shard(&key);
         if target == self.shard_id {
+            // The remote path runs RPUSH through `execute_local_command`,
+            // which logs it; log the local one the same way.
+            let logged = elements.clone();
             let len = self
                 .local_db
                 .borrow_mut()
                 .rpush(key.clone(), elements)
                 .unwrap_or(0);
+            if len > 0 {
+                self.log_mutation(|| Command::Rpush {
+                    key: key.clone(),
+                    values: logged.into(),
+                });
+            }
             crate::connection::notify_list_or_defer(&mut self.local_db.borrow_mut(), &key);
             len
         } else {

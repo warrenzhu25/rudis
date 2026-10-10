@@ -10772,6 +10772,20 @@ impl RudisTable {
         self.zadd_slice_internal(key, h, None, elements, flags)
     }
 
+    /// Like `zadd_slice`, but also returns how many members were added or
+    /// had their score changed, whatever `flags.ch` says: the reply counts
+    /// only additions without CH, yet a score update is a change that must
+    /// be replicated.
+    pub fn zadd_slice_changes(
+        &mut self,
+        key: &[u8],
+        elements: &[(f64, Bytes)],
+        flags: ZAddFlags,
+    ) -> Result<(usize, usize, Option<f64>), &'static str> {
+        let h = hash_key(key);
+        self.zadd_slice_counts(key, h, elements, flags)
+    }
+
     #[inline(always)]
     fn zadd_slice_internal(
         &mut self,
@@ -10781,6 +10795,20 @@ impl RudisTable {
         elements: &[(f64, Bytes)],
         flags: ZAddFlags,
     ) -> Result<(usize, Option<f64>), &'static str> {
+        self.zadd_slice_counts(key, h, elements, flags)
+            .map(|(reply, _, incr)| (reply, incr))
+    }
+
+    /// The ZADD reply count, the number of members added or changed, and
+    /// the INCR result.
+    #[inline(always)]
+    fn zadd_slice_counts(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        elements: &[(f64, Bytes)],
+        flags: ZAddFlags,
+    ) -> Result<(usize, usize, Option<f64>), &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
@@ -10844,7 +10872,7 @@ impl RudisTable {
                         }
 
                         let ret_count = if flags.ch { changed_count } else { added_count };
-                        return Ok((ret_count, new_score_incr));
+                        return Ok((ret_count, changed_count, new_score_incr));
                     }
                     _ => {
                         return Err(
@@ -10857,7 +10885,7 @@ impl RudisTable {
 
         // Key does not exist
         if flags.xx {
-            return Ok((0, None));
+            return Ok((0, 0, None));
         }
 
         let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
@@ -10887,7 +10915,7 @@ impl RudisTable {
             Expiry::from(None),
         );
         self.table.insert_prepared(entry, h, insert_idx);
-        Ok((added_count, new_score_incr))
+        Ok((added_count, added_count, new_score_incr))
     }
 
     #[inline]
@@ -16105,7 +16133,7 @@ fn load_legacy_rdb(
     if expected_crc != actual_crc {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "CRC64 checksum mismatch in RDB file",
+            "RDB CRC error: CRC64 checksum mismatch in RDB file",
         ));
     }
     // Skip REDIS0011
