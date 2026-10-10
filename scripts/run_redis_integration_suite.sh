@@ -10,13 +10,31 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TEST_DIR="$REPO_ROOT/tests/redis-tests"
+SRC_TEST_DIR="$REPO_ROOT/tests/redis-tests"
+# The suites run from a copy of the test tree, so the generated wrapper and
+# the patch below never touch the checked-in tree. Logs end up in
+# $TEST_DIR/tests/tmp.
+TEST_DIR="$REPO_ROOT/target/redis-tests-integ"
 SUITES="${1:?usage: $0 suite[,suite...]}"
 CLIENTS="${CLIENTS:-1}"
 THREADS="${RUDIS_THREADS:-4}"
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     (cd "$REPO_ROOT" && cargo build --release) || exit 1
+fi
+
+mkdir -p "$TEST_DIR"
+rsync -a --delete --exclude tests/tmp --exclude src/redis-server \
+    "$SRC_TEST_DIR/" "$TEST_DIR/" || exit 1
+# createComplexDataset, which most replication suites use for write load,
+# builds some hashes with HIMPORT (hash templates, unreleased Redis). Rudis
+# does not implement it; build those hashes with HSET instead.
+sed -i \
+    -e 's/^\(\s*\){\*}\$r himport prepare fs f0 f1 f2$/\1# (rudis) no HIMPORT PREPARE/' \
+    -e 's/{\*}\$r himport set \$k fs \$v \[randomValue\] \[randomValue\]/{*}$r hset $k f0 $v f1 [randomValue] f2 [randomValue]/' \
+    "$TEST_DIR/tests/support/util.tcl"
+if grep -q '$r himport' "$TEST_DIR/tests/support/util.tcl"; then
+    echo "warning: util.tcl still uses HIMPORT; update the patch in $0" >&2
 fi
 
 mkdir -p "$TEST_DIR/src"
