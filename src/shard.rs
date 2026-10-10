@@ -2184,12 +2184,10 @@ impl ShardDb {
     #[inline]
     pub fn dump(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         // A key still on the tier (it is only loaded back when memory
-        // allows) is dumped from its record, which already holds the value
-        // in DUMP's payload encoding.
+        // allows) is dumped from its record, decoded without promoting it.
         if let Some(ptr) = self.table.is_tiered(key) {
-            let mut payload = self.read_tiered_payload(ptr)?;
-            crate::table::RudisTable::seal_dump_payload(&mut payload);
-            return Some(payload);
+            let val = self.hydrate_tiered(ptr)?;
+            return crate::redis_rdb::dump_value(&val);
         }
         self.table.dump(key)
     }
@@ -2409,14 +2407,15 @@ impl ShardDb {
         {
             return;
         }
-        // A tiered record's payload is already in `serialize_val_payload`
-        // form (see `RudisTable::get_value_for_spill`), so it is copied
-        // verbatim. It must be read before anything is written for this
-        // entry: a failed read has to skip the whole entry, never leave an
-        // expiry opcode or a key without a value behind.
-        let tiered_payload = match &entry.val {
-            crate::table::RudisValue::Tiered(ptr) => match self.read_tiered_payload(**ptr) {
-                Some(raw) => Some(raw),
+        // A tiered record holds the value in `serialize_val_payload` form
+        // (see `RudisTable::get_value_for_spill`); it is decoded so it can
+        // be written in the Redis encoding. It must be read before anything
+        // is written for this entry: a failed read has to skip the whole
+        // entry, never leave an expiry opcode or a key without a value
+        // behind.
+        let hydrated = match &entry.val {
+            crate::table::RudisValue::Tiered(ptr) => match self.hydrate_tiered(**ptr) {
+                Some(val) => Some(val),
                 None => {
                     tracing::error!(
                         key = %String::from_utf8_lossy(&entry.key),
@@ -2427,20 +2426,21 @@ impl ShardDb {
             },
             _ => None,
         };
-        if let Some(exp) = entry.expire_at() {
-            let rem_ms = exp.duration_since(clock.now).as_millis() as u64;
-            let expire_unix_ms = clock.unix_ms + rem_ms;
-            buf.push(0xFC);
-            buf.extend_from_slice(&expire_unix_ms.to_le_bytes());
-        }
-        buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&entry.key);
-        match (&entry.val, tiered_payload) {
-            (_, Some(raw)) => buf.extend_from_slice(&raw),
-            (crate::table::RudisValue::Cooled(cv), None) => {
-                crate::table::RudisTable::serialize_val_payload(&cv.val, buf);
-            }
-            (other, None) => crate::table::RudisTable::serialize_val_payload(other, buf),
+        let val = hydrated.as_ref().unwrap_or(&entry.val);
+        let expire_unix_ms = entry
+            .expire_at()
+            .map(|exp| clock.unix_ms + exp.duration_since(clock.now).as_millis() as u64);
+        crate::redis_rdb::write_record(buf, &entry.key, val, expire_unix_ms);
+        let val = match val {
+            crate::table::RudisValue::Cooled(cv) => &cv.val,
+            v => v,
+        };
+        if let crate::table::RudisValue::Stream(s) = val
+            && crate::redis_rdb::stream_has_extras(s)
+        {
+            let mut ext = Vec::new();
+            crate::redis_rdb::encode_stream_extras(&entry.key, s, &mut ext);
+            crate::redis_rdb::write_ext_aux(buf, &ext);
         }
     }
 
@@ -2546,7 +2546,17 @@ impl ShardDb {
         self.table.warm_key(key);
     }
 
+    /// Writes the state Redis has no encoding for (see
+    /// [`crate::redis_rdb`]): legacy-format records wrapped in a
+    /// `rudis-ext` AUX field, which Redis and Valkey skip.
     pub fn save_extended_rdb_chunk(&self, buf: &mut Vec<u8>) {
+        let mut records = Vec::new();
+        self.save_extended_legacy_records(&mut records);
+        crate::redis_rdb::write_ext_aux(buf, &records);
+    }
+
+    /// The legacy-format records behind [`Self::save_extended_rdb_chunk`].
+    fn save_extended_legacy_records(&self, buf: &mut Vec<u8>) {
         // 1. JSON documents
         for (key, val) in self.json_store.iter() {
             buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -2856,258 +2866,11 @@ impl ShardDb {
         }
     }
 
-    pub fn restore_rdb_chunk(&mut self, mut data: &[u8]) -> Result<(), &'static str> {
-        let unix_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        while !data.is_empty() {
-            let mut expire_at = None;
-            if data[0] == 0xFC {
-                if data.len() < 9 {
-                    return Err("Truncated RDB expire");
-                }
-                let exp_unix_ms = u64::from_le_bytes(data[1..9].try_into().unwrap());
-                data = &data[9..];
-                if exp_unix_ms <= unix_now {
-                    if data.len() < 4 {
-                        return Err("Truncated RDB key");
-                    }
-                    let k_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                    data = &data[4..];
-                    if data.len() < k_len {
-                        return Err("Truncated RDB key");
-                    }
-                    data = &data[k_len..];
-                    let (_, consumed) = crate::table::RudisTable::deserialize_val_payload(data)?;
-                    data = &data[consumed..];
-                    continue;
-                }
-                let rem_ms = exp_unix_ms - unix_now;
-                expire_at =
-                    Some(std::time::Instant::now() + std::time::Duration::from_millis(rem_ms));
-            }
-            if data.len() < 4 {
-                return Err("Truncated RDB key");
-            }
-            let k_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-            data = &data[4..];
-            if data.len() < k_len {
-                return Err("Truncated RDB key");
-            }
-            let key = bytes::Bytes::copy_from_slice(&data[..k_len]);
-            data = &data[k_len..];
-
-            if data.is_empty() {
-                return Err("Truncated RDB type");
-            }
-            let type_byte = data[0];
-            if type_byte == 7 {
-                data = &data[1..];
-                if data.len() < 4 {
-                    return Err("Truncated JSON len");
-                }
-                let json_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                data = &data[4..];
-                if data.len() < json_len {
-                    return Err("Truncated JSON payload");
-                }
-                if let Ok(json_str) = std::str::from_utf8(&data[..json_len])
-                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
-                {
-                    self.json_store.insert_raw(key, val);
-                }
-                data = &data[json_len..];
-                continue;
-            } else if type_byte == 8 {
-                let (bf, used) = crate::probabilistic::BloomFilter::decode(&data[1..])?;
-                data = &data[1 + used..];
-                self.probabilistic_store.bloom_filters.insert(key, bf);
-                continue;
-            } else if type_byte == 9 {
-                data = &data[1..];
-                if data.len() < 4 {
-                    return Err("Truncated vector index name len");
-                }
-                let idx_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                data = &data[4..];
-                if data.len() < idx_len {
-                    return Err("Truncated vector index name");
-                }
-                let idx_name = String::from_utf8_lossy(&data[..idx_len]).to_string();
-                data = &data[idx_len..];
-
-                if data.len() < 4 {
-                    return Err("Truncated vector doc key len");
-                }
-                let doc_key_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                data = &data[4..];
-                if data.len() < doc_key_len {
-                    return Err("Truncated vector doc key");
-                }
-                let doc_key = bytes::Bytes::copy_from_slice(&data[..doc_key_len]);
-                data = &data[doc_key_len..];
-
-                if data.len() < 5 {
-                    return Err("Truncated vector metric and dim");
-                }
-                let metric_byte = data[0];
-                let has_vset_ext = (metric_byte & 0x80) != 0;
-                let metric = match metric_byte & 0x07 {
-                    0 => crate::vector::VectorMetric::Cosine,
-                    1 => crate::vector::VectorMetric::L2,
-                    _ => crate::vector::VectorMetric::IP,
-                };
-                let vec_len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-                data = &data[5..];
-                if data.len() < vec_len * 4 {
-                    return Err("Truncated vector coordinates");
-                }
-                let mut vector = Vec::with_capacity(vec_len);
-                for i in 0..vec_len {
-                    let bits = u32::from_le_bytes(data[i * 4..(i + 1) * 4].try_into().unwrap());
-                    vector.push(f32::from_bits(bits));
-                }
-                data = &data[vec_len * 4..];
-                if has_vset_ext {
-                    if data.len() < 10 {
-                        return Err("Truncated vector set extended metadata");
-                    }
-                    let vset_flags = data[0];
-                    let is_redis_vset = (vset_flags & 0x01) != 0;
-                    let quantize = (vset_flags & 0x02) != 0;
-                    let pq = (vset_flags & 0x04) != 0;
-                    let tiered = (vset_flags & 0x08) != 0;
-                    let quant = match data[1] {
-                        0 => crate::vector::VQuant::NoQuant,
-                        1 => crate::vector::VQuant::Q8,
-                        _ => crate::vector::VQuant::Bin,
-                    };
-                    let m = u32::from_le_bytes(data[2..6].try_into().unwrap()) as usize;
-                    let attr_len = u32::from_le_bytes(data[6..10].try_into().unwrap()) as usize;
-                    data = &data[10..];
-                    if data.len() < attr_len {
-                        return Err("Truncated vector set attribute");
-                    }
-                    let setattr = if attr_len > 0 {
-                        Some(String::from_utf8_lossy(&data[..attr_len]).to_string())
-                    } else {
-                        None
-                    };
-                    data = &data[attr_len..];
-                    let _ = self.vadd_ext(
-                        &idx_name,
-                        doc_key,
-                        vector,
-                        Some(metric),
-                        quantize,
-                        pq,
-                        tiered,
-                        None,
-                        Some(quant),
-                        None,
-                        setattr,
-                        Some(m),
-                        is_redis_vset,
-                    );
-                } else {
-                    let _ = self.vadd(
-                        &idx_name,
-                        doc_key,
-                        vector,
-                        Some(metric),
-                        false,
-                        false,
-                        false,
-                    );
-                }
-                continue;
-            } else if type_byte == 10 {
-                let (cf, used) = crate::probabilistic::CuckooFilter::decode(&data[1..])?;
-                data = &data[1 + used..];
-                self.probabilistic_store.cuckoo_filters.insert(key, cf);
-                continue;
-            } else if type_byte == 11 {
-                let (cms, used) = crate::probabilistic::CountMinSketch::decode(&data[1..])?;
-                data = &data[1 + used..];
-                self.probabilistic_store.cms_sketches.insert(key, cms);
-                continue;
-            } else if type_byte == 12 {
-                let (topk, used) = crate::probabilistic::TopK::decode(&data[1..])?;
-                data = &data[1 + used..];
-                self.probabilistic_store.topk_trackers.insert(key, topk);
-                continue;
-            } else if type_byte == 13 {
-                data = &data[1..];
-                if data.len() < 4 {
-                    return Err("Truncated CRDT payload len");
-                }
-                let payload_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                data = &data[4..];
-                if data.len() < payload_len {
-                    return Err("Truncated CRDT payload");
-                }
-                let payload = &data[..payload_len];
-                data = &data[payload_len..];
-                let _ = self.crdt_store.merge_sync_payload(payload);
-                continue;
-            } else if type_byte == 14 {
-                data = &data[1..];
-                if data.len() < 4 {
-                    return Err("Truncated hash field expires count");
-                }
-                let f_count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                data = &data[4..];
-                let mut expired_on_disk = Vec::new();
-                for _ in 0..f_count {
-                    if data.len() < 4 {
-                        return Err("Truncated hash field len");
-                    }
-                    let f_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                    data = &data[4..];
-                    if data.len() < f_len + 8 {
-                        return Err("Truncated hash field expire payload");
-                    }
-                    let field = bytes::Bytes::copy_from_slice(&data[..f_len]);
-                    let exp_unix_ms =
-                        u64::from_le_bytes(data[f_len..f_len + 8].try_into().unwrap());
-                    data = &data[f_len + 8..];
-                    if exp_unix_ms > unix_now {
-                        let rem_ms = exp_unix_ms - unix_now;
-                        self.table
-                            .hash_field_expires
-                            .entry(key.clone())
-                            .or_default()
-                            .insert(
-                                field,
-                                std::time::Instant::now()
-                                    + std::time::Duration::from_millis(rem_ms),
-                            );
-                    } else {
-                        expired_on_disk.push(field);
-                    }
-                }
-                if !expired_on_disk.is_empty() {
-                    let _ = self.table.hdel(&key, &expired_on_disk);
-                }
-                continue;
-            } else if matches!(type_byte, 15..=18) {
-                data = &data[1..];
-                self.restore_ai_native_rdb_record(type_byte, key, &mut data, unix_now, true)?;
-                continue;
-            }
-
-            let (val, consumed) = crate::table::RudisTable::deserialize_val_payload(data)?;
-            data = &data[consumed..];
-
-            self.table.insert_entry(crate::table::RudisEntry::new(
-                crate::compact::CompactKey::new(&key),
-                val,
-                crate::table::Expiry::from(expire_at),
-            ));
-        }
-        Ok(())
+    /// Loads a [`Self::save_rdb_chunk`] record stream, keeping every key.
+    pub fn restore_rdb_chunk(&mut self, data: &[u8]) -> Result<(), String> {
+        crate::redis_rdb::load_chunk(data, self)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     pub(crate) fn restore_ai_native_rdb_record(
@@ -4111,32 +3874,11 @@ pub async fn save_rdb_chunk_yielding(
     db: &std::cell::RefCell<ShardDb>,
     sink: &flume::Sender<Option<Vec<u8>>>,
 ) -> bool {
-    let epoch = db.borrow().table.layout_epoch();
-    let mut seg = 0;
+    let mut cursor = RdbSaveCursor::new(&db.borrow());
     let mut buf = Vec::with_capacity(RDB_FLUSH_BYTES * 2);
-    let finished = loop {
-        {
-            let db = db.borrow();
-            let clock = RdbClock::now();
-            if db.table.layout_epoch() != epoch {
-                for entry in db.table.entries() {
-                    db.save_rdb_entry(entry, &clock, &mut buf);
-                }
-                db.save_extended_rdb_chunk(&mut buf);
-                break buf;
-            }
-            let segments = db.table.segment_count();
-            while seg < segments
-                && clock.now.elapsed() < RDB_SAVE_STEP
-                && buf.len() < RDB_FLUSH_BYTES
-            {
-                db.save_rdb_segment(seg, &clock, &mut buf);
-                seg += 1;
-            }
-            if seg >= segments {
-                db.save_extended_rdb_chunk(&mut buf);
-                break buf;
-            }
+    loop {
+        if cursor.step(&db.borrow(), &mut buf, RDB_SAVE_STEP, RDB_FLUSH_BYTES) {
+            break;
         }
         if buf.len() >= RDB_FLUSH_BYTES {
             let piece = std::mem::replace(&mut buf, Vec::with_capacity(RDB_FLUSH_BYTES * 2));
@@ -4147,8 +3889,100 @@ pub async fn save_rdb_chunk_yielding(
         // A send that completes at once does not yield; always let the
         // shard's other tasks in between steps.
         crate::mailbox::yield_now().await;
-    };
-    finished.is_empty() || sink.send_async(Some(finished)).await.is_ok()
+    }
+    buf.is_empty() || sink.send_async(Some(buf)).await.is_ok()
+}
+
+/// Directory patterns (see [`crate::table::RudisFlatTable::segment_pattern`])
+/// of the segments a [`RdbSaveCursor`] has written. Keys matching one were
+/// already written: Redis and Valkey refuse an RDB with a key twice, so a
+/// segment split off a written one (or, after a renumbering, any such key)
+/// is skipped.
+#[derive(Default)]
+struct WrittenPatterns {
+    patterns: std::collections::HashSet<(u8, u64)>,
+    /// Bit `d` set: some pattern has depth `d`.
+    depths: u128,
+}
+
+impl WrittenPatterns {
+    fn insert(&mut self, depth: u8, bits: u64) {
+        self.patterns.insert((depth, bits));
+        self.depths |= 1u128 << depth.min(127);
+    }
+
+    /// Whether directory bits `bits`, known to depth `max_depth`, match a
+    /// written pattern.
+    fn covers(&self, max_depth: u8, bits: u64) -> bool {
+        (0..=max_depth.min(127)).any(|d| {
+            self.depths & (1u128 << d) != 0
+                && self
+                    .patterns
+                    .contains(&(d, bits & crate::table::dir_bits_mask(d)))
+        })
+    }
+}
+
+/// Progress of a [`save_rdb_chunk_yielding`] walk over a shard's table.
+struct RdbSaveCursor {
+    epoch: u64,
+    seg: usize,
+    written: WrittenPatterns,
+}
+
+impl RdbSaveCursor {
+    fn new(db: &ShardDb) -> Self {
+        RdbSaveCursor {
+            epoch: db.table.layout_epoch(),
+            seg: 0,
+            written: WrittenPatterns::default(),
+        }
+    }
+
+    /// Serializes at least one segment, then more until `budget` has passed
+    /// or `buf` holds `flush_bytes`. Returns true once everything, the
+    /// extended state included, is in `buf`.
+    fn step(
+        &mut self,
+        db: &ShardDb,
+        buf: &mut Vec<u8>,
+        budget: Duration,
+        flush_bytes: usize,
+    ) -> bool {
+        let clock = RdbClock::now();
+        if db.table.layout_epoch() != self.epoch {
+            // Renumbered (FLUSHALL, collapsing defrag): what is left is
+            // small; write the keys no written segment covered.
+            for entry in db.table.entries() {
+                let bits = crate::table::key_dir_bits(&entry.key);
+                if !self.written.covers(u8::MAX, bits) {
+                    db.save_rdb_entry(entry, &clock, buf);
+                }
+            }
+            db.save_extended_rdb_chunk(buf);
+            return true;
+        }
+        let segments = db.table.segment_count();
+        let mut first = true;
+        while self.seg < segments
+            && (first || (clock.now.elapsed() < budget && buf.len() < flush_bytes))
+        {
+            first = false;
+            let pattern = db.table.segment_pattern(self.seg);
+            if let Some((depth, bits)) = pattern {
+                if !self.written.covers(depth, bits) {
+                    db.save_rdb_segment(self.seg, &clock, buf);
+                }
+                self.written.insert(depth, bits);
+            }
+            self.seg += 1;
+        }
+        if self.seg >= segments {
+            db.save_extended_rdb_chunk(buf);
+            return true;
+        }
+        false
+    }
 }
 
 /// Piece size [`save_rdb_chunk_yielding`] streams to its sink.
@@ -4157,6 +3991,90 @@ const RDB_FLUSH_BYTES: usize = 4 << 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keys of a `save_rdb_chunk` record stream, in order.
+    fn chunk_keys(chunk: &[u8]) -> Vec<Bytes> {
+        use crate::redis_rdb::{OP_AUX, OP_EXPIRETIME_MS, Reader, skip_value};
+        let mut r = Reader::new(chunk);
+        let mut keys = Vec::new();
+        while !r.is_empty() {
+            match r.u8().unwrap() {
+                OP_AUX => {
+                    r.skip_string().unwrap();
+                    r.skip_string().unwrap();
+                }
+                OP_EXPIRETIME_MS => {
+                    r.take(8).unwrap();
+                }
+                t => {
+                    keys.push(r.bytes().unwrap());
+                    skip_value(t, &mut r).unwrap();
+                }
+            }
+        }
+        keys
+    }
+
+    /// Segments split while a yielding save runs must not get their keys
+    /// written twice: Redis and Valkey refuse an RDB with a duplicate key.
+    #[test]
+    fn yielding_save_writes_each_key_once_across_splits() {
+        let mut db = ShardDb::new(0);
+        for i in 0..6000 {
+            db.table
+                .set(Bytes::from(format!("k{i}")), Bytes::from_static(b"v"), None);
+        }
+        let mut cursor = RdbSaveCursor::new(&db);
+        let mut buf = Vec::new();
+        let mut next = 6000;
+        let mut steps = 0;
+        while !cursor.step(&db, &mut buf, Duration::ZERO, usize::MAX) {
+            steps += 1;
+            // Splits while the walk is under way, then let it finish.
+            let grow = if steps <= 6 { 1500 } else { 0 };
+            for _ in 0..grow {
+                db.table.set(
+                    Bytes::from(format!("k{next}")),
+                    Bytes::from_static(b"v"),
+                    None,
+                );
+                next += 1;
+            }
+        }
+        assert!(steps > 2, "the table has several segments");
+        let keys = chunk_keys(&buf);
+        let unique: std::collections::HashSet<&Bytes> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "a key was written twice");
+        for i in 0..6000 {
+            assert!(
+                unique.contains(&Bytes::from(format!("k{i}"))),
+                "k{i} missing"
+            );
+        }
+    }
+
+    /// After a renumbering, keys of already written segments are recognised
+    /// by their hash bits.
+    #[test]
+    fn written_patterns_cover_every_key_of_written_segments() {
+        let mut db = ShardDb::new(0);
+        for i in 0..5000 {
+            db.table
+                .set(Bytes::from(format!("k{i}")), Bytes::from_static(b"v"), None);
+        }
+        let mut written = WrittenPatterns::default();
+        let half = db.table.segment_count() / 2;
+        for seg in 0..half {
+            let (d, bits) = db.table.segment_pattern(seg).unwrap();
+            written.insert(d, bits);
+        }
+        for seg in 0..db.table.segment_count() {
+            for e in db.table.segment_entries(seg) {
+                let covered = written.covers(u8::MAX, crate::table::key_dir_bits(&e.key));
+                assert_eq!(covered, seg < half);
+            }
+        }
+    }
 
     #[test]
     fn test_fast_integer_formatting() {

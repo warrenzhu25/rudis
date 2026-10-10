@@ -14878,8 +14878,9 @@ fn test_startup_refuses_unloadable_rdb_and_aof_e2e() {
     std::fs::create_dir_all(&dir).unwrap();
     let dir_s = dir.to_str().unwrap();
 
-    // 1. A Redis/Valkey-style RDB (valid checksum) must not load as empty.
-    let mut rdb = b"REDIS0011\xFA\x09redis-ver\x058.1.0\xFE\x00\xFF".to_vec();
+    // 1. An RDB rudis cannot load (valid checksum; a Redis module value)
+    // must not load as empty.
+    let mut rdb = b"REDIS0011\xFA\x09redis-ver\x058.1.0\xFE\x00\x07\x01k\x00\xFF".to_vec();
     let crc = rudis::table::crc64(&rdb);
     rdb.extend_from_slice(&crc.to_le_bytes());
     let rdb_path = dir.join("dump.rdb");

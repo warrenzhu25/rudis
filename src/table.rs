@@ -1684,6 +1684,21 @@ pub fn hash_key(key: &[u8]) -> u64 {
 }
 
 #[inline(always)]
+/// The bits of `key`'s hash that pick its directory slot, lowest first
+/// (see [`RudisFlatTable::segment_pattern`]).
+pub fn key_dir_bits(key: &[u8]) -> u64 {
+    mix_hash(hash_key(key)) >> SEG_SHIFT
+}
+
+/// Mask of the low `depth` directory bits.
+pub fn dir_bits_mask(depth: u8) -> u64 {
+    if depth >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << depth) - 1
+    }
+}
+
 fn mix_hash(mut h: u64) -> u64 {
     h ^= h >> 32;
     h = h.wrapping_mul(0xd6e8feb86659fd93);
@@ -2807,6 +2822,17 @@ impl RudisFlatTable {
             .flat_map(|s| s.iter_entries())
     }
 
+    /// The directory pattern `(local depth, low directory bits)` that every
+    /// key of segment `seg` matches (extendible hashing), or `None` if the
+    /// segment is empty. A split only refines patterns, so a key whose bits
+    /// match a pattern keeps matching it until the table is renumbered.
+    pub fn segment_pattern(&self, seg: usize) -> Option<(u8, u64)> {
+        let s = self.segments.get(seg)?;
+        let entry = s.iter_entries().next()?;
+        let d = s.local_depth;
+        Some((d, key_dir_bits(&entry.key) & dir_bits_mask(d)))
+    }
+
     #[inline]
     pub fn entries_mut(&mut self) -> impl Iterator<Item = &mut RudisEntry> {
         self.segments.iter_mut().flat_map(|s| s.iter_entries_mut())
@@ -3467,6 +3493,11 @@ impl RudisTable {
     #[inline]
     pub fn entries(&self) -> impl Iterator<Item = &RudisEntry> {
         self.table.entries()
+    }
+
+    /// See [`RudisFlatTable::segment_pattern`].
+    pub fn segment_pattern(&self, seg: usize) -> Option<(u8, u64)> {
+        self.table.segment_pattern(seg)
     }
 
     /// See [`RudisFlatTable::layout_epoch`].
@@ -14380,121 +14411,12 @@ impl RudisTable {
                 s.rebuild_nodes();
                 RudisValue::Stream(Box::new(s))
             }
-            15 if data.starts_with(b"\x0F\x01\x10\x00") => {
-                let mut s = RudisStream::new();
-                s.last_id = StreamId::new(6, 0);
-                s.entries_added = 2;
-                s.max_deleted_entry_id = StreamId::default();
-                s.entries.insert(
-                    StreamId::new(5, 0),
-                    vec![(Bytes::from_static(b"data"), Bytes::from_static(b"e"))],
-                );
-                s.entries.insert(
-                    StreamId::new(6, 0),
-                    vec![(Bytes::from_static(b"data"), Bytes::from_static(b"f"))],
-                );
-                s.rebuild_nodes();
-
-                let mut g1 = StreamGroup {
-                    name: Bytes::from_static(b"g1"),
-                    last_delivered_id: StreamId::new(5, 0),
-                    entries_read: Some(1),
-                    consumers: HashMap::new(),
-                    pel: std::collections::BTreeMap::new(),
-                    next_nack_seq: 0,
-                };
-                let c11_name = Bytes::from_static(b"c11");
-                let deliv_time = 1624630359870u64;
-                for id in [
-                    StreamId::new(1, 0),
-                    StreamId::new(2, 0),
-                    StreamId::new(4, 0),
-                    StreamId::new(5, 0),
-                ] {
-                    g1.pel.insert(
-                        id,
-                        StreamPelEntry {
-                            consumer: c11_name.clone(),
-                            delivery_time_ms: deliv_time,
-                            delivery_count: 1,
-                            nack_seq: 0,
-                        },
-                    );
-                }
-                let mut c11 = StreamConsumer {
-                    name: c11_name.clone(),
-                    seen_time_ms: deliv_time,
-                    active_time_ms: Some(deliv_time),
-                    pel: std::collections::BTreeMap::new(),
-                };
-                for id in [
-                    StreamId::new(1, 0),
-                    StreamId::new(2, 0),
-                    StreamId::new(4, 0),
-                    StreamId::new(5, 0),
-                ] {
-                    c11.pel.insert(id, deliv_time);
-                }
-                g1.consumers.insert(c11_name, c11);
-                s.groups.insert(Bytes::from_static(b"g1"), g1);
-
-                let g2 = StreamGroup {
-                    name: Bytes::from_static(b"g2"),
-                    last_delivered_id: StreamId::new(0, 0),
-                    entries_read: Some(0),
-                    consumers: HashMap::new(),
-                    pel: std::collections::BTreeMap::new(),
-                    next_nack_seq: 0,
-                };
-                s.groups.insert(Bytes::from_static(b"g2"), g2);
-                RudisValue::Stream(Box::new(s))
-            }
-            19 if data.starts_with(b"\x13\x01\x10\x00") => {
-                let mut s = RudisStream::new();
-                s.last_id = StreamId::new(1, 1);
-                s.entries_added = 1;
-                s.max_deleted_entry_id = StreamId::default();
-                s.entries.insert(
-                    StreamId::new(1, 1),
-                    vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
-                );
-                s.rebuild_nodes();
-
-                let mut g = StreamGroup {
-                    name: Bytes::from_static(b"g"),
-                    last_delivered_id: StreamId::new(1, 1),
-                    entries_read: Some(1),
-                    consumers: HashMap::new(),
-                    pel: std::collections::BTreeMap::new(),
-                    next_nack_seq: 0,
-                };
-                let alice_name = Bytes::from_static(b"Alice");
-                let deliv_time = 1669793405685u64;
-                g.pel.insert(
-                    StreamId::new(1, 1),
-                    StreamPelEntry {
-                        consumer: alice_name.clone(),
-                        delivery_time_ms: deliv_time,
-                        delivery_count: 1,
-                        nack_seq: 0,
-                    },
-                );
-                let mut alice = StreamConsumer {
-                    name: alice_name.clone(),
-                    seen_time_ms: deliv_time,
-                    active_time_ms: Some(deliv_time),
-                    pel: std::collections::BTreeMap::new(),
-                };
-                alice.pel.insert(StreamId::new(1, 1), deliv_time);
-                g.consumers.insert(alice_name, alice);
-                s.groups.insert(Bytes::from_static(b"g"), g);
-                RudisValue::Stream(Box::new(s))
-            }
             _ => return Err("DUMP payload version or checksum are wrong"),
         };
         Ok((val, cursor))
     }
 
+    /// DUMP: a Redis-compatible payload (see [`crate::redis_rdb::dump_value`]).
     pub fn dump(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let h = hash_key(key);
         let idx = self.table.find(key, h)?;
@@ -14502,18 +14424,35 @@ impl RudisTable {
             return None;
         }
         let entry = self.table.get_slot(idx)?;
-        let mut payload = Vec::new();
-        Self::serialize_val_payload(&entry.val, &mut payload);
-        Self::seal_dump_payload(&mut payload);
-        Some(payload)
+        crate::redis_rdb::dump_value(&entry.val)
     }
 
-    /// Appends DUMP's trailer to a `serialize_val_payload` encoding: the
-    /// 2-byte RDB version (10) and a CRC64 of everything before it.
+    /// Appends the legacy DUMP trailer to a `serialize_val_payload`
+    /// encoding: the 2-byte RDB version (10) and a CRC64 of everything
+    /// before it.
     pub fn seal_dump_payload(payload: &mut Vec<u8>) {
         payload.extend_from_slice(&10u16.to_le_bytes());
         let crc = crc64(payload);
         payload.extend_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Decodes a DUMP payload body (trailer removed): Redis format first,
+    /// then the legacy Rudis format older versions dumped.
+    pub fn decode_dump_payload(
+        body: &[u8],
+        rdb_ver: u16,
+        now_unix_ms: u64,
+    ) -> Result<crate::redis_rdb::Decoded, &'static str> {
+        if rdb_ver as u32 <= crate::redis_rdb::MAX_RDB_VERSION
+            && let Ok(d) = crate::redis_rdb::decode_dump_body(body, now_unix_ms)
+        {
+            return Ok(d);
+        }
+        let (value, _) = Self::deserialize_val_payload(body).map_err(|_| "ERR Bad data format")?;
+        Ok(crate::redis_rdb::Decoded {
+            value,
+            field_expires: Vec::new(),
+        })
     }
 
     pub fn restore(
@@ -14569,8 +14508,7 @@ impl RudisTable {
         }
 
         let payload_len = data_len - 2;
-        let (decoded_value, _) = Self::deserialize_val_payload(&serialized[..payload_len])
-            .map_err(|_| "ERR Bad data format")?;
+        let decoded = Self::decode_dump_payload(&serialized[..payload_len], rdb_ver, now_unix)?;
 
         if self.exists(&key) {
             self.del(&key);
@@ -14600,11 +14538,32 @@ impl RudisTable {
         }
         let entry = RudisEntry::new(
             CompactKey::new(&key),
-            decoded_value,
+            decoded.value,
             Expiry::from(expire_at),
         );
         self.table.insert(entry);
+        if !decoded.field_expires.is_empty() {
+            // Redis 7.4 hash field TTLs.
+            let now = Instant::now();
+            let fmap = self.hash_field_expires.entry(key).or_default();
+            for (field, at_ms) in decoded.field_expires {
+                fmap.insert(
+                    field,
+                    now + Duration::from_millis(at_ms.saturating_sub(now_unix)),
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// The stream stored at `key`, for loaders that attach extra state.
+    pub fn stream_for_load(&mut self, key: &[u8]) -> Option<&mut RudisStream> {
+        let h = hash_key(key);
+        let (_, entry) = self.table.find_entry_mut(key, h)?;
+        match &mut entry.val {
+            RudisValue::Stream(s) => Some(s),
+            _ => None,
+        }
     }
 
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
@@ -15941,25 +15900,66 @@ pub fn load_rdb(
     load_rdb_bytes(&data, db, shard_id, num_shards)
 }
 
+/// Loads this shard's keys from an RDB file: the Redis/Valkey encoding
+/// (see [`crate::redis_rdb`]) or, for files written by older Rudis
+/// versions, the legacy Rudis encoding.
+///
+/// A file that starts `REDIS0011` + `SELECTDB 0` (no AUX fields) could be
+/// either; it is tried as Redis format first and, if that fails, loaded
+/// again as legacy format. If both fail, the Redis-format error is
+/// reported.
 pub fn load_rdb_bytes(
     data: &[u8],
     db: &mut crate::shard::ShardDb,
     shard_id: usize,
     num_shards: usize,
 ) -> std::io::Result<usize> {
+    use crate::redis_rdb::{FileKind, classify, header_version, load_file};
     if data.is_empty() {
         return Ok(0);
     }
-    if data.len() < 18 {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    if !data.starts_with(b"REDIS") {
+        return Err(invalid("Invalid RDB magic header".to_string()));
+    }
+    if data.len() < 18 && header_version(data).is_ok_and(|v| v >= 5) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "RDB file is truncated (shorter than header + EOF + checksum)",
         ));
     }
-    if !data.starts_with(b"REDIS") {
+    match classify(data) {
+        FileKind::Redis => {
+            load_file(data, db, shard_id, num_shards, false).map_err(|e| invalid(e.to_string()))
+        }
+        FileKind::Ambiguous => match load_file(data, db, shard_id, num_shards, true) {
+            Ok(n) => Ok(n),
+            Err(redis_err) => {
+                // Drop whatever the failed attempt loaded.
+                db.flushdb();
+                load_legacy_rdb(data, db, shard_id, num_shards).map_err(|legacy_err| {
+                    invalid(format!(
+                        "{redis_err} (and it is not a legacy rudis RDB either: {legacy_err})"
+                    ))
+                })
+            }
+        },
+    }
+}
+
+/// Loads an RDB file in the encoding Rudis wrote before it adopted the
+/// Redis one (u32 little-endian lengths; see
+/// [`RudisTable::deserialize_val_payload`]).
+fn load_legacy_rdb(
+    data: &[u8],
+    db: &mut crate::shard::ShardDb,
+    shard_id: usize,
+    num_shards: usize,
+) -> std::io::Result<usize> {
+    if data.len() < 18 {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Invalid RDB magic header",
+            std::io::ErrorKind::UnexpectedEof,
+            "RDB file is truncated (shorter than header + EOF + checksum)",
         ));
     }
     let content_len = data.len() - 8;
@@ -15971,13 +15971,55 @@ pub fn load_rdb_bytes(
             "CRC64 checksum mismatch in RDB file",
         ));
     }
+    // Skip REDIS0011
+    let (cursor, saw_eof, count) =
+        load_legacy_records(data, 9, content_len, db, shard_id, num_shards);
+    if !saw_eof {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "RDB parse error at offset {}: truncated, corrupt or unsupported record",
+                cursor
+            ),
+        ));
+    }
+    Ok(count)
+}
 
+/// Loads the legacy-format records of a `rudis-ext` AUX field (see
+/// [`crate::redis_rdb::EXT_AUX_KEY`]). Returns the keys loaded.
+pub(crate) fn load_legacy_ext(
+    blob: &[u8],
+    db: &mut crate::shard::ShardDb,
+    shard_id: usize,
+    num_shards: usize,
+) -> Result<usize, String> {
+    let (cursor, saw_eof, count) =
+        load_legacy_records(blob, 0, blob.len(), db, shard_id, num_shards);
+    if saw_eof || cursor != blob.len() {
+        return Err(format!(
+            "truncated, corrupt or unsupported record at offset {cursor}"
+        ));
+    }
+    Ok(count)
+}
+
+/// The legacy record loop over `data[start..content_len]`. Returns where it
+/// stopped, whether that was the EOF opcode, and the keys loaded.
+fn load_legacy_records(
+    data: &[u8],
+    start: usize,
+    content_len: usize,
+    db: &mut crate::shard::ShardDb,
+    shard_id: usize,
+    num_shards: usize,
+) -> (usize, bool, usize) {
     let unix_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let mut cursor = 9; // Skip REDIS0011
+    let mut cursor = start;
     let mut count = 0;
     // The writer always terminates with 0xFF; every malformed/unsupported
     // record below `break`s early, which we turn into an error after the loop.
@@ -16357,6 +16399,19 @@ pub fn load_rdb_bytes(
                 count += 1;
             }
             continue;
+        } else if type_byte == crate::redis_rdb::EXT_TYPE_STREAM_EXTRAS {
+            // IDMP / XNACK state of a stream loaded just before.
+            cursor += 1;
+            let stream = if crate::router::target_shard(&key, num_shards) == shard_id {
+                db.table.stream_for_load(&key)
+            } else {
+                None
+            };
+            match crate::redis_rdb::apply_stream_extras(&data[cursor..content_len], stream) {
+                Ok(used) => cursor += used,
+                Err(_) => break,
+            }
+            continue;
         }
 
         let (val, consumed) = match RudisTable::deserialize_val_payload(&data[cursor..content_len])
@@ -16380,23 +16435,7 @@ pub fn load_rdb_bytes(
         }
     }
 
-    if !saw_eof {
-        // 0xFA (AUX) right after the header is how Redis/Valkey RDBs start.
-        let hint = if data.get(9) == Some(&0xFA) {
-            " (looks like a Redis/Valkey RDB, which rudis cannot load yet)"
-        } else {
-            ""
-        };
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "RDB parse error at offset {}: truncated, corrupt or unsupported record{}",
-                cursor, hint
-            ),
-        ));
-    }
-
-    Ok(count)
+    (cursor, saw_eof, count)
 }
 
 #[cfg(test)]
@@ -17299,10 +17338,31 @@ mod tests {
         let err = load_rdb_bytes(&rdb_with_body(&cut), &mut db, 0, 1).unwrap_err();
         assert!(err.to_string().contains("RDB parse error"), "{err}");
 
-        // Redis/Valkey RDB (AUX field first) is reported, not silently empty.
-        let foreign = rdb_with_body(b"\xFA\x09redis-ver\x058.1.0\xFE\x00\xFF");
-        let err = load_rdb_bytes(&foreign, &mut db, 0, 1).unwrap_err();
-        assert!(err.to_string().contains("Redis/Valkey RDB"), "{err}");
+        // A Redis/Valkey RDB (AUX field first) loads.
+        let foreign = rdb_with_body(b"\xFA\x09redis-ver\x058.1.0\xFE\x00\x00\x01a\x01b\xFF");
+        let mut db = crate::shard::ShardDb::new(0);
+        assert_eq!(load_rdb_bytes(&foreign, &mut db, 0, 1).unwrap(), 1);
+        assert_eq!(db.table.get(b"a").unwrap().as_deref(), Some(&b"b"[..]));
+
+        // Redis data rudis cannot represent (a module value) is reported,
+        // not silently dropped.
+        let module = rdb_with_body(b"\xFA\x09redis-ver\x058.1.0\xFE\x00\x07\x01k\x00\xFF");
+        let err = load_rdb_bytes(&module, &mut db, 0, 1).unwrap_err();
+        assert!(err.to_string().contains("module"), "{err}");
+
+        // The legacy Rudis encoding still loads (Redis format is tried
+        // first, and fails, on such a file).
+        let mut legacy = vec![0xFE, 0x00];
+        legacy.extend_from_slice(&3u32.to_le_bytes());
+        legacy.extend_from_slice(b"old");
+        RudisTable::serialize_val_payload(&RudisValue::Int(5), &mut legacy);
+        legacy.push(0xFF);
+        let mut db = crate::shard::ShardDb::new(0);
+        assert_eq!(
+            load_rdb_bytes(&rdb_with_body(&legacy), &mut db, 0, 1).unwrap(),
+            1
+        );
+        assert_eq!(db.table.get(b"old").unwrap().as_deref(), Some(&b"5"[..]));
     }
 
     /// An RDB holds every shard's CRDT state in one record; each shard loads
