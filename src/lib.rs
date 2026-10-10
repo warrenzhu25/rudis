@@ -19,6 +19,7 @@ pub mod config;
 pub mod conn_balance;
 pub mod connection;
 pub mod crdt;
+pub mod debug_cmd;
 pub mod digest;
 pub mod geo;
 pub mod hll;

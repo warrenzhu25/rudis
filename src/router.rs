@@ -146,6 +146,16 @@ pub fn target_shard_and_hash(key: &[u8], num_shards: usize) -> (usize, u64) {
 
 use std::sync::atomic::Ordering;
 
+/// Internal `DEBUG` subcommands a connection sends to the other shards
+/// (handled by `execute_local_command`, rejected from clients).
+/// Replies with this shard's `DEBUG DIGEST` part.
+pub const DEBUG_DIGEST_SHARD: &[u8] = b"__shard-digest";
+/// Empties this shard and replays its AOF file.
+pub const DEBUG_LOADAOF_SHARD: &[u8] = b"__shard-loadaof";
+/// `__shard-populate <prefix> <size|""> <n>...`: creates this shard's
+/// `DEBUG POPULATE` keys.
+pub const DEBUG_POPULATE_SHARD: &[u8] = b"__shard-populate";
+
 /// Handle for a cross-shard MGET that has been dispatched but not yet gathered.
 ///
 /// Created by [`Router::begin_mget_resp`] and consumed by [`Router::finish_mget_resp`].
@@ -2926,6 +2936,17 @@ impl Router {
     /// sends them all before waiting, so K remote shards cost one round trip
     /// instead of K. Replies are returned in input order.
     pub async fn execute_remote_many(&self, cmds: Vec<(usize, Command)>) -> Vec<Vec<u8>> {
+        self.execute_remote_many_with(cmds, || {}).await
+    }
+
+    /// [`Self::execute_remote_many`] that runs `between` on this thread after
+    /// every command has been sent and before waiting for the replies, so
+    /// local work overlaps with the remote shards'.
+    pub async fn execute_remote_many_with(
+        &self,
+        cmds: Vec<(usize, Command)>,
+        between: impl FnOnce(),
+    ) -> Vec<Vec<u8>> {
         let is_resp3 = crate::connection::CURRENT_CLIENT_RESP3.get();
         // Remote shards write into these slots through raw pointers: the
         // boxed slice is never resized and outlives every wait below.
@@ -2954,6 +2975,7 @@ impl Router {
             let sent = self.senders[target].send(msg).is_ok();
             pending.push((responder, sent));
         }
+        between();
         for (responder, sent) in &pending {
             if *sent {
                 let _ = responder.wait_take().await;
@@ -3051,6 +3073,166 @@ impl Router {
             expires += nums.next().unwrap_or(0);
         }
         (keys, expires)
+    }
+
+    /// `DEBUG DIGEST`: XOR of every shard's key digests (see
+    /// [`crate::digest`]), 20 zero bytes for an empty dataset.
+    pub async fn debug_digest(&self) -> crate::digest::Digest20 {
+        let mut parts = vec![crate::digest::shard_digest(&self.local_db.borrow())];
+        let cmd = || Command::Debug(vec![Bytes::from_static(DEBUG_DIGEST_SHARD)]);
+        for res in self.execute_remote_many(self.to_other_shards(cmd)).await {
+            // A bulk string `$<len>\r\n<hex>:<count>\r\n`.
+            let part = res
+                .strip_prefix(b"$")
+                .and_then(|r| {
+                    let start = r.windows(2).position(|w| w == b"\r\n")? + 2;
+                    let body = r.get(start..)?;
+                    body.strip_suffix(b"\r\n")
+                })
+                .and_then(crate::digest::decode_shard_part);
+            match part {
+                Some(p) => parts.push(p),
+                None => {
+                    // A shard that could not answer must not make the
+                    // digest look like a smaller, valid dataset.
+                    let mut poisoned = crate::digest::ZERO;
+                    crate::digest::mix_digest(&mut poisoned, &res);
+                    parts.push((poisoned, 1));
+                }
+            }
+        }
+        crate::digest::combine_shards(parts)
+    }
+
+    /// `DEBUG DIGEST-VALUE`: per-key value digests, in `keys` order.
+    pub async fn debug_digest_values(&self, keys: &[Bytes]) -> Vec<crate::digest::Digest20> {
+        let mut out = vec![crate::digest::ZERO; keys.len()];
+        let mut remote = Vec::new();
+        let mut remote_idx = Vec::new();
+        {
+            let db = self.local_db.borrow();
+            for (i, key) in keys.iter().enumerate() {
+                let target = self.target_shard(key);
+                if target == self.shard_id {
+                    out[i] = crate::digest::key_value_digest(&db, key);
+                } else {
+                    remote.push((
+                        target,
+                        Command::Debug(vec![Bytes::from_static(b"digest-value"), key.clone()]),
+                    ));
+                    remote_idx.push(i);
+                }
+            }
+        }
+        for (res, i) in self
+            .execute_remote_many(remote)
+            .await
+            .into_iter()
+            .zip(remote_idx)
+        {
+            // `*1\r\n+<hex>\r\n`
+            out[i] = res
+                .iter()
+                .position(|&b| b == b'+')
+                .and_then(|p| res.get(p + 1..p + 41))
+                .and_then(crate::digest::from_hex)
+                .unwrap_or_else(|| {
+                    let mut poisoned = crate::digest::ZERO;
+                    crate::digest::mix_digest(&mut poisoned, &res);
+                    poisoned
+                });
+        }
+        out
+    }
+
+    /// `DEBUG SLEEP`: stalls every shard thread for `dur` at once, as
+    /// Redis' single thread does, so no shard serves anything meanwhile.
+    pub async fn debug_sleep_all(&self, dur: Duration, secs_arg: Bytes) {
+        let cmd = || Command::Debug(vec![Bytes::from_static(b"sleep"), secs_arg.clone()]);
+        self.execute_remote_many_with(self.to_other_shards(cmd), || std::thread::sleep(dur))
+            .await;
+    }
+
+    /// `DEBUG RELOAD`: saves the RDB (unless `save` is false), then replaces
+    /// the dataset with the file's contents.
+    pub async fn debug_reload(&self, save: bool) -> Result<(), String> {
+        if save {
+            // Let an in-flight BGSAVE finish rather than fail on "in progress".
+            while self.is_saving.load(Ordering::SeqCst) {
+                monoio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.save_rdb().await?;
+        }
+        let path = self.db_dir.join(crate::config::dbfilename(self.base_port));
+        let data = std::fs::read(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+        self.restore_rdb_bytes(Bytes::from(data)).await
+    }
+
+    /// `DEBUG LOADAOF`: flushes every shard's AOF buffer to disk, then each
+    /// shard empties its data and replays its AOF file. Nothing replayed is
+    /// propagated to replicas or appended to the AOF again.
+    pub async fn debug_loadaof(&self) -> Result<(), String> {
+        if self.aof.is_none() {
+            // Nothing to load from; Redis would leave an empty dataset, but
+            // dropping everything with no AOF to restore it is never wanted.
+            return Ok(());
+        }
+        self.sync_aof().await;
+        let cmd = || Command::Debug(vec![Bytes::from_static(DEBUG_LOADAOF_SHARD)]);
+        let mut replies = vec![self.execute_on_shard(self.shard_id, cmd()).await];
+        replies.extend(self.execute_remote_many(self.to_other_shards(cmd)).await);
+        let errors: Vec<String> = replies
+            .iter()
+            .filter(|r| r.first() == Some(&b'-'))
+            .map(|r| String::from_utf8_lossy(&r[1..]).trim_end().to_string())
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// `DEBUG POPULATE count [prefix] [size]`: creates the missing string
+    /// keys `prefix:0` .. `prefix:<count-1>` with values `value:<n>`
+    /// (padded with zero bytes or cut to `size` when it is given). Each
+    /// shard builds its own keys from their numbers, in bounded rounds, so
+    /// a large count never materializes in one message.
+    pub async fn debug_populate(&self, count: u64, prefix: Bytes, size: Option<u64>) {
+        const ROUND: u64 = 16 * 1024;
+        let size_arg = Bytes::from(size.map_or_else(String::new, |s| s.to_string()));
+        let mut start = 0u64;
+        while start < count {
+            let end = count.min(start + ROUND);
+            let mut per_shard: Vec<Vec<Bytes>> = vec![Vec::new(); self.num_shards];
+            let mut key = Vec::with_capacity(prefix.len() + 21);
+            for j in start..end {
+                key.clear();
+                key.extend_from_slice(&prefix);
+                key.push(b':');
+                key.extend_from_slice(j.to_string().as_bytes());
+                per_shard[self.target_shard(&key)].push(Bytes::from(j.to_string()));
+            }
+            let mut cmds = Vec::new();
+            for (sid, nums) in per_shard.into_iter().enumerate() {
+                if nums.is_empty() {
+                    continue;
+                }
+                let mut args = Vec::with_capacity(nums.len() + 3);
+                args.push(Bytes::from_static(DEBUG_POPULATE_SHARD));
+                args.push(prefix.clone());
+                args.push(size_arg.clone());
+                args.extend(nums);
+                cmds.push((sid, Command::Debug(args)));
+            }
+            let (local, remote): (Vec<_>, Vec<_>) =
+                cmds.into_iter().partition(|(sid, _)| *sid == self.shard_id);
+            for (sid, cmd) in local {
+                self.execute_on_shard(sid, cmd).await;
+            }
+            self.execute_remote_many(remote).await;
+            start = end;
+        }
     }
 
     pub async fn flushdb(&self) {

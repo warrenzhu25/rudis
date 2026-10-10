@@ -22171,3 +22171,388 @@ fn test_exec_dropped_by_panic_releases_pause_and_locks_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+/// Reads one complete RESP reply (simple line, bulk, or a flat array of
+/// lines/bulks), however it arrives split over reads.
+fn read_full_reply(stream: &mut TcpStream) -> String {
+    fn complete(buf: &[u8]) -> bool {
+        fn line_end(buf: &[u8], from: usize) -> Option<usize> {
+            buf.get(from..)?
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .map(|p| from + p)
+        }
+        // Returns the index after the element starting at `pos`.
+        fn element(buf: &[u8], pos: usize) -> Option<usize> {
+            let end = line_end(buf, pos)?;
+            match buf.get(pos)? {
+                b'$' => {
+                    let len: i64 = std::str::from_utf8(&buf[pos + 1..end]).ok()?.parse().ok()?;
+                    if len < 0 {
+                        return Some(end + 2);
+                    }
+                    let stop = end + 2 + len as usize + 2;
+                    (buf.len() >= stop).then_some(stop)
+                }
+                b'*' => {
+                    let n: i64 = std::str::from_utf8(&buf[pos + 1..end]).ok()?.parse().ok()?;
+                    let mut p = end + 2;
+                    for _ in 0..n.max(0) {
+                        p = element(buf, p)?;
+                    }
+                    Some(p)
+                }
+                _ => Some(end + 2),
+            }
+        }
+        element(buf, 0).is_some()
+    }
+    let mut out = Vec::new();
+    let mut buf = [0u8; 16384];
+    while out.is_empty() || !complete(&out) {
+        let n = stream.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed mid-reply");
+        out.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// [`resp_cmd`] that waits for the whole reply.
+fn resp_cmd_all(stream: &mut TcpStream, args: &[&str]) -> String {
+    let mut out = format!("*{}\r\n", args.len());
+    for a in args {
+        out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+    }
+    stream.write_all(out.as_bytes()).unwrap();
+    read_full_reply(stream)
+}
+
+/// `DEBUG DIGEST`'s 40 hex characters.
+fn debug_digest(c: &mut TcpStream) -> String {
+    let r = resp_cmd_all(c, &["DEBUG", "DIGEST"]);
+    let hex = r
+        .strip_prefix('+')
+        .and_then(|s| s.strip_suffix("\r\n"))
+        .unwrap_or_else(|| panic!("DEBUG DIGEST reply: {r:?}"));
+    assert_eq!(hex.len(), 40, "{r:?}");
+    assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{r:?}");
+    hex.to_string()
+}
+
+/// Loads the same logical dataset in one of two orders, with different
+/// encodings on the way (integers set as strings and back, hashes/sets/
+/// zsets grown past their small encodings then shrunk, ...).
+fn load_digest_dataset(c: &mut TcpStream, reverse: bool) {
+    let mut cmds: Vec<Vec<String>> = Vec::new();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    for i in 0..40 {
+        cmds.push(s(&["SET", &format!("str:{i}"), &format!("value-{i}")]));
+    }
+    cmds.push(s(&["SET", "num", "12345"]));
+    cmds.push(s(&["SET", "ttl", "v", "EX", "1000"]));
+    cmds.push(s(&["RPUSH", "list", "a", "b", "c"]));
+    cmds.push(s(&["SADD", "set", "x", "y", "z", "1", "2"]));
+    cmds.push(s(&["ZADD", "zset", "1.5", "a", "0", "b", "-3", "c"]));
+    cmds.push(s(&["HSET", "hash", "f1", "v1", "f2", "v2"]));
+    cmds.push(s(&["PFADD", "hll", "a", "b", "c"]));
+    if reverse {
+        cmds.reverse();
+    }
+    // Stream ids must grow, so these keep their order.
+    cmds.push(s(&["XADD", "stream", "1-1", "f", "v"]));
+    cmds.push(s(&["XADD", "stream", "2-1", "g", "w"]));
+    cmds.push(s(&["XGROUP", "CREATE", "stream", "grp", "0"]));
+    for cmd in &cmds {
+        let args: Vec<&str> = cmd.iter().map(|x| x.as_str()).collect();
+        let r = resp_cmd_all(c, &args);
+        assert!(!r.starts_with('-'), "{cmd:?}: {r}");
+    }
+    if reverse {
+        // Same final content, reached through other encodings and orders.
+        let big: Vec<String> = (0..200).map(|i| format!("m{i}")).collect();
+        let mut sadd = vec!["SADD", "bigset"];
+        sadd.extend(big.iter().map(|x| x.as_str()));
+        resp_cmd_all(c, &sadd);
+        let mut hset = vec!["HSET".to_string(), "bighash".to_string()];
+        for m in big.iter().rev() {
+            hset.push(m.clone());
+            hset.push(format!("v-{m}"));
+        }
+        let hset: Vec<&str> = hset.iter().map(|x| x.as_str()).collect();
+        resp_cmd_all(c, &hset);
+        let mut zadd = vec!["ZADD".to_string(), "bigzset".to_string()];
+        for (i, m) in big.iter().enumerate() {
+            zadd.push(i.to_string());
+            zadd.push(m.clone());
+        }
+        let zadd: Vec<&str> = zadd.iter().map(|x| x.as_str()).collect();
+        resp_cmd_all(c, &zadd);
+        resp_cmd_all(c, &["INCRBY", "num", "0"]);
+    } else {
+        let big: Vec<String> = (0..200).map(|i| format!("m{i}")).collect();
+        for m in big.iter().rev() {
+            resp_cmd_all(c, &["SADD", "bigset", m]);
+            resp_cmd_all(c, &["HSET", "bighash", m, &format!("v-{m}")]);
+        }
+        for (i, m) in big.iter().enumerate().rev() {
+            resp_cmd_all(c, &["ZADD", "bigzset", &i.to_string(), m]);
+        }
+    }
+}
+
+#[test]
+fn test_debug_digest_compares_logical_datasets_e2e() {
+    let (p1, p2) = (18400, 18401);
+    start_test_server(p1, 2);
+    start_test_server(p2, 3);
+    let mut a = TcpStream::connect(("127.0.0.1", p1)).unwrap();
+    let mut b = TcpStream::connect(("127.0.0.1", p2)).unwrap();
+
+    // Empty dataset: 40 zeros, as Redis.
+    assert_eq!(debug_digest(&mut a), "0".repeat(40));
+
+    load_digest_dataset(&mut a, false);
+    load_digest_dataset(&mut b, true);
+    let da = debug_digest(&mut a);
+    assert_ne!(da, "0".repeat(40));
+    assert_eq!(da, debug_digest(&mut b), "same data, other order/shards");
+
+    // DIGEST-VALUE: per key, zeros for a missing key, independent of names.
+    let va = resp_cmd_all(
+        &mut a,
+        &["DEBUG", "DIGEST-VALUE", "hash", "bigzset", "missing"],
+    );
+    let vb = resp_cmd_all(
+        &mut b,
+        &["DEBUG", "DIGEST-VALUE", "hash", "bigzset", "missing"],
+    );
+    assert_eq!(va, vb);
+    assert!(va.starts_with("*3\r\n+"), "{va}");
+    assert!(va.ends_with(&format!("+{}\r\n", "0".repeat(40))), "{va}");
+    let one = resp_cmd_all(&mut a, &["DEBUG", "DIGEST-VALUE", "num"]);
+    resp_cmd_all(&mut a, &["SET", "num-copy", "12345"]);
+    assert_eq!(
+        one,
+        resp_cmd_all(&mut a, &["DEBUG", "DIGEST-VALUE", "num-copy"])
+    );
+    resp_cmd_all(&mut a, &["DEL", "num-copy"]);
+    assert_eq!(debug_digest(&mut a), da);
+
+    // TTL presence counts, its value does not.
+    resp_cmd_all(&mut b, &["EXPIRE", "ttl", "5000"]);
+    assert_eq!(debug_digest(&mut b), da);
+    resp_cmd_all(&mut b, &["PERSIST", "ttl"]);
+    assert_ne!(debug_digest(&mut b), da);
+    resp_cmd_all(&mut b, &["EXPIRE", "ttl", "100"]);
+    assert_eq!(debug_digest(&mut b), da);
+
+    // Any change in content shows up.
+    resp_cmd_all(&mut b, &["HSET", "bighash", "m7", "changed"]);
+    assert_ne!(debug_digest(&mut b), da);
+    resp_cmd_all(&mut b, &["HSET", "bighash", "m7", "v-m7"]);
+    assert_eq!(debug_digest(&mut b), da);
+    resp_cmd_all(&mut b, &["LSET", "list", "0", "z"]);
+    assert_ne!(debug_digest(&mut b), da);
+
+    // FLUSHALL brings back the empty digest.
+    resp_cmd_all(&mut b, &["FLUSHALL"]);
+    assert_eq!(debug_digest(&mut b), "0".repeat(40));
+}
+
+#[test]
+fn test_debug_subcommands_help_and_errors_e2e() {
+    let port = 18402;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    let r = resp_cmd_all(&mut c, &["DEBUG", "no-such-sub"]);
+    assert_eq!(
+        r,
+        "-ERR unknown subcommand 'no-such-sub'. Try DEBUG HELP.\r\n"
+    );
+    // Internal shard messages are not client subcommands.
+    let r = resp_cmd_all(&mut c, &["DEBUG", "__shard-digest"]);
+    assert!(r.starts_with("-ERR unknown subcommand"), "{r}");
+    let help = resp_cmd_all(&mut c, &["DEBUG", "HELP"]);
+    assert!(
+        help.starts_with('*') && help.contains("+DIGEST-VALUE"),
+        "{help}"
+    );
+    // Redis internals Rudis does not have are accepted as no-ops.
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DEBUG", "QUICKLIST-PACKED-THRESHOLD", "100"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DEBUG", "set-active-expire", "1"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DEBUG", "PROTOCOL", "true"]),
+        ":1\r\n"
+    );
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DEBUG", "ERROR", "ERR custom"]),
+        "-ERR custom\r\n"
+    );
+    assert_eq!(resp_cmd_all(&mut c, &["DEBUG", "LOG", "hello"]), "+OK\r\n");
+    assert!(resp_cmd_all(&mut c, &["DEBUG", "STRINGMATCH-LEN"]).starts_with("+Apparently"));
+    assert!(
+        resp_cmd_all(&mut c, &["DEBUG", "RELOAD", "bogus"]).starts_with("-ERR DEBUG RELOAD only")
+    );
+
+    // POPULATE: missing keys only, Redis' names and values, on every shard.
+    resp_cmd_all(&mut c, &["SET", "key:3", "keep"]);
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DEBUG", "POPULATE", "100"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd_all(&mut c, &["DBSIZE"]), ":100\r\n");
+    assert_eq!(
+        resp_cmd_all(&mut c, &["GET", "key:57"]),
+        "$8\r\nvalue:57\r\n"
+    );
+    assert_eq!(resp_cmd_all(&mut c, &["GET", "key:3"]), "$4\r\nkeep\r\n");
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DEBUG", "POPULATE", "10", "p", "3"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd_all(&mut c, &["GET", "p:9"]), "$3\r\nval\r\n");
+    assert!(resp_cmd_all(&mut c, &["DEBUG", "POPULATE", "-1"]).starts_with("-ERR"));
+
+    // SLEEP stalls the whole server, not just this connection's thread.
+    let mut sleeper = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut others: Vec<TcpStream> = (0..4)
+        .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
+        .collect();
+    for o in &mut others {
+        assert_eq!(resp_cmd_all(o, &["PING"]), "+PONG\r\n");
+    }
+    sleeper
+        .write_all(b"*3\r\n$5\r\nDEBUG\r\n$5\r\nSLEEP\r\n$3\r\n0.6\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let start = std::time::Instant::now();
+    for o in &mut others {
+        assert_eq!(resp_cmd_all(o, &["PING"]), "+PONG\r\n");
+    }
+    assert!(
+        start.elapsed() >= Duration::from_millis(300),
+        "PINGs during DEBUG SLEEP answered after {:?}",
+        start.elapsed()
+    );
+    assert_eq!(read_full_reply(&mut sleeper), "+OK\r\n");
+}
+
+#[test]
+fn test_debug_reload_and_loadaof_keep_data_e2e() {
+    // RDB: DEBUG RELOAD saves, flushes and loads back the same data.
+    let port = 18403;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    load_digest_dataset(&mut c, false);
+    let before = debug_digest(&mut c);
+    let size = resp_cmd_all(&mut c, &["DBSIZE"]);
+    assert_eq!(resp_cmd_all(&mut c, &["DEBUG", "RELOAD"]), "+OK\r\n");
+    assert_eq!(debug_digest(&mut c), before);
+    assert_eq!(resp_cmd_all(&mut c, &["DBSIZE"]), size);
+    // NOSAVE reloads the file saved above, dropping later changes.
+    resp_cmd_all(&mut c, &["SET", "after-save", "x"]);
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DEBUG", "RELOAD", "NOSAVE"]),
+        "+OK\r\n"
+    );
+    assert_eq!(debug_digest(&mut c), before);
+
+    // AOF: DEBUG LOADAOF replays the AOF into the same data.
+    let port = 18404;
+    let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    start_test_server_with_aof(
+        port,
+        2,
+        rudis::aof::AofConfig {
+            enabled: true,
+            dir,
+            fsync_every_sec: false,
+        },
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    load_digest_dataset(&mut c, true);
+    let before = debug_digest(&mut c);
+    let size = resp_cmd_all(&mut c, &["DBSIZE"]);
+    assert_eq!(resp_cmd_all(&mut c, &["DEBUG", "LOADAOF"]), "+OK\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["DBSIZE"]), size);
+    assert_eq!(debug_digest(&mut c), before);
+    // Replaying did not append to the AOF: a second load is identical.
+    assert_eq!(resp_cmd_all(&mut c, &["DEBUG", "LOADAOF"]), "+OK\r\n");
+    assert_eq!(debug_digest(&mut c), before);
+    assert_eq!(
+        resp_cmd_all(&mut c, &["LRANGE", "list", "0", "-1"]),
+        "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+    );
+}
+
+#[test]
+fn test_debug_digest_replica_matches_master_e2e() {
+    let (mp, rp) = (18405, 18406);
+    start_test_server(mp, 2);
+    start_test_server(rp, 3);
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+
+    load_digest_dataset(&mut m, false);
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    let wait_equal = |m: &mut TcpStream, r: &mut TcpStream| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (dm, dr) = (debug_digest(m), debug_digest(r));
+            if dm == dr {
+                return dm;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replica digest {dr} never matched master {dm}"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let synced = wait_equal(&mut m, &mut r);
+    assert_ne!(synced, "0".repeat(40));
+
+    // Live stream after the full sync.
+    resp_cmd_all(&mut m, &["HSET", "bighash", "new", "field"]);
+    resp_cmd_all(&mut m, &["LPUSH", "list", "front"]);
+    resp_cmd_all(&mut m, &["ZINCRBY", "zset", "2", "a"]);
+    resp_cmd_all(&mut m, &["EXPIRE", "str:1", "1000"]);
+    let live = wait_equal(&mut m, &mut r);
+    assert_ne!(live, synced);
+
+    // DEBUG REPLICATE sends a command to the replica without running it
+    // here: the datasets diverge.
+    assert_eq!(
+        resp_cmd_all(
+            &mut m,
+            &["DEBUG", "REPLICATE", "SET", "only-on-replica", "1"]
+        ),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd_all(&mut r, &["EXISTS", "only-on-replica"]) != ":1\r\n" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "DEBUG REPLICATE not applied"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        resp_cmd_all(&mut m, &["EXISTS", "only-on-replica"]),
+        ":0\r\n"
+    );
+    assert_ne!(debug_digest(&mut m), debug_digest(&mut r));
+    resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
+}
