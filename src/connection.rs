@@ -16349,20 +16349,111 @@ async fn execute_command(
                     PAUSE_CRON.store(!enabled, std::sync::atomic::Ordering::Relaxed);
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
-                } else if sub.eq_ignore_ascii_case(b"sleep") {
-                    if let Some(arg) = args.get(1)
-                        && let Ok(s) = std::str::from_utf8(arg)
+                } else if sub.eq_ignore_ascii_case(b"sleep") && args.len() == 2 {
+                    // Like Redis' single thread, every shard stalls.
+                    if let Ok(s) = std::str::from_utf8(&args[1])
                         && let Ok(secs) = s.parse::<f64>()
+                        && secs.is_finite()
+                        && secs > 0.0
                     {
-                        monoio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
+                        router
+                            .debug_sleep_all(
+                                std::time::Duration::from_secs_f64(secs),
+                                args[1].clone(),
+                            )
+                            .await;
                     }
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
                 } else if sub.eq_ignore_ascii_case(b"panic") {
                     panic!("DEBUG PANIC requested by client");
+                } else if sub.eq_ignore_ascii_case(b"digest") && args.len() == 1 {
+                    let d = router.debug_digest().await;
+                    crate::debug_cmd::write_digest(out, &d);
+                    return false;
+                } else if sub.eq_ignore_ascii_case(b"digest-value") {
+                    let digests = router.debug_digest_values(&args[1..]).await;
+                    crate::debug_cmd::write_digest_array(out, &digests);
+                    return false;
+                } else if sub.eq_ignore_ascii_case(b"reload") {
+                    match crate::debug_cmd::parse_reload_options(&args[1..]) {
+                        Err(e) => write_resp_err(out, e),
+                        Ok(save) => match router.debug_reload(save).await {
+                            Ok(()) => {
+                                println!("DB reloaded by DEBUG RELOAD");
+                                out.extend_from_slice(b"+OK\r\n");
+                            }
+                            Err(e) => {
+                                eprintln!("DEBUG RELOAD failed: {}", e);
+                                out.extend_from_slice(
+                                    b"-ERR Error trying to load the RDB dump, check server logs.\r\n",
+                                );
+                            }
+                        },
+                    }
+                    return false;
+                } else if sub.eq_ignore_ascii_case(b"loadaof") && args.len() == 1 {
+                    match router.debug_loadaof().await {
+                        Ok(()) => {
+                            println!("Append Only File loaded by DEBUG LOADAOF");
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                        Err(e) => write_resp_err(out, e),
+                    }
+                    return false;
+                } else if sub.eq_ignore_ascii_case(b"populate") && (2..=4).contains(&args.len()) {
+                    let count = crate::debug_cmd::parse_non_negative(&args[1]);
+                    let size = args
+                        .get(3)
+                        .map(|s| crate::debug_cmd::parse_non_negative(s))
+                        .transpose();
+                    match (count, size) {
+                        (Err(e), _) | (_, Err(e)) => write_resp_err(out, e),
+                        (Ok(count), Ok(size)) => {
+                            let prefix = args
+                                .get(2)
+                                .cloned()
+                                .unwrap_or_else(|| Bytes::from_static(b"key"));
+                            router.debug_populate(count, prefix, size).await;
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                    }
+                    return false;
+                } else if sub.eq_ignore_ascii_case(b"replicate") && args.len() >= 2 {
+                    // Sent to the replicas only, never executed or logged
+                    // to the AOF (Redis uses it to test replica error
+                    // handling and data divergence).
+                    let bytes = crate::debug_cmd::encode_resp_array(&args[1..]);
+                    crate::replication::propagate_shard_bytes(router.port, router.shard_id, &bytes);
+                    out.extend_from_slice(b"+OK\r\n");
+                    return false;
+                } else if (sub.eq_ignore_ascii_case(b"stringmatch-len")
+                    || sub.eq_ignore_ascii_case(b"stringmatch-test"))
+                    && args.len() == 1
+                {
+                    crate::debug_cmd::stringmatch_fuzz();
+                    out.extend_from_slice(b"+Apparently Rudis did not crash: test passed\r\n");
+                    return false;
+                } else if sub.as_ref() == crate::router::DEBUG_DIGEST_SHARD
+                    || sub.as_ref() == crate::router::DEBUG_LOADAOF_SHARD
+                    || sub.as_ref() == crate::router::DEBUG_POPULATE_SHARD
+                {
+                    // Internal shard messages, not client subcommands.
+                    crate::debug_cmd::write_unknown_subcommand(out, sub);
+                    return false;
                 }
+            } else {
+                out.extend_from_slice(b"-ERR wrong number of arguments for 'debug' command\r\n");
+                return false;
             }
-            out.extend_from_slice(b"+OK\r\n");
+            // HELP, PROTOCOL, ERROR, LOG, the accepted no-op subcommands and
+            // the unknown-subcommand error need no shard data beyond this one.
+            crate::debug_cmd::execute_shard_debug(
+                args,
+                &mut router.local_db.borrow_mut(),
+                out,
+                router.aof.as_deref(),
+            );
             false
         }
         Command::DflyFlow { .. } => false,
@@ -22314,7 +22405,7 @@ pub fn execute_local_command(
                         panic!("DEBUG PANIC requested by client");
                     }
                 }
-                out.extend_from_slice(b"+OK\r\n");
+                crate::debug_cmd::execute_shard_debug(args, db, out, aof);
                 false
             }
             Command::Digest(key) => {

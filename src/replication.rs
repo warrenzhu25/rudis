@@ -1332,9 +1332,41 @@ pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> us
     }
 }
 
+thread_local! {
+    /// Set while this shard thread re-applies data that is already on the
+    /// replicas (`DEBUG LOADAOF` replaying the shard's AOF): nothing it
+    /// changes must be propagated again.
+    static PROPAGATION_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Suppresses replication propagation from this thread until dropped.
+pub struct SuppressPropagation {
+    prev: bool,
+}
+
+impl SuppressPropagation {
+    pub fn new() -> Self {
+        Self {
+            prev: PROPAGATION_SUPPRESSED.replace(true),
+        }
+    }
+}
+
+impl Default for SuppressPropagation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SuppressPropagation {
+    fn drop(&mut self) {
+        PROPAGATION_SUPPRESSED.set(self.prev);
+    }
+}
+
 #[inline(always)]
 pub fn propagate_bytes(port: u16, bytes: &[u8]) {
-    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
+    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) || PROPAGATION_SUPPRESSED.get() {
         return;
     }
     let hub = get_replication_hub(port);
@@ -1343,7 +1375,7 @@ pub fn propagate_bytes(port: u16, bytes: &[u8]) {
 
 #[inline(always)]
 pub fn propagate_shard_bytes(port: u16, shard_id: usize, bytes: &[u8]) {
-    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
+    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) || PROPAGATION_SUPPRESSED.get() {
         return;
     }
     let hub = get_replication_hub(port);
