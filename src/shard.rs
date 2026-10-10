@@ -1614,6 +1614,17 @@ impl ShardDb {
         self.table.zadd_slice(key, elements, flags)
     }
 
+    /// See `RudisTable::zadd_slice_changes`.
+    #[inline]
+    pub fn zadd_slice_changes(
+        &mut self,
+        key: &[u8],
+        elements: &[(f64, Bytes)],
+        flags: crate::table::ZAddFlags,
+    ) -> Result<(usize, usize, Option<f64>), &'static str> {
+        self.table.zadd_slice_changes(key, elements, flags)
+    }
+
     #[inline]
     pub fn zadd(
         &mut self,

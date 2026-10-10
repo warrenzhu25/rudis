@@ -22894,10 +22894,10 @@ fn test_debug_digest_replica_matches_master_e2e() {
     resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
 }
 
-/// FUNCTION LOAD/DELETE and SORT ... STORE reach a replica and survive an
-/// AOF restart (they used to be applied on the master only).
+/// FUNCTION LOAD/DELETE, SORT ... STORE and ZADD score updates reach a
+/// replica and survive an AOF restart (they used to stay on the master).
 #[test]
-fn test_functions_and_sort_store_replicate_and_persist_e2e() {
+fn test_functions_sort_store_and_zadd_updates_replicate_and_persist_e2e() {
     let (mport, rport) = (17109u16, 17110u16);
     let dir = std::env::temp_dir().join(format!("rudis-fnrepl-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -22961,7 +22961,11 @@ fn test_functions_and_sort_store_replicate_and_persist_e2e() {
         resp_cmd(&mut m, &["SORT", "srt", "STORE", "srt:out"]),
         ":3\r\n"
     );
+    // A score update adds nothing (reply 0) but is a change.
+    assert_eq!(resp_cmd(&mut m, &["ZADD", "zup", "1", "a"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut m, &["ZADD", "zup", "2", "a"]), ":0\r\n");
     synced(&mut m, &mut r);
+    assert_eq!(resp_cmd(&mut r, &["ZSCORE", "zup", "a"]), "$1\r\n2\r\n");
     assert!(resp_cmd(&mut r, &["FUNCTION", "LIST"]).contains("replib"));
     let sorted = "*3\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n";
     assert_eq!(resp_cmd(&mut r, &["LRANGE", "srt:out", "0", "-1"]), sorted);
@@ -22988,6 +22992,7 @@ fn test_functions_and_sort_store_replicate_and_persist_e2e() {
     m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     assert!(resp_cmd(&mut m, &["FUNCTION", "LIST"]).contains("replib"));
     assert_eq!(resp_cmd(&mut m, &["LRANGE", "srt:out", "0", "-1"]), sorted);
+    assert_eq!(resp_cmd(&mut m, &["ZSCORE", "zup", "a"]), "$1\r\n2\r\n");
     drop(m);
     shutdown_and_wait(mport, &mut master);
     let _ = std::fs::remove_dir_all(&dir);

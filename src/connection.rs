@@ -18281,15 +18281,17 @@ pub fn execute_local_command(
                 elements,
                 flags,
             } => {
-                match db.zadd_slice(key.as_ref(), elements, *flags) {
-                    Ok((count, incr_score)) => {
+                match db.zadd_slice_changes(key.as_ref(), elements, *flags) {
+                    Ok((count, changed, incr_score)) => {
                         if flags.incr {
                             if incr_score.is_some() {
                                 record_change!(cmd);
                                 notify_zset_or_defer(db, key);
                                 notify_keyspace_event(NOTIFY_ZSET, "zadd", key);
                             }
-                        } else if count > 0 {
+                        } else if changed > 0 {
+                            // Not `count`: without CH it only counts new
+                            // members, and a score update must replicate too.
                             record_change!(cmd);
                             notify_zset_or_defer(db, key);
                             notify_keyspace_event(NOTIFY_ZSET, "zadd", key);
