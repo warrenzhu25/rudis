@@ -3874,32 +3874,11 @@ pub async fn save_rdb_chunk_yielding(
     db: &std::cell::RefCell<ShardDb>,
     sink: &flume::Sender<Option<Vec<u8>>>,
 ) -> bool {
-    let epoch = db.borrow().table.layout_epoch();
-    let mut seg = 0;
+    let mut cursor = RdbSaveCursor::new(&db.borrow());
     let mut buf = Vec::with_capacity(RDB_FLUSH_BYTES * 2);
-    let finished = loop {
-        {
-            let db = db.borrow();
-            let clock = RdbClock::now();
-            if db.table.layout_epoch() != epoch {
-                for entry in db.table.entries() {
-                    db.save_rdb_entry(entry, &clock, &mut buf);
-                }
-                db.save_extended_rdb_chunk(&mut buf);
-                break buf;
-            }
-            let segments = db.table.segment_count();
-            while seg < segments
-                && clock.now.elapsed() < RDB_SAVE_STEP
-                && buf.len() < RDB_FLUSH_BYTES
-            {
-                db.save_rdb_segment(seg, &clock, &mut buf);
-                seg += 1;
-            }
-            if seg >= segments {
-                db.save_extended_rdb_chunk(&mut buf);
-                break buf;
-            }
+    loop {
+        if cursor.step(&db.borrow(), &mut buf, RDB_SAVE_STEP, RDB_FLUSH_BYTES) {
+            break;
         }
         if buf.len() >= RDB_FLUSH_BYTES {
             let piece = std::mem::replace(&mut buf, Vec::with_capacity(RDB_FLUSH_BYTES * 2));
@@ -3910,8 +3889,100 @@ pub async fn save_rdb_chunk_yielding(
         // A send that completes at once does not yield; always let the
         // shard's other tasks in between steps.
         crate::mailbox::yield_now().await;
-    };
-    finished.is_empty() || sink.send_async(Some(finished)).await.is_ok()
+    }
+    buf.is_empty() || sink.send_async(Some(buf)).await.is_ok()
+}
+
+/// Directory patterns (see [`crate::table::RudisFlatTable::segment_pattern`])
+/// of the segments a [`RdbSaveCursor`] has written. Keys matching one were
+/// already written: Redis and Valkey refuse an RDB with a key twice, so a
+/// segment split off a written one (or, after a renumbering, any such key)
+/// is skipped.
+#[derive(Default)]
+struct WrittenPatterns {
+    patterns: std::collections::HashSet<(u8, u64)>,
+    /// Bit `d` set: some pattern has depth `d`.
+    depths: u128,
+}
+
+impl WrittenPatterns {
+    fn insert(&mut self, depth: u8, bits: u64) {
+        self.patterns.insert((depth, bits));
+        self.depths |= 1u128 << depth.min(127);
+    }
+
+    /// Whether directory bits `bits`, known to depth `max_depth`, match a
+    /// written pattern.
+    fn covers(&self, max_depth: u8, bits: u64) -> bool {
+        (0..=max_depth.min(127)).any(|d| {
+            self.depths & (1u128 << d) != 0
+                && self
+                    .patterns
+                    .contains(&(d, bits & crate::table::dir_bits_mask(d)))
+        })
+    }
+}
+
+/// Progress of a [`save_rdb_chunk_yielding`] walk over a shard's table.
+struct RdbSaveCursor {
+    epoch: u64,
+    seg: usize,
+    written: WrittenPatterns,
+}
+
+impl RdbSaveCursor {
+    fn new(db: &ShardDb) -> Self {
+        RdbSaveCursor {
+            epoch: db.table.layout_epoch(),
+            seg: 0,
+            written: WrittenPatterns::default(),
+        }
+    }
+
+    /// Serializes at least one segment, then more until `budget` has passed
+    /// or `buf` holds `flush_bytes`. Returns true once everything, the
+    /// extended state included, is in `buf`.
+    fn step(
+        &mut self,
+        db: &ShardDb,
+        buf: &mut Vec<u8>,
+        budget: Duration,
+        flush_bytes: usize,
+    ) -> bool {
+        let clock = RdbClock::now();
+        if db.table.layout_epoch() != self.epoch {
+            // Renumbered (FLUSHALL, collapsing defrag): what is left is
+            // small; write the keys no written segment covered.
+            for entry in db.table.entries() {
+                let bits = crate::table::key_dir_bits(&entry.key);
+                if !self.written.covers(u8::MAX, bits) {
+                    db.save_rdb_entry(entry, &clock, buf);
+                }
+            }
+            db.save_extended_rdb_chunk(buf);
+            return true;
+        }
+        let segments = db.table.segment_count();
+        let mut first = true;
+        while self.seg < segments
+            && (first || (clock.now.elapsed() < budget && buf.len() < flush_bytes))
+        {
+            first = false;
+            let pattern = db.table.segment_pattern(self.seg);
+            if let Some((depth, bits)) = pattern {
+                if !self.written.covers(depth, bits) {
+                    db.save_rdb_segment(self.seg, &clock, buf);
+                }
+                self.written.insert(depth, bits);
+            }
+            self.seg += 1;
+        }
+        if self.seg >= segments {
+            db.save_extended_rdb_chunk(buf);
+            return true;
+        }
+        false
+    }
 }
 
 /// Piece size [`save_rdb_chunk_yielding`] streams to its sink.
@@ -3920,6 +3991,90 @@ const RDB_FLUSH_BYTES: usize = 4 << 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keys of a `save_rdb_chunk` record stream, in order.
+    fn chunk_keys(chunk: &[u8]) -> Vec<Bytes> {
+        use crate::redis_rdb::{OP_AUX, OP_EXPIRETIME_MS, Reader, skip_value};
+        let mut r = Reader::new(chunk);
+        let mut keys = Vec::new();
+        while !r.is_empty() {
+            match r.u8().unwrap() {
+                OP_AUX => {
+                    r.skip_string().unwrap();
+                    r.skip_string().unwrap();
+                }
+                OP_EXPIRETIME_MS => {
+                    r.take(8).unwrap();
+                }
+                t => {
+                    keys.push(r.bytes().unwrap());
+                    skip_value(t, &mut r).unwrap();
+                }
+            }
+        }
+        keys
+    }
+
+    /// Segments split while a yielding save runs must not get their keys
+    /// written twice: Redis and Valkey refuse an RDB with a duplicate key.
+    #[test]
+    fn yielding_save_writes_each_key_once_across_splits() {
+        let mut db = ShardDb::new(0);
+        for i in 0..6000 {
+            db.table
+                .set(Bytes::from(format!("k{i}")), Bytes::from_static(b"v"), None);
+        }
+        let mut cursor = RdbSaveCursor::new(&db);
+        let mut buf = Vec::new();
+        let mut next = 6000;
+        let mut steps = 0;
+        while !cursor.step(&db, &mut buf, Duration::ZERO, usize::MAX) {
+            steps += 1;
+            // Splits while the walk is under way, then let it finish.
+            let grow = if steps <= 6 { 1500 } else { 0 };
+            for _ in 0..grow {
+                db.table.set(
+                    Bytes::from(format!("k{next}")),
+                    Bytes::from_static(b"v"),
+                    None,
+                );
+                next += 1;
+            }
+        }
+        assert!(steps > 2, "the table has several segments");
+        let keys = chunk_keys(&buf);
+        let unique: std::collections::HashSet<&Bytes> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "a key was written twice");
+        for i in 0..6000 {
+            assert!(
+                unique.contains(&Bytes::from(format!("k{i}"))),
+                "k{i} missing"
+            );
+        }
+    }
+
+    /// After a renumbering, keys of already written segments are recognised
+    /// by their hash bits.
+    #[test]
+    fn written_patterns_cover_every_key_of_written_segments() {
+        let mut db = ShardDb::new(0);
+        for i in 0..5000 {
+            db.table
+                .set(Bytes::from(format!("k{i}")), Bytes::from_static(b"v"), None);
+        }
+        let mut written = WrittenPatterns::default();
+        let half = db.table.segment_count() / 2;
+        for seg in 0..half {
+            let (d, bits) = db.table.segment_pattern(seg).unwrap();
+            written.insert(d, bits);
+        }
+        for seg in 0..db.table.segment_count() {
+            for e in db.table.segment_entries(seg) {
+                let covered = written.covers(u8::MAX, crate::table::key_dir_bits(&e.key));
+                assert_eq!(covered, seg < half);
+            }
+        }
+    }
 
     #[test]
     fn test_fast_integer_formatting() {

@@ -1684,6 +1684,21 @@ pub fn hash_key(key: &[u8]) -> u64 {
 }
 
 #[inline(always)]
+/// The bits of `key`'s hash that pick its directory slot, lowest first
+/// (see [`RudisFlatTable::segment_pattern`]).
+pub fn key_dir_bits(key: &[u8]) -> u64 {
+    mix_hash(hash_key(key)) >> SEG_SHIFT
+}
+
+/// Mask of the low `depth` directory bits.
+pub fn dir_bits_mask(depth: u8) -> u64 {
+    if depth >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << depth) - 1
+    }
+}
+
 fn mix_hash(mut h: u64) -> u64 {
     h ^= h >> 32;
     h = h.wrapping_mul(0xd6e8feb86659fd93);
@@ -2807,6 +2822,17 @@ impl RudisFlatTable {
             .flat_map(|s| s.iter_entries())
     }
 
+    /// The directory pattern `(local depth, low directory bits)` that every
+    /// key of segment `seg` matches (extendible hashing), or `None` if the
+    /// segment is empty. A split only refines patterns, so a key whose bits
+    /// match a pattern keeps matching it until the table is renumbered.
+    pub fn segment_pattern(&self, seg: usize) -> Option<(u8, u64)> {
+        let s = self.segments.get(seg)?;
+        let entry = s.iter_entries().next()?;
+        let d = s.local_depth;
+        Some((d, key_dir_bits(&entry.key) & dir_bits_mask(d)))
+    }
+
     #[inline]
     pub fn entries_mut(&mut self) -> impl Iterator<Item = &mut RudisEntry> {
         self.segments.iter_mut().flat_map(|s| s.iter_entries_mut())
@@ -3467,6 +3493,11 @@ impl RudisTable {
     #[inline]
     pub fn entries(&self) -> impl Iterator<Item = &RudisEntry> {
         self.table.entries()
+    }
+
+    /// See [`RudisFlatTable::segment_pattern`].
+    pub fn segment_pattern(&self, seg: usize) -> Option<(u8, u64)> {
+        self.table.segment_pattern(seg)
     }
 
     /// See [`RudisFlatTable::layout_epoch`].
