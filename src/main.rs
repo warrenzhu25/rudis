@@ -5,6 +5,7 @@ use clap::Parser;
 use std::thread;
 
 use rudis::server::run_shard_worker;
+use rudis::{log_fatal, log_notice, log_warning};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -126,7 +127,7 @@ fn main() {
         match loaded {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("Failed to load config file {:?}: {}", config_path, e);
+                log_fatal!("Failed to load config file {:?}: {}", config_path, e);
                 std::process::exit(1);
             }
         }
@@ -159,7 +160,7 @@ fn main() {
 
     let port = server_config.port;
     let bind_addrs = rudis::netsec::parse_bind_spec(&server_config.bind).unwrap_or_else(|e| {
-        eprintln!("FATAL CONFIG: {}", e);
+        log_fatal!("FATAL CONFIG: {}", e);
         std::process::exit(1);
     });
     let bind_display = rudis::netsec::format_bind_spec(&bind_addrs);
@@ -169,7 +170,7 @@ fn main() {
             "yes" => true,
             "no" => false,
             other => {
-                eprintln!(
+                log_fatal!(
                     "FATAL CONFIG: --protected-mode expects yes|no, got '{}'",
                     other
                 );
@@ -231,8 +232,8 @@ fn main() {
             p,
             std::time::Duration::from_secs(3),
         ) {
-            eprintln!("{}", e);
-            eprintln!("Failed listening on port {} (tcp), aborting.", p);
+            log_fatal!("{}", e);
+            log_fatal!("Failed listening on port {} (tcp), aborting.", p);
             std::process::exit(1);
         }
     }
@@ -245,7 +246,7 @@ fn main() {
             "yes" => true,
             "no" => false,
             other => {
-                eprintln!(
+                log_fatal!(
                     "FATAL CONFIG: --enable-experimental-commands expects yes|no, got '{}'",
                     other
                 );
@@ -264,7 +265,7 @@ fn main() {
     let metrics_addr = server_config.metrics_port.map(|metrics_port| {
         let addr = std::net::SocketAddr::new(server_config.metrics_bind, metrics_port);
         rudis::telemetry::bind_metrics_listener(port, addr).unwrap_or_else(|e| {
-            eprintln!("FATAL CONFIG: cannot listen for metrics on {}: {}", addr, e);
+            log_fatal!("FATAL CONFIG: cannot listen for metrics on {}: {}", addr, e);
             std::process::exit(1);
         })
     });
@@ -278,7 +279,7 @@ fn main() {
         if (name == "replicaof" || name == "slaveof")
             && let Err(e) = rudis::replication::set_startup_replicaof(port, value)
         {
-            eprintln!("FATAL CONFIG: invalid '{}' directive: {}", name, e);
+            log_fatal!("FATAL CONFIG: invalid '{}' directive: {}", name, e);
             std::process::exit(1);
         }
         match rudis::connection::apply_config_value(port, port, name, value) {
@@ -289,13 +290,35 @@ fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("FATAL CONFIG: invalid '{}' directive: {}", name, e);
+                log_fatal!("FATAL CONFIG: invalid '{}' directive: {}", name, e);
                 std::process::exit(1);
             }
         }
     }
+    // After the directives, so these go to `logfile` and honour `loglevel`.
+    log_notice!("oO0OoO0OoO0Oo Rudis is starting oO0OoO0OoO0Oo");
+    log_notice!(
+        "Rudis version={}, bits={}, pid={}, just started",
+        env!("CARGO_PKG_VERSION"),
+        usize::BITS,
+        std::process::id()
+    );
+    if args.config.is_some() {
+        log_notice!("Configuration loaded");
+    } else {
+        log_warning!(
+            "Warning: no config file specified, using the default config. In order to specify a config file use rudis --config /path/to/rudis.conf"
+        );
+    }
+    let maxmemory = rudis::tiering::get_max_memory(port);
+    if maxmemory > 0 && maxmemory < 1024 * 1024 {
+        log_warning!(
+            "WARNING: You specified a maxmemory value that is less than 1MB (current value is {} bytes). Are you sure this is what you really want?",
+            maxmemory
+        );
+    }
     if !ignored_directives.is_empty() {
-        eprintln!(
+        log_warning!(
             "WARNING: config directives not supported by rudis were ignored: {}",
             ignored_directives.join(", ")
         );
@@ -305,7 +328,7 @@ fn main() {
             .write()
             .set_user(user, rules)
         {
-            eprintln!("FATAL CONFIG: error in user declaration '{}': {}", user, e);
+            log_fatal!("FATAL CONFIG: error in user declaration '{}': {}", user, e);
             std::process::exit(1);
         }
     }
@@ -316,16 +339,19 @@ fn main() {
     };
     if aof_config.enabled {
         match rudis::aof::reshard_aof_dir(&aof_config.dir, num_shards, port) {
-            Ok(Some(old)) => println!(
+            Ok(Some(old)) => log_notice!(
                 "AOF files in {:?} were written with a different shard layout ({} shards); \
                  resharded them for {} shards (originals kept in an aof-reshard-backup-* dir)",
-                aof_config.dir, old, num_shards
+                aof_config.dir,
+                old,
+                num_shards
             ),
             Ok(None) => {}
             Err(e) => {
-                eprintln!(
+                log_fatal!(
                     "FATAL: cannot reshard the AOF files in {:?}: {}",
-                    aof_config.dir, e
+                    aof_config.dir,
+                    e
                 );
                 std::process::exit(1);
             }
@@ -356,32 +382,35 @@ fn main() {
         None
     };
 
-    println!("============================================================");
-    println!("  rudis v0.1.0 (Redis in Rust)");
-    println!("  Architecture: Multi-threaded Shared-Nothing (Thread-per-Core)");
-    println!("  I/O Backend:  Linux io_uring (Monoio)");
-    println!("  Listening:    port {} (bind {})", port, bind_display);
+    let pinned = if args.no_pin {
+        "not pinned to CPU cores"
+    } else {
+        "pinned to CPU cores"
+    };
+    log_notice!("============================================================");
+    log_notice!("  rudis v0.1.0 (Redis in Rust)");
+    log_notice!("  Architecture: Multi-threaded Shared-Nothing (Thread-per-Core)");
+    log_notice!("  I/O Backend:  Linux io_uring (Monoio)");
+    log_notice!("  Listening:    port {} (bind {})", port, bind_display);
     if let Some(ref tls_cfg) = tls_config {
-        println!(
+        log_notice!(
             "  TLS Port:     {} (bind {})",
-            tls_cfg.tls_port, bind_display
+            tls_cfg.tls_port,
+            bind_display
         );
     }
-    println!(
-        "  Shards:       {} worker threads (pinned to CPU cores)",
-        num_shards
-    );
+    log_notice!("  Shards:       {} worker threads ({})", num_shards, pinned);
     if let Some(addr) = metrics_addr {
-        println!("  Metrics:      http://{}/metrics", addr);
+        log_notice!("  Metrics:      http://{}/metrics", addr);
     }
     if cluster_enabled {
-        println!(
+        log_notice!(
             "  Cluster Mode: ENABLED (Per-shard ports: {}-{})",
             port,
             port + num_shards as u16 - 1
         );
     }
-    println!(
+    log_notice!(
         "  AOF Persist:  {}",
         if aof_config.enabled {
             "ENABLED"
@@ -391,7 +420,18 @@ fn main() {
     );
     let sanity_report = rudis::syscheck::run_system_sanity_checks();
     rudis::syscheck::print_sanity_warnings(&sanity_report);
-    println!("============================================================");
+    log_notice!("============================================================");
+    log_notice!(
+        "Running mode={}, port={}.",
+        if cluster_enabled {
+            "cluster"
+        } else {
+            "standalone"
+        },
+        port
+    );
+
+    log_notice!("Server initialized");
 
     // Create lock-free cross-shard communication mesh
     let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
@@ -434,5 +474,6 @@ fn main() {
     for handle in handles {
         let _ = handle.join();
     }
-    println!("rudis server gracefully stopped. Goodbye!");
+    log_notice!("Redis is now ready to exit, bye bye...");
+    log_notice!("rudis server gracefully stopped. Goodbye!");
 }

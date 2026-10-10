@@ -2483,7 +2483,7 @@ pub fn replay_aof_with(
                         "truncated final command (set aof-load-truncated yes to load anyway)",
                     ));
                 }
-                eprintln!(
+                crate::log_warning!(
                     "!!! Warning: short read while loading the AOF file {:?}: truncating it from {} to {} bytes (last complete command).",
                     path,
                     data.len(),

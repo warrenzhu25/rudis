@@ -871,6 +871,7 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
         "client-output-buffer-limit".to_string(),
         crate::connection::format_client_output_buffer_limit_config(),
     );
+    directives.insert("loglevel".to_string(), crate::log::loglevel().to_string());
 
     // If requirepass is set
     let acl = crate::acl::get_acl_for_port(port);
@@ -917,6 +918,7 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
 
     fs::rename(&tmp_path, &path)
         .map_err(|e| format!("Failed to atomically rename config file: {}", e))?;
+    crate::log_notice!("CONFIG REWRITE executed with success.");
 
     // Directory fsync for crash-durability!
     if let Some(parent) = path.parent() {

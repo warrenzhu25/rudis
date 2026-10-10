@@ -249,9 +249,10 @@ pub fn ensure_port_free_with_grace(
             Err(_) => {
                 if !warned {
                     warned = true;
-                    eprintln!(
+                    crate::log_warning!(
                         "Port {} is busy; waiting up to {:?} for a previous instance to release it",
-                        port, grace
+                        port,
+                        grace
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
