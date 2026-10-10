@@ -1508,8 +1508,13 @@ pub fn unwatch_keys(port: u16, client_id: u64) {
     }
     let mut map = WATCHED_KEYS.write();
     if let Some(port_map) = map.get_mut(&port) {
-        for set in port_map.values_mut() {
+        // Drop keys nobody watches any more; they used to stay forever.
+        port_map.retain(|_, set| {
             set.remove(&client_id);
+            !set.is_empty()
+        });
+        if port_map.is_empty() {
+            map.remove(&port);
         }
     }
     CLIENT_WATCH_TAINTED.write().remove(&(port, client_id));
@@ -3633,6 +3638,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                 }
             }
             unregister_client_tracking(self.port, self.client_id);
+            unwatch_keys(self.port, self.client_id);
             if crate::block::has_blocked_waiters(self.port) {
                 let hub_arc = crate::block::get_block_hub_for_port(self.port);
                 let mut hub = hub_arc.lock();
@@ -4233,7 +4239,6 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
         squashed_responses,
         commands,
     });
-    unwatch_keys(router.port, client_id);
 }
 
 struct ConnScratch {
@@ -5207,6 +5212,42 @@ impl Drop for UnregisterFdOnDrop {
     }
 }
 
+/// Unregisters a replica (and forgets its fd) however its master-side task
+/// ends, including when the future is dropped part-way (connections run
+/// under `catch_unwind`): otherwise the hub keeps buffering for a dead
+/// replica and other threads may `send`/`shutdown` a reused fd number.
+/// Unregistering is idempotent with the explicit calls.
+struct ReplicaLink {
+    hub: std::sync::Arc<crate::replication::ReplicationHub>,
+    client_id: u64,
+    repl: Option<std::sync::Arc<crate::replication::ConnectedReplica>>,
+}
+
+impl Drop for ReplicaLink {
+    fn drop(&mut self) {
+        if let Some(r) = self.repl.take() {
+            r.detach_fd();
+        }
+        self.hub.unregister_replica(self.client_id);
+    }
+}
+
+/// [`ReplicaLink`] for a per-shard replication flow.
+struct ShardFlowLink {
+    hub: std::sync::Arc<crate::replication::ReplicationHub>,
+    shard_id: usize,
+    client_id: u64,
+    flow: std::sync::Arc<crate::replication::ShardReplicaFlow>,
+}
+
+impl Drop for ShardFlowLink {
+    fn drop(&mut self) {
+        self.flow.detach_fd();
+        self.hub
+            .unregister_shard_flow(self.shard_id, self.client_id);
+    }
+}
+
 async fn run_master_replica_stream(
     stream: TcpStream,
     client_id: u64,
@@ -5222,6 +5263,11 @@ async fn run_master_replica_stream(
         client_id,
     };
     let (write_tx, write_rx) = flume::unbounded::<Vec<u8>>();
+    let mut link = ReplicaLink {
+        hub: hub.clone(),
+        client_id,
+        repl: None,
+    };
 
     let is_sync = matches!(&psync_cmd, Command::Sync);
 
@@ -5293,7 +5339,7 @@ async fn run_master_replica_stream(
     }
 
     repl.attach_fd(raw_fd);
-    let reader_repl = repl.clone();
+    link.repl = Some(repl.clone());
     let writer_hub = hub.clone();
     monoio::spawn(async move {
         // Each wakeup carries no data: everything queued since the last one
@@ -5323,8 +5369,7 @@ async fn run_master_replica_stream(
     });
 
     read_replica_acks(&mut reader, |off| hub.update_replica_ack(client_id, off)).await;
-    reader_repl.detach_fd();
-    hub.unregister_replica(client_id);
+    drop(link);
 }
 
 async fn run_shard_replication_flow(
@@ -5349,7 +5394,12 @@ async fn run_shard_replication_flow(
     }
     let (write_tx, write_rx) = flume::bounded::<Vec<u8>>(4096);
 
-    let _flow = hub.register_shard_flow(shard_id, client_id, write_tx.clone(), Some(raw_fd));
+    let flow_link = ShardFlowLink {
+        hub: hub.clone(),
+        shard_id,
+        client_id,
+        flow: hub.register_shard_flow(shard_id, client_id, write_tx.clone(), Some(raw_fd)),
+    };
 
     // Fetch this shard's RDB chunk
     let chunk = if shard_id == router.shard_id {
@@ -5391,8 +5441,7 @@ async fn run_shard_replication_flow(
         hub.update_shard_flow_ack(shard_id, client_id, off)
     })
     .await;
-    _flow.detach_fd();
-    hub.unregister_shard_flow(shard_id, client_id);
+    drop(flow_link);
 }
 
 pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
@@ -25006,6 +25055,22 @@ mod tests {
         record_client_read(port, cid, b"test_key");
 
         unregister_client_tracking(port, cid);
+    }
+
+    #[test]
+    fn test_unwatch_drops_keys_nobody_watches() {
+        let port = 65429;
+        watch_keys(port, 1, &[Bytes::from("w:a"), Bytes::from("w:b")]);
+        watch_keys(port, 2, &[Bytes::from("w:b")]);
+        unwatch_keys(port, 1);
+        {
+            let map = WATCHED_KEYS.read();
+            let pm = map.get(&port).expect("client 2 still watches w:b");
+            assert!(!pm.contains_key(&Bytes::from("w:a")));
+            assert_eq!(pm.len(), 1);
+        }
+        unwatch_keys(port, 2);
+        assert!(!WATCHED_KEYS.read().contains_key(&port));
     }
 
     #[test]

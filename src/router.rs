@@ -263,6 +263,47 @@ pub fn local_real_used(
     net - slack as i64
 }
 
+/// Clears `is_saving` and records a failed save or rewrite if the task
+/// doing it ends without finishing (its future dropped part-way, e.g. by a
+/// panic isolated with `catch_unwind`). Otherwise one such save refuses
+/// every later SAVE/BGSAVE/BGREWRITEAOF as "in progress" and shutdown waits
+/// forever in `save_before_shutdown`.
+struct SaveFlagGuard {
+    is_saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    base_port: u16,
+    /// `Some(dirty_before)` for an RDB save, `None` for an AOF rewrite.
+    rdb_dirty_before: Option<u64>,
+    armed: bool,
+}
+
+impl SaveFlagGuard {
+    fn new(router: &Router, rdb_dirty_before: Option<u64>) -> Self {
+        Self {
+            is_saving: router.is_saving.clone(),
+            base_port: router.base_port,
+            rdb_dirty_before,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SaveFlagGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.is_saving.store(false, Ordering::SeqCst);
+        match self.rdb_dirty_before {
+            Some(d) => crate::snapshot::state(self.base_port).finish(d, false),
+            None => crate::snapshot::aof_rewrite_state(self.base_port).finish(false),
+        }
+    }
+}
+
 /// Hands a released VLL lock to the next waiter still waiting. A waiter whose
 /// transaction was dropped while queued (its receiver is gone) is skipped;
 /// granting it would leave the lock held by nobody, forever.
@@ -1110,6 +1151,15 @@ impl Router {
             return under();
         }
         self.is_auto_tiering.set(true);
+        // Cleared however this ends (also if the future is dropped part-way,
+        // which would otherwise stop auto-tiering on this shard for good).
+        struct ClearOnDrop<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _clear = ClearOnDrop(&self.is_auto_tiering);
 
         // Phase 1: Instant Zero-I/O Decommit of all Cooled keys
         let decommitted = self.decommit_local(None);
@@ -3767,8 +3817,11 @@ impl Router {
             return Err("Background save already in progress".to_string());
         }
         let dirty_before = crate::snapshot::state(self.base_port).begin();
+        let guard = SaveFlagGuard::new(self, Some(dirty_before));
         self.sync_aof().await;
-        self.perform_save_rdb(dirty_before).await
+        let res = self.perform_save_rdb(dirty_before).await;
+        guard.disarm();
+        res
     }
 
     /// The save step of `SHUTDOWN [SAVE|NOSAVE]` and SIGTERM. Returns an
@@ -3801,8 +3854,10 @@ impl Router {
         let dirty_before = crate::snapshot::state(self.base_port).begin();
         let router_clone = self.clone();
         monoio::spawn(async move {
+            let guard = SaveFlagGuard::new(&router_clone, Some(dirty_before));
             router_clone.sync_aof().await;
             let _ = router_clone.perform_save_rdb(dirty_before).await;
+            guard.disarm();
         });
         Ok(())
     }
@@ -3820,7 +3875,9 @@ impl Router {
         crate::snapshot::aof_rewrite_state(self.base_port).begin();
         let router_clone = self.clone();
         monoio::spawn(async move {
+            let guard = SaveFlagGuard::new(&router_clone, None);
             let _ = router_clone.perform_rewrite_aof().await;
+            guard.disarm();
         });
         Ok(())
     }
