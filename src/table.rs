@@ -16006,7 +16006,7 @@ fn load_legacy_rdb(
     if expected_crc != actual_crc {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "CRC64 checksum mismatch in RDB file",
+            "RDB CRC error: CRC64 checksum mismatch in RDB file",
         ));
     }
     // Skip REDIS0011

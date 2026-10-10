@@ -62,6 +62,8 @@ fn fatal_startup_error(shard_id: usize, msg: &str) -> ! {
         shard_id,
         msg
     );
+    // Redis's wording, which operators' tooling and the test suites look for.
+    crate::log_fatal!("Fatal error loading the DB, check server logs. Exiting.");
     std::process::exit(1);
 }
 

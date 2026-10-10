@@ -2843,6 +2843,73 @@ pub fn set_max_clients(limit: usize) {
     MAX_CLIENTS.store(limit, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When this process started, for INFO uptime.
+static SERVER_START: std::sync::LazyLock<(std::time::Instant, String)> =
+    std::sync::LazyLock::new(|| {
+        // INFO run_id: 40 random hex characters, fixed for the process.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let a = fxhash::hash64(&(seed, std::process::id()));
+        let b = fxhash::hash64(&(a, seed.rotate_left(17)));
+        let c = fxhash::hash64(&(b, a));
+        let run_id = format!("{a:016x}{b:016x}{c:016x}")[..40].to_string();
+        (std::time::Instant::now(), run_id)
+    });
+
+/// Called at startup so uptime counts from then, not from the first INFO.
+pub fn mark_server_start() {
+    std::sync::LazyLock::force(&SERVER_START);
+}
+
+/// The process fields of Redis's INFO server section (process_id, run_id,
+/// uptime, executable, config_file, ...), which monitoring relies on.
+fn server_info_process_fields() -> String {
+    let (started, run_id) = &*SERVER_START;
+    let uptime = started.elapsed().as_secs();
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let executable = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let config_file = crate::config::ACTIVE_CONFIG_FILE
+        .read()
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    format!(
+        "process_id:{}\r\nprocess_supervised:no\r\nrun_id:{}\r\nserver_time_usec:{}\r\nuptime_in_seconds:{}\r\nuptime_in_days:{}\r\nhz:10\r\nconfigured_hz:10\r\nlru_clock:{}\r\nexecutable:{}\r\nconfig_file:{}\r\nio_threads_active:0\r\n",
+        std::process::id(),
+        run_id,
+        now_us,
+        uptime,
+        uptime / 86400,
+        (now_us / 1_000_000) as u64 & ((1 << 24) - 1),
+        executable,
+        config_file,
+    )
+}
+
+/// INFO cpu from getrusage: the whole process (all shard threads).
+fn info_cpu_section() -> String {
+    let secs = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage writes one `rusage` into the pointer it is given;
+    // `ru` is a valid, writable, properly aligned `rusage`. A zeroed
+    // `rusage` is a valid value, so reading it after a failed call is fine.
+    let ru = unsafe {
+        libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr());
+        ru.assume_init()
+    };
+    let (sys, user) = (secs(ru.ru_stime), secs(ru.ru_utime));
+    format!(
+        "# CPU\r\nused_cpu_sys:{sys:.6}\r\nused_cpu_user:{user:.6}\r\nused_cpu_sys_children:0.000000\r\nused_cpu_user_children:0.000000\r\nused_cpu_sys_main_thread:{sys:.6}\r\nused_cpu_user_main_thread:{user:.6}\r\n"
+    )
+}
+
 pub fn get_max_clients() -> usize {
     MAX_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -9368,15 +9435,19 @@ async fn execute_command(
                 s
             };
             let server_str = format!(
-                "# Server\r\nredis_version:7.2.4\r\nredis_git_sha1:00000000\r\nredis_git_dirty:0\r\nredis_build_id:0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\nmultiplexing_api:{}\r\nrudis_version:0.1.0\r\narch:shared-nothing-{}\r\nshard_id:{}\r\nnum_shards:{}\r\ntcp_port:{}\r\n",
+                "# Server\r\nredis_version:7.2.4\r\nredis_git_sha1:00000000\r\nredis_git_dirty:0\r\nredis_build_id:0\r\nredis_mode:{}\r\nos:Linux\r\narch_bits:64\r\nmultiplexing_api:{}\r\n{}rudis_version:{}\r\narch:shared-nothing-{}\r\nshard_id:{}\r\nnum_shards:{}\r\ntcp_port:{}\r\n",
+                if router.cluster_enabled { "cluster" } else { "standalone" },
                 io_driver_name(),
+                server_info_process_fields(),
+                env!("CARGO_PKG_VERSION"),
                 io_driver_name(),
                 router.shard_id,
                 router.num_shards,
                 router.port,
             );
-            let cpu_str = "# CPU\r\nused_cpu_sys:0.000000\r\nused_cpu_user:0.000000\r\nused_cpu_sys_children:0.000000\r\nused_cpu_user_children:0.000000\r\nused_cpu_sys_main_thread:0.000000\r\nused_cpu_user_main_thread:0.000000\r\n";
-            let repl_str = format!("# Replication\r\n{}", hub.format_info_replication());
+            let cpu_str = info_cpu_section();
+            // `format_info_replication` starts with its own header.
+            let repl_str = hub.format_info_replication();
             let sec_raw = section.as_deref().unwrap_or(b"default");
             let sec_text = String::from_utf8_lossy(sec_raw);
             let tokens: Vec<String> = sec_text
@@ -9458,7 +9529,7 @@ async fn execute_command(
                             "persistence" => acc.push_str(&persistence_str),
                             "stats" => acc.push_str(&stats_str),
                             "replication" => acc.push_str(&repl_str),
-                            "cpu" => acc.push_str(cpu_str),
+                            "cpu" => acc.push_str(&cpu_str),
                             "storage" => acc.push_str(&storage_str),
                             "commandstats" => acc.push_str(&cmdstat_str),
                             "latencystats" => acc.push_str(&latencystat_str),

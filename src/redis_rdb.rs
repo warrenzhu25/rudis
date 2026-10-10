@@ -2005,7 +2005,7 @@ pub fn load_file(
         let end = data.len() - 8;
         let expected = le_u64(data, end)?;
         if expected != 0 && expected != crate::table::crc64(&data[..end]) {
-            return corrupt("CRC64 checksum mismatch in RDB file");
+            return corrupt("RDB CRC error: CRC64 checksum mismatch in RDB file");
         }
         end
     } else {

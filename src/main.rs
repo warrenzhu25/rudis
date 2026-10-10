@@ -195,6 +195,7 @@ fn main() {
         libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
     }
 
+    rudis::connection::mark_server_start();
     rudis::telemetry::init_telemetry();
     rudis::shutdown::install_signal_handlers();
     let (clap_args, positional_config, extra_directives) =
