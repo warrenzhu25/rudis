@@ -840,6 +840,56 @@ fn latency_bucket(usec: u64) -> usize {
     }
 }
 
+/// `latency-tracking`: whether `INFO latencystats` reports percentiles.
+pub static LATENCY_TRACKING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// `latency-tracking-info-percentiles` (Redis default `50 99 99.9`).
+static LATENCY_PERCENTILES: parking_lot::RwLock<Vec<f64>> = parking_lot::RwLock::new(Vec::new());
+
+fn latency_percentiles() -> Vec<f64> {
+    let p = LATENCY_PERCENTILES.read();
+    if p.is_empty() {
+        vec![50.0, 99.0, 99.9]
+    } else {
+        p.clone()
+    }
+}
+
+/// Formats a percentile like Redis does in `INFO latencystats` and
+/// `CONFIG GET latency-tracking-info-percentiles` (`50`, `99.9`).
+fn format_percentile(p: f64) -> String {
+    let s = format!("{p:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// The `p`th percentile (0-100) of a command's latency in microseconds,
+/// interpolated inside the power-of-two histogram bucket it falls in.
+fn latency_percentile_usec(hist: &[u64; LATENCY_BUCKETS], calls: u64, p: f64) -> f64 {
+    if calls == 0 {
+        return 0.0;
+    }
+    let target = ((p / 100.0) * calls as f64).ceil().max(1.0);
+    let mut cum = 0u64;
+    for (i, &n) in hist.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        if (cum + n) as f64 >= target {
+            let upper = (1u64 << i) as f64;
+            let lower = if i == 0 {
+                0.0
+            } else {
+                (1u64 << (i - 1)) as f64
+            };
+            let frac = (target - cum as f64) / n as f64;
+            return lower + (upper - lower) * frac;
+        }
+        cum += n;
+    }
+    (1u64 << (LATENCY_BUCKETS - 1)) as f64
+}
+
 pub static CMD_STATS: std::sync::LazyLock<
     parking_lot::RwLock<hashbrown::HashMap<String, CmdStat>>,
 > = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
@@ -2708,6 +2758,24 @@ pub fn apply_config_value(
             crate::mailbox::set_cross_shard_spin(parse_config_num(name, val_str)?)
         }
         "idle-poll-us" => monoio::set_idle_poll_us(parse_config_num(name, val_str)?),
+        "latency-tracking" => {
+            LATENCY_TRACKING.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
+        }
+        "latency-tracking-info-percentiles" => {
+            let mut ps = Vec::new();
+            for t in val_str.split_whitespace() {
+                match t.parse::<f64>() {
+                    Ok(v) if (0.0..=100.0).contains(&v) => ps.push(v),
+                    _ => {
+                        return Err(format!(
+                            "ERR CONFIG SET failed (possibly related to argument '{}') - percentile should be between 0.0 and 100.0",
+                            name
+                        ));
+                    }
+                }
+            }
+            *LATENCY_PERCENTILES.write() = ps;
+        }
         "appendfsync" => {
             crate::aof::set_fsync_every_sec(base_port, crate::aof::parse_appendfsync(val_str)?)
         }
@@ -9154,6 +9222,35 @@ async fn execute_command(
                 }
                 s
             };
+            let latencystat_str = {
+                // Built from the same per-command histograms as LATENCY
+                // HISTOGRAM (flushed by the commandstats step above).
+                let mut s = String::from("# Latencystats\r\n");
+                if LATENCY_TRACKING.load(std::sync::atomic::Ordering::Relaxed) {
+                    let ps = latency_percentiles();
+                    let map = CMD_STATS.read();
+                    let mut entries: Vec<_> = map.iter().filter(|(_, st)| st.calls > 0).collect();
+                    entries.sort_by(|a, b| a.0.cmp(b.0));
+                    for (cmd, st) in entries {
+                        let fields: Vec<String> = ps
+                            .iter()
+                            .map(|&p| {
+                                format!(
+                                    "p{}={:.3}",
+                                    format_percentile(p),
+                                    latency_percentile_usec(&st.hist, st.calls, p)
+                                )
+                            })
+                            .collect();
+                        s.push_str(&format!(
+                            "latency_percentiles_usec_{}:{}\r\n",
+                            cmd,
+                            fields.join(",")
+                        ));
+                    }
+                }
+                s
+            };
             let errorstat_str = {
                 let mut s = String::from("# Errorstats\r\n");
                 {
@@ -9226,6 +9323,7 @@ async fn execute_command(
                                     "cpu",
                                     "storage",
                                     "commandstats",
+                                    "latencystats",
                                     "errorstats",
                                     "keyspace",
                                 ] {
@@ -9241,6 +9339,7 @@ async fn execute_command(
                             "cpu" => push_unique("cpu"),
                             "storage" | "tiered" => push_unique("storage"),
                             "commandstats" => push_unique("commandstats"),
+                            "latencystats" => push_unique("latencystats"),
                             "errorstats" => push_unique("errorstats"),
                             "keyspace" => push_unique("keyspace"),
                             _ => {}
@@ -9258,6 +9357,7 @@ async fn execute_command(
                             "cpu" => acc.push_str(cpu_str),
                             "storage" => acc.push_str(&storage_str),
                             "commandstats" => acc.push_str(&cmdstat_str),
+                            "latencystats" => acc.push_str(&latencystat_str),
                             "errorstats" => acc.push_str(&errorstat_str),
                             "keyspace" => {
                                 // Only fan out when the section is requested.
@@ -9578,9 +9678,25 @@ async fn execute_command(
                     } else {
                         "no"
                     };
-                    let all_configs: [(&str, String); 51] = [
+                    let all_configs: [(&str, String); 53] = [
                         ("port", port_str),
                         ("idle-poll-us", monoio::idle_poll_us().to_string()),
+                        (
+                            "latency-tracking",
+                            if LATENCY_TRACKING.load(std::sync::atomic::Ordering::Relaxed) {
+                                "yes".to_string()
+                            } else {
+                                "no".to_string()
+                            },
+                        ),
+                        (
+                            "latency-tracking-info-percentiles",
+                            latency_percentiles()
+                                .iter()
+                                .map(|p| format_percentile(*p))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
                         (
                             "protected-mode",
                             if crate::netsec::protected_mode(router.base_port) {
@@ -25055,6 +25171,21 @@ mod tests {
         record_client_read(port, cid, b"test_key");
 
         unregister_client_tracking(port, cid);
+    }
+
+    #[test]
+    fn test_latency_percentile_interpolates_in_bucket() {
+        let mut hist = [0u64; LATENCY_BUCKETS];
+        // 90 calls <= 1 us, 10 calls in (512, 1024] us.
+        hist[0] = 90;
+        hist[10] = 10;
+        assert!((latency_percentile_usec(&hist, 100, 50.0) - 50.0 / 90.0).abs() < 1e-9);
+        assert_eq!(latency_percentile_usec(&hist, 100, 90.0), 1.0);
+        assert_eq!(latency_percentile_usec(&hist, 100, 95.0), 768.0);
+        assert_eq!(latency_percentile_usec(&hist, 100, 100.0), 1024.0);
+        assert_eq!(latency_percentile_usec(&hist, 0, 50.0), 0.0);
+        assert_eq!(format_percentile(99.9), "99.9");
+        assert_eq!(format_percentile(50.0), "50");
     }
 
     #[test]
