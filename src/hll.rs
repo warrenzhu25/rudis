@@ -271,28 +271,60 @@ pub fn hll_create_from_regs(regs: &[u8; 16384], card_cache: Option<u64>) -> Vec<
     out
 }
 
-pub fn hll_compute_card(regs: &[u8; 16384]) -> u64 {
-    const M: f64 = 16384.0;
-    const ALPHA: f64 = 0.7213475204444817;
-    let mut sum = 0.0;
-    let mut zeros = 0;
-    for &val in regs.iter() {
-        sum += 2.0_f64.powi(-(val as i32));
-        if val == 0 {
-            zeros += 1;
+/// Redis's `hllSigma` (Ertl, arXiv:1702.01284).
+fn hll_sigma(mut x: f64) -> f64 {
+    if x == 1.0 {
+        return f64::INFINITY;
+    }
+    let mut y = 1.0;
+    let mut z = x;
+    loop {
+        x *= x;
+        let z_prime = z;
+        z += x * y;
+        y += y;
+        if z_prime == z {
+            return z;
         }
     }
+}
 
-    let raw_estimate = ALPHA * M * M / sum;
-    if raw_estimate <= 2.5 * M && zeros > 0 {
-        let count = M * (M / zeros as f64).ln();
-        count.round() as u64
-    } else if raw_estimate <= (1.0 / 30.0) * 4294967296.0 {
-        raw_estimate.round() as u64
-    } else {
-        let two_to_32 = 4294967296.0;
-        (-two_to_32 * (1.0 - raw_estimate / two_to_32).ln()).round() as u64
+/// Redis's `hllTau` (Ertl, arXiv:1702.01284).
+fn hll_tau(mut x: f64) -> f64 {
+    if x == 0.0 || x == 1.0 {
+        return 0.0;
     }
+    let mut y = 1.0;
+    let mut z = 1.0 - x;
+    loop {
+        x = x.sqrt();
+        let z_prime = z;
+        y *= 0.5;
+        z -= (1.0 - x).powi(2) * y;
+        if z_prime == z {
+            return z / 3.0;
+        }
+    }
+}
+
+/// The cardinality estimate, computed exactly as Redis's `hllCount`
+/// (the improved estimator from Ertl, arXiv:1702.01284), so PFCOUNT gives
+/// the same answer as Redis and Valkey for the same registers.
+pub fn hll_compute_card(regs: &[u8; 16384]) -> u64 {
+    const M: f64 = HLL_REGISTERS as f64;
+    const Q: usize = 64 - 14;
+    const ALPHA_INF: f64 = 0.721_347_520_444_481_7;
+    let mut histo = [0u32; 64];
+    for &val in regs.iter() {
+        histo[(val & 63) as usize] += 1;
+    }
+    let mut z = M * hll_tau((M - histo[Q + 1] as f64) / M);
+    for j in (1..=Q).rev() {
+        z += histo[j] as f64;
+        z *= 0.5;
+    }
+    z += M * hll_sigma(histo[0] as f64 / M);
+    (ALPHA_INF * M * M / z).round() as u64
 }
 
 pub fn hll_count(bytes: &mut [u8]) -> Result<u64, &'static str> {
