@@ -445,6 +445,8 @@ pub enum Command {
         retrycount: Option<usize>,
         force: bool,
         justid: bool,
+        /// `LASTID <id>`: raises the group's last-delivered-id to `id`.
+        lastid: Option<crate::table::StreamId>,
     },
     Xautoclaim {
         key: Bytes,
@@ -9096,87 +9098,85 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let key = args[1].clone();
             let group = args[2].clone();
             let consumer = args[3].clone();
-            let min_idle_time: u64 = std::str::from_utf8(&args[4])
-                .map_err(|_| "value is not an integer or out of range")?
-                .parse()
-                .map_err(|_| "value is not an integer or out of range")?;
+            let parse_i64 = |raw: &[u8], err: &str| -> Result<i64, String> {
+                std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .ok_or_else(|| err.to_string())
+            };
+            // Like Redis, a negative min-idle-time means 0.
+            let min_idle_time =
+                parse_i64(&args[4], "Invalid min-idle-time argument for XCLAIM")?.max(0) as u64;
 
+            // As in Redis, the IDs run up to the first argument that is not a
+            // valid ID; everything after it is an option.
             let mut ids = Vec::new();
+            let mut i = 5;
+            while i < args.len() {
+                let is_id = std::str::from_utf8(&args[i])
+                    .ok()
+                    .is_some_and(|s| crate::table::StreamId::parse_exact(s).is_ok());
+                if !is_id {
+                    break;
+                }
+                ids.push(args[i].clone());
+                i += 1;
+            }
+
             let mut idle = None;
             let mut time = None;
             let mut retrycount = None;
             let mut force = false;
             let mut justid = false;
-            let mut i = 5;
-            let mut in_opts = false;
-
+            let mut lastid = None;
             while i < args.len() {
+                let more = i + 1 < args.len();
                 let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
                 match tok.as_str() {
-                    "IDLE" => {
-                        in_opts = true;
-                        if i + 1 >= args.len() {
-                            return Err("syntax error".to_string());
-                        }
-                        idle = Some(
-                            std::str::from_utf8(&args[i + 1])
-                                .map_err(|_| "value is not an integer or out of range")?
-                                .parse()
-                                .map_err(|_| "value is not an integer or out of range")?,
-                        );
-                        i += 2;
-                    }
-                    "TIME" => {
-                        in_opts = true;
-                        if i + 1 >= args.len() {
-                            return Err("syntax error".to_string());
-                        }
-                        time = Some(
-                            std::str::from_utf8(&args[i + 1])
-                                .map_err(|_| "value is not an integer or out of range")?
-                                .parse()
-                                .map_err(|_| "value is not an integer or out of range")?,
-                        );
-                        i += 2;
-                    }
-                    "RETRYCOUNT" => {
-                        in_opts = true;
-                        if i + 1 >= args.len() {
-                            return Err("syntax error".to_string());
-                        }
-                        retrycount = Some(
-                            std::str::from_utf8(&args[i + 1])
-                                .map_err(|_| "value is not an integer or out of range")?
-                                .parse()
-                                .map_err(|_| "value is not an integer or out of range")?,
-                        );
-                        i += 2;
-                    }
-                    "FORCE" => {
-                        in_opts = true;
-                        force = true;
+                    "FORCE" => force = true,
+                    "JUSTID" => justid = true,
+                    // IDLE and TIME both set the delivery time: the last one
+                    // given wins. Negative values (or a time in the future)
+                    // mean "now", which `xclaim` applies.
+                    "IDLE" if more => {
                         i += 1;
+                        let v = parse_i64(&args[i], "Invalid IDLE option argument for XCLAIM")?;
+                        idle = Some(v.max(0) as u64);
+                        time = None;
                     }
-                    "JUSTID" => {
-                        in_opts = true;
-                        justid = true;
+                    "TIME" if more => {
                         i += 1;
+                        let v = parse_i64(&args[i], "Invalid TIME option argument for XCLAIM")?;
+                        if v < 0 {
+                            idle = Some(0);
+                            time = None;
+                        } else {
+                            time = Some(v as u64);
+                            idle = None;
+                        }
                     }
-                    "LASTID" => {
-                        in_opts = true;
-                        i += 2;
+                    "RETRYCOUNT" if more => {
+                        i += 1;
+                        let v =
+                            parse_i64(&args[i], "Invalid RETRYCOUNT option argument for XCLAIM")?;
+                        // A negative count is the same as no RETRYCOUNT.
+                        retrycount = (v >= 0).then_some(v as usize);
+                    }
+                    "LASTID" if more => {
+                        i += 1;
+                        let s = std::str::from_utf8(&args[i]).map_err(|_| {
+                            "Invalid stream ID specified as stream command argument".to_string()
+                        })?;
+                        lastid = Some(crate::table::StreamId::parse_exact(s)?);
                     }
                     _ => {
-                        if in_opts {
-                            return Err("syntax error".to_string());
-                        }
-                        ids.push(args[i].clone());
-                        i += 1;
+                        return Err(format!(
+                            "Unrecognized XCLAIM option '{}'",
+                            String::from_utf8_lossy(&args[i])
+                        ));
                     }
                 }
-            }
-            if ids.is_empty() {
-                return Err("wrong number of arguments for 'xclaim' command".to_string());
+                i += 1;
             }
             Ok(Some(Command::Xclaim {
                 key,
@@ -9189,6 +9189,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 retrycount,
                 force,
                 justid,
+                lastid,
             }))
         }
         "XAUTOCLAIM" => {
@@ -15510,8 +15511,107 @@ mod tests {
                 retrycount: None,
                 force: false,
                 justid: true,
+                lastid: None,
             }
         );
+
+        // The propagated form: every option, IDs ending at the first option.
+        let parse_args = |args: &[&str]| {
+            let mut s = format!("*{}\r\n", args.len());
+            for a in args {
+                s.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            parse_command(&mut BytesMut::from(s.as_str()))
+        };
+        let cmd = parse_args(&[
+            "XCLAIM",
+            "s1",
+            "g1",
+            "c2",
+            "0",
+            "1-1",
+            "2",
+            "TIME",
+            "1700000000000",
+            "RETRYCOUNT",
+            "3",
+            "FORCE",
+            "JUSTID",
+            "LASTID",
+            "5-0",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::Xclaim {
+                key: Bytes::from_static(b"s1"),
+                group: Bytes::from_static(b"g1"),
+                consumer: Bytes::from_static(b"c2"),
+                min_idle_time: 0,
+                ids: vec![Bytes::from_static(b"1-1"), Bytes::from_static(b"2")],
+                idle: None,
+                time: Some(1_700_000_000_000),
+                retrycount: Some(3),
+                force: true,
+                justid: true,
+                lastid: Some(crate::table::StreamId::new(5, 0)),
+            }
+        );
+        // Negative values behave like Redis: min-idle 0, delivery time now
+        // (IDLE 0), RETRYCOUNT ignored. The last of IDLE/TIME wins.
+        match parse_args(&[
+            "XCLAIM",
+            "s",
+            "g",
+            "c",
+            "-5",
+            "1-0",
+            "TIME",
+            "-1",
+            "RETRYCOUNT",
+            "-2",
+        ])
+        .unwrap()
+        .unwrap()
+        {
+            Command::Xclaim {
+                min_idle_time,
+                idle,
+                time,
+                retrycount,
+                ..
+            } => {
+                assert_eq!(
+                    (min_idle_time, idle, time, retrycount),
+                    (0, Some(0), None, None)
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_args(&[
+            "XCLAIM", "s", "g", "c", "0", "1-0", "IDLE", "10", "TIME", "99",
+        ])
+        .unwrap()
+        .unwrap()
+        {
+            Command::Xclaim { idle, time, .. } => assert_eq!((idle, time), (None, Some(99))),
+            other => panic!("unexpected {other:?}"),
+        }
+        // No IDs at all is accepted (nothing to claim), as in Redis.
+        assert!(matches!(
+            parse_args(&["XCLAIM", "s", "g", "c", "0", "FORCE"]).unwrap().unwrap(),
+            Command::Xclaim { ref ids, force: true, .. } if ids.is_empty()
+        ));
+        assert_eq!(
+            parse_args(&["XCLAIM", "s", "g", "c", "0", "1-0", "BOGUS"]).unwrap_err(),
+            "Unrecognized XCLAIM option 'BOGUS'"
+        );
+        assert_eq!(
+            parse_args(&["XCLAIM", "s", "g", "c", "x", "1-0"]).unwrap_err(),
+            "Invalid min-idle-time argument for XCLAIM"
+        );
+        assert!(parse_args(&["XCLAIM", "s", "g", "c", "0", "1-0", "LASTID", "nope"]).is_err());
 
         let mut buf = BytesMut::from(
             "*8\r\n$10\r\nXAUTOCLAIM\r\n$2\r\ns1\r\n$2\r\ng1\r\n$2\r\nc2\r\n$1\r\n0\r\n$3\r\n0-0\r\n$5\r\nCOUNT\r\n$2\r\n10\r\n",

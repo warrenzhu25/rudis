@@ -695,6 +695,8 @@ impl BlockHub {
     /// Called when XADD adds an entry to a stream.
     pub fn notify_stream(&mut self, db: &mut crate::shard::ShardDb, key: &Bytes) {
         if let Some(waiters) = self.stream_waiters.get_mut(key) {
+            let aof = crate::connection::CURRENT_ROUTER
+                .with(|cr| cr.borrow().as_ref().and_then(|r| r.aof.clone()));
             let mut satisfied = Vec::new();
             for (idx, waiter) in waiters.iter().enumerate() {
                 if waiter.sender.is_disconnected() {
@@ -708,7 +710,10 @@ impl BlockHub {
                 }
                 let mut out = Vec::new();
                 crate::connection::CURRENT_CLIENT_RESP3.set(waiter.is_resp3);
-                crate::connection::execute_local_command(&waiter.cmd, db, &mut out, None);
+                // Serving a blocked XREADGROUP changes the group; the command
+                // records that for the replicas and, with this shard's AOF
+                // writer, for the AOF.
+                crate::connection::execute_local_command(&waiter.cmd, db, &mut out, aof.as_deref());
                 let is_xread = matches!(waiter.cmd, crate::resp::Command::Xread { .. });
                 let empty = out == b"$-1\r\n"
                     || out == b"*0\r\n"
@@ -755,6 +760,7 @@ impl BlockHub {
 /// the same shard's AOF, as the data change itself.
 fn propagate_served(port: u16, cmd: &crate::resp::Command) {
     let Some(bytes) = crate::aof::command_to_resp(cmd) else {
+        crate::aof::note_unpropagated(cmd);
         return;
     };
     let mut shard_id = None;

@@ -176,6 +176,31 @@ pub fn rewrite_and_swap_shard_aof(
     Ok(count)
 }
 
+static UNPROPAGATED_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called when a command changed data but `command_to_resp` cannot encode
+/// it, so the change reaches neither the AOF nor the replicas. Counts it
+/// (INFO persistence `unpropagated_changes`) and logs a warning the first
+/// time each command does it.
+pub fn note_unpropagated(cmd: &Command) {
+    static WARNED: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashSet<&'static str>>,
+    > = std::sync::OnceLock::new();
+    UNPROPAGATED_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = crate::connection::get_cmd_name(cmd);
+    if WARNED.get_or_init(Default::default).lock().insert(name) {
+        crate::log_warning!(
+            "{} changed data but cannot be propagated to replicas/AOF: replicas and the AOF will miss this change",
+            name
+        );
+    }
+}
+
+/// Changes that could not be propagated to replicas or the AOF.
+pub fn unpropagated_changes() -> u64 {
+    UNPROPAGATED_CHANGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     match cmd {
@@ -772,61 +797,39 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        // XADD and XTRIM log their trim as given, which their handlers
+        // first make exact (see `stream_exact_trim_args`), and XADD logs the
+        // ID it generated. IDMP is never logged here: XADD with IDMP logs
+        // XIDMPRECORD after the entry instead.
         Command::Xadd {
             key,
             nomkstream,
             maxlen,
             minid,
-            approx: _,
-            trim_strategy: _,
+            approx,
+            trim_strategy,
             idmp: _,
             id,
             fields,
-            limit: _,
+            limit,
         } => {
-            let mut num_args = 2 + 1 + fields.len() * 2;
+            let mut args: Vec<Vec<u8>> = vec![b"XADD".to_vec(), key.to_vec()];
             if *nomkstream {
-                num_args += 1;
+                args.push(b"NOMKSTREAM".to_vec());
             }
-            if maxlen.is_some() {
-                num_args += 2;
-            }
-            if minid.is_some() {
-                num_args += 2;
-            }
-            buf.extend_from_slice(
-                format!("*{}\r\n$4\r\nXADD\r\n${}\r\n", num_args, key.len()).as_bytes(),
-            );
-            buf.extend_from_slice(key);
-            buf.extend_from_slice(b"\r\n");
-            if *nomkstream {
-                buf.extend_from_slice(b"$10\r\nNOMKSTREAM\r\n");
-            }
-            if let Some(max) = maxlen {
-                let max_str = max.to_string();
-                buf.extend_from_slice(b"$6\r\nMAXLEN\r\n");
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", max_str.len(), max_str).as_bytes());
-            }
-            if let Some(min) = minid {
-                let min_str = min.to_string();
-                buf.extend_from_slice(b"$5\r\nMINID\r\n");
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", min_str.len(), min_str).as_bytes());
-            }
+            push_stream_trim_strategy(&mut args, *trim_strategy);
+            push_stream_trim_args(&mut args, *maxlen, *minid, *approx, *limit);
             let id_str = match id {
                 crate::table::StreamAddId::Explicit(sid) => sid.to_string(),
                 crate::table::StreamAddId::AutoSeq(ms) => format!("{}-*", ms),
                 crate::table::StreamAddId::Auto => "*".to_string(),
             };
-            buf.extend_from_slice(format!("${}\r\n{}\r\n", id_str.len(), id_str).as_bytes());
+            args.push(id_str.into_bytes());
             for (k, v) in fields {
-                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(b"\r\n");
-                buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                buf.extend_from_slice(v);
-                buf.extend_from_slice(b"\r\n");
+                args.push(k.to_vec());
+                args.push(v.to_vec());
             }
-            Some(buf)
+            Some(resp_argv(&args))
         }
         Command::Xdel { key, ids } => {
             buf.extend_from_slice(
@@ -863,33 +866,48 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             key,
             maxlen,
             minid,
-            approx: _,
-            trim_strategy: _,
-            limit: _,
+            approx,
+            trim_strategy,
+            limit,
         } => {
-            let mut num_args = 2;
-            if maxlen.is_some() {
-                num_args += 2;
+            let mut args: Vec<Vec<u8>> = vec![b"XTRIM".to_vec(), key.to_vec()];
+            push_stream_trim_args(&mut args, *maxlen, *minid, *approx, *limit);
+            push_stream_trim_strategy(&mut args, *trim_strategy);
+            Some(resp_argv(&args))
+        }
+        Command::Xcfgset {
+            key,
+            duration,
+            maxsize,
+        } => {
+            let mut args: Vec<Vec<u8>> = vec![b"XCFGSET".to_vec(), key.to_vec()];
+            if let Some(d) = duration {
+                args.push(b"IDMP-DURATION".to_vec());
+                args.push(d.to_string().into_bytes());
             }
-            if minid.is_some() {
-                num_args += 2;
+            if let Some(m) = maxsize {
+                args.push(b"IDMP-MAXSIZE".to_vec());
+                args.push(m.to_string().into_bytes());
             }
-            buf.extend_from_slice(
-                format!("*{}\r\n$5\r\nXTRIM\r\n${}\r\n", num_args, key.len()).as_bytes(),
-            );
-            buf.extend_from_slice(key);
-            buf.extend_from_slice(b"\r\n");
-            if let Some(max) = maxlen {
-                let max_str = max.to_string();
-                buf.extend_from_slice(b"$6\r\nMAXLEN\r\n");
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", max_str.len(), max_str).as_bytes());
-            }
-            if let Some(min) = minid {
-                let min_str = min.to_string();
-                buf.extend_from_slice(b"$5\r\nMINID\r\n");
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", min_str.len(), min_str).as_bytes());
-            }
-            Some(buf)
+            Some(resp_argv(&args))
+        }
+        // XDELEX and XACKDEL are deterministic: they are logged as given.
+        Command::Xdelex { key, strategy, ids } => {
+            let mut args: Vec<Vec<u8>> = vec![b"XDELEX".to_vec(), key.to_vec()];
+            push_stream_trim_strategy(&mut args, *strategy);
+            push_stream_ids(&mut args, ids);
+            Some(resp_argv(&args))
+        }
+        Command::Xackdel {
+            key,
+            group,
+            strategy,
+            ids,
+        } => {
+            let mut args: Vec<Vec<u8>> = vec![b"XACKDEL".to_vec(), key.to_vec(), group.to_vec()];
+            push_stream_trim_strategy(&mut args, *strategy);
+            push_stream_ids(&mut args, ids);
+            Some(resp_argv(&args))
         }
         Command::XgroupCreate {
             key,
@@ -1515,6 +1533,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             retrycount,
             force,
             justid,
+            lastid,
         } => {
             let mut args: Vec<Vec<u8>> = vec![
                 b"XCLAIM".to_vec(),
@@ -1543,6 +1562,10 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             if *justid {
                 args.push(b"JUSTID".to_vec());
+            }
+            if let Some(l) = lastid {
+                args.push(b"LASTID".to_vec());
+                args.push(l.to_string().into_bytes());
             }
             buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
             for a in args {
@@ -2351,6 +2374,50 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         Command::Delex { key, .. } => Some(resp_argv(&[b"DEL".as_slice(), key])),
         _ => None,
     }
+}
+
+/// `[KEEPREF | DELREF | ACKED]`; KEEPREF, the default, is left out so the
+/// command stays valid for servers without the Redis 8.2 strategies.
+fn push_stream_trim_strategy(args: &mut Vec<Vec<u8>>, strategy: crate::table::StreamTrimStrategy) {
+    match strategy {
+        crate::table::StreamTrimStrategy::KeepRef => {}
+        crate::table::StreamTrimStrategy::DelRef => args.push(b"DELREF".to_vec()),
+        crate::table::StreamTrimStrategy::Acked => args.push(b"ACKED".to_vec()),
+    }
+}
+
+/// `MAXLEN|MINID <=|~> <threshold> [LIMIT <count>]` for each threshold given.
+fn push_stream_trim_args(
+    args: &mut Vec<Vec<u8>>,
+    maxlen: Option<usize>,
+    minid: Option<crate::table::StreamId>,
+    approx: bool,
+    limit: Option<usize>,
+) {
+    let op: &[u8] = if approx { b"~" } else { b"=" };
+    if let Some(max) = maxlen {
+        args.push(b"MAXLEN".to_vec());
+        args.push(op.to_vec());
+        args.push(max.to_string().into_bytes());
+    }
+    if let Some(min) = minid {
+        args.push(b"MINID".to_vec());
+        args.push(op.to_vec());
+        args.push(min.to_string().into_bytes());
+    }
+    if let Some(l) = limit
+        && (maxlen.is_some() || minid.is_some())
+    {
+        args.push(b"LIMIT".to_vec());
+        args.push(l.to_string().into_bytes());
+    }
+}
+
+/// `IDS <numids> <id> ...`
+fn push_stream_ids(args: &mut Vec<Vec<u8>>, ids: &[crate::table::StreamId]) {
+    args.push(b"IDS".to_vec());
+    args.push(ids.len().to_string().into_bytes());
+    args.extend(ids.iter().map(|id| id.to_string().into_bytes()));
 }
 
 /// Encodes `args` as a RESP array of bulk strings.
@@ -3692,6 +3759,24 @@ mod tests {
             "XSETID s 9-9",
             "XGROUP CREATECONSUMER s g c",
             "XGROUP DELCONSUMER s g c",
+            "XGROUP SETID s g 5-0 ENTRIESREAD 3",
+            "XADD s NOMKSTREAM MAXLEN = 10 1-1 f v",
+            "XADD s DELREF MINID = 5-0 2-0 f v g w",
+            "XADD s ACKED MAXLEN ~ 10 LIMIT 5 3-0 f v",
+            "XADD s 1-* f v",
+            "XTRIM s MAXLEN = 10",
+            "XTRIM s MINID ~ 5-0 LIMIT 100 ACKED",
+            "XTRIM s MAXLEN = 0 DELREF",
+            "XCFGSET s IDMP-DURATION 60 IDMP-MAXSIZE 50",
+            "XCFGSET s IDMP-MAXSIZE 5",
+            "XDELEX s IDS 2 1-0 2-0",
+            "XDELEX s ACKED IDS 1 1-0",
+            "XACKDEL s g DELREF IDS 1 1-0",
+            "XACKDEL s g IDS 2 1-0 3-5",
+            "XCLAIM s g c 0 1-0 TIME 1700000000000 RETRYCOUNT 2 FORCE JUSTID LASTID 4-0",
+            "XCLAIM s g c 10 1-0 2-0 IDLE 5",
+            "XIDMPRECORD s p i 1-0",
+            "XNACK s g FAIL IDS 1 1-0",
         ];
         for line in round_trip {
             let cmd = parse_line(line);
@@ -3758,6 +3843,18 @@ mod tests {
             assert!(cmd.is_write_command(), "{line} should be a write");
             assert!(command_to_resp(&cmd).is_some(), "{line} not encoded");
         }
+    }
+
+    /// A change `command_to_resp` cannot encode is counted (and logged once
+    /// per command) instead of silently vanishing from the AOF/replicas.
+    #[test]
+    fn test_unencodable_changes_are_counted() {
+        let cmd = parse_line("PFDEBUG TODENSE h");
+        assert!(command_to_resp(&cmd).is_none());
+        let before = unpropagated_changes();
+        note_unpropagated(&cmd);
+        note_unpropagated(&cmd);
+        assert!(unpropagated_changes() >= before + 2);
     }
 
     #[test]

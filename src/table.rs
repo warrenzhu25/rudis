@@ -1163,6 +1163,28 @@ pub struct StreamGroup {
     pub next_nack_seq: u64,
 }
 
+/// What an XCLAIM or XAUTOCLAIM did, for its reply and its propagation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamClaimOutcome {
+    /// The claimed entries in claim order (fields are empty for JUSTID).
+    pub claimed: Vec<(StreamId, Vec<(Bytes, Bytes)>)>,
+    /// PEL entries dropped because their stream entry no longer exists.
+    pub deleted: Vec<(StreamId, StreamPelEntry)>,
+    pub consumer_created: bool,
+    /// XCLAIM's LASTID raised the group's last-delivered-id.
+    pub last_id_advanced: bool,
+}
+
+/// A consumer group's cursor and some of its PEL entries, read after a
+/// command changed them so the change can be propagated as Redis does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamGroupSnapshot {
+    pub last_delivered_id: StreamId,
+    pub entries_read: Option<u64>,
+    /// The requested PEL entries that exist and whose stream entry exists.
+    pub pel: Vec<(StreamId, StreamPelEntry)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RudisStream {
     pub entries: std::collections::BTreeMap<StreamId, Vec<(Bytes, Bytes)>>,
@@ -6707,6 +6729,11 @@ impl RudisTable {
         Ok(true)
     }
 
+    /// XCLAIM, with Redis's semantics (`xclaimCommand` in t_stream.c): the
+    /// IDs are claimed for `consumer` if idle for at least `min_idle_time`
+    /// (FORCE also creates missing PEL entries, but does not skip the idle
+    /// check of existing ones), PEL entries whose stream entry is gone are
+    /// dropped, and `lastid` raises the group's last-delivered-id.
     #[allow(clippy::too_many_arguments)]
     pub fn xclaim(
         &mut self,
@@ -6720,7 +6747,8 @@ impl RudisTable {
         retrycount: Option<usize>,
         force: bool,
         justid: bool,
-    ) -> Result<(Vec<(StreamId, Vec<(Bytes, Bytes)>)>, bool), String> {
+        lastid: Option<StreamId>,
+    ) -> Result<StreamClaimOutcome, String> {
         let h = hash_key(key);
         let Some(idx) = self.table.find(key, h) else {
             return Err("NOGROUP No such key or consumer group".to_string());
@@ -6739,20 +6767,34 @@ impl RudisTable {
         let Some(grp) = stream.groups.get_mut(group) else {
             return Err("NOGROUP No such key or consumer group".to_string());
         };
+        // Parse every ID first: the command is all or nothing.
+        let mut sids = Vec::with_capacity(ids.len());
+        for raw_id in ids {
+            let s = std::str::from_utf8(raw_id)
+                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+            sids.push(StreamId::parse_exact(s).map_err(|e| e.to_string())?);
+        }
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let target_delivery_time = if let Some(t) = time {
-            t
-        } else if let Some(id_ms) = idle {
-            now_ms.saturating_sub(id_ms)
-        } else {
-            now_ms
+        // A delivery time in the future (or before the epoch) means now.
+        let delivery_time = match (time, idle) {
+            (Some(t), _) if t <= now_ms => t,
+            (None, Some(i)) => now_ms.checked_sub(i).unwrap_or(now_ms),
+            _ => now_ms,
         };
 
-        let consumer_created = !grp.consumers.contains_key(&consumer);
+        let mut outcome = StreamClaimOutcome::default();
+        if let Some(l) = lastid
+            && l > grp.last_delivered_id
+        {
+            grp.last_delivered_id = l;
+            outcome.last_id_advanced = true;
+        }
+
+        outcome.consumer_created = !grp.consumers.contains_key(&consumer);
         grp.consumers
             .entry(consumer.clone())
             .and_modify(|c| c.seen_time_ms = now_ms)
@@ -6763,71 +6805,67 @@ impl RudisTable {
                 pel: std::collections::BTreeMap::new(),
             });
 
-        let mut claimed = Vec::new();
-        for raw_id in ids {
-            let s = std::str::from_utf8(raw_id)
-                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
-            let sid = StreamId::parse_exact(s).map_err(|e| e.to_string())?;
-
-            if let Some(pel_entry) = grp.pel.get(&sid).cloned() {
-                let elapsed = now_ms.saturating_sub(pel_entry.delivery_time_ms);
-                if elapsed < min_idle_time && !force {
-                    continue;
-                }
-                let Some(fields) = stream.entries.get(&sid).cloned() else {
+        for sid in sids {
+            let existing = grp.pel.get(&sid).cloned();
+            let Some(fields) = stream.entries.get(&sid) else {
+                // The entry is gone: drop its PEL entry.
+                if let Some(pe) = existing {
                     grp.pel.remove(&sid);
-                    if let Some(old_c) = grp.consumers.get_mut(&pel_entry.consumer) {
+                    if let Some(old_c) = grp.consumers.get_mut(&pe.consumer) {
                         old_c.pel.remove(&sid);
                     }
-                    continue;
-                };
-                if let Some(old_c) = grp.consumers.get_mut(&pel_entry.consumer) {
-                    old_c.pel.remove(&sid);
+                    outcome.deleted.push((sid, pe));
                 }
-                let new_count = retrycount.unwrap_or_else(|| {
-                    if justid {
-                        pel_entry.delivery_count
-                    } else {
-                        pel_entry.delivery_count.saturating_add(1)
+                continue;
+            };
+            let prev_count = match &existing {
+                Some(pe) => {
+                    if min_idle_time > 0
+                        && now_ms.saturating_sub(pe.delivery_time_ms) < min_idle_time
+                    {
+                        continue;
                     }
-                });
-                if let Some(pe) = grp.pel.get_mut(&sid) {
-                    pe.consumer = consumer.clone();
-                    pe.delivery_time_ms = target_delivery_time;
-                    pe.delivery_count = new_count;
+                    if pe.consumer != consumer
+                        && let Some(old_c) = grp.consumers.get_mut(&pe.consumer)
+                    {
+                        old_c.pel.remove(&sid);
+                    }
+                    pe.delivery_count
                 }
-                if let Some(new_c) = grp.consumers.get_mut(&consumer) {
-                    new_c.pel.insert(sid, target_delivery_time);
-                }
-                claimed.push((sid, fields));
-            } else if force && let Some(fields) = stream.entries.get(&sid).cloned() {
-                let new_count = retrycount.unwrap_or(1);
-                grp.pel.insert(
-                    sid,
-                    StreamPelEntry {
-                        consumer: consumer.clone(),
-                        delivery_time_ms: target_delivery_time,
-                        delivery_count: new_count,
-                        nack_seq: 0,
-                    },
-                );
-                if let Some(new_c) = grp.consumers.get_mut(&consumer) {
-                    new_c.pel.insert(sid, target_delivery_time);
-                }
-                claimed.push((sid, fields));
+                // Like a NACK created by Redis, a forced entry starts at 1.
+                None if force => 1,
+                None => continue,
+            };
+            let delivery_count = match retrycount {
+                Some(r) => r,
+                None if justid => prev_count,
+                None => prev_count.saturating_add(1),
+            };
+            grp.pel.insert(
+                sid,
+                StreamPelEntry {
+                    consumer: consumer.clone(),
+                    delivery_time_ms: delivery_time,
+                    delivery_count,
+                    nack_seq: 0,
+                },
+            );
+            if let Some(new_c) = grp.consumers.get_mut(&consumer) {
+                new_c.pel.insert(sid, delivery_time);
             }
+            let fields = if justid { Vec::new() } else { fields.clone() };
+            outcome.claimed.push((sid, fields));
         }
 
-        if !claimed.is_empty()
+        if !outcome.claimed.is_empty()
             && let Some(new_c) = grp.consumers.get_mut(&consumer)
         {
             new_c.active_time_ms = Some(now_ms);
         }
 
-        Ok((claimed, consumer_created))
+        Ok(outcome)
     }
 
-    #[allow(clippy::type_complexity)]
     pub fn xautoclaim(
         &mut self,
         key: &[u8],
@@ -6837,15 +6875,7 @@ impl RudisTable {
         start: &[u8],
         count: usize,
         justid: bool,
-    ) -> Result<
-        (
-            String,
-            Vec<(StreamId, Vec<(Bytes, Bytes)>)>,
-            Vec<StreamId>,
-            bool,
-        ),
-        String,
-    > {
+    ) -> Result<(String, StreamClaimOutcome), String> {
         let start_s = std::str::from_utf8(start)
             .map_err(|_| "Invalid stream ID specified as stream command argument")?;
         let start_id = if start_s == "-" || start_s == "0" || start_s == "0-0" {
@@ -6902,8 +6932,10 @@ impl RudisTable {
             "0-0".to_string()
         };
 
-        let mut claimed = Vec::new();
-        let mut deleted_ids = Vec::new();
+        let mut outcome = StreamClaimOutcome {
+            consumer_created,
+            ..Default::default()
+        };
 
         for (sid, pel_entry) in candidates.into_iter().take(count) {
             let Some(fields) = stream.entries.get(&sid).cloned() else {
@@ -6911,7 +6943,7 @@ impl RudisTable {
                 if let Some(old_c) = grp.consumers.get_mut(&pel_entry.consumer) {
                     old_c.pel.remove(&sid);
                 }
-                deleted_ids.push(sid);
+                outcome.deleted.push((sid, pel_entry));
                 continue;
             };
 
@@ -6923,6 +6955,7 @@ impl RudisTable {
                 if let Some(pe) = grp.pel.get_mut(&sid) {
                     pe.consumer = consumer.clone();
                     pe.delivery_time_ms = now_ms;
+                    pe.nack_seq = 0;
                     if !justid {
                         pe.delivery_count = pe.delivery_count.saturating_add(1);
                     }
@@ -6930,17 +6963,102 @@ impl RudisTable {
                 if let Some(new_c) = grp.consumers.get_mut(&consumer) {
                     new_c.pel.insert(sid, now_ms);
                 }
-                claimed.push((sid, fields));
+                outcome.claimed.push((sid, fields));
             }
         }
 
-        if !claimed.is_empty()
+        if !outcome.claimed.is_empty()
             && let Some(new_c) = grp.consumers.get_mut(&consumer)
         {
             new_c.active_time_ms = Some(now_ms);
         }
 
-        Ok((next_cursor, claimed, deleted_ids, consumer_created))
+        Ok((next_cursor, outcome))
+    }
+
+    fn stream_group_ref(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+    ) -> Option<(&RudisStream, &StreamGroup)> {
+        let idx = self.table.find(key, hash_key(key))?;
+        match &self.table.get_slot(idx)?.val {
+            RudisValue::Stream(s) => Some((s, s.groups.get(group)?)),
+            _ => None,
+        }
+    }
+
+    /// The group's last-delivered-id, entries-read and the PEL entries of
+    /// `ids` (skipping IDs not pending or no longer in the stream), or None
+    /// if the stream or group does not exist.
+    pub fn stream_group_snapshot(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        ids: &[StreamId],
+    ) -> Option<StreamGroupSnapshot> {
+        let (stream, grp) = self.stream_group_ref(key, group)?;
+        let pel = ids
+            .iter()
+            .filter(|id| stream.entries.contains_key(id))
+            .filter_map(|id| grp.pel.get(id).map(|pe| (*id, pe.clone())))
+            .collect();
+        Some(StreamGroupSnapshot {
+            last_delivered_id: grp.last_delivered_id,
+            entries_read: grp.entries_read,
+            pel,
+        })
+    }
+
+    /// Whether `group` of the stream at `key` has a consumer named `consumer`.
+    pub fn stream_has_consumer(&mut self, key: &[u8], group: &[u8], consumer: &[u8]) -> bool {
+        self.stream_group_ref(key, group)
+            .is_some_and(|(_, grp)| grp.consumers.contains_key(consumer))
+    }
+
+    /// The exact `(MAXLEN, MINID)` thresholds that make an exact trim (no
+    /// `~`, no LIMIT) of the stream as it was reproduce the trim that just
+    /// left it as it is now, given the trim's original thresholds. Like
+    /// Redis's `streamRewriteTrimArgument`, MAXLEN becomes the stream's
+    /// length and MINID its first ID (the maximum ID if it is empty). An
+    /// ACKED MINID trim only removes acknowledged entries, so it becomes the
+    /// first remaining acknowledged entry below the original MINID, if any.
+    pub fn stream_exact_trim_args(
+        &mut self,
+        key: &[u8],
+        maxlen: Option<usize>,
+        minid: Option<StreamId>,
+        strategy: StreamTrimStrategy,
+    ) -> (Option<usize>, Option<StreamId>) {
+        let stream = self.table.find(key, hash_key(key)).and_then(|idx| {
+            match &self.table.get_slot(idx)?.val {
+                RudisValue::Stream(s) => Some(s.as_ref()),
+                _ => None,
+            }
+        });
+        let Some(stream) = stream else {
+            return (maxlen, minid);
+        };
+        let exact_maxlen = maxlen.map(|_| stream.entries.len());
+        let exact_minid = minid.map(|orig| {
+            if strategy == StreamTrimStrategy::Acked {
+                stream
+                    .entries
+                    .keys()
+                    .take_while(|id| **id < orig)
+                    .find(|id| Self::is_entry_acked(&stream.groups, id))
+                    .copied()
+                    .unwrap_or(orig)
+            } else {
+                stream
+                    .entries
+                    .keys()
+                    .next()
+                    .copied()
+                    .unwrap_or(StreamId::new(u64::MAX, u64::MAX))
+            }
+        });
+        (exact_maxlen, exact_minid)
     }
 
     pub fn hget(&mut self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>, &'static str> {
@@ -15162,7 +15280,7 @@ impl RudisTable {
                                 grp.last_delivered_id = *id;
                             }
                             if !noack {
-                                grp.pel.insert(
+                                if let Some(prev) = grp.pel.insert(
                                     *id,
                                     StreamPelEntry {
                                         consumer: consumer.clone(),
@@ -15170,7 +15288,11 @@ impl RudisTable {
                                         delivery_count: 1,
                                         nack_seq: 0,
                                     },
-                                );
+                                ) && prev.consumer != consumer
+                                    && let Some(old_c) = grp.consumers.get_mut(&prev.consumer)
+                                {
+                                    old_c.pel.remove(id);
+                                }
                                 let cons = grp.consumers.get_mut(&consumer).unwrap();
                                 cons.pel.insert(*id, now);
                             }
@@ -15208,6 +15330,11 @@ impl RudisTable {
                         cons.active_time_ms = Some(now);
                     }
                     for (id, _, _) in &results {
+                        // Like Redis, an entry deleted from the stream is
+                        // reported but its delivery metadata is untouched.
+                        if !stream.entries.contains_key(id) {
+                            continue;
+                        }
                         if let Some(pel_entry) = grp.pel.get_mut(id) {
                             pel_entry.delivery_time_ms = now;
                             pel_entry.delivery_count = pel_entry.delivery_count.saturating_add(1);
@@ -18455,6 +18582,318 @@ mod tests {
         assert_eq!(table.zscore(b"restored_z", b"m2").unwrap(), Some(20.0));
     }
 
+    fn stream_test_add(t: &mut RudisTable, key: &'static [u8], ms: u64) {
+        t.xadd(
+            Bytes::from_static(key),
+            StreamAddId::Explicit(StreamId::new(ms, 0)),
+            vec![(Bytes::from_static(b"f"), Bytes::from(ms.to_string()))],
+            false,
+            None,
+            None,
+            false,
+            StreamTrimStrategy::KeepRef,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    fn stream_test_read(t: &mut RudisTable, key: &[u8], consumer: &'static [u8], count: usize) {
+        let (mut e, mut b) = (0, 0);
+        t.xreadgroup(
+            key,
+            b"g",
+            Bytes::from_static(consumer),
+            ">",
+            Some(count),
+            false,
+            None,
+            usize::MAX,
+            &mut e,
+            &mut b,
+        )
+        .unwrap();
+    }
+
+    fn stream_test_get(t: &mut RudisTable, key: &[u8]) -> RudisStream {
+        let idx = t.table.find(key, hash_key(key)).unwrap();
+        match &t.table.get_slot(idx).unwrap().val {
+            RudisValue::Stream(s) => (**s).clone(),
+            _ => panic!("not a stream"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_test_claim(
+        t: &mut RudisTable,
+        consumer: &'static [u8],
+        min_idle: u64,
+        id: &'static [u8],
+        time: Option<u64>,
+        retrycount: Option<usize>,
+        force: bool,
+        justid: bool,
+        lastid: Option<StreamId>,
+    ) -> StreamClaimOutcome {
+        t.xclaim(
+            b"s",
+            b"g",
+            Bytes::from_static(consumer),
+            min_idle,
+            &[Bytes::from_static(id)],
+            None,
+            time,
+            retrycount,
+            force,
+            justid,
+            lastid,
+        )
+        .unwrap()
+    }
+
+    /// XCLAIM behaves like Redis's xclaimCommand, which replicas and AOF
+    /// replay depend on.
+    #[test]
+    fn test_xclaim_redis_semantics() {
+        let mut t = RudisTable::new();
+        for ms in 1..=4 {
+            stream_test_add(&mut t, b"s", ms);
+        }
+        t.xgroup_create(
+            Bytes::from_static(b"s"),
+            Bytes::from_static(b"g"),
+            "0",
+            false,
+            None,
+        )
+        .unwrap();
+        stream_test_read(&mut t, b"s", b"c1", 2);
+        let id = |ms| StreamId::new(ms, 0);
+        let pel = |t: &mut RudisTable, ms| {
+            t.stream_group_snapshot(b"s", b"g", &[id(ms)])
+                .unwrap()
+                .pel
+                .first()
+                .map(|(_, pe)| pe.clone())
+        };
+
+        // FORCE does not skip the idle check of an existing entry.
+        let o = stream_test_claim(
+            &mut t, b"c2", 1_000_000, b"1-0", None, None, true, false, None,
+        );
+        assert!(o.claimed.is_empty());
+        assert!(o.consumer_created);
+        assert_eq!(pel(&mut t, 1).unwrap().consumer, Bytes::from_static(b"c1"));
+
+        // A forced new entry starts at 1, +1 without JUSTID.
+        let o = stream_test_claim(&mut t, b"c2", 0, b"3-0", None, None, true, false, None);
+        assert_eq!(o.claimed.len(), 1);
+        assert_eq!(pel(&mut t, 3).unwrap().delivery_count, 2);
+        stream_test_claim(&mut t, b"c2", 0, b"4-0", None, None, true, true, None);
+        assert_eq!(pel(&mut t, 4).unwrap().delivery_count, 1);
+
+        // The propagated form recreates the entry exactly; a TIME in the
+        // future means now.
+        let o = stream_test_claim(
+            &mut t,
+            b"c3",
+            0,
+            b"1-0",
+            Some(1_000),
+            Some(7),
+            true,
+            true,
+            Some(id(9)),
+        );
+        assert_eq!(o.claimed, vec![(id(1), Vec::new())]);
+        assert!(o.last_id_advanced);
+        let pe = pel(&mut t, 1).unwrap();
+        assert_eq!(
+            (pe.consumer, pe.delivery_time_ms, pe.delivery_count),
+            (Bytes::from_static(b"c3"), 1_000, 7)
+        );
+        let s = stream_test_get(&mut t, b"s");
+        let g = &s.groups[&Bytes::from_static(b"g")];
+        assert_eq!(g.last_delivered_id, id(9));
+        assert!(
+            !g.consumers[&Bytes::from_static(b"c1")]
+                .pel
+                .contains_key(&id(1))
+        );
+        assert!(
+            g.consumers[&Bytes::from_static(b"c3")]
+                .pel
+                .contains_key(&id(1))
+        );
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let o = stream_test_claim(
+            &mut t,
+            b"c3",
+            0,
+            b"2-0",
+            Some(u64::MAX),
+            None,
+            false,
+            true,
+            Some(id(5)),
+        );
+        assert!(!o.last_id_advanced, "LASTID only moves the group forward");
+        let pe = pel(&mut t, 2).unwrap();
+        assert!(pe.delivery_time_ms >= before && pe.delivery_time_ms < u64::MAX);
+        assert_eq!(pe.delivery_count, 1, "JUSTID keeps the count");
+
+        // Claiming a deleted entry drops its PEL entry and reports it.
+        t.xdel(b"s", &[id(2)]).unwrap();
+        let o = stream_test_claim(&mut t, b"c1", 0, b"2-0", None, None, true, false, None);
+        assert!(o.claimed.is_empty());
+        assert_eq!(o.deleted.len(), 1);
+        assert_eq!(o.deleted[0].1.consumer, Bytes::from_static(b"c3"));
+        assert!(
+            !stream_test_get(&mut t, b"s").groups[&Bytes::from_static(b"g")]
+                .pel
+                .contains_key(&id(2))
+        );
+    }
+
+    /// An approximate or LIMITed trim, rewritten by `stream_exact_trim_args`
+    /// and replayed exactly on a copy of the stream, leaves the same stream.
+    #[test]
+    fn test_stream_exact_trim_args_reproduce_trims() {
+        // 250 entries in nodes of 100; group "g" has everything delivered
+        // and acknowledged except 5-0 and 10-0.
+        let build = || {
+            let mut t = RudisTable::new();
+            for ms in 1..=250 {
+                stream_test_add(&mut t, b"s", ms);
+            }
+            t.xgroup_create(
+                Bytes::from_static(b"s"),
+                Bytes::from_static(b"g"),
+                "0",
+                false,
+                None,
+            )
+            .unwrap();
+            stream_test_read(&mut t, b"s", b"c", 250);
+            let acked: Vec<StreamId> = (1..=250)
+                .filter(|ms| *ms != 5 && *ms != 10)
+                .map(|ms| StreamId::new(ms, 0))
+                .collect();
+            t.xack(b"s", b"g", &acked).unwrap();
+            t
+        };
+        let shape = |t: &mut RudisTable| {
+            let s = stream_test_get(t, b"s");
+            let g = &s.groups[&Bytes::from_static(b"g")];
+            (
+                s.entries.keys().copied().collect::<Vec<_>>(),
+                g.pel.keys().copied().collect::<Vec<_>>(),
+                g.consumers[&Bytes::from_static(b"c")]
+                    .pel
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        type Case = (
+            Option<usize>,
+            Option<StreamId>,
+            StreamTrimStrategy,
+            Option<usize>,
+        );
+        let cases: &[Case] = &[
+            (Some(120), None, StreamTrimStrategy::KeepRef, None),
+            (Some(120), None, StreamTrimStrategy::DelRef, None),
+            (Some(10), None, StreamTrimStrategy::KeepRef, Some(150)),
+            (Some(240), None, StreamTrimStrategy::Acked, Some(4)),
+            (
+                None,
+                Some(StreamId::new(130, 0)),
+                StreamTrimStrategy::KeepRef,
+                None,
+            ),
+            (
+                None,
+                Some(StreamId::new(130, 0)),
+                StreamTrimStrategy::DelRef,
+                None,
+            ),
+            (
+                None,
+                Some(StreamId::new(50, 0)),
+                StreamTrimStrategy::Acked,
+                Some(10),
+            ),
+            (
+                None,
+                Some(StreamId::new(50, 0)),
+                StreamTrimStrategy::Acked,
+                None,
+            ),
+            (
+                None,
+                Some(StreamId::new(999, 0)),
+                StreamTrimStrategy::KeepRef,
+                None,
+            ),
+        ];
+        for &(maxlen, minid, strategy, limit) in cases {
+            let mut master = build();
+            let mut replica = build();
+            master
+                .xtrim(b"s", maxlen, minid, true, strategy, limit)
+                .unwrap();
+            let (m, n) = master.stream_exact_trim_args(b"s", maxlen, minid, strategy);
+            replica.xtrim(b"s", m, n, false, strategy, None).unwrap();
+            assert_eq!(
+                shape(&mut master),
+                shape(&mut replica),
+                "{maxlen:?} {minid:?} {strategy:?} {limit:?} -> {m:?} {n:?}"
+            );
+        }
+        // The rewrite of the issue's case: MAXLEN ~ keeps whole nodes, and
+        // the replica must keep exactly as many entries.
+        let mut master = build();
+        master
+            .xtrim(
+                b"s",
+                Some(100),
+                None,
+                true,
+                StreamTrimStrategy::KeepRef,
+                None,
+            )
+            .unwrap();
+        assert_eq!(master.xlen(b"s").unwrap(), 150);
+        assert_eq!(
+            master.stream_exact_trim_args(b"s", Some(100), None, StreamTrimStrategy::KeepRef),
+            (Some(150), None)
+        );
+        // An emptied stream rewrites MINID to the maximum ID, as Redis.
+        master
+            .xtrim(
+                b"s",
+                None,
+                Some(StreamId::new(999, 0)),
+                false,
+                StreamTrimStrategy::KeepRef,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            master.stream_exact_trim_args(
+                b"s",
+                None,
+                Some(StreamId::new(999, 0)),
+                StreamTrimStrategy::KeepRef
+            ),
+            (None, Some(StreamId::new(u64::MAX, u64::MAX)))
+        );
+    }
+
     #[test]
     fn test_streams_table() {
         let mut table = RudisTable::new();
@@ -19694,7 +20133,7 @@ mod tests {
             t.earliest_claim_wait_ms(b"s", b"g", u64::MAX)
                 .is_some_and(|w| w > 0)
         );
-        let (claimed, _) = t
+        let claimed = t
             .xclaim(
                 b"s",
                 b"g",
@@ -19706,8 +20145,10 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
             )
-            .unwrap();
+            .unwrap()
+            .claimed;
         assert_eq!(claimed.len(), 1);
     }
 
