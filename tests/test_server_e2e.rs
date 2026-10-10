@@ -19029,6 +19029,17 @@ fn test_metrics_port_serves_prometheus_over_http_e2e() {
     assert!(value("rudis_commands_processed_total") >= 1);
     assert!(value("rudis_used_memory_bytes") > 0);
     assert_eq!(value("rudis_connected_clients"), 1);
+    // Per-command counters and latency histograms, persistence and
+    // replication state.
+    assert!(
+        value("rudis_command_calls_total{cmd=\"set\"}") >= 1,
+        "{res}"
+    );
+    assert!(value("rudis_command_latency_seconds_count{cmd=\"set\"}") >= 1);
+    assert!(res.contains("rudis_command_latency_seconds_bucket{cmd=\"set\",le=\"+Inf\"}"));
+    assert_eq!(value("rudis_rdb_bgsave_in_progress"), 0);
+    assert_eq!(value("rudis_replication_connected_slaves"), 0);
+    assert!(res.contains("rudis_replication_role{role=\"master\"} 1"));
     assert!(http_get(metrics_port, "/").starts_with("HTTP/1.1 404 "));
 
     // A metrics port that can't be bound is a startup error, not a silent

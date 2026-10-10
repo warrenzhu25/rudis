@@ -126,6 +126,168 @@ fn format_server_stats() -> String {
     out
 }
 
+/// Escapes a Prometheus label value.
+fn label(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Per-command calls, time, failures and latency histograms (from the
+/// same data as INFO commandstats / LATENCY HISTOGRAM), error counts by
+/// prefix, and persistence and replication state.
+pub fn format_server_state_metrics(router: &crate::router::Router) -> String {
+    use crate::connection::{CMD_STATS, ERROR_STATS, FAILED_CMD_STATS, REJECTED_CMD_STATS};
+    let mut out = String::new();
+
+    let stats: Vec<(String, crate::connection::CmdStat)> = {
+        let map = CMD_STATS.read();
+        let mut v: Vec<_> = map.iter().map(|(k, s)| (k.clone(), *s)).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    };
+    out += "# HELP rudis_command_calls_total Calls per command\n# TYPE rudis_command_calls_total counter\n";
+    for (cmd, s) in &stats {
+        out += &format!(
+            "rudis_command_calls_total{{cmd=\"{}\"}} {}\n",
+            label(cmd),
+            s.calls
+        );
+    }
+    out += "# HELP rudis_command_duration_seconds_total Time spent executing each command\n# TYPE rudis_command_duration_seconds_total counter\n";
+    for (cmd, s) in &stats {
+        out += &format!(
+            "rudis_command_duration_seconds_total{{cmd=\"{}\"}} {:.9}\n",
+            label(cmd),
+            s.nanos as f64 / 1e9
+        );
+    }
+    for (name, help, map) in [
+        ("failed", "Calls that returned an error", &FAILED_CMD_STATS),
+        (
+            "rejected",
+            "Calls rejected before execution",
+            &REJECTED_CMD_STATS,
+        ),
+    ] {
+        out += &format!(
+            "# HELP rudis_command_{name}_total {help}\n# TYPE rudis_command_{name}_total counter\n"
+        );
+        let map = map.read();
+        let mut v: Vec<_> = map.iter().collect();
+        v.sort();
+        for (cmd, n) in v {
+            out += &format!(
+                "rudis_command_{name}_total{{cmd=\"{}\"}} {}\n",
+                label(cmd),
+                n
+            );
+        }
+    }
+    // Histogram buckets are powers of two microseconds (1 us .. ~16.8 s).
+    out += "# HELP rudis_command_latency_seconds Command execution latency\n# TYPE rudis_command_latency_seconds histogram\n";
+    for (cmd, s) in &stats {
+        let c = label(cmd);
+        let mut cum = 0u64;
+        for i in 0..=24 {
+            cum += s.hist[i];
+            out += &format!(
+                "rudis_command_latency_seconds_bucket{{cmd=\"{c}\",le=\"{}\"}} {cum}\n",
+                (1u64 << i) as f64 / 1e6
+            );
+        }
+        out += &format!(
+            "rudis_command_latency_seconds_bucket{{cmd=\"{c}\",le=\"+Inf\"}} {}\n\
+             rudis_command_latency_seconds_sum{{cmd=\"{c}\"}} {:.9}\n\
+             rudis_command_latency_seconds_count{{cmd=\"{c}\"}} {}\n",
+            s.calls,
+            s.nanos as f64 / 1e9,
+            s.calls
+        );
+    }
+    out += "# HELP rudis_errors_total Error replies by error prefix\n# TYPE rudis_errors_total counter\n";
+    {
+        let map = ERROR_STATS.read();
+        let mut v: Vec<_> = map.iter().collect();
+        v.sort();
+        for (prefix, n) in v {
+            out += &format!("rudis_errors_total{{prefix=\"{}\"}} {}\n", label(prefix), n);
+        }
+    }
+
+    let snap = crate::snapshot::state(router.base_port);
+    let aof_rw = crate::snapshot::aof_rewrite_state(router.base_port);
+    for (name, help, v) in [
+        (
+            "rdb_changes_since_last_save",
+            "Writes since the last successful save",
+            snap.changes_since_last_save(),
+        ),
+        (
+            "rdb_last_save_timestamp_seconds",
+            "Unix time of the last successful save",
+            snap.last_save_unix(),
+        ),
+        (
+            "rdb_bgsave_in_progress",
+            "1 while a save runs",
+            u64::from(snap.in_progress()),
+        ),
+        (
+            "rdb_last_bgsave_ok",
+            "1 if the last save succeeded",
+            u64::from(snap.last_save_ok()),
+        ),
+        (
+            "aof_enabled",
+            "1 if AOF is on",
+            u64::from(router.aof.is_some()),
+        ),
+        (
+            "aof_rewrite_in_progress",
+            "1 while an AOF rewrite runs",
+            u64::from(aof_rw.in_progress()),
+        ),
+        (
+            "aof_last_rewrite_ok",
+            "1 if the last AOF rewrite succeeded",
+            u64::from(aof_rw.last_ok()),
+        ),
+        (
+            "loading",
+            "1 while loading data at startup or from a master",
+            u64::from(crate::replication::is_loading(router.port)),
+        ),
+    ] {
+        out +=
+            &format!("# HELP rudis_{name} {help}\n# TYPE rudis_{name} gauge\nrudis_{name} {v}\n");
+    }
+
+    // INFO replication fields that are plain numbers become gauges; the
+    // role becomes a labelled 1.
+    let repl = crate::replication::get_replication_hub(router.port).format_info_replication();
+    for line in repl.lines() {
+        let Some((k, v)) = line.trim_end().split_once(':') else {
+            continue;
+        };
+        if k == "role" {
+            out += &format!(
+                "# HELP rudis_replication_role Replication role\n# TYPE rudis_replication_role gauge\nrudis_replication_role{{role=\"{}\"}} 1\n",
+                label(v)
+            );
+        } else if !k.is_empty()
+            && k.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            && let Ok(n) = v.parse::<i64>()
+        {
+            out += &format!(
+                "# HELP rudis_replication_{k} INFO replication {k}\n# TYPE rudis_replication_{k} gauge\nrudis_replication_{k} {n}\n"
+            );
+        }
+    }
+    out
+}
+
 /// `--metrics-port` listeners, bound at startup so a bad address fails
 /// fast, then served by shard 0. Keyed by the server's base port.
 static METRICS_LISTENERS: Mutex<Option<HashMap<u16, std::net::TcpListener>>> = Mutex::new(None);
@@ -218,11 +380,15 @@ async fn serve_metrics_conn(router: &crate::router::Router, mut stream: monoio::
     }
     let wants_metrics = request.starts_with(b"GET /metrics");
     let used = if wants_metrics {
+        // Per-command stats are buffered per shard; merge them first.
+        router.flush_all_command_stats().await;
         router.get_total_used_memory().await
     } else {
         0
     };
-    let response = metrics_http_response(&request, || format_prometheus_metrics(router.port, used));
+    let response = metrics_http_response(&request, || {
+        format_prometheus_metrics(router.port, used) + &format_server_state_metrics(router)
+    });
     let _ = stream.write_all(response).await;
 }
 
