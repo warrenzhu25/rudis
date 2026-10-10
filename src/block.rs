@@ -310,6 +310,23 @@ impl BlockHub {
         unblocked
     }
 
+    /// Unblocks, with an UNBLOCKED error, every client blocked on a command
+    /// that writes when served (list/zset pops and moves, XREADGROUP), as
+    /// Redis does when a master becomes a replica: served on the replica,
+    /// they would change its data behind its master's back.
+    pub fn unblock_writers(&mut self) -> usize {
+        let mut ids: Vec<u64> = self.blocked_clients.keys().copied().collect();
+        ids.extend(self.blocked_zset_clients.keys().copied());
+        ids.extend(self.stream_waiters.values().flatten().filter_map(|w| {
+            matches!(w.cmd, crate::resp::Command::Xreadgroup { .. }).then_some(w.client_id)
+        }));
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .filter(|&id| self.unblock_client(id, ClientUnblockType::Error))
+            .count()
+    }
+
     pub fn register_list_waiter(
         &mut self,
         client_id: u64,

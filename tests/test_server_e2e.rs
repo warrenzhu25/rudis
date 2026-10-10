@@ -23482,3 +23482,40 @@ fn test_functions_sort_store_and_zadd_updates_replicate_and_persist_e2e() {
     shutdown_and_wait(mport, &mut master);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A client blocked in BLPOP on a master that becomes a replica gets
+/// UNBLOCKED, as in Redis; served later from the replication stream, its pop
+/// would make the replica diverge from its master.
+#[test]
+fn test_replicaof_unblocks_clients_blocked_on_writes_e2e() {
+    let (aport, bport) = (17111u16, 17112u16);
+    let (as_, bs) = (aport.to_string(), bport.to_string());
+    let mut a = spawn_rudis_listening(&["--port", &as_, "--threads", "2", "--no-pin"], aport);
+    let mut b = spawn_rudis_listening(&["--port", &bs, "--threads", "2", "--no-pin"], bport);
+    let mut blocked = TcpStream::connect(("127.0.0.1", aport)).unwrap();
+    blocked
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    blocked
+        .write_all(&format_resp_cmd(&["BLPOP", "ub:list", "0"]))
+        .unwrap();
+    let mut c = TcpStream::connect(("127.0.0.1", aport)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !resp_cmd(&mut c, &["INFO", "clients"]).contains("blocked_clients:1") {
+        assert!(std::time::Instant::now() < deadline, "client never blocked");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["REPLICAOF", "127.0.0.1", &bs]),
+        "+OK\r\n"
+    );
+    let mut buf = [0u8; 256];
+    let n = blocked.read(&mut buf).unwrap();
+    let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
+    assert!(reply.starts_with("-UNBLOCKED"), "{reply:?}");
+    assert_eq!(resp_cmd(&mut c, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    drop((blocked, c));
+    shutdown_and_wait(aport, &mut a);
+    shutdown_and_wait(bport, &mut b);
+}
