@@ -57,13 +57,13 @@ pub const SHARD_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 /// like Redis does when it cannot load its data files. Serving an empty
 /// dataset instead would let the next save overwrite the original files.
 fn fatal_startup_error(shard_id: usize, msg: &str) -> ! {
+    // One line, so it is the last one logged whichever shard fails last;
+    // "Fatal error loading" is Redis's wording, which tooling looks for.
     crate::log_fatal!(
-        "[Shard {}] FATAL: {}. Refusing to start so existing data files are not overwritten.",
+        "[Shard {}] FATAL: Fatal error loading the DB: {}. Refusing to start so existing data files are not overwritten. Exiting.",
         shard_id,
         msg
     );
-    // Redis's wording, which operators' tooling and the test suites look for.
-    crate::log_fatal!("Fatal error loading the DB, check server logs. Exiting.");
     std::process::exit(1);
 }
 
@@ -81,6 +81,14 @@ static STARTUP_LOADS: std::sync::LazyLock<
 
 /// Records that a shard of the server on `base_port` finished loading
 /// `loaded` keys (RDB) or commands (AOF), having started at `started`.
+/// Keys the last startup RDB load restored (INFO rdb_last_load_keys_loaded).
+pub static LAST_LOAD_KEYS_LOADED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Keys the last startup RDB load skipped as already expired. Not counted
+/// yet: always 0.
+pub static LAST_LOAD_KEYS_EXPIRED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn note_startup_load(
     base_port: u16,
     num_shards: usize,
@@ -110,6 +118,7 @@ fn note_startup_load(
             crate::log_notice!("DB loaded from append only file: {:.3} seconds", secs);
         }
     } else {
+        LAST_LOAD_KEYS_LOADED.store(loaded, std::sync::atomic::Ordering::Relaxed);
         crate::log_notice!(
             "Done loading RDB, keys loaded: {}, keys expired: 0.",
             loaded
