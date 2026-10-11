@@ -4304,8 +4304,13 @@ pub async fn save_rdb_chunk_yielding(
     let mut cursor = RdbSaveCursor::new(&db.borrow());
     let mut buf = Vec::with_capacity(RDB_FLUSH_BYTES * 2);
     loop {
-        if cursor.step(&db.borrow(), &mut buf, RDB_SAVE_STEP, RDB_FLUSH_BYTES) {
-            break;
+        if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        let prev_seg = cursor.seg;
+        let done = cursor.step(&db.borrow(), &mut buf, RDB_SAVE_STEP, RDB_FLUSH_BYTES);
+        if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
         }
         if buf.len() >= RDB_FLUSH_BYTES {
             let piece = std::mem::replace(&mut buf, Vec::with_capacity(RDB_FLUSH_BYTES * 2));
@@ -4313,9 +4318,25 @@ pub async fn save_rdb_chunk_yielding(
                 return false;
             }
         }
+        let delay_us =
+            crate::connection::RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed);
+        if delay_us > 0 {
+            let segs_done = cursor.seg.saturating_sub(prev_seg).max(1) as u64;
+            let sleep_ms = (delay_us.saturating_mul(segs_done) / 1000).clamp(1, 50);
+            monoio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+        }
+        if done {
+            break;
+        }
         // A send that completes at once does not yield; always let the
         // shard's other tasks in between steps.
         crate::mailbox::yield_now().await;
+    }
+    if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
     }
     buf.is_empty() || sink.send_async(Some(buf)).await.is_ok()
 }

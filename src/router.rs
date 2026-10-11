@@ -4181,6 +4181,7 @@ impl Router {
             return Err("Background save already in progress".to_string());
         }
         let dirty_before = crate::snapshot::state(self.base_port).begin();
+        crate::connection::RDB_BGSAVE_ABORTED.store(false, Ordering::SeqCst);
         let guard = SaveFlagGuard::new(self, Some(dirty_before));
         self.sync_aof().await;
         let res = self.perform_save_rdb(dirty_before).await;
@@ -4216,6 +4217,7 @@ impl Router {
         }
         // Begin before replying so INFO right after +OK shows the save.
         let dirty_before = crate::snapshot::state(self.base_port).begin();
+        crate::connection::RDB_BGSAVE_ABORTED.store(false, Ordering::SeqCst);
         let router_clone = self.clone();
         crate::log_notice!("Background saving started");
         monoio::spawn(async move {
@@ -4479,11 +4481,17 @@ impl Router {
         } else {
             match cmd {
                 Command::Select(idx) => {
+                    let start = std::time::Instant::now();
                     let db_idx = idx as usize;
                     crate::connection::CURRENT_DB.set(db_idx);
                     self.local_db.borrow_mut().select_db(db_idx);
+                    crate::connection::record_replica_cmd_stats(
+                        &Command::Select(idx),
+                        start.elapsed().as_nanos() as u64,
+                    );
                 }
                 Command::Flushdb => {
+                    let start = std::time::Instant::now();
                     let cur_db = crate::connection::CURRENT_DB.get();
                     {
                         let mut db = self.local_db.borrow_mut();
@@ -4505,8 +4513,13 @@ impl Router {
                             }
                         }
                     }
+                    crate::connection::record_replica_cmd_stats(
+                        &Command::Flushdb,
+                        start.elapsed().as_nanos() as u64,
+                    );
                 }
                 Command::Flushall => {
+                    let start = std::time::Instant::now();
                     self.local_db.borrow_mut().flushall();
                     crate::connection::touch_watched_keys_on_flushall(self.port);
                     for (sid, sender) in self.senders.iter().enumerate() {
@@ -4520,8 +4533,13 @@ impl Router {
                             }
                         }
                     }
+                    crate::connection::record_replica_cmd_stats(
+                        &Command::Flushall,
+                        start.elapsed().as_nanos() as u64,
+                    );
                 }
                 Command::Swapdb { db1, db2 } => {
+                    let start = std::time::Instant::now();
                     let (d1, d2) = (db1.max(0) as usize, db2.max(0) as usize);
                     self.local_db.borrow_mut().swap_dbs(d1, d2);
                     crate::connection::touch_watched_keys_on_swapdb(self.port, d1, d2);
@@ -4540,16 +4558,30 @@ impl Router {
                             }
                         }
                     }
+                    crate::connection::record_replica_cmd_stats(
+                        &Command::Swapdb { db1, db2 },
+                        start.elapsed().as_nanos() as u64,
+                    );
                 }
                 Command::Mset(pairs) => {
+                    let start = std::time::Instant::now();
                     for (k, v) in pairs {
                         self.set(k, v, None).await;
                     }
+                    crate::connection::record_replica_cmd_stats(
+                        &Command::Mset(Vec::new()),
+                        start.elapsed().as_nanos() as u64,
+                    );
                 }
                 Command::Del(keys) => {
+                    let start = std::time::Instant::now();
                     for k in keys {
                         self.del(k).await;
                     }
+                    crate::connection::record_replica_cmd_stats(
+                        &Command::Del(smallvec::SmallVec::new()),
+                        start.elapsed().as_nanos() as u64,
+                    );
                 }
                 // The master logs CRDT changes per shard, but they arrive
                 // here on one stream: hand each shard the keys it owns.
@@ -4568,13 +4600,7 @@ impl Router {
                     }
                 }
                 _ => {
-                    let mut dummy_out = Vec::new();
-                    crate::connection::execute_local_command(
-                        &cmd,
-                        &mut self.local_db.borrow_mut(),
-                        &mut dummy_out,
-                        self.aof.as_deref(),
-                    );
+                    crate::connection::execute_cross_shard_replica_command(self, cmd).await;
                 }
             }
         }
@@ -4675,7 +4701,32 @@ impl Router {
         &self,
         chunk_tx: &flume::Sender<Option<Vec<u8>>>,
     ) -> Result<(), String> {
+        let stats_by_db = self.keyspace_stats_by_db().await;
+        if !stats_by_db.is_empty() {
+            let mut resize_buf = Vec::new();
+            let mut db_ids: Vec<usize> = stats_by_db.keys().copied().collect();
+            db_ids.sort_unstable();
+            for db_idx in db_ids {
+                if let Some(&(keys, expires)) = stats_by_db.get(&db_idx)
+                    && keys > 0
+                {
+                    if db_idx != 0 {
+                        crate::redis_rdb::write_selectdb(&mut resize_buf, db_idx);
+                    }
+                    crate::redis_rdb::write_resizedb(&mut resize_buf, keys as u64, expires as u64);
+                }
+            }
+            if stats_by_db.keys().any(|&d| d != 0) {
+                crate::redis_rdb::write_selectdb(&mut resize_buf, 0);
+            }
+            if !resize_buf.is_empty() && chunk_tx.send_async(Some(resize_buf)).await.is_err() {
+                return Err(WRITER_GONE.to_string());
+            }
+        }
         if !crate::shard::save_rdb_chunk_yielding(&self.local_db, chunk_tx).await {
+            if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
+                return Err("save aborted by FLUSHALL".to_string());
+            }
             return Err(WRITER_GONE.to_string());
         }
 
@@ -4683,6 +4734,9 @@ impl Router {
         // pieces from different shards never interleave.
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
+                if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
+                    return Err("save aborted by FLUSHALL".to_string());
+                }
                 let (done_tx, done_rx) = flume::bounded(1);
                 // A missing shard would silently drop its keys from the dump.
                 sender
@@ -4693,10 +4747,18 @@ impl Router {
                     .map_err(|_| format!("shard {} is not reachable", sid))?;
                 match done_rx.recv_async().await {
                     Ok(true) => {}
-                    Ok(false) => return Err(WRITER_GONE.to_string()),
+                    Ok(false) => {
+                        if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
+                            return Err("save aborted by FLUSHALL".to_string());
+                        }
+                        return Err(WRITER_GONE.to_string());
+                    }
                     Err(_) => return Err(format!("shard {} did not return its data", sid)),
                 }
             }
+        }
+        if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
+            return Err("save aborted by FLUSHALL".to_string());
         }
         Ok(())
     }

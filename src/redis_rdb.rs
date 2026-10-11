@@ -1354,6 +1354,12 @@ pub fn write_selectdb(out: &mut Vec<u8>, dbid: usize) {
     write_len(out, dbid as u64);
 }
 
+pub fn write_resizedb(out: &mut Vec<u8>, db_size: u64, expires_size: u64) {
+    out.push(OP_RESIZEDB);
+    write_len(out, db_size);
+    write_len(out, expires_size);
+}
+
 /// RDB type byte `val` is written with; `None` for tiered values, which the
 /// caller must read back from the tier first.
 pub fn value_type(val: &RudisValue) -> Option<u8> {
@@ -1988,8 +1994,21 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
                 }
             }
             OP_RESIZEDB => {
-                r.length()?;
-                r.length()?;
+                let db_size = r.length()?;
+                let expires_size = r.length()?;
+                if ctx.load_functions {
+                    let k_cap = if db_size == 0 {
+                        0
+                    } else {
+                        db_size.next_power_of_two().max(4)
+                    };
+                    let e_cap = if expires_size == 0 {
+                        0
+                    } else {
+                        expires_size.next_power_of_two().max(4)
+                    };
+                    crate::log_verbose!("DB {} resized: {} keys ({} expires)", dbid, k_cap, e_cap);
+                }
             }
             OP_SLOT_INFO => {
                 r.length()?;

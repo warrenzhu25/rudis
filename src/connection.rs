@@ -1972,6 +1972,8 @@ pub fn broadcast_monitor(port: u16, source_addr: &str, argv: &[Bytes]) {
 pub static RDB_KEY_SAVE_DELAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RDB_BGSAVE_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+pub static RDB_BGSAVE_ABORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub fn register_global_client(
     port: u16,
@@ -7220,8 +7222,20 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
                 "SORT"
             }
         }
-        Command::Lmove { .. } => "LMOVE",
-        Command::Blmove { .. } => "BLMOVE",
+        Command::Lmove { is_rpoplpush, .. } => {
+            if *is_rpoplpush {
+                "RPOPLPUSH"
+            } else {
+                "LMOVE"
+            }
+        }
+        Command::Blmove { is_rpoplpush, .. } => {
+            if *is_rpoplpush {
+                "BRPOPLPUSH"
+            } else {
+                "BLMOVE"
+            }
+        }
         Command::Lmovem { .. } => "LMOVEM",
         Command::Blmovem { .. } => "BLMOVEM",
         Command::Sadd { .. } => "SADD",
@@ -13125,6 +13139,7 @@ async fn execute_command_inner(
             ref destination,
             where_from,
             where_to,
+            is_rpoplpush,
         } => {
             let s_target = router.target_shard(source);
             let d_target = router.target_shard(destination);
@@ -13137,6 +13152,7 @@ async fn execute_command_inner(
                     let op = CrossShardElementMove::List {
                         from: where_from,
                         to: where_to,
+                        is_rpoplpush,
                     };
                     out.extend_from_slice(
                         &move_element_across_shards(router, source, destination, op, in_tx(client_id)).await,
@@ -13163,6 +13179,7 @@ async fn execute_command_inner(
             where_from,
             where_to,
             timeout,
+            is_rpoplpush,
         } => {
             let s_target = router.target_shard(source);
             let d_target = router.target_shard(destination);
@@ -13181,6 +13198,7 @@ async fn execute_command_inner(
                         where_from,
                         where_to,
                         timeout,
+                        is_rpoplpush,
                         out,
                     )
                     .await;
@@ -13195,6 +13213,7 @@ async fn execute_command_inner(
                         destination: destination.clone(),
                         where_from,
                         where_to,
+                        is_rpoplpush,
                     },
                     &mut router.local_db.borrow_mut(),
                     out,
@@ -13209,6 +13228,7 @@ async fn execute_command_inner(
                             destination: destination.clone(),
                             where_from,
                             where_to,
+                            is_rpoplpush,
                         },
                     )
                     .await;
@@ -13246,6 +13266,7 @@ async fn execute_command_inner(
                     from_type,
                     to_type,
                     destination.clone(),
+                    is_rpoplpush,
                     tx,
                 );
             }
@@ -15044,11 +15065,10 @@ async fn execute_command_inner(
             }
             if is_all {
                 router.flushall().await;
-                // Like Redis killing its BGSAVE child, FLUSHALL ends the
-                // save that `rdb-key-save-delay` keeps shown as in progress.
-                if RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                    RDB_BGSAVE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
-                }
+                // Like Redis killing its BGSAVE child, FLUSHALL aborts any
+                // in-progress BGSAVE and clears the synthetic delay flag.
+                RDB_BGSAVE_ABORTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                RDB_BGSAVE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
             } else {
                 router.flushdb().await;
             }
@@ -22026,6 +22046,7 @@ pub fn execute_local_command(
                 destination,
                 where_from,
                 where_to,
+                ..
             } => {
                 match db.lmove(source, destination.clone(), *where_from, *where_to) {
                     Ok(Some(val)) => {
@@ -25877,6 +25898,7 @@ enum CrossShardElementMove {
     List {
         from: crate::table::ListDirection,
         to: crate::table::ListDirection,
+        is_rpoplpush: bool,
     },
     /// SMOVE of one member between sets.
     Set { member: Bytes },
@@ -25886,8 +25908,8 @@ enum CrossShardElementMove {
 /// same tx locks as [`move_key_across_shards`]. Checks the types like Redis
 /// does (a missing source wins over a wrong-typed destination), then pops or
 /// removes the element on the source shard and pushes or adds it on the
-/// destination shard; each shard logs, replicates and notifies its own half
-/// (lpop + rpush, srem + sadd), which are also the events Redis emits.
+/// destination shard; each shard logs to its AOF and notifies its own half,
+/// while a single logical LMOVE / RPOPLPUSH / SMOVE is propagated to replicas.
 /// Returns the command's reply.
 async fn move_element_across_shards(
     router: &Router,
@@ -25929,8 +25951,14 @@ async fn move_element_across_shards(
         if dst_type != b"+none\r\n" && dst_type != kind {
             return WRONGTYPE.to_vec();
         }
+        let suppress =
+            crate::replication::get_replication_hub(router.port).suppress_hub_propagation();
         match op {
-            CrossShardElementMove::List { from, to } => {
+            CrossShardElementMove::List {
+                from,
+                to,
+                is_rpoplpush,
+            } => {
                 let pop = match from {
                     crate::table::ListDirection::Left => Command::Lpop {
                         key: src.clone(),
@@ -25957,6 +25985,18 @@ async fn move_element_across_shards(
                     },
                 };
                 let _ = exec_on_shard(router, d, push).await;
+                drop(suppress);
+                if crate::replication::has_connected_replicas(router.port)
+                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Lmove {
+                        source: src.clone(),
+                        destination: dst.clone(),
+                        where_from: from,
+                        where_to: to,
+                        is_rpoplpush,
+                    })
+                {
+                    crate::replication::propagate_bytes(router.port, &bytes);
+                }
                 let mut out = Vec::new();
                 write_resp_bulk(&mut out, &elem);
                 out
@@ -25979,10 +26019,20 @@ async fn move_element_across_shards(
                     d,
                     Command::Sadd {
                         key: dst.clone(),
-                        members: smallvec::smallvec![member],
+                        members: smallvec::smallvec![member.clone()],
                     },
                 )
                 .await;
+                drop(suppress);
+                if crate::replication::has_connected_replicas(router.port)
+                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Smove {
+                        source: src.clone(),
+                        destination: dst.clone(),
+                        member,
+                    })
+                {
+                    crate::replication::propagate_bytes(router.port, &bytes);
+                }
                 b":1\r\n".to_vec()
             }
         }
@@ -25997,10 +26047,11 @@ async fn move_element_across_shards(
 /// BLMOVE / BRPOPLPUSH for keys owned by different shards (standalone
 /// mode). If the source has an element, moves it like LMOVE does. Otherwise
 /// blocks as a one-element pop on the source; once served (the source's
-/// shard pops, logs and replicates that half), pushes the element to the
-/// destination's shard. If the destination meanwhile holds another type,
-/// the element goes back where it came from and the reply is WRONGTYPE,
-/// as if it had never been popped. Returns whether the client disconnected.
+/// shard pops and logs that half to its AOF), pushes the element to the
+/// destination's shard and replicates the logical LMOVE / RPOPLPUSH. If the
+/// destination meanwhile holds another type, the element goes back where it
+/// came from and the reply is WRONGTYPE, as if it had never been popped.
+/// Returns whether the client disconnected.
 #[allow(clippy::too_many_arguments)]
 async fn blmove_across_shards(
     router: &Router,
@@ -26011,11 +26062,13 @@ async fn blmove_across_shards(
     where_from: crate::table::ListDirection,
     where_to: crate::table::ListDirection,
     timeout: f64,
+    is_rpoplpush: bool,
     out: &mut Vec<u8>,
 ) -> bool {
     let op = CrossShardElementMove::List {
         from: where_from,
         to: where_to,
+        is_rpoplpush,
     };
     let reply = move_element_across_shards(router, source, destination, op, in_tx(client_id)).await;
     let is_nil = reply == b"$-1\r\n" || reply == b"_\r\n";
@@ -26037,7 +26090,7 @@ async fn blmove_across_shards(
         let hub_arc = crate::block::get_block_hub_for_port(router.port);
         let mut hub = hub_arc.lock();
         hub.register_blocked_client(client_id, tx.clone());
-        hub.register_list_waiter(client_id, source.clone(), to_pop_type(where_from), 1, tx);
+        hub.register_list_waiter_no_repl(client_id, source.clone(), to_pop_type(where_from), 1, tx);
     }
     recheck_blocking_keys(router, std::iter::once(source));
     let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
@@ -26068,15 +26121,30 @@ async fn blmove_across_shards(
                 router.target_shard(source),
                 router.target_shard(destination),
             );
+            let suppress =
+                crate::replication::get_replication_hub(router.port).suppress_hub_propagation();
             let dst_type = exec_on_shard(router, d, Command::Type(destination.clone())).await;
             if dst_type != b"+none\r\n" && dst_type != b"+list\r\n" {
                 let _ = exec_on_shard(router, s, push(source, where_from, elem)).await;
+                drop(suppress);
                 out.extend_from_slice(
                     b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
                 );
                 return client_disconnected;
             }
             let _ = exec_on_shard(router, d, push(destination, where_to, elem.clone())).await;
+            drop(suppress);
+            if crate::replication::has_connected_replicas(router.port)
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Lmove {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                    where_from,
+                    where_to,
+                    is_rpoplpush,
+                })
+            {
+                crate::replication::propagate_bytes(router.port, &bytes);
+            }
             if client_disconnected {
                 return true;
             }
@@ -26100,6 +26168,94 @@ async fn blmove_across_shards(
         _ => write_resp_null(out),
     }
     false
+}
+
+pub fn record_replica_cmd_stats(cmd: &Command, elapsed_ns: u64) {
+    record_cmd_stats(get_cmd_name(cmd), 1, elapsed_ns);
+}
+
+pub async fn execute_cross_shard_replica_command(router: &Router, cmd: Command) {
+    let start = std::time::Instant::now();
+    let name = get_cmd_name(&cmd);
+    let out = match cmd {
+        Command::Lmove {
+            ref source,
+            ref destination,
+            where_from,
+            where_to,
+            is_rpoplpush,
+        } => {
+            let op = CrossShardElementMove::List {
+                from: where_from,
+                to: where_to,
+                is_rpoplpush,
+            };
+            move_element_across_shards(router, source, destination, op, false).await
+        }
+        Command::Smove {
+            ref source,
+            ref destination,
+            ref member,
+        } => {
+            let op = CrossShardElementMove::Set {
+                member: member.clone(),
+            };
+            move_element_across_shards(router, source, destination, op, false).await
+        }
+        Command::Rename {
+            ref key,
+            ref newkey,
+            nx,
+        } => {
+            let mode = if nx {
+                CrossShardMove::RenameNx
+            } else {
+                CrossShardMove::Rename
+            };
+            move_key_across_shards(router, key, newkey, CURRENT_DB.get(), mode, false).await
+        }
+        Command::Copy {
+            ref source,
+            ref destination,
+            destination_db,
+            replace,
+        } => {
+            let dst_db = destination_db
+                .map(|d| d as usize)
+                .unwrap_or_else(|| CURRENT_DB.get());
+            let mode = if replace {
+                CrossShardMove::CopyReplace
+            } else {
+                CrossShardMove::Copy
+            };
+            move_key_across_shards(router, source, destination, dst_db, mode, false).await
+        }
+        Command::Msetnx(ref pairs) => msetnx_across_shards(router, pairs, false).await,
+        Command::Bitop {
+            ref op,
+            ref destkey,
+            ref srckeys,
+        } => bitop_across_shards(router, op, destkey, srckeys, false).await,
+        other => {
+            let mut dummy_out = Vec::new();
+            execute_local_command(
+                &other,
+                &mut router.local_db.borrow_mut(),
+                &mut dummy_out,
+                router.aof.as_deref(),
+            );
+            dummy_out
+        }
+    };
+    record_cmd_stats(name, 1, start.elapsed().as_nanos() as u64);
+    if out.first() == Some(&b'-') {
+        let end = out.iter().position(|&b| b == b'\r').unwrap_or(out.len());
+        crate::log_warning!(
+            "== CRITICAL == This replica is sending an error to its master: '{}' after processing the command '{}'",
+            String::from_utf8_lossy(&out[1..end]),
+            name.to_ascii_lowercase(),
+        );
+    }
 }
 
 /// Runs one command per `(shard, command)` pair, the local shard's inline

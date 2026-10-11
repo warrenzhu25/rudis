@@ -1298,7 +1298,18 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             destination,
             where_from,
             where_to,
+            is_rpoplpush,
         } => {
+            if *is_rpoplpush {
+                buf.extend_from_slice(
+                    format!("*3\r\n$9\r\nRPOPLPUSH\r\n${}\r\n", source.len()).as_bytes(),
+                );
+                buf.extend_from_slice(source);
+                buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
+                buf.extend_from_slice(destination);
+                buf.extend_from_slice(b"\r\n");
+                return Some(buf);
+            }
             let from_s = match where_from {
                 crate::table::ListDirection::Left => "LEFT",
                 crate::table::ListDirection::Right => "RIGHT",

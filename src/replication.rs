@@ -519,6 +519,19 @@ pub struct ReplicationHub {
     /// `cached_primary->db`, and reset to `repl-stream-db` (default 0) on full
     /// resynchronization.
     pub replica_selected_db: std::sync::atomic::AtomicUsize,
+    /// Cross-shard composite operations increment this while running internal
+    /// per-shard steps so they can propagate a single logical command instead.
+    pub suppress_propagation: std::sync::atomic::AtomicUsize,
+}
+
+/// Suppresses replication propagation across all shards for a `ReplicationHub`
+/// until dropped.
+pub struct SuppressHubPropagation(Arc<ReplicationHub>);
+
+impl Drop for SuppressHubPropagation {
+    fn drop(&mut self) {
+        self.0.suppress_propagation.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// Holds `ReplicationHub::apply_token` until dropped.
@@ -584,7 +597,13 @@ impl ReplicationHub {
             apply_token: (token_tx, token_rx),
             pinger_running: AtomicBool::new(false),
             replica_selected_db: std::sync::atomic::AtomicUsize::new(0),
+            suppress_propagation: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    pub fn suppress_hub_propagation(self: &Arc<Self>) -> SuppressHubPropagation {
+        self.suppress_propagation.fetch_add(1, Ordering::Acquire);
+        SuppressHubPropagation(self.clone())
     }
 
     /// True when this server is already replicating from `host:port`.
@@ -1807,7 +1826,9 @@ pub fn propagate_bytes(port: u16, bytes: &[u8]) {
         return;
     }
     let hub = get_replication_hub(port);
-    if !hub.replication_active.load(Ordering::Relaxed) {
+    if !hub.replication_active.load(Ordering::Relaxed)
+        || hub.suppress_propagation.load(Ordering::Acquire) != 0
+    {
         return;
     }
     hub.propagate(bytes);
@@ -1819,7 +1840,9 @@ pub fn propagate_shard_bytes(port: u16, shard_id: usize, bytes: &[u8]) {
         return;
     }
     let hub = get_replication_hub(port);
-    if !hub.replication_active.load(Ordering::Relaxed) {
+    if !hub.replication_active.load(Ordering::Relaxed)
+        || hub.suppress_propagation.load(Ordering::Acquire) != 0
+    {
         return;
     }
     hub.propagate_shard(shard_id, bytes);

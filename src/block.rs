@@ -53,11 +53,13 @@ pub enum WaiterOp {
     Pop {
         pop_type: ListPopType,
         count: usize,
+        suppress_repl: bool,
     },
     Move {
         where_from: ListPopType,
         where_to: ListPopType,
         destination: Bytes,
+        is_rpoplpush: bool,
     },
     Movem {
         where_from: ListPopType,
@@ -340,6 +342,29 @@ impl BlockHub {
         count: usize,
         sender: Sender<BlockedListResult>,
     ) {
+        self.register_list_waiter_inner(client_id, key, pop_type, count, false, sender);
+    }
+
+    pub fn register_list_waiter_no_repl(
+        &mut self,
+        client_id: u64,
+        key: Bytes,
+        pop_type: ListPopType,
+        count: usize,
+        sender: Sender<BlockedListResult>,
+    ) {
+        self.register_list_waiter_inner(client_id, key, pop_type, count, true, sender);
+    }
+
+    fn register_list_waiter_inner(
+        &mut self,
+        client_id: u64,
+        key: Bytes,
+        pop_type: ListPopType,
+        count: usize,
+        suppress_repl: bool,
+        sender: Sender<BlockedListResult>,
+    ) {
         let db = crate::connection::CURRENT_DB.get();
         self.list_waiters
             .entry((db, key.clone()))
@@ -347,7 +372,11 @@ impl BlockHub {
             .push_back(ListWaiter {
                 client_id,
                 key,
-                op: WaiterOp::Pop { pop_type, count },
+                op: WaiterOp::Pop {
+                    pop_type,
+                    count,
+                    suppress_repl,
+                },
                 sender,
             });
         self.sync_atomic_waiters_count();
@@ -360,6 +389,7 @@ impl BlockHub {
         where_from: ListPopType,
         where_to: ListPopType,
         destination: Bytes,
+        is_rpoplpush: bool,
         sender: Sender<BlockedListResult>,
     ) {
         let db = crate::connection::CURRENT_DB.get();
@@ -373,6 +403,7 @@ impl BlockHub {
                     where_from,
                     where_to,
                     destination,
+                    is_rpoplpush,
                 },
                 sender,
             });
@@ -436,7 +467,11 @@ impl BlockHub {
                     break;
                 }
                 match waiter.op {
-                    WaiterOp::Pop { pop_type, count } => {
+                    WaiterOp::Pop {
+                        pop_type,
+                        count,
+                        suppress_repl,
+                    } => {
                         let popped = match pop_type {
                             ListPopType::Left => table.lpop(key.as_ref(), count).ok(),
                             ListPopType::Right => table.rpop(key.as_ref(), count).ok(),
@@ -444,7 +479,7 @@ impl BlockHub {
                         if let Some(vals) = popped {
                             if !vals.is_empty() {
                                 let count = Some(vals.len());
-                                propagate_served(
+                                propagate_served_opts(
                                     self.port,
                                     &match pop_type {
                                         ListPopType::Left => crate::resp::Command::Lpop {
@@ -456,6 +491,7 @@ impl BlockHub {
                                             count,
                                         },
                                     },
+                                    suppress_repl,
                                 );
                                 let _ = waiter
                                     .sender
@@ -478,6 +514,7 @@ impl BlockHub {
                         where_from,
                         where_to,
                         ref destination,
+                        is_rpoplpush,
                     } => {
                         let dst_type = table.type_of(destination.as_ref());
                         if dst_type != "none" && dst_type != "list" {
@@ -515,6 +552,7 @@ impl BlockHub {
                                     destination: destination.clone(),
                                     where_from: dir(where_from),
                                     where_to: dir(where_to),
+                                    is_rpoplpush,
                                 },
                             );
                             let dest_clone = destination.clone();
@@ -856,6 +894,10 @@ impl BlockHub {
 /// client, so the AOF and the replicas see the pop in the same order, and in
 /// the same shard's AOF, as the data change itself.
 fn propagate_served(port: u16, cmd: &crate::resp::Command) {
+    propagate_served_opts(port, cmd, false);
+}
+
+fn propagate_served_opts(port: u16, cmd: &crate::resp::Command, suppress_repl: bool) {
     let Some(bytes) = crate::aof::command_to_resp(cmd) else {
         crate::aof::note_unpropagated(cmd);
         return;
@@ -869,7 +911,7 @@ fn propagate_served(port: u16, cmd: &crate::resp::Command) {
             }
         }
     });
-    if crate::replication::has_connected_replicas(port) {
+    if !suppress_repl && crate::replication::has_connected_replicas(port) {
         match shard_id {
             Some(id) => crate::replication::propagate_shard_bytes(port, id, &bytes),
             None => crate::replication::propagate_bytes(port, &bytes),
@@ -965,6 +1007,7 @@ mod tests {
             ListPopType::Right,
             ListPopType::Left,
             dst.clone(),
+            false,
             tx_m,
         );
 

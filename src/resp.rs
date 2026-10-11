@@ -1229,6 +1229,7 @@ pub enum Command {
         destination: Bytes,
         where_from: crate::table::ListDirection,
         where_to: crate::table::ListDirection,
+        is_rpoplpush: bool,
     },
     Blmove {
         source: Bytes,
@@ -1236,6 +1237,7 @@ pub enum Command {
         where_from: crate::table::ListDirection,
         where_to: crate::table::ListDirection,
         timeout: f64,
+        is_rpoplpush: bool,
     },
     Lmovem {
         source: Bytes,
@@ -9866,6 +9868,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 destination: args[2].clone(),
                 where_from,
                 where_to,
+                is_rpoplpush: false,
             }))
         }
         "BLMOVE" => {
@@ -9900,6 +9903,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 where_from,
                 where_to,
                 timeout,
+                is_rpoplpush: false,
             }))
         }
         "LMOVEM" => {
@@ -10084,6 +10088,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 destination: args[2].clone(),
                 where_from: crate::table::ListDirection::Right,
                 where_to: crate::table::ListDirection::Left,
+                is_rpoplpush: true,
             }))
         }
         "BRPOPLPUSH" => {
@@ -10106,6 +10111,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 where_from: crate::table::ListDirection::Right,
                 where_to: crate::table::ListDirection::Left,
                 timeout,
+                is_rpoplpush: true,
             }))
         }
         "INCRBYFLOAT" => {
@@ -15055,7 +15061,8 @@ mod tests {
                 source: Bytes::from_static(b"l1"),
                 destination: Bytes::from_static(b"l2"),
                 where_from: crate::table::ListDirection::Left,
-                where_to: crate::table::ListDirection::Right
+                where_to: crate::table::ListDirection::Right,
+                is_rpoplpush: false,
             }
         );
         let mut buf = BytesMut::from("BLMOVE l1 l2 RIGHT LEFT 1.5\r\n");
@@ -15066,7 +15073,8 @@ mod tests {
                 destination: Bytes::from_static(b"l2"),
                 where_from: crate::table::ListDirection::Right,
                 where_to: crate::table::ListDirection::Left,
-                timeout: 1.5
+                timeout: 1.5,
+                is_rpoplpush: false,
             }
         );
 
