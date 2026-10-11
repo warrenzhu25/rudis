@@ -327,6 +327,17 @@ pub fn execute_shard_debug(
                 write_error_reply(out, format!("ERR {}", msg).as_bytes());
             }
         }
+    } else if sub.as_ref() == crate::router::DEBUG_FLUSH_SHARD {
+        db.flushdb();
+        crate::block::get_block_hub_for_port(db.port)
+            .lock()
+            .notify_all_streams(db);
+        if let Some(aof) = aof
+            && let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Flushdb)
+        {
+            aof.borrow_mut().append(&bytes);
+        }
+        out.extend_from_slice(b"+OK\r\n");
     } else if sub.as_ref() == crate::router::DEBUG_POPULATE_SHARD {
         // `__shard-populate <prefix> <size|""> <n>...`
         let (Some(prefix), Some(size)) = (args.get(1), args.get(2)) else {

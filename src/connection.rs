@@ -14794,7 +14794,7 @@ async fn execute_command(
                     crate::table::add_lazyfreed_objects(n as u64);
                 }
             }
-            router.flushdb().await;
+            router.flushdb(matches!(cmd, Command::Flushall)).await;
             if RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                 RDB_BGSAVE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
             }
@@ -16750,6 +16750,7 @@ async fn execute_command(
                 } else if sub.as_ref() == crate::router::DEBUG_DIGEST_SHARD
                     || sub.as_ref() == crate::router::DEBUG_LOADAOF_SHARD
                     || sub.as_ref() == crate::router::DEBUG_POPULATE_SHARD
+                    || sub.as_ref() == crate::router::DEBUG_FLUSH_SHARD
                 {
                     // Internal shard messages, not client subcommands.
                     crate::debug_cmd::write_unknown_subcommand(out, sub);

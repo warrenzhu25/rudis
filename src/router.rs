@@ -155,6 +155,10 @@ pub const DEBUG_LOADAOF_SHARD: &[u8] = b"__shard-loadaof";
 /// `__shard-populate <prefix> <size|""> <n>...`: creates this shard's
 /// `DEBUG POPULATE` keys.
 pub const DEBUG_POPULATE_SHARD: &[u8] = b"__shard-populate";
+/// `DEBUG __shard-flush`: one shard's part of FLUSHDB / FLUSHALL, logged to
+/// its AOF but not replicated (the coordinating shard replicates the whole
+/// command once).
+pub const DEBUG_FLUSH_SHARD: &[u8] = b"__shard-flush";
 
 /// Handle for a cross-shard MGET that has been dispatched but not yet gathered.
 ///
@@ -3250,7 +3254,10 @@ impl Router {
         }
     }
 
-    pub async fn flushdb(&self) {
+    /// FLUSHDB (`all`: FLUSHALL) on every shard. Like Redis, the replicas
+    /// get the command once, even when the dataset was already empty; each
+    /// shard's AOF gets its own FLUSHDB.
+    pub async fn flushdb(&self, all: bool) {
         {
             let mut db = self.local_db.borrow_mut();
             db.flushdb();
@@ -3258,10 +3265,27 @@ impl Router {
                 .lock()
                 .notify_all_streams(&mut db);
         }
-        self.log_mutation(|| Command::Flushdb);
+        {
+            let _aof_only = crate::replication::SuppressPropagation::new();
+            self.log_mutation(|| Command::Flushdb);
+        }
         let _ = self
-            .execute_remote_many(self.to_other_shards(|| Command::Flushdb))
+            .execute_remote_many(
+                self.to_other_shards(|| {
+                    Command::Debug(vec![Bytes::from_static(DEBUG_FLUSH_SHARD)])
+                }),
+            )
             .await;
+        if crate::replication::has_connected_replicas(self.port) {
+            crate::replication::propagate_bytes(
+                self.port,
+                if all {
+                    b"*1\r\n$8\r\nFLUSHALL\r\n"
+                } else {
+                    b"*1\r\n$7\r\nFLUSHDB\r\n"
+                },
+            );
+        }
     }
 
     pub async fn publish(&self, channel: Bytes, message: Bytes) -> usize {
