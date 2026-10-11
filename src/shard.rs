@@ -2393,7 +2393,7 @@ impl ShardDb {
 
     #[inline]
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
-        let clock = RdbClock::now();
+        let clock = RdbClock::now(self.port);
         for entry in self.table.entries() {
             self.save_rdb_entry(entry, &clock, buf);
         }
@@ -2415,6 +2415,7 @@ impl ShardDb {
     ) {
         if let Some(exp) = entry.expire_at()
             && exp <= clock.now
+            && !clock.keep_expired
         {
             return;
         }
@@ -3847,11 +3848,17 @@ impl ShardDb {
 struct RdbClock {
     now: std::time::Instant,
     unix_ms: u64,
+    /// Write keys that already expired too, like Redis: a master with a
+    /// replication history has not told its replicas about them yet, and
+    /// after a restart it propagates their deletion (see
+    /// `replication::propagate_expired_on_load`).
+    keep_expired: bool,
 }
 
 impl RdbClock {
-    fn now() -> Self {
+    fn now(port: u16) -> Self {
         RdbClock {
+            keep_expired: crate::replication::snapshots_keep_expired(port),
             now: std::time::Instant::now(),
             unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3960,7 +3967,7 @@ impl RdbSaveCursor {
         budget: Duration,
         flush_bytes: usize,
     ) -> bool {
-        let clock = RdbClock::now();
+        let clock = RdbClock::now(db.port);
         if db.table.layout_epoch() != self.epoch {
             // Renumbered (FLUSHALL, collapsing defrag): what is left is
             // small; write the keys no written segment covered.

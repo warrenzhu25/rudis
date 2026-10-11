@@ -3,21 +3,51 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
+/// The replication id and offset are not part of the role: like Redis
+/// (PSYNC2), masters and replicas alike have a replication history
+/// (`ReplicationHub::ids` and `master_repl_offset`). A replica adopts its
+/// master's history and feeds the master's stream into its own backlog, so
+/// a whole chain shares one id and one offset space.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplicationRole {
-    Master {
-        replid: String,
-        replid2: String,
-        second_offset: i64,
-    },
+    Master,
     Slave {
         master_host: String,
         master_port: u16,
         link_status: String,
-        master_repl_offset: u64,
-        master_replid: String,
         sync_in_progress: bool,
     },
+}
+
+/// Redis's "no replid2".
+pub const NULL_REPLID: &str = "0000000000000000000000000000000000000000";
+
+/// Replication ids of this server's history (Redis's `replid`, `replid2`
+/// and `second_replid_offset`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplIds {
+    /// The current history; a replica's equals its master's.
+    pub replid: String,
+    /// The history this one continued (after a promotion or a master
+    /// changing ids), valid up to `second_offset`.
+    pub replid2: String,
+    /// First offset `replid2` does not cover (Redis's
+    /// `second_replid_offset`: switch offset + 1), -1 without `replid2`.
+    pub second_offset: i64,
+}
+
+/// A fresh random 40-character replication id.
+fn new_replid() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let h1 = fxhash::hash64(&(t, seq, std::process::id()));
+    let h2 = fxhash::hash64(&(seq, t.rotate_left(17), h1));
+    let h3 = fxhash::hash64(&(h1, h2)) as u32;
+    format!("{:016x}{:016x}{:08x}", h1, h2, h3)
 }
 
 pub struct ConnectedReplica {
@@ -48,6 +78,9 @@ pub struct ConnectedReplica {
     /// The replica's socket while its connection owns it, so breaking the
     /// output limit can drop the link even while the writer is blocked.
     conn_fd: Mutex<Option<i32>>,
+    /// Set by `ReplicationHub::disconnect_replicas`: the replica must
+    /// reconnect (our history changed); nothing more is sent to it.
+    disconnected: AtomicBool,
 }
 
 /// Below this many buffered bytes the output limits are not looked up.
@@ -203,7 +236,7 @@ impl ConnectedReplica {
     pub fn attach_fd(&self, fd: i32) {
         let mut slot = self.conn_fd.lock();
         *slot = Some(fd);
-        if self.is_overflowed() {
+        if self.is_overflowed() || self.is_disconnected() {
             // SAFETY: shutdown(2) takes no pointers. `fd` is the live socket being
             // attached, and we hold the `conn_fd` lock that `detach_fd` takes before the
             // socket closes.
@@ -229,6 +262,19 @@ impl ConnectedReplica {
     /// True once the replica broke its output buffer limit.
     pub fn is_overflowed(&self) -> bool {
         self.overflowed.load(Ordering::Acquire)
+    }
+
+    /// True once `ReplicationHub::disconnect_replicas` dropped the replica.
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire)
+    }
+
+    /// Drops the link so the replica reconnects (and learns our new
+    /// history); wakes the writer so it exits even before it has the fd.
+    fn disconnect(&self) {
+        self.disconnected.store(true, Ordering::Release);
+        self.drop_link();
+        let _ = self.sender.send(Vec::new());
     }
 
     /// Takes everything appended so far. The writer task calls this on each
@@ -395,7 +441,13 @@ impl ReplicationBacklog {
 pub struct ReplicationHub {
     pub port: u16,
     pub role: RwLock<ReplicationRole>,
-    pub master_replid: String,
+    /// Ids of this server's replication history. Changed only under the
+    /// backlog lock, so they always describe `master_repl_offset` and the
+    /// backlog consistently.
+    ids: RwLock<ReplIds>,
+    /// Offset of the last byte of our replication stream. A replica's is
+    /// its master's offset: it counts every byte of the master's stream it
+    /// processed (and fed to its own backlog and sub-replicas).
     pub master_repl_offset: AtomicU64,
     pub is_slave_atomic: std::sync::atomic::AtomicBool,
     pub has_replicas: std::sync::atomic::AtomicBool,
@@ -425,11 +477,35 @@ pub struct ReplicationHub {
     /// are connected or before the first one: `repl-backlog-ttl` counts
     /// from it.
     no_replicas_since: AtomicU64,
+    /// Redis's cached master: while set, a replica asks its master for a
+    /// partial resync of our history (`ids.replid`, `master_repl_offset`);
+    /// otherwise it asks for a full resync.
+    cached_master: AtomicBool,
+    /// One token, held by a replica's worker while it applies and feeds a
+    /// batch of its master's stream, and by a full sync or save on a
+    /// replica while it snapshots: the snapshot then matches one offset of
+    /// the stream exactly.
+    apply_token: (flume::Sender<()>, flume::Receiver<()>),
+    /// A task sends `repl-ping-replica-period` PINGs to the replicas.
+    pinger_running: AtomicBool,
+}
+
+/// Holds `ReplicationHub::apply_token` until dropped.
+pub struct ApplyGuard(flume::Sender<()>);
+
+impl Drop for ApplyGuard {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(());
+    }
 }
 
 /// `repl-backlog-ttl`: seconds without replicas after which a master drops
 /// its backlog (0: never), so a replica returning after that full-syncs.
 pub static REPL_BACKLOG_TTL: AtomicU64 = AtomicU64::new(3600);
+
+/// `repl-ping-replica-period`: a master PINGs its replicas this often
+/// (seconds), through the replication stream like Redis.
+pub static REPL_PING_PERIOD: AtomicU64 = AtomicU64::new(10);
 
 /// See `ReplicationHub::pending_peers`.
 #[derive(Default, Clone, Copy)]
@@ -442,25 +518,21 @@ struct PendingPeer {
 /// leave entries in.
 const MAX_PENDING_PEERS: usize = 4096;
 
+/// The PING a master sends its replicas every `repl-ping-replica-period`.
+const REPL_PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
+
 impl ReplicationHub {
     pub fn new(port: u16) -> Self {
-        use fxhash::hash64;
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let h1 = hash64(&port.to_le_bytes());
-        let h2 = hash64(&t.to_le_bytes());
-        let replid = format!("{:016x}{:016x}{:08x}", h1, h2, port);
-
+        let (token_tx, token_rx) = flume::bounded(1);
+        let _ = token_tx.try_send(());
         Self {
             port,
-            role: RwLock::new(ReplicationRole::Master {
-                replid: replid.clone(),
-                replid2: "0000000000000000000000000000000000000000".to_string(),
+            role: RwLock::new(ReplicationRole::Master),
+            ids: RwLock::new(ReplIds {
+                replid: new_replid(),
+                replid2: NULL_REPLID.to_string(),
                 second_offset: -1,
             }),
-            master_replid: replid,
             master_repl_offset: AtomicU64::new(0),
             is_slave_atomic: std::sync::atomic::AtomicBool::new(false),
             has_replicas: std::sync::atomic::AtomicBool::new(false),
@@ -476,6 +548,9 @@ impl ReplicationHub {
             worker_exit: Mutex::new(None),
             pending_peers: Mutex::new(HashMap::new()),
             no_replicas_since: AtomicU64::new(0),
+            cached_master: AtomicBool::new(false),
+            apply_token: (token_tx, token_rx),
+            pinger_running: AtomicBool::new(false),
         }
     }
 
@@ -489,60 +564,291 @@ impl ReplicationHub {
         self.is_slave_atomic.load(Ordering::Relaxed)
     }
 
+    /// The ids of our replication history.
+    pub fn ids(&self) -> ReplIds {
+        self.ids.read().clone()
+    }
+
+    /// Our current replication id (a replica's is its master's).
+    pub fn replid(&self) -> String {
+        self.ids.read().replid.clone()
+    }
+
+    /// Waits for the apply token (see `ReplicationHub::apply_token`).
+    pub async fn lock_apply(&self) -> ApplyGuard {
+        let _ = self.apply_token.1.recv_async().await;
+        ApplyGuard(self.apply_token.0.clone())
+    }
+
+    /// Redis's `shiftReplicationId`: the current id becomes replid2, valid
+    /// up to the current offset, and a new history starts. Call under the
+    /// backlog lock.
+    fn shift_replid_locked(&self) {
+        let offset = self.master_repl_offset.load(Ordering::SeqCst);
+        let mut ids = self.ids.write();
+        ids.replid2 = std::mem::replace(&mut ids.replid, new_replid());
+        // A replica asks for the first byte it lacks, so one with our
+        // history up to `offset` asks for `offset + 1`.
+        ids.second_offset = offset as i64 + 1;
+        crate::log_notice!(
+            "Setting secondary replication ID to {}, valid up to offset: {}. New replication ID is {}",
+            ids.replid2,
+            ids.second_offset,
+            ids.replid
+        );
+    }
+
+    /// DEBUG CHANGE-REPL-ID: a new history id and no replid2 (Redis's
+    /// `changeReplicationId` + `clearReplicationId2`), so nobody partially
+    /// resyncs with us afterwards.
+    pub fn change_replid(&self) {
+        let _backlog = self.backlog.write();
+        *self.ids.write() = ReplIds {
+            replid: new_replid(),
+            replid2: NULL_REPLID.to_string(),
+            second_offset: -1,
+        };
+    }
+
+    /// Promotes this server (REPLICAOF NO ONE, failover). Like Redis's
+    /// `replicationUnsetPrimary`, a replica keeps its master's history as
+    /// replid2 and starts a new one, so the master's other replicas and our
+    /// own sub-replicas can partially resync with us; sub-replicas are
+    /// disconnected to learn the new id. A master stays as it is.
     pub fn make_master(&self) {
-        use fxhash::hash64;
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let h1 = hash64(&self.port.to_le_bytes());
-        let h2 = hash64(&t.to_le_bytes());
-        let new_replid = format!("{:016x}{:016x}{:08x}", h1, h2, self.port);
-
-        let mut role = self.role.write();
-        let (replid2, second_offset) = match &*role {
-            ReplicationRole::Slave {
-                master_replid,
-                master_repl_offset,
-                ..
-            } if !master_replid.is_empty() => (master_replid.clone(), *master_repl_offset as i64),
-            _ => ("0000000000000000000000000000000000000000".to_string(), -1),
+        let dropped = {
+            let _backlog = self.backlog.write();
+            let mut role = self.role.write();
+            if matches!(*role, ReplicationRole::Master) && !self.is_slave() {
+                return;
+            }
+            self.shift_replid_locked();
+            *role = ReplicationRole::Master;
+            self.cached_master.store(false, Ordering::Relaxed);
+            self.is_slave_atomic.store(false, Ordering::Release);
+            // Like Redis, the backlog TTL counts from the promotion.
+            self.no_replicas_since.store(unix_secs(), Ordering::Relaxed);
+            self.take_replicas_locked()
         };
-
-        if second_offset >= 0 {
-            self.master_repl_offset
-                .store(second_offset as u64, Ordering::SeqCst);
+        for rep in dropped {
+            rep.disconnect();
         }
-
-        *role = ReplicationRole::Master {
-            replid: new_replid,
-            replid2,
-            second_offset,
-        };
-        self.is_slave_atomic.store(false, Ordering::Release);
         crate::log::set_role_replica(false);
     }
 
     /// After a failed or interrupted sync: marks the link down and drops
-    /// the master's replication id and offset, so the next attempt is a full
-    /// resync. The dataset may not match any offset of the master's.
+    /// our replication history, so the next attempt is a full resync and
+    /// nobody partially resyncs with us. The dataset may not match any
+    /// offset of the master's.
     fn forget_master_history(&self) {
-        // A worker that panicked holding the lock may have left the sync
-        // state half written; it is reset right here.
-        let mut role = self.role.write();
-        if let ReplicationRole::Slave {
-            ref mut link_status,
-            ref mut master_replid,
-            ref mut master_repl_offset,
-            ref mut sync_in_progress,
-            ..
-        } = *role
-        {
-            *link_status = "down".to_string();
-            master_replid.clear();
-            *master_repl_offset = 0;
-            *sync_in_progress = true;
+        let dropped = {
+            let mut backlog = self.backlog.write();
+            // A worker that panicked holding the lock may have left the sync
+            // state half written; it is reset right here.
+            let mut role = self.role.write();
+            if let ReplicationRole::Slave {
+                ref mut link_status,
+                ref mut sync_in_progress,
+                ..
+            } = *role
+            {
+                *link_status = "down".to_string();
+                *sync_in_progress = true;
+            }
+            self.cached_master.store(false, Ordering::Relaxed);
+            *self.ids.write() = ReplIds {
+                replid: new_replid(),
+                replid2: NULL_REPLID.to_string(),
+                second_offset: -1,
+            };
+            backlog.clear(self.master_repl_offset.load(Ordering::SeqCst));
+            self.psync_holes.lock().clear();
+            self.take_replicas_locked()
+        };
+        for rep in dropped {
+            rep.disconnect();
         }
+    }
+
+    /// Unregisters every replica; the caller holds the backlog lock and
+    /// calls `disconnect` on them after releasing it.
+    fn take_replicas_locked(&self) -> Vec<Arc<ConnectedReplica>> {
+        let mut reps = self.replicas.write();
+        if reps.is_empty() {
+            return Vec::new();
+        }
+        let dropped: Vec<_> = reps.drain().map(|(_, r)| r).collect();
+        self.has_replicas.store(false, Ordering::Release);
+        self.no_replicas_since.store(unix_secs(), Ordering::Relaxed);
+        dropped
+    }
+
+    /// Drops every replica's link so they reconnect (Redis's
+    /// `disconnectReplicas`).
+    pub fn disconnect_replicas(&self) {
+        let dropped = {
+            let _backlog = self.backlog.write();
+            self.take_replicas_locked()
+        };
+        for rep in dropped {
+            rep.disconnect();
+        }
+    }
+
+    /// The (replid, offset) a replica asks its master to continue from, or
+    /// None for a full resync (no usable cached master).
+    pub fn psync_request(&self) -> Option<(String, u64)> {
+        let _backlog = self.backlog.read();
+        if !self.cached_master.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some((
+            self.replid(),
+            self.master_repl_offset.load(Ordering::SeqCst),
+        ))
+    }
+
+    /// The master answered +FULLRESYNC: our dataset and history are about
+    /// to be replaced (Redis's `replicationAttachToNewPrimary`). Sub-replicas
+    /// are dropped (they must resync with us too) and the backlog emptied.
+    fn attach_to_new_master(&self) {
+        let dropped = {
+            let mut backlog = self.backlog.write();
+            self.cached_master.store(false, Ordering::Relaxed);
+            backlog.clear(self.master_repl_offset.load(Ordering::SeqCst));
+            self.psync_holes.lock().clear();
+            self.take_replicas_locked()
+        };
+        for rep in dropped {
+            rep.disconnect();
+        }
+    }
+
+    /// A full sync from the master loaded: our history is now the master's
+    /// `replid` at `offset`, with an empty backlog starting right there.
+    fn finish_full_resync(&self, replid: &str, offset: u64) {
+        {
+            let mut backlog = self.backlog.write();
+            *self.ids.write() = ReplIds {
+                replid: replid.to_string(),
+                replid2: NULL_REPLID.to_string(),
+                second_offset: -1,
+            };
+            self.master_repl_offset.store(offset, Ordering::SeqCst);
+            backlog.clear(offset);
+            self.psync_holes.lock().clear();
+            self.cached_master.store(true, Ordering::Relaxed);
+        }
+        self.activate_backlog();
+    }
+
+    /// The master answered +CONTINUE with id `new_id`. If its id changed
+    /// (it was promoted, or is a replica whose master was), the old id
+    /// becomes our replid2 up to the current offset and sub-replicas are
+    /// dropped to learn the new one, like Redis.
+    fn continue_with_master(&self, new_id: &str) {
+        let dropped = {
+            let _backlog = self.backlog.write();
+            self.cached_master.store(true, Ordering::Relaxed);
+            let mut ids = self.ids.write();
+            if ids.replid == new_id {
+                Vec::new()
+            } else {
+                crate::log_notice!("Master replication ID changed to {}", new_id);
+                ids.replid2 = std::mem::replace(&mut ids.replid, new_id.to_string());
+                ids.second_offset = self.master_repl_offset.load(Ordering::SeqCst) as i64 + 1;
+                drop(ids);
+                self.take_replicas_locked()
+            }
+        };
+        for rep in dropped {
+            rep.disconnect();
+        }
+        self.activate_backlog();
+    }
+
+    /// True for a master, and for a replica whose link with its master is
+    /// up: like Redis, only then do we serve (P)SYNC to our own replicas.
+    pub fn can_serve_replicas(&self) -> bool {
+        match &*self.role.read() {
+            ReplicationRole::Master => true,
+            ReplicationRole::Slave { link_status, .. } => link_status == "up",
+        }
+    }
+
+    /// Restores the replication history saved in the RDB loaded at
+    /// startup (its `repl-id` / `repl-offset` AUX fields), like Redis's
+    /// `loadDataFromDisk`. A server about to replicate (`replicaof` in its
+    /// config) continues that history with its master; a master starts a
+    /// new history that continues it, so its replicas partially resync.
+    pub fn restore_saved_history(&self, replid: &str, offset: u64, as_replica: bool) {
+        if !valid_replid(replid) {
+            return;
+        }
+        {
+            let mut backlog = self.backlog.write();
+            let mut ids = self.ids.write();
+            if as_replica {
+                ids.replid = replid.to_string();
+                ids.replid2 = NULL_REPLID.to_string();
+                ids.second_offset = -1;
+                self.cached_master.store(true, Ordering::Relaxed);
+            } else {
+                ids.replid2 = replid.to_string();
+                ids.second_offset = offset as i64 + 1;
+            }
+            self.master_repl_offset.store(offset, Ordering::SeqCst);
+            backlog.clear(offset);
+        }
+        // Like Redis, which creates the backlog at load time.
+        self.activate_backlog();
+    }
+
+    /// The `repl-id` / `repl-offset` to save in an RDB: a master's own
+    /// history, a replica's while it has a usable one (Redis's
+    /// `rdbPopulateSaveInfo`).
+    pub fn saved_history(&self) -> Option<(String, u64)> {
+        let _backlog = self.backlog.read();
+        if self.is_slave() && !self.cached_master.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some((
+            self.replid(),
+            self.master_repl_offset.load(Ordering::SeqCst),
+        ))
+    }
+
+    /// Starts the task that PINGs the replicas every
+    /// `repl-ping-replica-period` seconds, unless it runs already. It ends
+    /// once no replica is left. Must be called from a monoio runtime.
+    pub fn ensure_pinger(self: &Arc<Self>) {
+        if self.pinger_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let hub = self.clone();
+        monoio::spawn(async move {
+            let mut ticks: u64 = 0;
+            loop {
+                monoio::time::sleep(std::time::Duration::from_secs(1)).await;
+                ticks += 1;
+                if !hub.has_replicas.load(Ordering::Acquire) {
+                    hub.pinger_running.store(false, Ordering::Release);
+                    // A replica registering meanwhile saw the flag still
+                    // set and started nothing: keep going for it.
+                    if hub.has_replicas.load(Ordering::Acquire)
+                        && !hub.pinger_running.swap(true, Ordering::AcqRel)
+                    {
+                        continue;
+                    }
+                    return;
+                }
+                let period = REPL_PING_PERIOD.load(Ordering::Relaxed).max(1);
+                if ticks.is_multiple_of(period) && hub.is_master() && !PROPAGATION_SUPPRESSED.get()
+                {
+                    hub.propagate(REPL_PING);
+                }
+            }
+        });
     }
 
     pub fn stop_sync(&self) {
@@ -561,6 +867,16 @@ impl ReplicationHub {
         }
     }
 
+    /// `stop_sync`, then waits for the replica worker to exit, so nothing
+    /// it was applying or feeding lands after the caller changes the role.
+    pub async fn stop_sync_and_wait(&self) {
+        self.stop_sync();
+        let exit = self.worker_exit.lock().clone();
+        if let Some(exit) = exit {
+            let _ = exit.recv_async().await;
+        }
+    }
+
     /// CLIENT KILL of a replica's master link (`addr` is `host:port` of
     /// the configured master): breaks the link without stopping
     /// replication, so the worker reconnects and tries a partial resync.
@@ -572,7 +888,7 @@ impl ReplicationHub {
                 master_port,
                 ..
             } => addr == format!("{master_host}:{master_port}"),
-            ReplicationRole::Master { .. } => false,
+            ReplicationRole::Master => false,
         };
         if !matches {
             return false;
@@ -627,6 +943,7 @@ impl ReplicationHub {
             overflowed: AtomicBool::new(false),
             soft_since_ms: AtomicU64::new(0),
             conn_fd: Mutex::new(None),
+            disconnected: AtomicBool::new(false),
         });
         self.replicas.write().insert(id, rep.clone());
         self.no_replicas_since.store(0, Ordering::Relaxed);
@@ -638,13 +955,15 @@ impl ReplicationHub {
 
     /// Registers a replica about to receive a full sync of `num_shards`
     /// shards. Must happen before any shard serializes its snapshot; each
-    /// shard then calls `arm_full_sync` right after serializing.
+    /// shard then calls `arm_full_sync` right after serializing. None when
+    /// we are a replica whose own master link is down (Redis's
+    /// -NOMASTERLINK): we have nothing consistent to send.
     pub fn register_full_sync_replica(
         &self,
         id: u64,
         sender: flume::Sender<Vec<u8>>,
         num_shards: usize,
-    ) -> Arc<ConnectedReplica> {
+    ) -> Option<Arc<ConnectedReplica>> {
         let cut = FullSyncCut {
             armed: (0..num_shards)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
@@ -653,7 +972,10 @@ impl ReplicationHub {
             pre: Mutex::new(Vec::new()),
         };
         let _backlog = self.backlog.write();
-        self.insert_replica(id, sender, Some(cut))
+        if !self.can_serve_replicas() {
+            return None;
+        }
+        Some(self.insert_replica(id, sender, Some(cut)))
     }
 
     /// Called on shard `shard_id`'s thread right after it serialized its
@@ -669,11 +991,12 @@ impl ReplicationHub {
     }
 
     /// Ends the snapshot phase of replica `id` once every shard is armed.
-    /// Returns the offset to announce in +FULLRESYNC and the bytes to send
-    /// right after the snapshot; from then on the replica gets the live
-    /// stream, so its offset matches the master's.
-    pub fn finish_full_sync(&self, id: u64) -> (u64, Vec<u8>) {
+    /// Returns the replication id and offset to announce in +FULLRESYNC and
+    /// the bytes to send right after the snapshot; from then on the replica
+    /// gets the live stream, so its offset matches the master's.
+    pub fn finish_full_sync(&self, id: u64) -> (String, u64, Vec<u8>) {
         let _backlog = self.backlog.write();
+        let replid = self.replid();
         let offset = self.master_repl_offset.load(Ordering::SeqCst);
         let pre = match self.replicas.read().get(&id) {
             Some(rep) => match &rep.full_sync {
@@ -690,7 +1013,7 @@ impl ReplicationHub {
         if start < offset {
             self.psync_holes.lock().push((start, offset));
         }
-        (start, pre)
+        (replid, start, pre)
     }
 
     fn in_psync_hole(&self, replica_offset: u64, backlog_start: u64) -> bool {
@@ -847,6 +1170,24 @@ impl ReplicationHub {
         since != 0 && ttl != 0 && unix_secs().saturating_sub(since) >= ttl
     }
 
+    /// Whether `req_replid` names our history up to `target_offset` (the
+    /// next byte the replica wants): our current id, or replid2 when the
+    /// replica's history ends before we switched ids (Redis's
+    /// `primaryTryPartialResynchronization`).
+    fn replid_matches(&self, req_replid: &str, target_offset: u64) -> bool {
+        let ids = self.ids.read();
+        req_replid == ids.replid
+            || (ids.second_offset >= 0
+                && ids.replid2 != NULL_REPLID
+                && req_replid == ids.replid2
+                && target_offset <= ids.second_offset as u64)
+    }
+
+    /// Serves `PSYNC <req_replid> <req_offset>` from the backlog when our
+    /// history and backlog allow it, registering the replica. Returns our
+    /// replication id (for +CONTINUE), the backlog bytes to send first, and
+    /// the replica. Masters and replicas alike serve partial resyncs; a
+    /// replica only while its own master link is up.
     pub fn try_partial_resync(
         &self,
         client_id: u64,
@@ -862,33 +1203,13 @@ impl ReplicationHub {
         let target_offset = req_offset as u64;
         let req_offset = req_offset - 1;
 
-        let (current_replid, replid_matches) = {
-            let role = self.role.read();
-            match &*role {
-                ReplicationRole::Master {
-                    replid,
-                    replid2,
-                    second_offset,
-                } => {
-                    let matches = req_replid == replid
-                        || req_replid == self.master_replid
-                        || (!replid2.is_empty()
-                            && req_replid == replid2
-                            && *second_offset >= 0
-                            && req_offset <= *second_offset);
-                    (replid.clone(), matches)
-                }
-                _ => (String::new(), false),
-            }
-        };
-
-        if !replid_matches {
+        // Hold the backlog lock until the replica is registered, so no
+        // change lands between the diff and the live stream (and our ids
+        // cannot change meanwhile).
+        let mut backlog = self.backlog.write();
+        if !self.can_serve_replicas() || !self.replid_matches(req_replid, target_offset) {
             return None;
         }
-
-        // Hold the backlog lock until the replica is registered, so no
-        // change lands between the diff and the live stream.
-        let mut backlog = self.backlog.write();
         self.expire_idle_backlog(&mut backlog);
         let current_offset = self.master_repl_offset.load(Ordering::SeqCst);
         if !backlog.can_partial_sync(target_offset, current_offset)
@@ -898,6 +1219,7 @@ impl ReplicationHub {
         }
 
         let diff = backlog.get_diff(target_offset, current_offset)?;
+        let current_replid = self.replid();
         let rep = self.insert_replica(client_id, sender, None);
         drop(backlog);
         Some((current_replid, diff, rep))
@@ -910,25 +1232,7 @@ impl ReplicationHub {
         }
         let target_offset = req_offset as u64;
         let req_offset = req_offset - 1;
-        let role = self.role.read();
-        let replid_matches = match &*role {
-            ReplicationRole::Master {
-                replid,
-                replid2,
-                second_offset,
-            } => {
-                if req_replid == replid || req_replid == self.master_replid {
-                    true
-                } else {
-                    !replid2.is_empty()
-                        && req_replid == replid2
-                        && *second_offset >= 0
-                        && req_offset <= *second_offset
-                }
-            }
-            _ => false,
-        };
-        if !replid_matches {
+        if !self.replid_matches(req_replid, target_offset) {
             return false;
         }
         if self.backlog_idle_expired() {
@@ -959,57 +1263,7 @@ impl ReplicationHub {
         }
         if self.backlog_active.load(Ordering::Relaxed) || self.has_replicas.load(Ordering::Relaxed)
         {
-            let mut wake: Vec<Arc<ConnectedReplica>> = Vec::new();
-            {
-                let mut backlog = self.backlog.write();
-                if self.backlog_active.load(Ordering::Relaxed) {
-                    let new_offset = self
-                        .master_repl_offset
-                        .fetch_add(bytes.len() as u64, Ordering::SeqCst)
-                        + bytes.len() as u64;
-                    backlog.append(bytes, new_offset);
-                }
-                if self.has_replicas.load(Ordering::Relaxed) {
-                    let reps = self.replicas.read();
-                    for rep in reps.values() {
-                        match rep.delivery(shard) {
-                            Delivery::Send => {
-                                if rep.append_pending(bytes) {
-                                    wake.push(rep.clone());
-                                }
-                            }
-                            Delivery::Buffer => {
-                                if let Some(cut) = &rep.full_sync
-                                    && rep.append_pre(cut, bytes)
-                                {
-                                    wake.push(rep.clone());
-                                }
-                            }
-                            Delivery::Skip => {}
-                        }
-                    }
-                }
-            }
-            for rep in &wake {
-                if rep.is_overflowed() {
-                    // The writer may be blocked on the full socket.
-                    rep.drop_link();
-                }
-            }
-            let dead: Vec<u64> = wake
-                .iter()
-                .filter(|rep| rep.sender.send(Vec::new()).is_err())
-                .map(|rep| rep.id)
-                .collect();
-            if !dead.is_empty() {
-                let mut reps = self.replicas.write();
-                for id in dead {
-                    reps.remove(&id);
-                }
-                if reps.is_empty() {
-                    self.has_replicas.store(false, Ordering::Release);
-                }
-            }
+            self.append_stream(shard, bytes, false);
         }
 
         if !self.has_shard_flows.load(Ordering::Relaxed) {
@@ -1045,11 +1299,83 @@ impl ReplicationHub {
         }
     }
 
+    /// Feeds bytes of our master's replication stream, already applied, to
+    /// our backlog and our own replicas, unchanged (Redis's
+    /// `replicationFeedStreamFromPrimaryStream`): a chain of replicas shares
+    /// the master's offsets. Writes made locally on a (writable) replica are
+    /// never fed, like Redis.
+    pub fn feed_from_master(&self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.append_stream(None, bytes, true);
+        }
+    }
+
+    /// See `deliver`. `from_master`: bytes proxied from our master (we are
+    /// a replica), otherwise our own changes (we are a master). The role is
+    /// checked again under the backlog lock, which role switches take, so a
+    /// stream never gets bytes of the wrong origin.
+    fn append_stream(&self, shard: Option<usize>, bytes: &[u8], from_master: bool) {
+        let mut wake: Vec<Arc<ConnectedReplica>> = Vec::new();
+        {
+            let mut backlog = self.backlog.write();
+            if from_master == self.is_master() {
+                return;
+            }
+            if from_master || self.backlog_active.load(Ordering::Relaxed) {
+                let new_offset = self
+                    .master_repl_offset
+                    .fetch_add(bytes.len() as u64, Ordering::SeqCst)
+                    + bytes.len() as u64;
+                backlog.append(bytes, new_offset);
+            }
+            if self.has_replicas.load(Ordering::Relaxed) {
+                let reps = self.replicas.read();
+                for rep in reps.values() {
+                    match rep.delivery(shard) {
+                        Delivery::Send => {
+                            if rep.append_pending(bytes) {
+                                wake.push(rep.clone());
+                            }
+                        }
+                        Delivery::Buffer => {
+                            if let Some(cut) = &rep.full_sync
+                                && rep.append_pre(cut, bytes)
+                            {
+                                wake.push(rep.clone());
+                            }
+                        }
+                        Delivery::Skip => {}
+                    }
+                }
+            }
+        }
+        for rep in &wake {
+            if rep.is_overflowed() {
+                // The writer may be blocked on the full socket.
+                rep.drop_link();
+            }
+        }
+        let dead: Vec<u64> = wake
+            .iter()
+            .filter(|rep| rep.sender.send(Vec::new()).is_err())
+            .map(|rep| rep.id)
+            .collect();
+        if !dead.is_empty() {
+            let mut reps = self.replicas.write();
+            for id in dead {
+                reps.remove(&id);
+            }
+            if reps.is_empty() {
+                self.has_replicas.store(false, Ordering::Release);
+            }
+        }
+    }
+
     pub fn format_role_resp(&self) -> Vec<u8> {
         let role = self.role.read().clone();
+        let offset = self.master_repl_offset.load(Ordering::SeqCst);
         match role {
-            ReplicationRole::Master { .. } => {
-                let offset = self.master_repl_offset.load(Ordering::SeqCst);
+            ReplicationRole::Master => {
                 let reps = self.replicas.read();
                 let mut out = Vec::with_capacity(256);
                 out.extend_from_slice(b"*3\r\n$6\r\nmaster\r\n:");
@@ -1076,8 +1402,7 @@ impl ReplicationHub {
                 master_host,
                 master_port,
                 link_status,
-                master_repl_offset,
-                ..
+                sync_in_progress,
             } => {
                 let mut out = Vec::with_capacity(128);
                 out.extend_from_slice(b"*5\r\n$5\r\nslave\r\n$");
@@ -1087,97 +1412,108 @@ impl ReplicationHub {
                 out.extend_from_slice(format!("\r\n:{}\r\n$", master_port).as_bytes());
                 let state_str = if link_status == "up" {
                     "connected"
+                } else if sync_in_progress && self.loading.load(Ordering::Relaxed) {
+                    "sync"
                 } else {
                     "connect"
                 };
                 out.extend_from_slice(state_str.len().to_string().as_bytes());
                 out.extend_from_slice(b"\r\n");
                 out.extend_from_slice(state_str.as_bytes());
-                out.extend_from_slice(format!("\r\n:{}\r\n", master_repl_offset).as_bytes());
+                // Redis shows the offset of what was processed from the
+                // master, -1 while there is none.
+                let shown: i64 = if self.cached_master.load(Ordering::Relaxed) {
+                    offset as i64
+                } else {
+                    -1
+                };
+                out.extend_from_slice(format!("\r\n:{}\r\n", shown).as_bytes());
                 out
             }
         }
     }
 
+    /// The `slaveN:` lines and `connected_slaves` count of INFO, for
+    /// masters and replicas alike.
+    fn format_info_replicas(&self) -> (usize, String) {
+        let reps = self.replicas.read();
+        // One `slaveN:` line per replica, oldest first, as Redis.
+        let mut sorted: Vec<_> = reps.values().collect();
+        sorted.sort_by_key(|r| r.id);
+        let now = unix_secs();
+        let mut slaves = String::new();
+        for (i, rep) in sorted.iter().enumerate() {
+            let ip = rep
+                .ip
+                .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string());
+            let _ = std::fmt::Write::write_fmt(
+                &mut slaves,
+                format_args!(
+                    "slave{}:ip={},port={},state={},offset={},lag={}\r\n",
+                    i,
+                    ip,
+                    rep.listening_port.load(Ordering::SeqCst),
+                    if rep.is_online() {
+                        "online"
+                    } else {
+                        "wait_bgsave"
+                    },
+                    rep.ack_offset.load(Ordering::SeqCst),
+                    now.saturating_sub(rep.last_ack_time.load(Ordering::SeqCst)),
+                ),
+            );
+        }
+        (reps.len(), slaves)
+    }
+
+    /// The history and backlog part of INFO replication, the same on
+    /// masters and replicas (Redis).
+    fn format_info_history(&self) -> String {
+        let backlog = self.backlog.read();
+        let ids = self.ids.read().clone();
+        let offset = self.master_repl_offset.load(Ordering::SeqCst);
+        format!(
+            "master_replid:{}\r\n\
+             master_replid2:{}\r\n\
+             master_repl_offset:{}\r\n\
+             second_repl_offset:{}\r\n\
+             repl_backlog_active:1\r\n\
+             repl_backlog_size:{}\r\n\
+             repl_backlog_first_byte_offset:{}\r\n\
+             repl_backlog_histlen:{}\r\n",
+            ids.replid,
+            ids.replid2,
+            offset,
+            ids.second_offset,
+            backlog.max_size,
+            backlog.first_byte_offset,
+            backlog.len()
+        )
+    }
+
     pub fn format_info_replication(&self) -> String {
         let role = self.role.read().clone();
+        let (connected, slaves) = self.format_info_replicas();
+        let history = self.format_info_history();
         match role {
-            ReplicationRole::Master {
-                replid,
-                replid2,
-                second_offset,
-            } => {
-                let reps = self.replicas.read();
-                let offset = self.master_repl_offset.load(Ordering::SeqCst);
-                let backlog = self.backlog.read();
-                // One `slaveN:` line per replica, oldest first, as Redis.
-                let mut sorted: Vec<_> = reps.values().collect();
-                sorted.sort_by_key(|r| r.id);
-                let now = unix_secs();
-                let mut slaves = String::new();
-                for (i, rep) in sorted.iter().enumerate() {
-                    let ip = rep
-                        .ip
-                        .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string());
-                    let _ = std::fmt::Write::write_fmt(
-                        &mut slaves,
-                        format_args!(
-                            "slave{}:ip={},port={},state={},offset={},lag={}\r\n",
-                            i,
-                            ip,
-                            rep.listening_port.load(Ordering::SeqCst),
-                            if rep.is_online() {
-                                "online"
-                            } else {
-                                "wait_bgsave"
-                            },
-                            rep.ack_offset.load(Ordering::SeqCst),
-                            now.saturating_sub(rep.last_ack_time.load(Ordering::SeqCst)),
-                        ),
-                    );
-                }
-                format!(
-                    "# Replication\r\n\
-                     role:master\r\n\
-                     connected_slaves:{}\r\n\
-                     {}\
-                     master_replid:{}\r\n\
-                     master_replid2:{}\r\n\
-                     master_repl_offset:{}\r\n\
-                     second_repl_offset:{}\r\n\
-                     repl_backlog_active:1\r\n\
-                     repl_backlog_size:{}\r\n\
-                     repl_backlog_first_byte_offset:{}\r\n\
-                     repl_backlog_histlen:{}\r\n",
-                    reps.len(),
-                    slaves,
-                    replid,
-                    replid2,
-                    offset,
-                    // Redis shows the first offset replid2 no longer
-                    // covers: one past the switch offset.
-                    if second_offset >= 0 {
-                        second_offset + 1
-                    } else {
-                        -1
-                    },
-                    backlog.max_size,
-                    backlog.first_byte_offset,
-                    backlog.len()
-                )
-            }
+            ReplicationRole::Master => format!(
+                "# Replication\r\n\
+                 role:master\r\n\
+                 connected_slaves:{}\r\n\
+                 {}\
+                 {}",
+                connected, slaves, history
+            ),
             ReplicationRole::Slave {
                 master_host,
                 master_port,
                 link_status,
-                master_repl_offset,
-                master_replid,
                 sync_in_progress,
             } => {
-                let displayed_replid = if !master_replid.is_empty() {
-                    master_replid.as_str()
+                let processed = if self.cached_master.load(Ordering::Relaxed) {
+                    self.master_repl_offset.load(Ordering::SeqCst)
                 } else {
-                    self.master_replid.as_str()
+                    0
                 };
                 format!(
                     "# Replication\r\n\
@@ -1187,19 +1523,22 @@ impl ReplicationHub {
                      master_link_status:{}\r\n\
                      master_last_io_seconds_ago:0\r\n\
                      master_sync_in_progress:{}\r\n\
+                     slave_read_repl_offset:{}\r\n\
                      slave_repl_offset:{}\r\n\
                      slave_priority:100\r\n\
                      slave_read_only:1\r\n\
-                     connected_slaves:0\r\n\
-                     master_replid:{}\r\n\
-                     master_repl_offset:{}\r\n",
+                     connected_slaves:{}\r\n\
+                     {}\
+                     {}",
                     master_host,
                     master_port,
                     link_status,
                     if sync_in_progress { 1 } else { 0 },
-                    master_repl_offset,
-                    displayed_replid,
-                    master_repl_offset,
+                    processed,
+                    processed,
+                    connected,
+                    slaves,
+                    history,
                 )
             }
         }
@@ -1416,7 +1755,34 @@ pub fn start_replica_sync(
     let hub = get_replication_hub(port);
     hub.stop_sync();
 
-    hub.is_slave_atomic.store(true, Ordering::Release);
+    {
+        // Under the backlog lock, so no local write lands in our stream
+        // after we turned into a replica (see `append_stream`).
+        let _backlog = hub.backlog.write();
+        let mut role = hub.role.write();
+        if matches!(*role, ReplicationRole::Master)
+            && (hub.master_repl_offset.load(Ordering::SeqCst) > 0
+                || hub.ids.read().replid2 != NULL_REPLID)
+        {
+            // Redis's `replicationCachePrimaryUsingMyself`: ask the new
+            // master to continue our own history, which it may share (a
+            // demoted master rejoining the replica promoted in its place).
+            // A fresh server has no history to share and asks `PSYNC ? -1`.
+            crate::log_notice!(
+                "Before turning into a replica, using my own master parameters to synthesize a cached master: I may be able to synchronize with the new master with just a partial transfer."
+            );
+            hub.cached_master.store(true, Ordering::Relaxed);
+        }
+        // Like Redis, our own replicas stay connected: they may continue
+        // with us once we continue with the new master.
+        *role = ReplicationRole::Slave {
+            master_host: master_host.clone(),
+            master_port,
+            link_status: "down".to_string(),
+            sync_in_progress: true,
+        };
+        hub.is_slave_atomic.store(true, Ordering::Release);
+    }
     HAS_SLAVE_INSTANCE.store(true, Ordering::Release);
     crate::log::set_role_replica(true);
     // Like Redis: a blocked BLPOP & co. served here would change data the
@@ -1424,35 +1790,6 @@ pub fn start_replica_sync(
     crate::block::get_block_hub_for_port(port)
         .lock()
         .unblock_writers();
-
-    let (cached_replid, cached_offset) = {
-        let role = hub.role.read();
-        if let ReplicationRole::Slave {
-            master_host: ref prev_host,
-            master_port: prev_port,
-            ref master_replid,
-            master_repl_offset,
-            ..
-        } = *role
-        {
-            if prev_host == &master_host && prev_port == master_port {
-                (master_replid.clone(), master_repl_offset)
-            } else {
-                (String::new(), 0)
-            }
-        } else {
-            (String::new(), 0)
-        }
-    };
-
-    *hub.role.write() = ReplicationRole::Slave {
-        master_host: master_host.clone(),
-        master_port,
-        link_status: "down".to_string(),
-        master_repl_offset: cached_offset,
-        master_replid: cached_replid,
-        sync_in_progress: true,
-    };
 
     let (cancel_tx, cancel_rx) = flume::bounded(1);
     *hub.cancel_sync.write() = Some(cancel_tx);
@@ -1596,6 +1933,40 @@ pub fn set_startup_replicaof(port: u16, value: &str) -> Result<(), String> {
         }
         _ => Err("expected <masterip> <masterport>".to_string()),
     }
+}
+
+/// After a startup load: like Redis, a master that continues a saved
+/// replication history feeds a DEL for each key the load dropped as
+/// expired into its backlog, so replicas resuming from it drop them too.
+pub fn propagate_expired_on_load(port: u16, keys: &[Vec<u8>]) {
+    if keys.is_empty() || has_startup_replicaof(port) {
+        return;
+    }
+    let hub = get_replication_hub(port);
+    if !hub.is_master() || hub.ids().replid2 == NULL_REPLID {
+        return;
+    }
+    for key in keys {
+        let mut cmd = format!("*2\r\n$3\r\nDEL\r\n${}\r\n", key.len()).into_bytes();
+        cmd.extend_from_slice(key);
+        cmd.extend_from_slice(b"\r\n");
+        hub.propagate(&cmd);
+    }
+}
+
+/// Whether snapshots of the server on `port` keep keys that already
+/// expired (Redis always does): a master with replication active has not
+/// propagated their deletion yet, and must be able to after a restart.
+pub fn snapshots_keep_expired(port: u16) -> bool {
+    HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) && {
+        let hub = get_replication_hub(port);
+        hub.is_master() && hub.backlog_active.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether the config file made the server on `port` a replica.
+pub fn has_startup_replicaof(port: u16) -> bool {
+    STARTUP_REPLICAOF.lock().contains_key(&port)
 }
 
 pub fn take_startup_replicaof(port: u16) -> Option<(String, u16)> {
@@ -1897,21 +2268,10 @@ async fn run_replica_worker(
             continue 'reconnect_loop;
         }
 
-        // 4. PSYNC
-        let (cached_replid, cached_offset) = {
-            let role = hub.role.read();
-            if let ReplicationRole::Slave {
-                ref master_replid,
-                master_repl_offset,
-                ..
-            } = *role
-            {
-                (master_replid.clone(), master_repl_offset)
-            } else {
-                (String::new(), 0)
-            }
-        };
-
+        // 4. PSYNC, continuing our history when we have one (Redis's
+        // cached master: what we got from a previous master, or our own
+        // history when we were a master).
+        let (cached_replid, cached_offset) = hub.psync_request().unwrap_or_default();
         let psync_payload = if !cached_replid.is_empty() {
             // Like Redis, ask for the next byte: one past what was applied.
             let next = (cached_offset + 1).to_string();
@@ -1941,7 +2301,16 @@ async fn run_replica_worker(
         let Some((is_continue, new_replid, initial_offset)) =
             parse_psync_reply(&line, &cached_replid, cached_offset)
         else {
-            if log_attempt {
+            if line.starts_with(b"-NOMASTERLINK") || line.starts_with(b"-LOADING") {
+                // A replica serving us lost its own master, or loads: it
+                // can serve us later, and we keep our history.
+                if log_attempt {
+                    crate::log_notice!(
+                        "Master is currently unable to PSYNC but should be in the future: {}",
+                        String::from_utf8_lossy(&line).trim_end()
+                    );
+                }
+            } else if log_attempt {
                 crate::log_warning!(
                     "Unexpected reply to PSYNC from master: {}",
                     String::from_utf8_lossy(&line).trim_end()
@@ -1962,12 +2331,16 @@ async fn run_replica_worker(
         };
 
         if is_continue {
+            hub.continue_with_master(&new_replid);
             crate::log_notice!("Successful partial resynchronization with master.");
             crate::log_notice!(
                 "MASTER <-> REPLICA sync: Master accepted a Partial Resynchronization."
             );
         } else {
             crate::log_notice!("Full resync from master: {}:{}", new_replid, initial_offset);
+            // Our history no longer gets continued: if this sync fails, the
+            // next attempt is a full one too.
+            hub.cached_master.store(false, Ordering::Relaxed);
             // 5. Read RDB header: $<len>\r\n
             let rdb_len = loop {
                 match take_rdb_header(&mut buf) {
@@ -2042,6 +2415,7 @@ async fn run_replica_worker(
             // 7. Restore RDB into router. A failed load leaves the dataset
             // empty; forget the master's history too, so the next attempt
             // is a full resync rather than a partial one on top of nothing.
+            hub.attach_to_new_master();
             crate::log_notice!("MASTER <-> REPLICA sync: Flushing old data");
             crate::log_notice!("MASTER <-> REPLICA sync: Loading DB in memory");
             let loaded = {
@@ -2062,6 +2436,7 @@ async fn run_replica_worker(
                 monoio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 continue 'reconnect_loop;
             }
+            hub.finish_full_resync(&new_replid, initial_offset);
         }
 
         // 8. Mark link_status up
@@ -2069,15 +2444,11 @@ async fn run_replica_worker(
             let mut role = hub.role.write();
             if let ReplicationRole::Slave {
                 ref mut link_status,
-                ref mut master_repl_offset,
-                ref mut master_replid,
                 ref mut sync_in_progress,
                 ..
             } = *role
             {
                 *link_status = "up".to_string();
-                *master_repl_offset = initial_offset;
-                *master_replid = new_replid;
                 *sync_in_progress = false;
             }
         }
@@ -2129,44 +2500,47 @@ async fn run_replica_worker(
             }
             let mut protocol_error = false;
 
-            while !buf.is_empty() {
-                let initial_buf_len = buf.len();
-                match crate::resp::parse_command(&mut buf) {
-                    Ok(Some(cmd)) => {
-                        let consumed = initial_buf_len - buf.len();
-                        current_offset += consumed as u64;
+            if !buf.is_empty() {
+                // Applying a batch and feeding it to our backlog and
+                // sub-replicas is atomic with respect to snapshots taken
+                // on this server (see `ReplicationHub::apply_token`).
+                let _apply = hub.lock_apply().await;
+                // The exact bytes we process are what our sub-replicas get.
+                let raw = buf.clone().freeze();
+                let start_len = buf.len();
+                while !buf.is_empty() {
+                    let initial_buf_len = buf.len();
+                    match crate::resp::parse_command(&mut buf) {
+                        Ok(Some(cmd)) => {
+                            let consumed = initial_buf_len - buf.len();
+                            current_offset += consumed as u64;
 
-                        match &cmd {
-                            crate::resp::Command::Replconf(args) => {
-                                if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"getack") {
-                                    // Acknowledge only what is applied.
-                                    router.flush_replica_batch(&mut batch).await;
-                                    applied.set(current_offset);
-                                    let _ = ack_tx.send(());
+                            match &cmd {
+                                crate::resp::Command::Replconf(args) => {
+                                    if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"getack") {
+                                        // Acknowledge only what is applied.
+                                        router.flush_replica_batch(&mut batch).await;
+                                        applied.set(current_offset);
+                                        let _ = ack_tx.send(());
+                                    }
+                                }
+                                crate::resp::Command::Ping(_) => {}
+                                _ => {
+                                    router.apply_replica_command_batched(cmd, &mut batch).await;
                                 }
                             }
-                            crate::resp::Command::Ping(_) => {}
-                            _ => {
-                                router.apply_replica_command_batched(cmd, &mut batch).await;
-                            }
+                        }
+                        Ok(None) => break,
+                        // Skipping the bad bytes would silently diverge from
+                        // the master; reconnect and resume from what was applied.
+                        Err(_) => {
+                            protocol_error = true;
+                            break;
                         }
                     }
-                    Ok(None) => break,
-                    // Skipping the bad bytes would silently diverge from
-                    // the master; reconnect and resume from what was applied.
-                    Err(_) => {
-                        protocol_error = true;
-                        break;
-                    }
                 }
-            }
-            router.flush_replica_batch(&mut batch).await;
-            if let ReplicationRole::Slave {
-                ref mut master_repl_offset,
-                ..
-            } = *hub.role.write()
-            {
-                *master_repl_offset = current_offset;
+                router.flush_replica_batch(&mut batch).await;
+                hub.feed_from_master(&raw[..start_len - buf.len()]);
             }
             // The periodic ack reports this from its next tick.
             applied.set(current_offset);
@@ -2303,7 +2677,7 @@ mod tests {
         let (tx, _rx) = flume::unbounded();
 
         // Initially offset is 0, empty backlog
-        let replid = hub.master_replid.clone();
+        let replid = hub.replid();
 
         // Unknown replid fails
         assert!(
@@ -2376,7 +2750,7 @@ mod tests {
         let hub = ReplicationHub::new(19997);
         hub.propagate_shard(0, b"old");
         let (tx, rx) = flume::unbounded();
-        let rep = hub.register_full_sync_replica(7, tx, 2);
+        let rep = hub.register_full_sync_replica(7, tx, 2).unwrap();
 
         // Neither shard has serialized yet: the snapshot will contain it.
         hub.propagate_shard(1, b"in-snap");
@@ -2393,7 +2767,7 @@ mod tests {
         assert!(rep.take_pending().is_empty());
 
         let offset = hub.master_repl_offset.load(Ordering::SeqCst);
-        let (start, pre) = hub.finish_full_sync(7);
+        let (_, start, pre) = hub.finish_full_sync(7);
         assert_eq!(pre, b"after0after1");
         assert_eq!(start, offset - pre.len() as u64);
 
@@ -2403,7 +2777,7 @@ mod tests {
 
         // The replica's stream diverges from the backlog in [start, offset),
         // so a partial resync from inside it must be refused.
-        let replid = hub.master_replid.clone();
+        let replid = hub.replid();
         let (tx2, _rx2) = flume::unbounded();
         assert!(!hub.can_partial_resync(&replid, start as i64 + 1));
         assert!(
@@ -2421,7 +2795,7 @@ mod tests {
     fn test_replica_output_limit_hard_and_soft() {
         use crate::connection::BufferLimit;
         let hub = ReplicationHub::new(19995);
-        let replid = hub.master_replid.clone();
+        let replid = hub.replid();
         let (tx, _rx) = flume::unbounded();
         let (_, _, rep) = hub.try_partial_resync(1, tx, &replid, 1).unwrap();
         let limit = BufferLimit::new(1000, 500, 1);
@@ -2451,7 +2825,7 @@ mod tests {
     #[test]
     fn test_replica_over_output_limit_stops_buffering() {
         let hub = ReplicationHub::new(19994);
-        let replid = hub.master_replid.clone();
+        let replid = hub.replid();
         let (tx, rx) = flume::unbounded();
         let (_, _, rep) = hub.try_partial_resync(1, tx, &replid, 1).unwrap();
         TEST_REPLICA_LIMIT
@@ -2474,7 +2848,7 @@ mod tests {
     fn test_full_sync_buffer_counts_against_output_limit() {
         let hub = ReplicationHub::new(19993);
         let (tx, rx) = flume::unbounded();
-        let rep = hub.register_full_sync_replica(9, tx, 1);
+        let rep = hub.register_full_sync_replica(9, tx, 1).unwrap();
         hub.arm_full_sync(9, 0);
         TEST_REPLICA_LIMIT
             .with(|l| l.set(Some(crate::connection::BufferLimit::new(4 << 20, 0, 0))));
@@ -2484,7 +2858,7 @@ mod tests {
         }
         assert!(rep.is_overflowed());
         assert!(rx.try_recv().is_ok());
-        let (_, pre) = hub.finish_full_sync(9);
+        let (_, _, pre) = hub.finish_full_sync(9);
         assert!(pre.is_empty());
     }
 
@@ -2492,7 +2866,7 @@ mod tests {
     fn test_partial_resync_registers_before_next_change() {
         let hub = ReplicationHub::new(19996);
         hub.propagate(b"a");
-        let replid = hub.master_replid.clone();
+        let replid = hub.replid();
         let (tx, rx) = flume::unbounded();
         let (_, diff, rep) = hub.try_partial_resync(1, tx, &replid, 1).unwrap();
         assert_eq!(diff, b"a");
@@ -2586,7 +2960,7 @@ mod tests {
         let (tx, _rx) = flume::unbounded();
         let fresh = hub.register_replica(21, tx.clone());
         let stale = hub.register_replica(22, tx.clone());
-        let syncing = hub.register_full_sync_replica(23, tx, 2);
+        let syncing = hub.register_full_sync_replica(23, tx, 2).unwrap();
         assert!(fresh.is_online() && !syncing.is_online());
         assert_eq!(hub.good_replicas(10), 2);
         stale
@@ -2628,25 +3002,34 @@ mod tests {
         hub.unregister_replica(31);
     }
 
-    #[test]
-    fn test_replica_partial_resync_and_psync2_failover() {
-        let hub = ReplicationHub::new(19997);
-        let master_replid = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string();
+    /// A hub that is a replica of `master_replid`, synced at `offset`, with
+    /// its master link `up` or not.
+    fn replica_hub(port: u16, master_replid: &str, offset: u64, up: bool) -> ReplicationHub {
+        let hub = ReplicationHub::new(port);
         *hub.role.write() = ReplicationRole::Slave {
             master_host: "127.0.0.1".to_string(),
             master_port: 6379,
-            link_status: "up".to_string(),
-            master_repl_offset: 120,
-            master_replid: master_replid.clone(),
-            sync_in_progress: false,
+            link_status: if up { "up" } else { "down" }.to_string(),
+            sync_in_progress: !up,
         };
         hub.is_slave_atomic.store(true, Ordering::Release);
+        hub.finish_full_resync(master_replid, offset);
+        hub
+    }
 
-        // Verify info replication outputs master_replid and offset
+    #[test]
+    fn test_replica_partial_resync_and_psync2_failover() {
+        let master_replid = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string();
+        let hub = replica_hub(19997, &master_replid, 120, true);
+
+        // A replica shows its master's history as its own.
         let info = hub.format_info_replication();
         assert!(info.contains("role:slave"));
-        assert!(info.contains(&format!("master_replid:{}", master_replid)));
+        assert!(info.contains(&format!("master_replid:{}\r\n", master_replid)));
         assert!(info.contains("slave_repl_offset:120"));
+        assert!(info.contains("master_repl_offset:120\r\n"));
+        assert!(info.contains("repl_backlog_first_byte_offset:121\r\n"));
+        assert_eq!(hub.psync_request(), Some((master_replid.clone(), 120)));
 
         // Promote slave to master via make_master
         hub.make_master();
@@ -2654,29 +3037,24 @@ mod tests {
         assert!(!hub.is_slave());
         assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 120);
 
-        // Verify replid2 and second_offset inherited
-        {
-            let role = hub.role.read();
-            match &*role {
-                ReplicationRole::Master {
-                    replid,
-                    replid2,
-                    second_offset,
-                } => {
-                    assert_ne!(replid, &master_replid);
-                    assert_eq!(replid2, &master_replid);
-                    assert_eq!(*second_offset, 120);
-                }
-                _ => panic!("Expected master role"),
-            }
-        }
+        // Like Redis's shiftReplicationId: the master's id is replid2, valid
+        // up to offset 120 (second_repl_offset 121), with a new replid.
+        let ids = hub.ids();
+        assert_ne!(ids.replid, master_replid);
+        assert_eq!(ids.replid2, master_replid);
+        assert_eq!(ids.second_offset, 121);
+        let info = hub.format_info_replication();
+        assert!(info.contains(&format!("master_replid2:{}\r\n", master_replid)));
+        assert!(info.contains("second_repl_offset:121\r\n"));
 
         // Test that try_partial_resync succeeds for a client asking for replid2 at offset <= second_offset
         let (tx, _rx) = flume::unbounded();
-        assert!(
-            hub.try_partial_resync(100, tx.clone(), &master_replid, 121)
-                .is_some()
-        );
+        let (id, diff, _) = hub
+            .try_partial_resync(100, tx.clone(), &master_replid, 121)
+            .unwrap();
+        // +CONTINUE carries the new id, so the replica learns it.
+        assert_eq!(id, ids.replid);
+        assert!(diff.is_empty());
         hub.unregister_replica(100);
 
         // Asking for replid2 at offset > second_offset fails
@@ -2684,6 +3062,150 @@ mod tests {
             hub.try_partial_resync(101, tx, &master_replid, 122)
                 .is_none()
         );
+
+        // Promoting a master again changes nothing.
+        hub.make_master();
+        assert_eq!(hub.ids(), ids);
+    }
+
+    #[test]
+    fn test_replica_feeds_master_stream_to_backlog_and_subreplicas() {
+        let master_replid = "b".repeat(40);
+        let hub = replica_hub(19989, &master_replid, 100, true);
+        // A sub-replica continues with us using the master's history.
+        let (tx, rx) = flume::unbounded();
+        let (id, diff, sub) = hub.try_partial_resync(1, tx, &master_replid, 101).unwrap();
+        assert_eq!(id, master_replid);
+        assert!(diff.is_empty());
+
+        hub.feed_from_master(b"*1\r\n$4\r\nPING\r\n");
+        hub.feed_from_master(b"abc");
+        assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 117);
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(sub.take_pending(), b"*1\r\n$4\r\nPING\r\nabc");
+        assert_eq!(hub.backlog.read().get_diff(115, 117), Some(b"abc".to_vec()));
+
+        // Local writes on a (writable) replica are not ours to replicate.
+        hub.propagate(b"local");
+        hub.propagate_shard(0, b"local");
+        assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 117);
+        assert!(sub.take_pending().is_empty());
+
+        // Another sub-replica resumes from our backlog at the master's offsets.
+        let (tx2, _rx2) = flume::unbounded();
+        let (_, diff, _) = hub.try_partial_resync(2, tx2, &master_replid, 115).unwrap();
+        assert_eq!(diff, b"abc");
+
+        // A promoted replica no longer takes bytes from a stale worker.
+        hub.make_master();
+        hub.feed_from_master(b"late");
+        assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 117);
+    }
+
+    #[test]
+    fn test_replica_without_master_link_refuses_sync() {
+        let master_replid = "c".repeat(40);
+        let hub = replica_hub(19988, &master_replid, 10, false);
+        assert!(!hub.can_serve_replicas());
+        let (tx, _rx) = flume::unbounded();
+        assert!(
+            hub.try_partial_resync(1, tx.clone(), &master_replid, 11)
+                .is_none()
+        );
+        assert!(hub.register_full_sync_replica(2, tx, 1).is_none());
+        assert!(hub.replicas.read().is_empty());
+    }
+
+    #[test]
+    fn test_master_replid_change_shifts_ids_and_drops_subreplicas() {
+        let old = "d".repeat(40);
+        let new = "e".repeat(40);
+        let hub = replica_hub(19987, &old, 50, true);
+        let (tx, _rx) = flume::unbounded();
+        let (_, _, sub) = hub.try_partial_resync(1, tx, &old, 51).unwrap();
+
+        // Same id: nothing changes.
+        hub.continue_with_master(&old);
+        assert!(!sub.is_disconnected());
+        assert_eq!(hub.ids().replid, old);
+
+        // The master was promoted: +CONTINUE <new id>.
+        hub.continue_with_master(&new);
+        let ids = hub.ids();
+        assert_eq!(ids.replid, new);
+        assert_eq!(ids.replid2, old);
+        assert_eq!(ids.second_offset, 51);
+        assert!(sub.is_disconnected());
+        assert!(hub.replicas.read().is_empty());
+        // The sub-replica comes back with the old id and learns the new one.
+        let (tx, _rx) = flume::unbounded();
+        let (id, _, _) = hub.try_partial_resync(2, tx, &old, 51).unwrap();
+        assert_eq!(id, new);
+    }
+
+    #[test]
+    fn test_full_resync_from_new_master_replaces_history() {
+        let old = "f".repeat(40);
+        let hub = replica_hub(19986, &old, 70, true);
+        hub.feed_from_master(b"xyz");
+        let (tx, _rx) = flume::unbounded();
+        let (_, _, sub) = hub.try_partial_resync(1, tx, &old, 74).unwrap();
+
+        hub.attach_to_new_master();
+        assert!(sub.is_disconnected());
+        assert_eq!(hub.psync_request(), None);
+        assert_eq!(hub.saved_history(), None);
+        assert!(hub.backlog.read().is_empty());
+
+        let new = "1".repeat(40);
+        hub.finish_full_resync(&new, 5000);
+        let ids = hub.ids();
+        assert_eq!(ids.replid, new);
+        assert_eq!(ids.replid2, NULL_REPLID);
+        assert_eq!(ids.second_offset, -1);
+        assert_eq!(hub.psync_request(), Some((new.clone(), 5000)));
+        assert_eq!(hub.backlog.read().first_byte_offset, 5001);
+        // The old history is gone for sub-replicas.
+        let (tx, _rx) = flume::unbounded();
+        assert!(hub.try_partial_resync(2, tx, &old, 74).is_none());
+    }
+
+    #[test]
+    fn test_restore_saved_history() {
+        let saved = "2".repeat(40);
+        // A master continues the saved history under a new id.
+        let hub = ReplicationHub::new(19985);
+        hub.restore_saved_history(&saved, 300, false);
+        let ids = hub.ids();
+        assert_ne!(ids.replid, saved);
+        assert_eq!(ids.replid2, saved);
+        assert_eq!(ids.second_offset, 301);
+        assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 300);
+        assert_eq!(hub.backlog.read().first_byte_offset, 301);
+        assert!(hub.can_partial_resync(&saved, 301));
+        assert!(!hub.can_partial_resync(&saved, 300));
+        // A replica asks its master to continue it.
+        let hub = ReplicationHub::new(19984);
+        hub.restore_saved_history(&saved, 300, true);
+        assert_eq!(hub.psync_request(), Some((saved.clone(), 300)));
+        assert_eq!(hub.saved_history(), Some((saved.clone(), 300)));
+        // Garbage is ignored.
+        let hub = ReplicationHub::new(19983);
+        hub.restore_saved_history("short", 300, true);
+        assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_failed_sync_forgets_history() {
+        let id = "3".repeat(40);
+        let hub = replica_hub(19982, &id, 10, true);
+        let (tx, _rx) = flume::unbounded();
+        let (_, _, sub) = hub.try_partial_resync(1, tx, &id, 11).unwrap();
+        hub.forget_master_history();
+        assert!(sub.is_disconnected());
+        assert_eq!(hub.psync_request(), None);
+        assert_ne!(hub.ids().replid, id);
+        assert!(!hub.can_partial_resync(&id, 11));
     }
 
     #[test]

@@ -4403,7 +4403,21 @@ impl Router {
             })
             .map_err(|e| e.to_string())?;
 
-        let produced = self.produce_rdb_chunks(&chunk_tx).await;
+        // The replication history goes in only if the dataset matches it:
+        // the history did not move while the shards were serialized (on a
+        // replica, no batch of the master's stream was applied meanwhile).
+        let history_before = self.repl_history_for_save().await;
+        let mut produced = self.produce_rdb_chunks(&chunk_tx).await;
+        if produced.is_ok()
+            && let Some((replid, offset)) = history_before
+            && self.repl_history_for_save().await == Some((replid.clone(), offset))
+        {
+            let mut aux = Vec::new();
+            crate::redis_rdb::write_repl_aux(&mut aux, &replid, offset);
+            if chunk_tx.send_async(Some(aux)).await.is_err() {
+                produced = Err(WRITER_GONE.to_string());
+            }
+        }
         if produced.is_ok() {
             // If the writer already failed it has hung up; its error is
             // reported below.
@@ -4423,6 +4437,19 @@ impl Router {
     }
 
     /// Stream every shard's keyspace, one shard after another, into `chunk_tx`.
+    /// The replication history an RDB saved now would carry (see
+    /// `ReplicationHub::saved_history`), read between batches of a
+    /// replica's master stream.
+    async fn repl_history_for_save(&self) -> Option<(String, u64)> {
+        let hub = crate::replication::get_replication_hub(self.port);
+        let _apply = if hub.is_slave() {
+            Some(hub.lock_apply().await)
+        } else {
+            None
+        };
+        hub.saved_history()
+    }
+
     async fn produce_rdb_chunks(
         &self,
         chunk_tx: &flume::Sender<Option<Vec<u8>>>,

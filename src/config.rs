@@ -384,6 +384,8 @@ const RUDIS_CONFIG_NAMES: &[&str] = &[
     "backup-sealed-ttl",
     "backupdirname",
     "key-load-delay",
+    "slowlog-entry-max-argc",
+    "slowlog-entry-max-string-len",
     "stream-idmp-duration",
     "stream-idmp-maxsize",
 ];
@@ -878,6 +880,45 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
     if let Some(pass) = acl.read().requirepass.clone() {
         directives.insert("requirepass".to_string(), pass);
     }
+    directives.insert(
+        "repl-ping-replica-period".to_string(),
+        crate::replication::REPL_PING_PERIOD
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    directives.insert(
+        "repl-backlog-size".to_string(),
+        crate::replication::repl_backlog_size().to_string(),
+    );
+
+    // Directives written as a whole, replacing every line of theirs (and
+    // of their aliases): `save` may span lines, and `replicaof` goes away
+    // on a master, like Redis.
+    let mut whole: Vec<String> = Vec::new();
+    let points = save_points(port);
+    whole.push(if points.is_empty() {
+        "save \"\"".to_string()
+    } else {
+        let pairs: Vec<String> = points.iter().map(|(s, c)| format!("{s} {c}")).collect();
+        format!("save {}", pairs.join(" "))
+    });
+    if let crate::replication::ReplicationRole::Slave {
+        master_host,
+        master_port,
+        ..
+    } = &*crate::replication::get_replication_hub(port).role.read()
+    {
+        whole.push(format!("replicaof {master_host} {master_port}"));
+    }
+    lines.retain(|line| {
+        let key = line
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        !matches!(key.as_str(), "save" | "replicaof" | "slaveof")
+    });
+    lines.extend(whole);
 
     // 3. Update existing lines or track which ones were updated
     let mut updated_keys = std::collections::HashSet::new();

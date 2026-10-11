@@ -2865,6 +2865,13 @@ pub fn apply_config_value(
         }
         "repl-backlog-ttl" => crate::replication::REPL_BACKLOG_TTL
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "repl-ping-replica-period" | "repl-ping-slave-period" => {
+            let secs: u64 = parse_config_num(name, val_str)?;
+            if secs == 0 {
+                return Err(format!("argument for '{}' must be greater than 0", name));
+            }
+            crate::replication::REPL_PING_PERIOD.store(secs, Ordering::Relaxed)
+        }
         "min-replicas-max-lag" | "min-slaves-max-lag" => {
             MIN_REPLICAS_MAX_LAG.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
@@ -5611,6 +5618,47 @@ impl Drop for ShardFlowLink {
     }
 }
 
+/// Refuses a (P)SYNC while our own master link is down, like Redis.
+async fn no_master_link(writer: &mut monoio::net::tcp::TcpOwnedWriteHalf, name: &str) {
+    crate::log_notice!(
+        "Replica {} asks for synchronization but my master link is down",
+        name
+    );
+    let _ = writer
+        .write_all(b"-NOMASTERLINK Can't SYNC while not connected with my master\r\n".to_vec())
+        .await;
+}
+
+/// The full-sync snapshot for replica `client_id`: the RDB, the replication
+/// id and offset it is at, the stream bytes that must follow it, and the
+/// registered replica. None when we are a replica whose master link is
+/// down. On a replica the snapshot is taken holding the apply token, so it
+/// matches the announced offset of our master's stream exactly.
+async fn snapshot_for_replica(
+    hub: &std::sync::Arc<crate::replication::ReplicationHub>,
+    router: &Rc<Router>,
+    client_id: u64,
+    write_tx: &flume::Sender<Vec<u8>>,
+) -> Option<(
+    Vec<u8>,
+    String,
+    u64,
+    Vec<u8>,
+    std::sync::Arc<crate::replication::ConnectedReplica>,
+)> {
+    let _apply = if hub.is_slave() {
+        Some(hub.lock_apply().await)
+    } else {
+        None
+    };
+    let rep = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards)?;
+    crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
+    crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
+    let rdb = router.generate_full_rdb(Some(client_id)).await;
+    let (replid, offset, after_snapshot) = hub.finish_full_sync(client_id);
+    Some((rdb, replid, offset, after_snapshot, rep))
+}
+
 async fn run_master_replica_stream(
     stream: TcpStream,
     client_id: u64,
@@ -5639,6 +5687,14 @@ async fn run_master_replica_stream(
     };
 
     let is_sync = matches!(&psync_cmd, Command::Sync);
+
+    // Like Redis, a replica serves (P)SYNC only while its own master link
+    // is up: before that it has no consistent data and history to offer.
+    if !hub.can_serve_replicas() {
+        no_master_link(&mut writer, &name).await;
+        return;
+    }
+    hub.ensure_pinger();
 
     let repl;
     if !is_sync {
@@ -5675,25 +5731,28 @@ async fn run_master_replica_stream(
                     name,
                     req_replid,
                     req_offset,
-                    hub.master_replid
+                    hub.replid()
                 );
             } else {
                 crate::log_notice!("Full resync requested by replica {}", name);
             }
-            crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
-            crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
             // Register before any shard serializes, so each shard's changes
             // after its snapshot reach the replica (see FullSyncCut).
-            repl = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards);
-            let rdb = router.generate_full_rdb(Some(client_id)).await;
-            let (offset, after_snapshot) = hub.finish_full_sync(client_id);
-            if repl.is_overflowed() {
-                replica_output_limit_reached(client_id, &name);
+            let Some((rdb, replid, offset, after_snapshot, rep)) =
+                snapshot_for_replica(&hub, &router, client_id, &write_tx).await
+            else {
+                no_master_link(&mut writer, &name).await;
+                return;
+            };
+            repl = rep;
+            if repl.is_overflowed() || repl.is_disconnected() {
+                if repl.is_overflowed() {
+                    replica_output_limit_reached(client_id, &name);
+                }
                 hub.unregister_replica(client_id);
                 return;
             }
 
-            let replid = hub.master_replid.clone();
             let mut initial_msg =
                 format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
             initial_msg.extend_from_slice(&rdb);
@@ -5705,19 +5764,25 @@ async fn run_master_replica_stream(
         }
     } else {
         crate::log_notice!("Full resync requested by replica {}", name);
-        crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
-        crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
-        repl = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards);
-        let rdb = router.generate_full_rdb(Some(client_id)).await;
-        let (_, after_snapshot) = hub.finish_full_sync(client_id);
-        if repl.is_overflowed() {
-            replica_output_limit_reached(client_id, &name);
+        let Some((rdb, _, _, after_snapshot, rep)) =
+            snapshot_for_replica(&hub, &router, client_id, &write_tx).await
+        else {
+            no_master_link(&mut writer, &name).await;
+            return;
+        };
+        repl = rep;
+        if repl.is_overflowed() || repl.is_disconnected() {
+            if repl.is_overflowed() {
+                replica_output_limit_reached(client_id, &name);
+            }
             hub.unregister_replica(client_id);
             return;
         }
         let mut initial_msg = format!("${}\r\n", rdb.len()).into_bytes();
         initial_msg.extend_from_slice(&rdb);
-        initial_msg.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
+        if hub.is_master() {
+            initial_msg.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
+        }
         initial_msg.extend_from_slice(&after_snapshot);
         if writer.write_all(initial_msg).await.0.is_err() {
             hub.unregister_replica(client_id);
@@ -5735,7 +5800,7 @@ async fn run_master_replica_stream(
         // Each wakeup carries no data: everything queued since the last one
         // is in the replica's pending buffer and goes out in one write.
         while write_rx.recv_async().await.is_ok() {
-            if repl.is_overflowed() {
+            if repl.is_overflowed() || repl.is_disconnected() {
                 break;
             }
             let data = repl.take_pending();
@@ -9485,7 +9550,7 @@ async fn execute_command(
             let snap = crate::snapshot::state(router.base_port);
             let aof_rw = crate::snapshot::aof_rewrite_state(router.base_port);
             let persistence_str = format!(
-                "# Persistence\r\nloading:{}\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_last_bgrewrite_status:{}\r\nunpropagated_changes:{}\r\n",
+                "# Persistence\r\nloading:{}\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_load_keys_expired:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_last_bgrewrite_status:{}\r\nunpropagated_changes:{}\r\n",
                 u8::from(crate::replication::is_loading(router.port)),
                 snap.changes_since_last_save(),
                 u8::from(
@@ -9494,6 +9559,7 @@ async fn execute_command(
                 ),
                 snap.last_save_unix(),
                 if snap.last_save_ok() { "ok" } else { "err" },
+                crate::server::rdb_last_load_keys_expired(router.base_port),
                 u8::from(router.aof.is_some()),
                 u8::from(aof_rw.in_progress()),
                 if aof_rw.last_ok() { "ok" } else { "err" },
@@ -9730,7 +9796,7 @@ async fn execute_command(
             } else if args[0].eq_ignore_ascii_case(b"capa") {
                 if args.iter().any(|a| a.eq_ignore_ascii_case(b"dragonfly")) {
                     let hub = crate::replication::get_replication_hub(router.port);
-                    let replid = &hub.master_replid;
+                    let replid = &hub.replid();
                     let num_shards = router.num_shards;
                     out.extend_from_slice(
                         format!(
@@ -9774,7 +9840,7 @@ async fn execute_command(
         Command::Replicaof { host, port } => {
             let hub = crate::replication::get_replication_hub(router.port);
             if host.eq_ignore_ascii_case(b"no") && port.eq_ignore_ascii_case(b"one") {
-                hub.stop_sync();
+                hub.stop_sync_and_wait().await;
                 hub.make_master();
                 crate::log_notice!("MASTER MODE enabled (user request from 'id={}')", client_id);
                 out.extend_from_slice(b"+OK\r\n");
@@ -10021,7 +10087,10 @@ async fn execute_command(
                     let min_replicas_lag = MIN_REPLICAS_MAX_LAG
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let all_configs: [(&str, String); 62] = [
+                    let repl_ping_period = crate::replication::REPL_PING_PERIOD
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let all_configs: [(&str, String); 64] = [
                         ("port", port_str),
                         ("loglevel", crate::log::loglevel().to_string()),
                         ("logfile", crate::log::logfile()),
@@ -10143,6 +10212,8 @@ async fn execute_command(
                                 .load(std::sync::atomic::Ordering::Relaxed)
                                 .to_string(),
                         ),
+                        ("repl-ping-replica-period", repl_ping_period.clone()),
+                        ("repl-ping-slave-period", repl_ping_period),
                     ];
                     let hidden_configs: [(&str, String); 2] = [
                         ("key-load-delay", key_load_delay),
@@ -16580,6 +16651,10 @@ async fn execute_command(
                 } else if sub.eq_ignore_ascii_case(b"set-allow-access-expired") {
                     let flag = args.get(1).map(|v| v.as_ref() == b"1").unwrap_or(false);
                     ALLOW_ACCESS_EXPIRED.store(flag, std::sync::atomic::Ordering::Relaxed);
+                    out.extend_from_slice(b"+OK\r\n");
+                    return false;
+                } else if sub.eq_ignore_ascii_case(b"change-repl-id") {
+                    crate::replication::get_replication_hub(router.port).change_replid();
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
                 } else if sub.eq_ignore_ascii_case(b"set-active-expire") {
