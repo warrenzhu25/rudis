@@ -9485,7 +9485,9 @@ async fn execute_command(
             let snap = crate::snapshot::state(router.base_port);
             let aof_rw = crate::snapshot::aof_rewrite_state(router.base_port);
             let persistence_str = format!(
-                "# Persistence\r\nloading:{}\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_last_bgrewrite_status:{}\r\nunpropagated_changes:{}\r\n",
+                // The fork/COW fields are always 0: snapshots are taken in
+                // place, without a child process.
+                "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:ok\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\nunpropagated_changes:{}\r\n",
                 u8::from(crate::replication::is_loading(router.port)),
                 snap.changes_since_last_save(),
                 u8::from(
@@ -9494,6 +9496,8 @@ async fn execute_command(
                 ),
                 snap.last_save_unix(),
                 if snap.last_save_ok() { "ok" } else { "err" },
+                crate::server::LAST_LOAD_KEYS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed),
+                crate::server::LAST_LOAD_KEYS_LOADED.load(std::sync::atomic::Ordering::Relaxed),
                 u8::from(router.aof.is_some()),
                 u8::from(aof_rw.in_progress()),
                 if aof_rw.last_ok() { "ok" } else { "err" },
@@ -14724,9 +14728,9 @@ async fn execute_command(
                 }
             }
             router.flushdb().await;
-            if RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                RDB_BGSAVE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
+            // Like Redis killing its BGSAVE child, FLUSHALL ends the
+            // save that `rdb-key-save-delay` keeps shown as in progress.
+            RDB_BGSAVE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
             notify_flush_invalidation(router.port, client_id);
             out.extend_from_slice(b"+OK\r\n");
             false

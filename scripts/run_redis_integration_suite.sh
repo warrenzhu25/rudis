@@ -75,8 +75,8 @@ PASSED=()
 IFS=',' read -ra LIST <<< "$SUITES"
 for suite in "${LIST[@]}"; do
     echo ">>> Running integration suite: $suite"
-    if tclsh test_helper.tcl --clients "$CLIENTS" --ignore-encoding --ignore-digest \
-        --tags "-needs:debug -needs:config-rewrite -needs:pfdebug -valgrind" \
+    if tclsh test_helper.tcl --clients "$CLIENTS" --ignore-encoding \
+        --tags "-needs:config-rewrite -needs:pfdebug -valgrind" \
         --single "$suite" ${EXTRA_ARGS:-}; then
         PASSED+=("$suite")
     else
