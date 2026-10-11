@@ -4749,9 +4749,9 @@ fn take_conn_scratch(num_shards: usize) -> ConnScratch {
         responders: (0..num_shards)
             .map(|_| std::sync::Arc::new(crate::mailbox::BatchResponder::new()))
             .collect(),
-        remote_batches: (0..num_shards).map(|_| Vec::with_capacity(64)).collect(),
-        items_pool: (0..num_shards).map(|_| Vec::with_capacity(64)).collect(),
-        results_pool: (0..num_shards).map(|_| Vec::with_capacity(64)).collect(),
+        remote_batches: (0..num_shards).map(|_| Vec::new()).collect(),
+        items_pool: (0..num_shards).map(|_| Vec::new()).collect(),
+        results_pool: (0..num_shards).map(|_| Vec::new()).collect(),
         squashed_responses: Vec::with_capacity(64),
         commands: Vec::with_capacity(64),
     }
@@ -10038,27 +10038,39 @@ async fn execute_command_inner(
         Command::Replicaof { host, port } => {
             let hub = crate::replication::get_replication_hub(router.port);
             if host.eq_ignore_ascii_case(b"no") && port.eq_ignore_ascii_case(b"one") {
-                hub.stop_sync_and_wait().await;
-                hub.make_master();
-                crate::log_notice!("MASTER MODE enabled (user request from 'id={}')", client_id);
+                if hub.is_slave() {
+                    hub.stop_sync_and_wait().await;
+                    hub.make_master();
+                    crate::log_notice!(
+                        "MASTER MODE enabled (user request from 'id={}')",
+                        client_id
+                    );
+                }
                 out.extend_from_slice(b"+OK\r\n");
             } else {
                 let host_str = String::from_utf8_lossy(&host).to_string();
                 let port_str = String::from_utf8_lossy(&port);
                 if let Ok(mport) = port_str.parse::<u16>() {
-                    crate::log_notice!(
-                        "REPLICAOF {}:{} enabled (user request from 'id={}')",
-                        host_str,
-                        mport,
-                        client_id
-                    );
-                    crate::replication::start_replica_sync(
-                        router.port,
-                        host_str,
-                        mport,
-                        router.clone(),
-                    );
-                    out.extend_from_slice(b"+OK\r\n");
+                    if hub.is_replicating_from(&host_str, mport) {
+                        crate::log_notice!(
+                            "REPLICAOF would result into synchronization with the master we are already connected with. No operation performed."
+                        );
+                        out.extend_from_slice(b"+OK Already connected to specified master\r\n");
+                    } else {
+                        crate::log_notice!(
+                            "REPLICAOF {}:{} enabled (user request from 'id={}')",
+                            host_str,
+                            mport,
+                            client_id
+                        );
+                        crate::replication::start_replica_sync(
+                            router.port,
+                            host_str,
+                            mport,
+                            router.clone(),
+                        );
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
                 } else {
                     out.extend_from_slice(b"-ERR invalid port\r\n");
                 }
@@ -16483,7 +16495,11 @@ async fn execute_command_inner(
             false
         }
         Command::XdpInfo => {
-            let info = crate::xdp::get_xdp_engine().info();
+            let engine = crate::xdp::get_xdp_engine();
+            for qid in 0..router.num_shards as u32 {
+                let _ = engine.get_or_create_socket(router.port, qid);
+            }
+            let info = engine.info();
             write_resp_bulk(out, info.as_bytes());
             false
         }

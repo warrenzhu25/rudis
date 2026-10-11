@@ -1001,10 +1001,11 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
     // Matrix of SPSC rings: rings[i][j] is the ring from producer shard i to consumer shard j
     let mut rings: Vec<Vec<std::sync::Arc<SpscQueue<crate::shard::ShardMessage>>>> =
         Vec::with_capacity(num_shards);
-    for _ in 0..num_shards {
+    for i in 0..num_shards {
         let mut row = Vec::with_capacity(num_shards);
-        for _ in 0..num_shards {
-            row.push(std::sync::Arc::new(SpscQueue::new(256)));
+        for j in 0..num_shards {
+            let cap = if i == j { 16 } else { 64 };
+            row.push(std::sync::Arc::new(SpscQueue::new(cap)));
         }
         rings.push(row);
     }

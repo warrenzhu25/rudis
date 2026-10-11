@@ -170,10 +170,10 @@ pub struct SmallCollectionArena {
 impl SmallCollectionArena {
     pub fn new() -> Self {
         Self {
-            list_pool: Vec::with_capacity(128),
-            hash_pool: Vec::with_capacity(128),
-            set_pool: Vec::with_capacity(128),
-            zset_pool: Vec::with_capacity(128),
+            list_pool: Vec::new(),
+            hash_pool: Vec::new(),
+            set_pool: Vec::new(),
+            zset_pool: Vec::new(),
             allocations_saved: 0,
             recycles_count: 0,
         }

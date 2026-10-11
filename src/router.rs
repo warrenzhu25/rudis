@@ -347,10 +347,6 @@ impl Router {
         db_dir: std::path::PathBuf,
     ) -> Self {
         let slot_states = hashbrown::HashMap::new();
-        let mut slot_owners = Vec::with_capacity(16384);
-        for s in 0..16384 {
-            slot_owners.push(slot_to_shard(s as u16, num_shards));
-        }
         Self {
             shard_id,
             num_shards,
@@ -360,7 +356,7 @@ impl Router {
             local_db,
             senders,
             slot_states: Rc::new(RefCell::new(slot_states)),
-            slot_owners: Rc::new(RefCell::new(slot_owners)),
+            slot_owners: Rc::new(RefCell::new(Vec::new())),
             aof,
             pubsub,
             tx_lock: Rc::new(RefCell::new(None)),
@@ -406,7 +402,11 @@ impl Router {
     }
 
     pub fn target_shard_for_slot(&self, slot: u16) -> usize {
-        self.slot_owners.borrow()[slot as usize]
+        self.slot_owners
+            .borrow()
+            .get(slot as usize)
+            .copied()
+            .unwrap_or_else(|| slot_to_shard(slot, self.num_shards))
     }
 
     pub fn target_shard(&self, key: &[u8]) -> usize {
@@ -469,7 +469,16 @@ impl Router {
 
     pub fn set_slot_owner(&self, slot: u16, owner: usize) {
         self.slot_states.borrow_mut().remove(&slot);
-        self.slot_owners.borrow_mut()[slot as usize] = owner;
+        {
+            let mut owners = self.slot_owners.borrow_mut();
+            if owners.is_empty() {
+                owners.reserve_exact(16384);
+                for s in 0..16384 {
+                    owners.push(slot_to_shard(s as u16, self.num_shards));
+                }
+            }
+            owners[slot as usize] = owner;
+        }
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let _ = sender.send(ShardMessage::SetSlotOwner { slot, owner });
@@ -817,6 +826,7 @@ impl Router {
             }
         }
         self.publish_memory_state();
+        self.calibrate_real_memory();
         self.real_used_total()
     }
 
@@ -4334,6 +4344,11 @@ impl Router {
             }
         }
 
+        if let Some((replid, offset, stream_db)) =
+            crate::replication::get_replication_hub(self.port).saved_history()
+        {
+            crate::redis_rdb::write_repl_aux(&mut full_rdb, &replid, offset, stream_db);
+        }
         full_rdb.push(0xFF);
         let crc = crate::table::crc64(&full_rdb);
         full_rdb.extend_from_slice(&crc.to_le_bytes());
@@ -4615,11 +4630,11 @@ impl Router {
         let history_before = self.repl_history_for_save().await;
         let mut produced = self.produce_rdb_chunks(&chunk_tx).await;
         if produced.is_ok()
-            && let Some((replid, offset)) = history_before
-            && self.repl_history_for_save().await == Some((replid.clone(), offset))
+            && let Some((replid, offset, stream_db)) = history_before
+            && self.repl_history_for_save().await == Some((replid.clone(), offset, stream_db))
         {
             let mut aux = Vec::new();
-            crate::redis_rdb::write_repl_aux(&mut aux, &replid, offset);
+            crate::redis_rdb::write_repl_aux(&mut aux, &replid, offset, stream_db);
             if chunk_tx.send_async(Some(aux)).await.is_err() {
                 produced = Err(WRITER_GONE.to_string());
             }
@@ -4646,7 +4661,7 @@ impl Router {
     /// The replication history an RDB saved now would carry (see
     /// `ReplicationHub::saved_history`), read between batches of a
     /// replica's master stream.
-    async fn repl_history_for_save(&self) -> Option<(String, u64)> {
+    async fn repl_history_for_save(&self) -> Option<(String, u64, usize)> {
         let hub = crate::replication::get_replication_hub(self.port);
         let _apply = if hub.is_slave() {
             Some(hub.lock_apply().await)

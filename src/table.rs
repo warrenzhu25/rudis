@@ -2458,7 +2458,7 @@ pub struct RudisFlatTable {
     dir_mask: usize,
     pub capacity: usize,
     pub items: usize,
-    pub slot_counts: Box<[u32; 16384]>,
+    pub slot_counts: Option<Box<[u32; 16384]>>,
     /// Bumped when segments are renumbered (`clear`, `defrag` collapsing to
     /// one segment). Splits only append segments and in-place rebuilds keep
     /// a segment's entries in it, so walking segment ids in order sees every
@@ -2486,7 +2486,7 @@ impl RudisFlatTable {
             dir_mask: 0,
             capacity: init_cap,
             items: 0,
-            slot_counts: vec![0u32; 16384].into_boxed_slice().try_into().unwrap(),
+            slot_counts: None,
             layout_epoch: 0,
             seg_heap_bytes,
             seg_fixed_bytes,
@@ -2501,7 +2501,10 @@ impl RudisFlatTable {
         self.seg_heap_bytes
             + self.segments.capacity() * std::mem::size_of::<RawSegment>()
             + self.directory.capacity() * std::mem::size_of::<u32>()
-            + std::mem::size_of::<[u32; 16384]>()
+            + self
+                .slot_counts
+                .as_ref()
+                .map_or(0, |_| std::mem::size_of::<[u32; 16384]>())
     }
 
     /// Bytes of entry arena allocated but not holding a live entry (holes
@@ -2709,8 +2712,10 @@ impl RudisFlatTable {
         if existing.is_some() {
             self.segments[seg_id].replace_at(local_idx, entry)
         } else {
-            let slot = crate::router::key_slot(&entry.key) as usize;
-            self.slot_counts[slot] += 1;
+            if let Some(counts) = self.slot_counts.as_mut() {
+                let slot = crate::router::key_slot(&entry.key) as usize;
+                counts[slot] += 1;
+            }
             self.seg_heap_bytes += self.segments[seg_id].insert_at(entry, mix_hash(h), local_idx);
             self.items += 1;
             None
@@ -2719,8 +2724,10 @@ impl RudisFlatTable {
 
     #[inline(always)]
     pub fn insert_prepared(&mut self, entry: RudisEntry, hash: u64, global_idx: usize) {
-        let slot = crate::router::key_slot(&entry.key) as usize;
-        self.slot_counts[slot] += 1;
+        if let Some(counts) = self.slot_counts.as_mut() {
+            let slot = crate::router::key_slot(&entry.key) as usize;
+            counts[slot] += 1;
+        }
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
         self.seg_heap_bytes += self.segments[seg_id].insert_at(entry, mix_hash(hash), local_idx);
@@ -2743,8 +2750,10 @@ impl RudisFlatTable {
         let (entry, freed) = self.segments.get_mut(seg_id)?.remove(local_idx)?;
         self.seg_heap_bytes -= freed;
         self.items -= 1;
-        let slot = crate::router::key_slot(&entry.key) as usize;
-        self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
+        if let Some(counts) = self.slot_counts.as_mut() {
+            let slot = crate::router::key_slot(&entry.key) as usize;
+            counts[slot] = counts[slot].saturating_sub(1);
+        }
         Some(entry)
     }
 
@@ -2755,9 +2764,27 @@ impl RudisFlatTable {
         let (entry, freed) = self.segments[seg_id].remove_present(local_idx);
         self.seg_heap_bytes -= freed;
         self.items -= 1;
-        let slot = crate::router::key_slot(&entry.key) as usize;
-        self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
+        if let Some(counts) = self.slot_counts.as_mut() {
+            let slot = crate::router::key_slot(&entry.key) as usize;
+            counts[slot] = counts[slot].saturating_sub(1);
+        }
         entry
+    }
+
+    /// Number of entries in `slot` (including any not-yet-reaped expired keys),
+    /// populating `slot_counts` lazily on first cluster-slot query.
+    pub fn slot_count(&mut self, slot: u16) -> u32 {
+        let counts = self.slot_counts.get_or_insert_with(|| {
+            let mut boxed: Box<[u32; 16384]> =
+                vec![0u32; 16384].into_boxed_slice().try_into().unwrap();
+            for seg in &self.segments {
+                for entry in seg.iter_entries() {
+                    boxed[crate::router::key_slot(&entry.key) as usize] += 1;
+                }
+            }
+            boxed
+        });
+        counts[slot as usize]
     }
 
     #[inline(always)]
@@ -2922,13 +2949,15 @@ impl RudisFlatTable {
         self.layout_epoch += 1;
         self.segments.clear();
         self.segments.push(seg);
+        self.segments.shrink_to_fit();
         self.directory.clear();
         self.directory.push(0);
+        self.directory.shrink_to_fit();
         self.global_depth = 0;
         self.dir_mask = 0;
         self.capacity = 64;
         self.items = 0;
-        self.slot_counts.fill(0);
+        self.slot_counts = None;
         self.recompute_seg_heap_bytes();
     }
 
@@ -10686,11 +10715,15 @@ impl RudisTable {
     }
 
     pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
-        if self.table.items == 0 || self.table.slot_counts[slot as usize] == 0 {
+        if self.table.items == 0 {
+            return 0;
+        }
+        let slot_count = self.table.slot_count(slot) as usize;
+        if slot_count == 0 {
             return 0;
         }
         if self.num_expires == 0 {
-            return self.table.slot_counts[slot as usize] as usize;
+            return slot_count;
         }
         let now = Instant::now();
         let mut count = 0;
@@ -10719,7 +10752,7 @@ impl RudisTable {
     }
 
     pub fn get_keys_in_slot(&mut self, slot: u16, count: usize) -> Vec<Bytes> {
-        if self.table.items == 0 || self.table.slot_counts[slot as usize] == 0 {
+        if self.table.items == 0 || self.table.slot_count(slot) == 0 {
             return Vec::new();
         }
         let mut result = Vec::new();

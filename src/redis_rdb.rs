@@ -1258,8 +1258,8 @@ pub fn write_aux(out: &mut Vec<u8>, key: &[u8], val: &[u8]) {
 /// The replication history saved with a dataset (Redis's `repl-id` and
 /// `repl-offset` AUX fields), written at the end of the file once the
 /// whole dataset is known to match it.
-pub fn write_repl_aux(out: &mut Vec<u8>, replid: &str, offset: u64) {
-    write_aux(out, b"repl-stream-db", b"0");
+pub fn write_repl_aux(out: &mut Vec<u8>, replid: &str, offset: u64, stream_db: usize) {
+    write_aux(out, b"repl-stream-db", stream_db.to_string().as_bytes());
     write_aux(out, b"repl-id", replid.as_bytes());
     write_aux(out, b"repl-offset", offset.to_string().as_bytes());
 }

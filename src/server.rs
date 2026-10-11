@@ -261,6 +261,7 @@ pub fn run_shard_worker(
                             crate::replication::get_replication_hub(shard_port).restore_saved_history(
                                 &replid,
                                 offset,
+                                crate::redis_rdb::last_rdb_repl_stream_db(),
                                 crate::replication::has_startup_replicaof(base_port),
                             );
                         }
@@ -384,6 +385,7 @@ pub fn run_shard_worker(
         if shard_id == 0 {
             crate::tiering::register_server();
         }
+        router.publish_memory_state();
 
         // Active expiration cycle: run every 100ms
         let active_db = local_db.clone();
@@ -437,14 +439,16 @@ pub fn run_shard_worker(
 
         // 5. AF_XDP Kernel Bypass Ingress Loop: poll zero-copy Rx ring for packet descriptors
         let xdp_engine = crate::xdp::get_xdp_engine();
-        let xsk_socket = xdp_engine.get_or_create_socket(shard_port, shard_id as u32);
         let xdp_db = local_db.clone();
         let xdp_aof = aof_writer.clone();
         let xdp_router = router.clone();
         monoio::spawn(async move {
-            let mut frames = Vec::with_capacity(32);
+            let mut frames = Vec::new();
             loop {
-                let count = xsk_socket.rx_burst(&mut frames, 32);
+                let xsk_opt = xdp_engine.get_socket(shard_port, shard_id as u32);
+                let count = xsk_opt
+                    .as_ref()
+                    .map_or(0, |s| s.rx_burst(&mut frames, 32));
                 if count > 0 {
                     for frame in frames.drain(..) {
                         let action = xdp_engine.process_packet(&frame);
@@ -469,7 +473,9 @@ pub fn run_shard_worker(
                                     let resp = xdp_router.execute_remote(target_sid, cmd).await;
                                     out.extend_from_slice(&resp);
                                 }
-                                if !out.is_empty() {
+                                if !out.is_empty()
+                                    && let Some(ref xsk_socket) = xsk_opt
+                                {
                                     xsk_socket.tx_burst(&[&out]);
                                 }
                             }
@@ -1844,7 +1850,14 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     }
                     ShardMessage::SetSlotOwner { slot, owner } => {
                         cross_shard_slot_states.borrow_mut().remove(&slot);
-                        cross_shard_slot_owners.borrow_mut()[slot as usize] = owner;
+                        let mut owners = cross_shard_slot_owners.borrow_mut();
+                        if owners.is_empty() {
+                            owners.reserve_exact(16384);
+                            for s in 0..16384 {
+                                owners.push(crate::router::slot_to_shard(s as u16, num_shards));
+                            }
+                        }
+                        owners[slot as usize] = owner;
                     }
                     ShardMessage::SlotBarrier { responder } => {
                         let _ = responder.send(());
@@ -2325,6 +2338,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             let n = ready.entry(base_port).or_insert(0);
             *n += 1;
             if *n == num_shards {
+                router.calibrate_real_memory();
                 crate::log_notice!("Ready to accept connections tcp");
             }
         }

@@ -334,7 +334,7 @@ pub struct ReplicationBacklog {
 impl ReplicationBacklog {
     pub fn new(max_size: usize) -> Self {
         Self {
-            buffer: vec![0u8; max_size],
+            buffer: Vec::new(),
             write_idx: 0,
             len: 0,
             max_size,
@@ -356,6 +356,9 @@ impl ReplicationBacklog {
     /// Drops the history; the next byte appended has offset
     /// `current_master_offset + 1`.
     pub fn clear(&mut self, current_master_offset: u64) {
+        if self.buffer.len() < self.max_size {
+            self.buffer.clear();
+        }
         self.write_idx = 0;
         self.len = 0;
         self.first_byte_offset = current_master_offset + 1;
@@ -366,6 +369,16 @@ impl ReplicationBacklog {
         let n = data.len();
         if n == 0 {
             return;
+        }
+        if self.buffer.len() < self.max_size {
+            if self.len + n <= self.max_size {
+                self.buffer.extend_from_slice(data);
+                self.len += n;
+                self.write_idx = self.len % self.max_size;
+                self.first_byte_offset = current_master_offset.saturating_sub(self.len as u64) + 1;
+                return;
+            }
+            self.buffer.resize(self.max_size, 0);
         }
         if n >= self.max_size {
             let slice = &data[n - self.max_size..];
@@ -393,6 +406,15 @@ impl ReplicationBacklog {
     pub fn resize(&mut self, new_size: usize) {
         let new_size = new_size.max(1);
         if new_size == self.max_size {
+            return;
+        }
+        if self.len == 0 {
+            if !self.buffer.is_empty() {
+                self.buffer.resize(new_size, 0);
+                self.buffer.shrink_to_fit();
+            }
+            self.write_idx = 0;
+            self.max_size = new_size;
             return;
         }
         let keep = self.len.min(new_size);
@@ -455,6 +477,7 @@ pub struct ReplicationHub {
     pub is_slave_atomic: std::sync::atomic::AtomicBool,
     pub has_replicas: std::sync::atomic::AtomicBool,
     pub backlog_active: std::sync::atomic::AtomicBool,
+    pub replication_active: std::sync::atomic::AtomicBool,
     pub backlog: RwLock<ReplicationBacklog>,
     pub replicas: RwLock<HashMap<u64, Arc<ConnectedReplica>>>,
     pub cancel_sync: RwLock<Option<flume::Sender<()>>>,
@@ -491,6 +514,11 @@ pub struct ReplicationHub {
     apply_token: (flume::Sender<()>, flume::Receiver<()>),
     /// A task sends `repl-ping-replica-period` PINGs to the replicas.
     pinger_running: AtomicBool,
+    /// Selected DB index of the replication stream from our master. Preserved
+    /// across partial resynchronizations (`+CONTINUE`), like Redis's
+    /// `cached_primary->db`, and reset to `repl-stream-db` (default 0) on full
+    /// resynchronization.
+    pub replica_selected_db: std::sync::atomic::AtomicUsize,
 }
 
 /// Holds `ReplicationHub::apply_token` until dropped.
@@ -540,6 +568,7 @@ impl ReplicationHub {
             is_slave_atomic: std::sync::atomic::AtomicBool::new(false),
             has_replicas: std::sync::atomic::AtomicBool::new(false),
             backlog_active: std::sync::atomic::AtomicBool::new(true),
+            replication_active: std::sync::atomic::AtomicBool::new(false),
             backlog: RwLock::new(ReplicationBacklog::new(repl_backlog_size())),
             replicas: RwLock::new(HashMap::new()),
             cancel_sync: RwLock::new(None),
@@ -554,6 +583,19 @@ impl ReplicationHub {
             cached_master: AtomicBool::new(false),
             apply_token: (token_tx, token_rx),
             pinger_running: AtomicBool::new(false),
+            replica_selected_db: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// True when this server is already replicating from `host:port`.
+    pub fn is_replicating_from(&self, host: &str, port: u16) -> bool {
+        match &*self.role.read() {
+            ReplicationRole::Slave {
+                master_host,
+                master_port,
+                ..
+            } => master_host.eq_ignore_ascii_case(host) && *master_port == port,
+            ReplicationRole::Master => false,
         }
     }
 
@@ -785,7 +827,13 @@ impl ReplicationHub {
     /// `loadDataFromDisk`. A server about to replicate (`replicaof` in its
     /// config) continues that history with its master; a master starts a
     /// new history that continues it, so its replicas partially resync.
-    pub fn restore_saved_history(&self, replid: &str, offset: u64, as_replica: bool) {
+    pub fn restore_saved_history(
+        &self,
+        replid: &str,
+        offset: u64,
+        stream_db: usize,
+        as_replica: bool,
+    ) {
         if !valid_replid(replid) {
             return;
         }
@@ -797,6 +845,7 @@ impl ReplicationHub {
                 ids.replid2 = NULL_REPLID.to_string();
                 ids.second_offset = -1;
                 self.cached_master.store(true, Ordering::Relaxed);
+                self.replica_selected_db.store(stream_db, Ordering::Relaxed);
             } else {
                 ids.replid2 = replid.to_string();
                 ids.second_offset = offset as i64 + 1;
@@ -808,17 +857,25 @@ impl ReplicationHub {
         self.activate_backlog();
     }
 
-    /// The `repl-id` / `repl-offset` to save in an RDB: a master's own
-    /// history, a replica's while it has a usable one (Redis's
+    /// The `repl-id` / `repl-offset` / `repl-stream-db` to save in an RDB: a
+    /// master's own history, a replica's while it has a usable one (Redis's
     /// `rdbPopulateSaveInfo`).
-    pub fn saved_history(&self) -> Option<(String, u64)> {
-        let _backlog = self.backlog.read();
+    pub fn saved_history(&self) -> Option<(String, u64, usize)> {
+        let backlog = self.backlog.read();
         if self.is_slave() && !self.cached_master.load(Ordering::Relaxed) {
             return None;
         }
+        let stream_db = if self.is_slave() {
+            self.replica_selected_db.load(Ordering::Relaxed)
+        } else if backlog.stream_db == usize::MAX {
+            0
+        } else {
+            backlog.stream_db
+        };
         Some((
             self.replid(),
             self.master_repl_offset.load(Ordering::SeqCst),
+            stream_db,
         ))
     }
 
@@ -911,6 +968,7 @@ impl ReplicationHub {
 
     pub fn activate_backlog(&self) {
         self.backlog_active.store(true, Ordering::Release);
+        self.replication_active.store(true, Ordering::Release);
         HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
     }
 
@@ -953,6 +1011,7 @@ impl ReplicationHub {
         self.no_replicas_since.store(0, Ordering::Relaxed);
         self.has_replicas.store(true, Ordering::Release);
         self.backlog_active.store(true, Ordering::Release);
+        self.replication_active.store(true, Ordering::Release);
         HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
         rep
     }
@@ -1137,6 +1196,7 @@ impl ReplicationHub {
             .or_default()
             .insert(client_id, flow.clone());
         self.has_shard_flows.store(true, Ordering::Release);
+        self.replication_active.store(true, Ordering::Release);
         HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
         flow
     }
@@ -1655,7 +1715,9 @@ pub fn has_connected_replicas(port: u16) -> bool {
     }
     let hubs = REPLICATION_HUBS.read();
     if let Some(hub) = hubs.get(&port) {
-        hub.has_replicas.load(Ordering::Relaxed) || hub.backlog_active.load(Ordering::Relaxed)
+        hub.replication_active.load(Ordering::Relaxed)
+            && (hub.has_replicas.load(Ordering::Relaxed)
+                || hub.backlog_active.load(Ordering::Relaxed))
     } else {
         false
     }
@@ -1745,6 +1807,9 @@ pub fn propagate_bytes(port: u16, bytes: &[u8]) {
         return;
     }
     let hub = get_replication_hub(port);
+    if !hub.replication_active.load(Ordering::Relaxed) {
+        return;
+    }
     hub.propagate(bytes);
 }
 
@@ -1754,6 +1819,9 @@ pub fn propagate_shard_bytes(port: u16, shard_id: usize, bytes: &[u8]) {
         return;
     }
     let hub = get_replication_hub(port);
+    if !hub.replication_active.load(Ordering::Relaxed) {
+        return;
+    }
     hub.propagate_shard(shard_id, bytes);
 }
 
@@ -1996,7 +2064,9 @@ pub fn propagate_expired_on_load(port: u16, keys: &[Vec<u8>]) {
 pub fn snapshots_keep_expired(port: u16) -> bool {
     HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) && {
         let hub = get_replication_hub(port);
-        hub.is_master() && hub.backlog_active.load(Ordering::Relaxed)
+        hub.is_master()
+            && hub.replication_active.load(Ordering::Relaxed)
+            && hub.backlog_active.load(Ordering::Relaxed)
     }
 }
 
@@ -2103,7 +2173,6 @@ async fn run_replica_worker(
     // Failed attempts are retried every 50ms; like Redis (which retries once
     // a second) log at most one attempt's progress and errors per second.
     let mut last_logged_attempt: Option<std::time::Instant> = None;
-    let mut replica_selected_db: usize = 0;
 
     'reconnect_loop: loop {
         if is_sync_cancelled(&cancel_rx) {
@@ -2489,10 +2558,14 @@ async fn run_replica_worker(
                 *sync_in_progress = false;
             }
         }
-        if !is_continue {
-            replica_selected_db = crate::redis_rdb::last_rdb_repl_stream_db();
+        let mut replica_selected_db = if !is_continue {
+            let db = crate::redis_rdb::last_rdb_repl_stream_db();
+            hub.replica_selected_db.store(db, Ordering::Relaxed);
             crate::log_notice!("MASTER <-> REPLICA sync: Finished with success");
-        }
+            db
+        } else {
+            hub.replica_selected_db.load(Ordering::Relaxed)
+        };
         // Only repeated failures are throttled: after a working link breaks,
         // the next attempt is logged in full.
         last_logged_attempt = None;
@@ -2566,6 +2639,8 @@ async fn run_replica_worker(
                                         }
                                         .await;
                                         replica_selected_db = new_db;
+                                        hub.replica_selected_db
+                                            .store(replica_selected_db, Ordering::Relaxed);
                                         applied.set(current_offset);
                                         let _ = ack_tx.send(());
                                     }
@@ -2579,6 +2654,8 @@ async fn run_replica_worker(
                                     }
                                     .await;
                                     replica_selected_db = new_db;
+                                    hub.replica_selected_db
+                                        .store(replica_selected_db, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -2598,6 +2675,8 @@ async fn run_replica_worker(
                 }
                 .await;
                 replica_selected_db = new_db;
+                hub.replica_selected_db
+                    .store(replica_selected_db, Ordering::Relaxed);
                 hub.feed_from_master(&raw[..start_len - buf.len()]);
             }
             // The periodic ack reports this from its next tick.
@@ -3233,7 +3312,7 @@ mod tests {
         let saved = "2".repeat(40);
         // A master continues the saved history under a new id.
         let hub = ReplicationHub::new(19985);
-        hub.restore_saved_history(&saved, 300, false);
+        hub.restore_saved_history(&saved, 300, 0, false);
         let ids = hub.ids();
         assert_ne!(ids.replid, saved);
         assert_eq!(ids.replid2, saved);
@@ -3244,12 +3323,13 @@ mod tests {
         assert!(!hub.can_partial_resync(&saved, 300));
         // A replica asks its master to continue it.
         let hub = ReplicationHub::new(19984);
-        hub.restore_saved_history(&saved, 300, true);
+        hub.restore_saved_history(&saved, 300, 9, true);
         assert_eq!(hub.psync_request(), Some((saved.clone(), 300)));
-        assert_eq!(hub.saved_history(), Some((saved.clone(), 300)));
+        assert_eq!(hub.saved_history(), Some((saved.clone(), 300, 0)));
+        assert_eq!(hub.replica_selected_db.load(Ordering::Relaxed), 9);
         // Garbage is ignored.
         let hub = ReplicationHub::new(19983);
-        hub.restore_saved_history("short", 300, true);
+        hub.restore_saved_history("short", 300, 0, true);
         assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 0);
     }
 
