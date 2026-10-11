@@ -14,12 +14,14 @@ use std::ops::Deref;
 use std::ptr::NonNull;
 
 /// Longest string stored inline. Chosen so the enum is exactly 24 bytes:
-/// 1 B tag + 1 B length + 22 B data.
-pub const INLINE_CAP: usize = 22;
+/// 1 B tag + 23 B data (`Inline23`), or 1 B tag + 1 B length + 22 B data (`Inline`).
+pub const INLINE_CAP: usize = 23;
+const INLINE_SHORT_CAP: usize = 22;
 
 /// Longest key stored inline together with an expiry deadline:
-/// 1 B tag + 1 B length + 17 B data + 5 B deadline.
-pub const INLINE_TTL_CAP: usize = 17;
+/// 1 B tag + 18 B data + 5 B deadline (`InlineTtl18`), or 1 B tag + 1 B length + 17 B data + 5 B deadline.
+pub const INLINE_TTL_CAP: usize = 18;
+const INLINE_TTL_SHORT_CAP: usize = 17;
 
 const NANOS_PER_MS: u64 = 1_000_000;
 
@@ -59,10 +61,16 @@ fn unpack_ttl_ms(b: [u8; 5]) -> u64 {
 pub enum CompactKey {
     Inline {
         len: u8,
-        data: [u8; INLINE_CAP],
+        data: [u8; INLINE_SHORT_CAP],
     },
+    Inline23([u8; INLINE_CAP]),
     InlineTtl {
         len: u8,
+        data: [u8; INLINE_TTL_SHORT_CAP],
+        /// Deadline in milliseconds, see `pack_ttl_ms`.
+        ttl: [u8; 5],
+    },
+    InlineTtl18 {
         data: [u8; INLINE_TTL_CAP],
         /// Deadline in milliseconds, see `pack_ttl_ms`.
         ttl: [u8; 5],
@@ -79,13 +87,17 @@ const _: () = assert!(std::mem::size_of::<Option<CompactKey>>() == 24);
 impl CompactKey {
     #[inline]
     pub fn new(s: &[u8]) -> Self {
-        if s.len() <= INLINE_CAP {
-            let mut data = [0u8; INLINE_CAP];
+        if s.len() <= INLINE_SHORT_CAP {
+            let mut data = [0u8; INLINE_SHORT_CAP];
             data[..s.len()].copy_from_slice(s);
             CompactKey::Inline {
                 len: s.len() as u8,
                 data,
             }
+        } else if s.len() == INLINE_CAP {
+            let mut data = [0u8; INLINE_CAP];
+            data.copy_from_slice(s);
+            CompactKey::Inline23(data)
         } else {
             CompactKey::Heap(Box::from(s))
         }
@@ -96,16 +108,22 @@ impl CompactKey {
     pub fn with_ttl(s: &[u8], ttl: u64) -> Self {
         if ttl == 0 {
             Self::new(s)
-        } else if s.len() <= INLINE_TTL_CAP
+        } else if s.len() <= INLINE_TTL_SHORT_CAP
             && let Some(packed) = pack_ttl_ms(ttl)
         {
-            let mut data = [0u8; INLINE_TTL_CAP];
+            let mut data = [0u8; INLINE_TTL_SHORT_CAP];
             data[..s.len()].copy_from_slice(s);
             CompactKey::InlineTtl {
                 len: s.len() as u8,
                 data,
                 ttl: packed,
             }
+        } else if s.len() == INLINE_TTL_CAP
+            && let Some(packed) = pack_ttl_ms(ttl)
+        {
+            let mut data = [0u8; INLINE_TTL_CAP];
+            data.copy_from_slice(s);
+            CompactKey::InlineTtl18 { data, ttl: packed }
         } else {
             let mut v = Vec::with_capacity(8 + s.len());
             v.extend_from_slice(&ttl.to_ne_bytes());
@@ -119,8 +137,10 @@ impl CompactKey {
     #[inline(always)]
     pub fn ttl(&self) -> u64 {
         match self {
-            CompactKey::Inline { .. } | CompactKey::Heap(_) => 0,
-            CompactKey::InlineTtl { ttl, .. } => unpack_ttl_ms(*ttl),
+            CompactKey::Inline { .. } | CompactKey::Inline23(_) | CompactKey::Heap(_) => 0,
+            CompactKey::InlineTtl { ttl, .. } | CompactKey::InlineTtl18 { ttl, .. } => {
+                unpack_ttl_ms(*ttl)
+            }
             CompactKey::HeapTtl(b) => {
                 u64::from_ne_bytes(b[..8].try_into().expect("8-byte ttl prefix"))
             }
@@ -132,14 +152,15 @@ impl CompactKey {
     #[inline]
     pub fn set_ttl(&mut self, ttl: u64) {
         match self {
-            CompactKey::InlineTtl { ttl: t, .. }
+            CompactKey::InlineTtl { ttl: t, .. } | CompactKey::InlineTtl18 { ttl: t, .. }
                 if ttl != 0
                     && let Some(packed) = pack_ttl_ms(ttl) =>
             {
                 *t = packed
             }
             CompactKey::HeapTtl(b) if ttl != 0 => b[..8].copy_from_slice(&ttl.to_ne_bytes()),
-            CompactKey::Inline { .. } | CompactKey::Heap(_) if ttl == 0 => {}
+            CompactKey::Inline { .. } | CompactKey::Inline23(_) | CompactKey::Heap(_)
+                if ttl == 0 => {}
             _ => {
                 let new = Self::with_ttl(self.as_slice(), ttl);
                 *self = new;
@@ -151,8 +172,10 @@ impl CompactKey {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             CompactKey::Inline { len, data } => &data[..*len as usize],
+            CompactKey::Inline23(data) => data,
             CompactKey::Heap(b) => b,
             CompactKey::InlineTtl { len, data, .. } => &data[..*len as usize],
+            CompactKey::InlineTtl18 { data, .. } => data,
             CompactKey::HeapTtl(b) => &b[8..],
         }
     }
@@ -161,6 +184,8 @@ impl CompactKey {
     pub fn len(&self) -> usize {
         match self {
             CompactKey::Inline { len, .. } | CompactKey::InlineTtl { len, .. } => *len as usize,
+            CompactKey::Inline23(_) => INLINE_CAP,
+            CompactKey::InlineTtl18 { .. } => INLINE_TTL_CAP,
             CompactKey::Heap(b) => b.len(),
             CompactKey::HeapTtl(b) => b.len() - 8,
         }
@@ -175,7 +200,10 @@ impl CompactKey {
     pub fn is_inline(&self) -> bool {
         matches!(
             self,
-            CompactKey::Inline { .. } | CompactKey::InlineTtl { .. }
+            CompactKey::Inline { .. }
+                | CompactKey::Inline23(_)
+                | CompactKey::InlineTtl { .. }
+                | CompactKey::InlineTtl18 { .. }
         )
     }
 
@@ -183,7 +211,10 @@ impl CompactKey {
     #[inline(always)]
     pub fn heap_bytes(&self) -> usize {
         match self {
-            CompactKey::Inline { .. } | CompactKey::InlineTtl { .. } => 0,
+            CompactKey::Inline { .. }
+            | CompactKey::Inline23(_)
+            | CompactKey::InlineTtl { .. }
+            | CompactKey::InlineTtl18 { .. } => 0,
             CompactKey::Heap(b) | CompactKey::HeapTtl(b) => b.len(),
         }
     }
@@ -205,7 +236,7 @@ impl Default for CompactKey {
     fn default() -> Self {
         CompactKey::Inline {
             len: 0,
-            data: [0; INLINE_CAP],
+            data: [0; INLINE_SHORT_CAP],
         }
     }
 }
@@ -340,17 +371,79 @@ impl fmt::Debug for CompactKey {
 /// first read, so reads hand out a refcount clone instead of copying.
 pub const SHARE_MIN: usize = 256;
 
-/// Longest string value stored inline as raw bytes.
-pub const STR_INLINE_CAP: usize = 14;
+/// Longest string value stored inline as raw contiguous bytes (`Inline` up to
+/// 14 B, `Inline15` at 15 B).
+pub const STR_INLINE_CAP: usize = 15;
+const STR_INLINE_SHORT_CAP: usize = 14;
 
 /// Longest string value stored inline when every byte is 7-bit ASCII: 16
-/// bytes of 7 bits fill the same 14-byte buffer.
-pub const STR_PACKED_CAP: usize = 16;
+/// bytes fill a 14-byte buffer (`Packed`), 17 bytes fill a 15-byte buffer (`Packed17`).
+pub const STR_PACKED_CAP: usize = 17;
+const STR_PACKED_SHORT_CAP: usize = 16;
 
-/// String value stored in a table slot. 16 bytes, four representations:
-/// - `Inline`: up to [`STR_INLINE_CAP`] bytes, no heap allocation.
-/// - `Packed`: [`STR_INLINE_CAP`]` + 1 ..= `[`STR_PACKED_CAP`] bytes of 7-bit
-///   ASCII, packed 7 bits per byte, no heap allocation.
+/// Longest string value stored inline using 6-bit (`18..=20` B) or 5-bit (`21..=24` B)
+/// alphabet packing inside the 15-byte payload.
+pub const STR_MAX_PACKED_CAP: usize = 24;
+
+const ALPHABET_6A: &[u8; 64] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz:-";
+const ALPHABET_6B: &[u8; 64] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_.";
+const ALPHABET_5A: &[u8; 32] = b"0123456789abcdef:-_.TZ /+ghiklnv";
+const ALPHABET_5B: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz:-_./ ";
+
+const fn build_encode_table(alphabet: &[u8]) -> [u8; 256] {
+    let mut table = [0xFFu8; 256];
+    let mut i = 0;
+    while i < alphabet.len() {
+        table[alphabet[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+}
+
+const ENCODE_6A: [u8; 256] = build_encode_table(ALPHABET_6A);
+const ENCODE_6B: [u8; 256] = build_encode_table(ALPHABET_6B);
+const ENCODE_5A: [u8; 256] = build_encode_table(ALPHABET_5A);
+const ENCODE_5B: [u8; 256] = build_encode_table(ALPHABET_5B);
+
+#[inline]
+fn try_pack_bits<const BITS: usize>(s: &[u8], enc: &[u8; 256]) -> Option<[u8; 15]> {
+    let mut acc: u128 = 0;
+    for (i, &b) in s.iter().enumerate() {
+        let code = enc[b as usize];
+        if code == 0xFF {
+            return None;
+        }
+        acc |= (code as u128) << (BITS * i);
+    }
+    let bytes = acc.to_le_bytes();
+    let mut out = [0u8; 15];
+    out.copy_from_slice(&bytes[..15]);
+    Some(out)
+}
+
+#[inline]
+fn unpack_bits<const BITS: usize>(
+    data: &[u8; 15],
+    len: usize,
+    dec: &[u8],
+) -> [u8; STR_MAX_PACKED_CAP] {
+    let mut raw = [0u8; 16];
+    raw[..15].copy_from_slice(data);
+    let mut acc = u128::from_le_bytes(raw);
+    let mask = (1u128 << BITS) - 1;
+    let mut out = [0u8; STR_MAX_PACKED_CAP];
+    for slot in out.iter_mut().take(len) {
+        *slot = dec[(acc & mask) as usize];
+        acc >>= BITS;
+    }
+    out
+}
+
+/// String value stored in a table slot. 16 bytes, multiple representations:
+/// - `Inline` / `Inline15`: up to [`STR_INLINE_CAP`] (15) raw bytes, no heap allocation.
+/// - `Packed` / `Packed17`: `16..=17` bytes of 7-bit ASCII, no heap allocation.
+/// - `Packed6A_*` / `Packed6B_*`: `18..=20` bytes of 6-bit ASCII (`0-9A-Za-z:-` or `0-9A-Za-z_.`), no heap allocation.
+/// - `Packed5A_*` / `Packed5B_*`: `21..=24` bytes of 5-bit ASCII (hex/timestamps/identifiers or lowercase), no heap allocation.
 /// - `Heap`: an exact-size `Box<[u8]>` split into a thin pointer and a
 ///   `u32` length (a fat `Box<[u8]>` plus the tag would need 24 bytes). How
 ///   every other non-inline value is written, so SET costs one allocation.
@@ -358,27 +451,31 @@ pub const STR_PACKED_CAP: usize = 16;
 ///   is converted in place (no copy) on its first read via
 ///   [`CompactStr::make_shared`], so later GETs (often cross-shard) are a
 ///   refcount clone rather than a malloc + memcpy.
-///
-/// Measured alternatives at 1 KiB values: `Arc<[u8]>` puts its refcount in
-/// the data allocation, pushing values into the next jemalloc size class
-/// (SET -10%); copying on every read costs GET -10%; boxing a `Bytes` at
-/// write time adds a second allocation to every SET (-10%). A safe
-/// `Box<Box<[u8]>>` for `Heap` would add a 16-byte allocation per value.
-///
-/// A packed value has no contiguous bytes to borrow, so reads go through
-/// [`CompactStr::view`], which unpacks it on the stack.
-///
-/// Nested in `RudisValue::String` it adds no size: the enum stays 16 bytes
-/// because its other variants are boxed and fit beside this type's tag byte.
 pub enum CompactStr {
     Inline {
         len: u8,
-        data: [u8; STR_INLINE_CAP],
+        data: [u8; STR_INLINE_SHORT_CAP],
     },
+    Inline15([u8; STR_INLINE_CAP]),
     Packed {
         len: u8,
-        data: [u8; STR_INLINE_CAP],
+        data: [u8; STR_INLINE_SHORT_CAP],
     },
+    Packed17([u8; STR_INLINE_CAP]),
+    Packed6A18([u8; STR_INLINE_CAP]),
+    Packed6A19([u8; STR_INLINE_CAP]),
+    Packed6A20([u8; STR_INLINE_CAP]),
+    Packed6B18([u8; STR_INLINE_CAP]),
+    Packed6B19([u8; STR_INLINE_CAP]),
+    Packed6B20([u8; STR_INLINE_CAP]),
+    Packed5A21([u8; STR_INLINE_CAP]),
+    Packed5A22([u8; STR_INLINE_CAP]),
+    Packed5A23([u8; STR_INLINE_CAP]),
+    Packed5A24([u8; STR_INLINE_CAP]),
+    Packed5B21([u8; STR_INLINE_CAP]),
+    Packed5B22([u8; STR_INLINE_CAP]),
+    Packed5B23([u8; STR_INLINE_CAP]),
+    Packed5B24([u8; STR_INLINE_CAP]),
     /// Owns the allocation behind `ptr`: `len` bytes from a `Box<[u8]>`
     /// (see [`CompactStr::from_box`]), freed in `Drop`.
     Heap {
@@ -418,27 +515,43 @@ fn unpack7_u64(x: u64) -> u64 {
 /// Packs 15 or 16 ASCII bytes, 7 bits each, into 14 bytes (a 15-byte value
 /// packs a trailing zero, which `len` cuts off again on unpack).
 #[inline]
-fn pack7(s: &[u8]) -> [u8; STR_INLINE_CAP] {
-    let mut buf = [0u8; STR_PACKED_CAP];
+fn pack7(s: &[u8]) -> [u8; STR_INLINE_SHORT_CAP] {
+    let mut buf = [0u8; STR_PACKED_SHORT_CAP];
     buf[..s.len()].copy_from_slice(s);
     let (lo, hi) = buf.split_at(8);
     let lo = pack7_u64(u64::from_le_bytes(lo.try_into().unwrap_or_default()));
     let hi = pack7_u64(u64::from_le_bytes(hi.try_into().unwrap_or_default()));
-    let mut out = [0u8; STR_INLINE_CAP];
+    let mut out = [0u8; STR_INLINE_SHORT_CAP];
     out[..7].copy_from_slice(&lo.to_le_bytes()[..7]);
     out[7..].copy_from_slice(&hi.to_le_bytes()[..7]);
     out
 }
 
 #[inline]
-fn unpack7(data: &[u8; STR_INLINE_CAP]) -> [u8; STR_PACKED_CAP] {
+fn unpack7(data: &[u8; STR_INLINE_SHORT_CAP]) -> [u8; STR_MAX_PACKED_CAP] {
     let mut lo = [0u8; 8];
     let mut hi = [0u8; 8];
     lo[..7].copy_from_slice(&data[..7]);
     hi[..7].copy_from_slice(&data[7..]);
-    let mut out = [0u8; STR_PACKED_CAP];
+    let mut out = [0u8; STR_MAX_PACKED_CAP];
     out[..8].copy_from_slice(&unpack7_u64(u64::from_le_bytes(lo)).to_le_bytes());
-    out[8..].copy_from_slice(&unpack7_u64(u64::from_le_bytes(hi)).to_le_bytes());
+    out[8..16].copy_from_slice(&unpack7_u64(u64::from_le_bytes(hi)).to_le_bytes());
+    out
+}
+
+#[inline]
+fn pack7_17(s: &[u8]) -> [u8; STR_INLINE_CAP] {
+    let mut out = [0u8; STR_INLINE_CAP];
+    out[..14].copy_from_slice(&pack7(&s[..16]));
+    out[14] = s[16];
+    out
+}
+
+#[inline]
+fn unpack7_17(data: &[u8; STR_INLINE_CAP]) -> [u8; STR_MAX_PACKED_CAP] {
+    let head: &[u8; STR_INLINE_SHORT_CAP] = data[..14].try_into().unwrap();
+    let mut out = unpack7(head);
+    out[16] = data[14];
     out
 }
 
@@ -448,7 +561,10 @@ pub struct StrView<'a>(ViewRepr<'a>);
 
 enum ViewRepr<'a> {
     Slice(&'a [u8]),
-    Unpacked { len: u8, buf: [u8; STR_PACKED_CAP] },
+    Unpacked {
+        len: u8,
+        buf: [u8; STR_MAX_PACKED_CAP],
+    },
 }
 
 impl Deref for StrView<'_> {
@@ -472,17 +588,55 @@ impl AsRef<[u8]> for StrView<'_> {
 impl CompactStr {
     #[inline]
     pub fn new(s: &[u8]) -> Self {
-        if s.len() <= STR_INLINE_CAP {
+        let n = s.len();
+        if n <= STR_INLINE_SHORT_CAP {
+            let mut data = [0u8; STR_INLINE_SHORT_CAP];
+            data[..n].copy_from_slice(s);
+            CompactStr::Inline { len: n as u8, data }
+        } else if n == STR_INLINE_CAP {
             let mut data = [0u8; STR_INLINE_CAP];
-            data[..s.len()].copy_from_slice(s);
-            CompactStr::Inline {
-                len: s.len() as u8,
-                data,
-            }
-        } else if s.len() <= STR_PACKED_CAP && s.is_ascii() {
+            data.copy_from_slice(s);
+            CompactStr::Inline15(data)
+        } else if n == STR_PACKED_SHORT_CAP && s.is_ascii() {
             CompactStr::Packed {
-                len: s.len() as u8,
+                len: n as u8,
                 data: pack7(s),
+            }
+        } else if n == STR_PACKED_CAP && s.is_ascii() {
+            CompactStr::Packed17(pack7_17(s))
+        } else if (18..=20).contains(&n) {
+            if let Some(d) = try_pack_bits::<6>(s, &ENCODE_6A) {
+                match n {
+                    18 => CompactStr::Packed6A18(d),
+                    19 => CompactStr::Packed6A19(d),
+                    _ => CompactStr::Packed6A20(d),
+                }
+            } else if let Some(d) = try_pack_bits::<6>(s, &ENCODE_6B) {
+                match n {
+                    18 => CompactStr::Packed6B18(d),
+                    19 => CompactStr::Packed6B19(d),
+                    _ => CompactStr::Packed6B20(d),
+                }
+            } else {
+                CompactStr::from_box(Box::from(s))
+            }
+        } else if (21..=24).contains(&n) {
+            if let Some(d) = try_pack_bits::<5>(s, &ENCODE_5A) {
+                match n {
+                    21 => CompactStr::Packed5A21(d),
+                    22 => CompactStr::Packed5A22(d),
+                    23 => CompactStr::Packed5A23(d),
+                    _ => CompactStr::Packed5A24(d),
+                }
+            } else if let Some(d) = try_pack_bits::<5>(s, &ENCODE_5B) {
+                match n {
+                    21 => CompactStr::Packed5B21(d),
+                    22 => CompactStr::Packed5B22(d),
+                    23 => CompactStr::Packed5B23(d),
+                    _ => CompactStr::Packed5B24(d),
+                }
+            } else {
+                CompactStr::from_box(Box::from(s))
             }
         } else {
             CompactStr::from_box(Box::from(s))
@@ -542,9 +696,70 @@ impl CompactStr {
     pub fn view(&self) -> StrView<'_> {
         StrView(match self {
             CompactStr::Inline { len, data } => ViewRepr::Slice(&data[..*len as usize]),
+            CompactStr::Inline15(data) => ViewRepr::Slice(data),
             CompactStr::Packed { len, data } => ViewRepr::Unpacked {
                 len: *len,
                 buf: unpack7(data),
+            },
+            CompactStr::Packed17(data) => ViewRepr::Unpacked {
+                len: 17,
+                buf: unpack7_17(data),
+            },
+            CompactStr::Packed6A18(d) => ViewRepr::Unpacked {
+                len: 18,
+                buf: unpack_bits::<6>(d, 18, ALPHABET_6A),
+            },
+            CompactStr::Packed6A19(d) => ViewRepr::Unpacked {
+                len: 19,
+                buf: unpack_bits::<6>(d, 19, ALPHABET_6A),
+            },
+            CompactStr::Packed6A20(d) => ViewRepr::Unpacked {
+                len: 20,
+                buf: unpack_bits::<6>(d, 20, ALPHABET_6A),
+            },
+            CompactStr::Packed6B18(d) => ViewRepr::Unpacked {
+                len: 18,
+                buf: unpack_bits::<6>(d, 18, ALPHABET_6B),
+            },
+            CompactStr::Packed6B19(d) => ViewRepr::Unpacked {
+                len: 19,
+                buf: unpack_bits::<6>(d, 19, ALPHABET_6B),
+            },
+            CompactStr::Packed6B20(d) => ViewRepr::Unpacked {
+                len: 20,
+                buf: unpack_bits::<6>(d, 20, ALPHABET_6B),
+            },
+            CompactStr::Packed5A21(d) => ViewRepr::Unpacked {
+                len: 21,
+                buf: unpack_bits::<5>(d, 21, ALPHABET_5A),
+            },
+            CompactStr::Packed5A22(d) => ViewRepr::Unpacked {
+                len: 22,
+                buf: unpack_bits::<5>(d, 22, ALPHABET_5A),
+            },
+            CompactStr::Packed5A23(d) => ViewRepr::Unpacked {
+                len: 23,
+                buf: unpack_bits::<5>(d, 23, ALPHABET_5A),
+            },
+            CompactStr::Packed5A24(d) => ViewRepr::Unpacked {
+                len: 24,
+                buf: unpack_bits::<5>(d, 24, ALPHABET_5A),
+            },
+            CompactStr::Packed5B21(d) => ViewRepr::Unpacked {
+                len: 21,
+                buf: unpack_bits::<5>(d, 21, ALPHABET_5B),
+            },
+            CompactStr::Packed5B22(d) => ViewRepr::Unpacked {
+                len: 22,
+                buf: unpack_bits::<5>(d, 22, ALPHABET_5B),
+            },
+            CompactStr::Packed5B23(d) => ViewRepr::Unpacked {
+                len: 23,
+                buf: unpack_bits::<5>(d, 23, ALPHABET_5B),
+            },
+            CompactStr::Packed5B24(d) => ViewRepr::Unpacked {
+                len: 24,
+                buf: unpack_bits::<5>(d, 24, ALPHABET_5B),
             },
             CompactStr::Heap { .. } => ViewRepr::Slice(self.heap_slice()),
             CompactStr::Shared(b) => ViewRepr::Slice(b),
@@ -557,9 +772,10 @@ impl CompactStr {
     pub fn as_contiguous(&self) -> Option<&[u8]> {
         match self {
             CompactStr::Inline { len, data } => Some(&data[..*len as usize]),
-            CompactStr::Packed { .. } => None,
+            CompactStr::Inline15(data) => Some(data),
             CompactStr::Heap { .. } => Some(self.heap_slice()),
             CompactStr::Shared(b) => Some(b),
+            _ => None,
         }
     }
 
@@ -567,6 +783,15 @@ impl CompactStr {
     pub fn len(&self) -> usize {
         match self {
             CompactStr::Inline { len, .. } | CompactStr::Packed { len, .. } => *len as usize,
+            CompactStr::Inline15(_) => 15,
+            CompactStr::Packed17(_) => 17,
+            CompactStr::Packed6A18(_) | CompactStr::Packed6B18(_) => 18,
+            CompactStr::Packed6A19(_) | CompactStr::Packed6B19(_) => 19,
+            CompactStr::Packed6A20(_) | CompactStr::Packed6B20(_) => 20,
+            CompactStr::Packed5A21(_) | CompactStr::Packed5B21(_) => 21,
+            CompactStr::Packed5A22(_) | CompactStr::Packed5B22(_) => 22,
+            CompactStr::Packed5A23(_) | CompactStr::Packed5B23(_) => 23,
+            CompactStr::Packed5A24(_) | CompactStr::Packed5B24(_) => 24,
             CompactStr::Heap { len, .. } => *len as usize,
             CompactStr::Shared(b) => b.len(),
         }
@@ -579,7 +804,7 @@ impl CompactStr {
 
     #[inline(always)]
     pub fn is_inline(&self) -> bool {
-        matches!(self, CompactStr::Inline { .. } | CompactStr::Packed { .. })
+        !matches!(self, CompactStr::Heap { .. } | CompactStr::Shared(_))
     }
 
     #[inline(always)]
@@ -591,9 +816,9 @@ impl CompactStr {
     #[inline(always)]
     pub fn heap_bytes(&self) -> usize {
         match self {
-            CompactStr::Inline { .. } | CompactStr::Packed { .. } => 0,
             CompactStr::Heap { len, .. } => *len as usize,
             CompactStr::Shared(b) => b.len() + std::mem::size_of::<Bytes>(),
+            _ => 0,
         }
     }
 
@@ -651,10 +876,26 @@ impl Clone for CompactStr {
                 len: *len,
                 data: *data,
             },
+            CompactStr::Inline15(d) => CompactStr::Inline15(*d),
             CompactStr::Packed { len, data } => CompactStr::Packed {
                 len: *len,
                 data: *data,
             },
+            CompactStr::Packed17(d) => CompactStr::Packed17(*d),
+            CompactStr::Packed6A18(d) => CompactStr::Packed6A18(*d),
+            CompactStr::Packed6A19(d) => CompactStr::Packed6A19(*d),
+            CompactStr::Packed6A20(d) => CompactStr::Packed6A20(*d),
+            CompactStr::Packed6B18(d) => CompactStr::Packed6B18(*d),
+            CompactStr::Packed6B19(d) => CompactStr::Packed6B19(*d),
+            CompactStr::Packed6B20(d) => CompactStr::Packed6B20(*d),
+            CompactStr::Packed5A21(d) => CompactStr::Packed5A21(*d),
+            CompactStr::Packed5A22(d) => CompactStr::Packed5A22(*d),
+            CompactStr::Packed5A23(d) => CompactStr::Packed5A23(*d),
+            CompactStr::Packed5A24(d) => CompactStr::Packed5A24(*d),
+            CompactStr::Packed5B21(d) => CompactStr::Packed5B21(*d),
+            CompactStr::Packed5B22(d) => CompactStr::Packed5B22(*d),
+            CompactStr::Packed5B23(d) => CompactStr::Packed5B23(*d),
+            CompactStr::Packed5B24(d) => CompactStr::Packed5B24(*d),
             CompactStr::Heap { .. } => CompactStr::from_box(Box::from(self.heap_slice())),
             CompactStr::Shared(b) => CompactStr::Shared(b.clone()),
         }
@@ -666,7 +907,7 @@ impl Default for CompactStr {
     fn default() -> Self {
         CompactStr::Inline {
             len: 0,
-            data: [0; STR_INLINE_CAP],
+            data: [0; STR_INLINE_SHORT_CAP],
         }
     }
 }
@@ -820,7 +1061,7 @@ mod tests {
                 v |= (b as u128) << (7 * i);
             }
             let packed = pack7(&s);
-            assert_eq!(&packed[..], &v.to_le_bytes()[..STR_INLINE_CAP]);
+            assert_eq!(&packed[..], &v.to_le_bytes()[..STR_INLINE_SHORT_CAP]);
             assert_eq!(&unpack7(&packed)[..len], &s[..]);
         }
     }
@@ -833,12 +1074,15 @@ mod tests {
             x(&mut h);
             std::hash::Hasher::finish(&h)
         };
-        let lens = [0usize, 1, 13, 14, 15, 16, 17, 22, 23, 255, 256, 257, 4096];
-        // Binary data (bytes >= 0x80), full 7-bit ASCII range, and text.
-        let gens: [fn(usize) -> u8; 3] = [
+        let lens = [
+            0usize, 1, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 255, 256, 257, 4096,
+        ];
+        // Binary data (bytes >= 0x80), full 7-bit ASCII range, lowercase text, and timestamps/hex.
+        let gens: [fn(usize) -> u8; 4] = [
             |i| (i * 13 + 1) as u8,
             |i| if i % 2 == 0 { 0x7f } else { (i % 3) as u8 },
             |i| b'a' + (i % 26) as u8,
+            |i| b"0123456789abcdef:-_.TZ"[i % 22],
         ];
         for (g, gen_byte) in gens.iter().enumerate() {
             for n in lens {
@@ -846,9 +1090,19 @@ mod tests {
                 let v = CompactStr::new(&s);
                 assert_eq!(&*v.view(), &s[..], "gen {g} len {n}");
                 assert_eq!(v.len(), n);
-                let packable = n > STR_INLINE_CAP && n <= STR_PACKED_CAP && s.is_ascii();
-                assert_eq!(v.is_inline(), n <= STR_INLINE_CAP || packable);
-                assert_eq!(v.as_contiguous().is_none(), packable);
+                let packable = (n > STR_INLINE_CAP && n <= STR_PACKED_CAP && s.is_ascii())
+                    || ((18..=20).contains(&n)
+                        && (s.iter().all(|&b| ENCODE_6A[b as usize] != 0xFF)
+                            || s.iter().all(|&b| ENCODE_6B[b as usize] != 0xFF)))
+                    || ((21..=24).contains(&n)
+                        && (s.iter().all(|&b| ENCODE_5A[b as usize] != 0xFF)
+                            || s.iter().all(|&b| ENCODE_5B[b as usize] != 0xFF)));
+                assert_eq!(
+                    v.is_inline(),
+                    n <= STR_INLINE_CAP || packable,
+                    "gen {g} len {n}"
+                );
+                assert_eq!(v.as_contiguous().is_none(), packable, "gen {g} len {n}");
                 assert_eq!(v.heap_bytes(), if v.is_inline() { 0 } else { n });
                 assert_eq!(v.to_bytes(), Bytes::from(s.clone()));
                 assert_eq!(v.to_vec(), s);
