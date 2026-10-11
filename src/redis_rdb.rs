@@ -1255,6 +1255,69 @@ pub fn write_aux(out: &mut Vec<u8>, key: &[u8], val: &[u8]) {
     write_string(out, val);
 }
 
+/// The replication history saved with a dataset (Redis's `repl-id` and
+/// `repl-offset` AUX fields), written at the end of the file once the
+/// whole dataset is known to match it.
+pub fn write_repl_aux(out: &mut Vec<u8>, replid: &str, offset: u64) {
+    write_aux(out, b"repl-stream-db", b"0");
+    write_aux(out, b"repl-id", replid.as_bytes());
+    write_aux(out, b"repl-offset", offset.to_string().as_bytes());
+}
+
+thread_local! {
+    /// `repl-id` / `repl-offset` of the last RDB loaded on this thread.
+    static LOADED_REPL_INFO: std::cell::RefCell<(Option<String>, Option<u64>)> =
+        const { std::cell::RefCell::new((None, None)) };
+}
+
+fn note_repl_aux(key: &[u8], val: &[u8]) {
+    match key {
+        b"repl-id" => LOADED_REPL_INFO.with(|i| {
+            i.borrow_mut().0 = std::str::from_utf8(val).ok().map(str::to_string);
+        }),
+        b"repl-offset" => LOADED_REPL_INFO.with(|i| {
+            i.borrow_mut().1 = std::str::from_utf8(val)
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .and_then(|v| u64::try_from(v).ok());
+        }),
+        _ => {}
+    }
+}
+
+thread_local! {
+    /// While recording (a startup load), the keys dropped as expired.
+    static EXPIRED_ON_LOAD: std::cell::RefCell<Option<Vec<Vec<u8>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Starts (or stops) recording the keys loads on this thread drop because
+/// they already expired.
+pub fn record_expired_on_load(on: bool) {
+    EXPIRED_ON_LOAD.with(|e| *e.borrow_mut() = on.then(Vec::new));
+}
+
+/// Stops recording and returns the keys recorded.
+pub fn take_expired_on_load() -> Vec<Vec<u8>> {
+    EXPIRED_ON_LOAD.with(|e| e.borrow_mut().take().unwrap_or_default())
+}
+
+fn note_expired_on_load(key: &[u8]) {
+    EXPIRED_ON_LOAD.with(|e| {
+        if let Some(keys) = e.borrow_mut().as_mut() {
+            keys.push(key.to_vec());
+        }
+    });
+}
+
+/// Takes the replication id and offset saved in the RDB last loaded on
+/// this thread, if it had both; call before loading to forget a previous
+/// file's.
+pub fn take_loaded_repl_info() -> Option<(String, u64)> {
+    let (id, off) = LOADED_REPL_INFO.with(|i| std::mem::take(&mut *i.borrow_mut()));
+    Some((id?, off?))
+}
+
 /// Wraps Rudis legacy-format records in a [`EXT_AUX_KEY`] AUX field.
 pub fn write_ext_aux(out: &mut Vec<u8>, records: &[u8]) {
     if !records.is_empty() {
@@ -1936,6 +1999,7 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
             OP_AUX => {
                 let k = r.string()?;
                 let v = r.string()?;
+                note_repl_aux(&k, &v);
                 if k.as_ref() == EXT_AUX_KEY {
                     if (dbid as usize) >= max_dbs {
                         return Err(RdbError::new(format!(
@@ -1994,6 +2058,9 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
                 }
                 let exp = expire_ms.take();
                 let expired = exp.is_some_and(|ms| ms <= ctx.now_ms as i64);
+                if expired && ctx.owns(&key) {
+                    note_expired_on_load(&key);
+                }
                 if !ctx.owns(&key) || (expired && !ctx.strict) {
                     skip_value(t, r)?;
                     continue;

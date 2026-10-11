@@ -155,6 +155,10 @@ pub const DEBUG_LOADAOF_SHARD: &[u8] = b"__shard-loadaof";
 /// `__shard-populate <prefix> <size|""> <n>...`: creates this shard's
 /// `DEBUG POPULATE` keys.
 pub const DEBUG_POPULATE_SHARD: &[u8] = b"__shard-populate";
+/// `DEBUG __shard-flush`: one shard's part of FLUSHDB / FLUSHALL, logged to
+/// its AOF but not replicated (the coordinating shard replicates the whole
+/// command once).
+pub const DEBUG_FLUSH_SHARD: &[u8] = b"__shard-flush";
 
 /// Handle for a cross-shard MGET that has been dispatched but not yet gathered.
 ///
@@ -2428,12 +2432,17 @@ impl Router {
         }
     }
 
-    pub async fn incr_by(&self, key: Bytes, delta: i64) -> Result<i64, String> {
+    pub async fn incr_by(
+        &self,
+        key: Bytes,
+        delta: i64,
+        name: crate::resp::IncrName,
+    ) -> Result<i64, String> {
         let target = self.target_shard(&key);
         if target == self.shard_id {
             let res = self.local_db.borrow_mut().incr_by(key.clone(), delta);
             if res.is_ok() {
-                self.log_mutation(|| Command::IncrBy(key, delta, crate::resp::IncrName::IncrBy));
+                self.log_mutation(|| Command::IncrBy(key, delta, name));
             }
             res
         } else {
@@ -2442,6 +2451,7 @@ impl Router {
                 db: crate::connection::CURRENT_DB.get(),
                 key,
                 delta,
+                name,
                 responder: tx,
             };
             if self.senders[target].send(msg).is_ok() {
@@ -4599,7 +4609,21 @@ impl Router {
             })
             .map_err(|e| e.to_string())?;
 
-        let produced = self.produce_rdb_chunks(&chunk_tx).await;
+        // The replication history goes in only if the dataset matches it:
+        // the history did not move while the shards were serialized (on a
+        // replica, no batch of the master's stream was applied meanwhile).
+        let history_before = self.repl_history_for_save().await;
+        let mut produced = self.produce_rdb_chunks(&chunk_tx).await;
+        if produced.is_ok()
+            && let Some((replid, offset)) = history_before
+            && self.repl_history_for_save().await == Some((replid.clone(), offset))
+        {
+            let mut aux = Vec::new();
+            crate::redis_rdb::write_repl_aux(&mut aux, &replid, offset);
+            if chunk_tx.send_async(Some(aux)).await.is_err() {
+                produced = Err(WRITER_GONE.to_string());
+            }
+        }
         if produced.is_ok() {
             // If the writer already failed it has hung up; its error is
             // reported below.
@@ -4619,6 +4643,19 @@ impl Router {
     }
 
     /// Stream every shard's keyspace, one shard after another, into `chunk_tx`.
+    /// The replication history an RDB saved now would carry (see
+    /// `ReplicationHub::saved_history`), read between batches of a
+    /// replica's master stream.
+    async fn repl_history_for_save(&self) -> Option<(String, u64)> {
+        let hub = crate::replication::get_replication_hub(self.port);
+        let _apply = if hub.is_slave() {
+            Some(hub.lock_apply().await)
+        } else {
+            None
+        };
+        hub.saved_history()
+    }
+
     async fn produce_rdb_chunks(
         &self,
         chunk_tx: &flume::Sender<Option<Vec<u8>>>,

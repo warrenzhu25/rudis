@@ -1278,3 +1278,112 @@ fn valkey_replica_follows_rudis_stream_groups() {
     };
     assert_eq!(consumers(&mut m), consumers(&mut v));
 }
+
+fn info_of(c: &mut Client, section: &str, field: &str) -> String {
+    let text = c.c(&format!("INFO {section}")).text();
+    text.lines()
+        .find_map(|l| l.strip_prefix(&format!("{field}:")))
+        .unwrap_or_else(|| panic!("{field} missing in {text}"))
+        .trim()
+        .to_string()
+}
+
+/// PSYNC2 chains mixing Valkey and Rudis, both ways round: a middle replica
+/// proxies its master's stream byte for byte (one replication id and
+/// offset space on all three), and after promoting the middle node and
+/// re-pointing the old master, both reconnect with partial resyncs.
+#[test]
+fn psync2_chains_with_valkey() {
+    require_valkey!();
+    // (rudis_in_middle, master port, middle port, sub-replica port)
+    for (rudis_middle, pm, pr, ps) in [
+        (true, 18280u16, 18281u16, 18282u16),
+        (false, 18285, 18286, 18287),
+    ] {
+        let start = |rudis: bool, port: u16| -> Server {
+            let dir = scratch_dir(&format!("psync2-chain-{port}"));
+            if rudis {
+                start_rudis(port, &dir, 2)
+            } else {
+                // Rudis replicas read disk-based (`$<len>`) transfers only.
+                start_valkey(port, &dir, &["--repl-diskless-sync", "no"])
+            }
+        };
+        let master = start(!rudis_middle, pm);
+        let middle = start(rudis_middle, pr);
+        let sub = start(!rudis_middle, ps);
+        let (mut m, mut r, mut s) = (master.client(), middle.client(), sub.client());
+        populate(&mut m);
+        r.ok(&["REPLICAOF", "127.0.0.1", &pm.to_string()]);
+        wait_for("middle link up", || {
+            info_of(&mut r, "replication", "master_link_status") == "up"
+        });
+        s.ok(&["REPLICAOF", "127.0.0.1", &pr.to_string()]);
+        wait_for("sub-replica link up", || {
+            info_of(&mut s, "replication", "master_link_status") == "up"
+        });
+        for i in 0..200 {
+            m.ok(&["SET", &format!("chain:{i}"), &format!("v{i}")]);
+            m.c("INCR chain:ctr");
+        }
+        m.ok(&["SET", "chain:done", "1"]);
+        let off = |c: &mut Client| info_of(c, "replication", "master_repl_offset");
+        wait_for("offsets to match along the chain", || {
+            let o = off(&mut m);
+            s.c("EXISTS chain:done").int() == 1 && off(&mut r) == o && off(&mut s) == o
+        });
+        let replid = info_of(&mut m, "replication", "master_replid");
+        assert_eq!(info_of(&mut r, "replication", "master_replid"), replid);
+        assert_eq!(info_of(&mut s, "replication", "master_replid"), replid);
+        let expected = snapshot(&mut m);
+        assert_same(&expected, &snapshot(&mut r));
+        assert_same(&expected, &snapshot(&mut s));
+        // Both ends run the same server, so their digests compare.
+        assert_eq!(m.c("DEBUG DIGEST").text(), s.c("DEBUG DIGEST").text());
+
+        // Failover: promote the middle node, re-point the old master to it.
+        let full_before = info_of(&mut r, "stats", "sync_full");
+        let partial_before: u64 = info_of(&mut r, "stats", "sync_partial_ok").parse().unwrap();
+        let offset: u64 = off(&mut m).parse().unwrap();
+        r.ok(&["REPLICAOF", "NO", "ONE"]);
+        let new_replid = info_of(&mut r, "replication", "master_replid");
+        assert_ne!(new_replid, replid);
+        assert_eq!(info_of(&mut r, "replication", "master_replid2"), replid);
+        assert_eq!(
+            info_of(&mut r, "replication", "second_repl_offset"),
+            (offset + 1).to_string()
+        );
+        m.ok(&["REPLICAOF", "127.0.0.1", &pr.to_string()]);
+        wait_for("both to continue with the promoted node", || {
+            info_of(&mut m, "replication", "master_link_status") == "up"
+                && info_of(&mut s, "replication", "master_link_status") == "up"
+                && info_of(&mut m, "replication", "master_replid") == new_replid
+                && info_of(&mut s, "replication", "master_replid") == new_replid
+        });
+        for i in 0..50 {
+            r.ok(&["SET", &format!("after:{i}"), &format!("w{i}")]);
+        }
+        r.ok(&["SET", "after:done", "1"]);
+        wait_for("writes on the promoted node to reach both", || {
+            let o = off(&mut r);
+            m.c("EXISTS after:done").int() == 1
+                && s.c("EXISTS after:done").int() == 1
+                && off(&mut m) == o
+                && off(&mut s) == o
+        });
+        assert_eq!(info_of(&mut r, "stats", "sync_full"), full_before);
+        let partial_after: u64 = info_of(&mut r, "stats", "sync_partial_ok").parse().unwrap();
+        assert!(
+            partial_after >= partial_before + 2,
+            "{partial_before} -> {partial_after}"
+        );
+        let expected = snapshot(&mut r);
+        assert_same(&expected, &snapshot(&mut m));
+        assert_same(&expected, &snapshot(&mut s));
+        assert_eq!(m.c("DEBUG DIGEST").text(), s.c("DEBUG DIGEST").text());
+        drop((m, r, s));
+        master.kill();
+        middle.kill();
+        sub.kill();
+    }
+}

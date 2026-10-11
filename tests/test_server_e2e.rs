@@ -23782,3 +23782,234 @@ fn test_multi_db_persistence_and_replication_e2e() {
     shutdown_and_wait(mport, &mut master);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `field` of `INFO <section>` as a string.
+fn info_str(c: &mut TcpStream, section: &str, field: &str) -> String {
+    let info = resp_cmd(c, &["INFO", section]);
+    let prefix = format!("{field}:");
+    info.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| panic!("no {field} in INFO {section}: {info}"))
+}
+
+/// Polls `cond` for up to 10 seconds.
+fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn psync2_client(port: u16) -> TcpStream {
+    let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c
+}
+
+/// PSYNC2 on a chain master -> replica -> sub-replica: the replica proxies
+/// its master's stream, so all three share one replication id and offset;
+/// promoting the middle node and re-pointing the old master make partial
+/// resyncs only, like Redis.
+#[test]
+fn test_psync2_chained_replication_and_failover_e2e() {
+    let (pa, pb, pc) = (18240u16, 18241u16, 18242u16);
+    for p in [pa, pb, pc] {
+        start_test_server(p, 2);
+    }
+    let (mut a, mut b, mut c) = (psync2_client(pa), psync2_client(pb), psync2_client(pc));
+
+    assert_eq!(resp_cmd(&mut a, &["SET", "before", "1"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut b, &["REPLICAOF", "127.0.0.1", &pa.to_string()]),
+        "+OK\r\n"
+    );
+    wait_for("B link up", || {
+        info_str(&mut b, "replication", "master_link_status") == "up"
+    });
+    assert_eq!(
+        resp_cmd(&mut c, &["REPLICAOF", "127.0.0.1", &pb.to_string()]),
+        "+OK\r\n"
+    );
+    wait_for("C link up", || {
+        info_str(&mut c, "replication", "master_link_status") == "up"
+    });
+    assert_eq!(info_field_u64(&mut b, "replication", "connected_slaves"), 1);
+
+    // Writes on the master reach the sub-replica through the replica.
+    for i in 0..100 {
+        resp_cmd(&mut a, &["INCR", "x"]);
+        resp_cmd(&mut a, &["RPUSH", "l", &i.to_string()]);
+    }
+    resp_cmd(&mut a, &["HSET", "h", "f1", "v1", "f2", "v2"]);
+    resp_cmd(&mut a, &["ZADD", "z", "1", "a", "2", "b"]);
+    resp_cmd(&mut a, &["XADD", "s", "*", "f", "v"]);
+    resp_cmd(&mut a, &["XGROUP", "CREATE", "s", "g", "0"]);
+    resp_cmd(&mut a, &["SET", "after", "1"]);
+    wait_for("x on C", || {
+        resp_cmd(&mut c, &["GET", "x"]) == "$3\r\n100\r\n"
+    });
+    let off = |s: &mut TcpStream| info_field_u64(s, "replication", "master_repl_offset");
+    wait_for("offsets equal", || {
+        let o = off(&mut a);
+        o == off(&mut b) && o == off(&mut c)
+    });
+    let replid_a = info_str(&mut a, "replication", "master_replid");
+    assert_eq!(info_str(&mut b, "replication", "master_replid"), replid_a);
+    assert_eq!(info_str(&mut c, "replication", "master_replid"), replid_a);
+    let digest = debug_digest(&mut a);
+    assert_eq!(debug_digest(&mut b), digest);
+    assert_eq!(debug_digest(&mut c), digest);
+
+    // Like Redis, writes made on a writable replica are not propagated.
+    assert_eq!(
+        resp_cmd(&mut b, &["CONFIG", "SET", "replica-read-only", "no"]),
+        "+OK\r\n"
+    );
+    let off_before_local = off(&mut b);
+    if resp_cmd(&mut b, &["SET", "local", "1"]) == "+OK\r\n" {
+        assert_eq!(off(&mut b), off_before_local);
+        resp_cmd(&mut a, &["SET", "marker", "1"]);
+        wait_for("marker on C", || {
+            resp_cmd(&mut c, &["GET", "marker"]) == "$1\r\n1\r\n"
+        });
+        assert_eq!(resp_cmd(&mut c, &["GET", "local"]), "$-1\r\n");
+        resp_cmd(&mut b, &["DEL", "local"]);
+    }
+    resp_cmd(&mut b, &["CONFIG", "SET", "replica-read-only", "yes"]);
+    wait_for("offsets equal again", || {
+        let o = off(&mut a);
+        o == off(&mut b) && o == off(&mut c)
+    });
+
+    // Promote B: it keeps A's history as replid2 up to its offset, and C
+    // (dropped to learn the new id) continues with a partial resync.
+    let full_before = info_field_u64(&mut a, "stats", "sync_full");
+    let partial_before = info_field_u64(&mut a, "stats", "sync_partial_ok");
+    let offset = off(&mut a);
+    assert_eq!(resp_cmd(&mut b, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    let new_replid = info_str(&mut b, "replication", "master_replid");
+    assert_ne!(new_replid, replid_a);
+    assert_eq!(info_str(&mut b, "replication", "master_replid2"), replid_a);
+    assert_eq!(
+        info_field_u64(&mut b, "replication", "second_repl_offset"),
+        offset + 1
+    );
+    assert_eq!(off(&mut b), offset);
+    wait_for("C learns B's new id", || {
+        info_str(&mut c, "replication", "master_replid") == new_replid
+            && info_str(&mut c, "replication", "master_link_status") == "up"
+    });
+    assert_eq!(info_str(&mut c, "replication", "master_replid2"), replid_a);
+    assert_eq!(
+        info_field_u64(&mut c, "replication", "second_repl_offset"),
+        offset + 1
+    );
+
+    // The old master rejoins under B with its own history: partial too.
+    assert_eq!(
+        resp_cmd(&mut a, &["REPLICAOF", "127.0.0.1", &pb.to_string()]),
+        "+OK\r\n"
+    );
+    wait_for("A link up", || {
+        info_str(&mut a, "replication", "master_link_status") == "up"
+    });
+    assert_eq!(info_str(&mut a, "replication", "master_replid"), new_replid);
+    assert_eq!(info_field_u64(&mut b, "replication", "connected_slaves"), 2);
+    // Stats are process-wide: C's and A's resyncs were both partial.
+    assert_eq!(info_field_u64(&mut a, "stats", "sync_full"), full_before);
+    assert!(info_field_u64(&mut a, "stats", "sync_partial_ok") >= partial_before + 2);
+
+    for _ in 0..10 {
+        resp_cmd(&mut b, &["INCR", "x"]);
+    }
+    wait_for("x on A and C", || {
+        resp_cmd(&mut a, &["GET", "x"]) == "$3\r\n110\r\n"
+            && resp_cmd(&mut c, &["GET", "x"]) == "$3\r\n110\r\n"
+    });
+    wait_for("offsets equal after failover", || {
+        let o = off(&mut b);
+        o == off(&mut a) && o == off(&mut c)
+    });
+    let digest = debug_digest(&mut b);
+    assert_eq!(debug_digest(&mut a), digest);
+    assert_eq!(debug_digest(&mut c), digest);
+    // ROLE on the sub-replica shows the shared offset.
+    let role = resp_cmd(&mut c, &["ROLE"]);
+    assert!(
+        role.contains("connected") && role.contains(&format!(":{}\r\n", off(&mut b))),
+        "{role}"
+    );
+}
+
+/// A replica whose own master link is down refuses (P)SYNC like Redis,
+/// and SYNC on a sub-replica gets the master's commands in order.
+#[test]
+fn test_psync2_sub_replica_sync_stream_and_nomasterlink_e2e() {
+    let (pa, pb) = (18245u16, 18246u16);
+    start_test_server(pa, 2);
+    start_test_server(pb, 2);
+    let (mut a, mut b) = (psync2_client(pa), psync2_client(pb));
+    // Pointing at a dead master: no link, so no SYNC.
+    assert_eq!(
+        resp_cmd(&mut b, &["REPLICAOF", "127.0.0.1", "1"]),
+        "+OK\r\n"
+    );
+    let mut sub = psync2_client(pb);
+    let r = resp_cmd(&mut sub, &["PSYNC", "?", "-1"]);
+    assert!(r.starts_with("-NOMASTERLINK"), "{r:?}");
+
+    assert_eq!(
+        resp_cmd(&mut b, &["REPLICAOF", "127.0.0.1", &pa.to_string()]),
+        "+OK\r\n"
+    );
+    wait_for("B link up", || {
+        info_str(&mut b, "replication", "master_link_status") == "up"
+    });
+    let mut sub = psync2_client(pb);
+    sub.write_all(b"SYNC\r\n").unwrap();
+    // Skip the RDB: `$<len>\r\n<payload>`.
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    let rdb_end = loop {
+        let n = sub.read(&mut buf).unwrap();
+        assert!(n > 0);
+        got.extend_from_slice(&buf[..n]);
+        let skip = got.iter().take_while(|&&c| c == b'\n').count();
+        if let Some(pos) = got[skip..].windows(2).position(|w| w == b"\r\n") {
+            let len: usize = std::str::from_utf8(&got[skip + 1..skip + pos])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let end = skip + pos + 2 + len;
+            if got.len() >= end {
+                break end;
+            }
+        }
+    };
+    let mut stream = got.split_off(rdb_end);
+    resp_cmd(&mut a, &["SET", "k1", "v1"]);
+    resp_cmd(&mut a, &["FLUSHALL"]);
+    resp_cmd(&mut a, &["SET", "k2", "v2"]);
+    let want: &[&[u8]] = &[b"k1", b"FLUSHALL", b"k2"];
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = String::from_utf8_lossy(&stream).to_string();
+        let pos: Vec<Option<usize>> = want
+            .iter()
+            .map(|w| text.find(std::str::from_utf8(w).unwrap()))
+            .collect();
+        if pos.iter().all(Option::is_some) {
+            let p: Vec<usize> = pos.into_iter().map(Option::unwrap).collect();
+            assert!(p[0] < p[1] && p[1] < p[2], "{text:?}");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{text:?}");
+        sub.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        if let Ok(n) = sub.read(&mut buf) {
+            stream.extend_from_slice(&buf[..n]);
+        }
+    }
+}

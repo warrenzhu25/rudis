@@ -36,6 +36,11 @@ sed -i \
 if grep -q '$r himport' "$TEST_DIR/tests/support/util.tcl"; then
     echo "warning: util.tcl still uses HIMPORT; update the patch in $0" >&2
 fi
+# psync2-reg drives redis-benchmark through the master's unix socket; Rudis
+# listens on TCP only, so use the master's TCP address.
+sed -i \
+    -e 's/redis-benchmark -s \$R_unixsocket(0)/redis-benchmark -h $R_host(0) -p $R_port(0)/' \
+    "$TEST_DIR/tests/integration/psync2-reg.tcl"
 
 mkdir -p "$TEST_DIR/src"
 # Suites also run redis-cli, redis-benchmark and redis-check-{rdb,aof};

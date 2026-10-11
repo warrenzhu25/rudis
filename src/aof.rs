@@ -337,11 +337,30 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
-        Command::IncrBy(key, delta, _) => {
-            let d_str = delta.to_string();
-            buf.extend_from_slice(format!("*3\r\n$6\r\nINCRBY\r\n${}\r\n", key.len()).as_bytes());
+        Command::IncrBy(key, delta, name) => {
+            // Like Redis, the command as sent: INCR / DECR / INCRBY / DECRBY.
+            let (verb, arg): (&str, Option<i64>) = match name {
+                crate::resp::IncrName::Incr if *delta == 1 => ("INCR", None),
+                crate::resp::IncrName::Decr if *delta == -1 => ("DECR", None),
+                crate::resp::IncrName::DecrBy if *delta != i64::MIN => ("DECRBY", Some(-*delta)),
+                _ => ("INCRBY", Some(*delta)),
+            };
+            buf.extend_from_slice(
+                format!(
+                    "*{}\r\n${}\r\n{}\r\n${}\r\n",
+                    if arg.is_some() { 3 } else { 2 },
+                    verb.len(),
+                    verb,
+                    key.len()
+                )
+                .as_bytes(),
+            );
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", d_str.len(), d_str).as_bytes());
+            buf.extend_from_slice(b"\r\n");
+            if let Some(d) = arg {
+                let d_str = d.to_string();
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", d_str.len(), d_str).as_bytes());
+            }
             Some(buf)
         }
         Command::Expire { key, duration, .. } => {

@@ -364,6 +364,7 @@ pub enum ShardMessage {
         db: usize,
         key: Bytes,
         delta: i64,
+        name: crate::resp::IncrName,
         responder: flume::Sender<Result<i64, String>>,
     },
     Expire {
@@ -2760,7 +2761,7 @@ impl ShardDb {
 
     #[inline]
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
-        let clock = RdbClock::now();
+        let clock = RdbClock::now(self.port);
         if let Some(t0) = self.table_for_db(0) {
             for entry in t0.entries() {
                 self.save_rdb_entry(entry, &clock, buf);
@@ -2848,6 +2849,7 @@ impl ShardDb {
     ) {
         if let Some(exp) = entry.expire_at()
             && exp <= clock.now
+            && !clock.keep_expired
         {
             return;
         }
@@ -3107,7 +3109,7 @@ impl ShardDb {
         if let Some(t0) = self.table_for_db(0)
             && !t0.hash_field_expires.is_empty()
         {
-            let clock = RdbClock::now();
+            let clock = RdbClock::now(self.port);
             Self::write_hash_field_expires_legacy(&t0.hash_field_expires, &clock, buf);
         }
 
@@ -4255,11 +4257,17 @@ impl ShardDb {
 struct RdbClock {
     now: std::time::Instant,
     unix_ms: u64,
+    /// Write keys that already expired too, like Redis: a master with a
+    /// replication history has not told its replicas about them yet, and
+    /// after a restart it propagates their deletion (see
+    /// `replication::propagate_expired_on_load`).
+    keep_expired: bool,
 }
 
 impl RdbClock {
-    fn now() -> Self {
+    fn now(port: u16) -> Self {
         RdbClock {
+            keep_expired: crate::replication::snapshots_keep_expired(port),
             now: std::time::Instant::now(),
             unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4368,7 +4376,7 @@ impl RdbSaveCursor {
         budget: Duration,
         flush_bytes: usize,
     ) -> bool {
-        let clock = RdbClock::now();
+        let clock = RdbClock::now(db.port);
         let Some(t0) = db.table_for_db(0) else {
             db.save_extended_rdb_chunk(buf);
             db.save_other_dbs_rdb_chunk(&clock, buf);

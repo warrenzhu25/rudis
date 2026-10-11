@@ -73,44 +73,63 @@ struct StartupLoad {
     started: std::time::Instant,
     shards_done: usize,
     loaded: u64,
+    /// Keys the RDB load dropped as already expired.
+    expired: Vec<Vec<u8>>,
+}
+
+/// `rdb_last_load_keys_expired` of INFO persistence, by base port.
+static LAST_LOAD_KEYS_EXPIRED: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<u16, u64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Keys dropped as expired by the last RDB load of the server on `port`.
+pub fn rdb_last_load_keys_expired(port: u16) -> u64 {
+    LAST_LOAD_KEYS_EXPIRED
+        .lock()
+        .get(&port)
+        .copied()
+        .unwrap_or(0)
 }
 
 static STARTUP_LOADS: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<(u16, bool), StartupLoad>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// Records that a shard of the server on `base_port` finished loading
-/// `loaded` keys (RDB) or commands (AOF), having started at `started`.
 /// Keys the last startup RDB load restored (INFO rdb_last_load_keys_loaded).
 pub static LAST_LOAD_KEYS_LOADED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// Keys the last startup RDB load skipped as already expired. Not counted
-/// yet: always 0.
-pub static LAST_LOAD_KEYS_EXPIRED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
+/// Records that a shard of the server on `base_port` finished loading
+/// `loaded` keys (RDB) or commands (AOF), having started at `started`.
 fn note_startup_load(
     base_port: u16,
     num_shards: usize,
     aof: bool,
     started: std::time::Instant,
     loaded: u64,
+    expired: Vec<Vec<u8>>,
 ) {
     let mut loads = STARTUP_LOADS.lock();
     let entry = loads.entry((base_port, aof)).or_insert(StartupLoad {
         started,
         shards_done: 0,
         loaded: 0,
+        expired: Vec::new(),
     });
     entry.started = entry.started.min(started);
     entry.shards_done += 1;
     entry.loaded += loaded;
+    entry.expired.extend(expired);
     if entry.shards_done < num_shards {
         return;
     }
     let StartupLoad {
-        started, loaded, ..
+        started,
+        loaded,
+        expired,
+        ..
     } = loads.remove(&(base_port, aof)).expect("entry just updated");
+    drop(loads);
     let secs = started.elapsed().as_secs_f64();
     if aof {
         if loaded > 0 {
@@ -120,10 +139,17 @@ fn note_startup_load(
     } else {
         LAST_LOAD_KEYS_LOADED.store(loaded, std::sync::atomic::Ordering::Relaxed);
         crate::log_notice!(
-            "Done loading RDB, keys loaded: {}, keys expired: 0.",
-            loaded
+            "Done loading RDB, keys loaded: {}, keys expired: {}.",
+            loaded,
+            expired.len()
         );
         crate::log_notice!("DB loaded from disk: {:.3} seconds", secs);
+        LAST_LOAD_KEYS_EXPIRED
+            .lock()
+            .insert(base_port, expired.len() as u64);
+        // Like Redis, a master tells its replicas (through the backlog they
+        // continue from) about the keys it dropped as expired while loading.
+        crate::replication::propagate_expired_on_load(base_port, &expired);
     }
 }
 
@@ -221,12 +247,27 @@ pub fn run_shard_worker(
             let rdb_path = aof_config.dir.join(crate::config::dbfilename(base_port));
             if rdb_path.exists() {
                 let started = std::time::Instant::now();
-                match crate::table::load_rdb(&rdb_path, &mut local_db.borrow_mut(), shard_id, num_shards) {
+                let _ = crate::redis_rdb::take_loaded_repl_info();
+                crate::redis_rdb::record_expired_on_load(true);
+                let loaded = crate::table::load_rdb(&rdb_path, &mut local_db.borrow_mut(), shard_id, num_shards);
+                let expired = crate::redis_rdb::take_expired_on_load();
+                match loaded {
                     Ok(n) => {
+                        // Like Redis, continue the replication history
+                        // saved with the data (PSYNC after a restart).
+                        if shard_id == 0
+                            && let Some((replid, offset)) = crate::redis_rdb::take_loaded_repl_info()
+                        {
+                            crate::replication::get_replication_hub(shard_port).restore_saved_history(
+                                &replid,
+                                offset,
+                                crate::replication::has_startup_replicaof(base_port),
+                            );
+                        }
                         if n > 0 {
                             crate::log_verbose!("[Shard {}/{}] Restored {} keys from {:?}", shard_id, num_shards, n, rdb_path);
                         }
-                        note_startup_load(base_port, num_shards, false, started, n as u64);
+                        note_startup_load(base_port, num_shards, false, started, n as u64, expired);
                     }
                     Err(e) => fatal_startup_error(
                         shard_id,
@@ -248,7 +289,7 @@ pub fn run_shard_worker(
                             shard_id, n, aof_path
                         );
                     }
-                    note_startup_load(base_port, num_shards, true, started, n as u64);
+                    note_startup_load(base_port, num_shards, true, started, n as u64, Vec::new());
                 }
                 Err(e) => fatal_startup_error(
                     shard_id,
@@ -615,6 +656,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         db,
                         key,
                         delta,
+                        name,
                         responder,
                     } => {
                         crate::connection::CURRENT_DB.set(db);
@@ -622,8 +664,13 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         sdb.select_db(db);
                         let res = sdb.incr_by(key.clone(), delta);
                         if res.is_ok() {
-crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::IncrBy(key, delta, crate::resp::IncrName::IncrBy));
-}
+                            crate::replication::log_shard_mutation(
+                                port,
+                                shard_id,
+                                cross_shard_aof.as_deref(),
+                                || crate::resp::Command::IncrBy(key, delta, name),
+                            );
+                        }
                         let _ = responder.send(res);
                     }
                     ShardMessage::Expire {
