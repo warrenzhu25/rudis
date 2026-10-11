@@ -95,14 +95,14 @@ pub struct StreamWaiter {
 
 pub struct BlockHub {
     pub port: u16,
-    list_waiters: HashMap<Bytes, VecDeque<ListWaiter>>,
-    zset_waiters: HashMap<Bytes, VecDeque<ZSetWaiter>>,
-    stream_waiters: HashMap<Bytes, Vec<StreamWaiter>>,
+    list_waiters: HashMap<(usize, Bytes), VecDeque<ListWaiter>>,
+    zset_waiters: HashMap<(usize, Bytes), VecDeque<ZSetWaiter>>,
+    stream_waiters: HashMap<(usize, Bytes), Vec<StreamWaiter>>,
     blocked_clients: HashMap<u64, Sender<BlockedListResult>>,
     blocked_zset_clients: HashMap<u64, Sender<BlockedZSetResult>>,
     blocked_stream_clients: HashMap<u64, Sender<BlockedStreamResult>>,
     paused_count: usize,
-    pending_notifies: Vec<Bytes>,
+    pending_notifies: Vec<(usize, Bytes)>,
     /// This hub's share of `TOTAL_BLOCKED_WAITERS`.
     published_waiters: usize,
 }
@@ -188,12 +188,17 @@ impl BlockHub {
     }
 
     pub fn add_pending_notify(&mut self, key: Bytes) {
-        if !self.pending_notifies.iter().any(|k| k == &key) {
-            self.pending_notifies.push(key);
+        let db = crate::connection::CURRENT_DB.get();
+        if !self
+            .pending_notifies
+            .iter()
+            .any(|(d, k)| *d == db && k == &key)
+        {
+            self.pending_notifies.push((db, key));
         }
     }
 
-    pub fn resume(&mut self) -> Vec<Bytes> {
+    pub fn resume(&mut self) -> Vec<(usize, Bytes)> {
         if self.paused_count > 0 {
             self.paused_count -= 1;
         }
@@ -212,7 +217,7 @@ impl BlockHub {
     }
 
     pub fn blocking_keys_count(&self) -> usize {
-        let mut keys: hashbrown::HashSet<&Bytes> = hashbrown::HashSet::new();
+        let mut keys: hashbrown::HashSet<&(usize, Bytes)> = hashbrown::HashSet::new();
         for (k, v) in &self.list_waiters {
             if !v.is_empty() {
                 keys.insert(k);
@@ -335,8 +340,9 @@ impl BlockHub {
         count: usize,
         sender: Sender<BlockedListResult>,
     ) {
+        let db = crate::connection::CURRENT_DB.get();
         self.list_waiters
-            .entry(key.clone())
+            .entry((db, key.clone()))
             .or_default()
             .push_back(ListWaiter {
                 client_id,
@@ -356,8 +362,9 @@ impl BlockHub {
         destination: Bytes,
         sender: Sender<BlockedListResult>,
     ) {
+        let db = crate::connection::CURRENT_DB.get();
         self.list_waiters
-            .entry(source.clone())
+            .entry((db, source.clone()))
             .or_default()
             .push_back(ListWaiter {
                 client_id,
@@ -384,8 +391,9 @@ impl BlockHub {
         ordering: crate::resp::LmovemOrdering,
         sender: Sender<BlockedListResult>,
     ) {
+        let db = crate::connection::CURRENT_DB.get();
         self.list_waiters
-            .entry(source.clone())
+            .entry((db, source.clone()))
             .or_default()
             .push_back(ListWaiter {
                 client_id,
@@ -410,9 +418,11 @@ impl BlockHub {
         if table.is_key_expired(key.as_ref()) {
             return;
         }
+        let db = crate::connection::CURRENT_DB.get();
+        let db_key = (db, key.clone());
         let mut dest_to_notify: Option<Bytes> = None;
         let mut satisfied_clients = Vec::new();
-        if let Some(waiters) = self.list_waiters.get_mut(key) {
+        if let Some(waiters) = self.list_waiters.get_mut(&db_key) {
             while let Some(waiter) = waiters.pop_front() {
                 if waiter.sender.is_disconnected() {
                     continue;
@@ -613,8 +623,9 @@ impl BlockHub {
         is_zmpop: bool,
         sender: Sender<BlockedZSetResult>,
     ) {
+        let db = crate::connection::CURRENT_DB.get();
         self.zset_waiters
-            .entry(key.clone())
+            .entry((db, key.clone()))
             .or_default()
             .push_back(ZSetWaiter {
                 client_id,
@@ -633,8 +644,10 @@ impl BlockHub {
         if table.is_key_expired(key.as_ref()) {
             return;
         }
+        let db = crate::connection::CURRENT_DB.get();
+        let db_key = (db, key.clone());
         let mut satisfied_clients = Vec::new();
-        if let Some(waiters) = self.zset_waiters.get_mut(key) {
+        if let Some(waiters) = self.zset_waiters.get_mut(&db_key) {
             while let Some(waiter) = waiters.pop_front() {
                 if waiter.sender.is_disconnected() || satisfied_clients.contains(&waiter.client_id)
                 {
@@ -693,9 +706,10 @@ impl BlockHub {
         is_cross_shard: bool,
         sender: Sender<BlockedStreamResult>,
     ) {
+        let db = crate::connection::CURRENT_DB.get();
         self.blocked_stream_clients
             .insert(client_id, sender.clone());
-        let entry = self.stream_waiters.entry(key.clone()).or_default();
+        let entry = self.stream_waiters.entry((db, key.clone())).or_default();
         if !entry.iter().any(|w| w.client_id == client_id) {
             entry.push(StreamWaiter {
                 client_id,
@@ -711,7 +725,9 @@ impl BlockHub {
 
     /// Called when XADD adds an entry to a stream.
     pub fn notify_stream(&mut self, db: &mut crate::shard::ShardDb, key: &Bytes) {
-        if let Some(waiters) = self.stream_waiters.get_mut(key) {
+        let cur_db = crate::connection::CURRENT_DB.get();
+        let db_key = (cur_db, key.clone());
+        if let Some(waiters) = self.stream_waiters.get_mut(&db_key) {
             let aof = crate::connection::CURRENT_ROUTER
                 .with(|cr| cr.borrow().as_ref().and_then(|r| r.aof.clone()));
             let mut satisfied = Vec::new();
@@ -752,7 +768,7 @@ impl BlockHub {
                 removed_cids.push(w.client_id);
             }
             if waiters.is_empty() {
-                self.stream_waiters.remove(key);
+                self.stream_waiters.remove(&db_key);
             }
             if !removed_cids.is_empty() {
                 for other_waiters in self.stream_waiters.values_mut() {
@@ -764,10 +780,74 @@ impl BlockHub {
     }
 
     pub fn notify_all_streams(&mut self, db: &mut crate::shard::ShardDb) {
-        let keys: Vec<Bytes> = self.stream_waiters.keys().cloned().collect();
+        let cur_db = crate::connection::CURRENT_DB.get();
+        let keys: Vec<Bytes> = self
+            .stream_waiters
+            .keys()
+            .filter(|&(d, _)| *d == cur_db)
+            .map(|(_, k)| k.clone())
+            .collect();
         for k in keys {
             self.notify_stream(db, &k);
         }
+    }
+
+    pub fn notify_db_keys(&mut self, db: &mut crate::shard::ShardDb, db_idx: usize) {
+        let saved_db = db.current_db;
+        let saved_cur_db = crate::connection::CURRENT_DB.get();
+        db.select_db(db_idx);
+        crate::connection::CURRENT_DB.set(db_idx);
+
+        let list_keys: Vec<Bytes> = self
+            .list_waiters
+            .keys()
+            .filter(|(d, k)| {
+                *d == db_idx && !db.table.is_key_expired(k.as_ref()) && db.table.exists(k.as_ref())
+            })
+            .map(|(_, k)| k.clone())
+            .collect();
+        for k in list_keys {
+            if self.is_paused() {
+                self.add_pending_notify(k);
+            } else {
+                self.notify_list(&mut db.table, &k);
+            }
+        }
+
+        let zset_keys: Vec<Bytes> = self
+            .zset_waiters
+            .keys()
+            .filter(|(d, k)| {
+                *d == db_idx && !db.table.is_key_expired(k.as_ref()) && db.table.exists(k.as_ref())
+            })
+            .map(|(_, k)| k.clone())
+            .collect();
+        for k in zset_keys {
+            if self.is_paused() {
+                self.add_pending_notify(k);
+            } else {
+                self.notify_zset(&mut db.table, &k);
+            }
+        }
+
+        let stream_keys: Vec<Bytes> = self
+            .stream_waiters
+            .keys()
+            .filter(|(d, k)| {
+                *d == db_idx && !db.table.is_key_expired(k.as_ref()) && db.table.exists(k.as_ref())
+            })
+            .map(|(_, k)| k.clone())
+            .collect();
+        for k in stream_keys {
+            if self.is_paused() {
+                self.add_pending_notify(k);
+            } else {
+                self.notify_stream(db, &k);
+            }
+        }
+
+        db.select_db(saved_db);
+        crate::connection::CURRENT_DB.set(saved_cur_db);
     }
 }
 
@@ -814,7 +894,7 @@ mod tests {
 
         let pending = hub.resume();
         assert!(!hub.is_paused());
-        assert_eq!(pending, vec![Bytes::from_static(b"k1")]);
+        assert_eq!(pending, vec![(0, Bytes::from_static(b"k1"))]);
 
         let (tx, _rx) = unbounded();
         hub.register_list_waiter(100, Bytes::from_static(b"k1"), ListPopType::Left, 1, tx);
@@ -824,7 +904,7 @@ mod tests {
         hub.unregister_blocked_client(100);
         assert_eq!(
             hub.list_waiters
-                .get(&Bytes::from_static(b"k1"))
+                .get(&(0, Bytes::from_static(b"k1")))
                 .map_or(0, |v| v.len()),
             0
         );

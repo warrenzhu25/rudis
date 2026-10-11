@@ -449,6 +449,17 @@ pub fn dbfilename(port: u16) -> String {
         .unwrap_or_else(|| DEFAULT_DBFILENAME.to_string())
 }
 
+static NUM_DATABASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+
+#[inline(always)]
+pub fn databases_count() -> usize {
+    NUM_DATABASES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_databases_count(n: usize) {
+    NUM_DATABASES.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Redis rule: `SHUTDOWN SAVE` always snapshots, `NOSAVE` never does, and
 /// plain `SHUTDOWN` (or SIGTERM) snapshots when save points are configured.
 pub fn should_save_on_shutdown(save: Option<bool>, has_save_points: bool) -> bool {

@@ -335,27 +335,20 @@ pub enum ShardMessage {
         fd: std::os::unix::io::RawFd,
         peer: std::net::SocketAddr,
     },
-    Get {
-        key: Bytes,
-        responder: flume::Sender<Option<Bytes>>,
-    },
-    Set {
-        key: Bytes,
-        value: Bytes,
-        expire_in: Option<Duration>,
-        responder: flume::Sender<()>,
-    },
     Del {
+        db: usize,
         key: Bytes,
         responder: flume::Sender<bool>,
     },
     /// See [`crate::router::Router::del_if_unchanged`].
     DelIfUnchanged {
+        db: usize,
         key: Bytes,
         payload: Bytes,
         responder: flume::Sender<bool>,
     },
     DelKeys {
+        db: usize,
         keys: Vec<Bytes>,
         responder: flume::Sender<usize>,
     },
@@ -363,25 +356,30 @@ pub enum ShardMessage {
         responder: flume::Sender<usize>,
     },
     Exists {
+        db: usize,
         key: Bytes,
         responder: flume::Sender<bool>,
     },
     IncrBy {
+        db: usize,
         key: Bytes,
         delta: i64,
         responder: flume::Sender<Result<i64, String>>,
     },
     Expire {
+        db: usize,
         key: Bytes,
         duration: Duration,
         opts: crate::resp::ExpireOptions,
         responder: flume::Sender<bool>,
     },
     Persist {
+        db: usize,
         key: Bytes,
         responder: flume::Sender<bool>,
     },
     Ttl {
+        db: usize,
         key: Bytes,
         in_millis: bool,
         responder: flume::Sender<i64>,
@@ -400,6 +398,7 @@ pub enum ShardMessage {
         responder: flume::Sender<String>,
     },
     Batch {
+        db: usize,
         items: Vec<(usize, u64, Command)>,
         responder: std::sync::Arc<crate::mailbox::BatchResponder>,
         is_resp3: bool,
@@ -413,6 +412,7 @@ pub enum ShardMessage {
         defer_bcast: bool,
     },
     Mget {
+        db: usize,
         keys: Vec<(usize, Option<Bytes>)>,
         responder: flume::Sender<Vec<(usize, Option<Bytes>)>>,
     },
@@ -424,6 +424,7 @@ pub enum ShardMessage {
         no_touch: bool,
     },
     Mset {
+        db: usize,
         pairs: Vec<(Bytes, Bytes)>,
         responder: flume::Sender<Vec<(Bytes, Bytes)>>,
     },
@@ -449,6 +450,7 @@ pub enum ShardMessage {
         descriptor: std::sync::Arc<crate::mailbox::FastSetDescriptor>,
     },
     NotifyList {
+        db: usize,
         keys: Vec<Bytes>,
     },
     SetSlotState {
@@ -546,17 +548,21 @@ pub enum ShardMessage {
         responder: flume::Sender<(usize, Vec<crate::search::SearchHit>)>,
     },
     Keys {
+        db: usize,
         pattern: Bytes,
         responder: flume::Sender<Vec<Bytes>>,
     },
     Scan {
+        db: usize,
         params: Box<ScanParams>,
         responder: flume::Sender<(usize, Vec<Bytes>)>,
     },
     RandomKey {
+        db: usize,
         responder: flume::Sender<Option<Bytes>>,
     },
     ExpireTime {
+        db: usize,
         key: Bytes,
         in_millis: bool,
         responder: flume::Sender<i64>,
@@ -576,13 +582,30 @@ pub enum ShardMessage {
         responder: flume::Sender<Result<(), String>>,
     },
     ExecuteReplicaCmd {
+        db: usize,
         cmd: Box<Command>,
         responder: flume::Sender<()>,
     },
     /// Replicated commands for this shard, applied in order.
     ExecuteReplicaCmds {
+        db: usize,
         cmds: Vec<Command>,
         responder: flume::Sender<()>,
+    },
+    FlushDb {
+        db: usize,
+        responder: flume::Sender<()>,
+    },
+    FlushAll {
+        responder: flume::Sender<()>,
+    },
+    SwapDb {
+        db1: usize,
+        db2: usize,
+        responder: flume::Sender<()>,
+    },
+    KeyspaceStats {
+        responder: flume::Sender<Vec<(usize, usize, usize, u64)>>,
     },
     TierSpill {
         key: Bytes,
@@ -653,6 +676,7 @@ pub enum ShardMessage {
         responder: flume::Sender<bool>,
     },
     Delex {
+        db: usize,
         key: Bytes,
         condition: Option<Box<(String, Bytes)>>,
         responder: flume::Sender<bool>,
@@ -672,6 +696,8 @@ pub enum SlotState {
 /// it requires NO Mutex and NO cross-thread synchronization.
 pub struct ShardDb {
     pub table: crate::table::RudisTable,
+    pub current_db: usize,
+    pub tables: Vec<Option<crate::table::RudisTable>>,
     pub port: u16,
     pub shard_id: usize,
     pub tier_manager: Option<std::rc::Rc<crate::tiering::ShardTierManager>>,
@@ -692,6 +718,8 @@ impl ShardDb {
     pub fn new(port: u16) -> Self {
         Self {
             table: crate::table::RudisTable::new(),
+            current_db: 0,
+            tables: Vec::new(),
             port,
             shard_id: 0,
             tier_manager: None,
@@ -707,6 +735,103 @@ impl ShardDb {
             sticky_keys: hashbrown::HashSet::new(),
             search_indices: std::collections::HashMap::new(),
         }
+    }
+
+    #[inline(always)]
+    pub fn select_db(&mut self, target_db: usize) {
+        if self.current_db != target_db {
+            self.switch_db_slow(target_db);
+        }
+    }
+
+    #[cold]
+    fn switch_db_slow(&mut self, target_db: usize) {
+        let old_db = self.current_db;
+        let max_idx = old_db.max(target_db);
+        if self.tables.len() <= max_idx {
+            self.tables.resize_with(max_idx + 1, || None);
+        }
+        let target_table = self.tables[target_db].take().unwrap_or_default();
+        let old_table = std::mem::replace(&mut self.table, target_table);
+        self.tables[old_db] = Some(old_table);
+        self.current_db = target_db;
+    }
+
+    #[inline]
+    pub fn table_for_db(&self, db_idx: usize) -> Option<&crate::table::RudisTable> {
+        if db_idx == self.current_db {
+            Some(&self.table)
+        } else {
+            self.tables.get(db_idx).and_then(|t| t.as_ref())
+        }
+    }
+
+    #[inline]
+    pub fn table_for_db_mut(&mut self, db_idx: usize) -> &mut crate::table::RudisTable {
+        if db_idx == self.current_db {
+            return &mut self.table;
+        }
+        if self.tables.len() <= db_idx {
+            self.tables.resize_with(db_idx + 1, || None);
+        }
+        self.tables[db_idx].get_or_insert_with(crate::table::RudisTable::new)
+    }
+
+    #[inline]
+    pub fn max_db_len(&self) -> usize {
+        self.tables.len().max(self.current_db + 1)
+    }
+
+    #[inline]
+    pub fn total_used_memory(&self) -> usize {
+        let mut total = self.table.used_memory();
+        for (idx, opt) in self.tables.iter().enumerate() {
+            if idx != self.current_db
+                && let Some(t) = opt
+            {
+                total += t.used_memory();
+            }
+        }
+        total
+    }
+
+    #[inline]
+    pub fn total_free_arena_bytes(&self) -> usize {
+        let mut total = self.table.free_arena_bytes();
+        for (idx, opt) in self.tables.iter().enumerate() {
+            if idx != self.current_db
+                && let Some(t) = opt
+            {
+                total += t.free_arena_bytes();
+            }
+        }
+        total
+    }
+
+    #[inline]
+    pub fn try_evict_one_key(&mut self, policy: &str) -> Option<usize> {
+        if let Some(freed) = self.table.try_evict_one_key(policy) {
+            return Some(freed);
+        }
+        let max_db = self.max_db_len();
+        let saved_db = self.current_db;
+        let prev_tl = crate::connection::CURRENT_DB.get();
+        for db_idx in 0..max_db {
+            if db_idx == saved_db {
+                continue;
+            }
+            if self.table_for_db(db_idx).is_some_and(|t| !t.is_empty()) {
+                self.select_db(db_idx);
+                crate::connection::CURRENT_DB.set(db_idx);
+                let res = self.table.try_evict_one_key(policy);
+                self.select_db(saved_db);
+                crate::connection::CURRENT_DB.set(prev_tl);
+                if let Some(freed) = res {
+                    return Some(freed);
+                }
+            }
+        }
+        None
     }
 
     #[inline]
@@ -1853,15 +1978,43 @@ impl ShardDb {
         self.table.zscan(key, cursor, pattern, count)
     }
 
-    /// Empties the shard's whole dataset, every key family included. The
-    /// CRDT clock stays, so it never runs backwards.
+    /// Empties the currently selected database (`self.current_db`).
+    /// If `self.current_db == 0`, also clears DB-0-scoped extended stores.
     #[inline]
     pub fn flushdb(&mut self) {
         self.table.flushdb();
+        self.drain_dropped_tier();
+        if self.current_db == 0 {
+            self.sticky_keys.clear();
+            self.vector_indexes.clear();
+            self.semantic_caches.clear();
+            self.agent_memories.clear();
+            self.llm_quotas.clear();
+            self.agent_checkpoints.clear();
+            self.agent_tools.clear();
+            self.json_store = crate::json::JsonStore::new();
+            self.probabilistic_store = crate::probabilistic::ProbabilisticStore::new();
+            self.crdt_store.registers.clear();
+            self.crdt_store.sets.clear();
+            self.crdt_store.counters.clear();
+        }
+    }
+
+    /// Empties the shard's whole dataset across ALL databases, every key
+    /// family included. The CRDT clock stays, so it never runs backwards.
+    #[inline]
+    pub fn flushall(&mut self) {
+        self.table.flushdb();
         self.table.dropped_tier.clear();
+        for t in self.tables.iter_mut().flatten() {
+            t.flushdb();
+            t.dropped_tier.clear();
+        }
+        self.tables.clear();
         if let Some(tm) = &self.tier_manager {
             tm.reset();
         }
+        self.sticky_keys.clear();
         self.vector_indexes.clear();
         self.semantic_caches.clear();
         self.agent_memories.clear();
@@ -1873,6 +2026,195 @@ impl ShardDb {
         self.crdt_store.registers.clear();
         self.crdt_store.sets.clear();
         self.crdt_store.counters.clear();
+    }
+
+    pub fn swap_dbs(&mut self, db1: usize, db2: usize) {
+        if db1 == db2 {
+            return;
+        }
+        let saved = self.current_db;
+        self.select_db(0);
+        let max_idx = db1.max(db2);
+        if self.tables.len() <= max_idx {
+            self.tables.resize_with(max_idx + 1, || None);
+        }
+        if db1 == 0 {
+            let mut t2 = self.tables[db2].take().unwrap_or_default();
+            std::mem::swap(&mut self.table, &mut t2);
+            self.tables[db2] = Some(t2);
+        } else if db2 == 0 {
+            let mut t1 = self.tables[db1].take().unwrap_or_default();
+            std::mem::swap(&mut self.table, &mut t1);
+            self.tables[db1] = Some(t1);
+        } else {
+            self.tables.swap(db1, db2);
+        }
+        self.select_db(saved);
+        if crate::block::has_blocked_waiters(self.port) {
+            let hub_arc = crate::block::get_block_hub_for_port(self.port);
+            let mut hub = hub_arc.lock();
+            hub.notify_db_keys(self, db1);
+            hub.notify_db_keys(self, db2);
+        }
+    }
+
+    pub fn move_key(&mut self, src_db: usize, dst_db: usize, key: &[u8]) -> bool {
+        if src_db == dst_db {
+            return false;
+        }
+        let saved = self.current_db;
+        self.select_db(src_db);
+        if !self.table.exists(key) {
+            self.select_db(saved);
+            return false;
+        }
+        self.select_db(dst_db);
+        if self.table.exists(key) {
+            self.select_db(saved);
+            return false;
+        }
+        self.select_db(src_db);
+        let Some((entry, hfe)) = self.table.take_key_entry(key) else {
+            self.select_db(saved);
+            return false;
+        };
+        let key_bytes = entry.key.to_bytes();
+        self.select_db(dst_db);
+        self.table.insert_entry(entry);
+        if let Some(fmap) = hfe
+            && !fmap.is_empty()
+        {
+            self.table.hash_field_expires.insert(key_bytes, fmap);
+        }
+        self.select_db(saved);
+        if crate::block::has_blocked_waiters(self.port) {
+            let hub_arc = crate::block::get_block_hub_for_port(self.port);
+            let mut hub = hub_arc.lock();
+            hub.notify_db_keys(self, dst_db);
+        }
+        true
+    }
+
+    pub fn copy_to_db(
+        &mut self,
+        src_db: usize,
+        dst_db: usize,
+        src: &[u8],
+        dst: Bytes,
+        replace: bool,
+    ) -> Result<bool, &'static str> {
+        if src_db == dst_db {
+            let saved = self.current_db;
+            self.select_db(src_db);
+            let res = self.copy(src, dst, replace);
+            self.select_db(saved);
+            return res;
+        }
+        let saved = self.current_db;
+        self.select_db(src_db);
+        if !self.table.exists(src) {
+            self.select_db(saved);
+            return Ok(false);
+        }
+        let hydrated = self
+            .table
+            .is_tiered(src)
+            .and_then(|ptr| self.hydrate_tiered(ptr));
+        let Some(entry) = self.table.peek_entry(src) else {
+            self.select_db(saved);
+            return Ok(false);
+        };
+        let val = match &entry.val {
+            crate::table::RudisValue::Tiered(_) => match hydrated {
+                Some(v) => v,
+                None => {
+                    self.select_db(saved);
+                    return Ok(false);
+                }
+            },
+            crate::table::RudisValue::Cooled(cv) => cv.val.clone(),
+            other => other.clone(),
+        };
+        let expire_at = entry.expire_at();
+        let hfe = self.table.hash_field_expires.get(src).cloned();
+
+        self.select_db(dst_db);
+        if !replace && self.table.exists(&dst) {
+            self.select_db(saved);
+            return Ok(false);
+        }
+        let overwritten = (replace && self.tier_manager.is_some())
+            .then(|| {
+                self.table
+                    .is_tiered(&dst)
+                    .map(|p| (p, false))
+                    .or_else(|| self.table.is_cooled(&dst).map(|p| (p, true)))
+            })
+            .flatten();
+        let new_entry = crate::table::RudisEntry::new(
+            crate::compact::CompactKey::new(&dst),
+            val,
+            crate::table::Expiry::from(expire_at),
+        );
+        self.table.insert_entry(new_entry);
+        if let Some(fmap) = hfe {
+            self.table.hash_field_expires.insert(dst, fmap);
+        }
+        if let Some((ptr, is_cooled)) = overwritten
+            && let Some(tm) = &self.tier_manager
+        {
+            tm.on_key_overwritten(ptr, is_cooled);
+        }
+        self.drain_dropped_tier();
+        self.select_db(saved);
+        if crate::block::has_blocked_waiters(self.port) {
+            let hub_arc = crate::block::get_block_hub_for_port(self.port);
+            let mut hub = hub_arc.lock();
+            hub.notify_db_keys(self, dst_db);
+        }
+        Ok(true)
+    }
+
+    /// Per-DB `(db_idx, keys, expires, ttl_sum_ms)` for `INFO keyspace`.
+    pub fn keyspace_stats_by_db(&self) -> Vec<(usize, usize, usize, u64)> {
+        let now = std::time::Instant::now();
+        let max_db = self.max_db_len();
+        let mut out = Vec::new();
+        for db_idx in 0..max_db {
+            let Some(table) = self.table_for_db(db_idx) else {
+                continue;
+            };
+            let mut keys = table.len();
+            if db_idx == 0 {
+                keys += self.json_store.len()
+                    + self.probabilistic_store.bloom_filters.len()
+                    + self.probabilistic_store.cuckoo_filters.len()
+                    + self.probabilistic_store.cms_sketches.len()
+                    + self.probabilistic_store.topk_trackers.len()
+                    + self.vector_indexes.len();
+            }
+            if keys == 0 {
+                continue;
+            }
+            let expires = table.num_expires;
+            let mut ttl_sum_ms = 0u64;
+            if expires > 0 {
+                let mut sampled = 0usize;
+                for entry in table.entries() {
+                    if let Some(exp) = entry.expire_at() {
+                        if exp > now {
+                            ttl_sum_ms += exp.duration_since(now).as_millis() as u64;
+                        }
+                        sampled += 1;
+                        if sampled >= 100 {
+                            break;
+                        }
+                    }
+                }
+            }
+            out.push((db_idx, keys, expires, ttl_sum_ms));
+        }
+        out
     }
 
     /// Replaces this shard's dataset with its part of a master's full-sync
@@ -1893,13 +2235,16 @@ impl ShardDb {
             &std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>,
         )>,
     ) -> Result<(), String> {
-        self.flushdb();
+        self.select_db(0);
+        self.flushall();
         let loaded = crate::table::load_rdb_bytes(data, self, shard_id, num_shards)
             .map(|_| ())
             .map_err(|e| {
-                self.flushdb();
+                self.select_db(0);
+                self.flushall();
                 e.to_string()
             });
+        self.select_db(0);
         if let Some((dir, writer)) = aof {
             crate::aof::rewrite_and_swap_shard_aof(self, dir, shard_id, Some(writer))
                 .map_err(|e| format!("rewriting the AOF after the load: {e}"))?;
@@ -2064,8 +2409,30 @@ impl ShardDb {
 
     #[inline]
     pub fn active_expire_cycle(&mut self) -> usize {
-        let n = self.table.active_expire_cycle();
+        let prev_tl = crate::connection::CURRENT_DB.get();
+        let saved_db = self.current_db;
+        crate::connection::CURRENT_DB.set(saved_db);
+        let mut n = self.table.active_expire_cycle();
         self.drain_dropped_tier();
+        if !self.tables.is_empty() {
+            let max_db = self.max_db_len();
+            for db_idx in 0..max_db {
+                if db_idx == saved_db {
+                    continue;
+                }
+                let has_exp = self
+                    .table_for_db(db_idx)
+                    .is_some_and(|t| t.num_expires > 0 || !t.hash_field_expires.is_empty());
+                if has_exp {
+                    self.select_db(db_idx);
+                    crate::connection::CURRENT_DB.set(db_idx);
+                    n += self.table.active_expire_cycle();
+                    self.drain_dropped_tier();
+                }
+            }
+            self.select_db(saved_db);
+        }
+        crate::connection::CURRENT_DB.set(prev_tl);
         n
     }
 
@@ -2394,16 +2761,82 @@ impl ShardDb {
     #[inline]
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
         let clock = RdbClock::now();
-        for entry in self.table.entries() {
-            self.save_rdb_entry(entry, &clock, buf);
+        if let Some(t0) = self.table_for_db(0) {
+            for entry in t0.entries() {
+                self.save_rdb_entry(entry, &clock, buf);
+            }
         }
         self.save_extended_rdb_chunk(buf);
+        self.save_other_dbs_rdb_chunk(&clock, buf);
+    }
+
+    fn save_other_dbs_rdb_chunk(&self, clock: &RdbClock, buf: &mut Vec<u8>) {
+        let max_db = self.max_db_len();
+        let mut switched_db = false;
+        for db_idx in 1..max_db {
+            let Some(table) = self.table_for_db(db_idx) else {
+                continue;
+            };
+            if table.is_empty() && table.hash_field_expires.is_empty() {
+                continue;
+            }
+            crate::redis_rdb::write_selectdb(buf, db_idx);
+            switched_db = true;
+            for entry in table.entries() {
+                self.save_rdb_entry(entry, clock, buf);
+            }
+            if !table.hash_field_expires.is_empty() {
+                let mut records = Vec::new();
+                Self::write_hash_field_expires_legacy(
+                    &table.hash_field_expires,
+                    clock,
+                    &mut records,
+                );
+                crate::redis_rdb::write_ext_aux(buf, &records);
+            }
+        }
+        if switched_db {
+            crate::redis_rdb::write_selectdb(buf, 0);
+        }
+    }
+
+    fn write_hash_field_expires_legacy(
+        hfe: &hashbrown::HashMap<Bytes, hashbrown::HashMap<Bytes, std::time::Instant>>,
+        clock: &RdbClock,
+        buf: &mut Vec<u8>,
+    ) {
+        for (key, fmap) in hfe {
+            let active: Vec<(&Bytes, u64)> = fmap
+                .iter()
+                .filter_map(|(f, &exp)| {
+                    if exp > clock.now {
+                        let rem_ms = exp.duration_since(clock.now).as_millis() as u64;
+                        Some((f, clock.unix_ms + rem_ms))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !active.is_empty() {
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
+                buf.push(14u8);
+                buf.extend_from_slice(&(active.len() as u32).to_le_bytes());
+                for (field, exp_unix_ms) in active {
+                    buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(field);
+                    buf.extend_from_slice(&exp_unix_ms.to_le_bytes());
+                }
+            }
+        }
     }
 
     /// Serializes one table segment (see [`crate::table::RudisFlatTable::layout_epoch`]).
-    fn save_rdb_segment(&self, seg: usize, clock: &RdbClock, buf: &mut Vec<u8>) {
-        for entry in self.table.segment_entries(seg) {
-            self.save_rdb_entry(entry, clock, buf);
+    fn save_rdb_segment_db0(&self, seg: usize, clock: &RdbClock, buf: &mut Vec<u8>) {
+        if let Some(t0) = self.table_for_db(0) {
+            for entry in t0.segment_entries(seg) {
+                self.save_rdb_entry(entry, clock, buf);
+            }
         }
     }
 
@@ -2670,37 +3103,12 @@ impl ShardDb {
             buf.extend_from_slice(&crdt_payload);
         }
 
-        // 8. Hash field expirations (Redis 7.4 / Valkey 8 HEXPIRE)
-        if !self.table.hash_field_expires.is_empty() {
-            let now = std::time::Instant::now();
-            let unix_now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            for (key, fmap) in &self.table.hash_field_expires {
-                let active: Vec<(&Bytes, u64)> = fmap
-                    .iter()
-                    .filter_map(|(f, &exp)| {
-                        if exp > now {
-                            let rem_ms = exp.duration_since(now).as_millis() as u64;
-                            Some((f, unix_now + rem_ms))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !active.is_empty() {
-                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(key);
-                    buf.push(14u8);
-                    buf.extend_from_slice(&(active.len() as u32).to_le_bytes());
-                    for (field, exp_unix_ms) in active {
-                        buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
-                        buf.extend_from_slice(field);
-                        buf.extend_from_slice(&exp_unix_ms.to_le_bytes());
-                    }
-                }
-            }
+        // 8. Hash field expirations (Redis 7.4 / Valkey 8 HEXPIRE) for DB 0
+        if let Some(t0) = self.table_for_db(0)
+            && !t0.hash_field_expires.is_empty()
+        {
+            let clock = RdbClock::now();
+            Self::write_hash_field_expires_legacy(&t0.hash_field_expires, &clock, buf);
         }
 
         let write_bytes = |b: &mut Vec<u8>, slice: &[u8]| {
@@ -3944,7 +4352,7 @@ struct RdbSaveCursor {
 impl RdbSaveCursor {
     fn new(db: &ShardDb) -> Self {
         RdbSaveCursor {
-            epoch: db.table.layout_epoch(),
+            epoch: db.table_for_db(0).map_or(0, |t| t.layout_epoch()),
             seg: 0,
             written: WrittenPatterns::default(),
         }
@@ -3961,28 +4369,34 @@ impl RdbSaveCursor {
         flush_bytes: usize,
     ) -> bool {
         let clock = RdbClock::now();
-        if db.table.layout_epoch() != self.epoch {
+        let Some(t0) = db.table_for_db(0) else {
+            db.save_extended_rdb_chunk(buf);
+            db.save_other_dbs_rdb_chunk(&clock, buf);
+            return true;
+        };
+        if t0.layout_epoch() != self.epoch {
             // Renumbered (FLUSHALL, collapsing defrag): what is left is
             // small; write the keys no written segment covered.
-            for entry in db.table.entries() {
+            for entry in t0.entries() {
                 let bits = crate::table::key_dir_bits(&entry.key);
                 if !self.written.covers(u8::MAX, bits) {
                     db.save_rdb_entry(entry, &clock, buf);
                 }
             }
             db.save_extended_rdb_chunk(buf);
+            db.save_other_dbs_rdb_chunk(&clock, buf);
             return true;
         }
-        let segments = db.table.segment_count();
+        let segments = t0.segment_count();
         let mut first = true;
         while self.seg < segments
             && (first || (clock.now.elapsed() < budget && buf.len() < flush_bytes))
         {
             first = false;
-            let pattern = db.table.segment_pattern(self.seg);
+            let pattern = t0.segment_pattern(self.seg);
             if let Some((depth, bits)) = pattern {
                 if !self.written.covers(depth, bits) {
-                    db.save_rdb_segment(self.seg, &clock, buf);
+                    db.save_rdb_segment_db0(self.seg, &clock, buf);
                 }
                 self.written.insert(depth, bits);
             }
@@ -3990,6 +4404,7 @@ impl RdbSaveCursor {
         }
         if self.seg >= segments {
             db.save_extended_rdb_chunk(buf);
+            db.save_other_dbs_rdb_chunk(&clock, buf);
             return true;
         }
         false

@@ -38,6 +38,7 @@ pub struct AofWriter {
     file: Option<std::rc::Rc<monoio::fs::File>>,
     path: PathBuf,
     offset: u64,
+    current_db: usize,
 }
 
 impl AofWriter {
@@ -57,6 +58,7 @@ impl AofWriter {
             file: Some(std::rc::Rc::new(file)),
             path,
             offset,
+            current_db: 0,
         })
     }
 
@@ -67,6 +69,7 @@ impl AofWriter {
             file: None,
             path: PathBuf::new(),
             offset: 0,
+            current_db: 0,
         }
     }
 
@@ -82,7 +85,20 @@ impl AofWriter {
 
     #[inline]
     pub fn append(&mut self, data: &[u8]) {
+        let db = crate::connection::CURRENT_DB.get();
+        if db != self.current_db {
+            self.emit_select_db(db);
+        }
         self.buffer.extend_from_slice(data);
+    }
+
+    #[cold]
+    fn emit_select_db(&mut self, db: usize) {
+        self.current_db = db;
+        let db_str = db.to_string();
+        self.buffer.extend_from_slice(
+            format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{}\r\n", db_str.len(), db_str).as_bytes(),
+        );
     }
 
     #[inline]
@@ -157,6 +173,7 @@ impl AofWriter {
         self.file = Some(std::rc::Rc::new(monoio::fs::File::from_std(std_file)?));
         self.offset = new_size;
         self.buffer.clear();
+        self.current_db = 0;
         Ok(new_size)
     }
 }
@@ -626,8 +643,34 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
-        Command::Flushdb | Command::Flushall => {
+        Command::Flushdb => {
             buf.extend_from_slice(b"*1\r\n$7\r\nFLUSHDB\r\n");
+            Some(buf)
+        }
+        Command::Flushall => {
+            buf.extend_from_slice(b"*1\r\n$8\r\nFLUSHALL\r\n");
+            Some(buf)
+        }
+        Command::Move { key, db } => {
+            let s = db.to_string();
+            buf.extend_from_slice(format!("*3\r\n$4\r\nMOVE\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
+            Some(buf)
+        }
+        Command::Swapdb { db1, db2 } => {
+            let s1 = db1.to_string();
+            let s2 = db2.to_string();
+            buf.extend_from_slice(
+                format!(
+                    "*3\r\n$6\r\nSWAPDB\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    s1.len(),
+                    s1,
+                    s2.len(),
+                    s2
+                )
+                .as_bytes(),
+            );
             Some(buf)
         }
         Command::Msetnx(pairs) => {
@@ -2548,43 +2591,54 @@ pub fn replay_aof_with(
     let mut buf = BytesMut::from(&data[..]);
     let mut count = 0;
     let mut dummy_out = Vec::new();
-    while !buf.is_empty() {
-        let offset = data.len() - buf.len();
-        // rudis only ever appends RESP arrays; anything else is corruption
-        // (the inline parser would otherwise accept garbage as a command).
-        if buf[0] != b'*' {
-            return Err(bad(offset, "expected a RESP array"));
-        }
-        match crate::resp::parse_command(&mut buf) {
-            Ok(Some(cmd)) => {
-                crate::connection::execute_local_command(&cmd, db, &mut dummy_out, None);
-                dummy_out.clear();
-                count += 1;
+    let saved_db = crate::connection::CURRENT_DB.get();
+    crate::connection::CURRENT_DB.set(0);
+    db.select_db(0);
+    let res = (|| -> std::io::Result<usize> {
+        while !buf.is_empty() {
+            let offset = data.len() - buf.len();
+            // rudis only ever appends RESP arrays; anything else is corruption
+            // (the inline parser would otherwise accept garbage as a command).
+            if buf[0] != b'*' {
+                return Err(bad(offset, "expected a RESP array"));
             }
-            Ok(None) if buf.is_empty() => break,
-            Ok(None) => {
-                if !load_truncated {
-                    return Err(bad(
-                        offset,
-                        "truncated final command (set aof-load-truncated yes to load anyway)",
-                    ));
+            match crate::resp::parse_command(&mut buf) {
+                Ok(Some(cmd)) => {
+                    let is_select = matches!(cmd, Command::Select(_));
+                    crate::connection::execute_local_command(&cmd, db, &mut dummy_out, None);
+                    dummy_out.clear();
+                    if !is_select {
+                        count += 1;
+                    }
                 }
-                crate::log_warning!(
-                    "!!! Warning: short read while loading the AOF file {:?}: truncating it from {} to {} bytes (last complete command).",
-                    path,
-                    data.len(),
-                    offset
-                );
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(path)?
-                    .set_len(offset as u64)?;
-                break;
+                Ok(None) if buf.is_empty() => break,
+                Ok(None) => {
+                    if !load_truncated {
+                        return Err(bad(
+                            offset,
+                            "truncated final command (set aof-load-truncated yes to load anyway)",
+                        ));
+                    }
+                    crate::log_warning!(
+                        "!!! Warning: short read while loading the AOF file {:?}: truncating it from {} to {} bytes (last complete command).",
+                        path,
+                        data.len(),
+                        offset
+                    );
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)?
+                        .set_len(offset as u64)?;
+                    break;
+                }
+                Err(e) => return Err(bad(offset, &e)),
             }
-            Err(e) => return Err(bad(offset, &e)),
         }
-    }
-    Ok(count)
+        Ok(count)
+    })();
+    crate::connection::CURRENT_DB.set(saved_db);
+    db.select_db(saved_db);
+    res
 }
 
 /// Records how many shards wrote the `appendonly-{i}.aof` files in a dir.
@@ -2784,6 +2838,8 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
     drop(combined);
     let rewritten = std::fs::read(staging.join("appendonly-0.aof"))?;
     let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); num_shards];
+    let mut cur_db: usize = 0;
+    let mut shard_db: Vec<usize> = vec![0; num_shards];
     let mut buf = BytesMut::from(&rewritten[..]);
     while !buf.is_empty() {
         let start = rewritten.len() - buf.len();
@@ -2791,10 +2847,21 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
             Ok(Some(cmd)) => cmd,
             _ => return Err(invalid(format!("bad rewritten AOF at offset {}", start))),
         };
+        if let Command::Select(idx) = &cmd {
+            cur_db = *idx as usize;
+            continue;
+        }
         let raw = &rewritten[start..rewritten.len() - buf.len()];
         let shard = crate::connection::target_shard_of_cmd(&cmd, num_shards)
             .or_else(|| raw_resp_arg(raw, 1).map(|k| crate::router::target_shard(k, num_shards)))
             .unwrap_or(0);
+        if shard_db[shard] != cur_db {
+            let db_str = cur_db.to_string();
+            outputs[shard].extend_from_slice(
+                format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{}\r\n", db_str.len(), db_str).as_bytes(),
+            );
+            shard_db[shard] = cur_db;
+        }
         outputs[shard].extend_from_slice(raw);
     }
     for (i, out) in outputs.iter().enumerate() {
@@ -2865,214 +2932,240 @@ fn write_rewritten_aof(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    if !db.table.hash_field_expires.is_empty() {
-        let keys_with_field_exp: Vec<bytes::Bytes> =
-            db.table.hash_field_expires.keys().cloned().collect();
-        for k in keys_with_field_exp {
-            db.table.purge_expired_hash_fields(&k);
-        }
-    }
+    let orig_db = db.current_db;
+    let max_db = db.max_db_len();
 
     let file = std::fs::File::create(tmp_path)?;
     let mut writer = std::io::BufWriter::with_capacity(65536, file);
+    let mut emitted_db: usize = 0;
 
-    // 1. Snapshot all non-expired entries in RudisTable as canonical RESP commands
-    for entry in db.table.entries() {
-        if let Some(exp) = entry.expire_at()
-            && exp <= now
-        {
+    // 1. Snapshot all non-expired entries across all DBs in RudisTable as canonical RESP commands
+    for db_idx in 0..max_db {
+        if db_idx > 0 && db.table_for_db(db_idx).is_none_or(|t| t.is_empty()) {
             continue;
         }
-        let k = entry.key.as_ref();
-        let hydrated_val;
-        let val_ref = match &entry.val {
-            crate::table::RudisValue::Cooled(cv) => &cv.val,
-            crate::table::RudisValue::Tiered(ptr) => match db.hydrate_tiered(**ptr) {
-                Some(v) => {
-                    hydrated_val = v;
-                    &hydrated_val
+        db.select_db(db_idx);
+        if !db.table.hash_field_expires.is_empty() {
+            let keys_with_field_exp: Vec<bytes::Bytes> =
+                db.table.hash_field_expires.keys().cloned().collect();
+            for k in keys_with_field_exp {
+                db.table.purge_expired_hash_fields(&k);
+            }
+        }
+        if db.table.dbsize() == 0 {
+            continue;
+        }
+        if emitted_db != db_idx {
+            let db_str = db_idx.to_string();
+            writer.write_all(
+                format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{}\r\n", db_str.len(), db_str).as_bytes(),
+            )?;
+            emitted_db = db_idx;
+        }
+        for entry in db.table.entries() {
+            if let Some(exp) = entry.expire_at()
+                && exp <= now
+            {
+                continue;
+            }
+            let k = entry.key.as_ref();
+            let hydrated_val;
+            let val_ref = match &entry.val {
+                crate::table::RudisValue::Cooled(cv) => &cv.val,
+                crate::table::RudisValue::Tiered(ptr) => match db.hydrate_tiered(**ptr) {
+                    Some(v) => {
+                        hydrated_val = v;
+                        &hydrated_val
+                    }
+                    None => {
+                        tracing::error!(
+                            key = %String::from_utf8_lossy(k),
+                            "AOF rewrite: failed to read tiered value, key skipped"
+                        );
+                        continue;
+                    }
+                },
+                other => other,
+            };
+            match val_ref {
+                crate::table::RudisValue::String(val) => {
+                    if let Some(exp) = entry.expire_at() {
+                        let rem_ms_str =
+                            unix_ms_after(exp.saturating_duration_since(now)).to_string();
+                        writer.write_all(b"*5\r\n$3\r\nSET\r\n$")?;
+                        writer.write_all(k.len().to_string().as_bytes())?;
+                        writer.write_all(b"\r\n")?;
+                        writer.write_all(k)?;
+                        writer.write_all(b"\r\n$")?;
+                        writer.write_all(val.len().to_string().as_bytes())?;
+                        writer.write_all(b"\r\n")?;
+                        writer.write_all(&val.view())?;
+                        writer.write_all(b"\r\n$4\r\nPXAT\r\n$")?;
+                        writer.write_all(rem_ms_str.len().to_string().as_bytes())?;
+                        writer.write_all(b"\r\n")?;
+                        writer.write_all(rem_ms_str.as_bytes())?;
+                        writer.write_all(b"\r\n")?;
+                    } else {
+                        writer.write_all(b"*3\r\n$3\r\nSET\r\n$")?;
+                        writer.write_all(k.len().to_string().as_bytes())?;
+                        writer.write_all(b"\r\n")?;
+                        writer.write_all(k)?;
+                        writer.write_all(b"\r\n$")?;
+                        writer.write_all(val.len().to_string().as_bytes())?;
+                        writer.write_all(b"\r\n")?;
+                        writer.write_all(&val.view())?;
+                        writer.write_all(b"\r\n")?;
+                    }
+                    count += 1;
                 }
-                None => {
-                    tracing::error!(
-                        key = %String::from_utf8_lossy(k),
-                        "AOF rewrite: failed to read tiered value, key skipped"
-                    );
-                    continue;
-                }
-            },
-            other => other,
-        };
-        match val_ref {
-            crate::table::RudisValue::String(val) => {
-                if let Some(exp) = entry.expire_at() {
-                    let rem_ms_str = unix_ms_after(exp.saturating_duration_since(now)).to_string();
-                    writer.write_all(b"*5\r\n$3\r\nSET\r\n$")?;
-                    writer.write_all(k.len().to_string().as_bytes())?;
-                    writer.write_all(b"\r\n")?;
-                    writer.write_all(k)?;
-                    writer.write_all(b"\r\n$")?;
-                    writer.write_all(val.len().to_string().as_bytes())?;
-                    writer.write_all(b"\r\n")?;
-                    writer.write_all(&val.view())?;
-                    writer.write_all(b"\r\n$4\r\nPXAT\r\n$")?;
-                    writer.write_all(rem_ms_str.len().to_string().as_bytes())?;
-                    writer.write_all(b"\r\n")?;
-                    writer.write_all(rem_ms_str.as_bytes())?;
-                    writer.write_all(b"\r\n")?;
-                } else {
+                crate::table::RudisValue::Int(val) => {
+                    let val_str = val.to_string();
                     writer.write_all(b"*3\r\n$3\r\nSET\r\n$")?;
                     writer.write_all(k.len().to_string().as_bytes())?;
                     writer.write_all(b"\r\n")?;
                     writer.write_all(k)?;
                     writer.write_all(b"\r\n$")?;
-                    writer.write_all(val.len().to_string().as_bytes())?;
+                    writer.write_all(val_str.len().to_string().as_bytes())?;
                     writer.write_all(b"\r\n")?;
-                    writer.write_all(&val.view())?;
+                    writer.write_all(val_str.as_bytes())?;
                     writer.write_all(b"\r\n")?;
+                    count += 1;
                 }
-                count += 1;
-            }
-            crate::table::RudisValue::Int(val) => {
-                let val_str = val.to_string();
-                writer.write_all(b"*3\r\n$3\r\nSET\r\n$")?;
-                writer.write_all(k.len().to_string().as_bytes())?;
-                writer.write_all(b"\r\n")?;
-                writer.write_all(k)?;
-                writer.write_all(b"\r\n$")?;
-                writer.write_all(val_str.len().to_string().as_bytes())?;
-                writer.write_all(b"\r\n")?;
-                writer.write_all(val_str.as_bytes())?;
-                writer.write_all(b"\r\n")?;
-                count += 1;
-            }
-            crate::table::RudisValue::SmallHash(pairs) if !pairs.is_empty() => {
-                writer.write_all(
-                    format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", pairs.len() * 2 + 2, k.len())
-                        .as_bytes(),
-                )?;
-                writer.write_all(k)?;
-                writer.write_all(b"\r\n")?;
-                for (field, v) in pairs.iter() {
-                    writer.write_all(format!("${}\r\n", field.len()).as_bytes())?;
-                    writer.write_all(field.as_ref())?;
-                    writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
-                    writer.write_all(v.as_ref())?;
+                crate::table::RudisValue::SmallHash(pairs) if !pairs.is_empty() => {
+                    writer.write_all(
+                        format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", pairs.len() * 2 + 2, k.len())
+                            .as_bytes(),
+                    )?;
+                    writer.write_all(k)?;
                     writer.write_all(b"\r\n")?;
+                    for (field, v) in pairs.iter() {
+                        writer.write_all(format!("${}\r\n", field.len()).as_bytes())?;
+                        writer.write_all(field.as_ref())?;
+                        writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
+                        writer.write_all(v.as_ref())?;
+                        writer.write_all(b"\r\n")?;
+                    }
+                    count += 1;
                 }
-                count += 1;
-            }
-            crate::table::RudisValue::Hash(map) if !map.is_empty() => {
-                writer.write_all(
-                    format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", map.len() * 2 + 2, k.len()).as_bytes(),
-                )?;
-                writer.write_all(k)?;
-                writer.write_all(b"\r\n")?;
-                for (field, v) in map.as_ref() {
-                    writer.write_all(format!("${}\r\n", field.len()).as_bytes())?;
-                    writer.write_all(field.as_ref())?;
-                    writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
-                    writer.write_all(v.as_ref())?;
+                crate::table::RudisValue::Hash(map) if !map.is_empty() => {
+                    writer.write_all(
+                        format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", map.len() * 2 + 2, k.len())
+                            .as_bytes(),
+                    )?;
+                    writer.write_all(k)?;
                     writer.write_all(b"\r\n")?;
+                    for (field, v) in map.as_ref() {
+                        writer.write_all(format!("${}\r\n", field.len()).as_bytes())?;
+                        writer.write_all(field.as_ref())?;
+                        writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
+                        writer.write_all(v.as_ref())?;
+                        writer.write_all(b"\r\n")?;
+                    }
+                    count += 1;
                 }
-                count += 1;
-            }
-            crate::table::RudisValue::List(list) if !list.is_empty() => {
-                writer.write_all(
-                    format!("*{}\r\n$5\r\nRPUSH\r\n${}\r\n", list.len() + 2, k.len()).as_bytes(),
-                )?;
-                writer.write_all(k)?;
-                writer.write_all(b"\r\n")?;
-                for item in list.iter() {
-                    writer.write_all(format!("${}\r\n", item.len()).as_bytes())?;
-                    writer.write_all(item.as_ref())?;
+                crate::table::RudisValue::List(list) if !list.is_empty() => {
+                    writer.write_all(
+                        format!("*{}\r\n$5\r\nRPUSH\r\n${}\r\n", list.len() + 2, k.len())
+                            .as_bytes(),
+                    )?;
+                    writer.write_all(k)?;
                     writer.write_all(b"\r\n")?;
+                    for item in list.iter() {
+                        writer.write_all(format!("${}\r\n", item.len()).as_bytes())?;
+                        writer.write_all(item.as_ref())?;
+                        writer.write_all(b"\r\n")?;
+                    }
+                    count += 1;
                 }
-                count += 1;
-            }
-            crate::table::RudisValue::Set(set) if !set.is_empty() => {
-                let members: Vec<bytes::Bytes> = set.to_vec();
-                writer.write_all(
-                    format!("*{}\r\n$4\r\nSADD\r\n${}\r\n", members.len() + 2, k.len()).as_bytes(),
-                )?;
-                writer.write_all(k)?;
-                writer.write_all(b"\r\n")?;
-                for m in members {
-                    writer.write_all(format!("${}\r\n", m.len()).as_bytes())?;
-                    writer.write_all(m.as_ref())?;
+                crate::table::RudisValue::Set(set) if !set.is_empty() => {
+                    let members: Vec<bytes::Bytes> = set.to_vec();
+                    writer.write_all(
+                        format!("*{}\r\n$4\r\nSADD\r\n${}\r\n", members.len() + 2, k.len())
+                            .as_bytes(),
+                    )?;
+                    writer.write_all(k)?;
                     writer.write_all(b"\r\n")?;
+                    for m in members {
+                        writer.write_all(format!("${}\r\n", m.len()).as_bytes())?;
+                        writer.write_all(m.as_ref())?;
+                        writer.write_all(b"\r\n")?;
+                    }
+                    count += 1;
                 }
-                count += 1;
-            }
-            crate::table::RudisValue::ZSet(zset) if !zset.is_empty() => {
-                let elements = zset.to_vec();
-                writer.write_all(
-                    format!(
-                        "*{}\r\n$4\r\nZADD\r\n${}\r\n",
-                        elements.len() * 2 + 2,
-                        k.len()
-                    )
-                    .as_bytes(),
-                )?;
-                writer.write_all(k)?;
-                writer.write_all(b"\r\n")?;
-                for (member, score) in elements {
-                    let score_str = score.to_string();
+                crate::table::RudisValue::ZSet(zset) if !zset.is_empty() => {
+                    let elements = zset.to_vec();
                     writer.write_all(
                         format!(
-                            "${}\r\n{}\r\n${}\r\n",
-                            score_str.len(),
-                            score_str,
-                            member.len()
+                            "*{}\r\n$4\r\nZADD\r\n${}\r\n",
+                            elements.len() * 2 + 2,
+                            k.len()
                         )
                         .as_bytes(),
                     )?;
-                    writer.write_all(member.as_ref())?;
+                    writer.write_all(k)?;
                     writer.write_all(b"\r\n")?;
-                }
-                count += 1;
-            }
-            crate::table::RudisValue::HyperLogLog(hll) => {
-                writer.write_all(b"*3\r\n$3\r\nSET\r\n$")?;
-                writer.write_all(k.len().to_string().as_bytes())?;
-                writer.write_all(b"\r\n")?;
-                writer.write_all(k)?;
-                writer.write_all(b"\r\n$")?;
-                writer.write_all(hll.len().to_string().as_bytes())?;
-                writer.write_all(b"\r\n")?;
-                writer.write_all(hll.as_ref())?;
-                writer.write_all(b"\r\n")?;
-                count += 1;
-            }
-            crate::table::RudisValue::Stream(stream) => {
-                if !stream.entries.is_empty() {
-                    for (sid, fields) in &stream.entries {
-                        let id_str = sid.to_string();
-                        let num_args = 2 + 1 + fields.len() * 2;
+                    for (member, score) in elements {
+                        let score_str = score.to_string();
                         writer.write_all(
-                            format!("*{}\r\n$4\r\nXADD\r\n${}\r\n", num_args, k.len()).as_bytes(),
+                            format!(
+                                "${}\r\n{}\r\n${}\r\n",
+                                score_str.len(),
+                                score_str,
+                                member.len()
+                            )
+                            .as_bytes(),
+                        )?;
+                        writer.write_all(member.as_ref())?;
+                        writer.write_all(b"\r\n")?;
+                    }
+                    count += 1;
+                }
+                crate::table::RudisValue::HyperLogLog(hll) => {
+                    writer.write_all(b"*3\r\n$3\r\nSET\r\n$")?;
+                    writer.write_all(k.len().to_string().as_bytes())?;
+                    writer.write_all(b"\r\n")?;
+                    writer.write_all(k)?;
+                    writer.write_all(b"\r\n$")?;
+                    writer.write_all(hll.len().to_string().as_bytes())?;
+                    writer.write_all(b"\r\n")?;
+                    writer.write_all(hll.as_ref())?;
+                    writer.write_all(b"\r\n")?;
+                    count += 1;
+                }
+                crate::table::RudisValue::Stream(stream) => {
+                    if !stream.entries.is_empty() {
+                        for (sid, fields) in &stream.entries {
+                            let id_str = sid.to_string();
+                            let num_args = 2 + 1 + fields.len() * 2;
+                            writer.write_all(
+                                format!("*{}\r\n$4\r\nXADD\r\n${}\r\n", num_args, k.len())
+                                    .as_bytes(),
+                            )?;
+                            writer.write_all(k)?;
+                            writer.write_all(
+                                format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes(),
+                            )?;
+                            for (f, v) in fields {
+                                writer.write_all(format!("${}\r\n", f.len()).as_bytes())?;
+                                writer.write_all(f.as_ref())?;
+                                writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
+                                writer.write_all(v.as_ref())?;
+                                writer.write_all(b"\r\n")?;
+                            }
+                            count += 1;
+                        }
+                    }
+                    if stream.last_id != crate::table::StreamId::default()
+                        || stream.entries_added > 0
+                    {
+                        let last_id_str = stream.last_id.to_string();
+                        let ea_str = stream.entries_added.to_string();
+                        let md_str = stream.max_deleted_entry_id.to_string();
+                        writer.write_all(
+                            format!("*7\r\n$6\r\nXSETID\r\n${}\r\n", k.len()).as_bytes(),
                         )?;
                         writer.write_all(k)?;
                         writer.write_all(
-                            format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes(),
-                        )?;
-                        for (f, v) in fields {
-                            writer.write_all(format!("${}\r\n", f.len()).as_bytes())?;
-                            writer.write_all(f.as_ref())?;
-                            writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
-                            writer.write_all(v.as_ref())?;
-                            writer.write_all(b"\r\n")?;
-                        }
-                        count += 1;
-                    }
-                }
-                if stream.last_id != crate::table::StreamId::default() || stream.entries_added > 0 {
-                    let last_id_str = stream.last_id.to_string();
-                    let ea_str = stream.entries_added.to_string();
-                    let md_str = stream.max_deleted_entry_id.to_string();
-                    writer
-                        .write_all(format!("*7\r\n$6\r\nXSETID\r\n${}\r\n", k.len()).as_bytes())?;
-                    writer.write_all(k)?;
-                    writer.write_all(
                         format!(
                             "\r\n${}\r\n{}\r\n$12\r\nENTRIESADDED\r\n${}\r\n{}\r\n$12\r\nMAXDELETEDID\r\n${}\r\n{}\r\n",
                             last_id_str.len(), last_id_str,
@@ -3080,62 +3173,64 @@ fn write_rewritten_aof(
                             md_str.len(), md_str
                         ).as_bytes()
                     )?;
-                    count += 1;
-                }
-                for grp in stream.groups.values() {
-                    let last_deliv_str = grp.last_delivered_id.to_string();
-                    if let Some(er) = grp.entries_read {
-                        let er_str = er.to_string();
-                        writer.write_all(
-                            format!("*7\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n", k.len())
-                                .as_bytes(),
-                        )?;
-                        writer.write_all(k)?;
-                        writer.write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
-                        writer.write_all(&grp.name)?;
-                        writer.write_all(
-                            format!(
-                                "\r\n${}\r\n{}\r\n$11\r\nENTRIESREAD\r\n${}\r\n{}\r\n",
-                                last_deliv_str.len(),
-                                last_deliv_str,
-                                er_str.len(),
-                                er_str
-                            )
-                            .as_bytes(),
-                        )?;
-                    } else {
-                        writer.write_all(
-                            format!("*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n", k.len())
-                                .as_bytes(),
-                        )?;
-                        writer.write_all(k)?;
-                        writer.write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
-                        writer.write_all(&grp.name)?;
-                        writer.write_all(
-                            format!("\r\n${}\r\n{}\r\n", last_deliv_str.len(), last_deliv_str)
-                                .as_bytes(),
-                        )?;
+                        count += 1;
                     }
-                    count += 1;
-
-                    for (c_name, cons) in &grp.consumers {
-                        for (&sid, &deliv_time) in &cons.pel {
-                            let pe = match grp.pel.get(&sid) {
-                                Some(p) => p,
-                                None => continue,
-                            };
-                            let sid_str = sid.to_string();
-                            let dt_str = deliv_time.to_string();
-                            let rc_str = pe.delivery_count.to_string();
+                    for grp in stream.groups.values() {
+                        let last_deliv_str = grp.last_delivered_id.to_string();
+                        if let Some(er) = grp.entries_read {
+                            let er_str = er.to_string();
                             writer.write_all(
-                                format!("*10\r\n$6\r\nXCLAIM\r\n${}\r\n", k.len()).as_bytes(),
+                                format!("*7\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n", k.len())
+                                    .as_bytes(),
                             )?;
                             writer.write_all(k)?;
                             writer.write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
                             writer.write_all(&grp.name)?;
-                            writer.write_all(format!("\r\n${}\r\n", c_name.len()).as_bytes())?;
-                            writer.write_all(c_name)?;
                             writer.write_all(
+                                format!(
+                                    "\r\n${}\r\n{}\r\n$11\r\nENTRIESREAD\r\n${}\r\n{}\r\n",
+                                    last_deliv_str.len(),
+                                    last_deliv_str,
+                                    er_str.len(),
+                                    er_str
+                                )
+                                .as_bytes(),
+                            )?;
+                        } else {
+                            writer.write_all(
+                                format!("*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n", k.len())
+                                    .as_bytes(),
+                            )?;
+                            writer.write_all(k)?;
+                            writer.write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
+                            writer.write_all(&grp.name)?;
+                            writer.write_all(
+                                format!("\r\n${}\r\n{}\r\n", last_deliv_str.len(), last_deliv_str)
+                                    .as_bytes(),
+                            )?;
+                        }
+                        count += 1;
+
+                        for (c_name, cons) in &grp.consumers {
+                            for (&sid, &deliv_time) in &cons.pel {
+                                let pe = match grp.pel.get(&sid) {
+                                    Some(p) => p,
+                                    None => continue,
+                                };
+                                let sid_str = sid.to_string();
+                                let dt_str = deliv_time.to_string();
+                                let rc_str = pe.delivery_count.to_string();
+                                writer.write_all(
+                                    format!("*10\r\n$6\r\nXCLAIM\r\n${}\r\n", k.len()).as_bytes(),
+                                )?;
+                                writer.write_all(k)?;
+                                writer
+                                    .write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
+                                writer.write_all(&grp.name)?;
+                                writer
+                                    .write_all(format!("\r\n${}\r\n", c_name.len()).as_bytes())?;
+                                writer.write_all(c_name)?;
+                                writer.write_all(
                                 format!(
                                     "\r\n$1\r\n0\r\n${}\r\n{}\r\n$4\r\nTIME\r\n${}\r\n{}\r\n$10\r\nRETRYCOUNT\r\n${}\r\n{}\r\n$6\r\nJUSTID\r\n",
                                     sid_str.len(), sid_str,
@@ -3143,73 +3238,79 @@ fn write_rewritten_aof(
                                     rc_str.len(), rc_str,
                                 ).as_bytes()
                             )?;
-                            count += 1;
+                                count += 1;
+                            }
                         }
-                    }
 
-                    for (&sid, pe) in &grp.pel {
-                        if pe.consumer.is_empty() {
-                            let sid_str = sid.to_string();
-                            let rc_str = pe.delivery_count.to_string();
-                            writer.write_all(
-                                format!("*10\r\n$5\r\nXNACK\r\n${}\r\n", k.len()).as_bytes(),
-                            )?;
-                            writer.write_all(k)?;
-                            writer.write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
-                            writer.write_all(&grp.name)?;
-                            writer.write_all(
+                        for (&sid, pe) in &grp.pel {
+                            if pe.consumer.is_empty() {
+                                let sid_str = sid.to_string();
+                                let rc_str = pe.delivery_count.to_string();
+                                writer.write_all(
+                                    format!("*10\r\n$5\r\nXNACK\r\n${}\r\n", k.len()).as_bytes(),
+                                )?;
+                                writer.write_all(k)?;
+                                writer
+                                    .write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
+                                writer.write_all(&grp.name)?;
+                                writer.write_all(
                                 format!(
                                     "\r\n$4\r\nFAIL\r\n$3\r\nIDS\r\n$1\r\n1\r\n${}\r\n{}\r\n$10\r\nRETRYCOUNT\r\n${}\r\n{}\r\n$5\r\nFORCE\r\n",
                                     sid_str.len(), sid_str,
                                     rc_str.len(), rc_str,
                                 ).as_bytes()
                             )?;
-                            count += 1;
+                                count += 1;
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
-        }
 
-        if !matches!(val_ref, crate::table::RudisValue::String(_))
-            && let Some(exp) = entry.expire_at()
-        {
-            let rem_ms_str = unix_ms_after(exp.saturating_duration_since(now)).to_string();
-            writer.write_all(b"*3\r\n$9\r\nPEXPIREAT\r\n$")?;
-            writer.write_all(k.len().to_string().as_bytes())?;
-            writer.write_all(b"\r\n")?;
-            writer.write_all(k)?;
-            writer.write_all(b"\r\n$")?;
-            writer.write_all(rem_ms_str.len().to_string().as_bytes())?;
-            writer.write_all(b"\r\n")?;
-            writer.write_all(rem_ms_str.as_bytes())?;
-            writer.write_all(b"\r\n")?;
-        }
+            if !matches!(val_ref, crate::table::RudisValue::String(_))
+                && let Some(exp) = entry.expire_at()
+            {
+                let rem_ms_str = unix_ms_after(exp.saturating_duration_since(now)).to_string();
+                writer.write_all(b"*3\r\n$9\r\nPEXPIREAT\r\n$")?;
+                writer.write_all(k.len().to_string().as_bytes())?;
+                writer.write_all(b"\r\n")?;
+                writer.write_all(k)?;
+                writer.write_all(b"\r\n$")?;
+                writer.write_all(rem_ms_str.len().to_string().as_bytes())?;
+                writer.write_all(b"\r\n")?;
+                writer.write_all(rem_ms_str.as_bytes())?;
+                writer.write_all(b"\r\n")?;
+            }
 
-        if !db.table.hash_field_expires.is_empty()
-            && let Some(fmap) = db.table.hash_field_expires.get(k)
-        {
-            for (field, &exp) in fmap {
-                if exp > now {
-                    let rem_ms = exp.duration_since(now).as_millis() as u64;
-                    let exp_unix_ms_str = (unix_now + rem_ms).to_string();
-                    writer.write_all(b"*6\r\n$10\r\nHPEXPIREAT\r\n$")?;
-                    writer.write_all(k.len().to_string().as_bytes())?;
-                    writer.write_all(b"\r\n")?;
-                    writer.write_all(k)?;
-                    writer.write_all(b"\r\n$")?;
-                    writer.write_all(exp_unix_ms_str.len().to_string().as_bytes())?;
-                    writer.write_all(b"\r\n")?;
-                    writer.write_all(exp_unix_ms_str.as_bytes())?;
-                    writer.write_all(b"\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$")?;
-                    writer.write_all(field.len().to_string().as_bytes())?;
-                    writer.write_all(b"\r\n")?;
-                    writer.write_all(field.as_ref())?;
-                    writer.write_all(b"\r\n")?;
+            if !db.table.hash_field_expires.is_empty()
+                && let Some(fmap) = db.table.hash_field_expires.get(k)
+            {
+                for (field, &exp) in fmap {
+                    if exp > now {
+                        let rem_ms = exp.duration_since(now).as_millis() as u64;
+                        let exp_unix_ms_str = (unix_now + rem_ms).to_string();
+                        writer.write_all(b"*6\r\n$10\r\nHPEXPIREAT\r\n$")?;
+                        writer.write_all(k.len().to_string().as_bytes())?;
+                        writer.write_all(b"\r\n")?;
+                        writer.write_all(k)?;
+                        writer.write_all(b"\r\n$")?;
+                        writer.write_all(exp_unix_ms_str.len().to_string().as_bytes())?;
+                        writer.write_all(b"\r\n")?;
+                        writer.write_all(exp_unix_ms_str.as_bytes())?;
+                        writer.write_all(b"\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$")?;
+                        writer.write_all(field.len().to_string().as_bytes())?;
+                        writer.write_all(b"\r\n")?;
+                        writer.write_all(field.as_ref())?;
+                        writer.write_all(b"\r\n")?;
+                    }
                 }
             }
         }
+    }
+    db.select_db(orig_db);
+    if emitted_db != 0 {
+        writer.write_all(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n")?;
     }
 
     // 2. Snapshot JSON documents

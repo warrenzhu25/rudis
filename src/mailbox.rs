@@ -164,6 +164,7 @@ pub struct ScatterMgetDescriptor {
     pub results: Box<[CachePadded<UnsafeCell<Option<Bytes>>>]>,
     pub pending: AtomicUsize,
     pub state: std::sync::atomic::AtomicU8,
+    pub db: AtomicUsize,
     pub notify: CachePadded<UnsafeCell<flume::Sender<()>>>,
     pub recycled_keys: Box<[CachePadded<UnsafeCell<Vec<(usize, Bytes)>>>]>,
 }
@@ -203,6 +204,7 @@ impl ScatterMgetDescriptor {
             } else {
                 DESC_RUNNING
             }),
+            db: AtomicUsize::new(crate::connection::CURRENT_DB.get()),
             notify: CachePadded(UnsafeCell::new(notify)),
             recycled_keys: recycled.into_boxed_slice(),
         }
@@ -210,6 +212,8 @@ impl ScatterMgetDescriptor {
 
     #[inline(always)]
     pub fn reset(&self, total_keys: usize, pending_shards: usize, notify: flume::Sender<()>) {
+        self.db
+            .store(crate::connection::CURRENT_DB.get(), Ordering::Relaxed);
         self.state.store(
             if pending_shards == 0 {
                 DESC_COMPLETED
@@ -324,6 +328,7 @@ impl ScatterMgetDescriptor {
 pub struct ScatterMsetDescriptor {
     pub pending: AtomicUsize,
     pub state: std::sync::atomic::AtomicU8,
+    pub db: AtomicUsize,
     pub notify: CachePadded<UnsafeCell<flume::Sender<()>>>,
     pub recycled_pairs: Box<[CachePadded<UnsafeCell<Vec<(Bytes, Bytes)>>>]>,
 }
@@ -350,6 +355,7 @@ impl ScatterMsetDescriptor {
             } else {
                 DESC_RUNNING
             }),
+            db: AtomicUsize::new(crate::connection::CURRENT_DB.get()),
             notify: CachePadded(UnsafeCell::new(notify)),
             recycled_pairs: recycled.into_boxed_slice(),
         }
@@ -357,6 +363,8 @@ impl ScatterMsetDescriptor {
 
     #[inline(always)]
     pub fn reset(&self, pending_shards: usize, notify: flume::Sender<()>) {
+        self.db
+            .store(crate::connection::CURRENT_DB.get(), Ordering::Relaxed);
         self.state.store(
             if pending_shards == 0 {
                 DESC_COMPLETED
@@ -443,6 +451,7 @@ pub struct FastGetDescriptor {
     pub bell: Doorbell,
     /// The requesting client's `CLIENT NO-TOUCH`.
     pub no_touch: bool,
+    pub db: usize,
 }
 
 // SAFETY: Every field is itself Send; `UnsafeCell<T>` is Send for `T: Send`.
@@ -463,6 +472,7 @@ impl FastGetDescriptor {
             done: AtomicBool::new(false),
             bell: Doorbell::new(),
             no_touch: crate::connection::CLIENT_NO_TOUCH.get(),
+            db: crate::connection::CURRENT_DB.get(),
         }
     }
 
@@ -507,6 +517,7 @@ pub struct FastSetDescriptor {
     pub expire_in: Option<Duration>,
     pub done: AtomicBool,
     pub bell: Doorbell,
+    pub db: usize,
 }
 
 // SAFETY: Every field is Send (Bytes, Duration, atomics, Doorbell).
@@ -523,6 +534,7 @@ impl FastSetDescriptor {
             expire_in,
             done: AtomicBool::new(false),
             bell: Doorbell::new(),
+            db: crate::connection::CURRENT_DB.get(),
         }
     }
 
@@ -1064,6 +1076,7 @@ mod tests {
     fn test_try_recv_round_robins_across_producer_shards() {
         let (senders, receivers) = create_shard_mesh(3);
         let msg = |key: &'static str| crate::shard::ShardMessage::ExpireTime {
+            db: 0,
             key: Bytes::from_static(key.as_bytes()),
             in_millis: false,
             responder: flume::bounded(1).0,
@@ -1381,12 +1394,13 @@ mod tests {
         assert!(!rx.sleeping.load(Ordering::SeqCst));
         sender
             .send(crate::shard::ShardMessage::NotifyList {
+                db: 0,
                 keys: vec![Bytes::from("k1")],
             })
             .unwrap();
         assert!(!rx.notify_rx.try_consume());
         let msg = rx.try_recv().unwrap();
-        if let crate::shard::ShardMessage::NotifyList { keys } = msg {
+        if let crate::shard::ShardMessage::NotifyList { keys, .. } = msg {
             assert_eq!(keys[0], Bytes::from("k1"));
         } else {
             panic!("unexpected message");
@@ -1396,12 +1410,13 @@ mod tests {
         rx.sleeping.store(true, Ordering::SeqCst);
         sender
             .send(crate::shard::ShardMessage::NotifyList {
+                db: 0,
                 keys: vec![Bytes::from("k2")],
             })
             .unwrap();
         assert!(rx.notify_rx.try_consume());
         let msg = rx.try_recv().unwrap();
-        if let crate::shard::ShardMessage::NotifyList { keys } = msg {
+        if let crate::shard::ShardMessage::NotifyList { keys, .. } = msg {
             assert_eq!(keys[0], Bytes::from("k2"));
         } else {
             panic!("unexpected message");
@@ -1415,7 +1430,10 @@ mod tests {
         // thread asleep with a message queued, and the watchdog fires.
         const ROUNDS: usize = 200_000;
         let (mesh, mut receivers) = create_shard_mesh(2);
-        let msg = || crate::shard::ShardMessage::NotifyList { keys: Vec::new() };
+        let msg = || crate::shard::ShardMessage::NotifyList {
+            db: 0,
+            keys: Vec::new(),
+        };
         let rx_b = receivers.pop().unwrap();
         let rx_a = receivers.pop().unwrap();
         let (tx_a, tx_b) = (mesh[0][1].clone(), mesh[1][0].clone());

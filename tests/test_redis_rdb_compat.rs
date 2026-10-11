@@ -832,6 +832,22 @@ fn rudis_extensions_survive_and_valkey_skips_them() {
 /// Rudis refuses (instead of silently emptying) data it cannot represent.
 #[test]
 fn unsupported_rdb_contents_fail_loudly() {
+    // DB 1 (< databases 16) now loads into DB 1 without touching DB 0.
+    {
+        let mut body = b"REDIS0011\xFA\x09redis-ver\x057.2.4\xFE\x01\x00\x01k\x01v\xFF".to_vec();
+        let crc = rudis::table::crc64(&body);
+        body.extend_from_slice(&crc.to_le_bytes());
+        let mut db = rudis::shard::ShardDb::new(0);
+        assert_eq!(
+            rudis::table::load_rdb_bytes(&body, &mut db, 0, 1).unwrap(),
+            1
+        );
+        assert_eq!(db.current_db, 0);
+        assert_eq!(db.get(b"k"), None);
+        db.select_db(1);
+        assert_eq!(db.get(b"k"), Some(bytes::Bytes::from_static(b"v")));
+    }
+
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("module", {
             let mut b = b"REDIS0011\xFE\x00\x07\x01k".to_vec();
@@ -839,8 +855,8 @@ fn unsupported_rdb_contents_fail_loudly() {
             b
         }),
         (
-            "db 1",
-            b"REDIS0011\xFA\x09redis-ver\x057.2.4\xFE\x01\x00\x01k\x01v".to_vec(),
+            "db 16",
+            b"REDIS0011\xFA\x09redis-ver\x057.2.4\xFE\x10\x00\x01k\x01v".to_vec(),
         ),
         ("version", b"REDIS0099\xFF".to_vec()),
     ];
@@ -855,7 +871,7 @@ fn unsupported_rdb_contents_fail_loudly() {
         eprintln!("{name}: {err}");
         match name {
             "module" => assert!(err.to_string().contains("module"), "{err}"),
-            "db 1" => assert!(err.to_string().contains("database 1"), "{err}"),
+            "db 16" => assert!(err.to_string().contains("database 16"), "{err}"),
             _ => assert!(err.to_string().contains("version"), "{err}"),
         }
     }

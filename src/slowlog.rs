@@ -363,6 +363,22 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
             vec![Bytes::from_static(b"select"), Bytes::from(db.to_string())],
             2,
         ),
+        Command::Move { key, db } => (
+            vec![
+                Bytes::from_static(b"move"),
+                key.clone(),
+                Bytes::from(db.to_string()),
+            ],
+            3,
+        ),
+        Command::Swapdb { db1, db2 } => (
+            vec![
+                Bytes::from_static(b"swapdb"),
+                Bytes::from(db1.to_string()),
+                Bytes::from(db2.to_string()),
+            ],
+            3,
+        ),
         Command::Slowlog(args) => {
             let mut res = Vec::with_capacity(args.len() + 1);
             res.push(Bytes::from_static(b"slowlog"));

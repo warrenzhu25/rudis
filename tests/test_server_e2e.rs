@@ -23519,3 +23519,266 @@ fn test_replicaof_unblocks_clients_blocked_on_writes_e2e() {
     shutdown_and_wait(aport, &mut a);
     shutdown_and_wait(bport, &mut b);
 }
+
+#[test]
+fn test_multi_db_commands_watch_lua_and_blocking_e2e() {
+    let port = 17113u16;
+    start_test_server(port, 4);
+
+    let mut c1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut c2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // 1. SELECT bounds and CONFIG GET databases
+    let cfg = resp_cmd(&mut c1, &["CONFIG", "GET", "databases"]);
+    assert!(cfg.contains("16"), "{cfg:?}");
+    assert!(resp_cmd(&mut c1, &["SELECT", "-1"]).starts_with("-ERR DB index is out of range"));
+    assert!(resp_cmd(&mut c1, &["SELECT", "16"]).starts_with("-ERR DB index is out of range"));
+    assert_eq!(resp_cmd(&mut c1, &["SELECT", "2"]), "+OK\r\n");
+    assert!(resp_cmd(&mut c1, &["CLIENT", "INFO"]).contains("db=2"));
+    assert_eq!(resp_cmd(&mut c1, &["RESET"]), "+RESET\r\n");
+    assert!(resp_cmd(&mut c1, &["CLIENT", "INFO"]).contains("db=0"));
+
+    // 2. Per-connection DB isolation across shards (MSET, MGET, DBSIZE, INFO keyspace)
+    assert_eq!(
+        resp_cmd(
+            &mut c1,
+            &[
+                "MSET", "mdb_k1", "db0_v1", "mdb_k2", "db0_v2", "mdb_k3", "db0_v3"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c2, &["SELECT", "1"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c2, &["MGET", "mdb_k1", "mdb_k2", "mdb_k3"]),
+        "*3\r\n$-1\r\n$-1\r\n$-1\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c2, &["MSET", "mdb_k1", "db1_v1", "mdb_k2", "db1_v2"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c1, &["DBSIZE"]), ":3\r\n");
+    assert_eq!(resp_cmd(&mut c2, &["DBSIZE"]), ":2\r\n");
+    let ks = resp_cmd(&mut c1, &["INFO", "keyspace"]);
+    assert!(
+        ks.contains("db0:keys=3,") && ks.contains("db1:keys=2,"),
+        "{ks:?}"
+    );
+
+    // 3. MOVE (same-DB, missing, existing dest, and successful move with TTL)
+    assert_eq!(resp_cmd(&mut c1, &["MOVE", "mdb_k1", "0"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c1, &["MOVE", "no_such_key", "1"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c1, &["MOVE", "mdb_k1", "1"]), ":0\r\n"); // exists in db 1
+    assert_eq!(resp_cmd(&mut c1, &["PEXPIRE", "mdb_k3", "60000"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c1, &["MOVE", "mdb_k3", "1"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c1, &["GET", "mdb_k3"]), "$-1\r\n");
+    assert_eq!(resp_cmd(&mut c2, &["GET", "mdb_k3"]), "$6\r\ndb0_v3\r\n");
+    let pttl = resp_cmd(&mut c2, &["PTTL", "mdb_k3"]);
+    assert!(!pttl.starts_with(":-"), "TTL lost on MOVE: {pttl:?}");
+
+    // 4. COPY ... DB <n> [REPLACE] across different shards
+    let mut k_s0 = String::new();
+    let mut k_s1 = String::new();
+    for i in 0..200 {
+        let cand = format!("cp_key_{i}");
+        let sh = target_shard(cand.as_bytes(), 4);
+        if sh == 0 && k_s0.is_empty() {
+            k_s0 = cand;
+        } else if sh == 1 && k_s1.is_empty() {
+            k_s1 = cand;
+        }
+        if !k_s0.is_empty() && !k_s1.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        resp_cmd(&mut c1, &["SET", &k_s0, "cross_val", "PX", "60000"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c1, &["COPY", &k_s0, &k_s1, "DB", "1"]),
+        ":1\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c2, &["GET", &k_s1]), "$9\r\ncross_val\r\n");
+    assert_eq!(
+        resp_cmd(&mut c1, &["COPY", &k_s0, &k_s1, "DB", "1"]),
+        ":0\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c1, &["SET", &k_s0, "new_val"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c1, &["COPY", &k_s0, &k_s1, "DB", "1", "REPLACE"]),
+        ":1\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c2, &["GET", &k_s1]), "$7\r\nnew_val\r\n");
+
+    // 5. SWAPDB swaps across all shards
+    assert_eq!(resp_cmd(&mut c1, &["SWAPDB", "0", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c1, &["GET", &k_s1]), "$7\r\nnew_val\r\n");
+    assert_eq!(resp_cmd(&mut c2, &["GET", &k_s0]), "$7\r\nnew_val\r\n");
+    assert_eq!(resp_cmd(&mut c1, &["SWAPDB", "0", "1"]), "+OK\r\n");
+
+    // 6. WATCH per-DB isolation
+    assert_eq!(resp_cmd(&mut c1, &["SET", "watch_k", "v0"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c1, &["WATCH", "watch_k"]), "+OK\r\n");
+    // Modifying watch_k or FLUSHDB in DB 1 must NOT abort c1's transaction in DB 0.
+    assert_eq!(resp_cmd(&mut c2, &["SET", "watch_k", "v1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c2, &["FLUSHDB"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c1, &["MULTI"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c1, &["SET", "watch_k", "v0_tx"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c1, &["EXEC"]), "*1\r\n+OK\r\n");
+    assert_eq!(resp_cmd(&mut c1, &["GET", "watch_k"]), "$5\r\nv0_tx\r\n");
+
+    // SWAPDB 0 1 DOES taint WATCH on DB 0.
+    assert_eq!(resp_cmd(&mut c1, &["WATCH", "watch_k"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c2, &["SWAPDB", "0", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c1, &["MULTI"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c1, &["SET", "watch_k", "aborted"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c1, &["EXEC"]), "*-1\r\n");
+    assert_eq!(resp_cmd(&mut c2, &["SWAPDB", "0", "1"]), "+OK\r\n");
+
+    // 7. Lua EVAL with redis.call('SELECT', 3) restores caller's DB afterwards
+    assert_eq!(
+        resp_cmd(
+            &mut c1,
+            &[
+                "EVAL",
+                "redis.call('SELECT', 3); redis.call('SET', KEYS[1], 'ok3'); return redis.call('GET', KEYS[1])",
+                "1",
+                "lua_db3"
+            ]
+        ),
+        "$3\r\nok3\r\n"
+    );
+    assert!(resp_cmd(&mut c1, &["CLIENT", "INFO"]).contains("db=0"));
+    assert_eq!(resp_cmd(&mut c1, &["GET", "lua_db3"]), "$-1\r\n");
+    assert_eq!(resp_cmd(&mut c2, &["SELECT", "3"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c2, &["GET", "lua_db3"]), "$3\r\nok3\r\n");
+
+    // 8. BLPOP per-DB isolation
+    assert_eq!(resp_cmd(&mut c2, &["SELECT", "2"]), "+OK\r\n");
+    c2.write_all(&format_resp_cmd(&["BLPOP", "blk_list", "2"]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    // LPUSH in DB 0 does NOT wake c2 in DB 2.
+    assert_eq!(
+        resp_cmd(&mut c1, &["LPUSH", "blk_list", "from_db0"]),
+        ":1\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c1, &["SELECT", "2"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c1, &["LPUSH", "blk_list", "from_db2"]),
+        ":1\r\n"
+    );
+    let mut buf = [0u8; 256];
+    let n = c2.read(&mut buf).unwrap();
+    let reply = String::from_utf8_lossy(&buf[..n]);
+    assert!(reply.contains("from_db2"), "{reply:?}");
+    assert_eq!(resp_cmd(&mut c1, &["SELECT", "0"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c1, &["LPOP", "blk_list"]),
+        "$8\r\nfrom_db0\r\n"
+    );
+}
+
+#[test]
+fn test_multi_db_persistence_and_replication_e2e() {
+    let (mport, rport) = (17114u16, 17115u16);
+    let dir = std::env::temp_dir().join(format!("rudis-multidb-repl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mdir = dir.join("m");
+    let rdir = dir.join("r");
+    std::fs::create_dir_all(&mdir).unwrap();
+    std::fs::create_dir_all(&rdir).unwrap();
+    let (ms, rs) = (mport.to_string(), rport.to_string());
+    let (mds, rds) = (
+        mdir.to_str().unwrap().to_string(),
+        rdir.to_str().unwrap().to_string(),
+    );
+    let margs = [
+        "--port",
+        &ms,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &mds,
+        "--appendonly",
+        "yes",
+    ];
+    let rargs = ["--port", &rs, "--threads", "2", "--no-pin", "--dir", &rds];
+    let mut master = spawn_rudis_listening(&margs, mport);
+    let mut replica = spawn_rudis_listening(&rargs, rport);
+
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    // Populate DB 0 and DB 2 before attaching replica (tests full-sync RDB multi-DB)
+    assert_eq!(resp_cmd(&mut m, &["SET", "k0", "val0"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut m, &["SELECT", "2"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut m, &["SET", "k2", "val2"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut m, &["HSET", "h2", "f", "v"]), ":1\r\n");
+
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !resp_cmd(&mut r, &["INFO", "replication"]).contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica did not sync");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Stream live multi-DB mutations: SELECT 5, SET, MOVE, COPY ... DB, SWAPDB, FLUSHDB
+    assert_eq!(resp_cmd(&mut m, &["SELECT", "5"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut m, &["SET", "k5", "val5"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut m, &["MOVE", "k5", "4"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut m, &["SELECT", "4"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut m, &["COPY", "k5", "k5_copy", "DB", "2"]),
+        ":1\r\n"
+    );
+    assert_eq!(resp_cmd(&mut m, &["SWAPDB", "2", "3"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut m, &["WAIT", "1", "5000"]), ":1\r\n");
+
+    let m_digest = resp_cmd(&mut m, &["DEBUG", "DIGEST"]);
+    let r_digest = resp_cmd(&mut r, &["DEBUG", "DIGEST"]);
+    assert_eq!(
+        m_digest, r_digest,
+        "master/replica multi-DB digest mismatch"
+    );
+
+    assert_eq!(resp_cmd(&mut r, &["SELECT", "0"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut r, &["GET", "k0"]), "$4\r\nval0\r\n");
+    assert_eq!(resp_cmd(&mut r, &["SELECT", "3"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut r, &["GET", "k2"]), "$4\r\nval2\r\n");
+    assert_eq!(resp_cmd(&mut r, &["GET", "k5_copy"]), "$4\r\nval5\r\n");
+    assert_eq!(resp_cmd(&mut r, &["SELECT", "4"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut r, &["GET", "k5"]), "$4\r\nval5\r\n");
+
+    // Rewrite AOF on master, restart master without saving RDB, and verify AOF replay restores all DBs
+    assert!(resp_cmd(&mut m, &["BGREWRITEAOF"]).starts_with("+"));
+    drop(r);
+    shutdown_and_wait(rport, &mut replica);
+    let _ = m.write_all(&format_resp_cmd(&["SHUTDOWN", "NOSAVE"]));
+    drop(m);
+    let _ = master.wait();
+    let _ = std::fs::remove_file(mdir.join("dump.rdb"));
+
+    let mut master = spawn_rudis_listening(&margs, mport);
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(resp_cmd(&mut m, &["DEBUG", "DIGEST"]), m_digest);
+    drop(m);
+    shutdown_and_wait(mport, &mut master);
+    let _ = std::fs::remove_dir_all(&dir);
+}

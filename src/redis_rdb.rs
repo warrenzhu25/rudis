@@ -1286,6 +1286,11 @@ pub fn write_file_header(out: &mut Vec<u8>, used_mem: u64) {
     write_len(out, 0);
 }
 
+pub fn write_selectdb(out: &mut Vec<u8>, dbid: usize) {
+    out.push(OP_SELECTDB);
+    write_len(out, dbid as u64);
+}
+
 /// RDB type byte `val` is written with; `None` for tiered values, which the
 /// caller must read back from the tier first.
 pub fn value_type(val: &RudisValue) -> Option<u8> {
@@ -1880,12 +1885,22 @@ impl LoadCtx<'_> {
     }
 }
 
+pub static LAST_RDB_REPL_STREAM_DB: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+pub fn last_rdb_repl_stream_db() -> usize {
+    LAST_RDB_REPL_STREAM_DB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Reads records until `OP_EOF` (returning true) or, when `chunk` is set,
 /// the end of the input (returning false).
 fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbResult<bool> {
     let key_load_delay = crate::connection::key_load_delay_us();
+    let max_dbs = crate::config::databases_count();
     let mut expire_ms: Option<i64> = None;
     let mut dbid = 0u64;
+    ctx.db.select_db(0);
     loop {
         if chunk && r.is_empty() {
             return Ok(false);
@@ -1903,7 +1918,12 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
             OP_IDLE => {
                 r.length()?;
             }
-            OP_SELECTDB => dbid = r.length()?,
+            OP_SELECTDB => {
+                dbid = r.length()?;
+                if (dbid as usize) < max_dbs {
+                    ctx.db.select_db(dbid as usize);
+                }
+            }
             OP_RESIZEDB => {
                 r.length()?;
                 r.length()?;
@@ -1917,9 +1937,20 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
                 let k = r.string()?;
                 let v = r.string()?;
                 if k.as_ref() == EXT_AUX_KEY {
+                    if (dbid as usize) >= max_dbs {
+                        return Err(RdbError::new(format!(
+                            "the RDB has keys in database {dbid}; rudis is configured with {max_dbs} databases"
+                        )));
+                    }
                     let (sid, n) = ctx.shard.unwrap_or((0, 1));
                     ctx.count += crate::table::load_legacy_ext(&v, ctx.db, sid, n)
                         .map_err(|e| RdbError::new(format!("invalid rudis-ext record: {e}")))?;
+                } else if k.as_ref() == b"repl-stream-db"
+                    && let Ok(s) = std::str::from_utf8(&v)
+                    && let Ok(d) = s.parse::<usize>()
+                    && d < max_dbs
+                {
+                    LAST_RDB_REPL_STREAM_DB.store(d, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             OP_MODULE_AUX => {
@@ -1953,9 +1984,9 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
             }
             _ => {
                 let key = r.string()?;
-                if dbid != 0 {
+                if (dbid as usize) >= max_dbs {
                     return Err(RdbError::new(format!(
-                        "the RDB has keys in database {dbid}; rudis has a single database (0)"
+                        "the RDB has keys in database {dbid}; rudis is configured with {max_dbs} databases"
                     )));
                 }
                 if ctx.strict && key.is_empty() {
@@ -2011,6 +2042,9 @@ pub fn load_file(
     } else {
         data.len()
     };
+    if shard_id == 0 {
+        LAST_RDB_REPL_STREAM_DB.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut r = Reader::new(&data[9..body_end]);
     let mut ctx = LoadCtx {
         db,
@@ -2020,12 +2054,14 @@ pub fn load_file(
         now_ms: unix_ms_now(),
         count: 0,
     };
-    load_records(&mut r, &mut ctx, false).map_err(|e| {
+    let res = load_records(&mut r, &mut ctx, false).map_err(|e| {
         RdbError::new(format!(
             "RDB parse error at offset {}: {e}",
             9 + r.position()
         ))
-    })?;
+    });
+    ctx.db.select_db(0);
+    res?;
     if !r.is_empty() {
         return Err(RdbError::new(format!(
             "RDB parse error at offset {}: data after the EOF marker",
@@ -2047,7 +2083,9 @@ pub fn load_chunk(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResult<usiz
         now_ms: unix_ms_now(),
         count: 0,
     };
-    load_records(&mut r, &mut ctx, true)?;
+    let res = load_records(&mut r, &mut ctx, true);
+    ctx.db.select_db(0);
+    res?;
     Ok(ctx.count)
 }
 

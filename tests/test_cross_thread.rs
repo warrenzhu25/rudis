@@ -55,7 +55,7 @@ fn test_lock_free_spsc_queue_and_mesh() {
             let mut count = 0;
             for expected in 0..1000 {
                 let msg = rx_1.recv_async().await.unwrap();
-                if let rudis::shard::ShardMessage::NotifyList { keys } = msg {
+                if let rudis::shard::ShardMessage::NotifyList { keys, .. } = msg {
                     assert_eq!(keys[0], bytes::Bytes::from(format!("key_{}", expected)));
                     count += 1;
                 }
@@ -67,6 +67,7 @@ fn test_lock_free_spsc_queue_and_mesh() {
     let h_producer = thread::spawn(move || {
         for i in 0..1000 {
             let msg = rudis::shard::ShardMessage::NotifyList {
+                db: 0,
                 keys: vec![bytes::Bytes::from(format!("key_{}", i))],
             };
             sender_0_to_1.send(msg).unwrap();
@@ -87,7 +88,10 @@ fn test_mesh_async_ping_pong_never_loses_wakeup() {
     let mut receivers = receivers.into_iter();
     let (rx_0, rx_1) = (receivers.next().unwrap(), receivers.next().unwrap());
     let (tx_0, tx_1) = (mesh[0][1].clone(), mesh[1][0].clone());
-    let msg = || rudis::shard::ShardMessage::NotifyList { keys: Vec::new() };
+    let msg = || rudis::shard::ShardMessage::NotifyList {
+        db: 0,
+        keys: Vec::new(),
+    };
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let done_1 = done_tx.clone();
     let run = |f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>| {
@@ -134,8 +138,11 @@ fn test_mesh_flood_past_ring_capacity_keeps_per_sender_order() {
         producers.push(thread::spawn(move || {
             for i in 0..PER_SENDER {
                 let key = bytes::Bytes::from(format!("{}:{}", sender_id, i));
-                tx.send(rudis::shard::ShardMessage::NotifyList { keys: vec![key] })
-                    .unwrap();
+                tx.send(rudis::shard::ShardMessage::NotifyList {
+                    db: 0,
+                    keys: vec![key],
+                })
+                .unwrap();
             }
         }));
     }
@@ -144,7 +151,7 @@ fn test_mesh_flood_past_ring_capacity_keeps_per_sender_order() {
     let mut received = 0;
     while received < 3 * PER_SENDER {
         match rx.try_recv() {
-            Ok(rudis::shard::ShardMessage::NotifyList { keys }) => {
+            Ok(rudis::shard::ShardMessage::NotifyList { keys, .. }) => {
                 let s = std::str::from_utf8(&keys[0]).unwrap();
                 let (sender, seq) = s.split_once(':').unwrap();
                 let (sender, seq): (usize, usize) = (sender.parse().unwrap(), seq.parse().unwrap());

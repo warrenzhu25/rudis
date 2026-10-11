@@ -2260,7 +2260,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
             // Server-wide, by the allocator's count: other shards' published
             // usage plus ours.
             let stats = crate::tiering::get_tier_stats(port);
-            let total = crate::router::local_real_used(&stats, &db_call.borrow().table)
+            let total = crate::router::local_real_used(&stats, &db_call.borrow())
                 + stats.real_used_total(Some(crate::connection::current_shard_id()));
             if total > max_mem as i64 {
                 crate::connection::record_rejected_stat(cmd_name);
@@ -2436,7 +2436,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
             // Server-wide, by the allocator's count: other shards' published
             // usage plus ours.
             let stats = crate::tiering::get_tier_stats(port);
-            let total = crate::router::local_real_used(&stats, &db_pcall.borrow().table)
+            let total = crate::router::local_real_used(&stats, &db_pcall.borrow())
                 + stats.real_used_total(Some(crate::connection::current_shard_id()));
             if total > max_mem as i64 {
                 crate::connection::record_rejected_stat(cmd_name);

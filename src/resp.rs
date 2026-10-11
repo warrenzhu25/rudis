@@ -792,6 +792,14 @@ pub enum Command {
         newkey: Bytes,
         nx: bool,
     },
+    Move {
+        key: Bytes,
+        db: i64,
+    },
+    Swapdb {
+        db1: i64,
+        db2: i64,
+    },
     // EXTENDED STRING COMMANDS
     Setnx {
         key: Bytes,
@@ -5979,10 +5987,14 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() != 2 {
                 return Err("wrong number of arguments for 'select' command".to_string());
             }
-            let idx: u32 = std::str::from_utf8(&args[1])
+            let idx_i64: i64 = std::str::from_utf8(&args[1])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            if idx_i64 < 0 {
+                return Err("DB index is out of range".to_string());
+            }
+            let idx = u32::try_from(idx_i64).map_err(|_| "DB index is out of range".to_string())?;
             Ok(Some(Command::Select(idx)))
         }
         "SLOWLOG" => {
@@ -6123,15 +6135,39 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 nx: true,
             }))
         }
+        "MOVE" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'move' command".to_string());
+            }
+            let db: i64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Move {
+                key: args[1].clone(),
+                db,
+            }))
+        }
+        "SWAPDB" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'swapdb' command".to_string());
+            }
+            let db1: i64 = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "invalid first DB index".to_string())?;
+            let db2: i64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "invalid second DB index".to_string())?;
+            Ok(Some(Command::Swapdb { db1, db2 }))
+        }
         "COPY" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'copy' command".to_string());
             }
             let source = args[1].clone();
             let destination = args[2].clone();
-            if source == destination {
-                return Err("source and destination objects are the same".to_string());
-            }
             let mut replace = false;
             let mut destination_db = None;
             let mut i = 3;
@@ -6152,10 +6188,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .ok()
                             .and_then(|s| s.parse().ok())
                             .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        if db_id != 0 {
+                        if db_id < 0 || db_id as usize >= crate::config::databases_count() {
                             return Err("DB index is out of range".to_string());
                         }
-                        destination_db = Some(db_id as u32);
+                        let db_u32 = u32::try_from(db_id)
+                            .map_err(|_| "DB index is out of range".to_string())?;
+                        destination_db = Some(db_u32);
                         i += 2;
                     }
                     _ => return Err("syntax error".to_string()),

@@ -250,26 +250,23 @@ fn eviction_target(max_mem: usize) -> usize {
 #[inline]
 pub fn local_real_parts(
     stats: &crate::tiering::TieringStats,
-    table: &crate::table::RudisTable,
+    db: &crate::shard::ShardDb,
 ) -> (i64, usize) {
     if stats.real_accounting.load(Ordering::Relaxed) {
         (
             crate::allocator::thread_net_bytes(),
-            table.free_arena_bytes(),
+            db.total_free_arena_bytes(),
         )
     } else {
-        (table.used_memory() as i64, 0)
+        (db.total_used_memory() as i64, 0)
     }
 }
 
 /// [`local_real_parts`] as one number: the shard's contribution to
 /// [`crate::tiering::TieringStats::real_used_total`].
 #[inline]
-pub fn local_real_used(
-    stats: &crate::tiering::TieringStats,
-    table: &crate::table::RudisTable,
-) -> i64 {
-    let (net, slack) = local_real_parts(stats, table);
+pub fn local_real_used(stats: &crate::tiering::TieringStats, db: &crate::shard::ShardDb) -> i64 {
+    let (net, slack) = local_real_parts(stats, db);
     net - slack as i64
 }
 
@@ -843,8 +840,8 @@ impl Router {
         let (estimate, (net, slack)) = {
             let db = self.local_db.borrow();
             (
-                db.table.used_memory(),
-                local_real_parts(&self.tier_stats, &db.table),
+                db.total_used_memory(),
+                local_real_parts(&self.tier_stats, &db),
             )
         };
         self.tier_stats.publish_shard_used(self.shard_id, estimate);
@@ -903,11 +900,11 @@ impl Router {
             let others = self.tier_stats.real_used_total(Some(self.shard_id));
             let mut db = self.local_db.borrow_mut();
             loop {
-                let local = local_real_used(&self.tier_stats, &db.table);
-                if others + local <= target || db.table.used_memory() <= floor {
+                let local = local_real_used(&self.tier_stats, &db);
+                if others + local <= target || db.total_used_memory() <= floor {
                     break;
                 }
-                if db.table.try_evict_one_key(policy).is_none() {
+                if db.try_evict_one_key(policy).is_none() {
                     break;
                 }
             }
@@ -1413,7 +1410,9 @@ impl Router {
         if target == self.shard_id {
             self.get_local_checked(&key).await
         } else {
-            let desc = Arc::new(crate::mailbox::FastGetDescriptor::new(key));
+            let mut desc_inner = crate::mailbox::FastGetDescriptor::new(key);
+            desc_inner.db = crate::connection::CURRENT_DB.get();
+            let desc = Arc::new(desc_inner);
             let msg = ShardMessage::FastGet {
                 descriptor: desc.clone(),
             };
@@ -1611,9 +1610,9 @@ impl Router {
                 self.start_auto_tier_if_over();
             }
         } else {
-            let desc = Arc::new(crate::mailbox::FastSetDescriptor::new(
-                key, value, expire_in,
-            ));
+            let mut desc_inner = crate::mailbox::FastSetDescriptor::new(key, value, expire_in);
+            desc_inner.db = crate::connection::CURRENT_DB.get();
+            let desc = Arc::new(desc_inner);
             let msg = ShardMessage::FastSet {
                 descriptor: desc.clone(),
             };
@@ -1691,6 +1690,7 @@ impl Router {
         pending_shards: usize,
         notify: flume::Sender<()>,
     ) -> Arc<crate::mailbox::ScatterMgetDescriptor> {
+        let cur_db = crate::connection::CURRENT_DB.get();
         let mut pool = self.mget_desc_pool.borrow_mut();
         let mut kept = Vec::new();
         let mut chosen = None;
@@ -1708,14 +1708,17 @@ impl Router {
         pool.extend(kept);
         if let Some(desc) = chosen {
             desc.reset(total_keys, pending_shards, notify);
+            desc.db.store(cur_db, Ordering::Relaxed);
             return desc;
         }
-        Arc::new(crate::mailbox::ScatterMgetDescriptor::new(
+        let desc = Arc::new(crate::mailbox::ScatterMgetDescriptor::new(
             total_keys.max(64),
             self.num_shards,
             pending_shards,
             notify,
-        ))
+        ));
+        desc.db.store(cur_db, Ordering::Relaxed);
+        desc
     }
 
     #[inline(always)]
@@ -1730,6 +1733,7 @@ impl Router {
         pending_shards: usize,
         notify: flume::Sender<()>,
     ) -> Arc<crate::mailbox::ScatterMsetDescriptor> {
+        let cur_db = crate::connection::CURRENT_DB.get();
         let mut pool = self.mset_desc_pool.borrow_mut();
         let mut kept = Vec::new();
         let mut chosen = None;
@@ -1747,13 +1751,16 @@ impl Router {
         pool.extend(kept);
         if let Some(desc) = chosen {
             desc.reset(pending_shards, notify);
+            desc.db.store(cur_db, Ordering::Relaxed);
             return desc;
         }
-        Arc::new(crate::mailbox::ScatterMsetDescriptor::new(
+        let desc = Arc::new(crate::mailbox::ScatterMsetDescriptor::new(
             self.num_shards,
             pending_shards,
             notify,
-        ))
+        ));
+        desc.db.store(cur_db, Ordering::Relaxed);
+        desc
     }
 
     #[inline(always)]
@@ -2209,7 +2216,11 @@ impl Router {
             self.del_local(key)
         } else {
             let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::Del { key, responder: tx };
+            let msg = ShardMessage::Del {
+                db: crate::connection::CURRENT_DB.get(),
+                key,
+                responder: tx,
+            };
             if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
@@ -2247,6 +2258,7 @@ impl Router {
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::DelIfUnchanged {
+                db: crate::connection::CURRENT_DB.get(),
                 key,
                 payload,
                 responder: tx,
@@ -2347,12 +2359,14 @@ impl Router {
         }
 
         // 2. Dispatch batched requests to remote shards concurrently in parallel
+        let cur_db = crate::connection::CURRENT_DB.get();
         let mut responders = Vec::new();
         for (target_shard, shard_keys) in remote_batches.into_iter().enumerate() {
             if !shard_keys.is_empty() {
                 let (tx, rx) = flume::bounded(1);
                 if self.senders[target_shard]
                     .send(ShardMessage::DelKeys {
+                        db: cur_db,
                         keys: shard_keys,
                         responder: tx,
                     })
@@ -2401,7 +2415,11 @@ impl Router {
             self.local_db.borrow_mut().exists_with_hash(&key, hash)
         } else {
             let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::Exists { key, responder: tx };
+            let msg = ShardMessage::Exists {
+                db: crate::connection::CURRENT_DB.get(),
+                key,
+                responder: tx,
+            };
             if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
@@ -2421,6 +2439,7 @@ impl Router {
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::IncrBy {
+                db: crate::connection::CURRENT_DB.get(),
                 key,
                 delta,
                 responder: tx,
@@ -2455,6 +2474,7 @@ impl Router {
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Expire {
+                db: crate::connection::CURRENT_DB.get(),
                 key,
                 duration,
                 opts,
@@ -2478,7 +2498,11 @@ impl Router {
             res
         } else {
             let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::Persist { key, responder: tx };
+            let msg = ShardMessage::Persist {
+                db: crate::connection::CURRENT_DB.get(),
+                key,
+                responder: tx,
+            };
             if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
@@ -2527,6 +2551,7 @@ impl Router {
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Ttl {
+                db: crate::connection::CURRENT_DB.get(),
                 key,
                 in_millis,
                 responder: tx,
@@ -2731,6 +2756,7 @@ impl Router {
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Delex {
+                db: crate::connection::CURRENT_DB.get(),
                 key,
                 condition: condition.map(Box::new),
                 responder: tx,
@@ -2805,7 +2831,7 @@ impl Router {
                 .pipeline_len_cnt
                 .load(std::sync::atomic::Ordering::Relaxed);
             out.push_str(&format!(
-                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
+                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
                 client.id,
                 client.addr,
                 self.port,
@@ -2813,6 +2839,7 @@ impl Router {
                 age,
                 idle,
                 flags,
+                client.db,
                 qbuf,
                 qbuf_free,
                 client.omem,
@@ -2888,6 +2915,7 @@ impl Router {
             .map(|k| crate::table::hash_key(k))
             .unwrap_or(0);
         let msg = ShardMessage::Batch {
+            db: crate::connection::CURRENT_DB.get(),
             items: vec![(0, h, cmd)],
             responder: responder.clone(),
             is_resp3,
@@ -2963,6 +2991,7 @@ impl Router {
         between: impl FnOnce(),
     ) -> Vec<Vec<u8>> {
         let is_resp3 = crate::connection::CURRENT_CLIENT_RESP3.get();
+        let cur_db = crate::connection::CURRENT_DB.get();
         // Remote shards write into these slots through raw pointers: the
         // boxed slice is never resized and outlives every wait below.
         let mut slots: Box<[crate::shard::CompactResp]> = (0..cmds.len())
@@ -2980,6 +3009,7 @@ impl Router {
                 .map(|k| crate::table::hash_key(k))
                 .unwrap_or(0);
             let msg = ShardMessage::Batch {
+                db: cur_db,
                 items: vec![(0, h, cmd)],
                 responder: responder.clone(),
                 is_resp3,
@@ -3063,7 +3093,7 @@ impl Router {
         total
     }
 
-    /// Server-wide `(keys, keys with a TTL)` for `INFO keyspace`.
+    /// Server-wide `(keys, keys with a TTL)` for the current DB.
     pub async fn keyspace_stats(&self) -> (usize, usize) {
         let (mut keys, mut expires) = {
             let mut db = self.local_db.borrow_mut();
@@ -3088,6 +3118,41 @@ impl Router {
             expires += nums.next().unwrap_or(0);
         }
         (keys, expires)
+    }
+
+    /// Server-wide `(keys, keys with a TTL)` per non-empty database for `INFO keyspace`.
+    pub async fn keyspace_stats_by_db(&self) -> std::collections::BTreeMap<usize, (usize, usize)> {
+        let mut map = std::collections::BTreeMap::new();
+        {
+            let db = self.local_db.borrow();
+            for (db_idx, k, exp, _) in db.keyspace_stats_by_db() {
+                let entry = map.entry(db_idx).or_insert((0, 0));
+                entry.0 += k;
+                entry.1 += exp;
+            }
+        }
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender
+                    .send(ShardMessage::KeyspaceStats { responder: tx })
+                    .is_ok()
+                {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            if let Ok(stats) = rx.recv_async().await {
+                for (db_idx, k, exp, _) in stats {
+                    let entry = map.entry(db_idx).or_insert((0, 0));
+                    entry.0 += k;
+                    entry.1 += exp;
+                }
+            }
+        }
+        map
     }
 
     /// `DEBUG DIGEST`: XOR of every shard's key digests (see
@@ -3251,17 +3316,90 @@ impl Router {
     }
 
     pub async fn flushdb(&self) {
+        let cur_db = crate::connection::CURRENT_DB.get();
         {
             let mut db = self.local_db.borrow_mut();
+            db.select_db(cur_db);
             db.flushdb();
             crate::block::get_block_hub_for_port(self.port)
                 .lock()
                 .notify_all_streams(&mut db);
         }
         self.log_mutation(|| Command::Flushdb);
-        let _ = self
-            .execute_remote_many(self.to_other_shards(|| Command::Flushdb))
-            .await;
+        self.publish_memory_state();
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender
+                    .send(ShardMessage::FlushDb {
+                        db: cur_db,
+                        responder: tx,
+                    })
+                    .is_ok()
+                {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            let _ = rx.recv_async().await;
+        }
+    }
+
+    pub async fn flushall(&self) {
+        {
+            let mut db = self.local_db.borrow_mut();
+            db.flushall();
+            crate::block::get_block_hub_for_port(self.port)
+                .lock()
+                .notify_all_streams(&mut db);
+        }
+        self.log_mutation(|| Command::Flushall);
+        self.publish_memory_state();
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender
+                    .send(ShardMessage::FlushAll { responder: tx })
+                    .is_ok()
+                {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            let _ = rx.recv_async().await;
+        }
+    }
+
+    pub async fn swapdb(&self, db1: usize, db2: usize) {
+        self.local_db.borrow_mut().swap_dbs(db1, db2);
+        crate::connection::touch_watched_keys_on_swapdb(self.port, db1, db2);
+        self.log_mutation(|| Command::Swapdb {
+            db1: db1 as i64,
+            db2: db2 as i64,
+        });
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender
+                    .send(ShardMessage::SwapDb {
+                        db1,
+                        db2,
+                        responder: tx,
+                    })
+                    .is_ok()
+                {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            let _ = rx.recv_async().await;
+        }
     }
 
     pub async fn publish(&self, channel: Bytes, message: Bytes) -> usize {
@@ -3823,12 +3961,14 @@ impl Router {
     }
 
     pub async fn keys(&self, pattern: &[u8]) -> Vec<Bytes> {
+        let cur_db = crate::connection::CURRENT_DB.get();
         let mut all_keys = self.local_db.borrow_mut().keys(pattern);
         let mut pending = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
                 let msg = ShardMessage::Keys {
+                    db: cur_db,
                     pattern: Bytes::copy_from_slice(pattern),
                     responder: tx,
                 };
@@ -3852,6 +3992,7 @@ impl Router {
         count: usize,
         key_type: Option<&[u8]>,
     ) -> (u64, Vec<Bytes>) {
+        let cur_db = crate::connection::CURRENT_DB.get();
         let mut shard_id = (cursor >> 32) as usize;
         let mut slot_idx = (cursor & 0xFFFF_FFFF) as usize;
         if shard_id >= self.num_shards {
@@ -3868,6 +4009,7 @@ impl Router {
             } else {
                 let (tx, rx) = flume::bounded(1);
                 let msg = ShardMessage::Scan {
+                    db: cur_db,
                     params: Box::new(crate::shard::ScanParams {
                         slot: slot_idx,
                         pattern: pattern.map(Bytes::copy_from_slice),
@@ -3906,6 +4048,7 @@ impl Router {
     }
 
     pub async fn random_key(&self) -> Option<Bytes> {
+        let cur_db = crate::connection::CURRENT_DB.get();
         let num_shards = self.senders.len();
         if num_shards <= 1 {
             return self.local_db.borrow_mut().random_key();
@@ -3920,7 +4063,10 @@ impl Router {
             } else {
                 let (tx, rx) = flume::bounded(1);
                 if self.senders[sid]
-                    .send(ShardMessage::RandomKey { responder: tx })
+                    .send(ShardMessage::RandomKey {
+                        db: cur_db,
+                        responder: tx,
+                    })
                     .is_ok()
                     && let Ok(Some(k)) = rx.recv_async().await
                 {
@@ -3938,6 +4084,7 @@ impl Router {
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::ExpireTime {
+                db: crate::connection::CURRENT_DB.get(),
                 key,
                 in_millis,
                 responder: tx,
@@ -4146,7 +4293,7 @@ impl Router {
     /// `replication::FullSyncCut`).
     pub async fn generate_full_rdb(&self, arm_replica: Option<u64>) -> Vec<u8> {
         let mut full_rdb = Vec::new();
-        let used_mem = self.local_db.borrow().table.used_memory() as u64;
+        let used_mem = self.local_db.borrow().total_used_memory() as u64;
         crate::redis_rdb::write_file_header(&mut full_rdb, used_mem);
 
         // Local shard chunk
@@ -4254,6 +4401,7 @@ impl Router {
     /// Sends each shard its deferred replicated commands in one message and
     /// waits until all of them are applied.
     pub async fn flush_replica_batch(&self, batch: &mut [Vec<Command>]) {
+        let cur_db = crate::connection::CURRENT_DB.get();
         let (tx, rx) = flume::unbounded();
         let mut sent = 0;
         for (target, cmds) in batch.iter_mut().enumerate() {
@@ -4261,6 +4409,7 @@ impl Router {
                 continue;
             }
             let msg = ShardMessage::ExecuteReplicaCmds {
+                db: cur_db,
                 cmds: std::mem::take(cmds),
                 responder: tx.clone(),
             };
@@ -4289,6 +4438,7 @@ impl Router {
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::ExecuteReplicaCmd {
+                db: crate::connection::CURRENT_DB.get(),
                 cmd: Box::new(cmd),
                 responder: tx,
             };
@@ -4303,14 +4453,60 @@ impl Router {
             self.apply_replica_on(target, cmd).await;
         } else {
             match cmd {
-                Command::Flushall | Command::Flushdb => {
-                    self.local_db.borrow_mut().flushdb();
+                Command::Select(idx) => {
+                    let db_idx = idx as usize;
+                    crate::connection::CURRENT_DB.set(db_idx);
+                    self.local_db.borrow_mut().select_db(db_idx);
+                }
+                Command::Flushdb => {
+                    let cur_db = crate::connection::CURRENT_DB.get();
+                    {
+                        let mut db = self.local_db.borrow_mut();
+                        db.select_db(cur_db);
+                        db.flushdb();
+                    }
+                    crate::connection::touch_watched_keys_on_flushdb(self.port, cur_db);
                     for (sid, sender) in self.senders.iter().enumerate() {
                         if sid != self.shard_id {
                             let (tx, rx) = flume::bounded(1);
                             if sender
-                                .send(ShardMessage::ExecuteReplicaCmd {
-                                    cmd: Box::new(Command::Flushall),
+                                .send(ShardMessage::FlushDb {
+                                    db: cur_db,
+                                    responder: tx,
+                                })
+                                .is_ok()
+                            {
+                                let _ = rx.recv_async().await;
+                            }
+                        }
+                    }
+                }
+                Command::Flushall => {
+                    self.local_db.borrow_mut().flushall();
+                    crate::connection::touch_watched_keys_on_flushall(self.port);
+                    for (sid, sender) in self.senders.iter().enumerate() {
+                        if sid != self.shard_id {
+                            let (tx, rx) = flume::bounded(1);
+                            if sender
+                                .send(ShardMessage::FlushAll { responder: tx })
+                                .is_ok()
+                            {
+                                let _ = rx.recv_async().await;
+                            }
+                        }
+                    }
+                }
+                Command::Swapdb { db1, db2 } => {
+                    let (d1, d2) = (db1.max(0) as usize, db2.max(0) as usize);
+                    self.local_db.borrow_mut().swap_dbs(d1, d2);
+                    crate::connection::touch_watched_keys_on_swapdb(self.port, d1, d2);
+                    for (sid, sender) in self.senders.iter().enumerate() {
+                        if sid != self.shard_id {
+                            let (tx, rx) = flume::bounded(1);
+                            if sender
+                                .send(ShardMessage::SwapDb {
+                                    db1: d1,
+                                    db2: d2,
                                     responder: tx,
                                 })
                                 .is_ok()
@@ -4394,7 +4590,7 @@ impl Router {
         let (done_tx, done_rx) = flume::bounded::<Result<(), String>>(1);
         let tmp_path = tmp_filename.to_path_buf();
         let mut header = Vec::new();
-        let used_mem = self.local_db.borrow().table.used_memory() as u64;
+        let used_mem = self.local_db.borrow().total_used_memory() as u64;
         crate::redis_rdb::write_file_header(&mut header, used_mem);
         std::thread::Builder::new()
             .name("rdb-writer".into())
@@ -5019,7 +5215,9 @@ mod tests {
                         descriptor.recycle_keys(shard_id, keys);
                         descriptor.finish_shard();
                     }
-                    ShardMessage::Mset { pairs, responder } => {
+                    ShardMessage::Mset {
+                        pairs, responder, ..
+                    } => {
                         for (k, v) in &pairs {
                             db.set(k.clone(), v.clone(), None);
                         }
@@ -5028,6 +5226,7 @@ mod tests {
                     ShardMessage::Mget {
                         mut keys,
                         responder,
+                        ..
                     } => {
                         for item in &mut keys {
                             let val = db.get(item.1.as_ref().unwrap());
@@ -5184,7 +5383,9 @@ mod tests {
                         descriptor.recycle_keys(shard_id, keys);
                         descriptor.finish_shard();
                     }
-                    ShardMessage::Mset { pairs, responder } => {
+                    ShardMessage::Mset {
+                        pairs, responder, ..
+                    } => {
                         for (k, v) in &pairs {
                             remote_db.set(k.clone(), v.clone(), None);
                         }
@@ -5193,6 +5394,7 @@ mod tests {
                     ShardMessage::Mget {
                         mut keys,
                         responder,
+                        ..
                     } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
@@ -5285,6 +5487,7 @@ mod tests {
                     ShardMessage::Mget {
                         mut keys,
                         responder,
+                        ..
                     } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
@@ -5352,10 +5555,6 @@ mod tests {
                     ShardMessage::FastGet { descriptor } => {
                         let val = remote_db.get(&descriptor.key);
                         descriptor.finish(val);
-                    }
-                    ShardMessage::Get { key, responder } => {
-                        let val = remote_db.get(&key);
-                        let _ = responder.send(val);
                     }
                     ShardMessage::Batch {
                         mut items,
@@ -5472,6 +5671,7 @@ mod tests {
                     ShardMessage::Mget {
                         mut keys,
                         responder,
+                        ..
                     } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
@@ -5479,7 +5679,9 @@ mod tests {
                         }
                         let _ = responder.send(keys);
                     }
-                    ShardMessage::Mset { pairs, responder } => {
+                    ShardMessage::Mset {
+                        pairs, responder, ..
+                    } => {
                         for (k, v) in &pairs {
                             remote_db.set(k.clone(), v.clone(), None);
                         }
@@ -5604,6 +5806,7 @@ mod tests {
                     ShardMessage::Mget {
                         mut keys,
                         responder,
+                        ..
                     } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
@@ -5611,7 +5814,9 @@ mod tests {
                         }
                         let _ = responder.send(keys);
                     }
-                    ShardMessage::Mset { pairs, responder } => {
+                    ShardMessage::Mset {
+                        pairs, responder, ..
+                    } => {
                         for (k, v) in &pairs {
                             remote_db.set(k.clone(), v.clone(), None);
                         }
@@ -5711,6 +5916,7 @@ mod tests {
                     ShardMessage::Mget {
                         mut keys,
                         responder,
+                        ..
                     } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
@@ -5718,7 +5924,9 @@ mod tests {
                         }
                         let _ = responder.send(keys);
                     }
-                    ShardMessage::Mset { pairs, responder } => {
+                    ShardMessage::Mset {
+                        pairs, responder, ..
+                    } => {
                         for (k, v) in &pairs {
                             remote_db.set(k.clone(), v.clone(), None);
                         }
@@ -5874,15 +6082,6 @@ mod tests {
             let mut remote_db = ShardDb::new(9997);
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
-                    ShardMessage::Set {
-                        key,
-                        value,
-                        expire_in,
-                        responder,
-                    } => {
-                        remote_db.set(key, value, expire_in);
-                        let _ = responder.send(());
-                    }
                     ShardMessage::FastSet { descriptor } => {
                         remote_db.set(
                             descriptor.key.clone(),
@@ -5891,7 +6090,9 @@ mod tests {
                         );
                         descriptor.finish();
                     }
-                    ShardMessage::DelKeys { keys, responder } => {
+                    ShardMessage::DelKeys {
+                        keys, responder, ..
+                    } => {
                         let mut count = 0;
                         for k in keys {
                             if remote_db.del(&k) {
@@ -5900,7 +6101,7 @@ mod tests {
                         }
                         let _ = responder.send(count);
                     }
-                    ShardMessage::Exists { key, responder } => {
+                    ShardMessage::Exists { key, responder, .. } => {
                         let ex = remote_db.exists(&key);
                         let _ = responder.send(ex);
                     }

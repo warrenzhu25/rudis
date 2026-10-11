@@ -516,42 +516,9 @@ pub fn run_shard_worker(
                             }
                         }
                     }
-                    ShardMessage::Get { key, responder } => {
-                        let val = cross_shard_db.borrow_mut().get(&key);
-                        if let Some(v) = val {
-                            let _ = responder.send(Some(v));
-                        } else if cross_shard_db.borrow_mut().table.is_tiered(&key).is_some() {
-                            let r = cross_shard_router.clone();
-                            monoio::spawn(async move {
-                                let val = r.read_cold_key_local(&key).await;
-                                let _ = responder.send(val);
-                            });
-                        } else {
-                            let _ = responder.send(None);
-                        }
-                    }
-                    ShardMessage::Set {
-                        key,
-                        value,
-                        expire_in,
-                        responder,
-                    } => {
-                        crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Set {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    expire_in,
-                                    condition: crate::resp::SetCondition::None,
-                                    get: false,
-                                    keepttl: false,
-                                    past_expired: false,
-                                });
-                        cross_shard_db
-                            .borrow_mut()
-                            .set(key, value, expire_in);
-                        cross_shard_router.check_auto_tier_after_write();
-                        let _ = responder.send(());
-                    }
                     ShardMessage::FastGet { descriptor } => {
+                        crate::connection::CURRENT_DB.set(descriptor.db);
+                        cross_shard_db.borrow_mut().select_db(descriptor.db);
                         let prev_no_touch = crate::connection::CLIENT_NO_TOUCH.replace(descriptor.no_touch);
                         let val = cross_shard_db.borrow_mut().get_checked(&descriptor.key);
                         crate::connection::CLIENT_NO_TOUCH.set(prev_no_touch);
@@ -570,6 +537,8 @@ pub fn run_shard_worker(
                         }
                     }
                     ShardMessage::FastSet { descriptor } => {
+                        crate::connection::CURRENT_DB.set(descriptor.db);
+                        cross_shard_db.borrow_mut().select_db(descriptor.db);
                         crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Set {
                                     key: descriptor.key.clone(),
                                     value: descriptor.value.clone(),
@@ -590,31 +559,37 @@ pub fn run_shard_worker(
                         cross_shard_router.check_auto_tier_after_write();
                         descriptor.finish();
                     }
-                    ShardMessage::Del { key, responder } => {
-                        let mut db = cross_shard_db.borrow_mut();
-                        let deleted = db.del(&key);
+                    ShardMessage::Del { db, key, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
+                        let deleted = sdb.del(&key);
                         if deleted {
-                            db.delete_document_local(&String::from_utf8_lossy(&key));
+                            sdb.delete_document_local(&String::from_utf8_lossy(&key));
                             crate::connection::notify_keyspace_event_sync(&cross_shard_router, crate::connection::NOTIFY_GENERIC, "del", &key);
-                            crate::connection::notify_stream_or_defer(&mut db, &key);
+                            crate::connection::notify_stream_or_defer(&mut sdb, &key);
                             crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Del(smallvec![
                                         key,
                                     ]));
                         }
                         let _ = responder.send(deleted);
                     }
-                    ShardMessage::DelIfUnchanged { key, payload, responder } => {
+                    ShardMessage::DelIfUnchanged { db, key, payload, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        cross_shard_db.borrow_mut().select_db(db);
                         let _ = responder.send(cross_shard_router.del_if_unchanged_local(key, &payload));
                     }
-                    ShardMessage::DelKeys { keys, responder } => {
+                    ShardMessage::DelKeys { db, keys, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
                         let mut count = 0usize;
                         let mut deleted_keys = Vec::with_capacity(keys.len());
                         {
-                            let mut db = cross_shard_db.borrow_mut();
+                            let mut sdb = cross_shard_db.borrow_mut();
+                            sdb.select_db(db);
                             for k in keys {
-                                if db.del(&k) {
+                                if sdb.del(&k) {
                                     count += 1;
-                                    db.delete_document_local(&String::from_utf8_lossy(&k));
+                                    sdb.delete_document_local(&String::from_utf8_lossy(&k));
                                     crate::connection::notify_keyspace_event_sync(&cross_shard_router, crate::connection::NOTIFY_GENERIC, "del", &k);
                                     deleted_keys.push(k);
                                 }
@@ -629,28 +604,40 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let freed = cross_shard_db.borrow_mut().active_defrag();
                         let _ = responder.send(freed);
                     }
-                    ShardMessage::Exists { key, responder } => {
-                        let exists = cross_shard_db.borrow_mut().exists(&key);
+                    ShardMessage::Exists { db, key, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
+                        let exists = sdb.exists(&key);
                         let _ = responder.send(exists);
                     }
                     ShardMessage::IncrBy {
+                        db,
                         key,
                         delta,
                         responder,
                     } => {
-                        let res = cross_shard_db.borrow_mut().incr_by(key.clone(), delta);
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
+                        let res = sdb.incr_by(key.clone(), delta);
                         if res.is_ok() {
 crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::IncrBy(key, delta, crate::resp::IncrName::IncrBy));
 }
                         let _ = responder.send(res);
                     }
                     ShardMessage::Expire {
+                        db,
                         key,
                         duration,
                         opts,
                         responder,
                     } => {
-                        let res = cross_shard_db.borrow_mut().expire(&key, duration, opts);
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
+                        let res = sdb.expire(&key, duration, opts);
+                        drop(sdb);
                         if res {
                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
@@ -666,8 +653,12 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         }
                         let _ = responder.send(res);
                     }
-                    ShardMessage::Persist { key, responder } => {
-                        let res = cross_shard_db.borrow_mut().persist(&key);
+                    ShardMessage::Persist { db, key, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
+                        let res = sdb.persist(&key);
+                        drop(sdb);
                         if res {
                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
@@ -680,11 +671,15 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let _ = responder.send(res);
                     }
                     ShardMessage::Ttl {
+                        db,
                         key,
                         in_millis,
                         responder,
                     } => {
-                        let res = cross_shard_db.borrow_mut().ttl(&key, in_millis);
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
+                        let res = sdb.ttl(&key, in_millis);
                         let _ = responder.send(res);
                     }
                     ShardMessage::CountKeysInSlot { slot, responder } => {
@@ -730,7 +725,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             let pipe_sum = client.stats.pipeline_len_sum.load(std::sync::atomic::Ordering::Relaxed);
                             let pipe_cnt = client.stats.pipeline_len_cnt.load(std::sync::atomic::Ordering::Relaxed);
                             out.push_str(&format!(
-                                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
+                                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
                                 client.id,
                                 client.addr,
                                 port,
@@ -738,6 +733,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                 age,
                                 idle,
                                 flags,
+                                client.db,
                                 qbuf,
                                 qbuf_free,
                                 client.omem,
@@ -755,6 +751,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let _ = responder.send(out);
                     }
                     ShardMessage::Batch {
+                        db: batch_db,
                         mut items,
                         responder,
                         is_resp3,
@@ -770,6 +767,8 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             let aof_ref = cross_shard_aof.clone();
                             monoio::spawn(async move {
                                 crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
+                                crate::connection::CURRENT_DB.set(batch_db);
+                                r.local_db.borrow_mut().select_db(batch_db);
                                 let mut temp_buf = Vec::new();
                                 let mut has_writes = false;
                                 for (idx, key_hash, cmd) in items.drain(..) {
@@ -1159,6 +1158,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             });
                         } else {
                             crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
+                            crate::connection::CURRENT_DB.set(batch_db);
                             let prev_no_touch = crate::connection::CLIENT_NO_TOUCH.replace(no_touch);
                             let prev_defer = crate::connection::DEFER_BCAST_FLUSH.replace(defer_bcast);
                             let has_tracking = crate::connection::HAS_TRACKING_CLIENTS
@@ -1167,6 +1167,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             // script stats).
                             let prev_cid = crate::connection::CURRENT_CLIENT_ID.replace(client_id);
                             let mut db = cross_shard_db.borrow_mut();
+                            db.select_db(batch_db);
                             let aof_ref = cross_shard_aof.as_deref();
                             let mut temp_buf = Vec::new();
                             let mut has_writes = false;
@@ -1515,6 +1516,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     }
                                 } else if let Command::Eval { script, keys, args, read_only, auth_user } = &cmd {
                                     crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+                                    let saved_db = crate::connection::CURRENT_DB.get();
                                     drop(db);
                                     let script_str = String::from_utf8_lossy(script);
                                     crate::scripting::load_script(script);
@@ -1531,9 +1533,12 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                             crate::connection::write_resp_err(&mut temp_buf, e);
                                         }
                                     }
+                                    crate::connection::CURRENT_DB.set(saved_db);
                                     db = cross_shard_db.borrow_mut();
+                                    db.select_db(saved_db);
                                 } else if let Command::Evalsha { sha, keys, args, read_only, auth_user } = &cmd {
                                     crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+                                    let saved_db = crate::connection::CURRENT_DB.get();
                                     drop(db);
                                     let sha_str = String::from_utf8_lossy(sha);
                                     if let Some(script) = crate::scripting::get_script(&sha_str) {
@@ -1553,9 +1558,12 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     } else {
                                         temp_buf.extend_from_slice(b"-NOSCRIPT No matching script. Please use EVAL.\r\n");
                                     }
+                                    crate::connection::CURRENT_DB.set(saved_db);
                                     db = cross_shard_db.borrow_mut();
+                                    db.select_db(saved_db);
                                 } else if let Command::Fcall { function, keys, args, read_only, auth_user } = &cmd {
                                     crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+                                    let saved_db = crate::connection::CURRENT_DB.get();
                                     drop(db);
                                     match crate::scripting::call_function(
                                         function,
@@ -1568,7 +1576,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                         Ok(res) => temp_buf.extend_from_slice(&res),
                                         Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                     }
+                                    crate::connection::CURRENT_DB.set(saved_db);
                                     db = cross_shard_db.borrow_mut();
+                                    db.select_db(saved_db);
                                 } else {
                                     if cmd.is_write_command() {
                                         has_writes = true;
@@ -1606,8 +1616,10 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             }
                         }
                     }
-                    ShardMessage::Mget { mut keys, responder } => {
+                    ShardMessage::Mget { db: mget_db, mut keys, responder } => {
+                        crate::connection::CURRENT_DB.set(mget_db);
                         let mut db = cross_shard_db.borrow_mut();
+                        db.select_db(mget_db);
                         let mut cold_idx = None;
                         for (i, item) in keys.iter_mut().enumerate() {
                             let key = item.1.as_ref().unwrap();
@@ -1645,9 +1657,11 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             let _ = responder.send(keys);
                         }
                     }
-                    ShardMessage::Mset { mut pairs, responder } => {
+                    ShardMessage::Mset { db: mset_db, mut pairs, responder } => {
+                        crate::connection::CURRENT_DB.set(mset_db);
                         {
                             let mut db = cross_shard_db.borrow_mut();
+                            db.select_db(mset_db);
                             if cross_shard_aof.is_some() {
                                 for (k, v) in &pairs {
                                     db.set(k.clone(), v.clone(), None);
@@ -1669,8 +1683,11 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         descriptor,
                         no_touch,
                     } => {
+                        let req_db = descriptor.db.load(std::sync::atomic::Ordering::Relaxed);
+                        crate::connection::CURRENT_DB.set(req_db);
                         let prev_no_touch = crate::connection::CLIENT_NO_TOUCH.replace(no_touch);
                         let mut db = cross_shard_db.borrow_mut();
+                        db.select_db(req_db);
                         let has_tiering = db.tier_manager.is_some();
                         let mut cold_keys = None;
 
@@ -1731,6 +1748,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         mut pairs,
                         descriptor,
                     } => {
+                        let req_db = descriptor.db.load(std::sync::atomic::Ordering::Relaxed);
+                        crate::connection::CURRENT_DB.set(req_db);
+                        cross_shard_db.borrow_mut().select_db(req_db);
                         crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Mset(pairs.clone()));
                         {
                             let mut db = cross_shard_db.borrow_mut();
@@ -1925,12 +1945,66 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         };
                         let _ = responder.send(res);
                     }
-                    ShardMessage::Keys { pattern, responder } => {
-                        let keys = cross_shard_db.borrow_mut().keys(&pattern);
+                    ShardMessage::FlushDb { db, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut db_ref = cross_shard_db.borrow_mut();
+                        db_ref.select_db(db);
+                        db_ref.flushdb();
+                        crate::block::get_block_hub_for_port(db_ref.port)
+                            .lock()
+                            .notify_all_streams(&mut db_ref);
+                        drop(db_ref);
+                        if let Some(aof) = cross_shard_aof.as_deref()
+                            && let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Flushdb)
+                        {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                        cross_shard_router.publish_memory_state();
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::FlushAll { responder } => {
+                        let mut db_ref = cross_shard_db.borrow_mut();
+                        db_ref.flushall();
+                        crate::block::get_block_hub_for_port(db_ref.port)
+                            .lock()
+                            .notify_all_streams(&mut db_ref);
+                        drop(db_ref);
+                        if let Some(aof) = cross_shard_aof.as_deref()
+                            && let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Flushall)
+                        {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                        cross_shard_router.publish_memory_state();
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::SwapDb { db1, db2, responder } => {
+                        cross_shard_db.borrow_mut().swap_dbs(db1, db2);
+                        if let Some(aof) = cross_shard_aof.as_deref()
+                            && let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Swapdb {
+                                db1: db1 as i64,
+                                db2: db2 as i64,
+                            })
+                        {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::KeyspaceStats { responder } => {
+                        let stats = cross_shard_db.borrow().keyspace_stats_by_db();
+                        let _ = responder.send(stats);
+                    }
+                    ShardMessage::Keys { db, pattern, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
+                        let keys = sdb.keys(&pattern);
                         let _ = responder.send(keys);
                     }
-                    ShardMessage::Scan { params, responder } => {
-                        let res = cross_shard_db.borrow_mut().scan(
+                    ShardMessage::Scan { db, params, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
+                        let res = sdb.scan(
                             params.slot,
                             params.pattern.as_deref(),
                             params.count,
@@ -1938,16 +2012,23 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         );
                         let _ = responder.send(res);
                     }
-                    ShardMessage::RandomKey { responder } => {
-                        let key = cross_shard_db.borrow_mut().random_key();
+                    ShardMessage::RandomKey { db, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
+                        let key = sdb.random_key();
                         let _ = responder.send(key);
                     }
                     ShardMessage::ExpireTime {
+                        db,
                         key,
                         in_millis,
                         responder,
                     } => {
-                        let res = cross_shard_db.borrow_mut().expiretime(&key, in_millis);
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
+                        let res = sdb.expiretime(&key, in_millis);
                         let _ = responder.send(res);
                     }
                     ShardMessage::AcquireTxLock { tx_id, responder } => {
@@ -1976,21 +2057,25 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let aof = aof_dir.as_deref().zip(cross_shard_aof.as_ref());
                         let _ = responder.send(db.load_full_sync_rdb(&data, shard_id, num_shards, aof));
                     }
-                    ShardMessage::ExecuteReplicaCmd { cmd, responder } => {
-                        let mut db = cross_shard_db.borrow_mut();
+                    ShardMessage::ExecuteReplicaCmd { db, cmd, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
                         let mut dummy_out = Vec::new();
                         let aof_ref = cross_shard_aof.as_deref();
-                        crate::connection::apply_replicated_command(&cmd, &mut db, &mut dummy_out, aof_ref);
+                        crate::connection::apply_replicated_command(&cmd, &mut sdb, &mut dummy_out, aof_ref);
                         let _ = responder.send(());
                     }
-                    ShardMessage::ExecuteReplicaCmds { cmds, responder } => {
-                        let mut db = cross_shard_db.borrow_mut();
+                    ShardMessage::ExecuteReplicaCmds { db, cmds, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
                         let mut dummy_out = Vec::new();
                         let aof_ref = cross_shard_aof.as_deref();
                         for cmd in &cmds {
                             crate::connection::apply_replicated_command(
                                 cmd,
-                                &mut db,
+                                &mut sdb,
                                 &mut dummy_out,
                                 aof_ref,
                             );
@@ -2005,8 +2090,10 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         crate::connection::reset_local_cmd_stats();
                         let _ = responder.send(());
                     }
-                    ShardMessage::NotifyList { keys } => {
+                    ShardMessage::NotifyList { db: target_db, keys } => {
+                        crate::connection::CURRENT_DB.set(target_db);
                         let mut db = cross_shard_db.borrow_mut();
+                        db.select_db(target_db);
                         let hub_arc = crate::block::get_block_hub_for_port(db.port);
                         let mut hub = hub_arc.lock();
                         for k in keys {
@@ -2051,14 +2138,14 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let r = cross_shard_router.clone();
                         monoio::spawn(async move {
                             r.check_auto_tier_local().await;
-                            let used = r.local_db.borrow().table.used_memory();
+                            let used = r.local_db.borrow().total_used_memory();
                             let _ = responder.send(used);
                         });
                     }
                     ShardMessage::GetUsedMemory { responder } => {
                         // Also republishes this shard's allocator count.
                         cross_shard_router.publish_memory_state();
-                        let used = cross_shard_db.borrow().table.used_memory();
+                        let used = cross_shard_db.borrow().total_used_memory();
                         let _ = responder.send(used);
                     }
                     ShardMessage::EvictUntilUnder {
@@ -2072,11 +2159,11 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let ((), track) = crate::connection::with_evict_capture(client_id, || {
                             cross_shard_router.evict_local_until_under(&policy, floor);
                         });
-                        let used = cross_shard_db.borrow().table.used_memory();
+                        let used = cross_shard_db.borrow().total_used_memory();
                         let _ = responder.send((used, track));
                     }
                     ShardMessage::TryEvictOneKey { policy, responder } => {
-                        let freed = cross_shard_db.borrow_mut().table.try_evict_one_key(&policy);
+                        let freed = cross_shard_db.borrow_mut().try_evict_one_key(&policy);
                         let _ = responder.send(freed);
                     }
                     ShardMessage::StreamColdRead { key, responder } => {
@@ -2125,13 +2212,15 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let sticky = cross_shard_db.borrow().is_sticky(&key);
                         let _ = responder.send(sticky);
                     }
-                    ShardMessage::Delex { key, condition, responder } => {
-                        let mut db = cross_shard_db.borrow_mut();
+                    ShardMessage::Delex { db, key, condition, responder } => {
+                        crate::connection::CURRENT_DB.set(db);
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.select_db(db);
                         let should_del = match condition {
                             None => true,
                             Some(cond) => {
                                 let (op, expected) = &*cond;
-                                if let Some(val) = db.get(&key) {
+                                if let Some(val) = sdb.get(&key) {
                                     match op.to_uppercase().as_str() {
                                         "IFEQ" => val == expected,
                                         "IFNE" => val != expected,
@@ -2145,7 +2234,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             }
                         };
                         if should_del {
-                            let deleted = db.del(&key);
+                            let deleted = sdb.del(&key);
                             let _ = responder.send(deleted);
                         } else {
                             let _ = responder.send(false);

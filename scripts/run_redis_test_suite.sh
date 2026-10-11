@@ -151,7 +151,6 @@ for suite in "${TARGET_SUITES[@]}"; do
     if tclsh test_helper.tcl \
         --host 127.0.0.1 \
         --port "$PORT" \
-        --singledb \
         --ignore-encoding \
         --ignore-digest \
         --tags "-needs:repl -needs:debug -needs:config-rewrite -needs:pfdebug -needs:config-maxmemory" \

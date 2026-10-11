@@ -282,6 +282,7 @@ pub struct ReplicationBacklog {
     pub len: usize,
     pub max_size: usize,
     pub first_byte_offset: u64,
+    pub stream_db: usize,
 }
 
 impl ReplicationBacklog {
@@ -292,6 +293,7 @@ impl ReplicationBacklog {
             len: 0,
             max_size,
             first_byte_offset: 1,
+            stream_db: 0,
         }
     }
 
@@ -311,6 +313,7 @@ impl ReplicationBacklog {
         self.write_idx = 0;
         self.len = 0;
         self.first_byte_offset = current_master_offset + 1;
+        self.stream_db = 0;
     }
 
     pub fn append(&mut self, data: &[u8], current_master_offset: u64) {
@@ -656,6 +659,10 @@ impl ReplicationHub {
         self.insert_replica(id, sender, Some(cut))
     }
 
+    pub fn reset_stream_db(&self) {
+        self.backlog.write().stream_db = usize::MAX;
+    }
+
     /// Called on shard `shard_id`'s thread right after it serialized its
     /// snapshot for replica `id`.
     pub fn arm_full_sync(&self, id: u64, shard_id: usize) {
@@ -673,7 +680,8 @@ impl ReplicationHub {
     /// right after the snapshot; from then on the replica gets the live
     /// stream, so its offset matches the master's.
     pub fn finish_full_sync(&self, id: u64) -> (u64, Vec<u8>) {
-        let _backlog = self.backlog.write();
+        let mut backlog = self.backlog.write();
+        backlog.stream_db = usize::MAX;
         let offset = self.master_repl_offset.load(Ordering::SeqCst);
         let pre = match self.replicas.read().get(&id) {
             Some(rep) => match &rep.full_sync {
@@ -960,33 +968,55 @@ impl ReplicationHub {
         if self.backlog_active.load(Ordering::Relaxed) || self.has_replicas.load(Ordering::Relaxed)
         {
             let mut wake: Vec<Arc<ConnectedReplica>> = Vec::new();
+            let mut select_prefixed: Vec<u8>;
             {
                 let mut backlog = self.backlog.write();
+                let db = crate::connection::CURRENT_DB.get();
+                let payload: &[u8] = if db != backlog.stream_db
+                    && bytes.starts_with(b"*")
+                    && !bytes.starts_with(b"*2\r\n$6\r\nSELECT\r\n")
+                {
+                    backlog.stream_db = db;
+                    let db_str = db.to_string();
+                    select_prefixed =
+                        format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{}\r\n", db_str.len(), db_str)
+                            .into_bytes();
+                    select_prefixed.extend_from_slice(bytes);
+                    &select_prefixed
+                } else {
+                    bytes
+                };
                 if self.backlog_active.load(Ordering::Relaxed) {
                     let new_offset = self
                         .master_repl_offset
-                        .fetch_add(bytes.len() as u64, Ordering::SeqCst)
-                        + bytes.len() as u64;
-                    backlog.append(bytes, new_offset);
+                        .fetch_add(payload.len() as u64, Ordering::SeqCst)
+                        + payload.len() as u64;
+                    backlog.append(payload, new_offset);
                 }
                 if self.has_replicas.load(Ordering::Relaxed) {
                     let reps = self.replicas.read();
+                    let mut any_skipped = false;
                     for rep in reps.values() {
                         match rep.delivery(shard) {
                             Delivery::Send => {
-                                if rep.append_pending(bytes) {
+                                if rep.append_pending(payload) {
                                     wake.push(rep.clone());
                                 }
                             }
                             Delivery::Buffer => {
                                 if let Some(cut) = &rep.full_sync
-                                    && rep.append_pre(cut, bytes)
+                                    && rep.append_pre(cut, payload)
                                 {
                                     wake.push(rep.clone());
                                 }
                             }
-                            Delivery::Skip => {}
+                            Delivery::Skip => {
+                                any_skipped = true;
+                            }
                         }
+                    }
+                    if any_skipped {
+                        backlog.stream_db = usize::MAX;
                     }
                 }
             }
@@ -1696,6 +1726,7 @@ async fn run_replica_worker(
     // Failed attempts are retried every 50ms; like Redis (which retries once
     // a second) log at most one attempt's progress and errors per second.
     let mut last_logged_attempt: Option<std::time::Instant> = None;
+    let mut replica_selected_db: usize = 0;
 
     'reconnect_loop: loop {
         if is_sync_cancelled(&cancel_rx) {
@@ -2082,6 +2113,7 @@ async fn run_replica_worker(
             }
         }
         if !is_continue {
+            replica_selected_db = crate::redis_rdb::last_rdb_repl_stream_db();
             crate::log_notice!("MASTER <-> REPLICA sync: Finished with success");
         }
         // Only repeated failures are throttled: after a working link breaks,
@@ -2128,6 +2160,8 @@ async fn run_replica_worker(
                 break 'reconnect_loop;
             }
             let mut protocol_error = false;
+            crate::connection::CURRENT_DB.set(replica_selected_db);
+            router.local_db.borrow_mut().select_db(replica_selected_db);
 
             while !buf.is_empty() {
                 let initial_buf_len = buf.len();
@@ -2140,14 +2174,26 @@ async fn run_replica_worker(
                             crate::resp::Command::Replconf(args) => {
                                 if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"getack") {
                                     // Acknowledge only what is applied.
-                                    router.flush_replica_batch(&mut batch).await;
+                                    let (new_db, ()) = crate::connection::WithCurrentDb {
+                                        router: &router,
+                                        db: replica_selected_db,
+                                        fut: router.flush_replica_batch(&mut batch),
+                                    }
+                                    .await;
+                                    replica_selected_db = new_db;
                                     applied.set(current_offset);
                                     let _ = ack_tx.send(());
                                 }
                             }
                             crate::resp::Command::Ping(_) => {}
                             _ => {
-                                router.apply_replica_command_batched(cmd, &mut batch).await;
+                                let (new_db, ()) = crate::connection::WithCurrentDb {
+                                    router: &router,
+                                    db: replica_selected_db,
+                                    fut: router.apply_replica_command_batched(cmd, &mut batch),
+                                }
+                                .await;
+                                replica_selected_db = new_db;
                             }
                         }
                     }
@@ -2160,7 +2206,13 @@ async fn run_replica_worker(
                     }
                 }
             }
-            router.flush_replica_batch(&mut batch).await;
+            let (new_db, ()) = crate::connection::WithCurrentDb {
+                router: &router,
+                db: replica_selected_db,
+                fut: router.flush_replica_batch(&mut batch),
+            }
+            .await;
+            replica_selected_db = new_db;
             if let ReplicationRole::Slave {
                 ref mut master_repl_offset,
                 ..

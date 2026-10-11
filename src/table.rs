@@ -3494,7 +3494,43 @@ impl RudisTable {
         if entry.expire_at().is_some() {
             self.num_expires += 1;
         }
+        self.data_bytes += entry.key.heap_bytes() + entry.val.mem_bytes() + ENTRY_OVERHEAD;
         self.table.insert(entry);
+    }
+
+    #[inline]
+    pub fn take_key_entry(
+        &mut self,
+        key: &[u8],
+    ) -> Option<(RudisEntry, Option<hashbrown::HashMap<Bytes, Instant>>)> {
+        if self.table.items == 0 {
+            return None;
+        }
+        let h = hash_key(key);
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if let Some(expire_at) = entry.expire_at()
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                return None;
+            }
+            let hfe = if !self.hash_field_expires.is_empty() {
+                self.hash_field_expires.remove(key)
+            } else {
+                None
+            };
+            let val_bytes = entry.val.mem_bytes();
+            let freed = entry.key.heap_bytes() + val_bytes + ENTRY_OVERHEAD;
+            self.data_bytes = self.data_bytes.saturating_sub(freed);
+            let entry = self.table.remove_present(idx);
+            if entry.expire_at().is_some() {
+                self.num_expires = self.num_expires.saturating_sub(1);
+            }
+            return Some((entry, hfe));
+        }
+        None
     }
 
     #[inline(always)]
@@ -4667,6 +4703,13 @@ impl RudisTable {
     }
 
     pub fn flushdb(&mut self) {
+        for entry in self.table.entries() {
+            match &entry.val {
+                RudisValue::Tiered(ptr) => self.dropped_tier.push((**ptr, false)),
+                RudisValue::Cooled(cv) => self.dropped_tier.push((cv.ptr, true)),
+                _ => {}
+            }
+        }
         self.table.clear();
         self.hash_field_expires.clear();
         self.num_expires = 0;
@@ -16101,7 +16144,7 @@ pub fn load_rdb_bytes(
             Ok(n) => Ok(n),
             Err(redis_err) => {
                 // Drop whatever the failed attempt loaded.
-                db.flushdb();
+                db.flushall();
                 load_legacy_rdb(data, db, shard_id, num_shards).map_err(|legacy_err| {
                     invalid(format!(
                         "{redis_err} (and it is not a legacy rudis RDB either: {legacy_err})"

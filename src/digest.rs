@@ -341,11 +341,16 @@ fn is_live(entry: &RudisEntry, now: Instant) -> bool {
     entry.expire_at().is_none_or(|at| at > now)
 }
 
-fn main_entry_digest(db: &ShardDb, entry: &RudisEntry, d: &mut Digest20, ctx: &DigestCtx<'_>) {
-    let field_ttls = if db.table.hash_field_expires.is_empty() {
+fn main_entry_digest(
+    table: &crate::table::RudisTable,
+    entry: &RudisEntry,
+    d: &mut Digest20,
+    ctx: &DigestCtx<'_>,
+) {
+    let field_ttls = if table.hash_field_expires.is_empty() {
         None
     } else {
-        db.table.hash_field_expires.get(entry.key.as_slice())
+        table.hash_field_expires.get(entry.key.as_slice())
     };
     object_digest(d, &entry.val, entry.expire_at().is_some(), field_ttls, ctx);
 }
@@ -477,8 +482,8 @@ fn ext_value_digest(db: &ShardDb, key: &[u8], d: &mut Digest20) -> bool {
 }
 
 /// This shard's part of `DEBUG DIGEST`: the XOR of every live key's digest
-/// (name, type, value, TTL presence) and the number of keys included.
-/// Read-only: nothing is expired, promoted or warmed.
+/// (name, type, value, TTL presence) across all DBs and the number of keys
+/// included. Read-only: nothing is expired, promoted or warmed.
 pub fn shard_digest(db: &ShardDb) -> (Digest20, u64) {
     let now = Instant::now();
     let load = |ptr| db.hydrate_tiered(ptr);
@@ -488,15 +493,24 @@ pub fn shard_digest(db: &ShardDb) -> (Digest20, u64) {
     };
     let mut acc = ZERO;
     let mut count = 0u64;
-    for entry in db.table.entries() {
-        if !is_live(entry, now) {
+    let max_db = db.max_db_len();
+    for db_idx in 0..max_db {
+        let Some(table) = db.table_for_db(db_idx) else {
             continue;
+        };
+        for entry in table.entries() {
+            if !is_live(entry, now) {
+                continue;
+            }
+            let mut kd = ZERO;
+            if db_idx > 0 {
+                mix_digest(&mut kd, &(db_idx as u32).to_be_bytes());
+            }
+            mix_digest(&mut kd, entry.key.as_slice());
+            main_entry_digest(table, entry, &mut kd, &ctx);
+            xor_into(&mut acc, &kd);
+            count += 1;
         }
-        let mut kd = ZERO;
-        mix_digest(&mut kd, entry.key.as_slice());
-        main_entry_digest(db, entry, &mut kd, &ctx);
-        xor_into(&mut acc, &kd);
-        count += 1;
     }
     for_each_ext_key(db, |key, digest| {
         let mut kd = ZERO;
@@ -522,10 +536,12 @@ pub fn key_value_digest(db: &ShardDb, key: &[u8]) -> Digest20 {
             now,
             load_tiered: &load,
         };
-        main_entry_digest(db, entry, &mut d, &ctx);
+        main_entry_digest(&db.table, entry, &mut d, &ctx);
         return d;
     }
-    ext_value_digest(db, key, &mut d);
+    if db.current_db == 0 {
+        ext_value_digest(db, key, &mut d);
+    }
     d
 }
 

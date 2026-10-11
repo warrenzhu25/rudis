@@ -81,6 +81,7 @@ pub struct ClientInfo {
     pub last_active: Instant,
     pub last_cmd: &'static str,
     pub is_resp3: bool,
+    pub db: usize,
     pub track_tx: Option<flume::Sender<Vec<u8>>>,
     pub raw_fd: std::os::unix::io::RawFd,
     pub omem: usize,
@@ -299,6 +300,7 @@ pub struct ClientTracker {
 
 thread_local! {
     pub static CURRENT_CLIENT_RESP3: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static CURRENT_DB: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub static CURRENT_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static EXECUTING_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static DEFER_BCAST_FLUSH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -370,7 +372,8 @@ impl Drop for ExecCleanup<'_> {
         }
         if let Some(hub_arc) = self.hub.take() {
             let pending = hub_arc.lock().resume();
-            for k in pending {
+            let prev_cur_db = CURRENT_DB.get();
+            for (db_id, k) in pending {
                 let shard_id = self.router.target_shard(&k);
                 // `try_borrow_mut`: when unwinding, a borrow may still be
                 // live higher up; hand the key to the shard's own mailbox.
@@ -378,15 +381,23 @@ impl Drop for ExecCleanup<'_> {
                     .then(|| self.router.local_db.try_borrow_mut().ok())
                     .flatten();
                 if let Some(mut local_db) = local {
+                    let prev_local_db = local_db.current_db;
+                    CURRENT_DB.set(db_id);
+                    local_db.select_db(db_id);
                     let mut hub = hub_arc.lock();
                     hub.notify_stream(&mut local_db, &k);
                     hub.notify_list(&mut local_db.table, &k);
                     hub.notify_zset(&mut local_db.table, &k);
+                    drop(hub);
+                    local_db.select_db(prev_local_db);
                 } else {
-                    let _ = self.router.senders[shard_id]
-                        .send(ShardMessage::NotifyList { keys: vec![k] });
+                    let _ = self.router.senders[shard_id].send(ShardMessage::NotifyList {
+                        db: db_id,
+                        keys: vec![k],
+                    });
                 }
             }
+            CURRENT_DB.set(prev_cur_db);
         }
     }
 }
@@ -439,6 +450,14 @@ pub fn notify_keyspace_event(event_type: u32, event: &str, key: &[u8]) {
     });
 }
 
+pub fn notify_keyspace_event_in_db(db_id: usize, event_type: u32, event: &str, key: &[u8]) {
+    CURRENT_ROUTER.with(|cr| {
+        if let Some(router) = cr.borrow().as_ref() {
+            notify_keyspace_event_sync_in_db(router, db_id, event_type, event, key);
+        }
+    });
+}
+
 /// A blocking command first checks its keys and, finding nothing to serve,
 /// then registers as a waiter. A push that lands on a key's owner shard in
 /// between (shards run concurrently, and the check itself may await remote
@@ -446,12 +465,14 @@ pub fn notify_keyspace_event(event_type: u32, event: &str, key: &[u8]) {
 /// its timeout. Called right after registering: asks each key's owner to run
 /// the wakeup again, so a push from that window serves the new waiter.
 pub fn recheck_blocking_keys<'a>(router: &Router, keys: impl IntoIterator<Item = &'a Bytes>) {
+    let db_id = CURRENT_DB.get();
     let hub_arc = crate::block::get_block_hub_for_port(router.port);
     let mut remote: Vec<Vec<Bytes>> = Vec::new();
     for k in keys {
         let shard = router.target_shard(k);
         if shard == router.shard_id {
             let mut db = router.local_db.borrow_mut();
+            db.select_db(db_id);
             let mut hub = hub_arc.lock();
             if hub.is_paused() {
                 hub.add_pending_notify(k.clone());
@@ -481,7 +502,7 @@ pub fn recheck_blocking_keys<'a>(router: &Router, keys: impl IntoIterator<Item =
                 continue;
             }
         }
-        let _ = router.senders[shard].send(ShardMessage::NotifyList { keys });
+        let _ = router.senders[shard].send(ShardMessage::NotifyList { db: db_id, keys });
     }
 }
 
@@ -947,7 +968,7 @@ pub async fn wait_for_stream_result(
 
 static WATCHED_KEYS: std::sync::LazyLock<
     parking_lot::RwLock<
-        hashbrown::HashMap<u16, hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>>,
+        hashbrown::HashMap<u16, hashbrown::HashMap<(usize, Bytes), hashbrown::HashSet<u64>>>,
     >,
 > = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 
@@ -1718,11 +1739,15 @@ pub fn watch_keys(port: u16, client_id: u64, keys: &[Bytes]) {
     if keys.is_empty() {
         return;
     }
+    let db = CURRENT_DB.get();
     HAS_WATCHED_KEYS.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut map = WATCHED_KEYS.write();
     let port_map = map.entry(port).or_default();
     for k in keys {
-        port_map.entry(k.clone()).or_default().insert(client_id);
+        port_map
+            .entry((db, k.clone()))
+            .or_default()
+            .insert(client_id);
     }
     CLIENT_WATCH_TAINTED
         .write()
@@ -1767,13 +1792,72 @@ pub fn touch_watched_key(port: u16, key: &[u8]) {
     if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    touch_watched_key_in_db(port, CURRENT_DB.get(), key);
+}
+
+pub fn touch_watched_key_in_db(port: u16, db: usize, key: &[u8]) {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let map = WATCHED_KEYS.read();
-    if let Some(port_map) = map.get(&port)
-        && let Some(clients) = port_map.get(key)
-    {
+    if let Some(port_map) = map.get(&port) {
+        let mut tainted = None;
+        for ((w_db, w_key), clients) in port_map.iter() {
+            if *w_db == db && w_key.as_ref() == key {
+                let t = tainted.get_or_insert_with(|| CLIENT_WATCH_TAINTED.write());
+                for &cid in clients {
+                    t.insert((port, cid), true);
+                }
+            }
+        }
+    }
+}
+
+pub fn touch_watched_keys_on_swapdb(port: u16, db1: usize, db2: usize) {
+    if db1 == db2 || !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let map = WATCHED_KEYS.read();
+    if let Some(port_map) = map.get(&port) {
         let mut tainted = CLIENT_WATCH_TAINTED.write();
-        for &cid in clients {
-            tainted.insert((port, cid), true);
+        for ((w_db, _), clients) in port_map.iter() {
+            if *w_db == db1 || *w_db == db2 {
+                for &cid in clients {
+                    tainted.insert((port, cid), true);
+                }
+            }
+        }
+    }
+}
+
+pub fn touch_watched_keys_on_flushdb(port: u16, db: usize) {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let map = WATCHED_KEYS.read();
+    if let Some(port_map) = map.get(&port) {
+        let mut tainted = CLIENT_WATCH_TAINTED.write();
+        for ((w_db, _), clients) in port_map.iter() {
+            if *w_db == db {
+                for &cid in clients {
+                    tainted.insert((port, cid), true);
+                }
+            }
+        }
+    }
+}
+
+pub fn touch_watched_keys_on_flushall(port: u16) {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let map = WATCHED_KEYS.read();
+    if let Some(port_map) = map.get(&port) {
+        let mut tainted = CLIENT_WATCH_TAINTED.write();
+        for (_, clients) in port_map.iter() {
+            for &cid in clients {
+                tainted.insert((port, cid), true);
+            }
         }
     }
 }
@@ -1783,12 +1867,15 @@ pub fn touch_watched_key_any_port(key: &[u8]) {
     if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let cur_db = CURRENT_DB.get();
     let map = WATCHED_KEYS.read();
     let mut tainted = CLIENT_WATCH_TAINTED.write();
     for (&port, port_map) in map.iter() {
-        if let Some(clients) = port_map.get(key) {
-            for &cid in clients {
-                tainted.insert((port, cid), true);
+        for ((w_db, w_key), clients) in port_map.iter() {
+            if *w_db == cur_db && w_key.as_ref() == key {
+                for &cid in clients {
+                    tainted.insert((port, cid), true);
+                }
             }
         }
     }
@@ -1851,9 +1938,10 @@ pub fn broadcast_monitor(port: u16, source_addr: &str, argv: &[Bytes]) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let mut line = format!(
-        "+{}.{:06} [0 {}]",
+        "+{}.{:06} [{} {}]",
         now.as_secs(),
         now.subsec_micros(),
+        CURRENT_DB.get(),
         source_addr
     );
     for arg in argv {
@@ -2392,7 +2480,11 @@ pub fn record_client_read(port: u16, client_id: u64, key: &[u8]) {
 }
 
 pub fn notify_key_invalidation(port: u16, key: &[u8], sender_client_id: u64) {
-    touch_watched_key(port, key);
+    notify_key_invalidation_in_db(port, CURRENT_DB.get(), key, sender_client_id);
+}
+
+pub fn notify_key_invalidation_in_db(port: u16, db: usize, key: &[u8], sender_client_id: u64) {
+    touch_watched_key_in_db(port, db, key);
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -2988,6 +3080,13 @@ pub fn apply_config_value(
         "log-timestamp-format" => crate::log::set_log_timestamp_format(val_str)?,
         // Config file only (immutable in CONFIG SET, as in Redis).
         "logfile" => crate::log::set_logfile(val_str)?,
+        "databases" => {
+            let n: usize = parse_config_num(name, val_str)?;
+            if n == 0 {
+                return Err("Invalid number of databases".to_string());
+            }
+            crate::config::set_databases_count(n);
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -3240,11 +3339,20 @@ pub fn set_notify_keyspace_events_str(s: &str) {
 }
 
 pub fn notify_keyspace_event_sync(router: &Router, event_type: u32, event: &str, key: &[u8]) {
+    notify_keyspace_event_sync_in_db(router, CURRENT_DB.get(), event_type, event, key);
+}
+
+pub fn notify_keyspace_event_sync_in_db(
+    router: &Router,
+    db_id: usize,
+    event_type: u32,
+    event: &str,
+    key: &[u8],
+) {
     let flags = NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed);
     if flags == 0 || (flags & event_type == 0) {
         return;
     }
-    let db_id = 0;
     if flags & NOTIFY_KEYSPACE != 0 {
         let channel = format!("__keyspace@{}__:{}", db_id, String::from_utf8_lossy(key));
         let _ = router
@@ -3477,11 +3585,12 @@ async fn execute_tx_step(
     tx_queue: &mut Vec<Command>,
     tx_has_error: &mut bool,
 ) -> bool {
-    if !in_tx(client_id)
-        && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
-    {
-        c.last_active = Instant::now();
-        c.last_cmd = get_cmd_name(&cmd);
+    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+        CURRENT_DB.set(c.db);
+        if !in_tx(client_id) {
+            c.last_active = Instant::now();
+            c.last_cmd = get_cmd_name(&cmd);
+        }
     }
     if *in_multi {
         match cmd {
@@ -3542,11 +3651,14 @@ async fn execute_tx_step(
                 if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                     c.name = None;
                     c.is_resp3 = false;
+                    c.db = 0;
                     c.is_monitor = false;
                     c.stats
                         .tot_cmds
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                CURRENT_DB.set(0);
+                router.local_db.borrow_mut().select_db(0);
                 CLIENT_NO_TOUCH.set(false);
                 update_global_client_resp3(router.port, client_id, false);
                 update_global_client_auth(router.port, client_id, "default");
@@ -3818,6 +3930,7 @@ const REPLICATION_NEEDS_PLAINTEXT: &[u8] =
 #[derive(Default)]
 struct ClientThreadLocals {
     resp3: bool,
+    db: usize,
     client_id: u64,
     executing_client_id: u64,
     defer_bcast_flush: bool,
@@ -3830,6 +3943,7 @@ impl ClientThreadLocals {
     #[inline]
     fn swap_with_thread(&mut self) {
         self.resp3 = CURRENT_CLIENT_RESP3.replace(self.resp3);
+        self.db = CURRENT_DB.replace(self.db);
         self.client_id = CURRENT_CLIENT_ID.replace(self.client_id);
         self.executing_client_id = EXECUTING_CLIENT_ID.replace(self.executing_client_id);
         self.defer_bcast_flush = DEFER_BCAST_FLUSH.replace(self.defer_bcast_flush);
@@ -3929,6 +4043,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
             last_active: now,
             last_cmd: "NONE",
             is_resp3: false,
+            db: 0,
             track_tx: Some(track_tx),
             raw_fd,
             omem: 0,
@@ -4858,8 +4973,11 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                         c.name = None;
                         c.is_resp3 = false;
+                        c.db = 0;
                         c.is_monitor = false;
                     }
+                    CURRENT_DB.set(0);
+                    router.local_db.borrow_mut().select_db(0);
                     reset_client_pubsub(router, client_id);
 
                     let acl = crate::acl::get_acl_for_port(router.port);
@@ -5290,8 +5408,11 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                 if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                     c.name = None;
                     c.is_resp3 = false;
+                    c.db = 0;
                     c.is_monitor = false;
                 }
+                CURRENT_DB.set(0);
+                router.local_db.borrow_mut().select_db(0);
                 reset_client_pubsub(router, client_id);
 
                 let acl = crate::acl::get_acl_for_port(router.port);
@@ -5684,6 +5805,7 @@ async fn run_master_replica_stream(
             crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
             // Register before any shard serializes, so each shard's changes
             // after its snapshot reach the replica (see FullSyncCut).
+            hub.reset_stream_db();
             repl = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards);
             let rdb = router.generate_full_rdb(Some(client_id)).await;
             let (offset, after_snapshot) = hub.finish_full_sync(client_id);
@@ -5707,6 +5829,7 @@ async fn run_master_replica_stream(
         crate::log_notice!("Full resync requested by replica {}", name);
         crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
         crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
+        hub.reset_stream_db();
         repl = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards);
         let rdb = router.generate_full_rdb(Some(client_id)).await;
         let (_, after_snapshot) = hub.finish_full_sync(client_id);
@@ -5717,7 +5840,6 @@ async fn run_master_replica_stream(
         }
         let mut initial_msg = format!("${}\r\n", rdb.len()).into_bytes();
         initial_msg.extend_from_slice(&rdb);
-        initial_msg.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
         initial_msg.extend_from_slice(&after_snapshot);
         if writer.write_all(initial_msg).await.0.is_err() {
             hub.unregister_replica(client_id);
@@ -5895,6 +6017,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Expiretime(key, _)
         | Command::Rename { key, .. }
         | Command::Copy { source: key, .. }
+        | Command::Move { key, .. }
         | Command::Setbit { key, .. }
         | Command::Getbit { key, .. }
         | Command::Bitcount { key, .. }
@@ -6422,6 +6545,10 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         } => {
             f(source.as_ref());
             f(destination.as_ref());
+        }
+
+        Command::Move { key, .. } => {
+            f(key.as_ref());
         }
 
         Command::Bitop {
@@ -7083,10 +7210,12 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Slowlog(_) => "SLOWLOG",
         Command::Flushdb => "FLUSHDB",
         Command::Flushall => "FLUSHALL",
+        Command::Swapdb { .. } => "SWAPDB",
         Command::Touch(_) => "TOUCH",
         Command::Rename { nx: false, .. } => "RENAME",
         Command::Rename { nx: true, .. } => "RENAMENX",
         Command::Copy { .. } => "COPY",
+        Command::Move { .. } => "MOVE",
         Command::Setnx { .. } => "SETNX",
         Command::Getset { .. } => "GETSET",
         Command::Getdel(_) => "GETDEL",
@@ -8221,7 +8350,73 @@ fn allowed_while_loading(cmd: &Command) -> bool {
         )
 }
 
+pub struct WithCurrentDb<'a, F> {
+    pub router: &'a Router,
+    pub db: usize,
+    pub fut: F,
+}
+
+impl<'a, F: std::future::Future> std::future::Future for WithCurrentDb<'a, F> {
+    type Output = (usize, F::Output);
+
+    #[inline(always)]
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // SAFETY: `fut` is structurally pinned and never moved; `router` and `db` are Unpin.
+        let this = unsafe { self.get_unchecked_mut() };
+        CURRENT_DB.set(this.db);
+        if let Ok(mut local_db) = this.router.local_db.try_borrow_mut() {
+            local_db.select_db(this.db);
+        }
+        // SAFETY: `this.fut` is pinned for the lifetime of `Self`.
+        let res = unsafe { std::pin::Pin::new_unchecked(&mut this.fut) }.poll(cx);
+        this.db = CURRENT_DB.get();
+        if let Ok(mut local_db) = this.router.local_db.try_borrow_mut() {
+            local_db.select_db(this.db);
+        }
+        match res {
+            std::task::Poll::Ready(out) => std::task::Poll::Ready((this.db, out)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
 async fn execute_command(
+    cmd: Command,
+    router: &Router,
+    client_id: u64,
+    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+    out: &mut Vec<u8>,
+    asking: &mut bool,
+    authenticated: &mut bool,
+    auth_user: &mut String,
+) -> bool {
+    let initial_db = client_registry
+        .borrow()
+        .get(&client_id)
+        .map(|c| c.db)
+        .unwrap_or_else(|| CURRENT_DB.get());
+    WithCurrentDb {
+        router,
+        db: initial_db,
+        fut: execute_command_inner(
+            cmd,
+            router,
+            client_id,
+            client_registry,
+            out,
+            asking,
+            authenticated,
+            auth_user,
+        ),
+    }
+    .await
+    .1
+}
+
+async fn execute_command_inner(
     cmd: Command,
     router: &Router,
     client_id: u64,
@@ -8235,9 +8430,11 @@ async fn execute_command(
     let mut client_stats = None;
     if let Some(client) = client_registry.borrow().get(&client_id) {
         CURRENT_CLIENT_RESP3.set(client.is_resp3);
+        CURRENT_DB.set(client.db);
         initial_reply_mode = client.reply_mode;
         client_stats = Some(client.stats.clone());
     }
+    router.local_db.borrow_mut().select_db(CURRENT_DB.get());
     struct ExecutingClientGuard {
         prev_local: u64,
         prev_exec: u64,
@@ -9695,13 +9892,15 @@ async fn execute_command(
                             "errorstats" => acc.push_str(&errorstat_str),
                             "keyspace" => {
                                 // Only fan out when the section is requested.
-                                let (keys, expires) = router.keyspace_stats().await;
+                                let stats_by_db = router.keyspace_stats_by_db().await;
                                 acc.push_str("# Keyspace\r\n");
-                                if keys > 0 {
-                                    acc.push_str(&format!(
-                                        "db0:keys={},expires={},avg_ttl=0,subexpiry=0\r\n",
-                                        keys, expires
-                                    ));
+                                for (&db_idx, &(keys, expires)) in stats_by_db.iter() {
+                                    if keys > 0 {
+                                        acc.push_str(&format!(
+                                            "db{}:keys={},expires={},avg_ttl=0,subexpiry=0\r\n",
+                                            db_idx, keys, expires
+                                        ));
+                                    }
                                 }
                             }
                             _ => {}
@@ -10025,8 +10224,9 @@ async fn execute_command(
                     let min_replicas_lag = MIN_REPLICAS_MAX_LAG
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let all_configs: [(&str, String); 62] = [
+                    let all_configs: [(&str, String); 63] = [
                         ("port", port_str),
+                        ("databases", crate::config::databases_count().to_string()),
                         ("loglevel", crate::log::loglevel().to_string()),
                         ("logfile", crate::log::logfile()),
                         ("log-format", crate::log::log_format().to_string()),
@@ -10242,7 +10442,7 @@ async fn execute_command(
                             return false;
                         }
 
-                        if matches!(p_str.as_str(), "daemonize" | "logfile") {
+                        if matches!(p_str.as_str(), "daemonize" | "logfile" | "databases") {
                             out.extend_from_slice(
                                 format!(
                                     "-ERR CONFIG SET failed (possibly related to argument '{}') - can't set immutable config\r\n",
@@ -11058,7 +11258,7 @@ async fn execute_command(
                             .pipeline_len_cnt
                             .load(std::sync::atomic::Ordering::Relaxed);
                         let info = format!(
-                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
+                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
                             c.id,
                             c.addr,
                             router.port,
@@ -11066,6 +11266,7 @@ async fn execute_command(
                             age,
                             idle,
                             flags,
+                            c.db,
                             qbuf,
                             qbuf_free,
                             c.omem,
@@ -13830,10 +14031,13 @@ async fn execute_command(
             if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                 c.name = None;
                 c.is_resp3 = false;
+                c.db = 0;
                 c.is_monitor = false;
                 c.reply_mode = crate::resp::ClientReplyMode::On;
             }
             CURRENT_CLIENT_RESP3.set(false);
+            CURRENT_DB.set(0);
+            router.local_db.borrow_mut().select_db(0);
             update_global_client_resp3(router.port, client_id, false);
             update_global_client_auth(router.port, client_id, "default");
             unregister_client_tracking(router.port, client_id);
@@ -14649,9 +14853,21 @@ async fn execute_command(
             false
         }
         Command::Select(idx) => {
-            if idx >= 16 {
+            let is_cluster = router.cluster_enabled
+                || crate::cluster::get_cluster_hub(router.port)
+                    .cluster_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            if is_cluster && idx != 0 {
+                out.extend_from_slice(b"-ERR SELECT is not allowed in cluster mode\r\n");
+            } else if idx as usize >= crate::config::databases_count() {
                 out.extend_from_slice(b"-ERR DB index is out of range\r\n");
             } else {
+                let db_idx = idx as usize;
+                CURRENT_DB.set(db_idx);
+                router.local_db.borrow_mut().select_db(db_idx);
+                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                    c.db = db_idx;
+                }
                 out.extend_from_slice(b"+OK\r\n");
             }
             false
@@ -14708,31 +14924,98 @@ async fn execute_command(
             false
         }
         Command::Flushdb | Command::Flushall => {
+            let is_all = matches!(cmd, Command::Flushall);
+            let cur_db = CURRENT_DB.get();
             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                let watched_keys_for_port: Vec<Bytes> = {
+                let watched_keys_for_port: Vec<(usize, Bytes)> = {
                     let map = WATCHED_KEYS.read();
                     map.get(&router.port)
-                        .map(|m| m.keys().cloned().collect())
+                        .map(|m| {
+                            m.keys()
+                                .filter(|(w_db, _)| is_all || *w_db == cur_db)
+                                .cloned()
+                                .collect()
+                        })
                         .unwrap_or_default()
                 };
-                for k in watched_keys_for_port {
-                    if router.exists(k.clone()).await {
-                        touch_watched_key(router.port, k.as_ref());
+                for (w_db, k) in watched_keys_for_port {
+                    CURRENT_DB.set(w_db);
+                    router.local_db.borrow_mut().select_db(w_db);
+                    let ex = router.exists(k.clone()).await;
+                    CURRENT_DB.set(cur_db);
+                    router.local_db.borrow_mut().select_db(cur_db);
+                    if ex {
+                        touch_watched_key_in_db(router.port, w_db, k.as_ref());
                     }
                 }
             }
             if !in_tx(client_id) {
-                let n = router.dbsize().await;
+                let n = if is_all {
+                    router
+                        .keyspace_stats_by_db()
+                        .await
+                        .into_values()
+                        .map(|(k, _)| k)
+                        .sum()
+                } else {
+                    router.dbsize().await
+                };
                 if n > 0 {
                     crate::table::add_lazyfreed_objects(n as u64);
                 }
             }
-            router.flushdb().await;
-            // Like Redis killing its BGSAVE child, FLUSHALL ends the
-            // save that `rdb-key-save-delay` keeps shown as in progress.
-            RDB_BGSAVE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
+            if is_all {
+                router.flushall().await;
+                // Like Redis killing its BGSAVE child, FLUSHALL ends the
+                // save that `rdb-key-save-delay` keeps shown as in progress.
+                RDB_BGSAVE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                router.flushdb().await;
+            }
             notify_flush_invalidation(router.port, client_id);
             out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Swapdb { db1, db2 } => {
+            let is_cluster = router.cluster_enabled
+                || crate::cluster::get_cluster_hub(router.port)
+                    .cluster_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            let max_db = crate::config::databases_count();
+            if is_cluster {
+                out.extend_from_slice(b"-ERR SWAPDB is not allowed in cluster mode\r\n");
+            } else if db1 < 0 || db2 < 0 || db1 as usize >= max_db || db2 as usize >= max_db {
+                out.extend_from_slice(b"-ERR DB index is out of range\r\n");
+            } else {
+                let (d1, d2) = (db1 as usize, db2 as usize);
+                touch_watched_keys_on_swapdb(router.port, d1, d2);
+                router.swapdb(d1, d2).await;
+                notify_flush_invalidation(router.port, client_id);
+                out.extend_from_slice(b"+OK\r\n");
+            }
+            false
+        }
+        Command::Move { ref key, .. } => {
+            let is_cluster = router.cluster_enabled
+                || crate::cluster::get_cluster_hub(router.port)
+                    .cluster_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            if is_cluster {
+                out.extend_from_slice(b"-ERR MOVE is not allowed in cluster mode\r\n");
+                return false;
+            }
+            let target = router.target_shard(key);
+            if target == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(target, cmd).await;
+                out.extend_from_slice(&res);
+            }
             false
         }
         Command::Touch(keys) => {
@@ -14768,7 +15051,17 @@ async fn execute_command(
                     } else {
                         CrossShardMove::Rename
                     };
-                    out.extend_from_slice(&move_key_across_shards(router, key, newkey, mode, in_tx(client_id)).await);
+                    out.extend_from_slice(
+                        &move_key_across_shards(
+                            router,
+                            key,
+                            newkey,
+                            CURRENT_DB.get(),
+                            mode,
+                            in_tx(client_id),
+                        )
+                        .await,
+                    );
                 }
                 return false;
             }
@@ -14791,21 +15084,50 @@ async fn execute_command(
             destination_db,
             replace,
         } => {
+            let is_cluster = router.cluster_enabled
+                || crate::cluster::get_cluster_hub(router.port)
+                    .cluster_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            if is_cluster
+                && (CURRENT_DB.get() != 0 || destination_db.is_some_and(|d| d != 0))
+            {
+                out.extend_from_slice(
+                    b"-ERR Copying to another database is not allowed in cluster mode\r\n",
+                );
+                return false;
+            }
+            if let Some(d) = destination_db
+                && d as usize >= crate::config::databases_count()
+            {
+                out.extend_from_slice(b"-ERR DB index is out of range\r\n");
+                return false;
+            }
             let target_src = router.target_shard(source);
             let target_dst = router.target_shard(destination);
             if target_src != target_dst {
-                if router.cluster_enabled || destination_db.is_some() {
+                if router.cluster_enabled {
                     out.extend_from_slice(
                         b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
                     );
                 } else {
+                    let dst_db = destination_db
+                        .map(|d| d as usize)
+                        .unwrap_or_else(|| CURRENT_DB.get());
                     let mode = if replace {
                         CrossShardMove::CopyReplace
                     } else {
                         CrossShardMove::Copy
                     };
                     out.extend_from_slice(
-                        &move_key_across_shards(router, source, destination, mode, in_tx(client_id)).await,
+                        &move_key_across_shards(
+                            router,
+                            source,
+                            destination,
+                            dst_db,
+                            mode,
+                            in_tx(client_id),
+                        )
+                        .await,
                     );
                 }
                 return false;
@@ -15379,6 +15701,7 @@ async fn execute_command(
             if keys.is_empty() {
                 crate::scripting::arm_script_redirect();
             }
+            let saved_db = CURRENT_DB.get();
             let result = crate::scripting::eval_script(
                 &script_str,
                 &keys,
@@ -15387,6 +15710,8 @@ async fn execute_command(
                 router.aof.as_deref(),
                 read_only,
             );
+            CURRENT_DB.set(saved_db);
+            router.local_db.borrow_mut().select_db(saved_db);
             if let Some(target) = crate::scripting::take_script_redirect() {
                 let cmd = Command::Eval {
                     script,
@@ -15447,6 +15772,7 @@ async fn execute_command(
                 if keys.is_empty() {
                     crate::scripting::arm_script_redirect();
                 }
+                let saved_db = CURRENT_DB.get();
                 let result = crate::scripting::eval_script(
                     &script,
                     &keys,
@@ -15455,6 +15781,8 @@ async fn execute_command(
                     router.aof.as_deref(),
                     read_only,
                 );
+                CURRENT_DB.set(saved_db);
+                router.local_db.borrow_mut().select_db(saved_db);
                 if let Some(target) = crate::scripting::take_script_redirect() {
                     let cmd = Command::Evalsha {
                         sha,
@@ -15623,6 +15951,7 @@ async fn execute_command(
             if keys.is_empty() {
                 crate::scripting::arm_script_redirect();
             }
+            let saved_db = CURRENT_DB.get();
             let result = crate::scripting::call_function(
                 &function,
                 &keys,
@@ -15631,6 +15960,8 @@ async fn execute_command(
                 router.aof.as_deref(),
                 read_only,
             );
+            CURRENT_DB.set(saved_db);
+            router.local_db.borrow_mut().select_db(saved_db);
             if let Some(target) = crate::scripting::take_script_redirect() {
                 let cmd = Command::Fcall {
                     function,
@@ -16967,7 +17298,8 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Hgetex { key, .. }
         | Command::Hsetex { key, .. }
         | Command::Xclaim { key, .. }
-        | Command::Xautoclaim { key, .. } => Some(target_shard(key, num_shards)),
+        | Command::Xautoclaim { key, .. }
+        | Command::Move { key, .. } => Some(target_shard(key, num_shards)),
         Command::Zrangestore {
             dst: destination,
             src: source,
@@ -17270,6 +17602,7 @@ pub fn execute_local_command(
     out: &mut Vec<u8>,
     aof: Option<&RefCell<crate::aof::AofWriter>>,
 ) -> bool {
+    db.select_db(CURRENT_DB.get());
     db.hydrate_cmd_keys(cmd);
     // The client this command runs for, 0 for internal work (replication,
     // expiry, eviction); the connection path and shard batches set it.
@@ -19400,9 +19733,12 @@ pub fn execute_local_command(
                 false
             }
             Command::Select(idx) => {
-                if *idx >= 16 {
+                if *idx as usize >= crate::config::databases_count() {
                     out.extend_from_slice(b"-ERR DB index is out of range\r\n");
                 } else {
+                    let d = *idx as usize;
+                    CURRENT_DB.set(d);
+                    db.select_db(d);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 false
@@ -19461,25 +19797,79 @@ pub fn execute_local_command(
                 false
             }
             Command::Flushdb | Command::Flushall => {
+                let is_all = matches!(cmd, Command::Flushall);
+                let cur_db = db.current_db;
                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                    let watched_keys_for_port: Vec<Bytes> = {
+                    let watched_keys_for_port: Vec<(usize, Bytes)> = {
                         let map = WATCHED_KEYS.read();
                         map.get(&db.port)
                             .map(|m| m.keys().cloned().collect())
                             .unwrap_or_default()
                     };
-                    for k in watched_keys_for_port {
-                        if db.exists(k.as_ref()) {
-                            touch_watched_key(db.port, k.as_ref());
+                    for (w_db, k) in watched_keys_for_port {
+                        if (is_all || w_db == cur_db)
+                            && db.table_for_db(w_db).is_some()
+                            && db.table_for_db_mut(w_db).exists(k.as_ref())
+                        {
+                            touch_watched_key_in_db(db.port, w_db, k.as_ref());
                         }
                     }
                 }
-                db.flushdb();
+                if is_all {
+                    db.flushall();
+                } else {
+                    db.flushdb();
+                }
                 record_change!(cmd);
                 crate::block::get_block_hub_for_port(db.port)
                     .lock()
                     .notify_all_streams(db);
                 out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Swapdb { db1, db2 } => {
+                let num_dbs = crate::config::databases_count();
+                if *db1 < 0 || *db2 < 0 || (*db1 as usize) >= num_dbs || (*db2 as usize) >= num_dbs
+                {
+                    out.extend_from_slice(b"-ERR DB index is out of range\r\n");
+                    return false;
+                }
+                let (d1, d2) = (*db1 as usize, *db2 as usize);
+                touch_watched_keys_on_swapdb(db.port, d1, d2);
+                db.swap_dbs(d1, d2);
+                record_change!(cmd);
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Move { key, db: dst_db } => {
+                let num_dbs = crate::config::databases_count();
+                if *dst_db < 0 || (*dst_db as usize) >= num_dbs {
+                    out.extend_from_slice(b"-ERR DB index is out of range\r\n");
+                    return false;
+                }
+                let src_db = db.current_db;
+                let dst = *dst_db as usize;
+                if db.move_key(src_db, dst, key) {
+                    record_change!(cmd);
+                    touch_watched_key_in_db(db.port, src_db, key.as_ref());
+                    db.select_db(dst);
+                    CURRENT_DB.set(dst);
+                    match db.type_of(key) {
+                        "list" => notify_list_or_defer(db, key),
+                        "zset" => notify_zset_or_defer(db, key),
+                        "stream" => notify_stream_or_defer(db, key),
+                        _ => touch_watched_key_in_db(db.port, dst, key.as_ref()),
+                    }
+                    CURRENT_DB.set(src_db);
+                    db.select_db(src_db);
+                    notify_key_invalidation_in_db(db.port, src_db, key.as_ref(), cid);
+                    notify_key_invalidation_in_db(db.port, dst, key.as_ref(), cid);
+                    notify_keyspace_event_in_db(src_db, NOTIFY_GENERIC, "move_from", key.as_ref());
+                    notify_keyspace_event_in_db(dst, NOTIFY_GENERIC, "move_to", key.as_ref());
+                    out.extend_from_slice(b":1\r\n");
+                } else {
+                    out.extend_from_slice(b":0\r\n");
+                }
                 false
             }
             Command::Touch(keys) => {
@@ -19522,21 +19912,37 @@ pub fn execute_local_command(
             Command::Copy {
                 source,
                 destination,
+                destination_db,
                 replace,
-                ..
             } => {
-                let prev_kind = db.type_of(destination.as_ref());
+                let src_db = db.current_db;
+                let dst_db = destination_db.map(|d| d as usize).unwrap_or(src_db);
+                if dst_db >= crate::config::databases_count() {
+                    out.extend_from_slice(b"-ERR DB index is out of range\r\n");
+                    return false;
+                }
                 let src_kind = db.type_of(source.as_ref());
-                match db.copy(source, destination.clone(), *replace) {
+                db.select_db(dst_db);
+                let prev_kind = db.type_of(destination.as_ref());
+                db.select_db(src_db);
+                match db.copy_to_db(src_db, dst_db, source, destination.clone(), *replace) {
                     Ok(success) => {
                         if success {
                             record_change!(cmd);
+                            db.select_db(dst_db);
+                            CURRENT_DB.set(dst_db);
                             match db.type_of(destination) {
                                 "list" => notify_list_or_defer(db, destination),
                                 "zset" => notify_zset_or_defer(db, destination),
                                 "stream" => notify_stream_or_defer(db, destination),
-                                _ => touch_watched_key(db.port, destination.as_ref()),
+                                _ => touch_watched_key_in_db(db.port, dst_db, destination.as_ref()),
                             }
+                            notify_key_invalidation_in_db(
+                                db.port,
+                                dst_db,
+                                destination.as_ref(),
+                                cid,
+                            );
                             if prev_kind != "none" {
                                 notify_set_key_events_local(
                                     prev_kind,
@@ -19544,7 +19950,14 @@ pub fn execute_local_command(
                                     destination.as_ref(),
                                 );
                             }
-                            notify_keyspace_event(NOTIFY_GENERIC, "copy_to", destination.as_ref());
+                            notify_keyspace_event_in_db(
+                                dst_db,
+                                NOTIFY_GENERIC,
+                                "copy_to",
+                                destination.as_ref(),
+                            );
+                            CURRENT_DB.set(src_db);
+                            db.select_db(src_db);
                             out.extend_from_slice(b":1\r\n");
                         } else {
                             out.extend_from_slice(b":0\r\n");
@@ -24192,6 +24605,15 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
             // Changes whether the commands after it reply; the squashed path
             // only applies the reply mode in effect when the batch started.
             | Command::Client(ClientSubcommand::Reply(_))
+            | Command::Select(_)
+            | Command::Move { .. }
+            | Command::Swapdb { .. }
+            | Command::Flushdb
+            | Command::Flushall
+            | Command::Copy {
+                destination_db: Some(_),
+                ..
+            }
     )
 }
 
@@ -24212,8 +24634,55 @@ async fn execute_commands_squashed(
     authenticated: &mut bool,
     auth_user: &mut String,
 ) -> bool {
+    let initial_db = client_registry
+        .borrow()
+        .get(&client_id)
+        .map(|c| c.db)
+        .unwrap_or_else(|| CURRENT_DB.get());
+    WithCurrentDb {
+        router,
+        db: initial_db,
+        fut: execute_commands_squashed_inner(
+            commands,
+            has_special,
+            router,
+            responders,
+            remote_batches,
+            items_pool,
+            results_pool,
+            responses,
+            client_id,
+            client_registry,
+            out,
+            asking,
+            authenticated,
+            auth_user,
+        ),
+    }
+    .await
+    .1
+}
+
+#[allow(clippy::await_holding_refcell_ref)]
+async fn execute_commands_squashed_inner(
+    commands: &mut Vec<Command>,
+    has_special: bool,
+    router: &Router,
+    responders: &[std::sync::Arc<crate::mailbox::BatchResponder>],
+    remote_batches: &mut [Vec<(usize, u64, Command)>],
+    items_pool: &mut Vec<Vec<(usize, u64, Command)>>,
+    results_pool: &mut Vec<Vec<(usize, CompactResp)>>,
+    responses: &mut Vec<CompactResp>,
+    client_id: u64,
+    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+    out: &mut Vec<u8>,
+    asking: &mut bool,
+    authenticated: &mut bool,
+    auth_user: &mut String,
+) -> bool {
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
         CURRENT_CLIENT_RESP3.set(c.is_resp3);
+        CURRENT_DB.set(c.db);
         c.last_active = Instant::now();
         if let Some(last_cmd) = commands.last() {
             c.last_cmd = get_cmd_name(last_cmd);
@@ -24379,6 +24848,7 @@ async fn execute_commands_squashed(
         && !crate::replication::has_connected_replicas(router.port)
         && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0;
     let mut local_db = router.local_db.borrow_mut();
+    local_db.select_db(CURRENT_DB.get());
     // Commands handed to `execute_command` below record their own stats; the
     // time spent awaiting other shards is left out of the batch segments.
     let mut stat_run = CmdStatBatch::new();
@@ -24880,6 +25350,7 @@ async fn execute_commands_squashed(
                 None => responses[idx] = crate::shard::CompactResp::OK,
             }
             local_db = router.local_db.borrow_mut();
+            local_db.select_db(CURRENT_DB.get());
         } else if !matches!(
             cmd,
             Command::Ping(_)
@@ -24921,6 +25392,7 @@ async fn execute_commands_squashed(
             }
             responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
             local_db = router.local_db.borrow_mut();
+            local_db.select_db(CURRENT_DB.get());
             stat_run.restart();
         } else {
             stat_run.note(get_cmd_name(&cmd));
@@ -25079,6 +25551,7 @@ async fn flush_remote_batches(
             responder.prepare(resp_base_ptr, responses.len());
             let next_items = items_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
             let msg = ShardMessage::Batch {
+                db: CURRENT_DB.get(),
                 items: std::mem::replace(items, next_items),
                 responder: responder.clone(),
                 is_resp3,
@@ -25211,11 +25684,21 @@ async fn move_key_across_shards(
     router: &Router,
     src: &Bytes,
     dst: &Bytes,
+    dst_db: usize,
     mode: CrossShardMove,
     in_tx: bool,
 ) -> Vec<u8> {
+    let src_db = CURRENT_DB.get();
     router.ensure_loaded(src).await;
+    if dst_db != src_db {
+        CURRENT_DB.set(dst_db);
+        router.local_db.borrow_mut().select_db(dst_db);
+    }
     router.ensure_loaded(dst).await;
+    if dst_db != src_db {
+        CURRENT_DB.set(src_db);
+        router.local_db.borrow_mut().select_db(src_db);
+    }
     let (s, d) = (router.target_shard(src), router.target_shard(dst));
     let mut shards = [s, d];
     shards.sort_unstable();
@@ -25238,10 +25721,18 @@ async fn move_key_across_shards(
             resp_integer(&exec_on_shard(router, s, Command::Expiretime(src.clone(), true)).await)
                 .unwrap_or(-1);
         let replace = matches!(mode, CrossShardMove::Rename | CrossShardMove::CopyReplace);
+        if dst_db != src_db {
+            CURRENT_DB.set(dst_db);
+            router.local_db.borrow_mut().select_db(dst_db);
+        }
         if !replace {
             let exists =
                 exec_on_shard(router, d, Command::Exists(smallvec::smallvec![dst.clone()])).await;
             if resp_integer(&exists).unwrap_or(0) > 0 {
+                if dst_db != src_db {
+                    CURRENT_DB.set(src_db);
+                    router.local_db.borrow_mut().select_db(src_db);
+                }
                 return Ok(Some(false));
             }
         }
@@ -25257,6 +25748,10 @@ async fn move_key_across_shards(
             },
         )
         .await;
+        if dst_db != src_db {
+            CURRENT_DB.set(src_db);
+            router.local_db.borrow_mut().select_db(src_db);
+        }
         if restored.starts_with(b"-") {
             return Err(restored);
         }
@@ -25967,7 +26462,7 @@ mod tests {
         {
             let map = WATCHED_KEYS.read();
             let pm = map.get(&port).expect("client 2 still watches w:b");
-            assert!(!pm.contains_key(&Bytes::from("w:a")));
+            assert!(!pm.contains_key(&(0, Bytes::from("w:a"))));
             assert_eq!(pm.len(), 1);
         }
         unwatch_keys(port, 2);
