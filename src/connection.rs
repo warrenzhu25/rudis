@@ -2886,6 +2886,51 @@ static CONFIG_CLIENT_QUERY_BUFFER_LIMIT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1073741824);
 static CONFIG_KEY_LOAD_DELAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// Smallest `client-query-buffer-limit` accepted, as in Redis (1mb).
+const MIN_CLIENT_QUERY_BUFFER_LIMIT: u64 = 1024 * 1024;
+
+/// `client-query-buffer-limit` in bytes: the most input a client may have
+/// buffered for one command (a partially received command, or a complete
+/// one) before it is disconnected. Read once per batch of input.
+#[inline]
+fn client_query_buffer_limit() -> usize {
+    usize::try_from(CONFIG_CLIENT_QUERY_BUFFER_LIMIT.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(usize::MAX)
+}
+
+/// Whether the incomplete command left in a client's query buffer after
+/// parsing (`pending` bytes, all of it one partial frame) breaks `limit`.
+#[inline(always)]
+fn partial_query_over_limit(pending: usize, limit: usize) -> bool {
+    pending > limit
+}
+
+/// Whether the complete command just parsed off the front of a query buffer
+/// (which held `len_before` bytes and now holds `len_after`) breaks `limit`.
+/// The first compare is almost always false, so a normal pipeline pays one
+/// predictable branch per command.
+#[inline(always)]
+fn parsed_query_over_limit(len_before: usize, len_after: usize, limit: usize) -> bool {
+    len_before > limit && len_before - len_after > limit
+}
+
+/// Counts and logs a client dropped for breaking client-query-buffer-limit
+/// (Redis's wording; rate-limited, as many clients may break it at once).
+fn client_query_limit_reached(client_id: u64, qbuf: usize) {
+    static LOG_LIMIT: crate::log::RateLimit = crate::log::RateLimit::new();
+    crate::server_stats::add(
+        crate::server_stats::Stat::ClientQueryBufferLimitDisconnections,
+        1,
+    );
+    if LOG_LIMIT.allow(std::time::Duration::from_secs(1)) {
+        crate::log_warning!(
+            "Closing client that reached max query buffer length: id={} qbuf={}",
+            client_id,
+            qbuf
+        );
+    }
+}
+
 /// `key-load-delay`: microseconds to pause after each key an RDB load
 /// adds, like Redis (which uses it to make loads observable in tests).
 /// Values <= 0 mean no pause.
@@ -3043,8 +3088,17 @@ pub fn apply_config_value(
         "maxmemory-samples" => {
             CONFIG_MAXMEMORY_SAMPLES.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
-        "client-query-buffer-limit" => CONFIG_CLIENT_QUERY_BUFFER_LIMIT
-            .store(parse_config_bytes(name, val_str)?, Ordering::Relaxed),
+        "client-query-buffer-limit" => {
+            let limit = parse_config_bytes(name, val_str)?;
+            if limit < MIN_CLIENT_QUERY_BUFFER_LIMIT {
+                return Err(format!(
+                    "argument must be between {} and {} inclusive",
+                    MIN_CLIENT_QUERY_BUFFER_LIMIT,
+                    i64::MAX
+                ));
+            }
+            CONFIG_CLIENT_QUERY_BUFFER_LIMIT.store(limit, Ordering::Relaxed)
+        }
         "key-load-delay" => {
             CONFIG_KEY_LOAD_DELAY.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
@@ -4222,9 +4276,21 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                 let mut should_quit = false;
                 let mut has_special = in_multi;
                 let mut batch_in_bytes = n;
+                // client-query-buffer-limit: one relaxed load per batch. Only the
+                // bytes of a single command count (complete commands are parsed and
+                // run batch by batch), so a long pipeline drained normally never
+                // trips it; a huge partial command or one oversized command does.
+                let qbuf_limit = client_query_buffer_limit();
+                let mut qbuf_overflow = false;
                 while !buf.is_empty() {
+                    let len_before = buf.len();
                     match parse_command(&mut buf) {
                         Ok(Some(cmd)) => {
+                            if parsed_query_over_limit(len_before, buf.len(), qbuf_limit) {
+                                client_query_limit_reached(client_id, len_before - buf.len());
+                                qbuf_overflow = true;
+                                break;
+                            }
                             let is_quit = matches!(cmd, Command::Quit);
                             if !has_special && is_special_pipeline_cmd(&cmd) {
                                 has_special = true;
@@ -4243,6 +4309,12 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                             }
                         }
                         Ok(None) => {
+                            // `buf` now holds just one incomplete command.
+                            if partial_query_over_limit(buf.len(), qbuf_limit) {
+                                client_query_limit_reached(client_id, buf.len());
+                                qbuf_overflow = true;
+                                break;
+                            }
                             // Incomplete frame: check if remaining bytes just arrived in kernel buffer.
                             // Stop draining once the batch is full; the partial frame stays in `buf`
                             // and the next `read` completes it after this batch has run.
@@ -4340,6 +4412,14 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                             }
                         }
                     }
+                }
+
+                if qbuf_overflow {
+                    // Like Redis: close without running or answering what is
+                    // buffered; the loop exit recycles the scratch buffers.
+                    commands.clear();
+                    buf.clear();
+                    break;
                 }
 
                 if !commands.is_empty() {
@@ -5589,9 +5669,15 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
             Ok(0) => break,
             Ok(n) => {
                 crate::server_stats::add(crate::server_stats::Stat::NetInputBytes, n as u64);
+                let qbuf_limit = client_query_buffer_limit();
                 while !buf.is_empty() {
+                    let len_before = buf.len();
                     match parse_command(&mut buf) {
                         Ok(Some(cmd)) => {
+                            if parsed_query_over_limit(len_before, buf.len(), qbuf_limit) {
+                                client_query_limit_reached(client_id, len_before - buf.len());
+                                return;
+                            }
                             let mut out = Vec::new();
                             crate::pubsub::CURRENT_COMMAND_CLIENT_ID.set(Some(client_id));
                             let q = handle_pubsub_cmd(
@@ -5621,7 +5707,13 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                                 return;
                             }
                         }
-                        Ok(None) => break,
+                        Ok(None) => {
+                            if partial_query_over_limit(buf.len(), qbuf_limit) {
+                                client_query_limit_reached(client_id, buf.len());
+                                return;
+                            }
+                            break;
+                        }
                         Err(e) => {
                             let mut out = Vec::new();
                             write_resp_err(&mut out, &e);
@@ -9719,7 +9811,7 @@ async fn execute_command_inner(
             let pubsub_patterns = router.pubsub_numpat().await;
             let pubsubshard_channels = router.pubsub_shardchannels(None).await.len();
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_output_buffer_limit_disconnections:{}\r\n",
+                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_query_buffer_limit_disconnections:{}\r\nclient_output_buffer_limit_disconnections:{}\r\n",
                 total(Stat::ConnectionsReceived),
                 total(Stat::Commands),
                 ops_per_sec,
@@ -9746,6 +9838,7 @@ async fn execute_command_inner(
                 tracking_total_items,
                 tracking_total_keys,
                 tracking_total_prefixes,
+                total(Stat::ClientQueryBufferLimitDisconnections),
                 total(Stat::ClientOutputBufferLimitDisconnections),
             );
             let (blocked_clients_count, total_blocking_keys, total_blocking_keys_on_nokey) = {
@@ -10723,11 +10816,25 @@ async fn execute_command_inner(
                                 return false;
                             }
                         } else if p_str == "client-query-buffer-limit" {
-                            if crate::tiering::parse_memory_bytes(&val_str).is_none() {
-                                out.extend_from_slice(
-                                    b"-ERR CONFIG SET failed (possibly related to argument 'client-query-buffer-limit') - invalid client-query-buffer-limit\r\n",
-                                );
-                                return false;
+                            match crate::tiering::parse_memory_bytes(&val_str) {
+                                None => {
+                                    out.extend_from_slice(
+                                        b"-ERR CONFIG SET failed (possibly related to argument 'client-query-buffer-limit') - invalid client-query-buffer-limit\r\n",
+                                    );
+                                    return false;
+                                }
+                                Some(v) if v < MIN_CLIENT_QUERY_BUFFER_LIMIT => {
+                                    out.extend_from_slice(
+                                        format!(
+                                            "-ERR CONFIG SET failed (possibly related to argument 'client-query-buffer-limit') - argument must be between {} and {} inclusive\r\n",
+                                            MIN_CLIENT_QUERY_BUFFER_LIMIT,
+                                            i64::MAX
+                                        )
+                                        .as_bytes(),
+                                    );
+                                    return false;
+                                }
+                                Some(_) => {}
                             }
                         } else if p_str == "port" {
                             match val_str.parse::<u16>() {
@@ -26555,6 +26662,80 @@ mod tests {
     }
     use crate::resp::Command;
     use bytes::Bytes;
+
+    #[test]
+    fn test_query_buffer_limit_checks() {
+        let limit = 1024 * 1024;
+        // Partial command: only bytes actually buffered count.
+        assert!(!partial_query_over_limit(0, limit));
+        assert!(!partial_query_over_limit(limit, limit));
+        assert!(partial_query_over_limit(limit + 1, limit));
+        // Complete command: its own length counts, not what follows it.
+        assert!(!parsed_query_over_limit(100, 50, limit));
+        assert!(!parsed_query_over_limit(10 * limit, 10 * limit - 64, limit));
+        assert!(!parsed_query_over_limit(limit + 10, 10, limit));
+        assert!(parsed_query_over_limit(limit + 10, 9, limit));
+        assert!(parsed_query_over_limit(limit + 1, 0, limit));
+        // Unlimited (u64::MAX on a 64-bit target) never trips.
+        assert!(!partial_query_over_limit(usize::MAX - 1, usize::MAX));
+    }
+
+    /// Drives the parser the way the client loop does and applies the same
+    /// checks: a huge declared bulk that never completes trips the limit
+    /// once its buffered bytes pass it, while a pipeline of small commands
+    /// far larger than the limit in total does not.
+    #[test]
+    fn test_query_buffer_limit_with_parser() {
+        let limit = 1024 * 1024;
+
+        let mut buf = BytesMut::from(&b"*1\r\n$100000000\r\n"[..]);
+        buf.extend_from_slice(&vec![b'a'; limit]);
+        assert!(matches!(parse_command(&mut buf), Ok(None)));
+        assert!(partial_query_over_limit(buf.len(), limit));
+
+        let mut buf = BytesMut::new();
+        let cmd = b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n";
+        while buf.len() <= 4 * limit {
+            buf.extend_from_slice(cmd);
+        }
+        buf.extend_from_slice(b"*3\r\n$3\r\nSET"); // trailing partial frame
+        let mut parsed = 0usize;
+        loop {
+            let before = buf.len();
+            match parse_command(&mut buf) {
+                Ok(Some(_)) => {
+                    assert!(!parsed_query_over_limit(before, buf.len(), limit));
+                    parsed += 1;
+                }
+                Ok(None) => {
+                    assert!(!partial_query_over_limit(buf.len(), limit));
+                    break;
+                }
+                Err(e) => panic!("unexpected parse error: {e}"),
+            }
+        }
+        assert!(parsed * cmd.len() > 4 * limit);
+
+        // One complete command larger than the limit trips it.
+        let mut buf = BytesMut::from(format!("*2\r\n$4\r\nECHO\r\n${}\r\n", limit).as_bytes());
+        buf.extend_from_slice(&vec![b'x'; limit]);
+        buf.extend_from_slice(b"\r\n");
+        let before = buf.len();
+        assert!(matches!(parse_command(&mut buf), Ok(Some(_))));
+        assert!(parsed_query_over_limit(before, buf.len(), limit));
+    }
+
+    #[test]
+    fn test_client_query_buffer_limit_config_minimum() {
+        let before = CONFIG_CLIENT_QUERY_BUFFER_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(apply_config_value(0, 0, "client-query-buffer-limit", "1000").is_err());
+        assert!(apply_config_value(0, 0, "client-query-buffer-limit", "0").is_err());
+        assert!(apply_config_value(0, 0, "client-query-buffer-limit", "bogus").is_err());
+        assert_eq!(
+            CONFIG_CLIENT_QUERY_BUFFER_LIMIT.load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
+    }
 
     #[test]
     fn test_take_simple_replies_keeps_order_and_partial_lines() {

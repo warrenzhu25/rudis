@@ -24263,3 +24263,185 @@ fn test_psync2_sub_replica_sync_stream_and_nomasterlink_e2e() {
         }
     }
 }
+
+/// Whether the server closed `s`: EOF or a reset, not a read timeout.
+fn wait_for_server_close(s: &mut TcpStream) -> bool {
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut buf = [0u8; 4096];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return false;
+            }
+            Err(_) => return true,
+        }
+    }
+}
+
+fn wait_for_info_field(c: &mut TcpStream, field: &str) -> String {
+    let mut info = String::new();
+    for _ in 0..100 {
+        info = resp_cmd(c, &["INFO", "stats"]);
+        if info.contains(field) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    info
+}
+
+/// client-query-buffer-limit is enforced (it used to be accepted and
+/// reported but ignored, so one client could grow its query buffer without
+/// bound): a huge partial bulk, or one complete command larger than the
+/// limit, closes that client and is counted, and the server keeps serving
+/// everyone else. Runs the real binary: the limit is process-wide.
+#[test]
+fn test_client_query_buffer_limit_closes_client_e2e() {
+    let port = 16871;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let below_min = resp_cmd(
+        &mut admin,
+        &["CONFIG", "SET", "client-query-buffer-limit", "1000"],
+    );
+    assert!(below_min.starts_with("-ERR"), "{below_min}");
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["CONFIG", "SET", "client-query-buffer-limit", "1mb"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut admin, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+
+    // A bulk declared far beyond the limit, then more data than the limit
+    // without ever completing it.
+    let mut bad = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    bad.write_all(b"*1\r\n$100000000\r\n").unwrap();
+    let chunk = vec![b'a'; 64 * 1024];
+    for _ in 0..48 {
+        // 3MB; once the server closes, writes fail.
+        if bad.write_all(&chunk).is_err() {
+            break;
+        }
+    }
+    assert!(
+        wait_for_server_close(&mut bad),
+        "oversized partial command was not closed"
+    );
+    let info = wait_for_info_field(&mut admin, "client_query_buffer_limit_disconnections:1");
+    assert!(
+        info.contains("client_query_buffer_limit_disconnections:1"),
+        "{info}"
+    );
+
+    // One complete command over the limit (Redis's info.tcl case).
+    let mut big = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let value = "x".repeat(1024 * 1024);
+    let cmd = format!(
+        "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n${}\r\n{}\r\n",
+        value.len(),
+        value
+    );
+    let _ = big.write_all(cmd.as_bytes());
+    assert!(
+        wait_for_server_close(&mut big),
+        "oversized command was not closed"
+    );
+    let info = wait_for_info_field(&mut admin, "client_query_buffer_limit_disconnections:2");
+    assert!(
+        info.contains("client_query_buffer_limit_disconnections:2"),
+        "{info}"
+    );
+    assert_eq!(resp_cmd(&mut admin, &["EXISTS", "key"]), ":0\r\n");
+
+    // The server and other clients are unaffected; commands under the
+    // limit still work.
+    let mut other = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    other
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(resp_cmd(&mut other, &["PING"]), "+PONG\r\n");
+    let ok_value = "y".repeat(512 * 1024);
+    let ok_cmd = format!(
+        "*3\r\n$3\r\nSET\r\n$2\r\nok\r\n${}\r\n{}\r\n",
+        ok_value.len(),
+        ok_value
+    );
+    assert_eq!(send_and_read(&mut other, ok_cmd.as_bytes()), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut admin, &["STRLEN", "ok"]), ":524288\r\n");
+
+    shutdown_and_wait(port, &mut child);
+}
+
+/// A pipeline far larger in total than client-query-buffer-limit, made of
+/// small commands the server drains as they arrive, is not mistaken for an
+/// oversized query buffer.
+#[test]
+fn test_client_query_buffer_limit_allows_large_drained_pipeline_e2e() {
+    let port = 16872;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "client-query-buffer-limit", "1mb"]
+        ),
+        "+OK\r\n"
+    );
+
+    const N: usize = 50_000;
+    let value = "v".repeat(100);
+    let mut pipeline = Vec::new();
+    for i in 0..N {
+        let key = format!("pk:{i}");
+        pipeline.extend_from_slice(
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                key.len(),
+                key,
+                value.len(),
+                value
+            )
+            .as_bytes(),
+        );
+    }
+    assert!(pipeline.len() > 4 * 1024 * 1024);
+    let mut writer = c.try_clone().unwrap();
+    let w = thread::spawn(move || writer.write_all(&pipeline).unwrap());
+
+    let expected = N * b"+OK\r\n".len();
+    let mut got = Vec::with_capacity(expected);
+    let mut buf = vec![0u8; 64 * 1024];
+    while got.len() < expected {
+        let n = c.read(&mut buf).expect("pipeline replies");
+        assert!(n > 0, "server closed a drained pipeline");
+        got.extend_from_slice(&buf[..n]);
+    }
+    w.join().unwrap();
+    assert_eq!(got.len(), expected);
+    assert!(got.chunks(5).all(|r| r == b"+OK\r\n"));
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), format!(":{N}\r\n"));
+    let info = resp_cmd(&mut c, &["INFO", "stats"]);
+    assert!(
+        info.contains("client_query_buffer_limit_disconnections:0"),
+        "{info}"
+    );
+
+    shutdown_and_wait(port, &mut child);
+}
