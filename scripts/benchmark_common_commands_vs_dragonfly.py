@@ -18,7 +18,8 @@ import subprocess
 import sys
 import time
 
-RUDIS_BIN = "/usr/local/google/home/warrenzhu/github/rudis/target/release/rudis"
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUDIS_BIN = os.path.join(REPO_DIR, "target", "release", "rudis")
 DRAGONFLY_BIN = "/usr/local/google/home/warrenzhu/dragonfly"
 MEMTIER_BIN = "/usr/local/google/home/warrenzhu/memtier_benchmark/memtier_benchmark"
 
@@ -420,6 +421,7 @@ def run_single_memtier(port, workload, run_idx):
         "-c", str(CLIENT_CONNS),
         "--test-time", str(TEST_TIME_SECS),
         "--pipeline", str(workload["pipeline"]),
+        "--print-percentiles", "50,90,95,99,99.9",
         "--hide-histogram",
         "--json-out-file", json_path,
     ]
@@ -454,12 +456,13 @@ def run_single_memtier(port, workload, run_idx):
         os.remove(json_path)
         totals = data["ALL STATS"]["Totals"]
         percentiles = totals.get("Percentile Latencies", {})
+        avg_lat = float(totals.get("Latency", 0.0))
         return {
             "ops_sec": float(totals.get("Ops/sec", 0.0)),
-            "avg_latency": float(totals.get("Latency", 0.0)),
-            "p50": float(percentiles.get("50.000", totals.get("Latency", 0.0))),
-            "p99": float(percentiles.get("99.000", totals.get("Latency", 0.0))),
-            "p99_9": float(percentiles.get("99.900", totals.get("Latency", 0.0))),
+            "avg_latency": avg_lat,
+            "p50": float(percentiles.get("p50.00", percentiles.get("50.000", avg_lat))),
+            "p99": float(percentiles.get("p99.00", percentiles.get("99.000", avg_lat))),
+            "p99_9": float(percentiles.get("p99.90", percentiles.get("99.900", avg_lat))),
         }
     except Exception as e:
         print(f"       [!] Error parsing JSON {json_path}: {e}")
@@ -492,7 +495,9 @@ def run_workload_benchmark(engine_name, port, workload):
 
     ops_list = [x["ops_sec"] for x in runs]
     avg_lat_list = [x["avg_latency"] for x in runs]
+    p50_list = [x["p50"] for x in runs]
     p99_list = [x["p99"] for x in runs]
+    p99_9_list = [x["p99_9"] for x in runs]
 
     median_ops = statistics.median(ops_list)
     stdev_ops = statistics.stdev(ops_list) if len(ops_list) > 1 else 0.0
@@ -509,7 +514,9 @@ def run_workload_benchmark(engine_name, port, workload):
         "ops_sec_max": max(ops_list),
         "ops_sec_cv_pct": cv_pct,
         "avg_latency_median": statistics.median(avg_lat_list),
+        "p50_latency_median": statistics.median(p50_list),
         "p99_latency_median": statistics.median(p99_list),
+        "p99_9_latency_median": statistics.median(p99_9_list),
         "runs": ops_list,
     }
 
@@ -635,11 +642,11 @@ def benchmark_at_core_count(cores):
 def main():
     print("=================================================================")
     print("  RUDIS VS DRAGONFLY: MOST COMMON REDIS COMMANDS BENCHMARK SUITE ")
-    print("  Cores Tested: 16 Physical Cores & 32 Physical Cores            ")
+    print("  Cores Tested: 8 Physical Cores & 16 Physical Cores             ")
     print("  Data Types: Strings, Hashes, Lists, Sets, ZSets, Keyspace      ")
     print("=================================================================")
 
-    out_file = "/usr/local/google/home/warrenzhu/github/rudis/benchmark_common_commands_results.json"
+    out_file = os.path.join(REPO_DIR, "benchmark_common_commands_results.json")
     final_results = {}
     if os.path.exists(out_file):
         try:
@@ -648,7 +655,7 @@ def main():
         except Exception:
             final_results = {}
 
-    core_list = [16]
+    core_list = [8, 16]
     if len(sys.argv) > 1:
         core_list = [int(x) for x in sys.argv[1].split(",")]
     for cores in core_list:

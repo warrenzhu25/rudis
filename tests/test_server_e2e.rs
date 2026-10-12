@@ -26550,3 +26550,54 @@ fn test_pipelined_multikey_del_and_exists_folding_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_pipelined_mset_folding_e2e() {
+    let port = 17983u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Send a single pipeline mixing cross-shard MSETs (with duplicate keys within and across MSETs),
+    // single-key SETs, and cross-shard MGETs across 4 shards.
+    let mut pipe = String::new();
+    pipe.push_str("MSET mset_k_0 v0_a mset_k_1 v1_a mset_k_2 v2_a mset_k_3 v3_a mset_k_0 v0_b\r\n");
+    pipe.push_str("MSET mset_k_2 v2_b mset_k_4 v4_a mset_k_5 v5_a mset_k_6 v6_a mset_k_7 v7_a\r\n");
+    pipe.push_str("SET mset_k_5 v5_override\r\n");
+    pipe.push_str(
+        "MGET mset_k_0 mset_k_1 mset_k_2 mset_k_3 mset_k_4 mset_k_5 mset_k_6 mset_k_7\r\n",
+    );
+
+    let resp = send_and_read(&mut c, pipe.as_bytes());
+    let expected = concat!(
+        "+OK\r\n",
+        "+OK\r\n",
+        "+OK\r\n",
+        "*8\r\n",
+        "$4\r\nv0_b\r\n",
+        "$4\r\nv1_a\r\n",
+        "$4\r\nv2_b\r\n",
+        "$4\r\nv3_a\r\n",
+        "$4\r\nv4_a\r\n",
+        "$11\r\nv5_override\r\n",
+        "$4\r\nv6_a\r\n",
+        "$4\r\nv7_a\r\n",
+    );
+    assert_eq!(resp, expected);
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

@@ -179,7 +179,12 @@ neither physical cores nor L3 cache complexes.
 See [`docs/benchmark_multicore_results.md`](docs/benchmark_multicore_results.md) for the 8-core
 head-to-head table, p99 latency breakdown, and topology notes explaining why 32-thread benchmarks
 on a single 32-physical-core / 64-vCPU VM suffer from SMT sibling contention between server and
-client threads.
+client threads, and [`docs/benchmarks/multi_command_comparison.md`](docs/benchmarks/multi_command_comparison.md)
+([`benchmark_common_commands_results.json`](benchmark_common_commands_results.json)) for the
+16-command data-structure suite (`SET`, `GET`, `INCR`, `MSET`, `MGET`, `HSET`, `HGET`, `LPUSH`,
+`LPOP`, `LRANGE`, `SADD`, `SISMEMBER`, `ZADD`, `ZRANGE`, `DEL`, `EXISTS`) at 8 and 16 physical
+cores, where Rudis leads Dragonfly v1.39 on all 16 commands by **+43.9% to +210.8% (1.44x–3.11x)**
+at 16 physical cores.
 
 ---
 

@@ -26739,6 +26739,40 @@ async fn execute_commands_squashed_inner(
                 }
             }
             folded_int_sums.push((idx, start, responses.len() - start));
+        } else if write_fast_path && let Command::Mset(pairs) = cmd {
+            stat_run.note("MSET");
+            let watched = HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed);
+            let tracking = HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
+            for (key, value) in pairs {
+                let (target, key_hash) = router.target_shard_and_hash(key.as_ref());
+                if target == router.shard_id {
+                    has_local_writes = true;
+                    if watched {
+                        touch_watched_key(router.port, key.as_ref());
+                    }
+                    if tracking {
+                        notify_key_invalidation(router.port, key.as_ref(), client_id);
+                    }
+                    local_db.table.set_with_hash(key, key_hash, value, None);
+                } else {
+                    let slot = responses.len();
+                    responses.push(CompactResp::empty());
+                    remote_batches[target].push((
+                        slot,
+                        key_hash,
+                        Command::Set {
+                            key,
+                            value,
+                            expire_in: None,
+                            condition: crate::resp::SetCondition::None,
+                            get: false,
+                            keepttl: false,
+                            past_expired: false,
+                        },
+                    ));
+                }
+            }
+            responses[idx] = crate::shard::CompactResp::OK;
         } else if let Command::Mset(pairs) = cmd {
             local_db.drain_dropped_tier();
             drop(local_db);
@@ -29915,6 +29949,79 @@ mod tests {
             .await;
             assert!(!quit);
             assert_eq!(out, b"+OK\r\n+OK\r\n:3\r\n:2\r\n:0\r\n");
+        });
+    }
+
+    #[test]
+    fn test_squashed_pipeline_folds_mset() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
+            let db = Rc::new(RefCell::new(ShardDb::new(9996)));
+            let router = Router::new(
+                0,
+                1,
+                9996,
+                db,
+                senders_mesh[0].clone(),
+                None,
+                Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+                std::env::temp_dir(),
+            );
+            let client_registry = RefCell::new(hashbrown::HashMap::new());
+            let mut asking = false;
+            let mut authenticated = true;
+            let mut auth_user = String::from("default");
+            let mut out = Vec::new();
+            let responders = vec![std::sync::Arc::new(crate::mailbox::BatchResponder::new())];
+            let mut remote_batches = vec![Vec::new()];
+            let mut items_pool = vec![Vec::new()];
+            let mut results_pool = vec![Vec::new()];
+            let mut squashed_responses = Vec::new();
+
+            let mut cmds = vec![
+                Command::Mset(vec![
+                    (Bytes::from("ms_a"), Bytes::from("v1")),
+                    (Bytes::from("ms_b"), Bytes::from("v2")),
+                    (Bytes::from("ms_a"), Bytes::from("v1_last")),
+                ]),
+                Command::Mset(vec![
+                    (Bytes::from("ms_b"), Bytes::from("v2_next")),
+                    (Bytes::from("ms_c"), Bytes::from("v3")),
+                ]),
+                Command::Mget(vec![
+                    Bytes::from("ms_a"),
+                    Bytes::from("ms_b"),
+                    Bytes::from("ms_c"),
+                ]),
+            ];
+
+            let quit = execute_commands_squashed(
+                &mut cmds,
+                false,
+                &router,
+                &responders,
+                &mut remote_batches,
+                &mut items_pool,
+                &mut results_pool,
+                &mut squashed_responses,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert!(!quit);
+            assert_eq!(
+                out,
+                b"+OK\r\n+OK\r\n*3\r\n$7\r\nv1_last\r\n$7\r\nv2_next\r\n$2\r\nv3\r\n"
+            );
         });
     }
 }
