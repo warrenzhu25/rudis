@@ -7554,6 +7554,8 @@ fn test_deployment_configuration_and_service_assets_e2e() {
     );
     let docker_content = std::fs::read_to_string(dockerfile_path).unwrap();
     assert!(docker_content.contains("FROM rust:"));
+    assert!(docker_content.contains("COPY vendor ./vendor"));
+    assert!(docker_content.contains("HEALTHCHECK"));
     assert!(docker_content.contains("ENTRYPOINT"));
 
     let ci_path = std::path::Path::new(".github/workflows/ci.yml");

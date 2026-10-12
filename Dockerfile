@@ -16,8 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency manifests for cache optimization
+# Copy dependency manifests and vendored crates for cache optimization
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 
 # Copy source code
 COPY src ./src
@@ -48,6 +49,9 @@ USER rudis
 
 # Expose default Redis and TLS ports
 EXPOSE 6379 6380
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6379 && printf '*1\\r\\n$4\\r\\nPING\\r\\n' >&3 && head -n 1 <&3 | grep -q '^\\(+PONG\\|-NOAUTH\\)'"]
 
 ENTRYPOINT ["/usr/local/bin/rudis"]
 # Like the official redis image: protected mode would refuse every client

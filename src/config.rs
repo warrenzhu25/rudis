@@ -1381,4 +1381,33 @@ mod tests {
         let _ = fs::remove_file(&cfg_path);
         let _ = fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_dockerfile_copies_path_dependencies_and_has_healthcheck() {
+        let cargo_toml = fs::read_to_string("Cargo.toml").unwrap();
+        let dockerfile = fs::read_to_string("Dockerfile").unwrap();
+        let build_idx = dockerfile
+            .find("cargo build")
+            .expect("Dockerfile should run cargo build");
+        let before_build = &dockerfile[..build_idx];
+
+        for line in cargo_toml.lines() {
+            if let Some(idx) = line.find("path = \"") {
+                let rest = &line[idx + "path = \"".len()..];
+                if let Some(end) = rest.find('"') {
+                    let dep_path = &rest[..end];
+                    let top_dir = dep_path.split('/').next().unwrap_or(dep_path);
+                    assert!(
+                        before_build.contains(&format!("COPY {top_dir} "))
+                            || before_build.contains(&format!("COPY {dep_path} ")),
+                        "Dockerfile must COPY local path dependency '{dep_path}' before cargo build"
+                    );
+                }
+            }
+        }
+        assert!(
+            dockerfile.contains("HEALTHCHECK"),
+            "Dockerfile must define a HEALTHCHECK instruction"
+        );
+    }
 }
