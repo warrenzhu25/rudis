@@ -705,6 +705,9 @@ impl RudisConfig {
                         .map_err(|e| format!("In included file {:?}: {}", path, e))?;
                 }
                 "user" => {
+                    if config.users.iter().any(|(u, _)| u == rest[0]) {
+                        return Err(format!("Duplicate user '{}' found", rest[0]));
+                    }
                     config.users.push((
                         rest[0].to_string(),
                         rest[1..].iter().map(|r| r.to_string()).collect(),
@@ -924,6 +927,13 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
     {
         whole.push(format!("replicaof {master_host} {master_port}"));
     }
+    let rewrite_users = crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
+        && acl.read().aclfile.is_none();
+    if rewrite_users {
+        for line in acl.read().list() {
+            whole.push(line);
+        }
+    }
     lines.retain(|line| {
         let key = line
             .split_whitespace()
@@ -931,6 +941,7 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
             .unwrap_or("")
             .to_ascii_lowercase();
         !matches!(key.as_str(), "save" | "replicaof" | "slaveof")
+            && !(rewrite_users && key == "user")
     });
     lines.extend(whole);
 

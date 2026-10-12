@@ -2620,37 +2620,14 @@ fn script_acl_denied(port: u16, cmd: &Command) -> Option<String> {
     } else {
         auth_user.as_str()
     };
-    if !crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
-        && user_name == "default"
-    {
-        return None;
-    }
-    let acl = crate::acl::get_acl_for_port(port);
-    let guard = acl.read();
-    let user = guard.users.get(user_name)?;
-    let name = crate::connection::acl_cmd_name(cmd);
-    if !user.can_execute_command(name) {
-        return Some(format!(
-            "NOPERM this user has no permissions to run the '{}' command",
-            name.to_lowercase()
-        ));
-    }
-    let need = crate::connection::acl_key_perm(cmd);
-    let mut key_denied = false;
-    crate::connection::for_each_cmd_key(cmd, |k| key_denied |= !user.can_access_key(k, need));
-    if key_denied {
-        return Some(
-            "NOPERM this user has no permissions to access one of the keys used as arguments"
-                .to_string(),
-        );
-    }
-    if crate::connection::acl_channels_denied(user, cmd) {
-        return Some(
-            "NOPERM this user has no permissions to access one of the channels used as arguments"
-                .to_string(),
-        );
-    }
-    None
+    let reply =
+        crate::connection::acl_denied_in_context(port, user_name, cmd, Some(("lua", "eval")))?;
+    let s = String::from_utf8_lossy(&reply);
+    Some(
+        s.trim_start_matches('-')
+            .trim_end_matches("\r\n")
+            .to_string(),
+    )
 }
 
 fn resp_bytes_to_lua(lua: &Lua, out: &[u8], is_hgetall_map: bool) -> mlua::Result<Value> {

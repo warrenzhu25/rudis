@@ -165,6 +165,62 @@ fn setuser_err(rule: &str, msg: &str) -> String {
     format!("Error in ACL SETUSER modifier '{}': {}", rule, msg)
 }
 
+/// Reason for an ACL access denial (used by `ACL LOG` and `INFO stats`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AclDeniedReason {
+    Auth,
+    Command,
+    Key,
+    Channel,
+}
+
+impl AclDeniedReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Command => "command",
+            Self::Key => "key",
+            Self::Channel => "channel",
+        }
+    }
+}
+
+/// One entry in the server's `ACL LOG` ring buffer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AclLogEntry {
+    pub entry_id: u64,
+    pub count: u64,
+    pub reason: AclDeniedReason,
+    pub context: String,
+    pub object: String,
+    pub username: String,
+    pub age_created: std::time::Instant,
+    pub timestamp_created: f64,
+    pub timestamp_last_updated: f64,
+    pub client_info: String,
+}
+
+fn unix_now_secs_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CmdRuleEntry {
+    Category { allow: bool, name: &'static str },
+    Command { allow: bool, idx: usize },
+    FirstArg { parent_idx: usize, arg: String },
+}
+
+fn canonical_category_name(name: &str) -> Option<(&'static str, u32)> {
+    CATEGORIES
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(name))
+        .map(|i| (CATEGORIES[i], 1u32 << i))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AclUser {
     pub name: String,
@@ -176,6 +232,13 @@ pub struct AclUser {
     /// grants commands that are not in the category table.
     pub all_commands: bool,
     commands: CommandSet,
+    /// Base command rule (`true` = `+@all`, `false` = `-@all`) and ordered,
+    /// compacted command rule modifiers as tracked by Redis `ACL GETUSER`.
+    cmd_base_all: bool,
+    cmd_rules: Vec<CmdRuleEntry>,
+    /// Allowed first-argument restrictions `(parent_cmd_idx, lowercase_arg)`
+    /// such as `+select|0` or `+debug|object`.
+    first_arg_rules: Vec<(usize, String)>,
     pub all_keys: bool,
     /// `~pat` / `%R~pat` / `%W~pat` key patterns.
     pub key_patterns: Vec<KeyPattern>,
@@ -183,6 +246,9 @@ pub struct AclUser {
     pub all_channels: bool,
     /// `&<glob>` Pub/Sub channel patterns.
     pub channel_patterns: Vec<String>,
+    /// `sanitize-payload` (default) / `skip-sanitize-payload`: whether
+    /// RESTORE payloads get deep sanitization for this user.
+    pub sanitize_payload: bool,
 }
 
 impl AclUser {
@@ -194,16 +260,20 @@ impl AclUser {
             nopass: true,
             all_commands: true,
             commands: CommandSet::full(),
+            cmd_base_all: true,
+            cmd_rules: Vec::new(),
+            first_arg_rules: Vec::new(),
             all_keys: true,
             key_patterns: Vec::new(),
             all_channels: true,
             channel_patterns: Vec::new(),
+            sanitize_payload: true,
         }
     }
 
-    /// A newly created user. Like Redis 7 (`acl-pubsub-default resetchannels`)
-    /// it starts as `off resetpass resetkeys resetchannels -@all`.
-    fn new_empty(name: &str) -> Self {
+    /// A newly created user. Starts as `off resetpass resetkeys -@all`, with
+    /// channel access governed by `acl-pubsub-default` (`all_channels_default`).
+    pub fn new_empty_with_pubsub(name: &str, all_channels_default: bool) -> Self {
         Self {
             name: name.to_string(),
             enabled: false,
@@ -211,10 +281,14 @@ impl AclUser {
             nopass: false,
             all_commands: false,
             commands: CommandSet::empty(),
+            cmd_base_all: false,
+            cmd_rules: Vec::new(),
+            first_arg_rules: Vec::new(),
             all_keys: false,
             key_patterns: Vec::new(),
-            all_channels: false,
+            all_channels: all_channels_default,
             channel_patterns: Vec::new(),
+            sanitize_payload: true,
         }
     }
 
@@ -222,6 +296,17 @@ impl AclUser {
     /// container name (subcommand unknown to the caller) is permitted only if
     /// every non-help subcommand is.
     pub fn can_execute_command(&self, cmd_name: &str) -> bool {
+        self.can_execute_command_with_first_arg(cmd_name, None)
+    }
+
+    /// Checks command permission, additionally consulting first-arg rules
+    /// (`+select|0`, `+debug|object`) when `first_arg` is provided and the
+    /// full command is not unconditionally permitted.
+    pub fn can_execute_command_with_first_arg(
+        &self,
+        cmd_name: &str,
+        first_arg: Option<&[u8]>,
+    ) -> bool {
         let Some(i) = command_index(cmd_name) else {
             return self.all_commands;
         };
@@ -230,7 +315,18 @@ impl AclUser {
             return true;
         }
         if c.subs.0 == c.subs.1 {
-            return self.commands.get(i);
+            if self.commands.get(i) {
+                return true;
+            }
+            if let Some(arg) = first_arg
+                && !self.first_arg_rules.is_empty()
+            {
+                return self
+                    .first_arg_rules
+                    .iter()
+                    .any(|(idx, a)| *idx == i && a.as_bytes().eq_ignore_ascii_case(arg));
+            }
+            return false;
         }
         (c.subs.0..c.subs.1).all(|j| {
             let j = j as usize;
@@ -246,6 +342,7 @@ impl AclUser {
         for j in a..b {
             self.commands.set(j as usize, allow);
         }
+        self.first_arg_rules.retain(|(idx, _)| *idx != i);
         if !allow {
             self.all_commands = false;
         }
@@ -262,7 +359,15 @@ impl AclUser {
         }
     }
 
-    fn apply_rule(&mut self, rule: &str) -> Result<(), String> {
+    pub fn apply_rule(&mut self, rule: &str) -> Result<(), String> {
+        self.apply_rule_with_pubsub(rule, false)
+    }
+
+    pub fn apply_rule_with_pubsub(
+        &mut self,
+        rule: &str,
+        all_channels_default: bool,
+    ) -> Result<(), String> {
         let lower = rule.to_ascii_lowercase();
         match lower.as_str() {
             "on" => self.enabled = true,
@@ -286,10 +391,16 @@ impl AclUser {
             "allcommands" | "+@all" => {
                 self.commands = CommandSet::full();
                 self.all_commands = true;
+                self.cmd_base_all = true;
+                self.cmd_rules.clear();
+                self.first_arg_rules.clear();
             }
             "nocommands" | "-@all" => {
                 self.commands = CommandSet::empty();
                 self.all_commands = false;
+                self.cmd_base_all = false;
+                self.cmd_rules.clear();
+                self.first_arg_rules.clear();
             }
             "allchannels" | "&*" => {
                 self.all_channels = true;
@@ -299,11 +410,13 @@ impl AclUser {
                 self.all_channels = false;
                 self.channel_patterns.clear();
             }
+            "sanitize-payload" => self.sanitize_payload = true,
+            "skip-sanitize-payload" => self.sanitize_payload = false,
             // No selectors exist, so there is nothing to clear.
             "clearselectors" => {}
             "reset" => {
                 let name = std::mem::take(&mut self.name);
-                *self = Self::new_empty(&name);
+                *self = Self::new_empty_with_pubsub(&name, all_channels_default);
             }
             _ => return self.apply_prefixed_rule(rule),
         }
@@ -361,11 +474,75 @@ impl AclUser {
         } else if let Some(rest) = rule.strip_prefix('+').or_else(|| rule.strip_prefix('-')) {
             let allow = rule.starts_with('+');
             if let Some(cat) = rest.strip_prefix('@') {
-                let bit = category_bit(cat).ok_or_else(|| setuser_err(rule, UNKNOWN))?;
+                let (cat_name, bit) =
+                    canonical_category_name(cat).ok_or_else(|| setuser_err(rule, UNKNOWN))?;
                 self.change_category(bit, allow);
-            } else {
-                let i = command_index(rest).ok_or_else(|| setuser_err(rule, UNKNOWN))?;
+                self.cmd_rules.retain(
+                    |e| !matches!(e, CmdRuleEntry::Category { name, .. } if *name == cat_name),
+                );
+                self.cmd_rules.push(CmdRuleEntry::Category {
+                    allow,
+                    name: cat_name,
+                });
+            } else if let Some(i) = command_index(rest) {
                 self.change_perm(i, allow);
+                let (a, b) = COMMANDS[i].subs;
+                self.cmd_rules.retain(|e| match e {
+                    CmdRuleEntry::Command { idx, .. } => {
+                        *idx != i && !(*idx >= a as usize && *idx < b as usize)
+                    }
+                    CmdRuleEntry::FirstArg { parent_idx, .. } => *parent_idx != i,
+                    _ => true,
+                });
+                self.cmd_rules.push(CmdRuleEntry::Command { allow, idx: i });
+            } else if rest.contains('|') {
+                let parts: Vec<&str> = rest.split('|').collect();
+                if parts.len() == 3 {
+                    let sub_name = format!("{}|{}", parts[0], parts[1]);
+                    if command_index(&sub_name).is_some() {
+                        return Err(setuser_err(
+                            rule,
+                            "Allowing first-arg of a subcommand is not supported",
+                        ));
+                    }
+                    return Err(setuser_err(rule, UNKNOWN));
+                }
+                if parts.len() == 2
+                    && allow
+                    && !parts[1].is_empty()
+                    && let Some(parent_idx) = command_index(parts[0])
+                {
+                    let c = &COMMANDS[parent_idx];
+                    // Only plain commands (no subcommands in table, e.g.
+                    // SELECT or DEBUG) accept first-arg restrictions; an
+                    // unknown subcommand of a container (e.g. +config|asdf)
+                    // is rejected as unknown.
+                    if c.subs.0 == c.subs.1 && c.parent.is_none() {
+                        let arg_lower = parts[1].to_ascii_lowercase();
+                        if !self
+                            .first_arg_rules
+                            .iter()
+                            .any(|(idx, a)| *idx == parent_idx && *a == arg_lower)
+                        {
+                            self.first_arg_rules.push((parent_idx, arg_lower.clone()));
+                        }
+                        self.cmd_rules.retain(|e| {
+                            !matches!(
+                                e,
+                                CmdRuleEntry::FirstArg { parent_idx: p, arg }
+                                    if *p == parent_idx && *arg == arg_lower
+                            )
+                        });
+                        self.cmd_rules.push(CmdRuleEntry::FirstArg {
+                            parent_idx,
+                            arg: arg_lower,
+                        });
+                        return Ok(());
+                    }
+                }
+                return Err(setuser_err(rule, UNKNOWN));
+            } else {
+                return Err(setuser_err(rule, UNKNOWN));
             }
         } else {
             return Err(setuser_err(rule, "Syntax error"));
@@ -376,22 +553,18 @@ impl AclUser {
     /// The command part of `ACL LIST` / `ACL GETUSER`, replayable through
     /// `ACL SETUSER`.
     pub fn commands_rule_string(&self) -> String {
-        let allowed = (0..NUM_COMMANDS).filter(|&i| self.commands.get(i)).count();
-        let base_all = self.all_commands || allowed * 2 > NUM_COMMANDS;
-        let mut parts = vec![if base_all { "+@all" } else { "-@all" }.to_string()];
+        let mut parts = vec![if self.cmd_base_all { "+@all" } else { "-@all" }.to_string()];
         let sign = |on: bool| if on { '+' } else { '-' };
-        for (i, c) in COMMANDS.iter().enumerate() {
-            if c.parent.is_some() {
-                continue;
-            }
-            let on = self.commands.get(i);
-            if on != base_all {
-                parts.push(format!("{}{}", sign(on), c.name));
-            }
-            for j in c.subs.0..c.subs.1 {
-                let s = self.commands.get(j as usize);
-                if s != on {
-                    parts.push(format!("{}{}", sign(s), COMMANDS[j as usize].name));
+        for entry in &self.cmd_rules {
+            match entry {
+                CmdRuleEntry::Category { allow, name } => {
+                    parts.push(format!("{}@{}", sign(*allow), name));
+                }
+                CmdRuleEntry::Command { allow, idx } => {
+                    parts.push(format!("{}{}", sign(*allow), COMMANDS[*idx].name));
+                }
+                CmdRuleEntry::FirstArg { parent_idx, arg } => {
+                    parts.push(format!("+{}|{}", COMMANDS[*parent_idx].name, arg));
                 }
             }
         }
@@ -414,11 +587,11 @@ impl AclUser {
         }
     }
 
+    /// Channel string for `ACL GETUSER <user> channels`: `"&*"` when
+    /// `all_channels`, else `&pat` entries joined by space (`""` when empty).
     pub fn channels_rule_string(&self) -> String {
         if self.all_channels {
             "&*".to_string()
-        } else if self.channel_patterns.is_empty() {
-            "resetchannels".to_string()
         } else {
             self.channel_patterns
                 .iter()
@@ -465,9 +638,20 @@ impl AclUser {
         if self.all_keys {
             flags.push("allkeys".to_string());
         }
+        if self.all_channels {
+            flags.push("allchannels".to_string());
+        }
         if self.all_commands {
             flags.push("allcommands".to_string());
         }
+        flags.push(
+            if self.sanitize_payload {
+                "sanitize-payload"
+            } else {
+                "skip-sanitize-payload"
+            }
+            .to_string(),
+        );
         flags
     }
 
@@ -485,13 +669,28 @@ impl AclUser {
                 parts.push(h.clone());
             }
         }
+        parts.push(
+            if self.sanitize_payload {
+                "sanitize-payload"
+            } else {
+                "skip-sanitize-payload"
+            }
+            .to_string(),
+        );
+        // Like Redis' ACLDescribeSelector: no key patterns means nothing to
+        // list (a new user has none).
         let keys = self.keys_rule_string();
-        if keys.is_empty() {
-            parts.push("resetkeys".to_string());
-        } else {
+        if !keys.is_empty() {
             parts.push(keys);
         }
-        parts.push(self.channels_rule_string());
+        if self.all_channels {
+            parts.push("&*".to_string());
+        } else {
+            parts.push("resetchannels".to_string());
+            for pat in &self.channel_patterns {
+                parts.push(format!("&{}", pat));
+            }
+        }
         parts.push(self.commands_rule_string());
         parts.join(" ")
     }
@@ -502,6 +701,15 @@ pub struct AclManager {
     /// Value of the `requirepass` config, kept only so CONFIG GET/REWRITE can
     /// report it like Redis does. ACL commands never expose it.
     pub requirepass: Option<String>,
+    /// `acl-pubsub-default`: `true` = `allchannels`, `false` = `resetchannels`
+    /// (Redis 7 default).
+    pub acl_pubsub_default_all: bool,
+    /// `aclfile`: path to external ACL file (empty if not configured).
+    pub aclfile: Option<std::path::PathBuf>,
+    /// `acllog-max-len` (default 128).
+    pub acllog_max_len: usize,
+    pub acl_log: std::collections::VecDeque<AclLogEntry>,
+    pub next_log_entry_id: u64,
 }
 
 impl Default for AclManager {
@@ -517,7 +725,58 @@ impl AclManager {
         Self {
             users,
             requirepass: None,
+            acl_pubsub_default_all: false,
+            aclfile: None,
+            acllog_max_len: 128,
+            acl_log: std::collections::VecDeque::new(),
+            next_log_entry_id: 0,
         }
+    }
+
+    /// Records a security event in `ACL LOG` (aggregating matching entries as
+    /// Redis `ACLAddLogEntry` does).
+    pub fn add_log_entry(
+        &mut self,
+        reason: AclDeniedReason,
+        context: &str,
+        object: &str,
+        username: &str,
+        client_info: String,
+    ) {
+        if self.acllog_max_len == 0 {
+            return;
+        }
+        let now_ts = unix_now_secs_f64();
+        if let Some(pos) = self.acl_log.iter().position(|e| {
+            e.reason == reason
+                && e.context == context
+                && e.object == object
+                && e.username == username
+        }) {
+            let mut entry = self.acl_log.remove(pos).unwrap();
+            entry.count += 1;
+            entry.timestamp_last_updated = now_ts;
+            entry.client_info = client_info;
+            self.acl_log.push_front(entry);
+            return;
+        }
+        while self.acl_log.len() >= self.acllog_max_len {
+            self.acl_log.pop_back();
+        }
+        let entry_id = self.next_log_entry_id;
+        self.next_log_entry_id += 1;
+        self.acl_log.push_front(AclLogEntry {
+            entry_id,
+            count: 1,
+            reason,
+            context: context.to_string(),
+            object: object.to_string(),
+            username: username.to_string(),
+            age_created: std::time::Instant::now(),
+            timestamp_created: now_ts,
+            timestamp_last_updated: now_ts,
+            client_info,
+        });
     }
 
     pub fn check_auth(
@@ -605,17 +864,109 @@ impl AclManager {
     /// Applies `rules` atomically: on error the user is left unchanged (or not
     /// created), as in Redis.
     pub fn set_user(&mut self, username: &str, rules: &[String]) -> Result<(), String> {
+        if username.contains(' ') || username.contains('\0') {
+            return Err("Usernames can't contain spaces or null characters".to_string());
+        }
+        let default_all_chan = self.acl_pubsub_default_all;
         let mut user = self
             .users
             .get(username)
             .cloned()
-            .unwrap_or_else(|| AclUser::new_empty(username));
+            .unwrap_or_else(|| AclUser::new_empty_with_pubsub(username, default_all_chan));
         for rule in rules {
-            user.apply_rule(rule)?;
+            user.apply_rule_with_pubsub(rule, default_all_chan)?;
         }
         HAS_CUSTOM_ACL.store(true, Ordering::Release);
         self.users.insert(username.to_string(), user);
         Ok(())
+    }
+
+    /// Applies a `user <name> [rules...]` declaration from a config file or
+    /// `aclfile`, where a fresh user (including `default`) starts from
+    /// `new_empty_with_pubsub` before its rules are applied (except `default`
+    /// when not mentioned in an `aclfile`, which stays `new_default()`).
+    pub fn load_user_from_declaration(
+        &mut self,
+        username: &str,
+        rules: &[String],
+    ) -> Result<(), String> {
+        if username.contains(' ') || username.contains('\0') {
+            return Err("Usernames can't contain spaces or null characters".to_string());
+        }
+        let default_all_chan = self.acl_pubsub_default_all;
+        let mut user = AclUser::new_empty_with_pubsub(username, default_all_chan);
+        for rule in rules {
+            user.apply_rule_with_pubsub(rule, default_all_chan)?;
+        }
+        HAS_CUSTOM_ACL.store(true, Ordering::Release);
+        self.users.insert(username.to_string(), user);
+        Ok(())
+    }
+
+    /// Loads users from the configured `aclfile` atomically (leaving existing
+    /// users untouched on any syntax or duplicate-user error).
+    pub fn load_from_aclfile(&mut self) -> Result<(), String> {
+        let Some(ref path) = self.aclfile else {
+            return Err("This Redis instance is not configured to use an ACL file. You may want to specify users via the ACL SETUSER command and then issue a CONFIG REWRITE (assuming you have a configuration file set) in order to store users in the Redis configuration.".to_string());
+        };
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Loading ACL file {:?} failed: {}", path, e))?;
+        let default_all_chan = self.acl_pubsub_default_all;
+        let mut new_users: HashMap<String, AclUser> = HashMap::new();
+        for (line_idx, raw_line) in content.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("user") {
+                return Err(format!(
+                    "{}:{}: Unrecognized ACL file line starting with '{}'",
+                    path.display(),
+                    line_idx + 1,
+                    parts.first().copied().unwrap_or("")
+                ));
+            }
+            let username = parts[1];
+            if new_users.contains_key(username) {
+                return Err(format!(
+                    "{}:{}: Duplicate user '{}' found",
+                    path.display(),
+                    line_idx + 1,
+                    username
+                ));
+            }
+            let mut user = AclUser::new_empty_with_pubsub(username, default_all_chan);
+            for rule in &parts[2..] {
+                user.apply_rule_with_pubsub(rule, default_all_chan)
+                    .map_err(|e| format!("{}:{}: {}", path.display(), line_idx + 1, e))?;
+            }
+            new_users.insert(username.to_string(), user);
+        }
+        // As in Redis, if the ACL file omits `default`, keep the standard
+        // default user (`on nopass ~* &* +@all`).
+        new_users
+            .entry("default".to_string())
+            .or_insert_with(AclUser::new_default);
+        HAS_CUSTOM_ACL.store(true, Ordering::Release);
+        self.users = new_users;
+        Ok(())
+    }
+
+    /// Saves all current users to the configured `aclfile`.
+    pub fn save_to_aclfile(&self) -> Result<(), String> {
+        let Some(ref path) = self.aclfile else {
+            return Err("This Redis instance is not configured to use an ACL file. You may want to specify users via the ACL SETUSER command and then issue a CONFIG REWRITE (assuming you have a configuration file set) in order to store users in the Redis configuration.".to_string());
+        };
+        let mut lines = self.list();
+        lines.push(String::new());
+        let body = lines.join("\n");
+        std::fs::write(path, body).map_err(|e| {
+            format!(
+                "Wait, impossible to open the ACL file {:?} for writing: {}",
+                path, e
+            )
+        })
     }
 
     pub fn del_user(&mut self, usernames: &[String]) -> usize {
@@ -628,6 +979,36 @@ impl AclManager {
         }
         count
     }
+}
+
+/// Generates a random hex password for `ACL GENPASS [bits]` (1..=4096 bits,
+/// default 256 -> 64 hex chars).
+pub fn genpass_hex(bits: Option<i64>) -> Result<String, &'static str> {
+    let bits = bits.unwrap_or(256);
+    if !(1..=4096).contains(&bits) {
+        return Err(
+            "ACL GENPASS argument must be the number of bits for the output password, a positive number up to 4096",
+        );
+    }
+    let hex_len = (bits as usize).div_ceil(4);
+    let byte_len = hex_len.div_ceil(2);
+    let mut random_bytes = vec![0u8; byte_len];
+    use ring::rand::{SecureRandom, SystemRandom};
+    let rng = SystemRandom::new();
+    if rng.fill(&mut random_bytes).is_err() {
+        for (i, b) in random_bytes.iter_mut().enumerate() {
+            *b = ((unix_now_secs_f64().to_bits() as usize)
+                .wrapping_mul(31)
+                .wrapping_add(i)) as u8;
+        }
+    }
+    let mut s = String::with_capacity(byte_len * 2);
+    for b in random_bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s.truncate(hex_len);
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -886,7 +1267,8 @@ mod tests {
         let err = user_with(&["&*", "&x"]).unwrap_err();
         assert!(err.contains("allchannels"), "{err}");
         let u = user_with(&["&*", "resetchannels"]).unwrap();
-        assert_eq!(u.channels_rule_string(), "resetchannels");
+        assert_eq!(u.channels_rule_string(), "");
+        assert!(u.to_acl_list_line().contains("resetchannels"));
         let u = user_with(&["&*", "reset"]).unwrap();
         assert!(!u.all_channels);
     }
@@ -947,5 +1329,102 @@ mod tests {
             assert_eq!(u.all_channels, u2.all_channels, "{line}");
             assert_eq!(u.channel_patterns, u2.channel_patterns, "{line}");
         }
+    }
+
+    #[test]
+    fn test_acl_cat_genpass_first_arg_log_and_aclfile() {
+        // ACL CAT
+        let tx_cmds = commands_in_category("transaction").unwrap();
+        assert!(tx_cmds.contains(&"multi"));
+        assert!(commands_in_category("nonexistent").is_none());
+
+        // ACL GENPASS
+        assert_eq!(genpass_hex(None).unwrap().len(), 64);
+        assert_eq!(genpass_hex(Some(5)).unwrap().len(), 2);
+        assert!(genpass_hex(Some(0)).is_err());
+        assert!(genpass_hex(Some(5000)).is_err());
+
+        // First-arg rules (+select|0, +debug|object)
+        let u = user_with(&["on", "nopass", "-@all", "+select|0", "+debug|object"]).unwrap();
+        assert!(!u.can_execute_command("select"));
+        assert!(u.can_execute_command_with_first_arg("select", Some(b"0")));
+        assert!(!u.can_execute_command_with_first_arg("select", Some(b"1")));
+        assert!(u.can_execute_command_with_first_arg("debug", Some(b"OBJECT")));
+        assert!(!u.can_execute_command_with_first_arg("debug", Some(b"SEGFAULT")));
+        assert!(u.commands_rule_string().contains("+select|0"));
+
+        // ACL LOG aggregation and max len
+        let mut mgr = AclManager::new();
+        mgr.acllog_max_len = 2;
+        mgr.add_log_entry(
+            AclDeniedReason::Command,
+            "toplevel",
+            "get",
+            "alice",
+            "id=1".to_string(),
+        );
+        mgr.add_log_entry(
+            AclDeniedReason::Command,
+            "toplevel",
+            "get",
+            "alice",
+            "id=1".to_string(),
+        );
+        assert_eq!(mgr.acl_log.len(), 1);
+        assert_eq!(mgr.acl_log[0].count, 2);
+        assert_eq!(mgr.acl_log[0].entry_id, 0);
+        mgr.add_log_entry(
+            AclDeniedReason::Key,
+            "toplevel",
+            "k1",
+            "alice",
+            "id=1".to_string(),
+        );
+        mgr.add_log_entry(
+            AclDeniedReason::Channel,
+            "toplevel",
+            "c1",
+            "alice",
+            "id=1".to_string(),
+        );
+        assert_eq!(mgr.acl_log.len(), 2);
+        assert_eq!(mgr.acl_log[0].object, "c1");
+        assert_eq!(mgr.acl_log[1].object, "k1");
+
+        // ACL SAVE / LOAD round-trip and duplicate rejection
+        let path = std::env::temp_dir().join(format!("rudis-acl-unit-{}.acl", std::process::id()));
+        mgr.aclfile = Some(path.clone());
+        mgr.set_user(
+            "alice",
+            &[
+                "on".to_string(),
+                ">secret".to_string(),
+                "~k:*".to_string(),
+                "&ch:*".to_string(),
+                "+get".to_string(),
+            ],
+        )
+        .unwrap();
+        mgr.save_to_aclfile().unwrap();
+        let mut mgr2 = AclManager::new();
+        mgr2.aclfile = Some(path.clone());
+        mgr2.load_from_aclfile().unwrap();
+        let alice = mgr2.get_user("alice").unwrap();
+        assert!(alice.enabled);
+        assert!(alice.can_execute_command("get"));
+        assert!(!alice.can_execute_command("set"));
+        assert!(alice.can_access_key(b"k:1", KEY_READ));
+        assert!(alice.can_access_channel(b"ch:1", false));
+
+        // Duplicate user in ACL file fails atomically without clobbering existing users
+        std::fs::write(
+            &path,
+            "user alice on nopass ~* +@all\nuser alice on nopass ~* -@all\n",
+        )
+        .unwrap();
+        let err = mgr2.load_from_aclfile().unwrap_err();
+        assert!(err.contains("Duplicate user 'alice'"), "{err}");
+        assert!(!mgr2.get_user("alice").unwrap().can_execute_command("set"));
+        let _ = std::fs::remove_file(&path);
     }
 }

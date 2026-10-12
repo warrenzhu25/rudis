@@ -418,13 +418,23 @@ fn main() {
             ignored_directives.join(", ")
         );
     }
-    for (user, rules) in &server_config.users {
-        if let Err(e) = rudis::acl::get_acl_for_port(port)
-            .write()
-            .set_user(user, rules)
-        {
-            log_fatal!("FATAL CONFIG: error in user declaration '{}': {}", user, e);
-            std::process::exit(1);
+    {
+        let acl_arc = rudis::acl::get_acl_for_port(port);
+        let mut acl = acl_arc.write();
+        if let Some(ref p) = acl.aclfile.clone() {
+            if p.is_relative() {
+                acl.aclfile = Some(server_config.dir.join(p));
+            }
+            if let Err(e) = acl.load_from_aclfile() {
+                log_fatal!("FATAL CONFIG: error loading ACL file: {}", e);
+                std::process::exit(1);
+            }
+        }
+        for (user, rules) in &server_config.users {
+            if let Err(e) = acl.load_user_from_declaration(user, rules) {
+                log_fatal!("FATAL CONFIG: error in user declaration '{}': {}", user, e);
+                std::process::exit(1);
+            }
         }
     }
     if server_config.appendfsync_always {

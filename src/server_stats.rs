@@ -36,9 +36,17 @@ pub enum Stat {
     ClientOutputBufferLimitDisconnections,
     /// Clients disconnected for breaking client-query-buffer-limit.
     ClientQueryBufferLimitDisconnections,
+    /// Failed authentication attempts.
+    AclAccessDeniedAuth,
+    /// Commands rejected due to ACL command permissions.
+    AclAccessDeniedCmd,
+    /// Commands rejected due to ACL key permissions.
+    AclAccessDeniedKey,
+    /// Commands rejected due to ACL Pub/Sub channel permissions.
+    AclAccessDeniedChannel,
 }
 
-const NUM_STATS: usize = 12;
+const NUM_STATS: usize = 16;
 
 #[repr(align(128))]
 struct Slot {
@@ -111,6 +119,10 @@ const ALL: [Stat; NUM_STATS] = [
     Stat::SyncPartialErr,
     Stat::ClientOutputBufferLimitDisconnections,
     Stat::ClientQueryBufferLimitDisconnections,
+    Stat::AclAccessDeniedAuth,
+    Stat::AclAccessDeniedCmd,
+    Stat::AclAccessDeniedKey,
+    Stat::AclAccessDeniedChannel,
 ];
 
 /// Restarts every counter from zero (CONFIG RESETSTAT).

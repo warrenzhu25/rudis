@@ -232,7 +232,17 @@ pub enum AclSubcommand {
     },
     DelUser(Vec<String>),
     WhoAmI,
-    Cat,
+    Cat(Option<String>),
+    GenPass(Option<i64>),
+    DryRun {
+        username: String,
+        cmd_args: Vec<Bytes>,
+    },
+    Log(Option<usize>),
+    LogReset,
+    Save,
+    Load,
+    Help,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -2935,10 +2945,96 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
             match sub.as_str() {
-                "LIST" => Ok(Some(Command::Acl(AclSubcommand::List))),
-                "USERS" => Ok(Some(Command::Acl(AclSubcommand::Users))),
-                "WHOAMI" => Ok(Some(Command::Acl(AclSubcommand::WhoAmI))),
-                "CAT" => Ok(Some(Command::Acl(AclSubcommand::Cat))),
+                "LIST" => {
+                    if args.len() != 2 {
+                        return Err("wrong number of arguments for 'acl|list' command".to_string());
+                    }
+                    Ok(Some(Command::Acl(AclSubcommand::List)))
+                }
+                "USERS" => {
+                    if args.len() != 2 {
+                        return Err("wrong number of arguments for 'acl|users' command".to_string());
+                    }
+                    Ok(Some(Command::Acl(AclSubcommand::Users)))
+                }
+                "WHOAMI" => {
+                    if args.len() != 2 {
+                        return Err(
+                            "wrong number of arguments for 'acl|whoami' command".to_string()
+                        );
+                    }
+                    Ok(Some(Command::Acl(AclSubcommand::WhoAmI)))
+                }
+                "CAT" => {
+                    if args.len() == 2 {
+                        Ok(Some(Command::Acl(AclSubcommand::Cat(None))))
+                    } else if args.len() == 3 {
+                        let cat = String::from_utf8_lossy(&args[2]).to_string();
+                        Ok(Some(Command::Acl(AclSubcommand::Cat(Some(cat)))))
+                    } else {
+                        Err("unknown subcommand or wrong number of arguments for 'CAT'. Try ACL HELP.".to_string())
+                    }
+                }
+                "GENPASS" => {
+                    if args.len() == 2 {
+                        Ok(Some(Command::Acl(AclSubcommand::GenPass(None))))
+                    } else if args.len() == 3 {
+                        let bits_s = String::from_utf8_lossy(&args[2]);
+                        let bits = bits_s.parse::<i64>().unwrap_or(-1);
+                        Ok(Some(Command::Acl(AclSubcommand::GenPass(Some(bits)))))
+                    } else {
+                        Err("unknown subcommand or wrong number of arguments for 'GENPASS'. Try ACL HELP.".to_string())
+                    }
+                }
+                "DRYRUN" => {
+                    if args.len() < 4 {
+                        return Err(
+                            "wrong number of arguments for 'acl|dryrun' command".to_string()
+                        );
+                    }
+                    let username = String::from_utf8_lossy(&args[2]).to_string();
+                    let cmd_args = args[3..].to_vec();
+                    Ok(Some(Command::Acl(AclSubcommand::DryRun {
+                        username,
+                        cmd_args,
+                    })))
+                }
+                "LOG" => {
+                    if args.len() == 2 {
+                        Ok(Some(Command::Acl(AclSubcommand::Log(None))))
+                    } else if args.len() == 3 {
+                        let arg_s = String::from_utf8_lossy(&args[2]);
+                        if arg_s.eq_ignore_ascii_case("RESET") {
+                            Ok(Some(Command::Acl(AclSubcommand::LogReset)))
+                        } else if let Ok(n) = arg_s.parse::<i64>()
+                            && n >= 0
+                        {
+                            Ok(Some(Command::Acl(AclSubcommand::Log(Some(n as usize)))))
+                        } else {
+                            Err("ACL LOG requires an integer argument or 'RESET'".to_string())
+                        }
+                    } else {
+                        Err("unknown subcommand or wrong number of arguments for 'LOG'. Try ACL HELP.".to_string())
+                    }
+                }
+                "SAVE" => {
+                    if args.len() != 2 {
+                        return Err("wrong number of arguments for 'acl|save' command".to_string());
+                    }
+                    Ok(Some(Command::Acl(AclSubcommand::Save)))
+                }
+                "LOAD" => {
+                    if args.len() != 2 {
+                        return Err("wrong number of arguments for 'acl|load' command".to_string());
+                    }
+                    Ok(Some(Command::Acl(AclSubcommand::Load)))
+                }
+                "HELP" => {
+                    if args.len() != 2 {
+                        return Err("wrong number of arguments for 'acl|help' command".to_string());
+                    }
+                    Ok(Some(Command::Acl(AclSubcommand::Help)))
+                }
                 "GETUSER" => {
                     if args.len() != 3 {
                         return Err(
@@ -2976,7 +3072,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         .collect();
                     Ok(Some(Command::Acl(AclSubcommand::DelUser(usernames))))
                 }
-                _ => Err(format!("unknown subcommand '{}' for 'acl'", sub)),
+                _ => Err(format!(
+                    "unknown subcommand or wrong number of arguments for '{}'. Try ACL HELP.",
+                    String::from_utf8_lossy(&args[1])
+                )),
             }
         }
         "GET" => {
@@ -6576,6 +6675,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "FLUSH" => Ok(Some(Command::ScriptFlush)),
                 "KILL" if args.len() == 2 => Ok(Some(Command::ScriptKill)),
+                "HELP" if args.len() == 2 => Ok(Some(Command::Unknown("SCRIPT HELP".to_string()))),
                 _ => Err(format!(
                     "ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'",
                     sub

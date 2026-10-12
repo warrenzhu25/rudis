@@ -3076,6 +3076,32 @@ pub fn apply_config_value(
             let acl = crate::acl::get_acl_for_port(port);
             acl.write().set_requirepass(val_str);
         }
+        "acllog-max-len" => {
+            let max_len: usize = parse_config_num(name, val_str)?;
+            crate::acl::get_acl_for_port(port).write().acllog_max_len = max_len;
+        }
+        "acl-pubsub-default" => {
+            let acl_arc = crate::acl::get_acl_for_port(port);
+            let mut acl = acl_arc.write();
+            if val_str.eq_ignore_ascii_case("allchannels") {
+                acl.acl_pubsub_default_all = true;
+            } else if val_str.eq_ignore_ascii_case("resetchannels") {
+                acl.acl_pubsub_default_all = false;
+            } else {
+                return Err(
+                    "acl-pubsub-default must be 'allchannels' or 'resetchannels'".to_string(),
+                );
+            }
+        }
+        "aclfile" => {
+            let acl_arc = crate::acl::get_acl_for_port(port);
+            let mut acl = acl_arc.write();
+            if val_str.is_empty() {
+                acl.aclfile = None;
+            } else {
+                acl.aclfile = Some(std::path::PathBuf::from(val_str));
+            }
+        }
         "notify-keyspace-events" => set_notify_keyspace_events_str(val_str),
         "aof-load-truncated" => {
             crate::aof::set_aof_load_truncated(parse_config_bool(name, val_str)?)
@@ -3936,7 +3962,19 @@ async fn execute_tx_step(
                 );
                 false
             }
-            _ => {
+            // Redis checks permissions when queueing too: a denied command
+            // gets its NOPERM now and aborts the EXEC.
+            ref c => {
+                if let Some(err) = acl_denied_in_context(
+                    router.port,
+                    auth_user,
+                    c,
+                    Some(("multi", acl_cmd_name(c))),
+                ) {
+                    *tx_has_error = true;
+                    out_buf.extend_from_slice(&err);
+                    return false;
+                }
                 if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                     enforce_tracking_max_keys(router.port);
                 }
@@ -7835,7 +7873,13 @@ pub fn acl_cmd_name(cmd: &Command) -> &'static str {
             A::SetUser { .. } => "acl|setuser",
             A::DelUser(_) => "acl|deluser",
             A::WhoAmI => "acl|whoami",
-            A::Cat => "acl|cat",
+            A::Cat(_) => "acl|cat",
+            A::GenPass(_) => "acl|genpass",
+            A::DryRun { .. } => "acl|dryrun",
+            A::Log(_) | A::LogReset => "acl|log",
+            A::Save => "acl|save",
+            A::Load => "acl|load",
+            A::Help => "acl|help",
         },
         Command::Cluster(sub) => match sub {
             C::KeySlot(_) => "cluster|keyslot",
@@ -7859,12 +7903,33 @@ pub fn acl_cmd_name(cmd: &Command) -> &'static str {
         Command::FunctionStats => "function|stats",
         Command::FunctionKill => "function|kill",
         Command::FunctionDelete(_) => "function|delete",
+        Command::ScriptLoad(_) => "script|load",
+        Command::ScriptExists(_) => "script|exists",
+        Command::ScriptFlush => "script|flush",
+        Command::ScriptKill => "script|kill",
         Command::Memory(sub) => match sub {
             M::Usage { .. } => "memory|usage",
             M::Stats => "memory|stats",
             M::Purge => "memory|purge",
             M::Doctor => "memory|doctor",
             M::Defrag => "memory",
+        },
+        Command::Unknown(s) => match s.as_str() {
+            "SCRIPT HELP" => "script|help",
+            "CONFIG HELP" => "config|help",
+            "CLIENT HELP" => "client|help",
+            "CLUSTER HELP" => "cluster|help",
+            "COMMAND HELP" => "command|help",
+            "FUNCTION HELP" => "function|help",
+            "LATENCY HELP" => "latency|help",
+            "MEMORY HELP" => "memory|help",
+            "MODULE HELP" => "module|help",
+            "OBJECT HELP" => "object|help",
+            "PUBSUB HELP" => "pubsub|help",
+            "SLOWLOG HELP" => "slowlog|help",
+            "XGROUP HELP" => "xgroup|help",
+            "XINFO HELP" => "xinfo|help",
+            _ => "UNKNOWN",
         },
         _ => get_cmd_name(cmd),
     }
@@ -8558,11 +8623,168 @@ fn is_mode_switch_cmd(cmd: &Command) -> bool {
 const NOPERM_CHANNEL: &[u8] =
     b"-NOPERM this user has no permissions to access one of the channels used as arguments\r\n";
 
-/// True if `cmd` names a Pub/Sub channel (or PSUBSCRIBE pattern) the user's
-/// `&` permissions do not cover.
-pub fn acl_channels_denied(user: &crate::acl::AclUser, cmd: &Command) -> bool {
+/// Extracts the first argument for commands that support first-arg ACL rules
+/// (`+select|0`, `+debug|object`).
+pub fn acl_first_arg(cmd: &Command) -> Option<Vec<u8>> {
+    match cmd {
+        Command::Select(db) => Some(db.to_string().into_bytes()),
+        Command::Debug(args) => args.first().map(|a| a.to_vec()),
+        _ => None,
+    }
+}
+
+/// Checks whether `user` is permitted to execute `cmd` without recording
+/// metrics or `ACL LOG` entries (used by `ACL DRYRUN` and pipeline squashing).
+pub fn acl_check_user_cmd(user: &crate::acl::AclUser, cmd: &Command) -> Option<Vec<u8>> {
+    let acl_name = acl_cmd_name(cmd);
+    let first_arg = acl_first_arg(cmd);
+    if !user.can_execute_command_with_first_arg(acl_name, first_arg.as_deref()) {
+        return Some(
+            format!(
+                "-NOPERM this user has no permissions to run the '{}' command\r\n",
+                acl_name.to_lowercase()
+            )
+            .into_bytes(),
+        );
+    }
+    let need = acl_key_perm(cmd);
+    for key in cmd_keys(cmd) {
+        if !user.can_access_key(key, need) {
+            return Some(
+                b"-NOPERM this user has no permissions to access one of the keys used as arguments\r\n"
+                    .to_vec(),
+            );
+        }
+    }
+    if acl_first_denied_channel(user, cmd).is_some() {
+        return Some(NOPERM_CHANNEL.to_vec());
+    }
+    None
+}
+
+fn format_acl_log_client_info(auth_user: &str, cmd_for_info: &str) -> String {
+    let cid = requesting_client_id();
+    format!(
+        "id={} addr=127.0.0.1:0 laddr=127.0.0.1:6379 fd=0 name= age=0 idle=0 flags=N db={} sub=0 psub=0 ssub=0 multi=-1 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user={}",
+        cid,
+        CURRENT_DB.get(),
+        cmd_for_info.to_ascii_lowercase(),
+        auth_user
+    )
+}
+
+pub fn record_acl_denial(
+    port: u16,
+    reason: crate::acl::AclDeniedReason,
+    context: &str,
+    object: &str,
+    username: &str,
+    cmd_for_info: &str,
+) {
+    use crate::acl::AclDeniedReason;
+    use crate::server_stats::{Stat, add};
+    match reason {
+        AclDeniedReason::Auth => add(Stat::AclAccessDeniedAuth, 1),
+        AclDeniedReason::Command => add(Stat::AclAccessDeniedCmd, 1),
+        AclDeniedReason::Key => add(Stat::AclAccessDeniedKey, 1),
+        AclDeniedReason::Channel => add(Stat::AclAccessDeniedChannel, 1),
+    }
+    let client_info = format_acl_log_client_info(username, cmd_for_info);
+    let acl = crate::acl::get_acl_for_port(port);
+    acl.write()
+        .add_log_entry(reason, context, object, username, client_info);
+}
+
+/// The ACL check every command goes through (Redis `ACLCheckAllPerm`):
+/// command, key and channel permissions of `auth_user`. Returns the NOPERM
+/// reply if denied. Free when no custom ACL exists and the user is default.
+pub fn acl_denied(port: u16, auth_user: &str, cmd: &Command) -> Option<Vec<u8>> {
+    acl_denied_in_context(port, auth_user, cmd, None)
+}
+
+pub fn acl_denied_in_context(
+    port: u16,
+    auth_user: &str,
+    cmd: &Command,
+    explicit_ctx: Option<(&str, &str)>,
+) -> Option<Vec<u8>> {
+    if !crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
+        && auth_user == "default"
+    {
+        return None;
+    }
+    let acl_name = acl_cmd_name(cmd);
+    let is_exec = explicit_ctx.is_none() && in_tx(requesting_client_id());
+    let (ctx, info_cmd) = explicit_ctx.unwrap_or(if is_exec {
+        ("multi", "exec")
+    } else {
+        ("toplevel", acl_name)
+    });
+    let denial = {
+        let acl = crate::acl::get_acl_for_port(port);
+        let guard = acl.read();
+        let user = guard.users.get(auth_user)?;
+        let first_arg = acl_first_arg(cmd);
+        if !user.can_execute_command_with_first_arg(acl_name, first_arg.as_deref()) {
+            let lower = acl_name.to_lowercase();
+            let reply = if is_exec {
+                b"-NOPERM ACLs rules changed between the moment the transaction was accumulated and the EXEC call. This command is no longer allowed for the following reason: no permission to execute the command or subcommand\r\n".to_vec()
+            } else {
+                format!(
+                    "-NOPERM this user has no permissions to run the '{}' command\r\n",
+                    lower
+                )
+                .into_bytes()
+            };
+            Some((crate::acl::AclDeniedReason::Command, lower, reply))
+        } else {
+            let need = acl_key_perm(cmd);
+            let mut denied_key: Option<String> = None;
+            for key in cmd_keys(cmd) {
+                if !user.can_access_key(key, need) {
+                    denied_key = Some(String::from_utf8_lossy(key).into_owned());
+                    break;
+                }
+            }
+            if let Some(k) = denied_key {
+                let reply = if is_exec {
+                    b"-NOPERM ACLs rules changed between the moment the transaction was accumulated and the EXEC call. This command is no longer allowed for the following reason: no permission to touch the specified keys\r\n".to_vec()
+                } else {
+                    b"-NOPERM this user has no permissions to access one of the keys used as arguments\r\n".to_vec()
+                };
+                Some((crate::acl::AclDeniedReason::Key, k, reply))
+            } else {
+                acl_first_denied_channel(user, cmd).map(|ch| {
+                    let reply = if is_exec {
+                        b"-NOPERM ACLs rules changed between the moment the transaction was accumulated and the EXEC call. This command is no longer allowed for the following reason: no permission to access one of the channels used as arguments\r\n".to_vec()
+                    } else {
+                        NOPERM_CHANNEL.to_vec()
+                    };
+                    (
+                        crate::acl::AclDeniedReason::Channel,
+                        String::from_utf8_lossy(ch).into_owned(),
+                        reply,
+                    )
+                })
+            }
+        }
+    };
+    if let Some((reason, obj, reply)) = denial {
+        record_acl_denial(port, reason, ctx, &obj, auth_user, info_cmd);
+        Some(reply)
+    } else {
+        None
+    }
+}
+
+/// First Pub/Sub channel (or PSUBSCRIBE pattern) in `cmd` that `user` may not
+/// access, or `None` if all are permitted.
+pub fn acl_first_denied_channel<'a>(
+    user: &crate::acl::AclUser,
+    cmd: &'a Command,
+) -> Option<&'a [u8]> {
     if user.all_channels {
-        return false;
+        return None;
     }
     let (channels, is_pattern): (&[Bytes], bool) = match cmd {
         Command::Subscribe(c) | Command::Ssubscribe(c) => (c, false),
@@ -8570,16 +8792,20 @@ pub fn acl_channels_denied(user: &crate::acl::AclUser, cmd: &Command) -> bool {
         Command::Publish { channel, .. } | Command::Spublish { channel, .. } => {
             (std::slice::from_ref(channel), false)
         }
-        _ => return false,
+        _ => return None,
     };
     channels
         .iter()
-        .any(|c| !user.can_access_channel(c, is_pattern))
+        .find(|c| !user.can_access_channel(c, is_pattern))
+        .map(|c| c.as_ref())
 }
 
-/// AUTH/ACL gate for mode-switching commands, which bypass execute_command.
-/// Returns the error reply if the client may not run `cmd`; `None` otherwise
-/// (and always `None` for commands that are not mode switches).
+/// True if `cmd` names a Pub/Sub channel (or PSUBSCRIBE pattern) the user's
+/// `&` permissions do not cover.
+pub fn acl_channels_denied(user: &crate::acl::AclUser, cmd: &Command) -> bool {
+    acl_first_denied_channel(user, cmd).is_some()
+}
+
 /// `appendfsync always`: if any AOF was appended to since this connection
 /// last checked, makes every shard's AOF durable before its replies go out.
 /// One relaxed load when no server in the process runs `always`.
@@ -8597,6 +8823,9 @@ async fn aof_always_barrier(router: &Router, seen: &mut u64) {
     }
 }
 
+/// AUTH/ACL gate for mode-switching commands, which bypass execute_command.
+/// Returns the error reply if the client may not run `cmd`; `None` otherwise
+/// (and always `None` for commands that are not mode switches).
 fn mode_switch_denied(
     cmd: &Command,
     port: u16,
@@ -8614,20 +8843,40 @@ fn mode_switch_denied(
     {
         return None;
     }
-    let acl = crate::acl::get_acl_for_port(port);
-    let guard = acl.read();
-    let user = guard.users.get(auth_user)?;
     let name = acl_cmd_name(cmd);
-    if user.can_execute_command(name) {
-        acl_channels_denied(user, cmd).then(|| NOPERM_CHANNEL.to_vec())
-    } else {
-        Some(
-            format!(
+    let denial = {
+        let acl = crate::acl::get_acl_for_port(port);
+        let guard = acl.read();
+        let user = guard.users.get(auth_user)?;
+        let first_arg = acl_first_arg(cmd);
+        if user.can_execute_command_with_first_arg(name, first_arg.as_deref()) {
+            acl_first_denied_channel(user, cmd).map(|ch| {
+                (
+                    crate::acl::AclDeniedReason::Channel,
+                    String::from_utf8_lossy(ch).into_owned(),
+                    NOPERM_CHANNEL.to_vec(),
+                )
+            })
+        } else {
+            let lower = name.to_lowercase();
+            let reply = format!(
                 "-NOPERM this user has no permissions to run the '{}' command\r\n",
-                name.to_lowercase()
+                lower
             )
-            .into_bytes(),
-        )
+            .into_bytes();
+            Some((crate::acl::AclDeniedReason::Command, lower, reply))
+        }
+    };
+    if let Some((reason, obj, reply)) = denial {
+        let ctx = if in_tx(requesting_client_id()) {
+            "multi"
+        } else {
+            "toplevel"
+        };
+        record_acl_denial(port, reason, ctx, &obj, auth_user, name);
+        Some(reply)
+    } else {
+        None
     }
 }
 
@@ -8935,37 +9184,10 @@ async fn execute_command_inner(
     }
 
     if *authenticated
-        && (crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
-            || auth_user != "default")
+        && let Some(err) = acl_denied(router.port, auth_user, &cmd)
     {
-        let acl = crate::acl::get_acl_for_port(router.port);
-        let acl_guard = acl.read();
-        if let Some(user) = acl_guard.users.get(auth_user) {
-            let acl_name = acl_cmd_name(&cmd);
-            if !user.can_execute_command(acl_name) {
-                out.extend_from_slice(
-                    format!(
-                        "-NOPERM this user has no permissions to run the '{}' command\r\n",
-                        acl_name.to_lowercase()
-                    )
-                    .as_bytes(),
-                );
-                return false;
-            }
-            let need = acl_key_perm(&cmd);
-            for key in cmd_keys(&cmd) {
-                if !user.can_access_key(key, need) {
-                    out.extend_from_slice(
-                        b"-NOPERM this user has no permissions to access one of the keys used as arguments\r\n",
-                    );
-                    return false;
-                }
-            }
-            if acl_channels_denied(user, &cmd) {
-                out.extend_from_slice(NOPERM_CHANNEL);
-                return false;
-            }
-        }
+        out.extend_from_slice(&err);
+        return false;
     }
 
     if let Command::Asking = cmd {
@@ -9978,7 +10200,7 @@ async fn execute_command_inner(
             let pubsub_patterns = router.pubsub_numpat().await;
             let pubsubshard_channels = router.pubsub_shardchannels(None).await.len();
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_query_buffer_limit_disconnections:{}\r\nclient_output_buffer_limit_disconnections:{}\r\n",
+                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_query_buffer_limit_disconnections:{}\r\nclient_output_buffer_limit_disconnections:{}\r\nacl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\nacl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\n",
                 total(Stat::ConnectionsReceived),
                 total(Stat::Commands),
                 ops_per_sec,
@@ -10007,6 +10229,10 @@ async fn execute_command_inner(
                 tracking_total_prefixes,
                 total(Stat::ClientQueryBufferLimitDisconnections),
                 total(Stat::ClientOutputBufferLimitDisconnections),
+                total(Stat::AclAccessDeniedAuth),
+                total(Stat::AclAccessDeniedCmd),
+                total(Stat::AclAccessDeniedKey),
+                total(Stat::AclAccessDeniedChannel),
             );
             let (blocked_clients_count, total_blocking_keys, total_blocking_keys_on_nokey) = {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
@@ -10541,7 +10767,22 @@ async fn execute_command_inner(
                         .to_string();
                     let obuf = format_client_output_buffer_limit_config();
                     let acl = crate::acl::get_acl_for_port(router.port);
-                    let pass = acl.read().requirepass.clone().unwrap_or_default();
+                    let (pass, acllog_max_len, acl_pubsub_default, aclfile_str) = {
+                        let g = acl.read();
+                        (
+                            g.requirepass.clone().unwrap_or_default(),
+                            g.acllog_max_len.to_string(),
+                            if g.acl_pubsub_default_all {
+                                "allchannels".to_string()
+                            } else {
+                                "resetchannels".to_string()
+                            },
+                            g.aclfile
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                        )
+                    };
                     let app = if router.aof.is_some() {
                         "yes".to_string()
                     } else {
@@ -10612,8 +10853,11 @@ async fn execute_command_inner(
                     let repl_ping_period = crate::replication::REPL_PING_PERIOD
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let all_configs: [(&str, String); 73] = [
+                    let all_configs: [(&str, String); 76] = [
                         ("port", port_str),
+                        ("acllog-max-len", acllog_max_len),
+                        ("acl-pubsub-default", acl_pubsub_default),
+                        ("aclfile", aclfile_str),
                         ("databases", crate::config::databases_count().to_string()),
                         ("loglevel", crate::log::loglevel().to_string()),
                         ("logfile", crate::log::logfile()),
@@ -12859,13 +13103,26 @@ async fn execute_command_inner(
             let uname = username.as_deref().unwrap_or("default");
             let pass = password.as_str();
             let acl = crate::acl::get_acl_for_port(router.port);
-            let acl_guard = acl.read();
-            if let Ok(authed_user) = acl_guard.check_auth(Some(uname), pass) {
+            let res = acl.read().check_auth(Some(uname), pass);
+            if let Ok(authed_user) = res {
                 *authenticated = true;
                 *auth_user = authed_user.clone();
                 update_global_client_auth(router.port, client_id, &authed_user);
                 out.extend_from_slice(b"+OK\r\n");
             } else {
+                let ctx = if in_tx(requesting_client_id()) {
+                    "multi"
+                } else {
+                    "toplevel"
+                };
+                record_acl_denial(
+                    router.port,
+                    crate::acl::AclDeniedReason::Auth,
+                    ctx,
+                    "AUTH",
+                    uname,
+                    "auth",
+                );
                 out.extend_from_slice(
                     b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
                 );
@@ -12874,6 +13131,7 @@ async fn execute_command_inner(
         }
         Command::Acl(subcmd) => {
             let acl = crate::acl::get_acl_for_port(router.port);
+            let mut close_conn = false;
             match subcmd {
                 crate::resp::AclSubcommand::WhoAmI => {
                     out.extend_from_slice(
@@ -12941,18 +13199,268 @@ async fn execute_command_inner(
                     }
                 }
                 crate::resp::AclSubcommand::DelUser(usernames) => {
-                    let count = acl.write().del_user(&usernames);
-                    write_resp_integer(out, count as i64);
+                    if usernames.iter().any(|u| u.is_empty()) {
+                        out.extend_from_slice(b"-ERR Username cannot be empty\r\n");
+                    } else if usernames.iter().any(|u| u == "default") {
+                        out.extend_from_slice(b"-ERR The 'default' user cannot be removed\r\n");
+                    } else {
+                        let count = acl.write().del_user(&usernames);
+                        let map = GLOBAL_CLIENTS.read();
+                        for (&(p, cid), entry) in map.iter() {
+                            if p == router.port && usernames.iter().any(|u| u == &entry.auth_user) {
+                                if cid == client_id {
+                                    close_conn = true;
+                                } else {
+                                    if entry
+                                        .stats
+                                        .killed
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                    {
+                                        ACTIVE_CLIENTS
+                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    // SAFETY: shutdown(2) takes no pointers; raw_fd is valid under GLOBAL_CLIENTS lock.
+                                    unsafe {
+                                        libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
+                                    }
+                                    crate::block::get_block_hub_for_port(router.port)
+                                        .lock()
+                                        .remove_waiters_for_client(cid);
+                                }
+                            }
+                        }
+                        write_resp_integer(out, count as i64);
+                    }
                 }
-                crate::resp::AclSubcommand::Cat => {
-                    let cats = crate::acl_categories::CATEGORIES;
-                    out.extend_from_slice(format!("*{}\r\n", cats.len()).as_bytes());
-                    for cat in cats {
-                        out.extend_from_slice(format!("${}\r\n{}\r\n", cat.len(), cat).as_bytes());
+                crate::resp::AclSubcommand::Cat(cat_opt) => {
+                    if let Some(cat) = cat_opt {
+                        match crate::acl::commands_in_category(&cat) {
+                            Some(cmds) => {
+                                out.extend_from_slice(format!("*{}\r\n", cmds.len()).as_bytes());
+                                for c in cmds {
+                                    write_resp_bulk(out, c.as_bytes());
+                                }
+                            }
+                            None => {
+                                out.extend_from_slice(
+                                    format!("-ERR Unknown category '{}'\r\n", cat).as_bytes(),
+                                );
+                            }
+                        }
+                    } else {
+                        let cats = crate::acl_categories::CATEGORIES;
+                        out.extend_from_slice(format!("*{}\r\n", cats.len()).as_bytes());
+                        for cat in cats {
+                            out.extend_from_slice(
+                                format!("${}\r\n{}\r\n", cat.len(), cat).as_bytes(),
+                            );
+                        }
+                    }
+                }
+                crate::resp::AclSubcommand::GenPass(bits) => match crate::acl::genpass_hex(bits) {
+                    Ok(s) => write_resp_bulk(out, s.as_bytes()),
+                    Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+                },
+                crate::resp::AclSubcommand::DryRun { username, cmd_args } => {
+                    let user_opt = acl.read().get_user(&username);
+                    let Some(user) = user_opt else {
+                        out.extend_from_slice(
+                            format!("-ERR User '{}' not found\r\n", username).as_bytes(),
+                        );
+                        return false;
+                    };
+                    let raw_name = String::from_utf8_lossy(&cmd_args[0]).to_ascii_lowercase();
+                    match crate::resp::build_command(cmd_args.clone()) {
+                        Ok(Some(Command::Unknown(_))) | Ok(None) => {
+                            out.extend_from_slice(
+                                format!("-ERR Command '{}' not found\r\n", raw_name).as_bytes(),
+                            );
+                        }
+                        Ok(Some(parsed_cmd)) => {
+                            if let Some(err) = acl_check_user_cmd(&user, &parsed_cmd) {
+                                let msg = String::from_utf8_lossy(&err);
+                                let msg = msg
+                                    .trim_start_matches("-NOPERM ")
+                                    .trim_start_matches('-')
+                                    .trim_end_matches("\r\n");
+                                let full = format!("This user {}", msg.trim_start_matches("this user "));
+                                write_resp_bulk(out, full.as_bytes());
+                            } else {
+                                out.extend_from_slice(b"+OK\r\n");
+                            }
+                        }
+                        Err(_) => {
+                            // Even when arguments fail syntax validation, Redis
+                            // DRYRUN checks command permission first.
+                            let cand = if cmd_args.len() >= 2 {
+                                let sub = format!(
+                                    "{}|{}",
+                                    raw_name,
+                                    String::from_utf8_lossy(&cmd_args[1]).to_ascii_lowercase()
+                                );
+                                if crate::acl::command_index(&sub).is_some() {
+                                    sub
+                                } else {
+                                    raw_name.clone()
+                                }
+                            } else {
+                                raw_name.clone()
+                            };
+                            if crate::acl::command_index(&cand).is_none() {
+                                out.extend_from_slice(
+                                    format!("-ERR Command '{}' not found\r\n", raw_name).as_bytes(),
+                                );
+                            } else if !user.can_execute_command_with_first_arg(
+                                &cand,
+                                cmd_args.get(1).map(|b| b.as_ref()),
+                            ) {
+                                let full = format!(
+                                    "This user has no permissions to run the '{}' command",
+                                    cand
+                                );
+                                write_resp_bulk(out, full.as_bytes());
+                            } else {
+                                out.extend_from_slice(b"+OK\r\n");
+                            }
+                        }
+                    }
+                }
+                crate::resp::AclSubcommand::Log(count_opt) => {
+                    let guard = acl.read();
+                    let limit = count_opt.unwrap_or(guard.acl_log.len());
+                    let entries: Vec<_> = guard.acl_log.iter().take(limit).collect();
+                    write_resp_array_header(out, entries.len());
+                    for e in entries {
+                        if CURRENT_CLIENT_RESP3.get() {
+                            out.extend_from_slice(b"%10\r\n");
+                        } else {
+                            write_resp_array_header(out, 20);
+                        }
+                        write_resp_bulk(out, b"count");
+                        write_resp_integer(out, e.count as i64);
+                        write_resp_bulk(out, b"reason");
+                        write_resp_bulk(out, e.reason.as_str().as_bytes());
+                        write_resp_bulk(out, b"context");
+                        write_resp_bulk(out, e.context.as_bytes());
+                        write_resp_bulk(out, b"object");
+                        write_resp_bulk(out, e.object.as_bytes());
+                        write_resp_bulk(out, b"username");
+                        write_resp_bulk(out, e.username.as_bytes());
+                        write_resp_bulk(out, b"age-seconds");
+                        let age_s = format!("{:.3}", e.age_created.elapsed().as_secs_f64());
+                        write_resp_bulk(out, age_s.as_bytes());
+                        write_resp_bulk(out, b"client-info");
+                        write_resp_bulk(out, e.client_info.as_bytes());
+                        write_resp_bulk(out, b"entry-id");
+                        write_resp_integer(out, e.entry_id as i64);
+                        write_resp_bulk(out, b"timestamp-created");
+                        let ts_c = (e.timestamp_created * 1000.0) as i64;
+                        write_resp_integer(out, ts_c);
+                        write_resp_bulk(out, b"timestamp-last-updated");
+                        let ts_u = (e.timestamp_last_updated * 1000.0) as i64;
+                        write_resp_integer(out, ts_u);
+                    }
+                }
+                crate::resp::AclSubcommand::LogReset => {
+                    acl.write().acl_log.clear();
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                crate::resp::AclSubcommand::Save => match acl.read().save_to_aclfile() {
+                    Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                    Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+                },
+                crate::resp::AclSubcommand::Load => {
+                    let res = acl.write().load_from_aclfile();
+                    match res {
+                        Ok(()) => {
+                            let guard = acl.read();
+                            let map = GLOBAL_CLIENTS.read();
+                            for (&(p, cid), entry) in map.iter() {
+                                if p == router.port {
+                                    let keep = guard
+                                        .users
+                                        .get(&entry.auth_user)
+                                        .map(|u| u.enabled)
+                                        .unwrap_or(false);
+                                    if !keep {
+                                        if cid == client_id {
+                                            close_conn = true;
+                                        } else {
+                                            if entry
+                                                .stats
+                                                .killed
+                                                .compare_exchange(
+                                                    false,
+                                                    true,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                )
+                                                .is_ok()
+                                            {
+                                                ACTIVE_CLIENTS.fetch_sub(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            }
+                                            // SAFETY: shutdown(2) takes no pointers; raw_fd is valid under GLOBAL_CLIENTS lock.
+                                            unsafe {
+                                                libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
+                                            }
+                                            crate::block::get_block_hub_for_port(router.port)
+                                                .lock()
+                                                .remove_waiters_for_client(cid);
+                                        }
+                                    }
+                                }
+                            }
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                        Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+                    }
+                }
+                crate::resp::AclSubcommand::Help => {
+                    const HELP: &[&str] = &[
+                        "ACL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                        "LOAD",
+                        "    Reload users from the ACL file.",
+                        "SAVE",
+                        "    Save the current ACL rules to the ACL file.",
+                        "LIST",
+                        "    Show user details in config file format.",
+                        "USERS",
+                        "    List all the registered usernames.",
+                        "GETUSER <username>",
+                        "    Get the user details.",
+                        "SETUSER <username> [attribs ...]",
+                        "    Create or modify a user with the specified attributes.",
+                        "DELUSER <username> [<username> ...]",
+                        "    Delete a list of users.",
+                        "CAT [<category>]",
+                        "    List available categories, or commands inside a category.",
+                        "GENPASS [<bits>]",
+                        "    Generate a secure 256-bit user password.",
+                        "WHOAMI",
+                        "    Return the current connection username.",
+                        "LOG [<count> | RESET]",
+                        "    List latest events denied because of ACLs.",
+                        "DRYRUN <username> <command> [<arg> ...]",
+                        "    Returns whether the user can execute the given command without executing the command.",
+                        "HELP",
+                        "    Print this help.",
+                    ];
+                    write_resp_array_header(out, HELP.len());
+                    for line in HELP {
+                        write_resp_bulk(out, line.as_bytes());
                     }
                 }
             }
-            false
+            close_conn
         }
         Command::Blpop { keys, timeout } => {
             let mut popped: Option<(Bytes, Bytes)> = None;
@@ -14427,6 +14935,14 @@ async fn execute_command_inner(
                     *auth_user = user.clone();
                     update_global_client_auth(router.port, client_id, &user);
                 } else {
+                    record_acl_denial(
+                        router.port,
+                        crate::acl::AclDeniedReason::Auth,
+                        "toplevel",
+                        "AUTH",
+                        uname,
+                        "hello",
+                    );
                     out.extend_from_slice(
                         b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
                     );
@@ -14439,10 +14955,16 @@ async fn execute_command_inner(
                 return false;
             }
 
-            if let Some(name) = setname
-                && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
-            {
-                c.name = Some(name.clone());
+            if let Some(name) = setname {
+                if name.bytes().any(|b| !(b'!'..=b'~').contains(&b)) {
+                    out.extend_from_slice(
+                        b"-ERR Client names cannot contain spaces, newlines or special characters.\r\n",
+                    );
+                    return false;
+                }
+                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                    c.name = Some(name.clone());
+                }
             }
 
             let cur_resp3 = client_registry
@@ -25262,23 +25784,11 @@ async fn execute_commands_squashed_inner(
                     can_squash = false;
                     break;
                 }
-                if let Some(user) = &user {
-                    let cmd_name = acl_cmd_name(cmd);
-                    if !user.can_execute_command(cmd_name) || acl_channels_denied(user, cmd) {
-                        can_squash = false;
-                        break;
-                    }
-                    let mut forbidden = false;
-                    let need = acl_key_perm(cmd);
-                    for_each_cmd_key(cmd, |k| {
-                        if !user.can_access_key(k, need) {
-                            forbidden = true;
-                        }
-                    });
-                    if forbidden {
-                        can_squash = false;
-                        break;
-                    }
+                if let Some(user) = &user
+                    && acl_check_user_cmd(user, cmd).is_some()
+                {
+                    can_squash = false;
+                    break;
                 }
                 if is_cluster {
                     let mut first_slot: Option<u16> = None;

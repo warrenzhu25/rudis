@@ -468,8 +468,58 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
                 vec![Bytes::from_static(b"acl"), Bytes::from_static(b"whoami")],
                 2,
             ),
-            crate::resp::AclSubcommand::Cat => (
-                vec![Bytes::from_static(b"acl"), Bytes::from_static(b"cat")],
+            crate::resp::AclSubcommand::Cat(cat) => {
+                let mut v = vec![Bytes::from_static(b"acl"), Bytes::from_static(b"cat")];
+                if let Some(c) = cat {
+                    v.push(Bytes::from(c.clone()));
+                }
+                let len = v.len();
+                (v, len)
+            }
+            crate::resp::AclSubcommand::GenPass(bits) => {
+                let mut v = vec![Bytes::from_static(b"acl"), Bytes::from_static(b"genpass")];
+                if let Some(b) = bits {
+                    v.push(Bytes::from(b.to_string()));
+                }
+                let len = v.len();
+                (v, len)
+            }
+            crate::resp::AclSubcommand::DryRun { username, cmd_args } => {
+                let mut v = vec![
+                    Bytes::from_static(b"acl"),
+                    Bytes::from_static(b"dryrun"),
+                    Bytes::from(username.clone()),
+                ];
+                v.extend(cmd_args.iter().cloned());
+                let len = v.len();
+                (v, len)
+            }
+            crate::resp::AclSubcommand::Log(cnt) => {
+                let mut v = vec![Bytes::from_static(b"acl"), Bytes::from_static(b"log")];
+                if let Some(n) = cnt {
+                    v.push(Bytes::from(n.to_string()));
+                }
+                let len = v.len();
+                (v, len)
+            }
+            crate::resp::AclSubcommand::LogReset => (
+                vec![
+                    Bytes::from_static(b"acl"),
+                    Bytes::from_static(b"log"),
+                    Bytes::from_static(b"reset"),
+                ],
+                3,
+            ),
+            crate::resp::AclSubcommand::Save => (
+                vec![Bytes::from_static(b"acl"), Bytes::from_static(b"save")],
+                2,
+            ),
+            crate::resp::AclSubcommand::Load => (
+                vec![Bytes::from_static(b"acl"), Bytes::from_static(b"load")],
+                2,
+            ),
+            crate::resp::AclSubcommand::Help => (
+                vec![Bytes::from_static(b"acl"), Bytes::from_static(b"help")],
                 2,
             ),
         },

@@ -2855,7 +2855,11 @@ fn test_auth_and_acl_e2e() {
     // Wrong password check
     assert!(send_and_read(&mut client, b"AUTH alice wrongpass\r\n").starts_with("-WRONGPASS"));
 
-    // 4. Delete user alice
+    // 4. Switch back to default before deleting alice (Redis closes connections using a deleted user)
+    assert_eq!(
+        send_and_read(&mut client, b"AUTH default \"\"\r\n"),
+        "+OK\r\n"
+    );
     assert_eq!(
         send_and_read(&mut client, b"ACL DELUSER alice\r\n"),
         ":1\r\n"
@@ -14698,9 +14702,7 @@ fn test_acl_categories_and_unknown_rules_e2e() {
 
     // ACL GETUSER describes the effective command set in replayable form.
     let getuser = resp_cmd(&mut admin, &["ACL", "GETUSER", "app"]);
-    assert!(getuser.contains("+@all"), "{}", getuser);
-    assert!(getuser.contains("-flushall"), "{}", getuser);
-    assert!(getuser.contains("-config|set"), "{}", getuser);
+    assert!(getuser.contains("+@all -@dangerous"), "{}", getuser);
     assert!(!getuser.contains("-get "), "{}", getuser);
 }
 
@@ -25459,6 +25461,115 @@ fn test_appendfsync_always_writes_before_replying_e2e() {
     assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":91\r\n");
     assert_eq!(resp_cmd(&mut c, &["GET", "dur:39"]), "$8\r\nval-39-x\r\n");
     drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_acl_completeness_e2e() {
+    let port: u16 = 17970;
+    let port_s = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-acl-e2e-{port}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let acl_path = dir.join("users.acl");
+    std::fs::write(
+        &acl_path,
+        "# initial acl file\nuser default on nopass ~* &* +@all\nuser alice on >alicepass ~k:* &ch:* -@all +get +set +select|0 +multi +exec\n",
+    )
+    .unwrap();
+    let acl_s = acl_path.to_str().unwrap();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aclfile",
+        acl_s,
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+
+    let mut admin = connect();
+    // ACL CAT & GENPASS
+    let cats = resp_cmd(&mut admin, &["ACL", "CAT"]);
+    assert!(cats.contains("scripting") && cats.contains("transaction"));
+    let tx_cat = resp_cmd(&mut admin, &["ACL", "CAT", "transaction"]);
+    assert!(tx_cat.contains("multi"));
+    let gp = resp_cmd(&mut admin, &["ACL", "GENPASS", "128"]);
+    assert!(gp.starts_with("$32\r\n"), "{gp}");
+
+    // ACL DRYRUN checks command, key, channel, and first-arg rules
+    assert_eq!(
+        resp_cmd(&mut admin, &["ACL", "DRYRUN", "alice", "GET", "k:1"]),
+        "+OK\r\n"
+    );
+    let dry_cmd = resp_cmd(&mut admin, &["ACL", "DRYRUN", "alice", "INCR", "k:1"]);
+    assert!(
+        dry_cmd.contains("has no permissions to run the 'incr' command"),
+        "{dry_cmd}"
+    );
+    let dry_key = resp_cmd(&mut admin, &["ACL", "DRYRUN", "alice", "GET", "other:1"]);
+    assert!(
+        dry_key.contains("has no permissions to access one of the keys used as arguments"),
+        "{dry_key}"
+    );
+    assert_eq!(
+        resp_cmd(&mut admin, &["ACL", "DRYRUN", "alice", "SELECT", "0"]),
+        "+OK\r\n"
+    );
+    let dry_sel = resp_cmd(&mut admin, &["ACL", "DRYRUN", "alice", "SELECT", "1"]);
+    assert!(
+        dry_sel.contains("has no permissions to run the 'select' command"),
+        "{dry_sel}"
+    );
+
+    // Client authenticated as alice exercises first-arg rules, ACL LOG, and EXEC recheck
+    let mut c = connect();
+    assert_eq!(resp_cmd(&mut c, &["ACL", "LOG", "RESET"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["AUTH", "alice", "alicepass"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SELECT", "0"]), "+OK\r\n");
+    let sel_err = resp_cmd(&mut c, &["SELECT", "2"]);
+    assert!(sel_err.starts_with("-NOPERM"), "{sel_err}");
+
+    // Queue a valid command in MULTI, revoke key access before EXEC, verify EXEC-time recheck
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "k:1", "val"]), "+QUEUED\r\n");
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["ACL", "SETUSER", "alice", "resetkeys", "~allowed:*"]
+        ),
+        "+OK\r\n"
+    );
+    let exec_resp = resp_cmd(&mut c, &["EXEC"]);
+    assert!(
+        exec_resp.contains("no permission to touch the specified keys"),
+        "{exec_resp}"
+    );
+
+    // ACL LOG & INFO stats
+    let log_resp = resp_cmd(&mut admin, &["ACL", "LOG"]);
+    assert!(
+        log_resp.starts_with("*2\r\n*20\r\n"),
+        "expected 2 entries of 20 elements each, got: {log_resp}"
+    );
+    assert!(log_resp.contains("multi") && log_resp.contains("k:1"));
+    let info = resp_cmd(&mut admin, &["INFO", "stats"]);
+    assert!(info.contains("acl_access_denied_cmd:1\r\n"), "{info}");
+    assert!(info.contains("acl_access_denied_key:1\r\n"), "{info}");
+
+    // ACL SAVE & LOAD round-trip
+    assert_eq!(resp_cmd(&mut admin, &["ACL", "SAVE"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut admin, &["ACL", "LOAD"]), "+OK\r\n");
+
+    drop(c);
+    drop(admin);
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
