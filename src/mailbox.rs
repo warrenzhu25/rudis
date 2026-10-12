@@ -476,6 +476,17 @@ impl FastGetDescriptor {
         }
     }
 
+    #[inline(always)]
+    pub fn reset(&mut self, key: Bytes) {
+        self.key = key;
+        *self.val.get_mut() = None;
+        *self.wrong_type.get_mut() = false;
+        *self.done.get_mut() = false;
+        self.bell.try_consume();
+        self.no_touch = crate::connection::CLIENT_NO_TOUCH.get();
+        self.db = crate::connection::CURRENT_DB.get();
+    }
+
     /// Waits (after `spin` polls) until a remote shard has called `finish`.
     #[inline(always)]
     pub async fn wait_done(&self, spin: usize) {
@@ -536,6 +547,16 @@ impl FastSetDescriptor {
             bell: Doorbell::new(),
             db: crate::connection::CURRENT_DB.get(),
         }
+    }
+
+    #[inline(always)]
+    pub fn reset(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
+        self.key = key;
+        self.value = value;
+        self.expire_in = expire_in;
+        *self.done.get_mut() = false;
+        self.bell.try_consume();
+        self.db = crate::connection::CURRENT_DB.get();
     }
 
     #[inline(always)]

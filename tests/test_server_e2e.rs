@@ -25573,3 +25573,45 @@ fn test_acl_completeness_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_cross_shard_single_key_pooled_ops_e2e() {
+    let port = 17971;
+    let port_s = port.to_string();
+    let args = ["--port", &port_s, "--threads", "4", "--no-pin"];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Exercise unpipelined (p=1) cross-shard single-key paths across 32 keys
+    // so multiple shards are hit repeatedly and descriptors/responders are reused.
+    for round in 0..3 {
+        for i in 0..32 {
+            let k = format!("p1:pool:{i}");
+            assert_eq!(resp_cmd(&mut c, &["SET", &k, "10"]), "+OK\r\n");
+            assert_eq!(resp_cmd(&mut c, &["GET", &k]), "$2\r\n10\r\n");
+            assert_eq!(resp_cmd(&mut c, &["INCRBY", &k, "5"]), ":15\r\n");
+            assert_eq!(resp_cmd(&mut c, &["EXISTS", &k]), ":1\r\n");
+            assert_eq!(resp_cmd(&mut c, &["EXPIRE", &k, "120"]), ":1\r\n");
+            let ttl: i64 = resp_cmd(&mut c, &["TTL", &k])
+                .trim_start_matches(':')
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(ttl > 0, "round {round} key {k} ttl={ttl}");
+            let exat: i64 = resp_cmd(&mut c, &["EXPIRETIME", &k])
+                .trim_start_matches(':')
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(exat > 0, "round {round} key {k} expiretime={exat}");
+            assert_eq!(resp_cmd(&mut c, &["PERSIST", &k]), ":1\r\n");
+            assert_eq!(resp_cmd(&mut c, &["TTL", &k]), ":-1\r\n");
+            assert_eq!(resp_cmd(&mut c, &["DEL", &k]), ":1\r\n");
+            assert_eq!(resp_cmd(&mut c, &["EXISTS", &k]), ":0\r\n");
+        }
+    }
+
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

@@ -232,6 +232,18 @@ pub struct Router {
     pub mset_batch_pool: Rc<RefCell<Vec<Vec<Vec<(Bytes, Bytes)>>>>>,
     pub mget_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMgetDescriptor>>>>,
     pub mset_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMsetDescriptor>>>>,
+    pub fast_get_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::FastGetDescriptor>>>>,
+    pub fast_set_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::FastSetDescriptor>>>>,
+    pub bool_responder_pool: Rc<RefCell<Vec<(flume::Sender<bool>, flume::Receiver<bool>)>>>,
+    pub i64_responder_pool: Rc<RefCell<Vec<(flume::Sender<i64>, flume::Receiver<i64>)>>>,
+    pub incr_responder_pool: Rc<
+        RefCell<
+            Vec<(
+                flume::Sender<Result<i64, String>>,
+                flume::Receiver<Result<i64, String>>,
+            )>,
+        >,
+    >,
     pub pubsub_responder_pool: Rc<RefCell<Vec<(flume::Sender<usize>, flume::Receiver<usize>)>>>,
     pub presence_table: std::sync::Arc<crate::pubsub::ShardedPresenceTable>,
     pub tier_stats: std::sync::Arc<crate::tiering::TieringStats>,
@@ -376,6 +388,11 @@ impl Router {
             mset_batch_pool: Rc::new(RefCell::new(Vec::new())),
             mget_desc_pool: Rc::new(RefCell::new(Vec::new())),
             mset_desc_pool: Rc::new(RefCell::new(Vec::new())),
+            fast_get_desc_pool: Rc::new(RefCell::new(Vec::new())),
+            fast_set_desc_pool: Rc::new(RefCell::new(Vec::new())),
+            bool_responder_pool: Rc::new(RefCell::new(Vec::new())),
+            i64_responder_pool: Rc::new(RefCell::new(Vec::new())),
+            incr_responder_pool: Rc::new(RefCell::new(Vec::new())),
             pubsub_responder_pool: Rc::new(RefCell::new(Vec::new())),
             presence_table: crate::pubsub::get_presence_table(port),
             tier_stats: {
@@ -1441,13 +1458,11 @@ impl Router {
         if target == self.shard_id {
             self.get_local_checked(&key).await
         } else {
-            let mut desc_inner = crate::mailbox::FastGetDescriptor::new(key);
-            desc_inner.db = crate::connection::CURRENT_DB.get();
-            let desc = Arc::new(desc_inner);
+            let desc = self.acquire_fast_get_descriptor(key);
             let msg = ShardMessage::FastGet {
                 descriptor: desc.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 desc.wait_done(crate::mailbox::cross_shard_spin()).await;
                 if desc.wrong_type.load(Ordering::Relaxed) {
                     Err(WRONGTYPE_ERR)
@@ -1459,7 +1474,9 @@ impl Router {
                 }
             } else {
                 Ok(None)
-            }
+            };
+            self.release_fast_get_descriptor(desc);
+            res
         }
     }
 
@@ -1641,15 +1658,14 @@ impl Router {
                 self.start_auto_tier_if_over();
             }
         } else {
-            let mut desc_inner = crate::mailbox::FastSetDescriptor::new(key, value, expire_in);
-            desc_inner.db = crate::connection::CURRENT_DB.get();
-            let desc = Arc::new(desc_inner);
+            let desc = self.acquire_fast_set_descriptor(key, value, expire_in);
             let msg = ShardMessage::FastSet {
                 descriptor: desc.clone(),
             };
             if self.senders[target].send(msg).is_ok() {
                 desc.wait_done(crate::mailbox::cross_shard_spin()).await;
             }
+            self.release_fast_set_descriptor(desc);
         }
     }
 
@@ -1684,6 +1700,113 @@ impl Router {
                     r.check_auto_tier_local().await;
                 });
             }
+        }
+    }
+
+    #[inline(always)]
+    pub fn acquire_fast_get_descriptor(
+        &self,
+        key: Bytes,
+    ) -> Arc<crate::mailbox::FastGetDescriptor> {
+        let mut pool = self.fast_get_desc_pool.borrow_mut();
+        if let Some(idx) = pool.iter().rposition(|d| Arc::strong_count(d) == 1) {
+            let mut desc = pool.swap_remove(idx);
+            if let Some(inner) = Arc::get_mut(&mut desc) {
+                inner.reset(key);
+                return desc;
+            }
+        }
+        Arc::new(crate::mailbox::FastGetDescriptor::new(key))
+    }
+
+    #[inline(always)]
+    pub fn release_fast_get_descriptor(&self, desc: Arc<crate::mailbox::FastGetDescriptor>) {
+        if self.fast_get_desc_pool.borrow().len() < 64 {
+            self.fast_get_desc_pool.borrow_mut().push(desc);
+        }
+    }
+
+    #[inline(always)]
+    pub fn acquire_fast_set_descriptor(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        expire_in: Option<Duration>,
+    ) -> Arc<crate::mailbox::FastSetDescriptor> {
+        let mut pool = self.fast_set_desc_pool.borrow_mut();
+        if let Some(idx) = pool.iter().rposition(|d| Arc::strong_count(d) == 1) {
+            let mut desc = pool.swap_remove(idx);
+            if let Some(inner) = Arc::get_mut(&mut desc) {
+                inner.reset(key, value, expire_in);
+                return desc;
+            }
+        }
+        Arc::new(crate::mailbox::FastSetDescriptor::new(
+            key, value, expire_in,
+        ))
+    }
+
+    #[inline(always)]
+    pub fn release_fast_set_descriptor(&self, desc: Arc<crate::mailbox::FastSetDescriptor>) {
+        if self.fast_set_desc_pool.borrow().len() < 64 {
+            self.fast_set_desc_pool.borrow_mut().push(desc);
+        }
+    }
+
+    #[inline(always)]
+    pub fn acquire_bool_responder(&self) -> (flume::Sender<bool>, flume::Receiver<bool>) {
+        self.bool_responder_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| flume::bounded(1))
+    }
+
+    #[inline(always)]
+    pub fn release_bool_responder(&self, tx: flume::Sender<bool>, rx: flume::Receiver<bool>) {
+        if self.bool_responder_pool.borrow().len() < 64 {
+            while rx.try_recv().is_ok() {}
+            self.bool_responder_pool.borrow_mut().push((tx, rx));
+        }
+    }
+
+    #[inline(always)]
+    pub fn acquire_i64_responder(&self) -> (flume::Sender<i64>, flume::Receiver<i64>) {
+        self.i64_responder_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| flume::bounded(1))
+    }
+
+    #[inline(always)]
+    pub fn release_i64_responder(&self, tx: flume::Sender<i64>, rx: flume::Receiver<i64>) {
+        if self.i64_responder_pool.borrow().len() < 64 {
+            while rx.try_recv().is_ok() {}
+            self.i64_responder_pool.borrow_mut().push((tx, rx));
+        }
+    }
+
+    #[inline(always)]
+    pub fn acquire_incr_responder(
+        &self,
+    ) -> (
+        flume::Sender<Result<i64, String>>,
+        flume::Receiver<Result<i64, String>>,
+    ) {
+        self.incr_responder_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| flume::bounded(1))
+    }
+
+    #[inline(always)]
+    pub fn release_incr_responder(
+        &self,
+        tx: flume::Sender<Result<i64, String>>,
+        rx: flume::Receiver<Result<i64, String>>,
+    ) {
+        if self.incr_responder_pool.borrow().len() < 64 {
+            while rx.try_recv().is_ok() {}
+            self.incr_responder_pool.borrow_mut().push((tx, rx));
         }
     }
 
@@ -2246,17 +2369,19 @@ impl Router {
         if target == self.shard_id {
             self.del_local(key)
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_bool_responder();
             let msg = ShardMessage::Del {
                 db: crate::connection::CURRENT_DB.get(),
                 key,
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
                 false
-            }
+            };
+            self.release_bool_responder(tx, rx);
+            res
         }
     }
 
@@ -2287,18 +2412,20 @@ impl Router {
         if target == self.shard_id {
             self.del_if_unchanged_local(key, &payload)
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_bool_responder();
             let msg = ShardMessage::DelIfUnchanged {
                 db: crate::connection::CURRENT_DB.get(),
                 key,
                 payload,
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
                 false
-            }
+            };
+            self.release_bool_responder(tx, rx);
+            res
         }
     }
 
@@ -2445,17 +2572,19 @@ impl Router {
         if target == self.shard_id {
             self.local_db.borrow_mut().exists_with_hash(&key, hash)
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_bool_responder();
             let msg = ShardMessage::Exists {
                 db: crate::connection::CURRENT_DB.get(),
                 key,
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
                 false
-            }
+            };
+            self.release_bool_responder(tx, rx);
+            res
         }
     }
 
@@ -2473,21 +2602,23 @@ impl Router {
             }
             res
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_incr_responder();
             let msg = ShardMessage::IncrBy {
                 db: crate::connection::CURRENT_DB.get(),
                 key,
                 delta,
                 name,
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async()
                     .await
                     .unwrap_or_else(|_| Err("shard disconnected".to_string()))
             } else {
                 Err("failed to route to shard".to_string())
-            }
+            };
+            self.release_incr_responder(tx, rx);
+            res
         }
     }
 
@@ -2509,19 +2640,21 @@ impl Router {
             }
             res
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_bool_responder();
             let msg = ShardMessage::Expire {
                 db: crate::connection::CURRENT_DB.get(),
                 key,
                 duration,
                 opts,
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
                 false
-            }
+            };
+            self.release_bool_responder(tx, rx);
+            res
         }
     }
 
@@ -2534,17 +2667,19 @@ impl Router {
             }
             res
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_bool_responder();
             let msg = ShardMessage::Persist {
                 db: crate::connection::CURRENT_DB.get(),
                 key,
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
                 false
-            }
+            };
+            self.release_bool_responder(tx, rx);
+            res
         }
     }
 
@@ -2578,18 +2713,20 @@ impl Router {
         if target == self.shard_id {
             self.local_db.borrow_mut().ttl(&key, in_millis)
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_i64_responder();
             let msg = ShardMessage::Ttl {
                 db: crate::connection::CURRENT_DB.get(),
                 key,
                 in_millis,
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(-2)
             } else {
                 -2
-            }
+            };
+            self.release_i64_responder(tx, rx);
+            res
         }
     }
 
@@ -4159,18 +4296,20 @@ impl Router {
         if target == self.shard_id {
             self.local_db.borrow_mut().expiretime(&key, in_millis)
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_i64_responder();
             let msg = ShardMessage::ExpireTime {
                 db: crate::connection::CURRENT_DB.get(),
                 key,
                 in_millis,
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(-2)
             } else {
                 -2
-            }
+            };
+            self.release_i64_responder(tx, rx);
+            res
         }
     }
 
@@ -6683,5 +6822,143 @@ mod tests {
         assert_eq!(router.notify_channel_pool.borrow().len(), 2);
         t1.join().unwrap();
         t2.join().unwrap();
+    }
+
+    #[test]
+    fn test_router_single_key_descriptor_and_responder_pool_reuse() {
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
+
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9983)));
+        let router = Router::new(
+            0,
+            2,
+            9983,
+            db0,
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut k1 = None;
+        for i in 0..1000 {
+            let k = Bytes::from(format!("pool_single_k_{}", i));
+            if target_shard(&k, 2) == 1 {
+                k1 = Some(k);
+                break;
+            }
+        }
+        let k1 = k1.unwrap();
+
+        let worker = std::thread::spawn(move || {
+            let mut remote_db = ShardDb::new(9983);
+            while let Ok(msg) = rx1.recv() {
+                match msg {
+                    ShardMessage::FastSet { descriptor } => {
+                        remote_db.set(
+                            descriptor.key.clone(),
+                            descriptor.value.clone(),
+                            descriptor.expire_in,
+                        );
+                        descriptor.finish();
+                    }
+                    ShardMessage::FastGet { descriptor } => {
+                        match remote_db.get_checked(&descriptor.key) {
+                            Ok(v) => descriptor.finish(v),
+                            Err(_) => descriptor.finish_wrong_type(),
+                        }
+                    }
+                    ShardMessage::Exists { key, responder, .. } => {
+                        let _ = responder.send(remote_db.exists(&key));
+                    }
+                    ShardMessage::IncrBy {
+                        key,
+                        delta,
+                        responder,
+                        ..
+                    } => {
+                        let _ = responder.send(remote_db.incr_by(key, delta));
+                    }
+                    ShardMessage::Expire {
+                        key,
+                        duration,
+                        opts,
+                        responder,
+                        ..
+                    } => {
+                        let _ = responder.send(remote_db.expire(&key, duration, opts));
+                    }
+                    ShardMessage::Ttl {
+                        key,
+                        in_millis,
+                        responder,
+                        ..
+                    } => {
+                        let _ = responder.send(remote_db.ttl(&key, in_millis));
+                    }
+                    ShardMessage::Persist { key, responder, .. } => {
+                        let _ = responder.send(remote_db.persist(&key));
+                    }
+                    ShardMessage::ExpireTime {
+                        key,
+                        in_millis,
+                        responder,
+                        ..
+                    } => {
+                        let _ = responder.send(remote_db.expiretime(&key, in_millis));
+                    }
+                    ShardMessage::Del { key, responder, .. } => {
+                        let _ = responder.send(remote_db.del(&key));
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for round in 0..4 {
+                router.set(k1.clone(), Bytes::from("10"), None).await;
+                assert_eq!(router.fast_set_desc_pool.borrow().len(), 1);
+
+                let v = router.get_checked(k1.clone()).await.unwrap();
+                assert_eq!(v, Some(Bytes::from("10")));
+                assert_eq!(router.fast_get_desc_pool.borrow().len(), 1);
+
+                let n = router
+                    .incr_by(k1.clone(), 5, crate::resp::IncrName::IncrBy)
+                    .await
+                    .unwrap();
+                assert_eq!(n, 15);
+                assert_eq!(router.incr_responder_pool.borrow().len(), 1);
+
+                assert!(router.exists(k1.clone()).await);
+                assert!(
+                    router
+                        .expire(
+                            k1.clone(),
+                            Duration::from_secs(60),
+                            crate::resp::ExpireOptions::default()
+                        )
+                        .await
+                );
+                assert!(router.ttl(k1.clone(), false).await > 0);
+                assert!(router.expiretime(k1.clone(), false).await > 0);
+                assert_eq!(router.i64_responder_pool.borrow().len(), 1);
+                assert!(router.persist(k1.clone()).await);
+                assert_eq!(router.ttl(k1.clone(), false).await, -1);
+                assert!(router.del(k1.clone()).await);
+                assert_eq!(router.bool_responder_pool.borrow().len(), 1);
+                let _ = round;
+            }
+        });
+        drop(router);
+        worker.join().unwrap();
     }
 }
