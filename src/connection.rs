@@ -3046,12 +3046,28 @@ pub fn apply_config_value(
         "min-replicas-max-lag" | "min-slaves-max-lag" => {
             MIN_REPLICAS_MAX_LAG.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
-        "slowlog-log-slower-than" => crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
-            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
-        "slowlog-max-len" => {
+        "slowlog-log-slower-than" | "commandlog-execution-slower-than" => {
+            crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
+                .store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "slowlog-max-len" | "commandlog-slow-execution-max-len" => {
             crate::slowlog::SLOWLOG_MAX_LEN
                 .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
             crate::slowlog::trim_slowlog_buffer();
+        }
+        "commandlog-request-larger-than" => crate::slowlog::COMMANDLOG_REQUEST_LARGER_THAN
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "commandlog-large-request-max-len" => {
+            crate::slowlog::COMMANDLOG_LARGE_REQUEST_MAX_LEN
+                .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
+            crate::slowlog::trim_large_request_buffer();
+        }
+        "commandlog-reply-larger-than" => crate::slowlog::COMMANDLOG_REPLY_LARGER_THAN
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "commandlog-large-reply-max-len" => {
+            crate::slowlog::COMMANDLOG_LARGE_REPLY_MAX_LEN
+                .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
+            crate::slowlog::trim_large_reply_buffer();
         }
         "slowlog-entry-max-argc" => crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
@@ -3355,6 +3371,18 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
     let slow_str = crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
         .load(std::sync::atomic::Ordering::Relaxed)
         .to_string();
+    let cmdlog_req_than = crate::slowlog::COMMANDLOG_REQUEST_LARGER_THAN
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let cmdlog_req_len = crate::slowlog::COMMANDLOG_LARGE_REQUEST_MAX_LEN
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let cmdlog_rep_than = crate::slowlog::COMMANDLOG_REPLY_LARGER_THAN
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let cmdlog_rep_len = crate::slowlog::COMMANDLOG_LARGE_REPLY_MAX_LEN
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
     let obuf = format_client_output_buffer_limit_config();
     let acl = crate::acl::get_acl_for_port(router.port);
     let (pass, acllog_max_len, acl_pubsub_default, aclfile_str) = {
@@ -3468,7 +3496,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
-    let all_configs: [(&str, String); 87] = [
+    let all_configs: [(&str, String); 93] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
@@ -3579,8 +3607,14 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         ("stream-idmp-duration", stream_idmp_dur),
         ("stream-idmp-maxsize", stream_idmp_max),
         ("maxclients", max_c),
-        ("slowlog-log-slower-than", slow_than),
-        ("slowlog-max-len", slow_len),
+        ("slowlog-log-slower-than", slow_than.clone()),
+        ("slowlog-max-len", slow_len.clone()),
+        ("commandlog-execution-slower-than", slow_than),
+        ("commandlog-slow-execution-max-len", slow_len),
+        ("commandlog-request-larger-than", cmdlog_req_than),
+        ("commandlog-large-request-max-len", cmdlog_req_len),
+        ("commandlog-reply-larger-than", cmdlog_rep_than),
+        ("commandlog-large-reply-max-len", cmdlog_rep_len),
         ("slowlog-entry-max-argc", slow_argc),
         ("slowlog-entry-max-string-len", slow_str),
         ("client-output-buffer-limit", obuf),
@@ -3684,6 +3718,425 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         out.extend_from_slice(format!("${}\r\n{}\r\n", k.len(), k).as_bytes());
         out.extend_from_slice(format!("${}\r\n{}\r\n", v.len(), v).as_bytes());
     }
+}
+
+fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut Vec<u8>) {
+    // Phase 1: Validate all pairs and check for duplicates before applying any change
+    let mut seen_canonical: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (param, val) in pairs {
+        let p_str = String::from_utf8_lossy(param).to_lowercase();
+        let val_str = String::from_utf8_lossy(val);
+        let canonical = match p_str.as_str() {
+            "busy-reply-threshold" | "lua-time-limit" => "lua-time-limit",
+            "slaveof" | "replicaof" => "replicaof",
+            "slave-read-only" | "replica-read-only" => "replica-read-only",
+            "slave-ignore-maxmemory" | "replica-ignore-maxmemory" => "replica-ignore-maxmemory",
+            "slave-priority" | "replica-priority" => "replica-priority",
+            "slave-announce-ip" | "replica-announce-ip" => "replica-announce-ip",
+            "slave-announce-port" | "replica-announce-port" => "replica-announce-port",
+            "min-slaves-to-write" | "min-replicas-to-write" => "min-replicas-to-write",
+            "min-slaves-max-lag" | "min-replicas-max-lag" => "min-replicas-max-lag",
+            "hash-max-ziplist-entries" | "hash-max-listpack-entries" => "hash-max-listpack-entries",
+            "hash-max-ziplist-value" | "hash-max-listpack-value" => "hash-max-listpack-value",
+            other => other,
+        };
+        if !seen_canonical.insert(canonical.to_string()) {
+            out.extend_from_slice(
+                b"-ERR Cannot set duplicate config parameters in a single CONFIG SET call\r\n",
+            );
+            return;
+        }
+
+        if matches!(
+            p_str.as_str(),
+            "daemonize"
+                | "logfile"
+                | "databases"
+                | "enable-debug-command"
+                | "enable-module-command"
+        ) {
+            out.extend_from_slice(
+                format!(
+                    "-ERR CONFIG SET failed (possibly related to argument '{}') - can't set immutable config\r\n",
+                    p_str
+                )
+                .as_bytes(),
+            );
+            return;
+        } else if let Some(Err(e)) = match p_str.as_str() {
+            "loglevel" => Some(crate::log::validate_loglevel(&val_str)),
+            "log-format" => Some(crate::log::validate_log_format(&val_str)),
+            "log-timestamp-format" => Some(crate::log::validate_log_timestamp_format(&val_str)),
+            _ => None,
+        } {
+            out.extend_from_slice(
+                format!(
+                    "-ERR CONFIG SET failed (possibly related to argument '{}') - {}\r\n",
+                    p_str, e
+                )
+                .as_bytes(),
+            );
+            return;
+        } else if p_str == "aof-load-truncated" {
+            if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
+                out.extend_from_slice(
+                    b"-ERR CONFIG SET failed (possibly related to argument 'aof-load-truncated') - argument must be 'yes' or 'no'\r\n",
+                );
+                return;
+            }
+        } else if p_str == "appendonly" {
+            let requested = match val_str.to_ascii_lowercase().as_str() {
+                "yes" => true,
+                "no" => false,
+                _ => {
+                    out.extend_from_slice(
+                        b"-ERR CONFIG SET failed (possibly related to argument 'appendonly') - argument must be 'yes' or 'no'\r\n",
+                    );
+                    return;
+                }
+            };
+            if requested != router.aof.is_some() {
+                out.extend_from_slice(
+                    b"-ERR CONFIG SET failed (possibly related to argument 'appendonly') - changing appendonly at runtime is not supported; set it in the config file and restart\r\n",
+                );
+                return;
+            }
+        } else if p_str == "cross-shard-spin" {
+            if val_str.parse::<usize>().is_err() {
+                out.extend_from_slice(
+                    b"-ERR CONFIG SET failed (possibly related to argument 'cross-shard-spin') - argument must be a non-negative integer\r\n",
+                );
+                return;
+            }
+        } else if p_str == "appendfsync" {
+            if let Err(e) = crate::aof::parse_appendfsync(&val_str) {
+                out.extend_from_slice(
+                    format!(
+                        "-ERR CONFIG SET failed (possibly related to argument 'appendfsync') - {}\r\n",
+                        e
+                    )
+                    .as_bytes(),
+                );
+                return;
+            }
+        } else if matches!(
+            p_str.as_str(),
+            "timeout" | "tcp-keepalive" | "replica-priority" | "slave-priority"
+        ) {
+            if val_str.parse::<u64>().is_err() {
+                out.extend_from_slice(
+                    format!(
+                        "-ERR CONFIG SET failed (possibly related to argument '{}') - argument couldn't be parsed into an integer\r\n",
+                        p_str
+                    )
+                    .as_bytes(),
+                );
+                return;
+            }
+        } else if matches!(
+            p_str.as_str(),
+            "replica-announce-port" | "slave-announce-port"
+        ) {
+            if val_str.parse::<u16>().is_err() {
+                out.extend_from_slice(
+                    format!(
+                        "-ERR CONFIG SET failed (possibly related to argument '{}') - argument couldn't be parsed into an integer\r\n",
+                        p_str
+                    )
+                    .as_bytes(),
+                );
+                return;
+            }
+        } else if matches!(
+            p_str.as_str(),
+            "replica-read-only"
+                | "slave-read-only"
+                | "replica-ignore-maxmemory"
+                | "slave-ignore-maxmemory"
+        ) {
+            if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
+                out.extend_from_slice(
+                    format!(
+                        "-ERR CONFIG SET failed (possibly related to argument '{}') - argument must be 'yes' or 'no'\r\n",
+                        p_str
+                    )
+                    .as_bytes(),
+                );
+                return;
+            }
+        } else if p_str == "dbfilename" {
+            if let Err(e) = crate::config::validate_dbfilename(&val_str) {
+                out.extend_from_slice(
+                    format!(
+                        "-ERR CONFIG SET failed (possibly related to argument 'dbfilename') - {}\r\n",
+                        e
+                    )
+                    .as_bytes(),
+                );
+                return;
+            }
+        } else if p_str == "save" {
+            if crate::config::parse_save_points(&val_str).is_err() {
+                out.extend_from_slice(
+                    b"-ERR CONFIG SET failed (possibly related to argument 'save') - Invalid save parameters\r\n",
+                );
+                return;
+            }
+        } else if p_str == "protected-mode" {
+            if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
+                out.extend_from_slice(
+                    b"-ERR CONFIG SET failed (possibly related to argument 'protected-mode') - argument must be 'yes' or 'no'\r\n",
+                );
+                return;
+            }
+        } else if p_str == "bind" {
+            let current = crate::netsec::bind_addrs(router.base_port);
+            match crate::netsec::parse_bind_spec(&val_str) {
+                Ok(requested) if requested == current => {}
+                Ok(_) => {
+                    out.extend_from_slice(
+                        b"-ERR CONFIG SET failed (possibly related to argument 'bind') - changing bind at runtime is not supported; set it in the config file and restart\r\n",
+                    );
+                    return;
+                }
+                Err(_) => {
+                    out.extend_from_slice(
+                        b"-ERR CONFIG SET failed (possibly related to argument 'bind') - Failed to bind to specified addresses.\r\n",
+                    );
+                    return;
+                }
+            }
+        } else if p_str == "maxmemory-clients" {
+            if let Some(pct_str) = val_str.strip_suffix('%') {
+                match pct_str.parse::<i64>() {
+                    Ok(pct) if (0..=100).contains(&pct) => {}
+                    _ => {
+                        out.extend_from_slice(
+                            b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory-clients') - percentage argument must be less or equal to 100\r\n",
+                        );
+                        return;
+                    }
+                }
+            } else if crate::tiering::parse_memory_bytes(&val_str).is_none() {
+                out.extend_from_slice(
+                    b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory-clients') - invalid maxmemory-clients\r\n",
+                );
+                return;
+            }
+        } else if p_str == "client-query-buffer-limit" {
+            match crate::tiering::parse_memory_bytes(&val_str) {
+                None => {
+                    out.extend_from_slice(
+                        b"-ERR CONFIG SET failed (possibly related to argument 'client-query-buffer-limit') - invalid client-query-buffer-limit\r\n",
+                    );
+                    return;
+                }
+                Some(v) if v < MIN_CLIENT_QUERY_BUFFER_LIMIT => {
+                    out.extend_from_slice(
+                        format!(
+                            "-ERR CONFIG SET failed (possibly related to argument 'client-query-buffer-limit') - argument must be between {} and {} inclusive\r\n",
+                            MIN_CLIENT_QUERY_BUFFER_LIMIT,
+                            i64::MAX
+                        )
+                        .as_bytes(),
+                    );
+                    return;
+                }
+                Some(_) => {}
+            }
+        } else if p_str == "port" {
+            match val_str.parse::<u16>() {
+                Ok(new_port) => {
+                    if new_port != 0
+                        && new_port != router.port
+                        && let Err(e) = std::net::TcpListener::bind(("127.0.0.1", new_port))
+                    {
+                        out.extend_from_slice(
+                            format!(
+                                "-ERR CONFIG SET failed (possibly related to argument 'port') - Unable to listen on this port: {}\r\n",
+                                e
+                            )
+                            .as_bytes(),
+                        );
+                        return;
+                    }
+                }
+                Err(_) => {
+                    out.extend_from_slice(
+                        b"-ERR CONFIG SET failed (possibly related to argument 'port') - Invalid argument\r\n",
+                    );
+                    return;
+                }
+            }
+        } else if p_str == "proto-max-bulk-len" {
+            if val_str.parse::<usize>().is_err() {
+                out.extend_from_slice(
+                    b"-ERR Invalid argument for CONFIG SET proto-max-bulk-len\r\n",
+                );
+                return;
+            }
+        } else if p_str == "maxmemory" {
+            if crate::tiering::parse_memory_bytes(&val_str).is_none() {
+                out.extend_from_slice(
+                    b"-ERR CONFIG SET failed (Invalid argument for 'maxmemory')\r\n",
+                );
+                return;
+            }
+        } else if p_str == "maxmemory-policy" {
+            if let Err(e) = crate::config::validate_maxmemory_policy(&val_str) {
+                out.extend_from_slice(
+                    format!(
+                        "-ERR CONFIG SET failed (possibly related to argument 'maxmemory-policy') - {}\r\n",
+                        e
+                    )
+                    .as_bytes(),
+                );
+                return;
+            }
+        } else if p_str == "tiered-offload-threshold" {
+            if val_str.parse::<u64>().is_err() {
+                out.extend_from_slice(
+                    b"-ERR Invalid argument for CONFIG SET tiered-offload-threshold\r\n",
+                );
+                return;
+            }
+        } else if p_str == "tiered-upload-threshold" {
+            if val_str.parse::<u64>().is_err() {
+                out.extend_from_slice(
+                    b"-ERR Invalid argument for CONFIG SET tiered-upload-threshold\r\n",
+                );
+                return;
+            }
+        } else if p_str == "hash-max-listpack-entries"
+            || p_str == "hash-max-ziplist-entries"
+            || p_str == "hash-max-listpack-value"
+            || p_str == "hash-max-ziplist-value"
+        {
+            if val_str.parse::<usize>().is_err() {
+                out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
+                return;
+            }
+        } else if p_str == "stream-node-max-entries" {
+            match val_str.parse::<usize>() {
+                Ok(n) if n > 0 => {}
+                Ok(_) => {
+                    out.extend_from_slice(
+                        b"-ERR stream-node-max-entries must be a positive integer\r\n",
+                    );
+                    return;
+                }
+                Err(_) => {
+                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
+                    return;
+                }
+            }
+        } else if p_str == "stream-idmp-duration" {
+            match val_str.parse::<i64>() {
+                Ok(n) if (1..=86400).contains(&n) => {}
+                _ => {
+                    out.extend_from_slice(
+                        b"-ERR stream-idmp-duration must be between 1 and 86400\r\n",
+                    );
+                    return;
+                }
+            }
+        } else if p_str == "stream-idmp-maxsize" {
+            match val_str.parse::<i64>() {
+                Ok(n) if (1..=10000).contains(&n) => {}
+                _ => {
+                    out.extend_from_slice(
+                        b"-ERR stream-idmp-maxsize must be between 1 and 10000\r\n",
+                    );
+                    return;
+                }
+            }
+        } else if matches!(
+            p_str.as_str(),
+            "min-replicas-to-write"
+                | "min-slaves-to-write"
+                | "min-replicas-max-lag"
+                | "min-slaves-max-lag"
+        ) {
+            if val_str.parse::<u32>().is_err() {
+                out.extend_from_slice(
+                    format!("-ERR Invalid argument for CONFIG SET {p_str}\r\n").as_bytes(),
+                );
+                return;
+            }
+        } else if matches!(
+            p_str.as_str(),
+            "slowlog-log-slower-than"
+                | "commandlog-execution-slower-than"
+                | "commandlog-request-larger-than"
+                | "commandlog-reply-larger-than"
+        ) {
+            if val_str.parse::<i64>().is_err() {
+                out.extend_from_slice(
+                    format!("-ERR Invalid argument for CONFIG SET {p_str}\r\n").as_bytes(),
+                );
+                return;
+            }
+        } else if matches!(
+            p_str.as_str(),
+            "slowlog-max-len"
+                | "commandlog-slow-execution-max-len"
+                | "commandlog-large-request-max-len"
+                | "commandlog-large-reply-max-len"
+        ) {
+            if val_str.parse::<usize>().is_err() {
+                out.extend_from_slice(
+                    format!("-ERR Invalid argument for CONFIG SET {p_str}\r\n").as_bytes(),
+                );
+                return;
+            }
+        } else if p_str == "slowlog-entry-max-argc" {
+            match val_str.parse::<usize>() {
+                Ok(v) if v >= 2 => {}
+                _ => {
+                    out.extend_from_slice(b"-ERR argument must be between 2 and 2147483647\r\n");
+                    return;
+                }
+            }
+        } else if p_str == "slowlog-entry-max-string-len" {
+            match val_str.parse::<usize>() {
+                Ok(v) if v >= 1 => {}
+                _ => {
+                    out.extend_from_slice(b"-ERR argument must be between 1 and 2147483647\r\n");
+                    return;
+                }
+            }
+        } else if p_str == "client-output-buffer-limit" {
+            if let Err(err) = set_client_output_buffer_limit_str(&val_str) {
+                out.extend_from_slice(err.as_bytes());
+                return;
+            }
+        } else if p_str == "latency-monitor-threshold" {
+            if val_str.parse::<i64>().is_err() {
+                out.extend_from_slice(
+                    b"-ERR Invalid argument for CONFIG SET latency-monitor-threshold\r\n",
+                );
+                return;
+            }
+        } else if p_str == "maxclients" {
+            if val_str.parse::<usize>().is_err() {
+                out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET maxclients\r\n");
+                return;
+            }
+        } else if p_str == "tracking-table-max-keys" && val_str.parse::<usize>().is_err() {
+            out.extend_from_slice(
+                b"-ERR Invalid argument for CONFIG SET tracking-table-max-keys\r\n",
+            );
+            return;
+        }
+    }
+
+    // Phase 2: Apply all validated config parameters
+    for (param, val) in pairs {
+        let p_str = String::from_utf8_lossy(param).to_lowercase();
+        let val_str = String::from_utf8_lossy(val);
+        let _ = apply_config_value(router.port, router.base_port, &p_str, &val_str);
+    }
+    out.extend_from_slice(b"+OK\r\n");
 }
 
 pub fn set_max_clients(limit: usize) {
@@ -7999,6 +8452,9 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::KeyspaceStats => "KEYSPACESTATS",
         Command::Select(_) => "SELECT",
         Command::Slowlog(_) => "SLOWLOG",
+        Command::Commandlog(_) => "COMMANDLOG",
+        Command::Lolwut(_) => "LOLWUT",
+        Command::Sentinel(_) => "SENTINEL",
         Command::Flushdb => "FLUSHDB",
         Command::Flushall => "FLUSHALL",
         Command::Swapdb { .. } => "SWAPDB",
@@ -8367,6 +8823,17 @@ pub fn acl_cmd_name(cmd: &Command) -> &'static str {
             M::Doctor => "memory|doctor",
             M::Defrag => "memory",
         },
+        Command::Commandlog(args) => {
+            match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                Some(b"get") => "commandlog|get",
+                Some(b"len") => "commandlog|len",
+                Some(b"reset") => "commandlog|reset",
+                Some(b"help") => "commandlog|help",
+                _ => "commandlog",
+            }
+        }
+        Command::Lolwut(_) => "lolwut",
+        Command::Sentinel(_) => "sentinel",
         Command::Unknown(s) => match s.as_str() {
             "SCRIPT HELP" => "script|help",
             "CONFIG HELP" => "config|help",
@@ -9388,6 +9855,8 @@ fn allowed_while_loading(cmd: &Command) -> bool {
                 | "SELECT"
                 | "SHUTDOWN"
                 | "SLOWLOG"
+                | "COMMANDLOG"
+                | "LOLWUT"
                 | "SPUBLISH"
                 | "SSUBSCRIBE"
                 | "SUBSCRIBE"
@@ -9550,7 +10019,7 @@ async fn execute_command_inner(
     let slow_threshold =
         crate::slowlog::SLOWLOG_LOG_SLOWER_THAN.load(std::sync::atomic::Ordering::Relaxed);
     let lat_threshold = LATENCY_MONITOR_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed);
-    let skip_slowlog = matches!(cmd, Command::Quit)
+    let skip_slowlog = matches!(cmd, Command::Quit | Command::Exec | Command::Commandlog(_))
         || (slow_threshold >= 10_000 && matches!(cmd, Command::Mset(_) | Command::Mget(_)));
     let (cmd_for_slowlog, exec_start) =
         if (slow_threshold >= 0 && !skip_slowlog) || lat_threshold > 0 {
@@ -9563,6 +10032,7 @@ async fn execute_command_inner(
         start: Option<std::time::Instant>,
         threshold: i64,
         skip_slowlog: bool,
+        reply_bytes: usize,
         client_id: u64,
         client_registry: &'a RefCell<hashbrown::HashMap<u64, ClientInfo>>,
     }
@@ -9575,24 +10045,58 @@ async fn execute_command_inner(
                 if duration_ms > 0 {
                     record_latency_event("command", duration_ms);
                 }
-                if !self.skip_slowlog && self.threshold >= 0 && duration_us >= self.threshold as u64
-                {
-                    let (addr_str, name_str) =
-                        if let Some(c) = self.client_registry.borrow().get(&self.client_id) {
-                            (c.addr.to_string(), c.name.clone().unwrap_or_default())
-                        } else {
-                            ("".to_string(), "".to_string())
-                        };
-                    crate::slowlog::log_command_if_slow(&cmd, duration_us, &addr_str, &name_str);
+                if !self.skip_slowlog {
+                    let req_thresh = crate::slowlog::COMMANDLOG_REQUEST_LARGER_THAN
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let rep_thresh = crate::slowlog::COMMANDLOG_REPLY_LARGER_THAN
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let is_slow = self.threshold >= 0 && duration_us >= self.threshold as u64;
+                    let is_large_rep = rep_thresh >= 0 && (self.reply_bytes as i64) >= rep_thresh;
+                    let req_bytes = if req_thresh >= 0 {
+                        let b = crate::slowlog::estimate_command_request_bytes(&cmd);
+                        ((b as i64) >= req_thresh).then_some(b)
+                    } else {
+                        None
+                    };
+                    if is_slow || is_large_rep || req_bytes.is_some() {
+                        let (addr_str, name_str) =
+                            if let Some(c) = self.client_registry.borrow().get(&self.client_id) {
+                                (c.addr.to_string(), c.name.clone().unwrap_or_default())
+                            } else {
+                                ("".to_string(), "".to_string())
+                            };
+                        if is_slow {
+                            crate::slowlog::log_command_if_slow(
+                                &cmd,
+                                duration_us,
+                                &addr_str,
+                                &name_str,
+                            );
+                        }
+                        if let Some(b) = req_bytes {
+                            crate::slowlog::log_command_if_large_request(
+                                &cmd, b, &addr_str, &name_str,
+                            );
+                        }
+                        if is_large_rep {
+                            crate::slowlog::log_command_if_large_reply(
+                                &cmd,
+                                self.reply_bytes,
+                                &addr_str,
+                                &name_str,
+                            );
+                        }
+                    }
                 }
             }
         }
     }
-    let _slowlog_guard = SlowlogTracker {
+    let mut _slowlog_guard = SlowlogTracker {
         cmd: cmd_for_slowlog,
         start: exec_start,
         threshold: slow_threshold,
         skip_slowlog,
+        reply_bytes: 0,
         client_id,
         client_registry,
     };
@@ -11218,439 +11722,7 @@ async fn execute_command_inner(
                         }
                     }
 
-                    // Phase 1: Validate all pairs and check for duplicates before applying any change
-                    let mut seen_canonical: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                    for (param, val) in &pairs {
-                        let p_str = String::from_utf8_lossy(param).to_lowercase();
-                        let val_str = String::from_utf8_lossy(val);
-                        let canonical = match p_str.as_str() {
-                            "busy-reply-threshold" | "lua-time-limit" => "lua-time-limit",
-                            "slaveof" | "replicaof" => "replicaof",
-                            "slave-read-only" | "replica-read-only" => "replica-read-only",
-                            "slave-ignore-maxmemory" | "replica-ignore-maxmemory" => {
-                                "replica-ignore-maxmemory"
-                            }
-                            "slave-priority" | "replica-priority" => "replica-priority",
-                            "slave-announce-ip" | "replica-announce-ip" => "replica-announce-ip",
-                            "slave-announce-port" | "replica-announce-port" => {
-                                "replica-announce-port"
-                            }
-                            "min-slaves-to-write" | "min-replicas-to-write" => {
-                                "min-replicas-to-write"
-                            }
-                            "min-slaves-max-lag" | "min-replicas-max-lag" => "min-replicas-max-lag",
-                            "hash-max-ziplist-entries" | "hash-max-listpack-entries" => {
-                                "hash-max-listpack-entries"
-                            }
-                            "hash-max-ziplist-value" | "hash-max-listpack-value" => {
-                                "hash-max-listpack-value"
-                            }
-                            other => other,
-                        };
-                        if !seen_canonical.insert(canonical.to_string()) {
-                            out.extend_from_slice(
-                                b"-ERR Cannot set duplicate config parameters in a single CONFIG SET call\r\n",
-                            );
-                            return false;
-                        }
-
-                        if matches!(
-                            p_str.as_str(),
-                            "daemonize"
-                                | "logfile"
-                                | "databases"
-                                | "enable-debug-command"
-                                | "enable-module-command"
-                        ) {
-                            out.extend_from_slice(
-                                format!(
-                                    "-ERR CONFIG SET failed (possibly related to argument '{}') - can't set immutable config\r\n",
-                                    p_str
-                                )
-                                .as_bytes(),
-                            );
-                            return false;
-                        } else if let Some(Err(e)) = match p_str.as_str() {
-                            "loglevel" => Some(crate::log::validate_loglevel(&val_str)),
-                            "log-format" => Some(crate::log::validate_log_format(&val_str)),
-                            "log-timestamp-format" => {
-                                Some(crate::log::validate_log_timestamp_format(&val_str))
-                            }
-                            _ => None,
-                        } {
-                            out.extend_from_slice(
-                                format!(
-                                    "-ERR CONFIG SET failed (possibly related to argument '{}') - {}\r\n",
-                                    p_str, e
-                                )
-                                .as_bytes(),
-                            );
-                            return false;
-                        } else if p_str == "aof-load-truncated" {
-                            if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
-                                out.extend_from_slice(
-                                    b"-ERR CONFIG SET failed (possibly related to argument 'aof-load-truncated') - argument must be 'yes' or 'no'\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "appendonly" {
-                            // The AOF writers are opened once per shard at startup.
-                            let requested = match val_str.to_ascii_lowercase().as_str() {
-                                "yes" => true,
-                                "no" => false,
-                                _ => {
-                                    out.extend_from_slice(
-                                        b"-ERR CONFIG SET failed (possibly related to argument 'appendonly') - argument must be 'yes' or 'no'\r\n",
-                                    );
-                                    return false;
-                                }
-                            };
-                            if requested != router.aof.is_some() {
-                                out.extend_from_slice(
-                                    b"-ERR CONFIG SET failed (possibly related to argument 'appendonly') - changing appendonly at runtime is not supported; set it in the config file and restart\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "cross-shard-spin" {
-                            if val_str.parse::<usize>().is_err() {
-                                out.extend_from_slice(
-                                    b"-ERR CONFIG SET failed (possibly related to argument 'cross-shard-spin') - argument must be a non-negative integer\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "appendfsync" {
-                            if let Err(e) = crate::aof::parse_appendfsync(&val_str) {
-                                out.extend_from_slice(
-                                    format!(
-                                        "-ERR CONFIG SET failed (possibly related to argument 'appendfsync') - {}\r\n",
-                                        e
-                                    )
-                                    .as_bytes(),
-                                );
-                                return false;
-                            }
-                        } else if matches!(
-                            p_str.as_str(),
-                            "timeout" | "tcp-keepalive" | "replica-priority" | "slave-priority"
-                        ) {
-                            if val_str.parse::<u64>().is_err() {
-                                out.extend_from_slice(
-                                    format!(
-                                        "-ERR CONFIG SET failed (possibly related to argument '{}') - argument couldn't be parsed into an integer\r\n",
-                                        p_str
-                                    )
-                                    .as_bytes(),
-                                );
-                                return false;
-                            }
-                        } else if matches!(
-                            p_str.as_str(),
-                            "replica-announce-port" | "slave-announce-port"
-                        ) {
-                            if val_str.parse::<u16>().is_err() {
-                                out.extend_from_slice(
-                                    format!(
-                                        "-ERR CONFIG SET failed (possibly related to argument '{}') - argument couldn't be parsed into an integer\r\n",
-                                        p_str
-                                    )
-                                    .as_bytes(),
-                                );
-                                return false;
-                            }
-                        } else if matches!(
-                            p_str.as_str(),
-                            "replica-read-only"
-                                | "slave-read-only"
-                                | "replica-ignore-maxmemory"
-                                | "slave-ignore-maxmemory"
-                        ) {
-                            if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
-                                out.extend_from_slice(
-                                    format!(
-                                        "-ERR CONFIG SET failed (possibly related to argument '{}') - argument must be 'yes' or 'no'\r\n",
-                                        p_str
-                                    )
-                                    .as_bytes(),
-                                );
-                                return false;
-                            }
-                        } else if p_str == "dbfilename" {
-                            if let Err(e) = crate::config::validate_dbfilename(&val_str) {
-                                out.extend_from_slice(
-                                    format!(
-                                        "-ERR CONFIG SET failed (possibly related to argument 'dbfilename') - {}\r\n",
-                                        e
-                                    )
-                                    .as_bytes(),
-                                );
-                                return false;
-                            }
-                        } else if p_str == "save" {
-                            if crate::config::parse_save_points(&val_str).is_err() {
-                                out.extend_from_slice(
-                                    b"-ERR CONFIG SET failed (possibly related to argument 'save') - Invalid save parameters\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "protected-mode" {
-                            if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
-                                out.extend_from_slice(
-                                    b"-ERR CONFIG SET failed (possibly related to argument 'protected-mode') - argument must be 'yes' or 'no'\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "bind" {
-                            // Listeners are created once per shard at startup; a
-                            // no-op SET is fine, anything else must not claim success.
-                            let current = crate::netsec::bind_addrs(router.base_port);
-                            match crate::netsec::parse_bind_spec(&val_str) {
-                                Ok(requested) if requested == current => {}
-                                Ok(_) => {
-                                    out.extend_from_slice(
-                                        b"-ERR CONFIG SET failed (possibly related to argument 'bind') - changing bind at runtime is not supported; set it in the config file and restart\r\n",
-                                    );
-                                    return false;
-                                }
-                                Err(_) => {
-                                    out.extend_from_slice(
-                                        b"-ERR CONFIG SET failed (possibly related to argument 'bind') - Failed to bind to specified addresses.\r\n",
-                                    );
-                                    return false;
-                                }
-                            }
-                        } else if p_str == "maxmemory-clients" {
-                            if let Some(pct_str) = val_str.strip_suffix('%') {
-                                match pct_str.parse::<i64>() {
-                                    Ok(pct) if (0..=100).contains(&pct) => {}
-                                    _ => {
-                                        out.extend_from_slice(
-                                            b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory-clients') - percentage argument must be less or equal to 100\r\n",
-                                        );
-                                        return false;
-                                    }
-                                }
-                            } else if crate::tiering::parse_memory_bytes(&val_str).is_none() {
-                                out.extend_from_slice(
-                                    b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory-clients') - invalid maxmemory-clients\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "client-query-buffer-limit" {
-                            match crate::tiering::parse_memory_bytes(&val_str) {
-                                None => {
-                                    out.extend_from_slice(
-                                        b"-ERR CONFIG SET failed (possibly related to argument 'client-query-buffer-limit') - invalid client-query-buffer-limit\r\n",
-                                    );
-                                    return false;
-                                }
-                                Some(v) if v < MIN_CLIENT_QUERY_BUFFER_LIMIT => {
-                                    out.extend_from_slice(
-                                        format!(
-                                            "-ERR CONFIG SET failed (possibly related to argument 'client-query-buffer-limit') - argument must be between {} and {} inclusive\r\n",
-                                            MIN_CLIENT_QUERY_BUFFER_LIMIT,
-                                            i64::MAX
-                                        )
-                                        .as_bytes(),
-                                    );
-                                    return false;
-                                }
-                                Some(_) => {}
-                            }
-                        } else if p_str == "port" {
-                            match val_str.parse::<u16>() {
-                                Ok(new_port) => {
-                                    if new_port != 0
-                                        && new_port != router.port
-                                        && let Err(e) =
-                                            std::net::TcpListener::bind(("127.0.0.1", new_port))
-                                    {
-                                        out.extend_from_slice(
-                                                format!(
-                                                    "-ERR CONFIG SET failed (possibly related to argument 'port') - Unable to listen on this port: {}\r\n",
-                                                    e
-                                                )
-                                                .as_bytes(),
-                                            );
-                                        return false;
-                                    }
-                                }
-                                Err(_) => {
-                                    out.extend_from_slice(
-                                        b"-ERR CONFIG SET failed (possibly related to argument 'port') - Invalid argument\r\n",
-                                    );
-                                    return false;
-                                }
-                            }
-                        } else if p_str == "proto-max-bulk-len" {
-                            if val_str.parse::<usize>().is_err() {
-                                out.extend_from_slice(
-                                    b"-ERR Invalid argument for CONFIG SET proto-max-bulk-len\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "maxmemory" {
-                            if crate::tiering::parse_memory_bytes(&val_str).is_none() {
-                                out.extend_from_slice(
-                                    b"-ERR CONFIG SET failed (Invalid argument for 'maxmemory')\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "maxmemory-policy" {
-                            if let Err(e) = crate::config::validate_maxmemory_policy(&val_str) {
-                                out.extend_from_slice(
-                                    format!(
-                                        "-ERR CONFIG SET failed (possibly related to argument 'maxmemory-policy') - {}\r\n",
-                                        e
-                                    )
-                                    .as_bytes(),
-                                );
-                                return false;
-                            }
-                        } else if p_str == "tiered-offload-threshold" {
-                            if val_str.parse::<u64>().is_err() {
-                                out.extend_from_slice(
-                                    b"-ERR Invalid argument for CONFIG SET tiered-offload-threshold\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "tiered-upload-threshold" {
-                            if val_str.parse::<u64>().is_err() {
-                                out.extend_from_slice(
-                                    b"-ERR Invalid argument for CONFIG SET tiered-upload-threshold\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "hash-max-listpack-entries"
-                            || p_str == "hash-max-ziplist-entries"
-                            || p_str == "hash-max-listpack-value"
-                            || p_str == "hash-max-ziplist-value"
-                        {
-                            if val_str.parse::<usize>().is_err() {
-                                out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
-                                return false;
-                            }
-                        } else if p_str == "stream-node-max-entries" {
-                            match val_str.parse::<usize>() {
-                                Ok(n) if n > 0 => {}
-                                Ok(_) => {
-                                    out.extend_from_slice(
-                                        b"-ERR stream-node-max-entries must be a positive integer\r\n",
-                                    );
-                                    return false;
-                                }
-                                Err(_) => {
-                                    out.extend_from_slice(
-                                        b"-ERR Invalid argument for CONFIG SET\r\n",
-                                    );
-                                    return false;
-                                }
-                            }
-                        } else if p_str == "stream-idmp-duration" {
-                            match val_str.parse::<i64>() {
-                                Ok(n) if (1..=86400).contains(&n) => {}
-                                _ => {
-                                    out.extend_from_slice(
-                                        b"-ERR stream-idmp-duration must be between 1 and 86400\r\n",
-                                    );
-                                    return false;
-                                }
-                            }
-                        } else if p_str == "stream-idmp-maxsize" {
-                            match val_str.parse::<i64>() {
-                                Ok(n) if (1..=10000).contains(&n) => {}
-                                _ => {
-                                    out.extend_from_slice(
-                                        b"-ERR stream-idmp-maxsize must be between 1 and 10000\r\n",
-                                    );
-                                    return false;
-                                }
-                            }
-                        } else if matches!(
-                            p_str.as_str(),
-                            "min-replicas-to-write"
-                                | "min-slaves-to-write"
-                                | "min-replicas-max-lag"
-                                | "min-slaves-max-lag"
-                        ) {
-                            if val_str.parse::<u32>().is_err() {
-                                out.extend_from_slice(
-                                    format!("-ERR Invalid argument for CONFIG SET {p_str}\r\n")
-                                        .as_bytes(),
-                                );
-                                return false;
-                            }
-                        } else if p_str == "slowlog-log-slower-than" {
-                            if val_str.parse::<i64>().is_err() {
-                                out.extend_from_slice(
-                                    b"-ERR Invalid argument for CONFIG SET slowlog-log-slower-than\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "slowlog-max-len" {
-                            if val_str.parse::<usize>().is_err() {
-                                out.extend_from_slice(
-                                    b"-ERR Invalid argument for CONFIG SET slowlog-max-len\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "slowlog-entry-max-argc" {
-                            match val_str.parse::<usize>() {
-                                Ok(v) if v >= 2 => {}
-                                _ => {
-                                    out.extend_from_slice(
-                                        b"-ERR argument must be between 2 and 2147483647\r\n",
-                                    );
-                                    return false;
-                                }
-                            }
-                        } else if p_str == "slowlog-entry-max-string-len" {
-                            match val_str.parse::<usize>() {
-                                Ok(v) if v >= 1 => {}
-                                _ => {
-                                    out.extend_from_slice(
-                                        b"-ERR argument must be between 1 and 2147483647\r\n",
-                                    );
-                                    return false;
-                                }
-                            }
-                        } else if p_str == "client-output-buffer-limit" {
-                            if let Err(err) = set_client_output_buffer_limit_str(&val_str) {
-                                out.extend_from_slice(err.as_bytes());
-                                return false;
-                            }
-                        } else if p_str == "latency-monitor-threshold" {
-                            if val_str.parse::<i64>().is_err() {
-                                out.extend_from_slice(
-                                    b"-ERR Invalid argument for CONFIG SET latency-monitor-threshold\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "maxclients" {
-                            if val_str.parse::<usize>().is_err() {
-                                out.extend_from_slice(
-                                    b"-ERR Invalid argument for CONFIG SET maxclients\r\n",
-                                );
-                                return false;
-                            }
-                        } else if p_str == "tracking-table-max-keys"
-                            && val_str.parse::<usize>().is_err()
-                        {
-                            out.extend_from_slice(
-                                b"-ERR Invalid argument for CONFIG SET tracking-table-max-keys\r\n",
-                            );
-                            return false;
-                        }
-                    }
-
-                    // Phase 2: Apply all validated config parameters
-                    for (param, val) in &pairs {
-                        let p_str = String::from_utf8_lossy(param).to_lowercase();
-                        let val_str = String::from_utf8_lossy(val);
-                        // Validated in phase 1.
-                        let _ = apply_config_value(router.port, router.base_port, &p_str, &val_str);
-                    }
-                    out.extend_from_slice(b"+OK\r\n");
+                    apply_config_set_pairs(router, &pairs, out);
                     false
                 }
                 _ => unreachable!(),
@@ -16086,6 +16158,18 @@ async fn execute_command_inner(
             }
             false
         }
+        Command::Commandlog(args) => {
+            crate::slowlog::handle_commandlog(&args, out);
+            false
+        }
+        Command::Lolwut(args) => {
+            crate::slowlog::handle_lolwut(&args, out);
+            false
+        }
+        Command::Sentinel(args) => {
+            crate::slowlog::handle_sentinel(&args, out);
+            false
+        }
         Command::Flushdb | Command::Flushall => {
             let is_all = matches!(cmd, Command::Flushall);
             let cur_db = CURRENT_DB.get();
@@ -18224,6 +18308,7 @@ async fn execute_command_inner(
             c.reply_mode = crate::resp::ClientReplyMode::On;
         }
     }
+    _slowlog_guard.reply_bytes = out.len().saturating_sub(error_stat_start);
     record_reply_error_stat(out, error_stat_start, cmd_name);
     ret
 }
@@ -20980,6 +21065,18 @@ pub fn execute_local_command(
                     let entries = crate::slowlog::slowlog_get(count);
                     crate::slowlog::write_slowlog_entries_resp(&entries, out);
                 }
+                false
+            }
+            Command::Commandlog(args) => {
+                crate::slowlog::handle_commandlog(args, out);
+                false
+            }
+            Command::Lolwut(args) => {
+                crate::slowlog::handle_lolwut(args, out);
+                false
+            }
+            Command::Sentinel(args) => {
+                crate::slowlog::handle_sentinel(args, out);
                 false
             }
             Command::Flushdb | Command::Flushall => {

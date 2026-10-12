@@ -794,6 +794,9 @@ pub enum Command {
     KeyspaceStats,
     Select(u32),
     Slowlog(Vec<Bytes>),
+    Commandlog(Vec<Bytes>),
+    Lolwut(Vec<Bytes>),
+    Sentinel(Vec<Bytes>),
     Debug(Vec<Bytes>),
     Flushdb,
     Flushall,
@@ -6109,6 +6112,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             };
             Ok(Some(Command::Slowlog(sub_args)))
         }
+        "COMMANDLOG" => Ok(Some(Command::Commandlog(args[1..].to_vec()))),
+        "LOLWUT" => Ok(Some(Command::Lolwut(args[1..].to_vec()))),
+        "SENTINEL" => Ok(Some(Command::Sentinel(args[1..].to_vec()))),
         "DEBUG" => Ok(Some(Command::Debug(args[1..].to_vec()))),
         "DIGEST" => {
             if args.len() != 2 {

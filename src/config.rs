@@ -933,6 +933,42 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
             .to_string(),
     );
     directives.insert(
+        "commandlog-execution-slower-than".to_string(),
+        crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    directives.insert(
+        "commandlog-slow-execution-max-len".to_string(),
+        crate::slowlog::SLOWLOG_MAX_LEN
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    directives.insert(
+        "commandlog-request-larger-than".to_string(),
+        crate::slowlog::COMMANDLOG_REQUEST_LARGER_THAN
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    directives.insert(
+        "commandlog-large-request-max-len".to_string(),
+        crate::slowlog::COMMANDLOG_LARGE_REQUEST_MAX_LEN
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    directives.insert(
+        "commandlog-reply-larger-than".to_string(),
+        crate::slowlog::COMMANDLOG_REPLY_LARGER_THAN
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    directives.insert(
+        "commandlog-large-reply-max-len".to_string(),
+        crate::slowlog::COMMANDLOG_LARGE_REPLY_MAX_LEN
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    directives.insert(
         "client-output-buffer-limit".to_string(),
         crate::connection::format_client_output_buffer_limit_config(),
     );

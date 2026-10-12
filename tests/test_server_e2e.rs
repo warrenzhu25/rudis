@@ -26321,3 +26321,88 @@ fn test_router_pooled_channels_spublish_and_loopback_conf_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_commandlog_lolwut_and_sentinel_e2e() {
+    let port = 17979u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "1", "--no-pin"], port);
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // 1. LOLWUT & SENTINEL
+    let lol = resp_cmd(&mut c, &["LOLWUT"]);
+    assert!(
+        lol.starts_with('$') && lol.contains("Redis ver. 7.2.4"),
+        "{lol}"
+    );
+    let lol_v5 = resp_cmd(&mut c, &["LOLWUT", "VERSION", "5", "40"]);
+    assert!(
+        lol_v5.starts_with('$') && lol_v5.contains("version 5"),
+        "{lol_v5}"
+    );
+    assert!(
+        resp_cmd(&mut c, &["LOLWUT", "VERSION", "bad"]).starts_with("-ERR"),
+        "expected error on non-integer LOLWUT version"
+    );
+
+    let sent = resp_cmd(&mut c, &["SENTINEL", "MASTERS"]);
+    assert_eq!(sent, "-ERR This instance has sentinel support disabled\r\n");
+
+    // 2. COMMANDLOG (SLOW, LARGE-REQUEST, LARGE-REPLY) & CONFIG SET/GET
+    assert_eq!(
+        resp_cmd(&mut c, &["COMMANDLOG", "RESET", "SLOW"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["COMMANDLOG", "RESET", "LARGE-REQUEST"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["COMMANDLOG", "RESET", "LARGE-REPLY"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &[
+                "CONFIG",
+                "SET",
+                "commandlog-request-larger-than",
+                "150",
+                "commandlog-reply-larger-than",
+                "150",
+            ],
+        ),
+        "+OK\r\n"
+    );
+    assert!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "commandlog-request-larger-than"])
+            .contains("\r\n150\r\n")
+    );
+
+    let big_val = "x".repeat(256);
+    assert_eq!(
+        resp_cmd(&mut c, &["SET", "cmdlog:key", &big_val]),
+        "+OK\r\n"
+    );
+    let got = resp_cmd(&mut c, &["GET", "cmdlog:key"]);
+    assert!(got.contains(&big_val), "{got}");
+
+    let req_len = resp_cmd(&mut c, &["COMMANDLOG", "LEN", "LARGE-REQUEST"]);
+    assert_eq!(req_len, ":1\r\n");
+    let rep_len = resp_cmd(&mut c, &["COMMANDLOG", "LEN", "LARGE-REPLY"]);
+    assert_eq!(rep_len, ":1\r\n");
+
+    let req_entries = resp_cmd(&mut c, &["COMMANDLOG", "GET", "10", "LARGE-REQUEST"]);
+    assert!(req_entries.contains("cmdlog:key"), "{req_entries}");
+    let rep_entries = resp_cmd(&mut c, &["COMMANDLOG", "GET", "10", "LARGE-REPLY"]);
+    assert!(rep_entries.contains("cmdlog:key"), "{rep_entries}");
+
+    let help = resp_cmd(&mut c, &["COMMANDLOG", "HELP"]);
+    assert!(help.contains("LARGE-REQUEST"), "{help}");
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

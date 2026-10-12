@@ -10,12 +10,21 @@ pub const DEFAULT_SLOWLOG_LOG_SLOWER_THAN: i64 = 10000; // 10,000 microseconds =
 pub const DEFAULT_SLOWLOG_MAX_LEN: usize = 128;
 pub const DEFAULT_SLOWLOG_ENTRY_MAX_ARGC: usize = 32;
 pub const DEFAULT_SLOWLOG_ENTRY_MAX_STRING_LEN: usize = 128;
+pub const DEFAULT_COMMANDLOG_LARGER_THAN: i64 = 1024 * 1024; // 1 MiB
+pub const DEFAULT_COMMANDLOG_LARGE_MAX_LEN: usize = 64;
 
 pub static SLOWLOG_LOG_SLOWER_THAN: AtomicI64 = AtomicI64::new(DEFAULT_SLOWLOG_LOG_SLOWER_THAN);
 pub static SLOWLOG_MAX_LEN: AtomicUsize = AtomicUsize::new(DEFAULT_SLOWLOG_MAX_LEN);
 pub static SLOWLOG_ENTRY_MAX_ARGC: AtomicUsize = AtomicUsize::new(DEFAULT_SLOWLOG_ENTRY_MAX_ARGC);
 pub static SLOWLOG_ENTRY_MAX_STRING_LEN: AtomicUsize =
     AtomicUsize::new(DEFAULT_SLOWLOG_ENTRY_MAX_STRING_LEN);
+pub static COMMANDLOG_REQUEST_LARGER_THAN: AtomicI64 =
+    AtomicI64::new(DEFAULT_COMMANDLOG_LARGER_THAN);
+pub static COMMANDLOG_LARGE_REQUEST_MAX_LEN: AtomicUsize =
+    AtomicUsize::new(DEFAULT_COMMANDLOG_LARGE_MAX_LEN);
+pub static COMMANDLOG_REPLY_LARGER_THAN: AtomicI64 = AtomicI64::new(DEFAULT_COMMANDLOG_LARGER_THAN);
+pub static COMMANDLOG_LARGE_REPLY_MAX_LEN: AtomicUsize =
+    AtomicUsize::new(DEFAULT_COMMANDLOG_LARGE_MAX_LEN);
 
 // Statistics for INFO STATS
 pub static SLOWLOG_COMMANDS_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -78,6 +87,8 @@ pub fn reset_slowlog_stats() {
 }
 
 static SLOWLOG_BUFFER: Mutex<VecDeque<SlowlogEntry>> = Mutex::new(VecDeque::new());
+static LARGE_REQUEST_BUFFER: Mutex<VecDeque<SlowlogEntry>> = Mutex::new(VecDeque::new());
+static LARGE_REPLY_BUFFER: Mutex<VecDeque<SlowlogEntry>> = Mutex::new(VecDeque::new());
 
 /// Returns current length of the slowlog ring buffer
 pub fn slowlog_len() -> usize {
@@ -104,6 +115,22 @@ pub fn slowlog_get(count: Option<i64>) -> Vec<SlowlogEntry> {
 pub fn trim_slowlog_buffer() {
     let max_len = SLOWLOG_MAX_LEN.load(Ordering::Relaxed);
     let mut buf = SLOWLOG_BUFFER.lock();
+    while buf.len() > max_len {
+        buf.pop_front();
+    }
+}
+
+pub fn trim_large_request_buffer() {
+    let max_len = COMMANDLOG_LARGE_REQUEST_MAX_LEN.load(Ordering::Relaxed);
+    let mut buf = LARGE_REQUEST_BUFFER.lock();
+    while buf.len() > max_len {
+        buf.pop_front();
+    }
+}
+
+pub fn trim_large_reply_buffer() {
+    let max_len = COMMANDLOG_LARGE_REPLY_MAX_LEN.load(Ordering::Relaxed);
+    let mut buf = LARGE_REPLY_BUFFER.lock();
     while buf.len() > max_len {
         buf.pop_front();
     }
@@ -235,6 +262,10 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
             let len = args.len();
             (args, len)
         }
+        Command::Append { key, value } => (
+            vec![Bytes::from_static(b"append"), key.clone(), value.clone()],
+            3,
+        ),
         Command::Del(keys) => {
             let mut args = Vec::with_capacity(keys.len() + 1);
             args.push(Bytes::from_static(b"del"));
@@ -385,6 +416,29 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
             for a in args {
                 res.push(Bytes::from(String::from_utf8_lossy(a).to_lowercase()));
             }
+            let len = res.len();
+            (res, len)
+        }
+        Command::Commandlog(args) => {
+            let mut res = Vec::with_capacity(args.len() + 1);
+            res.push(Bytes::from_static(b"commandlog"));
+            for a in args {
+                res.push(Bytes::from(String::from_utf8_lossy(a).to_lowercase()));
+            }
+            let len = res.len();
+            (res, len)
+        }
+        Command::Lolwut(args) => {
+            let mut res = Vec::with_capacity(args.len() + 1);
+            res.push(Bytes::from_static(b"lolwut"));
+            res.extend_from_slice(args);
+            let len = res.len();
+            (res, len)
+        }
+        Command::Sentinel(args) => {
+            let mut res = Vec::with_capacity(args.len() + 1);
+            res.push(Bytes::from_static(b"sentinel"));
+            res.extend_from_slice(args);
             let len = res.len();
             (res, len)
         }
@@ -822,6 +876,326 @@ pub fn write_slowlog_entries_resp(entries: &[SlowlogEntry], out: &mut Vec<u8>) {
     }
 }
 
+fn build_truncated_entry(
+    cmd: &Command,
+    metric_val: u64,
+    client_addr: &str,
+    client_name: &str,
+) -> SlowlogEntry {
+    let id = NEXT_ENTRY_ID.fetch_add(1, Ordering::Relaxed);
+    let now_ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let (mut argv, original_argc) = command_to_slowlog_argv(cmd);
+    let max_str_len = SLOWLOG_ENTRY_MAX_STRING_LEN.load(Ordering::Relaxed);
+    for arg in &mut argv {
+        if arg.len() > max_str_len {
+            let excess = arg.len() - max_str_len;
+            let mut truncated = arg.slice(..max_str_len).to_vec();
+            truncated.extend_from_slice(format!("... ({} more bytes)", excess).as_bytes());
+            *arg = Bytes::from(truncated);
+        }
+    }
+    let max_argc = SLOWLOG_ENTRY_MAX_ARGC.load(Ordering::Relaxed);
+    if argv.len() > max_argc && max_argc >= 2 {
+        let excess = original_argc - (max_argc - 1);
+        argv.truncate(max_argc - 1);
+        argv.push(Bytes::from(format!("... ({} more arguments)", excess)));
+    }
+    SlowlogEntry {
+        id,
+        timestamp: now_ts,
+        duration_us: metric_val,
+        argv,
+        client_addr: client_addr.to_string(),
+        client_name: client_name.to_string(),
+        original_argc,
+    }
+}
+
+/// Estimates the wire/payload size of `cmd` for `commandlog-request-larger-than`.
+pub fn estimate_command_request_bytes(cmd: &Command) -> usize {
+    let (argv, _) = command_to_slowlog_argv(cmd);
+    argv.iter().map(|a| a.len()).sum()
+}
+
+pub fn log_command_if_large_request(
+    cmd: &Command,
+    req_bytes: usize,
+    client_addr: &str,
+    client_name: &str,
+) {
+    let threshold = COMMANDLOG_REQUEST_LARGER_THAN.load(Ordering::Relaxed);
+    if threshold < 0 || (req_bytes as u64) < (threshold as u64) {
+        return;
+    }
+    let max_len = COMMANDLOG_LARGE_REQUEST_MAX_LEN.load(Ordering::Relaxed);
+    if max_len == 0 {
+        LARGE_REQUEST_BUFFER.lock().clear();
+        return;
+    }
+    let entry = build_truncated_entry(cmd, req_bytes as u64, client_addr, client_name);
+    let mut buf = LARGE_REQUEST_BUFFER.lock();
+    buf.push_back(entry);
+    while buf.len() > max_len {
+        buf.pop_front();
+    }
+}
+
+pub fn log_command_if_large_reply(
+    cmd: &Command,
+    reply_bytes: usize,
+    client_addr: &str,
+    client_name: &str,
+) {
+    let threshold = COMMANDLOG_REPLY_LARGER_THAN.load(Ordering::Relaxed);
+    if threshold < 0 || (reply_bytes as u64) < (threshold as u64) {
+        return;
+    }
+    let max_len = COMMANDLOG_LARGE_REPLY_MAX_LEN.load(Ordering::Relaxed);
+    if max_len == 0 {
+        LARGE_REPLY_BUFFER.lock().clear();
+        return;
+    }
+    let entry = build_truncated_entry(cmd, reply_bytes as u64, client_addr, client_name);
+    let mut buf = LARGE_REPLY_BUFFER.lock();
+    buf.push_back(entry);
+    while buf.len() > max_len {
+        buf.pop_front();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandlogType {
+    Slow,
+    LargeRequest,
+    LargeReply,
+}
+
+impl CommandlogType {
+    pub fn parse(raw: &[u8]) -> Option<Self> {
+        if raw.eq_ignore_ascii_case(b"slow") {
+            Some(Self::Slow)
+        } else if raw.eq_ignore_ascii_case(b"large-request") {
+            Some(Self::LargeRequest)
+        } else if raw.eq_ignore_ascii_case(b"large-reply") {
+            Some(Self::LargeReply)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn commandlog_len(log_type: CommandlogType) -> usize {
+    match log_type {
+        CommandlogType::Slow => slowlog_len(),
+        CommandlogType::LargeRequest => LARGE_REQUEST_BUFFER.lock().len(),
+        CommandlogType::LargeReply => LARGE_REPLY_BUFFER.lock().len(),
+    }
+}
+
+pub fn commandlog_reset(log_type: CommandlogType) {
+    match log_type {
+        CommandlogType::Slow => slowlog_reset(),
+        CommandlogType::LargeRequest => LARGE_REQUEST_BUFFER.lock().clear(),
+        CommandlogType::LargeReply => LARGE_REPLY_BUFFER.lock().clear(),
+    }
+}
+
+pub fn commandlog_get(count: Option<i64>, log_type: CommandlogType) -> Vec<SlowlogEntry> {
+    match log_type {
+        CommandlogType::Slow => slowlog_get(count),
+        CommandlogType::LargeRequest => {
+            let buf = LARGE_REQUEST_BUFFER.lock();
+            let limit = match count {
+                Some(c) if c >= 0 => c as usize,
+                _ => buf.len(),
+            };
+            buf.iter().rev().take(limit).cloned().collect()
+        }
+        CommandlogType::LargeReply => {
+            let buf = LARGE_REPLY_BUFFER.lock();
+            let limit = match count {
+                Some(c) if c >= 0 => c as usize,
+                _ => buf.len(),
+            };
+            buf.iter().rev().take(limit).cloned().collect()
+        }
+    }
+}
+
+/// Executes `COMMANDLOG <GET|LEN|RESET|HELP> ...` and writes the RESP reply to `out`.
+pub fn handle_commandlog(args: &[Bytes], out: &mut Vec<u8>) {
+    if args.is_empty() {
+        out.extend_from_slice(b"-ERR wrong number of arguments for 'commandlog' command\r\n");
+        return;
+    }
+    let sub = args[0].to_ascii_lowercase();
+    match sub.as_slice() {
+        b"help" => {
+            if args.len() != 1 {
+                out.extend_from_slice(
+                    b"-ERR wrong number of arguments for 'commandlog|help' command\r\n",
+                );
+                return;
+            }
+            let help_lines = [
+                "COMMANDLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "GET <count> <type>",
+                "    Return top <count> entries from the specified commandlog (-1 for all).",
+                "LEN <type>",
+                "    Return the length of the specified commandlog.",
+                "RESET <type>",
+                "    Reset the specified commandlog, clearing all entries.",
+                "    <type> is one of: SLOW, LARGE-REQUEST, LARGE-REPLY",
+                "HELP",
+                "    Return top-level help about COMMANDLOG subcommands.",
+            ];
+            out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
+            for line in help_lines {
+                out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+            }
+        }
+        b"len" => {
+            if args.len() != 2 {
+                out.extend_from_slice(
+                    b"-ERR wrong number of arguments for 'commandlog|len' command\r\n",
+                );
+                return;
+            }
+            let Some(log_type) = CommandlogType::parse(&args[1]) else {
+                let raw = String::from_utf8_lossy(&args[1]);
+                out.extend_from_slice(
+                    format!(
+                        "-ERR Unknown commandlog type '{}'. Valid types are: SLOW, LARGE-REQUEST, LARGE-REPLY\r\n",
+                        raw
+                    )
+                    .as_bytes(),
+                );
+                return;
+            };
+            let len = commandlog_len(log_type);
+            out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+        }
+        b"reset" => {
+            if args.len() != 2 {
+                out.extend_from_slice(
+                    b"-ERR wrong number of arguments for 'commandlog|reset' command\r\n",
+                );
+                return;
+            }
+            let Some(log_type) = CommandlogType::parse(&args[1]) else {
+                let raw = String::from_utf8_lossy(&args[1]);
+                out.extend_from_slice(
+                    format!(
+                        "-ERR Unknown commandlog type '{}'. Valid types are: SLOW, LARGE-REQUEST, LARGE-REPLY\r\n",
+                        raw
+                    )
+                    .as_bytes(),
+                );
+                return;
+            };
+            commandlog_reset(log_type);
+            out.extend_from_slice(b"+OK\r\n");
+        }
+        b"get" => {
+            if args.len() != 3 {
+                out.extend_from_slice(
+                    b"-ERR wrong number of arguments for 'commandlog|get' command\r\n",
+                );
+                return;
+            }
+            let count = match std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                Some(c) if c >= -1 => c,
+                Some(_) => {
+                    out.extend_from_slice(b"-ERR count should be greater than or equal to -1\r\n");
+                    return;
+                }
+                None => {
+                    out.extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+                    return;
+                }
+            };
+            let Some(log_type) = CommandlogType::parse(&args[2]) else {
+                let raw = String::from_utf8_lossy(&args[2]);
+                out.extend_from_slice(
+                    format!(
+                        "-ERR Unknown commandlog type '{}'. Valid types are: SLOW, LARGE-REQUEST, LARGE-REPLY\r\n",
+                        raw
+                    )
+                    .as_bytes(),
+                );
+                return;
+            };
+            let entries = commandlog_get(Some(count), log_type);
+            write_slowlog_entries_resp(&entries, out);
+        }
+        _ => {
+            let sub_str = String::from_utf8_lossy(&args[0]);
+            out.extend_from_slice(
+                format!(
+                    "-ERR unknown subcommand '{}'. Try COMMANDLOG HELP.\r\n",
+                    sub_str
+                )
+                .as_bytes(),
+            );
+        }
+    }
+}
+
+/// Executes `LOLWUT [VERSION <ver> [<arg>...]]` and writes the RESP bulk string reply to `out`.
+pub fn handle_lolwut(args: &[Bytes], out: &mut Vec<u8>) {
+    let mut idx = 0;
+    let mut version: i64 = 6;
+    if !args.is_empty() && args[0].eq_ignore_ascii_case(b"version") {
+        if args.len() < 2 {
+            out.extend_from_slice(b"-ERR wrong number of arguments for 'lolwut' command\r\n");
+            return;
+        }
+        match std::str::from_utf8(&args[1])
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            Some(v) => version = v,
+            None => {
+                out.extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+                return;
+            }
+        }
+        idx = 2;
+    }
+    while idx < args.len() {
+        if std::str::from_utf8(&args[idx])
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .is_none()
+        {
+            out.extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+            return;
+        }
+        idx += 1;
+    }
+    let body = format!(
+        "Rudis shared-nothing io_uring engine (LOLWUT version {})\n\
+         +---+   +---+   +---+   +---+\n\
+         |S0 |<->|S1 |<->|S2 |<->|S3 |\n\
+         +---+   +---+   +---+   +---+\n\
+         Redis ver. 7.2.4\n",
+        version
+    );
+    out.extend_from_slice(format!("${}\r\n{}\r\n", body.len(), body).as_bytes());
+}
+
+/// Executes `SENTINEL ...` on a non-Sentinel server instance, matching Redis/Valkey behavior.
+pub fn handle_sentinel(_args: &[Bytes], out: &mut Vec<u8>) {
+    out.extend_from_slice(b"-ERR This instance has sentinel support disabled\r\n");
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -913,5 +1287,72 @@ pub(crate) mod tests {
         )]);
         let (argv, _) = command_to_slowlog_argv(&cmd);
         assert_eq!(&argv[3][..], b"(redacted)");
+    }
+
+    #[test]
+    fn test_commandlog_lolwut_and_sentinel() {
+        let _guard = TEST_LOCK.lock();
+        SLOWLOG_ENTRY_MAX_ARGC.store(DEFAULT_SLOWLOG_ENTRY_MAX_ARGC, Ordering::Relaxed);
+        SLOWLOG_ENTRY_MAX_STRING_LEN.store(DEFAULT_SLOWLOG_ENTRY_MAX_STRING_LEN, Ordering::Relaxed);
+        COMMANDLOG_REQUEST_LARGER_THAN.store(10, Ordering::Relaxed);
+        COMMANDLOG_REPLY_LARGER_THAN.store(10, Ordering::Relaxed);
+        commandlog_reset(CommandlogType::LargeRequest);
+        commandlog_reset(CommandlogType::LargeReply);
+
+        let cmd = Command::Append {
+            key: Bytes::from_static(b"bigkey"),
+            value: Bytes::from_static(b"bigvalue_payload"),
+        };
+        let req_bytes = estimate_command_request_bytes(&cmd);
+        assert!(req_bytes >= 10);
+        log_command_if_large_request(&cmd, req_bytes, "127.0.0.1:9000", "cmdlog-client");
+        log_command_if_large_reply(&cmd, 2048, "127.0.0.1:9000", "cmdlog-client");
+
+        let mut out = Vec::new();
+        handle_commandlog(
+            &[
+                Bytes::from_static(b"LEN"),
+                Bytes::from_static(b"LARGE-REQUEST"),
+            ],
+            &mut out,
+        );
+        assert_eq!(out, b":1\r\n");
+
+        out.clear();
+        handle_commandlog(
+            &[
+                Bytes::from_static(b"GET"),
+                Bytes::from_static(b"1"),
+                Bytes::from_static(b"LARGE-REPLY"),
+            ],
+            &mut out,
+        );
+        assert!(String::from_utf8_lossy(&out).contains(":2048\r\n"));
+
+        out.clear();
+        handle_commandlog(
+            &[
+                Bytes::from_static(b"RESET"),
+                Bytes::from_static(b"LARGE-REQUEST"),
+            ],
+            &mut out,
+        );
+        assert_eq!(out, b"+OK\r\n");
+        assert_eq!(commandlog_len(CommandlogType::LargeRequest), 0);
+        commandlog_reset(CommandlogType::LargeReply);
+        COMMANDLOG_REQUEST_LARGER_THAN.store(DEFAULT_COMMANDLOG_LARGER_THAN, Ordering::Relaxed);
+        COMMANDLOG_REPLY_LARGER_THAN.store(DEFAULT_COMMANDLOG_LARGER_THAN, Ordering::Relaxed);
+
+        out.clear();
+        handle_lolwut(
+            &[Bytes::from_static(b"VERSION"), Bytes::from_static(b"5")],
+            &mut out,
+        );
+        let lol_str = String::from_utf8_lossy(&out);
+        assert!(lol_str.contains("Redis ver. 7.2.4"), "{lol_str}");
+
+        out.clear();
+        handle_sentinel(&[Bytes::from_static(b"MASTERS")], &mut out);
+        assert_eq!(out, b"-ERR This instance has sentinel support disabled\r\n");
     }
 }
