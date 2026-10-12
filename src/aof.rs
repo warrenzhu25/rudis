@@ -4182,6 +4182,292 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every write command reaches the AOF and the replicas: either
+    /// `command_to_resp` encodes it, or it is listed below with the path
+    /// that logs its change instead. A write command that silently falls
+    /// into `command_to_resp`'s wildcard arm is never persisted nor
+    /// replicated (as FT.CREATE once was).
+    ///
+    /// The write commands come from the command table (the `@write`
+    /// category, see `acl_categories`), and each needs a sample here, so a
+    /// newly added write command fails this test until it is encoded or
+    /// listed. The rudis-only families (BF., FT., JSON., ...) share one
+    /// table entry each, so their samples list the writing subcommands.
+    #[test]
+    fn test_every_write_command_is_propagated() {
+        // Not encoded on purpose: the handler logs the effect instead.
+        const PROPAGATED_ELSEWHERE: &[(&str, &str)] = &[
+            (
+                "BLPOP l 0",
+                "the served pop is logged as LPOP/RPOP (block.rs)",
+            ),
+            (
+                "BRPOP l 0",
+                "the served pop is logged as LPOP/RPOP (block.rs)",
+            ),
+            ("BLMOVE a b LEFT RIGHT 0", "logged as LMOVE"),
+            ("BLMOVEM a b LEFT RIGHT 0", "logged as LMOVE/LMOVEM"),
+            ("BRPOPLPUSH a b 0", "logged as RPOPLPUSH"),
+            ("BLMPOP 0 1 l LEFT", "logged as the LPOP/RPOP of its effect"),
+            ("LMPOP 1 l LEFT", "logged as the LPOP/RPOP of its effect"),
+            ("BZPOPMAX z 0", "logged as ZPOPMAX"),
+            ("BZPOPMIN z 0", "logged as ZPOPMIN"),
+            ("BZMPOP 0 1 z MIN", "logged as ZPOPMIN/ZPOPMAX"),
+            ("GETEX k PX 100", "logged as EXPIRE/PERSIST"),
+            ("INCREX k BYINT 1", "logged as the SET of the result"),
+            (
+                "GEORADIUS g 15 37 200 km STORE d",
+                "logged as DEL + ZADD of the result",
+            ),
+            (
+                "GEORADIUSBYMEMBER g m 100 km STORE d",
+                "logged as DEL + ZADD of the result",
+            ),
+            (
+                "MIGRATE 127.0.0.1 1 k 0 1000",
+                "logged as the DEL of the moved keys",
+            ),
+            (
+                "XREADGROUP GROUP g c STREAMS s >",
+                "logged as XCLAIM / XGROUP SETID",
+            ),
+            (
+                "PFDEBUG TODENSE h",
+                "changes the encoding only, not the value",
+            ),
+        ];
+        // Known gaps, kept failing loudly once fixed: FT.ADD documents live
+        // only in the global search registry (not in the keyspace, and not
+        // seen by FT.SEARCH on shards with the index), so nothing persists
+        // them.
+        const NOT_PROPAGATED: &[&str] = &["FT.ADD i d 1 FIELDS t v"];
+        // In the command table but not implemented: they reply an error.
+        const NOT_IMPLEMENTED: &[(&str, &str)] = &[
+            ("delifeq", "DELIFEQ k v"),
+            ("cluster|flushslot", "CLUSTER FLUSHSLOT 0"),
+            ("restore-asking", "RESTORE-ASKING k 0 payload"),
+        ];
+        let samples: &[&str] = &[
+            "APPEND k v",
+            "BF.ADD b x",
+            "BF.MADD b x y",
+            "BF.RESERVE b 0.01 100",
+            "BF.RESTORE b p",
+            "BITFIELD k SET i5 0 1",
+            "BITOP AND d a b",
+            "CF.ADD c x",
+            "CF.ADDNX c x",
+            "CF.DEL c x",
+            "CF.RESERVE c 64",
+            "CF.RESTORE c p",
+            "CMS.INCRBY m x 1",
+            "CMS.INITBYDIM m 10 2",
+            "CMS.INITBYPROB m 0.01 0.99",
+            "CMS.RESTORE m p",
+            "COPY a b",
+            "CRDT.MERGE p",
+            "CRDT.GC",
+            "DECR k",
+            "DECRBY k 2",
+            "DEL k",
+            "DELEX k IFEQ v",
+            "EXPIRE k 10",
+            "EXPIREAT k 2000000000",
+            "FLUSHALL",
+            "FLUSHDB",
+            "FT.CREATE i ON HASH SCHEMA t TEXT",
+            "FT.ALTER i SCHEMA ADD n NUMERIC",
+            "FT.DROPINDEX i",
+            "FUNCTION DELETE lib",
+            "FUNCTION FLUSH",
+            "FUNCTION LOAD code",
+            "FUNCTION RESTORE payload",
+            "GEOADD g 13.361389 38.115556 Palermo",
+            "GEOSEARCHSTORE d s FROMLONLAT 15 37 BYRADIUS 200 km",
+            "GETDEL k",
+            "GETSET k v",
+            "HDEL h f",
+            "HEXPIRE h 10 FIELDS 1 f",
+            "HEXPIREAT h 2000000000 FIELDS 1 f",
+            "HGETDEL h FIELDS 1 f",
+            "HGETEX h PX 100 FIELDS 1 f",
+            "HINCRBY h f 1",
+            "HINCRBYFLOAT h f 1.5",
+            "HMSET h f v",
+            "HPERSIST h FIELDS 1 f",
+            "HPEXPIRE h 100 FIELDS 1 f",
+            "HPEXPIREAT h 2000000000000 FIELDS 1 f",
+            "HSET h f v",
+            "HSETEX h PX 100 FIELDS 1 f v",
+            "HSETNX h f v",
+            "INCR k",
+            "INCRBY k 2",
+            "INCRBYFLOAT k 1.5",
+            "JSON.SET j $ 1",
+            "JSON.DEL j",
+            "JSON.FORGET j",
+            "JSON.CLEAR j",
+            "JSON.NUMINCRBY j $ 1",
+            "JSON.NUMMULTBY j $ 2",
+            "JSON.STRAPPEND j \"x\"",
+            "JSON.ARRAPPEND j $ 1",
+            "JSON.ARRPOP j",
+            "JSON.TOGGLE j $",
+            "LINSERT l BEFORE a b",
+            "LMOVE a b LEFT RIGHT",
+            "LMOVEM a b LEFT RIGHT",
+            "LPOP l",
+            "LPUSH l a",
+            "LPUSHX l a",
+            "LREM l 1 a",
+            "LSET l 0 a",
+            "LTRIM l 0 1",
+            "MOVE k 1",
+            "MSET a 1 b 2",
+            "MSETEX 1 k v PX 100",
+            "MSETNX a 1",
+            "PERSIST k",
+            "PEXPIRE k 100",
+            "PEXPIREAT k 2000000000000",
+            "PFADD h a",
+            "PFMERGE d a b",
+            "PSETEX k 100 v",
+            "RENAME a b",
+            "RENAMENX a b",
+            "RESTORE k 0 payload",
+            "RPOP l",
+            "RPOPLPUSH a b",
+            "RPUSH l a",
+            "RPUSHX l a",
+            "SADD s a",
+            "SDIFFSTORE d a b",
+            "SEMANTIC.SET ns id prompt response VECTOR 2 1 2",
+            "SEMANTIC.DEL ns id",
+            "SEMANTIC.FLUSH ns",
+            "SET k v",
+            "SETBIT k 0 1",
+            "SETEX k 10 v",
+            "SETNX k v",
+            "SETRANGE k 0 v",
+            "SINTERSTORE d a b",
+            "SMOVE a b m",
+            "SORT l STORE d",
+            "SPOP s",
+            "SREM s a",
+            "SUNIONSTORE d a b",
+            "SWAPDB 0 1",
+            "TOPK.ADD t x",
+            "TOPK.RESERVE t 10",
+            "TOPK.RESTORE t p",
+            "UNLINK k",
+            "VADD v VALUES 2 1 2 e",
+            "VREM v e",
+            "VSETATTR v e {}",
+            "XACK s g 1-1",
+            "XACKDEL s g IDS 1 1-0",
+            "XADD s * f v",
+            "XAUTOCLAIM s g c 0 0",
+            "XCFGSET s IDMP-MAXSIZE 5",
+            "XCLAIM s g c 10 1-0",
+            "XDEL s 1-1",
+            "XDELEX s IDS 1 1-0",
+            "XGROUP CREATE s g $ MKSTREAM",
+            "XGROUP CREATECONSUMER s g c",
+            "XGROUP DELCONSUMER s g c",
+            "XGROUP DESTROY s g",
+            "XGROUP SETID s g 5-0",
+            "XIDMPRECORD s p i 1-0",
+            "XNACK s g FAIL IDS 1 1-0",
+            "XSETID s 9-9",
+            "XTRIM s MAXLEN 10",
+            "ZADD z 1 a",
+            "ZDIFFSTORE d 2 a b",
+            "ZINCRBY z 1 a",
+            "ZINTERSTORE d 2 a b",
+            "ZMPOP 1 z MIN",
+            "ZPOPMAX z",
+            "ZPOPMIN z",
+            "ZRANGESTORE d z 0 -1",
+            "ZREM z a",
+            "ZREMRANGEBYLEX z [a [b",
+            "ZREMRANGEBYRANK z 0 1",
+            "ZREMRANGEBYSCORE z 0 1",
+            "ZUNIONSTORE d 2 a b",
+            // Rudis-only writes outside the command table.
+            "AGENT.MEM.ADD s user hi",
+            "AGENT.MEM.CLEAR s",
+        ];
+
+        let parse = |line: &str| {
+            let mut buf = bytes::BytesMut::from(format!("{line}\r\n").as_str());
+            match crate::resp::parse_command(&mut buf) {
+                Ok(Some(cmd)) => cmd,
+                other => panic!("{line}: {other:?}"),
+            }
+        };
+        // The command table name a sample line exercises: `parent|sub` for
+        // container commands, the family (`bf`, `ft`, ...) for dotted ones.
+        let table_name = |line: &str| -> String {
+            let mut words = line.split(' ').map(str::to_ascii_lowercase);
+            let first = words.next().unwrap_or_default();
+            let sub = format!("{first}|{}", words.next().unwrap_or_default());
+            if crate::acl_categories::COMMANDS
+                .iter()
+                .any(|c| c.name == sub)
+            {
+                sub
+            } else {
+                first.split('.').next().unwrap_or_default().to_string()
+            }
+        };
+        let mut covered = std::collections::HashSet::new();
+        let mut unencoded = Vec::new();
+        for line in samples {
+            let cmd = parse(line);
+            covered.insert(table_name(line));
+            if command_to_resp(&cmd).is_none() {
+                unencoded.push(*line);
+            }
+        }
+        assert!(
+            unencoded.is_empty(),
+            "write commands never logged: {unencoded:?}"
+        );
+        let elsewhere = PROPAGATED_ELSEWHERE.iter().map(|(line, _)| *line);
+        for line in elsewhere.chain(NOT_PROPAGATED.iter().copied()) {
+            let cmd = parse(line);
+            assert!(cmd.is_write_command(), "{line} should be a write");
+            assert!(
+                command_to_resp(&cmd).is_none(),
+                "{line} is encoded now: move it to the samples"
+            );
+            covered.insert(table_name(line));
+        }
+        for (name, line) in NOT_IMPLEMENTED {
+            assert!(
+                matches!(parse(line), Command::Unknown(_)),
+                "{line} is implemented now: add a sample"
+            );
+            covered.insert(name.to_string());
+        }
+
+        let write_bit = crate::acl_categories::CATEGORIES
+            .iter()
+            .position(|c| *c == "write")
+            .map(|i| 1u32 << i)
+            .unwrap();
+        let missing: Vec<&str> = crate::acl_categories::COMMANDS
+            .iter()
+            .filter(|c| c.cats & write_bit != 0 && c.subs.0 == c.subs.1)
+            .map(|c| c.name)
+            .filter(|n| !covered.contains(*n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "write commands without a sample: {missing:?}"
+        );
+    }
+
     /// A change `command_to_resp` cannot encode is counted (and logged once
     /// per command) instead of silently vanishing from the AOF/replicas.
     #[test]
