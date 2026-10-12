@@ -370,5 +370,37 @@
       "set_p99_ms": 1.023,
       "get_p99_ms": 1.191
     }
+  },
+  "dragonfly_scaling": {
+    "1": {
+      "set_ops_sec": 349248.88,
+      "get_ops_sec": 64876.61,
+      "set_p99_ms": 4.639,
+      "get_p99_ms": 28.031
+    },
+    "2": {
+      "set_ops_sec": 544296.43,
+      "get_ops_sec": 115795.82,
+      "set_p99_ms": 4.015,
+      "get_p99_ms": 15.615
+    },
+    "4": {
+      "set_ops_sec": 856916.59,
+      "get_ops_sec": 221866.46,
+      "set_p99_ms": 2.495,
+      "get_p99_ms": 7.039
+    },
+    "8": {
+      "set_ops_sec": 1317425.57,
+      "get_ops_sec": 418986.72,
+      "set_p99_ms": 1.711,
+      "get_p99_ms": 3.919
+    },
+    "16": {
+      "set_ops_sec": 1882172.31,
+      "get_ops_sec": 701857.73,
+      "set_p99_ms": 1.375,
+      "get_p99_ms": 3.439
+    }
   }
 }

@@ -167,12 +167,14 @@ neither physical cores nor L3 cache complexes.
 | **MGET 10-Key Scattered (P8)** | **892,875 ops/s** | 319,051 ops/s | 219,186 ops/s | **+179.9%** | **1.42 ms** | 3.25 ms |
 | **DEL 10-Key Scattered (P8)** | **1,128,372 ops/s** | 350,898 ops/s | 387,464 ops/s | **+221.6%** | **1.07 ms** | 3.10 ms |
 
-### Physical Core Scaling (Rudis 1 to 16 Physical Cores, Pipeline 16, 1 KB payload)
+### Physical Core Scaling (Rudis vs. Dragonfly v1.39, 1 to 16 Physical Cores, Pipeline 16, 1 KB payload)
 
-| Physical Cores | 1 | 2 | 4 | 8 | 16 |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **SET (P16, 1KB)** | 651,303 ops/s | 862,089 ops/s | 1,464,246 ops/s | 2,332,478 ops/s | **3,202,127 ops/s** (4.92x) |
-| **GET (P16, 1KB)** | 572,696 ops/s | 676,476 ops/s | 1,183,696 ops/s | 1,898,886 ops/s | **2,261,864 ops/s** (3.95x) |
+| Engine / Workload | 1 Core | 2 Cores | 4 Cores | 8 Cores | 16 Cores | 1→16c Speedup |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Rudis SET (P16, 1KB)** | **651,303 ops/s** | **862,089 ops/s** | **1,464,246 ops/s** | **2,332,478 ops/s** | **3,202,127 ops/s** | **4.92x** |
+| Dragonfly SET (P16, 1KB) | 349,249 ops/s | 544,296 ops/s | 856,917 ops/s | 1,317,426 ops/s | 1,882,172 ops/s | 5.39x |
+| **Rudis GET (P16, 1KB)** | **572,696 ops/s** | **676,476 ops/s** | **1,183,696 ops/s** | **1,898,886 ops/s** | **2,261,864 ops/s** | **3.95x** |
+| Dragonfly GET (P16, 1KB) | 64,877 ops/s | 115,796 ops/s | 221,866 ops/s | 418,987 ops/s | 701,858 ops/s | 10.82x |
 
 See [`docs/benchmark_multicore_results.md`](docs/benchmark_multicore_results.md) for the 8-core
 head-to-head table, p99 latency breakdown, and topology notes explaining why 32-thread benchmarks

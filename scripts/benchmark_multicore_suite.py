@@ -328,20 +328,20 @@ def benchmark_at_core_count(cores):
     return results
 
 
-def run_rudis_scaling():
+def run_engine_scaling(engine="Rudis"):
     print(f"\n=================================================================")
-    print(f"       RUDIS CORE SCALING PROFILE (1, 2, 4, 8, 16 CORES)         ")
+    print(f"       {engine.upper()} CORE SCALING PROFILE (1, 2, 4, 8, 16 CORES)         ")
     print(f"=================================================================")
     scaling_data = {}
     cores_list = [1, 2, 4, 8, 16]
     set_wl = WORKLOADS[0]
     get_wl = WORKLOADS[1]
-    port = 16379
+    port = 16379 if engine == "Rudis" else 16381
 
     for c in cores_list:
-        proc = start_engine("Rudis", c, port)
+        proc = start_engine(engine, c, port)
         if not proc:
-            print(f"Failed to start Rudis with {c} cores")
+            print(f"Failed to start {engine} with {c} cores")
             continue
         try:
             set_runs = []
@@ -369,7 +369,7 @@ def run_rudis_scaling():
                     "get_p99_ms": round(get_p99, 3),
                 }
                 print(
-                    f"  Rudis {c:2d} Core(s): SET {set_med:>11,.0f} ops/s (p99 {set_p99:.2f}ms) | "
+                    f"  {engine:<9} {c:2d} Core(s): SET {set_med:>11,.0f} ops/s (p99 {set_p99:.2f}ms) | "
                     f"GET {get_med:>11,.0f} ops/s (p99 {get_p99:.2f}ms)"
                 )
         finally:
@@ -434,7 +434,9 @@ def generate_markdown(results, out_path):
 
     lines.extend([
         "",
-        "## 4. Rudis Physical Core Scaling Profile (1 to 16 Cores)",
+        "## 4. Physical Core Scaling Profile (1 to 16 Cores: Rudis vs. Dragonfly v1.39)",
+        "",
+        "### Rudis (1 to 16 Physical Cores)",
         "",
         "| Physical Cores | SET (P16, 1KB) | SET Speedup | SET p99 | GET (P16, 1KB) | GET Speedup | GET p99 |",
         "| :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
@@ -454,6 +456,29 @@ def generate_markdown(results, out_path):
         lines.append(
             f"| **{c:2d} Core(s)** | **{s_ops:,.0f} ops/s** | {s_fac:.2f}x | {s_p99:.2f} ms | **{g_ops:,.0f} ops/s** | {g_fac:.2f}x | {g_p99:.2f} ms |"
         )
+
+    df_scaling = results.get("dragonfly_scaling", {})
+    if df_scaling:
+        lines.extend([
+            "",
+            "### Dragonfly v1.39 (1 to 16 Physical Cores)",
+            "",
+            "| Physical Cores | SET (P16, 1KB) | SET Speedup | SET p99 | GET (P16, 1KB) | GET Speedup | GET p99 |",
+            "| :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ])
+        df_base_set = df_scaling.get("1", {}).get("set_ops_sec", 1.0) or 1.0
+        df_base_get = df_scaling.get("1", {}).get("get_ops_sec", 1.0) or 1.0
+        for c in [1, 2, 4, 8, 16]:
+            row = df_scaling.get(str(c), {})
+            s_ops = row.get("set_ops_sec", 0.0)
+            g_ops = row.get("get_ops_sec", 0.0)
+            s_p99 = row.get("set_p99_ms", 0.0)
+            g_p99 = row.get("get_p99_ms", 0.0)
+            s_fac = s_ops / df_base_set if df_base_set > 0 else 1.0
+            g_fac = g_ops / df_base_get if df_base_get > 0 else 1.0
+            lines.append(
+                f"| **{c:2d} Core(s)** | **{s_ops:,.0f} ops/s** | {s_fac:.2f}x | {s_p99:.2f} ms | **{g_ops:,.0f} ops/s** | {g_fac:.2f}x | {g_p99:.2f} ms |"
+            )
 
     lines.extend([
         "",
@@ -476,7 +501,8 @@ def main():
     final_results = {
         "8_cores": benchmark_at_core_count(8),
         "16_cores": benchmark_at_core_count(16),
-        "rudis_scaling": run_rudis_scaling(),
+        "rudis_scaling": run_engine_scaling("Rudis"),
+        "dragonfly_scaling": run_engine_scaling("Dragonfly"),
     }
 
     json_path = os.path.join(REPO_DIR, "benchmark_multicore_results.json")
