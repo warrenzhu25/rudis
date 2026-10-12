@@ -907,6 +907,20 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
         "repl-backlog-size".to_string(),
         crate::replication::repl_backlog_size().to_string(),
     );
+    let hub = crate::replication::get_replication_hub(port);
+    directives.insert(
+        "replica-priority".to_string(),
+        hub.replica_priority
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    if let Some(ann_ip) = hub.announce_ip.read().clone().filter(|s| !s.is_empty()) {
+        directives.insert("replica-announce-ip".to_string(), ann_ip);
+    }
+    let ann_port = hub.announce_port.load(std::sync::atomic::Ordering::Relaxed);
+    if ann_port != 0 {
+        directives.insert("replica-announce-port".to_string(), ann_port.to_string());
+    }
 
     // Directives written as a whole, replacing every line of theirs (and
     // of their aliases): `save` may span lines, and `replicaof` goes away

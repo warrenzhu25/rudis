@@ -3204,6 +3204,24 @@ pub fn apply_config_value(
         "replica-ignore-maxmemory" | "slave-ignore-maxmemory" => {
             REPLICA_IGNORE_MAXMEMORY.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
         }
+        "replica-priority" | "slave-priority" => {
+            crate::replication::get_replication_hub(base_port)
+                .replica_priority
+                .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
+        }
+        "replica-announce-ip" | "slave-announce-ip" => {
+            let hub = crate::replication::get_replication_hub(base_port);
+            *hub.announce_ip.write() = if val_str.is_empty() {
+                None
+            } else {
+                Some(val_str.to_string())
+            };
+        }
+        "replica-announce-port" | "slave-announce-port" => {
+            crate::replication::get_replication_hub(base_port)
+                .announce_port
+                .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
+        }
         "masterauth" => crate::replication::set_masterauth(port, val_str),
         "masteruser" => crate::replication::set_masteruser(port, val_str),
         "jemalloc-bg-thread" => {
@@ -10523,6 +10541,14 @@ async fn execute_command_inner(
                     hub.set_replica_port(client_id, rport);
                 }
                 out.extend_from_slice(b"+OK\r\n");
+            } else if args[0].eq_ignore_ascii_case(b"ip-address") {
+                if args.len() >= 2
+                    && let Ok(s) = std::str::from_utf8(&args[1])
+                {
+                    let hub = crate::replication::get_replication_hub(router.port);
+                    hub.set_replica_announced_ip(client_id, s);
+                }
+                out.extend_from_slice(b"+OK\r\n");
             } else if args[0].eq_ignore_ascii_case(b"capa") {
                 if args.iter().any(|a| a.eq_ignore_ascii_case(b"dragonfly")) {
                     let hub = crate::replication::get_replication_hub(router.port);
@@ -10853,7 +10879,17 @@ async fn execute_command_inner(
                     let repl_ping_period = crate::replication::REPL_PING_PERIOD
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let all_configs: [(&str, String); 76] = [
+                    let hub = crate::replication::get_replication_hub(router.base_port);
+                    let replica_priority = hub
+                        .replica_priority
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let announce_ip = hub.announce_ip.read().clone().unwrap_or_default();
+                    let announce_port = hub
+                        .announce_port
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let all_configs: [(&str, String); 82] = [
                         ("port", port_str),
                         ("acllog-max-len", acllog_max_len),
                         ("acl-pubsub-default", acl_pubsub_default),
@@ -11009,6 +11045,12 @@ async fn execute_command_inner(
                         ("slave-read-only", ro.to_string()),
                         ("replica-ignore-maxmemory", ignore_maxmem.to_string()),
                         ("slave-ignore-maxmemory", ignore_maxmem.to_string()),
+                        ("replica-priority", replica_priority.clone()),
+                        ("slave-priority", replica_priority),
+                        ("replica-announce-ip", announce_ip.clone()),
+                        ("slave-announce-ip", announce_ip),
+                        ("replica-announce-port", announce_port.clone()),
+                        ("slave-announce-port", announce_port),
                         ("min-replicas-to-write", min_replicas.clone()),
                         ("min-slaves-to-write", min_replicas),
                         ("min-replicas-max-lag", min_replicas_lag.clone()),
@@ -11099,6 +11141,11 @@ async fn execute_command_inner(
                             "slave-read-only" | "replica-read-only" => "replica-read-only",
                             "slave-ignore-maxmemory" | "replica-ignore-maxmemory" => {
                                 "replica-ignore-maxmemory"
+                            }
+                            "slave-priority" | "replica-priority" => "replica-priority",
+                            "slave-announce-ip" | "replica-announce-ip" => "replica-announce-ip",
+                            "slave-announce-port" | "replica-announce-port" => {
+                                "replica-announce-port"
                             }
                             "min-slaves-to-write" | "min-replicas-to-write" => {
                                 "min-replicas-to-write"
@@ -11194,8 +11241,25 @@ async fn execute_command_inner(
                                 );
                                 return false;
                             }
-                        } else if matches!(p_str.as_str(), "timeout" | "tcp-keepalive") {
+                        } else if matches!(
+                            p_str.as_str(),
+                            "timeout" | "tcp-keepalive" | "replica-priority" | "slave-priority"
+                        ) {
                             if val_str.parse::<u64>().is_err() {
+                                out.extend_from_slice(
+                                    format!(
+                                        "-ERR CONFIG SET failed (possibly related to argument '{}') - argument couldn't be parsed into an integer\r\n",
+                                        p_str
+                                    )
+                                    .as_bytes(),
+                                );
+                                return false;
+                            }
+                        } else if matches!(
+                            p_str.as_str(),
+                            "replica-announce-port" | "slave-announce-port"
+                        ) {
+                            if val_str.parse::<u16>().is_err() {
                                 out.extend_from_slice(
                                     format!(
                                         "-ERR CONFIG SET failed (possibly related to argument '{}') - argument couldn't be parsed into an integer\r\n",

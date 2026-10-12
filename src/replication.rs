@@ -1,6 +1,6 @@
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 /// The replication id and offset are not part of the role: like Redis
@@ -59,6 +59,8 @@ pub struct ConnectedReplica {
     pub last_ack_time: AtomicU64,
     /// The replica's address as seen by the master (INFO and ROLE).
     pub ip: Option<std::net::IpAddr>,
+    /// IP/hostname announced by the replica via `REPLCONF ip-address`, overriding `ip`.
+    pub announced_ip: RwLock<Option<String>>,
     /// Set while the replica's full-sync snapshot is being taken.
     pub full_sync: Option<FullSyncCut>,
     /// Stream bytes not yet taken by the writer task, appended in offset
@@ -522,6 +524,14 @@ pub struct ReplicationHub {
     /// Cross-shard composite operations increment this while running internal
     /// per-shard steps so they can propagate a single logical command instead.
     pub suppress_propagation: std::sync::atomic::AtomicUsize,
+    /// `replica-priority` / `slave-priority` (default 100; 0 = never promote).
+    pub replica_priority: AtomicU64,
+    /// `replica-announce-ip` / `slave-announce-ip` sent in `REPLCONF ip-address`.
+    pub announce_ip: RwLock<Option<String>>,
+    /// `replica-announce-port` / `slave-announce-port` sent in `REPLCONF listening-port` when non-zero.
+    pub announce_port: AtomicU16,
+    /// Unix timestamp (seconds) of the last successful read from our master (0 if never).
+    pub last_master_io_secs: AtomicU64,
 }
 
 /// Suppresses replication propagation across all shards for a `ReplicationHub`
@@ -552,10 +562,11 @@ pub static REPL_BACKLOG_TTL: AtomicU64 = AtomicU64::new(3600);
 pub static REPL_PING_PERIOD: AtomicU64 = AtomicU64::new(10);
 
 /// See `ReplicationHub::pending_peers`.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct PendingPeer {
     port: u16,
     ip: Option<std::net::IpAddr>,
+    announced_ip: Option<String>,
 }
 
 /// Bound on `pending_peers`, which only clients that never send PSYNC
@@ -598,6 +609,10 @@ impl ReplicationHub {
             pinger_running: AtomicBool::new(false),
             replica_selected_db: std::sync::atomic::AtomicUsize::new(0),
             suppress_propagation: std::sync::atomic::AtomicUsize::new(0),
+            replica_priority: AtomicU64::new(100),
+            announce_ip: RwLock::new(None),
+            announce_port: AtomicU16::new(0),
+            last_master_io_secs: AtomicU64::new(0),
         }
     }
 
@@ -1017,6 +1032,7 @@ impl ReplicationHub {
             // replica counts as good until it misses acks.
             last_ack_time: AtomicU64::new(unix_secs()),
             ip: peer.ip,
+            announced_ip: RwLock::new(peer.announced_ip),
             full_sync,
             pending: Mutex::new(Vec::new()),
             wake_queued: AtomicBool::new(false),
@@ -1144,21 +1160,41 @@ impl ReplicationHub {
         self.note_pending_peer(id, |p| p.port = port);
     }
 
+    pub fn set_replica_announced_ip(&self, id: u64, ip_str: &str) {
+        let ip_opt = if ip_str.is_empty() {
+            None
+        } else {
+            Some(ip_str.to_string())
+        };
+        if let Some(rep) = self.replicas.read().get(&id) {
+            *rep.announced_ip.write() = ip_opt;
+            return;
+        }
+        self.note_pending_peer(id, |p| p.announced_ip = ip_opt);
+    }
+
     /// Redis's name for replica connection `id` in the log: `ip:port`, with
     /// the port it announced (REPLCONF listening-port).
     pub fn replica_name(&self, id: u64) -> String {
-        let (ip, port) = match self.replicas.read().get(&id) {
-            Some(r) => (r.ip, r.listening_port.load(Ordering::Relaxed) as u16),
+        let (announced, ip, port) = match self.replicas.read().get(&id) {
+            Some(r) => (
+                r.announced_ip.read().clone(),
+                r.ip,
+                r.listening_port.load(Ordering::Relaxed) as u16,
+            ),
             None => {
                 let peer = self
                     .pending_peers
                     .lock()
                     .get(&id)
-                    .copied()
+                    .cloned()
                     .unwrap_or_default();
-                (peer.ip, peer.port)
+                (peer.announced_ip, peer.ip, peer.port)
             }
         };
+        if let Some(ann) = announced {
+            return format!("{ann}:{port}");
+        }
         match ip {
             Some(std::net::IpAddr::V6(ip)) => format!("[{ip}]:{port}"),
             Some(ip) => format!("{ip}:{port}"),
@@ -1499,9 +1535,10 @@ impl ReplicationHub {
                 for rep in reps.values() {
                     let rport = rep.listening_port.load(Ordering::SeqCst);
                     let rack = rep.ack_offset.load(Ordering::SeqCst);
-                    let ip = rep
-                        .ip
-                        .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string());
+                    let ip = rep.announced_ip.read().clone().unwrap_or_else(|| {
+                        rep.ip
+                            .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string())
+                    });
                     out.extend_from_slice(format!("*3\r\n${}\r\n{}\r\n$", ip.len(), ip).as_bytes());
                     let rport_s = rport.to_string();
                     out.extend_from_slice(rport_s.len().to_string().as_bytes());
@@ -1558,9 +1595,10 @@ impl ReplicationHub {
         let now = unix_secs();
         let mut slaves = String::new();
         for (i, rep) in sorted.iter().enumerate() {
-            let ip = rep
-                .ip
-                .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string());
+            let ip = rep.announced_ip.read().clone().unwrap_or_else(|| {
+                rep.ip
+                    .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string())
+            });
             let _ = std::fmt::Write::write_fmt(
                 &mut slaves,
                 format_args!(
@@ -1630,27 +1668,42 @@ impl ReplicationHub {
                 } else {
                     0
                 };
+                let last_io = self.last_master_io_secs.load(Ordering::Relaxed);
+                let last_io_ago: i64 = if last_io > 0 {
+                    unix_secs().saturating_sub(last_io) as i64
+                } else {
+                    -1
+                };
+                let priority = self.replica_priority.load(Ordering::Relaxed);
+                let ro = if crate::connection::REPLICA_READ_ONLY.load(Ordering::Relaxed) {
+                    1
+                } else {
+                    0
+                };
                 format!(
                     "# Replication\r\n\
                      role:slave\r\n\
                      master_host:{}\r\n\
                      master_port:{}\r\n\
                      master_link_status:{}\r\n\
-                     master_last_io_seconds_ago:0\r\n\
+                     master_last_io_seconds_ago:{}\r\n\
                      master_sync_in_progress:{}\r\n\
                      slave_read_repl_offset:{}\r\n\
                      slave_repl_offset:{}\r\n\
-                     slave_priority:100\r\n\
-                     slave_read_only:1\r\n\
+                     slave_priority:{}\r\n\
+                     slave_read_only:{}\r\n\
                      connected_slaves:{}\r\n\
                      {}\
                      {}",
                     master_host,
                     master_port,
                     link_status,
+                    last_io_ago,
                     if sync_in_progress { 1 } else { 0 },
                     processed,
                     processed,
+                    priority,
+                    ro,
                     connected,
                     slaves,
                     history,
@@ -2305,7 +2358,11 @@ async fn run_replica_worker(
                             }
                             break;
                         }
-                        Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                        Ok(n) => {
+                            hub.last_master_io_secs
+                                .store(unix_secs(), Ordering::Relaxed);
+                            buf.extend_from_slice(&read_buf[..n]);
+                        }
                     }
                 }
                 match line_res {
@@ -2356,8 +2413,14 @@ async fn run_replica_worker(
             }
         }
 
-        // 2. REPLCONF listening-port
-        let my_port_s = my_port.to_string();
+        // 2. REPLCONF listening-port (and optional ip-address)
+        let announced_port = hub.announce_port.load(Ordering::Relaxed);
+        let effective_port = if announced_port != 0 {
+            announced_port
+        } else {
+            my_port
+        };
+        let my_port_s = effective_port.to_string();
         let replconf_port = format!(
             "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n${}\r\n{}\r\n",
             my_port_s.len(),
@@ -2379,6 +2442,29 @@ async fn run_replica_worker(
             }
             monoio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue 'reconnect_loop;
+        }
+
+        let announced_ip = hub.announce_ip.read().clone();
+        if let Some(ann_ip) = announced_ip.filter(|s| !s.is_empty()) {
+            let replconf_ip = format!(
+                "*3\r\n$8\r\nREPLCONF\r\n$10\r\nip-address\r\n${}\r\n{}\r\n",
+                ann_ip.len(),
+                ann_ip
+            );
+            let line = send_and_expect_line!(replconf_ip.into_bytes());
+            if !line.starts_with(b"+OK") {
+                if log_attempt {
+                    crate::log_warning!(
+                        "Master replied to REPLCONF ip-address with an error: {}",
+                        String::from_utf8_lossy(&line).trim_end()
+                    );
+                }
+                if is_sync_cancelled(&cancel_rx) {
+                    break 'reconnect_loop;
+                }
+                monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue 'reconnect_loop;
+            }
         }
 
         // 3. REPLCONF capa psync2
@@ -2481,7 +2567,11 @@ async fn run_replica_worker(
                 read_buf = returned;
                 match res {
                     Ok(0) | Err(_) => break None,
-                    Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                    Ok(n) => {
+                        hub.last_master_io_secs
+                            .store(unix_secs(), Ordering::Relaxed);
+                        buf.extend_from_slice(&read_buf[..n]);
+                    }
                 }
             };
 
@@ -2520,7 +2610,11 @@ async fn run_replica_worker(
                         read_failed = true;
                         break;
                     }
-                    Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                    Ok(n) => {
+                        hub.last_master_io_secs
+                            .store(unix_secs(), Ordering::Relaxed);
+                        buf.extend_from_slice(&read_buf[..n]);
+                    }
                 }
             }
             if read_failed {
@@ -2717,7 +2811,11 @@ async fn run_replica_worker(
             read_buf = returned;
             match res {
                 Ok(0) | Err(_) => break,
-                Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                Ok(n) => {
+                    hub.last_master_io_secs
+                        .store(unix_secs(), Ordering::Relaxed);
+                    buf.extend_from_slice(&read_buf[..n]);
+                }
             }
         }
 
@@ -3562,5 +3660,62 @@ mod tests {
         std::io::Write::write_all(&mut &ours, b"x").unwrap();
         let mut byte = [0u8; 1];
         assert_eq!(std::io::Read::read(&mut &theirs, &mut byte).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_announced_ip_port_priority_and_master_last_io() {
+        let hub = ReplicationHub::new(19993);
+        hub.note_replica_ip(42, "127.0.0.1".parse().unwrap());
+        hub.set_replica_port(42, 26379);
+        hub.set_replica_announced_ip(42, "10.20.30.40");
+        assert_eq!(hub.replica_name(42), "10.20.30.40:26379");
+
+        let (tx, _rx) = flume::unbounded();
+        let _rep = hub.register_replica(42, tx);
+        let info_master = hub.format_info_replication();
+        assert!(
+            info_master.contains("slave0:ip=10.20.30.40,port=26379,state=online"),
+            "{info_master}"
+        );
+        let role_resp = String::from_utf8(hub.format_role_resp()).unwrap();
+        assert!(
+            role_resp.contains("$11\r\n10.20.30.40\r\n$5\r\n26379\r\n"),
+            "{role_resp}"
+        );
+
+        // Update announced IP after registration
+        hub.set_replica_announced_ip(42, "replica.internal.local");
+        assert_eq!(hub.replica_name(42), "replica.internal.local:26379");
+
+        // Switch hub to Slave and verify master_last_io_seconds_ago and slave_priority
+        *hub.role.write() = ReplicationRole::Slave {
+            master_host: "127.0.0.1".to_string(),
+            master_port: 6379,
+            link_status: "up".to_string(),
+            sync_in_progress: false,
+        };
+        let info_before_io = hub.format_info_replication();
+        assert!(
+            info_before_io.contains("master_last_io_seconds_ago:-1\r\n"),
+            "{info_before_io}"
+        );
+        assert!(
+            info_before_io.contains("slave_priority:100\r\n"),
+            "{info_before_io}"
+        );
+
+        hub.replica_priority.store(45, Ordering::Relaxed);
+        hub.last_master_io_secs
+            .store(unix_secs().saturating_sub(2), Ordering::Relaxed);
+        let info_after_io = hub.format_info_replication();
+        assert!(
+            info_after_io.contains("slave_priority:45\r\n"),
+            "{info_after_io}"
+        );
+        assert!(
+            info_after_io.contains("master_last_io_seconds_ago:2\r\n")
+                || info_after_io.contains("master_last_io_seconds_ago:3\r\n"),
+            "{info_after_io}"
+        );
     }
 }

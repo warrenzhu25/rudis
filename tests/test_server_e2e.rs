@@ -25615,3 +25615,118 @@ fn test_cross_shard_single_key_pooled_ops_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_replica_announce_and_priority_e2e() {
+    let m_port = 17972;
+    let r_port = 17973;
+    let m_port_s = m_port.to_string();
+    let r_port_s = r_port.to_string();
+    let mut master =
+        spawn_rudis_listening(&["--port", &m_port_s, "--threads", "2", "--no-pin"], m_port);
+    let mut replica =
+        spawn_rudis_listening(&["--port", &r_port_s, "--threads", "2", "--no-pin"], r_port);
+
+    let mut mc = TcpStream::connect(("127.0.0.1", m_port)).unwrap();
+    mc.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut rc = TcpStream::connect(("127.0.0.1", r_port)).unwrap();
+    rc.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Configure announce-ip, announce-port, and replica-priority on the replica before syncing
+    assert_eq!(
+        resp_cmd(&mut rc, &["CONFIG", "SET", "replica-priority", "25"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut rc,
+            &["CONFIG", "SET", "replica-announce-ip", "192.0.2.99"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut rc,
+            &["CONFIG", "SET", "replica-announce-port", "36379"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut rc, &["CONFIG", "GET", "slave-priority"]),
+        "*2\r\n$14\r\nslave-priority\r\n$2\r\n25\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut rc, &["CONFIG", "GET", "replica-announce-ip"]),
+        "*2\r\n$19\r\nreplica-announce-ip\r\n$10\r\n192.0.2.99\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut rc, &["CONFIG", "GET", "replica-announce-port"]),
+        "*2\r\n$21\r\nreplica-announce-port\r\n$5\r\n36379\r\n"
+    );
+
+    // Reject duplicate alias in single CONFIG SET and invalid integer
+    assert!(
+        resp_cmd(
+            &mut rc,
+            &[
+                "CONFIG",
+                "SET",
+                "replica-priority",
+                "10",
+                "slave-priority",
+                "20"
+            ]
+        )
+        .starts_with("-ERR")
+    );
+    assert!(resp_cmd(&mut rc, &["CONFIG", "SET", "replica-priority", "bad"]).starts_with("-ERR"));
+    assert!(
+        resp_cmd(
+            &mut rc,
+            &["CONFIG", "SET", "replica-announce-port", "99999"]
+        )
+        .starts_with("-ERR")
+    );
+
+    // Start replication
+    assert_eq!(
+        resp_cmd(&mut rc, &["REPLICAOF", "127.0.0.1", &m_port_s]),
+        "+OK\r\n"
+    );
+
+    // Wait for replica link to come up
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let info = resp_cmd(&mut rc, &["INFO", "replication"]);
+        if info.contains("master_link_status:up\r\n") {
+            assert!(info.contains("slave_priority:25\r\n"), "{info}");
+            assert!(
+                !info.contains("master_last_io_seconds_ago:-1\r\n"),
+                "{info}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica did not sync in time: {info}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Master INFO replication and ROLE should report the announced IP and port
+    let m_info = resp_cmd(&mut mc, &["INFO", "replication"]);
+    assert!(
+        m_info.contains("slave0:ip=192.0.2.99,port=36379,state=online"),
+        "{m_info}"
+    );
+    let m_role = resp_cmd(&mut mc, &["ROLE"]);
+    assert!(
+        m_role.contains("$10\r\n192.0.2.99\r\n$5\r\n36379\r\n"),
+        "{m_role}"
+    );
+
+    drop(rc);
+    drop(mc);
+    shutdown_and_wait(r_port, &mut replica);
+    shutdown_and_wait(m_port, &mut master);
+}
