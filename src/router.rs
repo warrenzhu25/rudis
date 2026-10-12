@@ -781,16 +781,18 @@ impl Router {
         if target == self.shard_id {
             self.cool_local(key).await
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_bool_responder();
             let msg = ShardMessage::TierCool {
                 key: Bytes::copy_from_slice(key),
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
                 false
-            }
+            };
+            self.release_bool_responder(tx, rx);
+            res
         }
     }
 
@@ -800,16 +802,18 @@ impl Router {
             if target == self.shard_id {
                 self.decommit_local(Some(k))
             } else {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 let msg = ShardMessage::TierDecommit {
                     key: Some(Bytes::copy_from_slice(k)),
-                    responder: tx,
+                    responder: tx.clone(),
                 };
-                if self.senders[target].send(msg).is_ok() {
+                let res = if self.senders[target].send(msg).is_ok() {
                     rx.recv_async().await.unwrap_or(0)
                 } else {
                     0
-                }
+                };
+                self.release_pubsub_responder(tx, rx);
+                res
             }
         } else {
             let mut total = 0;
@@ -817,14 +821,15 @@ impl Router {
                 if s == self.shard_id {
                     total += self.decommit_local(None);
                 } else {
-                    let (tx, rx) = flume::bounded(1);
+                    let (tx, rx) = self.acquire_pubsub_responder();
                     let msg = ShardMessage::TierDecommit {
                         key: None,
-                        responder: tx,
+                        responder: tx.clone(),
                     };
                     if self.senders[s].send(msg).is_ok() {
                         total += rx.recv_async().await.unwrap_or(0);
                     }
+                    self.release_pubsub_responder(tx, rx);
                 }
             }
             total
@@ -836,13 +841,16 @@ impl Router {
     pub async fn get_total_used_memory(&self) -> usize {
         for s in 0..self.num_shards {
             if s != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
-                let msg = ShardMessage::GetUsedMemory { responder: tx };
+                let (tx, rx) = self.acquire_pubsub_responder();
+                let msg = ShardMessage::GetUsedMemory {
+                    responder: tx.clone(),
+                };
                 if self.senders[s].send(msg).is_ok()
                     && let Ok(used) = rx.recv_async().await
                 {
                     self.tier_stats.publish_shard_used(s, used);
                 }
+                self.release_pubsub_responder(tx, rx);
             }
         }
         self.publish_memory_state();
@@ -973,14 +981,17 @@ impl Router {
         self.last_usage_refresh.set(Some(now));
         for s in 0..self.num_shards {
             if s != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 if self.senders[s]
-                    .send(ShardMessage::GetUsedMemory { responder: tx })
+                    .send(ShardMessage::GetUsedMemory {
+                        responder: tx.clone(),
+                    })
                     .is_ok()
                     && let Ok(used) = rx.recv_async().await
                 {
                     self.tier_stats.publish_shard_used(s, used);
                 }
+                self.release_pubsub_responder(tx, rx);
             }
         }
     }
@@ -1157,14 +1168,17 @@ impl Router {
             if s == self.shard_id {
                 continue;
             }
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_pubsub_responder();
             if self.senders[s]
-                .send(ShardMessage::TierAutoSpill { responder: tx })
+                .send(ShardMessage::TierAutoSpill {
+                    responder: tx.clone(),
+                })
                 .is_ok()
                 && let Ok(used) = rx.recv_async().await
             {
                 self.tier_stats.publish_shard_used(s, used);
             }
+            self.release_pubsub_responder(tx, rx);
             if !self.over_maxmemory() {
                 self.remote_spill_backoff.set(None);
                 return true;
@@ -1292,16 +1306,18 @@ impl Router {
         if target == self.shard_id {
             self.spill_local(key).await
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_bool_responder();
             let msg = ShardMessage::TierSpill {
                 key: Bytes::copy_from_slice(key),
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
                 false
-            }
+            };
+            self.release_bool_responder(tx, rx);
+            res
         }
     }
 
@@ -1314,16 +1330,18 @@ impl Router {
         if target == self.shard_id {
             self.load_local(key).await
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_bool_responder();
             let msg = ShardMessage::TierLoad {
                 key: Bytes::copy_from_slice(key),
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
                 false
-            }
+            };
+            self.release_bool_responder(tx, rx);
+            res
         }
     }
 
@@ -1347,13 +1365,16 @@ impl Router {
         let mut total = self.gc_local();
         for s in 0..self.num_shards {
             if s != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 if self.senders[s]
-                    .send(ShardMessage::TierGc { responder: tx })
+                    .send(ShardMessage::TierGc {
+                        responder: tx.clone(),
+                    })
                     .is_ok()
                 {
                     total += rx.recv_async().await.unwrap_or(0);
                 }
+                self.release_pubsub_responder(tx, rx);
             }
         }
         total
@@ -1823,8 +1844,10 @@ impl Router {
 
     #[inline(always)]
     pub fn release_notify_channel(&self, tx: flume::Sender<()>, rx: flume::Receiver<()>) {
-        while rx.try_recv().is_ok() {}
-        self.notify_channel_pool.borrow_mut().push((tx, rx));
+        if self.notify_channel_pool.borrow().len() < 64 {
+            while rx.try_recv().is_ok() {}
+            self.notify_channel_pool.borrow_mut().push((tx, rx));
+        }
     }
 
     #[inline(always)]
@@ -1837,8 +1860,10 @@ impl Router {
 
     #[inline(always)]
     pub fn release_pubsub_responder(&self, tx: flume::Sender<usize>, rx: flume::Receiver<usize>) {
-        while rx.try_recv().is_ok() {}
-        self.pubsub_responder_pool.borrow_mut().push((tx, rx));
+        if self.pubsub_responder_pool.borrow().len() < 64 {
+            while rx.try_recv().is_ok() {}
+            self.pubsub_responder_pool.borrow_mut().push((tx, rx));
+        }
     }
 
     pub fn acquire_mget_descriptor(
@@ -2524,25 +2549,28 @@ impl Router {
         let mut responders = Vec::new();
         for (target_shard, shard_keys) in remote_batches.into_iter().enumerate() {
             if !shard_keys.is_empty() {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 if self.senders[target_shard]
                     .send(ShardMessage::DelKeys {
                         db: cur_db,
                         keys: shard_keys,
-                        responder: tx,
+                        responder: tx.clone(),
                     })
                     .is_ok()
                 {
-                    responders.push(rx);
+                    responders.push((tx, rx));
+                } else {
+                    self.release_pubsub_responder(tx, rx);
                 }
             }
         }
 
         // 3. Concurrently await all remote responses in parallel
-        for rx in responders {
+        for (tx, rx) in responders {
             if let Ok(shard_deleted) = rx.recv_async().await {
                 total_deleted += shard_deleted;
             }
+            self.release_pubsub_responder(tx, rx);
         }
 
         total_deleted
@@ -2553,19 +2581,24 @@ impl Router {
         let mut responders = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 if sender
-                    .send(ShardMessage::ActiveDefrag { responder: tx })
+                    .send(ShardMessage::ActiveDefrag {
+                        responder: tx.clone(),
+                    })
                     .is_ok()
                 {
-                    responders.push(rx);
+                    responders.push((tx, rx));
+                } else {
+                    self.release_pubsub_responder(tx, rx);
                 }
             }
         }
-        for rx in responders {
+        for (tx, rx) in responders {
             if let Ok(freed) = rx.recv_async().await {
                 total_freed += freed;
             }
+            self.release_pubsub_responder(tx, rx);
         }
         total_freed
     }
@@ -2695,10 +2728,14 @@ impl Router {
         let mut responders = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
-                let msg = ShardMessage::SyncAof { responder: tx };
+                let (tx, rx) = self.acquire_notify_channel();
+                let msg = ShardMessage::SyncAof {
+                    responder: tx.clone(),
+                };
                 if sender.send(msg).is_ok() {
-                    responders.push(rx);
+                    responders.push((tx, rx));
+                } else {
+                    self.release_notify_channel(tx, rx);
                 }
             }
         }
@@ -2706,8 +2743,9 @@ impl Router {
         if let Some(aof) = &self.aof {
             let _ = crate::aof::AofWriter::sync_durable(aof).await;
         }
-        for rx in responders {
+        for (tx, rx) in responders {
             let _ = rx.recv_async().await;
+            self.release_notify_channel(tx, rx);
         }
     }
 
@@ -2739,16 +2777,18 @@ impl Router {
             if target == self.shard_id {
                 self.local_db.borrow_mut().count_keys_in_slot(slot)
             } else {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 let msg = ShardMessage::CountKeysInSlot {
                     slot,
-                    responder: tx,
+                    responder: tx.clone(),
                 };
-                if self.senders[target].send(msg).is_ok() {
+                let res = if self.senders[target].send(msg).is_ok() {
                     rx.recv_async().await.unwrap_or(0)
                 } else {
                     0
-                }
+                };
+                self.release_pubsub_responder(tx, rx);
+                res
             }
         } else {
             let mut total = self.local_db.borrow_mut().count_keys_in_slot(slot);
@@ -2756,14 +2796,15 @@ impl Router {
                 if s == self.shard_id {
                     continue;
                 }
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 let msg = ShardMessage::CountKeysInSlot {
                     slot,
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if self.senders[s].send(msg).is_ok() {
                     total += rx.recv_async().await.unwrap_or(0);
                 }
+                self.release_pubsub_responder(tx, rx);
             }
             total
         }
@@ -2818,14 +2859,15 @@ impl Router {
             if s == self.shard_id {
                 total += self.local_db.borrow_mut().flush_slots(ranges);
             } else {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 let msg = ShardMessage::FlushSlots {
                     ranges: ranges.to_vec(),
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if self.senders[s].send(msg).is_ok() {
                     total += rx.recv_async().await.unwrap_or(0);
                 }
+                self.release_pubsub_responder(tx, rx);
             }
         }
         total
@@ -2840,14 +2882,15 @@ impl Router {
                     count += 1;
                 }
             } else {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 let msg = ShardMessage::Stick {
                     keys: vec![key.clone()],
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if self.senders[target].send(msg).is_ok() {
                     count += rx.recv_async().await.unwrap_or(0);
                 }
+                self.release_pubsub_responder(tx, rx);
             }
         }
         count
@@ -2862,14 +2905,15 @@ impl Router {
                     count += 1;
                 }
             } else {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 let msg = ShardMessage::Unstick {
                     keys: vec![key.clone()],
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if self.senders[target].send(msg).is_ok() {
                     count += rx.recv_async().await.unwrap_or(0);
                 }
+                self.release_pubsub_responder(tx, rx);
             }
         }
         count
@@ -2880,16 +2924,18 @@ impl Router {
         if target == self.shard_id {
             self.local_db.borrow().is_sticky(key)
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_bool_responder();
             let msg = ShardMessage::IsSticky {
                 key: key.clone(),
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
                 false
-            }
+            };
+            self.release_bool_responder(tx, rx);
+            res
         }
     }
 
@@ -2923,18 +2969,20 @@ impl Router {
             };
             if should_del { db.del(&key) } else { false }
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_bool_responder();
             let msg = ShardMessage::Delex {
                 db: crate::connection::CURRENT_DB.get(),
                 key,
                 condition: condition.map(Box::new),
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
                 false
-            }
+            };
+            self.release_bool_responder(tx, rx);
+            res
         }
     }
 
@@ -3049,11 +3097,14 @@ impl Router {
         }
         for (shard_id, sender) in self.senders.iter().enumerate() {
             if shard_id != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
-                let msg = ShardMessage::ResetCommandStats { responder: tx };
+                let (tx, rx) = self.acquire_notify_channel();
+                let msg = ShardMessage::ResetCommandStats {
+                    responder: tx.clone(),
+                };
                 if sender.send(msg).is_ok() {
                     let _ = rx.recv_async().await;
                 }
+                self.release_notify_channel(tx, rx);
             }
         }
     }
@@ -3062,11 +3113,14 @@ impl Router {
         crate::connection::flush_local_cmd_stats();
         for (shard_id, sender) in self.senders.iter().enumerate() {
             if shard_id != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
-                let msg = ShardMessage::FlushCommandStats { responder: tx };
+                let (tx, rx) = self.acquire_notify_channel();
+                let msg = ShardMessage::FlushCommandStats {
+                    responder: tx.clone(),
+                };
                 if sender.send(msg).is_ok() {
                     let _ = rx.recv_async().await;
                 }
+                self.release_notify_channel(tx, rx);
             }
         }
     }
@@ -3500,20 +3554,23 @@ impl Router {
         let mut pending = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_notify_channel();
                 if sender
                     .send(ShardMessage::FlushDb {
                         db: cur_db,
-                        responder: tx,
+                        responder: tx.clone(),
                     })
                     .is_ok()
                 {
-                    pending.push(rx);
+                    pending.push((tx, rx));
+                } else {
+                    self.release_notify_channel(tx, rx);
                 }
             }
         }
-        for rx in pending {
+        for (tx, rx) in pending {
             let _ = rx.recv_async().await;
+            self.release_notify_channel(tx, rx);
         }
     }
 
@@ -3530,17 +3587,22 @@ impl Router {
         let mut pending = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_notify_channel();
                 if sender
-                    .send(ShardMessage::FlushAll { responder: tx })
+                    .send(ShardMessage::FlushAll {
+                        responder: tx.clone(),
+                    })
                     .is_ok()
                 {
-                    pending.push(rx);
+                    pending.push((tx, rx));
+                } else {
+                    self.release_notify_channel(tx, rx);
                 }
             }
         }
-        for rx in pending {
+        for (tx, rx) in pending {
             let _ = rx.recv_async().await;
+            self.release_notify_channel(tx, rx);
         }
     }
 
@@ -3554,21 +3616,24 @@ impl Router {
         let mut pending = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_notify_channel();
                 if sender
                     .send(ShardMessage::SwapDb {
                         db1,
                         db2,
-                        responder: tx,
+                        responder: tx.clone(),
                     })
                     .is_ok()
                 {
-                    pending.push(rx);
+                    pending.push((tx, rx));
+                } else {
+                    self.release_notify_channel(tx, rx);
                 }
             }
         }
-        for rx in pending {
+        for (tx, rx) in pending {
             let _ = rx.recv_async().await;
+            self.release_notify_channel(tx, rx);
         }
     }
 
@@ -3691,21 +3756,23 @@ impl Router {
 
     pub async fn spublish(&self, channel: Bytes, message: Bytes) -> usize {
         let slot = key_slot(&channel);
-        let target = slot_to_shard(slot, self.num_shards);
+        let target = self.target_shard_for_slot(slot);
         if target == self.shard_id {
             self.pubsub.borrow().spublish(&channel, &message)
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_pubsub_responder();
             let msg = ShardMessage::Spublish {
                 channel,
                 message,
-                responder: tx,
+                responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(0)
             } else {
                 0
-            }
+            };
+            self.release_pubsub_responder(tx, rx);
+            res
         }
     }
 
@@ -3717,23 +3784,24 @@ impl Router {
         is_resp3: bool,
     ) -> usize {
         let slot = key_slot(&channel);
-        let target = slot_to_shard(slot, self.num_shards);
+        let target = self.target_shard_for_slot(slot);
         if target == self.shard_id {
             self.pubsub
                 .borrow_mut()
                 .ssubscribe(client_id, channel, tx, is_resp3)
         } else {
-            let (resp_tx, resp_rx) = flume::bounded(1);
+            let (resp_tx, resp_rx) = self.acquire_notify_channel();
             let msg = ShardMessage::Ssubscribe {
                 client_id,
                 channel: channel.clone(),
                 sender: tx,
                 is_resp3,
-                responder: resp_tx,
+                responder: resp_tx.clone(),
             };
             if self.senders[target].send(msg).is_ok() {
                 let _ = resp_rx.recv_async().await;
             }
+            self.release_notify_channel(resp_tx, resp_rx);
             let mut hub = self.pubsub.borrow_mut();
             hub.client_shard_channels
                 .entry(client_id)
@@ -3745,19 +3813,20 @@ impl Router {
 
     pub async fn sunsubscribe(&self, client_id: u64, channel: Bytes) -> usize {
         let slot = key_slot(&channel);
-        let target = slot_to_shard(slot, self.num_shards);
+        let target = self.target_shard_for_slot(slot);
         if target == self.shard_id {
             self.pubsub.borrow_mut().sunsubscribe(client_id, &channel)
         } else {
-            let (resp_tx, resp_rx) = flume::bounded(1);
+            let (resp_tx, resp_rx) = self.acquire_notify_channel();
             let msg = ShardMessage::Sunsubscribe {
                 client_id,
                 channel: channel.clone(),
-                responder: resp_tx,
+                responder: resp_tx.clone(),
             };
             if self.senders[target].send(msg).is_ok() {
                 let _ = resp_rx.recv_async().await;
             }
+            self.release_notify_channel(resp_tx, resp_rx);
             let mut hub = self.pubsub.borrow_mut();
             if let Some(ch_set) = hub.client_shard_channels.get_mut(&client_id) {
                 ch_set.remove(&channel);
@@ -3820,7 +3889,7 @@ impl Router {
         let mut shard_channels: hashbrown::HashMap<usize, Vec<Bytes>> = hashbrown::HashMap::new();
         for ch in &channels {
             let slot = key_slot(ch);
-            let target = slot_to_shard(slot, self.num_shards);
+            let target = self.target_shard_for_slot(slot);
             if target == self.shard_id {
                 counts.insert(ch.clone(), self.pubsub.borrow().shard_numsub(ch));
             } else {
@@ -3913,15 +3982,16 @@ impl Router {
         // Broadcast to all other shards
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_notify_channel();
                 let msg = ShardMessage::InitSearchIndex {
                     schema: Box::new(schema.clone()),
                     aof_record: aof_record.clone(),
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if sender.send(msg).is_ok() {
                     let _ = rx.recv_async().await;
                 }
+                self.release_notify_channel(tx, rx);
             }
         }
 
@@ -3940,17 +4010,18 @@ impl Router {
 
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_bool_responder();
                 let msg = ShardMessage::DropSearchIndex {
                     name: name.to_string(),
                     aof_record: aof_record.clone(),
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if sender.send(msg).is_ok()
                     && let Ok(dropped) = rx.recv_async().await
                 {
                     any_dropped = any_dropped || dropped;
                 }
+                self.release_bool_responder(tx, rx);
             }
         }
 
@@ -4006,15 +4077,16 @@ impl Router {
 
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_notify_channel();
                 let msg = ShardMessage::InitSearchIndex {
                     schema: Box::new(schema.clone()),
                     aof_record: aof_record.clone(),
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if sender.send(msg).is_ok() {
                     let _ = rx.recv_async().await;
                 }
+                self.release_notify_channel(tx, rx);
             }
         }
 
@@ -4319,29 +4391,31 @@ impl Router {
     pub async fn acquire_tx_locks(&self, shard_ids: &[usize], tx_id: u64) {
         for &sid in shard_ids {
             if sid == self.shard_id {
-                let rx = {
+                let pending = {
                     let mut lock = self.tx_lock.borrow_mut();
                     if lock.is_none() {
                         *lock = Some(tx_id);
                         None
                     } else {
-                        let (tx, rx) = flume::bounded(1);
-                        self.tx_waiters.borrow_mut().push_back((tx_id, tx));
-                        Some(rx)
+                        let (tx, rx) = self.acquire_notify_channel();
+                        self.tx_waiters.borrow_mut().push_back((tx_id, tx.clone()));
+                        Some((tx, rx))
                     }
                 };
-                if let Some(rx) = rx {
+                if let Some((tx, rx)) = pending {
                     let _ = rx.recv_async().await;
+                    self.release_notify_channel(tx, rx);
                 }
             } else {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_notify_channel();
                 let msg = ShardMessage::AcquireTxLock {
                     tx_id,
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if self.senders[sid].send(msg).is_ok() {
                     let _ = rx.recv_async().await;
                 }
+                self.release_notify_channel(tx, rx);
             }
         }
     }
@@ -4688,15 +4762,16 @@ impl Router {
                 self.aof.as_deref(),
             );
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self.acquire_notify_channel();
             let msg = ShardMessage::ExecuteReplicaCmd {
                 db: crate::connection::CURRENT_DB.get(),
                 cmd: Box::new(cmd),
-                responder: tx,
+                responder: tx.clone(),
             };
             if self.senders[target].send(msg).is_ok() {
                 let _ = rx.recv_async().await;
             }
+            self.release_notify_channel(tx, rx);
         }
     }
 
@@ -4726,16 +4801,17 @@ impl Router {
                     crate::connection::touch_watched_keys_on_flushdb(self.port, cur_db);
                     for (sid, sender) in self.senders.iter().enumerate() {
                         if sid != self.shard_id {
-                            let (tx, rx) = flume::bounded(1);
+                            let (tx, rx) = self.acquire_notify_channel();
                             if sender
                                 .send(ShardMessage::FlushDb {
                                     db: cur_db,
-                                    responder: tx,
+                                    responder: tx.clone(),
                                 })
                                 .is_ok()
                             {
                                 let _ = rx.recv_async().await;
                             }
+                            self.release_notify_channel(tx, rx);
                         }
                     }
                     crate::connection::record_replica_cmd_stats(
@@ -4749,13 +4825,16 @@ impl Router {
                     crate::connection::touch_watched_keys_on_flushall(self.port);
                     for (sid, sender) in self.senders.iter().enumerate() {
                         if sid != self.shard_id {
-                            let (tx, rx) = flume::bounded(1);
+                            let (tx, rx) = self.acquire_notify_channel();
                             if sender
-                                .send(ShardMessage::FlushAll { responder: tx })
+                                .send(ShardMessage::FlushAll {
+                                    responder: tx.clone(),
+                                })
                                 .is_ok()
                             {
                                 let _ = rx.recv_async().await;
                             }
+                            self.release_notify_channel(tx, rx);
                         }
                     }
                     crate::connection::record_replica_cmd_stats(
@@ -4770,17 +4849,18 @@ impl Router {
                     crate::connection::touch_watched_keys_on_swapdb(self.port, d1, d2);
                     for (sid, sender) in self.senders.iter().enumerate() {
                         if sid != self.shard_id {
-                            let (tx, rx) = flume::bounded(1);
+                            let (tx, rx) = self.acquire_notify_channel();
                             if sender
                                 .send(ShardMessage::SwapDb {
                                     db1: d1,
                                     db2: d2,
-                                    responder: tx,
+                                    responder: tx.clone(),
                                 })
                                 .is_ok()
                             {
                                 let _ = rx.recv_async().await;
                             }
+                            self.release_notify_channel(tx, rx);
                         }
                     }
                     crate::connection::record_replica_cmd_stats(
@@ -7033,6 +7113,118 @@ mod tests {
             assert!(router.exists(k0.clone()).await);
             assert!(router.del(k0.clone()).await);
             assert!(!router.exists(k0.clone()).await);
+        });
+        drop(router);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn test_router_notify_and_pubsub_channel_pools_and_dynamic_spublish() {
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
+
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9996)));
+        let router = Router::new(
+            0,
+            2,
+            9996,
+            db0.clone(),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut ch0 = Bytes::from_static(b"spub_0");
+        for i in 0..1000 {
+            let candidate = Bytes::from(format!("spub_{}", i));
+            if target_shard(&candidate, 2) == 0 {
+                ch0 = candidate;
+                break;
+            }
+        }
+        let slot = crate::router::key_slot(&ch0);
+        let mut owners = vec![0usize; 16384];
+        owners[slot as usize] = 1;
+        *router.slot_owners.borrow_mut() = owners;
+
+        let worker = std::thread::spawn(move || {
+            let mut remote_pubsub = crate::pubsub::PubSubHub::new();
+            while let Ok(msg) = rx1.recv() {
+                match msg {
+                    ShardMessage::Spublish {
+                        channel,
+                        message,
+                        responder,
+                    } => {
+                        let _ = responder.send(remote_pubsub.spublish(&channel, &message));
+                    }
+                    ShardMessage::Ssubscribe {
+                        client_id,
+                        channel,
+                        sender,
+                        is_resp3,
+                        responder,
+                    } => {
+                        remote_pubsub.ssubscribe(client_id, channel, sender, is_resp3);
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::Sunsubscribe {
+                        client_id,
+                        channel,
+                        responder,
+                    } => {
+                        remote_pubsub.sunsubscribe(client_id, &channel);
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::AcquireTxLock { responder, .. } => {
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::ReleaseTxLock { .. } => {}
+                    ShardMessage::FlushDb { responder, .. } => {
+                        let _ = responder.send(());
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (sub_tx, sub_rx) = flume::unbounded();
+            let count = router.ssubscribe(42, ch0.clone(), sub_tx, false).await;
+            assert_eq!(count, 1);
+            assert_eq!(router.notify_channel_pool.borrow().len(), 1);
+
+            let delivered = router
+                .spublish(ch0.clone(), Bytes::from_static(b"hello"))
+                .await;
+            assert_eq!(delivered, 1);
+            assert_eq!(router.pubsub_responder_pool.borrow().len(), 1);
+            let pushed = sub_rx.try_recv().expect("expected sharded pubsub message");
+            assert!(
+                String::from_utf8_lossy(&pushed).contains("hello"),
+                "unexpected push payload: {:?}",
+                pushed
+            );
+
+            let rem = router.sunsubscribe(42, ch0.clone()).await;
+            assert_eq!(rem, 0);
+            assert_eq!(router.notify_channel_pool.borrow().len(), 1);
+
+            for tx_id in 1..=4 {
+                router.acquire_tx_locks(&[0, 1], tx_id).await;
+                router.release_tx_locks(&[0, 1], tx_id).await;
+            }
+            assert_eq!(router.notify_channel_pool.borrow().len(), 1);
+
+            router.flushdb().await;
+            assert_eq!(router.notify_channel_pool.borrow().len(), 1);
         });
         drop(router);
         worker.join().unwrap();

@@ -26260,3 +26260,64 @@ fn test_ops_maxmemory_policy_validation_sd_notify_and_llm_quota_persistence_e2e(
     shutdown_and_wait(port, &mut srv2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_router_pooled_channels_spublish_and_loopback_conf_e2e() {
+    // 1. Verify rudis.conf binds to loopback by default
+    let conf_cfg = rudis::config::RudisConfig::load_file(std::path::Path::new("rudis.conf"))
+        .expect("rudis.conf should parse cleanly");
+    assert_eq!(conf_cfg.bind, "127.0.0.1 -::1");
+
+    let port = 17978u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // 2. Multi-key DEL, cross-shard MULTI/EXEC, and FLUSHDB exercising pooled responder channels
+    for round in 0..5 {
+        assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+        for i in 0..8 {
+            let k = format!("pool:tx:{round}:{i}");
+            assert_eq!(resp_cmd(&mut c, &["SET", &k, "v"]), "+QUEUED\r\n");
+        }
+        let exec_resp = resp_cmd(&mut c, &["EXEC"]);
+        assert!(exec_resp.starts_with("*8\r\n"), "{exec_resp}");
+
+        let del_keys: Vec<String> = (0..8).map(|i| format!("pool:tx:{round}:{i}")).collect();
+        let mut del_cmd = vec!["DEL"];
+        for k in &del_keys {
+            del_cmd.push(k.as_str());
+        }
+        assert_eq!(resp_cmd(&mut c, &del_cmd), ":8\r\n");
+    }
+
+    // 3. Sharded pub/sub (SSUBSCRIBE / SPUBLISH / PUBSUB SHARDNUMSUB) across shards
+    let mut sub = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sub.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let ssub_resp = resp_cmd(&mut sub, &["SSUBSCRIBE", "shardchan:{alpha}"]);
+    assert!(
+        ssub_resp.contains("ssubscribe") && ssub_resp.contains(":1\r\n"),
+        "{ssub_resp}"
+    );
+
+    let numsub_resp = resp_cmd(&mut c, &["PUBSUB", "SHARDNUMSUB", "shardchan:{alpha}"]);
+    assert!(numsub_resp.contains(":1\r\n"), "{numsub_resp}");
+
+    assert_eq!(
+        resp_cmd(&mut c, &["SPUBLISH", "shardchan:{alpha}", "msg1"]),
+        ":1\r\n"
+    );
+    let mut buf = [0u8; 512];
+    let n = sub.read(&mut buf).unwrap();
+    let received = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        received.contains("smessage") && received.contains("msg1"),
+        "{received}"
+    );
+
+    drop(sub);
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}
