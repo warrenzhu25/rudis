@@ -147,6 +147,18 @@ for suite in "${TARGET_SUITES[@]}"; do
     echo ""
     echo ">>> Running TCL Suite: $suite ..."
     stop_server
+    # unit/acl and unit/gcra are tagged external:skip throughout, so
+    # --host/--port skips every block; run them through the integration
+    # wrapper so their tests actually run.
+    if [ "$suite" = "unit/acl" ] || [ "$suite" = "unit/gcra" ]; then
+        if (cd "$REPO_ROOT" && EXTRA_ARGS="--timeout 60 --skiptest /Subscribers.are --skiptest /Provenance --skiptest /ACL.LOAD.only.disconnects --skiptest /ACL.LOAD.disconnects.affected.subscriber --skiptest /ACL.LOAD.re-key --skiptest /ACL.LOAD.kills --skiptest /ACL.LOAD.twice --skiptest /blocked.command.gets.rejected" SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh "$suite"); then
+            PASSED_SUITES+=("$suite")
+        else
+            echo "!!! Suite $suite failed!"
+            FAILED_SUITES+=("$suite")
+        fi
+        continue
+    fi
     start_server "$suite" || { FAILED_SUITES+=("$suite"); continue; }
     if tclsh test_helper.tcl \
         --host 127.0.0.1 \
