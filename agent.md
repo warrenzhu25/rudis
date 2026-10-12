@@ -4,6 +4,12 @@ This document defines the mandatory operating guidelines, architectural invarian
 
 ---
 
+## 0. Working Preferences
+
+* **Do not use sub-agents.** Do the work directly in the main conversation instead of delegating to sub-agents, parallel agent workflows or swarms. Sub-agents use too many tokens, and their progress can't be followed or steered from the main conversation. If a task looks like it really needs them, ask first.
+
+---
+
 ## 1. Core Architectural Invariants
 
 `rudis` is designed from the ground up for extreme throughput and low tail latency on modern multi-core Linux systems. Every modification must uphold these principles:
