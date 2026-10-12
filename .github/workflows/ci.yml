@@ -123,14 +123,26 @@ jobs:
           echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo n/a)"
           ulimit -l
 
+      # Every in-process test server keeps its io_uring rings for the life
+      # of the test binary, and ring memory counts against RLIMIT_MEMLOCK
+      # (8 MB on the runners), so the suite runs out of it part-way and
+      # shards fall back to epoll. Lift the limit for these steps, as
+      # rudis.service does with LimitMEMLOCK=infinity.
       - name: Run Unit Tests
-        run: cargo test --release --lib
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          cargo test --release --lib
 
       - name: Run Cross-Thread Integration Tests
-        run: cargo test --release --test test_cross_thread
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          cargo test --release --test test_cross_thread
 
       - name: Run End-to-End Integration Tests (serial)
-        run: cargo test --release --test test_server_e2e -- --test-threads=1
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          ulimit -l
+          cargo test --release --test test_server_e2e -- --test-threads=1
 
   redis_tcl_suites:
     name: Redis TCL compatibility suites (io_uring)
