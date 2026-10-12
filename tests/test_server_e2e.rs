@@ -23940,6 +23940,99 @@ fn test_evicted_keys_propagate_to_replica_and_aof_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Like Redis's default `replica-ignore-maxmemory yes`, a replica over its
+/// own `maxmemory` must not evict: it used to, dropping keys its master
+/// still had. `replica-ignore-maxmemory no` makes it enforce the limit.
+#[test]
+fn test_replica_ignores_maxmemory_by_default_e2e() {
+    let (mport, rport) = (17952u16, 17953u16);
+    let (ms, rs) = (mport.to_string(), rport.to_string());
+    let margs = [
+        "--port",
+        &ms,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--bind",
+        "127.0.0.1",
+    ];
+    let rargs = [
+        "--port",
+        &rs,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--bind",
+        "127.0.0.1",
+    ];
+    let mut master = spawn_rudis_listening(&margs, mport);
+    let mut replica = spawn_rudis_listening(&rargs, rport);
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "GET", "replica-ignore-maxmemory"]),
+        "*2\r\n$24\r\nreplica-ignore-maxmemory\r\n$3\r\nyes\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    wait_for("replica link up", || {
+        resp_cmd(&mut r, &["INFO", "replication"]).contains("master_link_status:up")
+    });
+    for i in 0..500 {
+        let k = format!("k{i}");
+        assert_eq!(resp_cmd(&mut m, &["SET", &k, "value"]), "+OK\r\n");
+    }
+    assert_eq!(resp_cmd(&mut m, &["WAIT", "1", "5000"]), ":1\r\n");
+
+    // Any dataset is over a 1-byte limit.
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "SET", "maxmemory", "1"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut r,
+            &["CONFIG", "SET", "maxmemory-policy", "allkeys-random"]
+        ),
+        "+OK\r\n"
+    );
+    for i in 0..20 {
+        let k = format!("k{i}");
+        assert_eq!(resp_cmd(&mut r, &["GET", &k]), "$5\r\nvalue\r\n");
+    }
+    assert_eq!(resp_cmd(&mut r, &["DBSIZE"]), ":500\r\n");
+    assert_eq!(info_field_u64(&mut r, "stats", "evicted_keys"), 0);
+
+    // Opting out makes the replica enforce its own limit.
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "SET", "slave-ignore-maxmemory", "no"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "GET", "replica-ignore-maxmemory"]),
+        "*2\r\n$24\r\nreplica-ignore-maxmemory\r\n$2\r\nno\r\n"
+    );
+    resp_cmd(&mut r, &["GET", "k0"]);
+    assert!(info_field_u64(&mut r, "stats", "evicted_keys") > 0);
+    assert!(
+        resp_cmd(
+            &mut r,
+            &["CONFIG", "SET", "replica-ignore-maxmemory", "maybe"]
+        )
+        .starts_with("-ERR")
+    );
+
+    drop(r);
+    shutdown_and_wait(rport, &mut replica);
+    drop(m);
+    shutdown_and_wait(mport, &mut master);
+}
+
 /// `field` of `INFO <section>` as a string.
 fn info_str(c: &mut TcpStream, section: &str, field: &str) -> String {
     let info = resp_cmd(c, &["INFO", section]);

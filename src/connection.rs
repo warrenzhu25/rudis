@@ -1433,6 +1433,21 @@ pub static TCP_KEEPALIVE_SECS: std::sync::atomic::AtomicU64 =
 pub static REPLICA_READ_ONLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// `replica-ignore-maxmemory`: whether a replica leaves `maxmemory` to its
+/// master (yes, the Redis default). A replica evicting on its own would
+/// drop keys its master still has, and its keyspace would diverge.
+pub static REPLICA_IGNORE_MAXMEMORY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the server on `port` skips `maxmemory` enforcement because it is
+/// a replica and `replica-ignore-maxmemory` is on.
+#[inline]
+pub fn maxmemory_ignored_as_replica(port: u16) -> bool {
+    REPLICA_IGNORE_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::replication::get_replication_hub(port).is_slave()
+}
+
 /// Applies `tcp-keepalive` to an accepted client socket, like Redis's
 /// anetKeepAlive: probes start after the idle time and are sent every third
 /// of it, three times, before the peer is considered dead.
@@ -3078,6 +3093,9 @@ pub fn apply_config_value(
         }
         "replica-read-only" | "slave-read-only" => {
             REPLICA_READ_ONLY.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
+        }
+        "replica-ignore-maxmemory" | "slave-ignore-maxmemory" => {
+            REPLICA_IGNORE_MAXMEMORY.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
         }
         "masterauth" => crate::replication::set_masterauth(port, val_str),
         "masteruser" => crate::replication::set_masteruser(port, val_str),
@@ -8789,12 +8807,14 @@ async fn execute_command_inner(
         return false;
     }
 
-    // Enforce maxmemory: evict or return OOM if memory limit is exceeded
+    // Enforce maxmemory: evict or return OOM if memory limit is exceeded.
+    // Like Redis, a replica with `replica-ignore-maxmemory` (the default)
+    // leaves that to its master, whose evictions reach it as DELs.
     let max_mem = router
         .tier_stats
         .max_memory
         .load(std::sync::atomic::Ordering::Relaxed);
-    if max_mem > 0 {
+    if max_mem > 0 && !maxmemory_ignored_as_replica(router.port) {
         let policy = get_max_memory_policy();
         if policy != "noeviction" {
             if !matches!(
@@ -10305,6 +10325,12 @@ async fn execute_command_inner(
                     } else {
                         "no"
                     };
+                    let ignore_maxmem =
+                        if REPLICA_IGNORE_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) {
+                            "yes"
+                        } else {
+                            "no"
+                        };
                     let min_replicas = MIN_REPLICAS_TO_WRITE
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
@@ -10314,7 +10340,7 @@ async fn execute_command_inner(
                     let repl_ping_period = crate::replication::REPL_PING_PERIOD
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let all_configs: [(&str, String); 65] = [
+                    let all_configs: [(&str, String); 67] = [
                         ("port", port_str),
                         ("databases", crate::config::databases_count().to_string()),
                         ("loglevel", crate::log::loglevel().to_string()),
@@ -10427,6 +10453,8 @@ async fn execute_command_inner(
                         ),
                         ("replica-read-only", ro.to_string()),
                         ("slave-read-only", ro.to_string()),
+                        ("replica-ignore-maxmemory", ignore_maxmem.to_string()),
+                        ("slave-ignore-maxmemory", ignore_maxmem.to_string()),
                         ("min-replicas-to-write", min_replicas.clone()),
                         ("min-slaves-to-write", min_replicas),
                         ("min-replicas-max-lag", min_replicas_lag.clone()),
@@ -10515,6 +10543,9 @@ async fn execute_command_inner(
                             "busy-reply-threshold" | "lua-time-limit" => "lua-time-limit",
                             "slaveof" | "replicaof" => "replicaof",
                             "slave-read-only" | "replica-read-only" => "replica-read-only",
+                            "slave-ignore-maxmemory" | "replica-ignore-maxmemory" => {
+                                "replica-ignore-maxmemory"
+                            }
                             "min-slaves-to-write" | "min-replicas-to-write" => {
                                 "min-replicas-to-write"
                             }
@@ -10613,8 +10644,13 @@ async fn execute_command_inner(
                                 );
                                 return false;
                             }
-                        } else if matches!(p_str.as_str(), "replica-read-only" | "slave-read-only")
-                        {
+                        } else if matches!(
+                            p_str.as_str(),
+                            "replica-read-only"
+                                | "slave-read-only"
+                                | "replica-ignore-maxmemory"
+                                | "slave-ignore-maxmemory"
+                        ) {
                             if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
                                 out.extend_from_slice(
                                     format!(
@@ -26468,6 +26504,40 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `replica-ignore-maxmemory` (alias `slave-…`) defaults to yes and only
+    /// exempts a replica from `maxmemory`: a master keeps enforcing it, and
+    /// `no` makes a replica enforce it too.
+    #[test]
+    fn test_replica_ignore_maxmemory_gates_only_replicas() {
+        use std::sync::atomic::Ordering;
+        const PORT: u16 = 65011;
+        assert!(
+            REPLICA_IGNORE_MAXMEMORY.load(Ordering::Relaxed),
+            "default yes"
+        );
+        assert!(!maxmemory_ignored_as_replica(PORT), "a master enforces it");
+
+        let hub = crate::replication::get_replication_hub(PORT);
+        crate::replication::HAS_SLAVE_INSTANCE.store(true, Ordering::Release);
+        hub.is_slave_atomic.store(true, Ordering::Release);
+        assert!(maxmemory_ignored_as_replica(PORT));
+
+        assert_eq!(
+            apply_config_value(PORT, PORT, "slave-ignore-maxmemory", "no"),
+            Ok(true)
+        );
+        assert!(!maxmemory_ignored_as_replica(PORT), "`no` enforces it");
+        assert!(apply_config_value(PORT, PORT, "replica-ignore-maxmemory", "maybe").is_err());
+        assert!(!REPLICA_IGNORE_MAXMEMORY.load(Ordering::Relaxed));
+        assert_eq!(
+            apply_config_value(PORT, PORT, "replica-ignore-maxmemory", "YES"),
+            Ok(true)
+        );
+        assert!(maxmemory_ignored_as_replica(PORT));
+        hub.is_slave_atomic.store(false, Ordering::Release);
+        assert!(!maxmemory_ignored_as_replica(PORT));
+    }
 
     /// Client handlers run under `catch_unwind`; with std locks a panic
     /// while holding a global lock poisoned it and every later `.lock()
