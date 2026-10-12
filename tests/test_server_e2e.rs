@@ -25198,3 +25198,81 @@ fn test_allkeys_lfu_keeps_frequently_used_keys_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+/// With several shards, eviction must come off every shard evenly. It used
+/// to drain the shard running the commands (hot keys included) while other
+/// shards held cold data, because each shard's share ignored memory no
+/// shard owns. Checked with LFU: the balancing is the same for every
+/// policy, and LRU's one-second clock (as Redis's) can't rank keys written
+/// within the same second, which this whole run fits in.
+#[test]
+fn test_eviction_spreads_across_shards_and_keeps_hot_keys_e2e() {
+    for (port, policy) in [(17966u16, "allkeys-lfu")] {
+        let ps = port.to_string();
+        let mut child = spawn_rudis_listening(&["--port", &ps, "--threads", "4", "--no-pin"], port);
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-policy", policy]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "lfu-log-factor", "0"]),
+            "+OK\r\n"
+        );
+        let val = "x".repeat(1000);
+        let mut hot_misses = 0;
+        let mut touch_hot = |c: &mut TcpStream| {
+            for i in 0..100 {
+                if !resp_cmd(c, &["GET", &format!("hot:{i}")]).starts_with("$1000") {
+                    hot_misses += 1;
+                }
+            }
+        };
+        for i in 0..100 {
+            assert_eq!(
+                resp_cmd(&mut c, &["SET", &format!("hot:{i}"), &val]),
+                "+OK\r\n"
+            );
+        }
+        for _ in 0..50 {
+            touch_hot(&mut c);
+        }
+        let used = info_u64(&mut c, "memory", "used_memory");
+        assert_eq!(
+            resp_cmd(
+                &mut c,
+                &[
+                    "CONFIG",
+                    "SET",
+                    "maxmemory",
+                    &(used + 4_000_000).to_string()
+                ]
+            ),
+            "+OK\r\n"
+        );
+        // Cold keys well past the limit; the hot set stays in use throughout.
+        for i in 0..12_000 {
+            let r = resp_cmd(&mut c, &["SET", &format!("cold:{i}"), &val]);
+            assert!(r == "+OK\r\n" || r.starts_with("-OOM"), "{r}");
+            if i % 500 == 499 {
+                touch_hot(&mut c);
+            }
+        }
+        assert!(info_u64(&mut c, "stats", "evicted_keys") > 4000, "{policy}");
+        let hot_alive = (0..100)
+            .filter(|i| resp_cmd(&mut c, &["EXISTS", &format!("hot:{i}")]) == ":1\r\n")
+            .count();
+        eprintln!("{policy}: {hot_alive}/100 hot keys alive, {hot_misses} hot GET misses");
+        assert!(
+            hot_alive >= 95,
+            "{policy}: only {hot_alive}/100 hot keys survived"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "0"]),
+            "+OK\r\n"
+        );
+        drop(c);
+        shutdown_and_wait(port, &mut child);
+    }
+}

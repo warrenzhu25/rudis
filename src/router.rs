@@ -1025,15 +1025,32 @@ impl Router {
             return true;
         }
         let target = eviction_target(max_mem);
-        let share = (target / self.num_shards.max(1)).max(1);
-        let floors: &[usize] = if self.num_shards <= 1 {
-            &[0]
+        // Each shard's fair share, in the units shards report their size in
+        // (the table's estimate). Estimates leave out memory no shard owns
+        // (connection buffers, shared structures), so `target / shards`
+        // would let every shard keep more than fits together: one shard sat
+        // at that share while the shard running the command evicted its own
+        // keys, hot ones included, to cover the rest. Instead scale the
+        // current estimates by `target / real total`, so the excess comes off
+        // every shard alike, and recompute with fresh numbers if a round
+        // wasn't enough. Only then may shards go below an even split (e.g.
+        // volatile-* with TTL keys on a few shards).
+        let fair_share = || {
+            let real_total = self.real_used_total().max(1);
+            let est_total = self.tier_stats.published_used_total(None);
+            let est_target = (est_total as u128 * target as u128 / real_total as u128) as usize;
+            (est_target.min(target) / self.num_shards.max(1)).max(1)
+        };
+        const FAIR_ROUNDS: usize = 3;
+        let rounds = if self.num_shards <= 1 {
+            1
         } else {
-            &[share, 0]
+            FAIR_ROUNDS + 1
         };
         let regrowth = (max_mem / 1024).max(1024);
         let total = || self.real_used_total();
-        for &floor in floors {
+        for round in 0..rounds {
+            let floor = if round + 1 < rounds { fair_share() } else { 0 };
             let (under, track) = crate::connection::with_evict_capture(client_id, || {
                 self.evict_local_until_under(policy, floor)
             });
