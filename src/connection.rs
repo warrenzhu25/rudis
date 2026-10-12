@@ -9914,19 +9914,22 @@ async fn execute_command(
         .get(&client_id)
         .map(|c| c.db)
         .unwrap_or_else(|| CURRENT_DB.get());
+    let fut = execute_command_inner(
+        cmd,
+        router,
+        client_id,
+        client_registry,
+        out,
+        asking,
+        authenticated,
+        auth_user,
+    );
+    #[cfg(debug_assertions)]
+    let fut = Box::pin(fut);
     WithCurrentDb {
         router,
         db: initial_db,
-        fut: execute_command_inner(
-            cmd,
-            router,
-            client_id,
-            client_registry,
-            out,
-            asking,
-            authenticated,
-            auth_user,
-        ),
+        fut,
     }
     .await
     .1
@@ -25969,25 +25972,28 @@ async fn execute_commands_squashed(
         .get(&client_id)
         .map(|c| c.db)
         .unwrap_or_else(|| CURRENT_DB.get());
+    let fut = execute_commands_squashed_inner(
+        commands,
+        has_special,
+        router,
+        responders,
+        remote_batches,
+        items_pool,
+        results_pool,
+        responses,
+        client_id,
+        client_registry,
+        out,
+        asking,
+        authenticated,
+        auth_user,
+    );
+    #[cfg(debug_assertions)]
+    let fut = Box::pin(fut);
     WithCurrentDb {
         router,
         db: initial_db,
-        fut: execute_commands_squashed_inner(
-            commands,
-            has_special,
-            router,
-            responders,
-            remote_batches,
-            items_pool,
-            results_pool,
-            responses,
-            client_id,
-            client_registry,
-            out,
-            asking,
-            authenticated,
-            auth_user,
-        ),
+        fut,
     }
     .await
     .1

@@ -433,4 +433,75 @@ mod tests {
         let junk = metrics_http_response(b"\r\n\r\n", || not_metrics(""));
         assert!(junk.starts_with(b"HTTP/1.1 405 "));
     }
+
+    #[test]
+    fn test_perf_regression_gate_validates_throughput_and_latency_invariants() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = repo_root.join("scripts/check_perf_regression.py");
+        let default_json = repo_root.join("benchmark_perf_counters.json");
+
+        // 1. Committed baseline passes hardware counter, throughput, and latency gates.
+        let ok_out = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(&default_json)
+            .output()
+            .expect("run check_perf_regression.py");
+        assert!(
+            ok_out.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&ok_out.stdout),
+            String::from_utf8_lossy(&ok_out.stderr)
+        );
+
+        // 2. Throughput floor violation fails the gate.
+        let tmp_dir = std::env::temp_dir().join(format!("rudis_perf_gate_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let bad_tput_json = tmp_dir.join("bad_tput.json");
+        std::fs::write(
+            &bad_tput_json,
+            r#"{
+              "GET": {
+                "page-faults": {"per_op_median": 0.0},
+                "context-switches": {"per_op_median": 0.0},
+                "_ops_sec_median": 500000.0,
+                "_avg_latency_ms_median": 0.25,
+                "_p99_latency_ms_median": 0.80,
+                "_p999_latency_ms_median": 2.50
+              }
+            }"#,
+        )
+        .unwrap();
+        let bad_tput = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(&bad_tput_json)
+            .output()
+            .unwrap();
+        assert!(!bad_tput.status.success());
+        assert!(String::from_utf8_lossy(&bad_tput.stdout).contains("GET throughput:"));
+
+        // 3. p99 tail latency ceiling violation fails the gate.
+        let bad_lat_json = tmp_dir.join("bad_lat.json");
+        std::fs::write(
+            &bad_lat_json,
+            r#"{
+              "SET": {
+                "context-switches": {"per_op_median": 0.0},
+                "_ops_sec_median": 3200000.0,
+                "_avg_latency_ms_median": 0.35,
+                "_p99_latency_ms_median": 5.50,
+                "_p999_latency_ms_median": 8.00
+              }
+            }"#,
+        )
+        .unwrap();
+        let bad_lat = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(&bad_lat_json)
+            .output()
+            .unwrap();
+        assert!(!bad_lat.status.success());
+        assert!(String::from_utf8_lossy(&bad_lat.stdout).contains("SET p99 latency:"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }

@@ -163,6 +163,7 @@ def run_client(extra_args):
         "--test-time", str(PERF_SECS),
         "--pipeline", "16",
         "--key-maximum", str(KEY_MAX),
+        "--print-percentiles", "50,90,95,99,99.9",
         "--hide-histogram",
         "--json-out-file", "/tmp/perfbench_client.json",
     ] + extra_args
@@ -171,9 +172,23 @@ def run_client(extra_args):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         with open("/tmp/perfbench_client.json") as f:
-            return float(json.load(f)["ALL STATS"]["Totals"]["Ops/sec"])
+            totals = json.load(f)["ALL STATS"]["Totals"]
+        pcts = totals.get("Percentile Latencies", {})
+        return {
+            "ops_sec": float(totals.get("Ops/sec", 0.0)),
+            "avg_latency_ms": float(totals.get("Average Latency", totals.get("Latency", 0.0))),
+            "p50_latency_ms": float(pcts.get("p50.00", pcts.get("50.000", 0.0))),
+            "p99_latency_ms": float(pcts.get("p99.00", pcts.get("99.000", 0.0))),
+            "p999_latency_ms": float(pcts.get("p99.90", pcts.get("99.900", 0.0))),
+        }
     except Exception:
-        return 0.0
+        return {
+            "ops_sec": 0.0,
+            "avg_latency_ms": 0.0,
+            "p50_latency_ms": 0.0,
+            "p99_latency_ms": 0.0,
+            "p999_latency_ms": 0.0,
+        }
 
 
 def parse_perf(stderr_text):
@@ -245,7 +260,8 @@ def measure(name, spec):
             except Exception:
                 pass
 
-            ops_sec = run_client(spec["args"])
+            client_stats = run_client(spec["args"])
+            ops_sec = client_stats["ops_sec"]
             counters = {}
             if perf:
                 try:
@@ -271,6 +287,10 @@ def measure(name, spec):
                 continue
             samples.append({
                 "ops_sec": ops_sec,
+                "avg_latency_ms": client_stats["avg_latency_ms"],
+                "p50_latency_ms": client_stats["p50_latency_ms"],
+                "p99_latency_ms": client_stats["p99_latency_ms"],
+                "p999_latency_ms": client_stats["p999_latency_ms"],
                 "per_op": {k: v / total_ops for k, v in counters.items()},
             })
         return samples
@@ -294,17 +314,37 @@ def check_regressions(results, baseline_path):
         if wl not in results:
             continue
         cur_data = results[wl]
+        cur_ops = cur_data.get("_ops_sec_median", 0.0)
+        cur_avg_lat = cur_data.get("_avg_latency_ms_median", 0.0)
+        cur_p99_lat = cur_data.get("_p99_latency_ms_median", 0.0)
+        cur_p999_lat = cur_data.get("_p999_latency_ms_median", 0.0)
         if wl == "GET":
             cur_pf = cur_data.get("page-faults", {}).get("per_op_median", 0.0)
             cur_cs = cur_data.get("context-switches", {}).get("per_op_median", 0.0)
             if cur_pf > 0.01:
-                regressions.append(f"GET page-faults regression: {cur_pf:.4f} /op (expected ~0.0)")
+                regressions.append(f"GET page-faults regression: {cur_pf:.4f} /op (expected <= 0.01)")
             if cur_cs > 0.01:
-                regressions.append(f"GET context-switches regression: {cur_cs:.4f} /op (expected ~0.0)")
+                regressions.append(f"GET context-switches regression: {cur_cs:.4f} /op (expected <= 0.01)")
+            if cur_ops < 2630000:
+                regressions.append(f"GET throughput regression: {cur_ops:,.0f} ops/s (expected >= 2,630,000)")
+            if cur_avg_lat > 1.2:
+                regressions.append(f"GET avg latency regression: {cur_avg_lat:.3f} ms (expected <= 1.200 ms)")
+            if cur_p99_lat > 2.9:
+                regressions.append(f"GET p99 latency regression: {cur_p99_lat:.3f} ms (expected <= 2.900 ms)")
+            if cur_p999_lat > 15.0:
+                regressions.append(f"GET p99.9 latency regression: {cur_p999_lat:.3f} ms (expected <= 15.000 ms)")
         elif wl == "SET":
             cur_cs = cur_data.get("context-switches", {}).get("per_op_median", 0.0)
             if cur_cs > 0.01:
-                regressions.append(f"SET context-switches regression: {cur_cs:.4f} /op (expected ~0.0)")
+                regressions.append(f"SET context-switches regression: {cur_cs:.4f} /op (expected <= 0.01)")
+            if cur_ops < 2630000:
+                regressions.append(f"SET throughput regression: {cur_ops:,.0f} ops/s (expected >= 2,630,000)")
+            if cur_avg_lat > 1.2:
+                regressions.append(f"SET avg latency regression: {cur_avg_lat:.3f} ms (expected <= 1.200 ms)")
+            if cur_p99_lat > 2.9:
+                regressions.append(f"SET p99 latency regression: {cur_p99_lat:.3f} ms (expected <= 2.900 ms)")
+            if cur_p999_lat > 15.0:
+                regressions.append(f"SET p99.9 latency regression: {cur_p999_lat:.3f} ms (expected <= 15.000 ms)")
 
     if regressions:
         print("\n" + "=" * 80)
@@ -314,7 +354,7 @@ def check_regressions(results, baseline_path):
         print("=" * 80)
         return 1
     else:
-        print("\n[+] Performance regression gate passed: zero hardware counter regressions detected.")
+        print("\n[+] Performance regression gate passed: zero hardware counter, throughput, or latency regressions detected.")
         return 0
 
 
@@ -358,8 +398,19 @@ def main():
             print(f"    {event:<18} {med:>14.2f} /op   (CV {cv:>5.1f}%)")
 
         ops = [s["ops_sec"] for s in samples]
-        agg["_ops_sec_median"] = statistics.median(ops)
-        print(f"    {'(throughput)':<18} {statistics.median(ops):>14,.0f} ops/s")
+        avg_lats = [s["avg_latency_ms"] for s in samples]
+        p50_lats = [s["p50_latency_ms"] for s in samples]
+        p99_lats = [s["p99_latency_ms"] for s in samples]
+        p999_lats = [s["p999_latency_ms"] for s in samples]
+        agg["_ops_sec_median"] = round(statistics.median(ops), 2)
+        agg["_avg_latency_ms_median"] = round(statistics.median(avg_lats), 3)
+        agg["_p50_latency_ms_median"] = round(statistics.median(p50_lats), 3)
+        agg["_p99_latency_ms_median"] = round(statistics.median(p99_lats), 3)
+        agg["_p999_latency_ms_median"] = round(statistics.median(p999_lats), 3)
+        print(f"    {'(throughput)':<18} {agg['_ops_sec_median']:>14,.0f} ops/s")
+        print(f"    {'(avg latency)':<18} {agg['_avg_latency_ms_median']:>14.3f} ms")
+        print(f"    {'(p99 latency)':<18} {agg['_p99_latency_ms_median']:>14.3f} ms")
+        print(f"    {'(p99.9 latency)':<18} {agg['_p999_latency_ms_median']:>14.3f} ms")
         results[name] = agg
 
     with open(out, "w") as f:

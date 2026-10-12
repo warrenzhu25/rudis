@@ -26406,3 +26406,36 @@ fn test_commandlog_lolwut_and_sentinel_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_perf_regression_gate_live_and_static_e2e() {
+    let port = 17980u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo_root.join("scripts/check_perf_regression.py");
+    let out = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--live")
+        .arg("--attach")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--duration")
+        .arg("0.2")
+        .arg("--live-throughput-floor")
+        .arg("5000")
+        .output()
+        .expect("run check_perf_regression.py --live --attach");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "live perf gate failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("LIVE-SET"), "{stdout}");
+    assert!(stdout.contains("LIVE-GET"), "{stdout}");
+    assert!(stdout.contains("GATE SUCCESS"), "{stdout}");
+
+    shutdown_and_wait(port, &mut srv);
+}
