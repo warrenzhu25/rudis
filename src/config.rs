@@ -921,6 +921,11 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
     if ann_port != 0 {
         directives.insert("replica-announce-port".to_string(), ann_port.to_string());
     }
+    let cluster_hub = crate::cluster::get_cluster_hub(port);
+    let cluster_cfg_name = cluster_hub.config_file_name();
+    if cluster_cfg_name != "nodes.conf" {
+        directives.insert("cluster-config-file".to_string(), cluster_cfg_name);
+    }
 
     // Directives written as a whole, replacing every line of theirs (and
     // of their aliases): `save` may span lines, and `replicaof` goes away

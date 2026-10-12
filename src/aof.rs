@@ -947,6 +947,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             serialized,
             replace,
             absttl,
+            ..
         } => {
             let mut num_args = 4;
             if *replace {
@@ -4945,7 +4946,6 @@ mod tests {
         const NOT_IMPLEMENTED: &[(&str, &str)] = &[
             ("delifeq", "DELIFEQ k v"),
             ("cluster|flushslot", "CLUSTER FLUSHSLOT 0"),
-            ("restore-asking", "RESTORE-ASKING k 0 payload"),
         ];
         let samples: &[&str] = &[
             "APPEND k v",
@@ -5035,6 +5035,7 @@ mod tests {
             "RENAME a b",
             "RENAMENX a b",
             "RESTORE k 0 payload",
+            "RESTORE-ASKING k 0 payload",
             "RPOP l",
             "RPOPLPUSH a b",
             "RPUSH l a",

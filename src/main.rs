@@ -300,13 +300,41 @@ fn main() {
     let num_shards = server_config.threads.unwrap_or_else(|| num_cores.min(8));
 
     let cluster_enabled = server_config.cluster_enabled;
-    if cluster_enabled {
+    {
         let hub = rudis::cluster::get_cluster_hub(port);
-        hub.cluster_enabled
-            .store(true, std::sync::atomic::Ordering::Release);
-        rudis::cluster::HAS_ACTIVE_CLUSTER.store(true, std::sync::atomic::Ordering::Release);
-        hub.num_shards
-            .store(num_shards, std::sync::atomic::Ordering::Release);
+        let cfg_name = server_config
+            .extra_directives
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cluster-config-file"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("nodes.conf");
+        let cfg_path = if std::path::Path::new(cfg_name).is_absolute() {
+            std::path::PathBuf::from(cfg_name)
+        } else {
+            server_config.dir.join(cfg_name)
+        };
+        hub.set_config_file(cfg_path.clone());
+        if cluster_enabled {
+            hub.cluster_enabled
+                .store(true, std::sync::atomic::Ordering::Release);
+            rudis::cluster::HAS_ACTIVE_CLUSTER.store(true, std::sync::atomic::Ordering::Release);
+            hub.num_shards
+                .store(num_shards, std::sync::atomic::Ordering::Release);
+            match hub.load_config(&cfg_path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = hub.save_config();
+                }
+                Err(e) => {
+                    log_warning!(
+                        "Failed loading cluster config {}: {}",
+                        cfg_path.display(),
+                        e
+                    );
+                }
+            }
+        }
     }
 
     // Like Redis, refuse to start on a port something already listens on;

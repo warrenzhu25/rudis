@@ -3222,6 +3222,19 @@ pub fn apply_config_value(
                 .announce_port
                 .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
         }
+        "cluster-config-file" => {
+            if val_str.is_empty() {
+                return Err("Invalid cluster-config-file".to_string());
+            }
+            let hub = crate::cluster::get_cluster_hub(base_port);
+            let new_path = hub
+                .config_file
+                .read()
+                .as_ref()
+                .and_then(|p| p.parent().map(|dir| dir.join(val_str)))
+                .unwrap_or_else(|| std::path::PathBuf::from(val_str));
+            hub.set_config_file(new_path);
+        }
         "masterauth" => crate::replication::set_masterauth(port, val_str),
         "masteruser" => crate::replication::set_masteruser(port, val_str),
         "jemalloc-bg-thread" => {
@@ -7641,7 +7654,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::PfdebugSimd(_) => "PFDEBUG",
         Command::Pfselftest => "PFSELFTEST",
         Command::Dump(_) => "DUMP",
-        Command::Restore { .. } => "RESTORE",
+        Command::Restore { asking: true, .. } => "RESTORE-ASKING",
+        Command::Restore { asking: false, .. } => "RESTORE",
         Command::Xadd { .. } => "XADD",
         Command::Xlen(_) => "XLEN",
         Command::Xrange { .. } => "XRANGE",
@@ -9214,7 +9228,7 @@ async fn execute_command_inner(
         return false;
     }
 
-    let is_asking = *asking;
+    let is_asking = *asking || matches!(cmd, Command::Restore { asking: true, .. });
     *asking = false;
 
     if router.cluster_enabled {
@@ -9885,8 +9899,7 @@ async fn execute_command_inner(
         }
         Command::Exists(keys) => {
             if keys.len() == 1 {
-                let (target, hash) =
-                    crate::router::target_shard_and_hash(&keys[0], router.num_shards);
+        let (target, hash) = router.target_shard_and_hash(&keys[0]);
                 let exists = if target == router.shard_id {
                     router
                         .local_db
@@ -10889,8 +10902,12 @@ async fn execute_command_inner(
                         .announce_port
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let all_configs: [(&str, String); 82] = [
+                    let all_configs: [(&str, String); 83] = [
                         ("port", port_str),
+                        (
+                            "cluster-config-file",
+                            crate::cluster::get_cluster_hub(router.base_port).config_file_name(),
+                        ),
                         ("acllog-max-len", acllog_max_len),
                         ("acl-pubsub-default", acl_pubsub_default),
                         ("aclfile", aclfile_str),
@@ -11960,7 +11977,11 @@ async fn execute_command_inner(
                     }
                 },
                 ClusterSubcommand::SaveConfig => {
-                    out.extend_from_slice(b"+OK\r\n");
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
+                    match hub.save_config() {
+                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+                    }
                 }
                 ClusterSubcommand::BumpEpoch => {
                     let hub = crate::cluster::get_cluster_hub(router.port);
@@ -11973,6 +11994,13 @@ async fn execute_command_inner(
                         Ok(()) => out.extend_from_slice(b"+OK\r\n"),
                         Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
                     }
+                }
+                ClusterSubcommand::FlushSlots => {
+                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    hub.my_slots.write().clear();
+                    hub.slot_states.write().clear();
+                    let _ = hub.save_config();
+                    out.extend_from_slice(b"+OK\r\n");
                 }
             }
             false
@@ -21465,6 +21493,7 @@ pub fn execute_local_command(
                 serialized,
                 replace,
                 absttl,
+                ..
             } => {
                 let prev_type = if *replace {
                     Some(db.type_of(key.as_ref()))
@@ -25842,7 +25871,8 @@ async fn execute_commands_squashed_inner(
         };
         let my_slots_guard = hub.as_ref().map(|h| h.my_slots.read());
         let is_cluster = router.cluster_enabled || my_slots_guard.is_some();
-        if has_special || user.is_some() || is_cluster {
+        let has_dynamic_owners = !router.slot_owners.borrow().is_empty();
+        if has_special || user.is_some() || is_cluster || has_dynamic_owners {
             for cmd in commands.iter() {
                 if is_special_pipeline_cmd(cmd) {
                     can_squash = false;
@@ -25854,27 +25884,43 @@ async fn execute_commands_squashed_inner(
                     can_squash = false;
                     break;
                 }
-                if is_cluster {
+                if is_cluster || has_dynamic_owners {
                     let mut first_slot: Option<u16> = None;
+                    let mut first_shard: Option<usize> = None;
                     let mut invalid_slot = false;
                     let mut has_keys = false;
                     for_each_cmd_key(cmd, |k| {
                         has_keys = true;
                         let slot = key_slot(k);
                         if let Some(fs) = first_slot {
-                            if fs != slot {
+                            if is_cluster && fs != slot {
                                 invalid_slot = true;
                             }
                         } else {
                             first_slot = Some(slot);
                         }
-                        if router.get_slot_state(slot) != crate::shard::SlotState::Stable {
-                            invalid_slot = true;
+                        if has_dynamic_owners {
+                            let shard = router.target_shard_for_slot(slot);
+                            if let Some(fsh) = first_shard {
+                                if fsh != shard
+                                    && !matches!(cmd, Command::Mget(_) | Command::Mset(_))
+                                {
+                                    invalid_slot = true;
+                                }
+                            } else {
+                                first_shard = Some(shard);
+                            }
                         }
-                        if let Some(my_slots) = &my_slots_guard {
-                            let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
-                            if !owns_slot {
+                        if is_cluster {
+                            if router.get_slot_state(slot) != crate::shard::SlotState::Stable {
                                 invalid_slot = true;
+                            }
+                            if let Some(my_slots) = &my_slots_guard {
+                                let owns_slot =
+                                    my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
+                                if !owns_slot {
+                                    invalid_slot = true;
+                                }
                             }
                         }
                     });
@@ -25882,7 +25928,8 @@ async fn execute_commands_squashed_inner(
                         can_squash = false;
                         break;
                     }
-                    if !has_keys
+                    if is_cluster
+                        && !has_keys
                         && !matches!(
                             cmd,
                             Command::Ping(_)
@@ -25965,7 +26012,13 @@ async fn execute_commands_squashed_inner(
         if cmd.is_write_command() && !dirty_counted_on_change(&cmd) {
             crate::snapshot::note_write();
         }
-        if let Some((target, key_hash)) = target_shard_and_hash_of_cmd(&cmd, router.num_shards) {
+        if let Some((mut target, key_hash)) = target_shard_and_hash_of_cmd(&cmd, router.num_shards)
+        {
+            if !router.slot_owners.borrow().is_empty()
+                && let Some(k) = cmd_primary_key(&cmd)
+            {
+                target = router.target_shard(k);
+            }
             stat_run.note(get_cmd_name(&cmd));
             if target == router.shard_id {
                 local_buf.clear();
@@ -26854,6 +26907,7 @@ async fn move_key_across_shards(
                 serialized: payload,
                 replace: true,
                 absttl: expire_at > 0,
+                asking: false,
             },
         )
         .await;

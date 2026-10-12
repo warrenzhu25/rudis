@@ -74,6 +74,7 @@ pub enum ClusterSubcommand {
     SaveConfig,
     BumpEpoch,
     SetConfigEpoch(u64),
+    FlushSlots,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -980,6 +981,7 @@ pub enum Command {
         serialized: Bytes,
         replace: bool,
         absttl: bool,
+        asking: bool,
     },
     // STREAM COMMANDS
     Xadd {
@@ -4189,6 +4191,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "SAVECONFIG" => Ok(Some(Command::Cluster(ClusterSubcommand::SaveConfig))),
                 "BUMPEPOCH" => Ok(Some(Command::Cluster(ClusterSubcommand::BumpEpoch))),
+                "FLUSHSLOTS" => Ok(Some(Command::Cluster(ClusterSubcommand::FlushSlots))),
                 "SET-CONFIG-EPOCH" | "SETCONFIGEPOCH" => {
                     if args.len() < 3 {
                         return Err(
@@ -7562,9 +7565,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Dump(args[1].clone())))
         }
-        "RESTORE" => {
+        cmd_name @ ("RESTORE" | "RESTORE-ASKING") => {
             if args.len() < 4 {
-                return Err("wrong number of arguments for 'restore' command".to_string());
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let key = args[1].clone();
             let ttl_ms: u64 = std::str::from_utf8(&args[2])
@@ -7574,6 +7580,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let serialized = args[3].clone();
             let mut replace = false;
             let mut absttl = false;
+            let mut asking = cmd_name == "RESTORE-ASKING";
             let mut i = 4;
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
@@ -7584,6 +7591,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     "ABSTTL" => {
                         absttl = true;
+                        i += 1;
+                    }
+                    "ASKING" => {
+                        asking = true;
                         i += 1;
                     }
                     "IDLETIME" | "FREQ" => {
@@ -7601,6 +7612,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 serialized,
                 replace,
                 absttl,
+                asking,
             }))
         }
         "XADD" => {
@@ -14807,6 +14819,7 @@ mod tests {
                 serialized: Bytes::from_static(b"data"),
                 replace: false,
                 absttl: false,
+                asking: false,
             }
         );
 
@@ -14822,6 +14835,23 @@ mod tests {
                 serialized: Bytes::from_static(b"data"),
                 replace: true,
                 absttl: true,
+                asking: false,
+            }
+        );
+
+        // RESTORE-ASKING
+        let mut buf = BytesMut::from(
+            "*5\r\n$14\r\nRESTORE-ASKING\r\n$5\r\nmykey\r\n$1\r\n0\r\n$4\r\ndata\r\n$7\r\nREPLACE\r\n",
+        );
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Restore {
+                key: Bytes::from_static(b"mykey"),
+                ttl_ms: 0,
+                serialized: Bytes::from_static(b"data"),
+                replace: true,
+                absttl: false,
+                asking: true,
             }
         );
     }

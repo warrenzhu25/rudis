@@ -130,6 +130,7 @@ pub struct ClusterHub {
     pub slot_states: RwLock<HashMap<u16, (String, String)>>,
     pub cluster_enabled: AtomicBool,
     pub num_shards: std::sync::atomic::AtomicUsize,
+    pub config_file: RwLock<Option<std::path::PathBuf>>,
 }
 
 pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
@@ -221,7 +222,185 @@ impl ClusterHub {
             slot_states: RwLock::new(HashMap::new()),
             cluster_enabled: AtomicBool::new(false),
             num_shards: std::sync::atomic::AtomicUsize::new(1),
+            config_file: RwLock::new(None),
         }
+    }
+
+    pub fn set_config_file(&self, path: std::path::PathBuf) {
+        *self.config_file.write() = Some(path);
+    }
+
+    pub fn config_file_name(&self) -> String {
+        self.config_file
+            .read()
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "nodes.conf".to_string())
+    }
+
+    pub fn save_config(&self) -> Result<(), String> {
+        let path_opt = self.config_file.read().clone();
+        let Some(path) = path_opt else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut content = self.cluster_nodes();
+        content.push_str(&format!(
+            "vars currentEpoch {} lastVoteEpoch {}\n",
+            self.current_epoch.load(Ordering::Relaxed),
+            self.last_vote_epoch.load(Ordering::Relaxed)
+        ));
+        let tmp_path = path.with_extension(format!("tmp.{}", self.port));
+        std::fs::write(&tmp_path, content.as_bytes())
+            .map_err(|e| format!("Failed writing cluster config file: {}", e))?;
+        std::fs::rename(&tmp_path, &path)
+            .map_err(|e| format!("Failed renaming cluster config file: {}", e))?;
+        Ok(())
+    }
+
+    pub fn load_config(&self, path: &std::path::Path) -> Result<bool, String> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed reading cluster config file: {}", e))?;
+        let mut parsed_peers = HashMap::new();
+        let mut parsed_my_slots = Vec::new();
+        let mut parsed_slot_states = HashMap::new();
+        let mut saw_myself = false;
+
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+            if parts[0] == "vars" {
+                let mut i = 1;
+                while i + 1 < parts.len() {
+                    match parts[i] {
+                        "currentEpoch" => {
+                            if let Ok(v) = parts[i + 1].parse::<u64>() {
+                                self.current_epoch.store(v, Ordering::SeqCst);
+                            }
+                            i += 2;
+                        }
+                        "lastVoteEpoch" => {
+                            if let Ok(v) = parts[i + 1].parse::<u64>() {
+                                self.last_vote_epoch.store(v, Ordering::SeqCst);
+                            }
+                            i += 2;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                continue;
+            }
+            if parts.len() < 8 {
+                continue;
+            }
+            let id = parts[0].to_string();
+            let addr_part = parts[1];
+            let (ip_port, cport_opt) = match addr_part.split_once('@') {
+                Some((ip_p, cp)) => (ip_p, cp.parse::<u16>().ok()),
+                None => (addr_part, None),
+            };
+            let (ip, port) = match ip_port.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(self.port)),
+                None => ("127.0.0.1".to_string(), self.port),
+            };
+            let cport = cport_opt.unwrap_or_else(|| port.saturating_add(10000));
+            let flags = parts[2].to_string();
+            let master_id = parts[3].to_string();
+            let ping_sent = parts[4].parse::<u64>().unwrap_or(0);
+            let pong_recv = parts[5].parse::<u64>().unwrap_or(0);
+            let config_epoch = parts[6].parse::<u64>().unwrap_or(0);
+            let link_state = parts[7].to_string();
+
+            let mut node_slots = Vec::new();
+            for token in &parts[8..] {
+                if token.starts_with('[') && token.ends_with(']') {
+                    let inner = &token[1..token.len() - 1];
+                    if let Some((slot_str, target_id)) = inner.split_once("->-") {
+                        if let Ok(slot) = slot_str.parse::<u16>() {
+                            parsed_slot_states
+                                .insert(slot, ("migrating".to_string(), target_id.to_string()));
+                        }
+                    } else if let Some((slot_str, source_id)) = inner.split_once("-<-")
+                        && let Ok(slot) = slot_str.parse::<u16>()
+                    {
+                        parsed_slot_states
+                            .insert(slot, ("importing".to_string(), source_id.to_string()));
+                    }
+                } else if let Some((s_str, e_str)) = token.split_once('-') {
+                    if let (Ok(s), Ok(e)) = (s_str.parse::<u16>(), e_str.parse::<u16>()) {
+                        node_slots.push((s, e));
+                    }
+                } else if let Ok(s) = token.parse::<u16>() {
+                    node_slots.push((s, s));
+                }
+            }
+            compact_slots(&mut node_slots);
+
+            if flags.split(',').any(|f| f == "myself") {
+                saw_myself = true;
+                *self.my_id.write() = id;
+                let role = if flags.split(',').any(|f| f == "slave" || f == "replica") {
+                    "slave"
+                } else {
+                    "master"
+                };
+                *self.role.write() = role.to_string();
+                *self.master_id.write() = master_id;
+                self.config_epoch.store(config_epoch, Ordering::SeqCst);
+                self.current_epoch.fetch_max(config_epoch, Ordering::SeqCst);
+                parsed_my_slots = node_slots;
+            } else {
+                let clean_flags = flags
+                    .split(',')
+                    .filter(|&f| f != "myself")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                parsed_peers.insert(
+                    id.clone(),
+                    ClusterNodeInfo {
+                        id,
+                        ip,
+                        port,
+                        cport,
+                        flags: if clean_flags.is_empty() {
+                            "master".to_string()
+                        } else {
+                            clean_flags
+                        },
+                        master_id,
+                        ping_sent,
+                        pong_recv,
+                        config_epoch,
+                        link_state,
+                        slots: node_slots,
+                    },
+                );
+            }
+        }
+
+        if saw_myself {
+            *self.my_slots.write() = parsed_my_slots;
+            *self.slot_states.write() = parsed_slot_states;
+        }
+        if !parsed_peers.is_empty() {
+            *self.nodes.write() = parsed_peers;
+            self.has_nodes.store(true, Ordering::Release);
+        }
+        Ok(saw_myself)
     }
 
     pub fn my_id(&self) -> String {
@@ -241,6 +420,7 @@ impl ClusterHub {
             + 1;
         self.config_epoch.store(next, Ordering::SeqCst);
         self.current_epoch.fetch_max(next, Ordering::SeqCst);
+        let _ = self.save_config();
         next
     }
 
@@ -273,6 +453,7 @@ impl ClusterHub {
         }
         self.config_epoch.store(epoch, Ordering::SeqCst);
         self.current_epoch.fetch_max(epoch, Ordering::SeqCst);
+        let _ = self.save_config();
         Ok(())
     }
 
@@ -291,17 +472,20 @@ impl ClusterHub {
                 remove_slots(&mut my_slots, &[slot]);
             }
         }
-        let mut nodes = self.nodes.write();
-        for (id, node) in nodes.iter_mut() {
-            if id == owner_id {
-                if !node.slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
-                    node.slots.push((slot, slot));
-                    compact_slots(&mut node.slots);
+        {
+            let mut nodes = self.nodes.write();
+            for (id, node) in nodes.iter_mut() {
+                if id == owner_id {
+                    if !node.slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
+                        node.slots.push((slot, slot));
+                        compact_slots(&mut node.slots);
+                    }
+                } else if node.slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
+                    remove_slots(&mut node.slots, &[slot]);
                 }
-            } else if node.slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
-                remove_slots(&mut node.slots, &[slot]);
             }
         }
+        let _ = self.save_config();
     }
 
     /// The `PING` this node sends on the cluster bus.
@@ -384,13 +568,15 @@ impl ClusterHub {
         let cfg_epoch = self.config_epoch.load(Ordering::Relaxed);
         let is_cluster = self.cluster_enabled.load(Ordering::Relaxed);
         let num_shards = self.num_shards.load(Ordering::Relaxed).max(1);
-        let my_slots_str = if is_cluster && self.nodes.read().is_empty() {
+        let my_slots_snapshot = self.my_slots.read().clone();
+        let has_default_all_slots =
+            my_slots_snapshot.len() == 1 && my_slots_snapshot[0] == (0, 16383);
+        let my_slots_str = if is_cluster && self.nodes.read().is_empty() && has_default_all_slots {
             let end_slot = 16384 / num_shards - 1;
             format!(" 0-{}", end_slot)
         } else {
-            let my_slots = self.my_slots.read().clone();
             let mut s_str = String::new();
-            for (s, e) in &my_slots {
+            for (s, e) in &my_slots_snapshot {
                 if s == e {
                     s_str.push_str(&format!(" {}", s));
                 } else {
@@ -631,28 +817,37 @@ impl ClusterHub {
             }
         }
 
+        let _ = self.save_config();
         Ok(())
     }
 
     pub fn cluster_forget(&self, node_id: &str) -> Result<(), String> {
-        let mut nodes = self.nodes.write();
-        nodes.remove(node_id);
-        let mut pfail = self.pfail_reports.write();
-        pfail.remove(node_id);
-        for reports in pfail.values_mut() {
-            reports.remove(node_id);
+        {
+            let mut nodes = self.nodes.write();
+            nodes.remove(node_id);
         }
+        {
+            let mut pfail = self.pfail_reports.write();
+            pfail.remove(node_id);
+            for reports in pfail.values_mut() {
+                reports.remove(node_id);
+            }
+        }
+        let _ = self.save_config();
         Ok(())
     }
 
     pub fn cluster_replicate(&self, master_id: &str) -> Result<(), String> {
-        let nodes = self.nodes.read();
-        if !nodes.contains_key(master_id) {
-            return Err("ERR Unknown node".to_string());
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(master_id) {
+                return Err("ERR Unknown node".to_string());
+            }
         }
         *self.role.write() = "slave".to_string();
         *self.master_id.write() = master_id.to_string();
         self.my_slots.write().clear();
+        let _ = self.save_config();
         Ok(())
     }
 
@@ -682,24 +877,27 @@ impl ClusterHub {
         crate::replication::get_replication_hub(self.port).make_master();
 
         // Broadcast FAILOVER to all peers
-        let nodes = self.nodes.read();
-        for peer in nodes.values() {
-            let addr = format!("{}:{}", peer.ip, peer.cport);
-            if let Ok(mut stream) =
-                TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
-            {
-                let mut slots_repr = String::new();
-                for (s, e) in &inherited_slots {
-                    slots_repr.push_str(&format!("{}-{},", s, e));
+        {
+            let nodes = self.nodes.read();
+            for peer in nodes.values() {
+                let addr = format!("{}:{}", peer.ip, peer.cport);
+                if let Ok(mut stream) =
+                    TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
+                {
+                    let mut slots_repr = String::new();
+                    for (s, e) in &inherited_slots {
+                        slots_repr.push_str(&format!("{}-{},", s, e));
+                    }
+                    if slots_repr.ends_with(',') {
+                        slots_repr.pop();
+                    }
+                    let msg = format!("FAILOVER {} {} {}\r\n", my_id, new_epoch, slots_repr);
+                    let _ = stream.write_all(msg.as_bytes());
                 }
-                if slots_repr.ends_with(',') {
-                    slots_repr.pop();
-                }
-                let msg = format!("FAILOVER {} {} {}\r\n", my_id, new_epoch, slots_repr);
-                let _ = stream.write_all(msg.as_bytes());
             }
         }
 
+        let _ = self.save_config();
         Ok(())
     }
 
@@ -1025,20 +1223,26 @@ impl ClusterHub {
                 return Err(format!("ERR Slot {} out of range", s));
             }
         }
-        let mut my_slots = self.my_slots.write();
-        if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
-            my_slots.clear();
+        {
+            let mut my_slots = self.my_slots.write();
+            if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
+                my_slots.clear();
+            }
+            for &s in slots {
+                my_slots.push((s, s));
+            }
+            compact_slots(&mut my_slots);
         }
-        for &s in slots {
-            my_slots.push((s, s));
-        }
-        compact_slots(&mut my_slots);
+        let _ = self.save_config();
         Ok(())
     }
 
     pub fn cluster_delslots(&self, slots: &[u16]) -> Result<(), String> {
-        let mut my_slots = self.my_slots.write();
-        remove_slots(&mut my_slots, slots);
+        {
+            let mut my_slots = self.my_slots.write();
+            remove_slots(&mut my_slots, slots);
+        }
+        let _ = self.save_config();
         Ok(())
     }
 
@@ -1048,26 +1252,32 @@ impl ClusterHub {
                 return Err(format!("ERR Invalid slot range {}-{}", start, end));
             }
         }
-        let mut my_slots = self.my_slots.write();
-        if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
-            my_slots.clear();
+        {
+            let mut my_slots = self.my_slots.write();
+            if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
+                my_slots.clear();
+            }
+            for &(start, end) in ranges {
+                my_slots.push((start, end));
+            }
+            compact_slots(&mut my_slots);
         }
-        for &(start, end) in ranges {
-            my_slots.push((start, end));
-        }
-        compact_slots(&mut my_slots);
+        let _ = self.save_config();
         Ok(())
     }
 
     pub fn cluster_delslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
-        let mut my_slots = self.my_slots.write();
-        let mut to_remove = Vec::new();
-        for &(start, end) in ranges {
-            for s in start..=end {
-                to_remove.push(s);
+        {
+            let mut my_slots = self.my_slots.write();
+            let mut to_remove = Vec::new();
+            for &(start, end) in ranges {
+                for s in start..=end {
+                    to_remove.push(s);
+                }
             }
+            remove_slots(&mut my_slots, &to_remove);
         }
-        remove_slots(&mut my_slots, &to_remove);
+        let _ = self.save_config();
         Ok(())
     }
 
@@ -1537,6 +1747,7 @@ impl ClusterHub {
             *self.master_id.write() = "-".to_string();
             self.my_slots.write().clear();
         }
+        let _ = self.save_config();
         Ok(())
     }
 
@@ -2604,5 +2815,90 @@ mod tests {
         // The server hangs up without replying.
         assert!(matches!(c.read_to_end(&mut rest), Ok(0) | Err(_)));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn test_cluster_save_and_load_nodes_conf() {
+        let dir = std::env::temp_dir().join(format!(
+            "rudis_cluster_cfg_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("nodes-7600.conf");
+
+        let hub = ClusterHub::new(7600);
+        hub.set_config_file(cfg_path.clone());
+        assert_eq!(hub.config_file_name(), "nodes-7600.conf");
+        *hub.my_id.write() = "1111111111111111111111111111111111111111".to_string();
+        hub.current_epoch.store(12, Ordering::SeqCst);
+        hub.config_epoch.store(7, Ordering::SeqCst);
+        hub.last_vote_epoch.store(5, Ordering::SeqCst);
+        *hub.my_slots.write() = vec![(0, 5460), (10000, 10000)];
+        hub.slot_states.write().insert(
+            5460,
+            (
+                "migrating".to_string(),
+                "2222222222222222222222222222222222222222".to_string(),
+            ),
+        );
+        hub.slot_states.write().insert(
+            5461,
+            (
+                "importing".to_string(),
+                "2222222222222222222222222222222222222222".to_string(),
+            ),
+        );
+        hub.nodes.write().insert(
+            "2222222222222222222222222222222222222222".to_string(),
+            ClusterNodeInfo {
+                id: "2222222222222222222222222222222222222222".to_string(),
+                ip: "127.0.0.1".to_string(),
+                port: 7601,
+                cport: 17601,
+                flags: "master".to_string(),
+                master_id: "-".to_string(),
+                ping_sent: 0,
+                pong_recv: 0,
+                config_epoch: 9,
+                link_state: "connected".to_string(),
+                slots: vec![(5461, 9999), (10001, 16383)],
+            },
+        );
+        hub.has_nodes.store(true, Ordering::Release);
+        hub.save_config().unwrap();
+
+        let loaded = ClusterHub::new(7600);
+        assert!(loaded.load_config(&cfg_path).unwrap());
+        assert_eq!(loaded.my_id(), "1111111111111111111111111111111111111111");
+        assert_eq!(loaded.current_epoch.load(Ordering::Relaxed), 12);
+        assert_eq!(loaded.config_epoch.load(Ordering::Relaxed), 7);
+        assert_eq!(loaded.last_vote_epoch.load(Ordering::Relaxed), 5);
+        assert_eq!(*loaded.my_slots.read(), vec![(0, 5460), (10000, 10000)]);
+        assert_eq!(
+            loaded.slot_states.read().get(&5460),
+            Some(&(
+                "migrating".to_string(),
+                "2222222222222222222222222222222222222222".to_string()
+            ))
+        );
+        assert_eq!(
+            loaded.slot_states.read().get(&5461),
+            Some(&(
+                "importing".to_string(),
+                "2222222222222222222222222222222222222222".to_string()
+            ))
+        );
+        let peers = loaded.nodes.read();
+        let peer = peers
+            .get("2222222222222222222222222222222222222222")
+            .unwrap();
+        assert_eq!(peer.port, 7601);
+        assert_eq!(peer.cport, 17601);
+        assert_eq!(peer.config_epoch, 9);
+        assert_eq!(peer.slots, vec![(5461, 9999), (10001, 16383)]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -25732,3 +25732,217 @@ fn test_replica_announce_and_priority_e2e() {
     shutdown_and_wait(r_port, &mut replica);
     shutdown_and_wait(m_port, &mut master);
 }
+
+#[test]
+fn test_cluster_persistence_restore_asking_and_dynamic_slots_e2e() {
+    let port = 17974;
+    let port_s = port.to_string();
+    let dir = std::env::temp_dir().join(format!(
+        "rudis_cluster_e2e_{}_{}",
+        port,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap().to_string();
+
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--dir",
+            &dir_s,
+            "--cluster-enabled",
+            "yes",
+            "--threads",
+            "1",
+            "--no-pin",
+        ],
+        port,
+    );
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Verify default cluster-config-file and custom CONFIG SET
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "cluster-config-file"]),
+        "*2\r\n$19\r\ncluster-config-file\r\n$10\r\nnodes.conf\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "cluster-config-file", "nodes-17974.conf"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "cluster-config-file"]),
+        "*2\r\n$19\r\ncluster-config-file\r\n$16\r\nnodes-17974.conf\r\n"
+    );
+
+    let orig_id_resp = resp_cmd(&mut c, &["CLUSTER", "MYID"]);
+    let orig_id = orig_id_resp
+        .lines()
+        .nth(1)
+        .expect("CLUSTER MYID bulk line")
+        .to_string();
+    assert_eq!(orig_id.len(), 40);
+
+    // Restrict slots to 0..=100, bump epoch, and save config
+    assert_eq!(resp_cmd(&mut c, &["CLUSTER", "FLUSHSLOTS"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CLUSTER", "ADDSLOTSRANGE", "0", "100"]),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["CLUSTER", "BUMPEPOCH"]).starts_with("+BUMPED "));
+    assert_eq!(resp_cmd(&mut c, &["CLUSTER", "SAVECONFIG"]), "+OK\r\n");
+
+    let nodes_conf_path = dir.join("nodes-17974.conf");
+    assert!(nodes_conf_path.exists(), "nodes-17974.conf should exist");
+
+    // Test RESTORE-ASKING on an IMPORTING slot without prior ASKING command:
+    // Create a key in slot <= 100 or set slot of "k_mig" as IMPORTING.
+    assert_eq!(resp_cmd(&mut c, &["CLUSTER", "ADDSLOTS", "500"]), "+OK\r\n");
+    // Find a key that hashes to slot 500 or use a hash tag.
+    let slot_tag_resp = resp_cmd(&mut c, &["CLUSTER", "KEYSLOT", "{mig}key"]);
+    let mig_slot: u16 = slot_tag_resp
+        .trim()
+        .strip_prefix(':')
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CLUSTER", "ADDSLOTS", &mig_slot.to_string()]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["SET", "{mig}src", "hello_mig"]),
+        "+OK\r\n"
+    );
+    let dump_raw = {
+        use std::io::{Read, Write};
+        c.write_all(b"*2\r\n$4\r\nDUMP\r\n$8\r\n{mig}src\r\n")
+            .unwrap();
+        let mut hdr = [0u8; 64];
+        let mut pos = 0;
+        loop {
+            let n = c.read(&mut hdr[pos..pos + 1]).unwrap();
+            assert_eq!(n, 1);
+            pos += 1;
+            if pos >= 2 && &hdr[pos - 2..pos] == b"\r\n" {
+                break;
+            }
+        }
+        let len_str = std::str::from_utf8(&hdr[1..pos - 2]).unwrap();
+        let bulk_len: usize = len_str.parse().unwrap();
+        let mut payload = vec![0u8; bulk_len + 2];
+        c.read_exact(&mut payload).unwrap();
+        payload.truncate(bulk_len);
+        payload
+    };
+
+    // Mark mig_slot as IMPORTING from a peer node
+    let peer_id = "2222222222222222222222222222222222222222";
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &[
+                "CLUSTER",
+                "SETSLOT",
+                &mig_slot.to_string(),
+                "IMPORTING",
+                peer_id
+            ]
+        ),
+        "+OK\r\n"
+    );
+
+    // Plain RESTORE without ASKING on an IMPORTING slot returns -MOVED
+    {
+        use std::io::{Read, Write};
+        let mut frame = Vec::new();
+        frame.extend_from_slice(
+            format!(
+                "*4\r\n$7\r\nRESTORE\r\n$8\r\n{{mig}}dst\r\n$1\r\n0\r\n${}\r\n",
+                dump_raw.len()
+            )
+            .as_bytes(),
+        );
+        frame.extend_from_slice(&dump_raw);
+        frame.extend_from_slice(b"\r\n");
+        c.write_all(&frame).unwrap();
+        let mut buf = [0u8; 128];
+        let n = c.read(&mut buf).unwrap();
+        let reply = String::from_utf8_lossy(&buf[..n]);
+        assert!(reply.starts_with("-MOVED "), "expected -MOVED, got {reply}");
+    }
+
+    // RESTORE-ASKING without a preceding ASKING command succeeds on an IMPORTING slot
+    {
+        use std::io::{Read, Write};
+        let mut frame = Vec::new();
+        frame.extend_from_slice(
+            format!(
+                "*5\r\n$14\r\nRESTORE-ASKING\r\n$8\r\n{{mig}}dst\r\n$1\r\n0\r\n${}\r\n",
+                dump_raw.len()
+            )
+            .as_bytes(),
+        );
+        frame.extend_from_slice(&dump_raw);
+        frame.extend_from_slice(b"\r\n$7\r\nREPLACE\r\n");
+        c.write_all(&frame).unwrap();
+        let mut buf = [0u8; 128];
+        let n = c.read(&mut buf).unwrap();
+        let reply = String::from_utf8_lossy(&buf[..n]);
+        assert_eq!(reply, "+OK\r\n");
+    }
+
+    // Stabilize slot and verify restored value
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CLUSTER", "SETSLOT", &mig_slot.to_string(), "STABLE"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["GET", "{mig}dst"]),
+        "$9\r\nhello_mig\r\n"
+    );
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+
+    // Restart server with custom cluster-config-file in rudis.conf and verify state is reloaded
+    let conf_path = dir.join("rudis.conf");
+    std::fs::write(
+        &conf_path,
+        format!(
+            "port {}\ndir {}\ncluster-enabled yes\ncluster-config-file nodes-17974.conf\n",
+            port, dir_s
+        ),
+    )
+    .unwrap();
+
+    let mut srv2 = spawn_rudis_listening(
+        &[conf_path.to_str().unwrap(), "--threads", "1", "--no-pin"],
+        port,
+    );
+    let mut c2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let reloaded_id_resp = resp_cmd(&mut c2, &["CLUSTER", "MYID"]);
+    let reloaded_id = reloaded_id_resp.lines().nth(1).unwrap().to_string();
+    assert_eq!(reloaded_id, orig_id);
+
+    let nodes_out = resp_cmd(&mut c2, &["CLUSTER", "NODES"]);
+    assert!(nodes_out.contains(&orig_id), "{nodes_out}");
+    assert!(nodes_out.contains("0-100"), "{nodes_out}");
+
+    drop(c2);
+    shutdown_and_wait(port, &mut srv2);
+    let _ = std::fs::remove_dir_all(&dir);
+}

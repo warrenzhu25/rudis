@@ -427,7 +427,10 @@ impl Router {
     }
 
     pub fn target_shard(&self, key: &[u8]) -> usize {
-        if self.cluster_enabled || crate::cluster::has_active_cluster(self.port) {
+        if self.cluster_enabled
+            || !self.slot_owners.borrow().is_empty()
+            || crate::cluster::has_active_cluster(self.port)
+        {
             let slot = key_slot(key);
             self.target_shard_for_slot(slot)
         } else {
@@ -2365,7 +2368,7 @@ impl Router {
     }
 
     pub async fn del(&self, key: Bytes) -> bool {
-        let target = target_shard(&key, self.num_shards);
+        let target = self.target_shard(&key);
         if target == self.shard_id {
             self.del_local(key)
         } else {
@@ -2408,7 +2411,7 @@ impl Router {
     /// changed it since it was dumped. The check and the delete run on the
     /// owning shard in one step.
     pub async fn del_if_unchanged(&self, key: Bytes, payload: Bytes) -> bool {
-        let target = target_shard(&key, self.num_shards);
+        let target = self.target_shard(&key);
         if target == self.shard_id {
             self.del_if_unchanged_local(key, &payload)
         } else {
@@ -6957,6 +6960,79 @@ mod tests {
                 assert_eq!(router.bool_responder_pool.borrow().len(), 1);
                 let _ = round;
             }
+        });
+        drop(router);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn test_router_dynamic_slot_owners_del_and_exists() {
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
+
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9997)));
+        let router = Router::new(
+            0,
+            2,
+            9997,
+            db0.clone(),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        // Pick a key that statically hashes to shard 0, then dynamically reassign its slot to shard 1.
+        let mut k0 = Bytes::from_static(b"dyn_k_0");
+        for i in 0..1000 {
+            let candidate = Bytes::from(format!("dyn_k_{}", i));
+            if target_shard(&candidate, 2) == 0 {
+                k0 = candidate;
+                break;
+            }
+        }
+        let slot = crate::router::key_slot(&k0);
+        let mut owners = vec![0usize; 16384];
+        owners[slot as usize] = 1;
+        *router.slot_owners.borrow_mut() = owners;
+
+        let worker = std::thread::spawn(move || {
+            let mut remote_db = ShardDb::new(9997);
+            while let Ok(msg) = rx1.recv() {
+                match msg {
+                    ShardMessage::FastSet { descriptor } => {
+                        remote_db.set(
+                            descriptor.key.clone(),
+                            descriptor.value.clone(),
+                            descriptor.expire_in,
+                        );
+                        descriptor.finish();
+                    }
+                    ShardMessage::Exists { db, key, responder } => {
+                        remote_db.select_db(db);
+                        let _ = responder.send(remote_db.exists(&key));
+                    }
+                    ShardMessage::Del { db, key, responder } => {
+                        remote_db.select_db(db);
+                        let _ = responder.send(remote_db.del(&key));
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            router.set(k0.clone(), Bytes::from("v"), None).await;
+            assert!(!router.local_db.borrow_mut().exists(&k0));
+            assert!(router.exists(k0.clone()).await);
+            assert!(router.del(k0.clone()).await);
+            assert!(!router.exists(k0.clone()).await);
         });
         drop(router);
         worker.join().unwrap();
