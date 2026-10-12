@@ -271,21 +271,23 @@ lists only directives and flags verified against [`src/config.rs`](src/config.rs
 | `threads <n>` (alias `io-threads`) | Worker/shard count | `min(available_cores, 8)` |
 | `maxclients <n>` | Maximum concurrent client connections | `10000` |
 | `maxmemory <size>` | Memory threshold that drives tiered offload sizing (e.g. `4gb`) | unset |
-| `maxmemory-policy <policy>` | Eviction policy name | `noeviction` |
-| `appendonly <yes\|no>` | Enable AOF persistence | `no` |
-| `dir <path>` | Data directory for RDB (`dump.rdb`, hardcoded filename — not configurable) and AOF files | `.` |
-| `requirepass <password>` | Sets the default user's password for `AUTH` | unset |
+| `maxmemory-policy <policy>` | Eviction policy (`noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-lfu`, `allkeys-random`, `volatile-random`, `volatile-ttl`) | `noeviction` |
+| `appendonly <yes\|no>` | Enable AOF persistence (also runtime-toggleable via `CONFIG SET appendonly`) | `no` |
+| `appendfsync <always\|everysec\|no>` | AOF fsync durability mode | `everysec` |
+| `auto-aof-rewrite-percentage <pct>` / `auto-aof-rewrite-min-size <size>` | Automatic background AOF compaction thresholds | `100` / `64mb` |
+| `dir <path>` / `dbfilename <name>` | Data directory and RDB filename | `.` / `dump.rdb` |
+| `save <seconds> <changes>` | Automatic background RDB snapshot schedule | unset |
+| `requirepass <password>` / `aclfile <path>` | Default user password / external ACL users file (`ACL SAVE` / `ACL LOAD`) | unset |
 | `tls-port <n>` | Port for TLS connections | unset |
 | `tls-cert-file <path>` / `tls-key-file <path>` | TLS certificate / key PEM files | unset (self-signed cert generated in memory if a `tls-port` is set without them) |
-| `cluster-enabled <yes\|no>` | Enable Redis Cluster mode/routing | `no` |
+| `tls-ca-cert-file <path>` / `tls-auth-clients <yes\|no\|optional>` | mTLS client certificate CA bundle and verification mode | unset / `no` |
+| `tls-replication <yes\|no>` / `tls-cluster <yes\|no>` | Encrypt outbound replication links and cluster gossip bus with TLS | `no` / `no` |
+| `cluster-enabled <yes\|no>` / `cluster-config-file <path>` | Enable Redis Cluster mode and automatic `nodes.conf` persistence | `no` / `nodes.conf` |
+| `enable-debug-command <yes\|no\|local>` | Gate `DEBUG` subcommands | `no` |
 | `tiered-offload-threshold <pct>` | Memory-pressure percentage that starts offloading to NVMe tiering | `60` |
 | `tiered-upload-threshold <pct>` | Memory-pressure percentage that triggers more aggressive offload | `80` |
 
-Any other directive (including the classic Redis `save <seconds> <changes>` snapshot-schedule
-syntax) parses without error and is stored verbatim, but **`save` is not currently acted on** —
-there is no code path that reads it to schedule an automatic `BGSAVE`; only explicit
-`SAVE`/`BGSAVE` and replica full-resync produce an RDB file. See
-[`docs/rdbsave.md`](docs/rdbsave.md) §2 for the full trigger table.
+`save <seconds> <changes>` schedules automatic background `BGSAVE` runs when at least `<changes>` writes have occurred after `<seconds>` elapsed since the last save, and triggers an RDB save on graceful `SHUTDOWN`/`SIGTERM`. See [`docs/rdbsave.md`](docs/rdbsave.md) §2 for the full trigger table.
 
 ### CLI flags (override the config file)
 
@@ -300,7 +302,7 @@ There is no CLI equivalent for `requirepass` — set it in the config file.
 ### Example: `rudis.conf` (shipped in the repository root)
 
 ```conf
-bind 0.0.0.0
+bind 127.0.0.1 -::1
 port 6379
 maxclients 10000
 
@@ -356,13 +358,16 @@ Description=Rudis in-memory datastore
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
 User=rudis
 Group=rudis
 ExecStart=/usr/local/bin/rudis -c /etc/rudis/rudis.conf
+TimeoutStopSec=300s
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65536
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -425,19 +430,19 @@ docker run -d --name rudis \
 
 Understand what "durable" means here today before relying on it:
 
-- **AOF** (`appendonly yes`): `appendfsync everysec` (default) fsyncs roughly every second;
-  `appendfsync no` leaves flushing to the OS. Both can be changed with `CONFIG SET`.
-  `appendfsync always` is **not supported** — writes reach the AOF through a background flusher,
-  so a reply can't wait for its fsync — and the server refuses to start (or `CONFIG SET` fails)
-  rather than silently running with weaker durability. `appendonly` can't be toggled at runtime;
-  set it in the config file and restart. Expect to lose up to ~1 second of writes on a hard crash.
+- **AOF** (`appendonly yes`): supports `appendfsync always` (waits for the background AOF writer
+  to `fdatasync` the batch before replying to the client), `appendfsync everysec` (default,
+  fsyncs roughly every second), and `appendfsync no` (leaves flushing to the OS). Both
+  `appendonly` and `appendfsync` can be changed at runtime via `CONFIG SET`. Automatic background
+  AOF compaction is driven by `auto-aof-rewrite-percentage` and `auto-aof-rewrite-min-size`.
 - **RDB autosave**: `save <seconds> <changes>` points schedule `BGSAVE` like Redis. Unlike
   Redis there are no default save points; with none configured, nothing is saved automatically
-  (and not on shutdown).
+  (and not on shutdown unless `SHUTDOWN SAVE` is used).
 - **NVMe-tiered keys** (`RudisValue::Tiered`) are read back from the tier and written with their
   real value and type by `SAVE`/`BGSAVE` and `BGREWRITEAOF`. After a restart they come back as
-  ordinary in-memory keys (tiering state itself is not persisted). A tiered record that can't be
-  read (I/O error, CRC mismatch) is logged and left out of the snapshot.
+  ordinary in-memory keys (tiering state itself is not persisted). If a tiered record cannot be
+  read (I/O error or CRC mismatch), the save fails cleanly and keeps any prior `dump.rdb` file
+  intact rather than silently dropping records.
 - `SAVE`/`BGSAVE` never `fork()`. Each shard serializes its keyspace in steps of at most ~1ms and
   yields between them, and CRC, file writes and fsync run on a separate `rdb-writer` thread, so a
   `BGSAVE` adds latency in ~1ms slices rather than stalling a shard for its whole dataset. The
@@ -446,13 +451,15 @@ Understand what "durable" means here today before relying on it:
 
 ### Memory Sizing & Eviction
 
-- `maxmemory-policy` accepts `noeviction` (default — new writes get `-OOM` once `maxmemory` is
-  exceeded), `allkeys-lru`, `volatile-lru`, `volatile-ttl`, and `allkeys-random`.
-- Despite the name, the "LRU" policies are **not true LRU**: eviction samples up to 10 occupied
-  slots from a rolling cursor (`RudisTable::try_evict_one_key` in [`src/table.rs`](src/table.rs))
-  and evicts from that small sample — there is no per-key access-time tracking. `volatile-ttl`
-  picks the soonest-to-expire key *within the sample*, not globally across the keyspace. Size
-  `maxmemory` with headroom rather than relying on precise recency-based eviction under pressure.
+- `maxmemory-policy` is validated at startup and in `CONFIG SET`, accepting `noeviction`
+  (default — new writes get `-OOM` once `maxmemory` is exceeded), `allkeys-lru`, `volatile-lru`,
+  `allkeys-lfu`, `volatile-lfu`, `volatile-ttl`, `allkeys-random`, and `volatile-random`.
+- Every `RudisValue` carries a 16-bit LRU clock and an 8-bit logarithmic LFU Morris counter with
+  time-based decay (`RudisTable::try_evict_one_key` in [`src/table.rs`](src/table.rs)), sampling
+  occupied entries (and falling back to non-string stores such as `json_store`,
+  `probabilistic_store`, `vector_sets`, and `agent_ctx` when needed). Evicted keys propagate
+  synthetic `DEL` commands to the AOF and attached replicas so replicas never retain keys the
+  master evicted. Eviction runs only before write commands, never before reads.
 - `maxmemory` also drives the thresholds that trigger NVMe tiering offload — see
   [NVMe Tiered Storage](#6-nvme-tiered-storage-smallbins--direct-io) below.
 
@@ -506,11 +513,13 @@ stop past its grace period) skips all of the above, so give the process at least
   explicit cert/key pair, Rudis generates a self-signed certificate **in memory** at startup — do
   not rely on that beyond local testing, since clients have nothing to verify it against.
 - TLS connections run through userspace `rustls` only; there is no kernel TLS offload (see
-  [Kernel-Bypass Networking & TLS: Status](#7-kernel-bypass-networking--tls-status)). They run
-  the same client loop as plaintext ones, so pipelining (including cross-shard squashing),
-  transactions, Pub/Sub, blocking commands, MONITOR, client tracking, `CLIENT KILL`/`LIST`/`REPLY`
-  and output-buffer limits behave identically. Replication links (`PSYNC`/`SYNC`) are only
-  accepted on the plaintext port.
+  [Kernel-Bypass Networking & TLS: Status](#7-kernel-bypass-networking--tls-status)). Mutual TLS
+  (mTLS) client certificate verification is supported via `tls-ca-cert-file` and
+  `tls-auth-clients` (`yes` | `no` | `optional`), hot-reloadable via `CONFIG SET`. Outbound
+  replication (`tls-replication yes`) and cluster gossip (`tls-cluster yes`) also support TLS.
+  TLS client connections run the same client loop as plaintext ones, so pipelining (including
+  cross-shard squashing), transactions, Pub/Sub, blocking commands, MONITOR, client tracking,
+  `CLIENT KILL`/`LIST`/`REPLY` and output-buffer limits behave identically.
 - Run as a dedicated non-root user; the included [`Dockerfile`](Dockerfile) already does this via
   a `rudis` system user.
 - Bind to a private interface (`bind <ip>`) rather than `0.0.0.0` unless the port is otherwise
@@ -642,8 +651,8 @@ including *why* this direction is still worth pursuing despite not being wired u
   `AGENT.MEM.SEARCH`, `AGENT.MEM.COMPACT`). Gets RDB and AOF/replication coverage.
 - **Dual RPM/TPM LLM Quota Governor (`LLM.QUOTA.*`, `src/agent.rs`)**: sliding-window
   Requests-Per-Minute and Tokens-Per-Minute rate limiting with pre-flight token reservation
-  (`LLM.QUOTA.RESERVE`) and post-stream actual token settlement (`LLM.QUOTA.SETTLE`). Unlike the
-  other agent.rs stores, this state has **no persistence or replication** — it resets on restart.
+  (`LLM.QUOTA.RESERVE`) and post-stream actual token settlement (`LLM.QUOTA.SETTLE`). Persisted in
+  RDB snapshots (`EXT_TYPE_LLM_QUOTA`) and logged to AOF / replicated.
 - **DAG State Checkpointing & Idempotent Tool Leases (`AGENT.CHECKPOINT.*`, `AGENT.TOOL.*`,
   `src/agent.rs`)**: parent-linked execution state lineage (`PUT`/`GET`/`HISTORY`) and
   TTL-guarded exactly-once tool call execution leases (`CLAIM`/`COMPLETE`). Checkpoint timestamps
@@ -670,11 +679,10 @@ links go to the corresponding source-verified subsystem specification.
 > [!IMPORTANT]
 > The non-Redis command families `JSON.*`, `BF.*`, `CF.*`, `CMS.*`, `TOPK.*`, `FT.*`,
 > `SEMANTIC.*`, `CRDT.*`, `LLM.*`, `MCP.*` and `XDP.*` are **off by default** and answer
-> `ERR unknown command`. `JSON.*`, `SEMANTIC.*`, `BF.*`, `CF.*`, `CMS.*`, `TOPK.*` and `CRDT.*`
-> writes go to the AOF and to replicas like core writes (a `CRDT.*` write is logged as a
-> `CRDT.MERGE` of the changed state); most writes of the other families are not written
-> to the AOF or replicated, so that data is lost on restart or failover. Enable them with
-> `enable-experimental-commands yes` (config file) or `--enable-experimental-commands yes`.
+> `ERR unknown command`. Enable them with `enable-experimental-commands yes` (config file) or
+> `--enable-experimental-commands yes`. All mutating commands across `JSON.*`, `FT.*`,
+> `SEMANTIC.*`, `BF.*`, `CF.*`, `CMS.*`, `TOPK.*`, `CRDT.*`, `AGENT.*`, and `LLM.QUOTA.*` are
+> persisted to RDB and AOF and propagated to replicas.
 
 | Subsystem | Status | Notes | Design Doc |
 | :--- | :---: | :--- | :--- |
@@ -696,7 +704,7 @@ links go to the corresponding source-verified subsystem specification.
 | **RediSearch (`FT.*`)** | Implemented | Inverted index, BM25, `RangeTree`, `FLAT` & `HNSW` vector fields, pre-filtered KNN, `VECTOR_RANGE`, `FT.HYBRID` (RRF/Linear), `FT.ALTER`, `FT.PROFILE`, multi-vector JSON chunks (`$.chunks[*].emb`). | [09](docs/design/09_redisearch.md) |
 | **RedisBloom-style probabilistic types** | Implemented | Bloom, Cuckoo, Count-Min Sketch, Top-K. | [18](docs/design/18_probabilistic.md) |
 | **HNSW & Redis 8 Vector Sets (`V*`)** | Implemented | Redis 8 Vector Sets (`VADD`/`VSIM`/`VEMB`/`VLINKS`/`VSETATTR`), Cosine/L2/IP SIMD kernels, SQ8/BIN/PQ compression, `REDUCE` projection, NVMe `.vtier` disk reranking (`TIERED` + `RERANK`). | [08](docs/design/08_vector_engine.md) |
-| **Agent memory, LLM quota & checkpoints** | Implemented, with a gap | Working + HNSW episodic memory (`AGENT.MEM.*`), DAG checkpoints (`AGENT.CHECKPOINT.*`), tool leases (`AGENT.TOOL.*`) all get RDB+AOF/replication coverage; the RPM/TPM quota governor (`LLM.QUOTA.*`) has none and resets on restart. | [20](docs/design/20_agent_memory.md) |
+| **Agent memory, LLM quota & checkpoints** | Implemented | Working + HNSW episodic memory (`AGENT.MEM.*`), DAG checkpoints (`AGENT.CHECKPOINT.*`), tool leases (`AGENT.TOOL.*`), and the RPM/TPM quota governor (`LLM.QUOTA.*`) all get RDB + AOF/replication coverage. | [20](docs/design/20_agent_memory.md) |
 | **MCP server & semantic cache** | Implemented | Built-in MCP JSON-RPC 2.0 server (`MCP.*`, 11 tools) translating into ordinary commands via the normal dispatch path; semantic cache (`SEMANTIC.*`) lives in `src/vector.rs`. | [21](docs/design/21_mcp_server.md), [08](docs/design/08_vector_engine.md) |
 | **NVMe tiered storage** | Implemented | Hot/Cooled/Cold lifecycle, `SmallBins`, Direct I/O; tiered keys are written with their real value and type by `SAVE`/`BGSAVE` and `BGREWRITEAOF`. | [07](docs/design/07_nvme_tiering.md), [tiered_storage.md](docs/design/tiered_storage.md) |
 | **`TIER.SNAPSHOT` reflink checkpoints** | Implemented | Real `ioctl(FICLONE)` cloning of the NVMe tier's backing file — unrelated to `SAVE`/`BGSAVE`. | [tiered_storage.md](docs/design/tiered_storage.md) |
@@ -748,7 +756,4 @@ For deep technical walkthroughs, internal architecture specifications, and bench
 
 ## License
 
-This repository does not currently include a `LICENSE` file, and `Cargo.toml` does not declare
-a `license` field. No open-source license terms have been formally granted for this codebase
-yet; do not assume MIT (or any other) terms until a `LICENSE` file is added. If you need to use
-this code and the licensing status matters to you, contact the maintainer.
+Released under the [MIT License](LICENSE) (`license = "MIT"` in `Cargo.toml`).

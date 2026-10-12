@@ -23,14 +23,9 @@ This document summarizes the architectural, operational, and semantic difference
 ## 2. Structural & Semantic Limits
 
 ### String & Value Sizes
-* **Redis**: Strings are limited to 512 MB, enforced by `proto-max-bulk-len`.
+* **Redis**: Strings are limited to 512 MB, enforced by `proto-max-bulk-len`, and client input buffers are bounded by `client-query-buffer-limit` (1 GB default).
 * **Dragonfly**: Strings are limited to 256 MB.
-* **Rudis**: **No maximum bulk-string/array length is currently enforced** — the RESP parser
-  (`src/resp.rs`) trusts the declared length from the wire, bounded only by available memory
-  and `usize` overflow checks. A client sending a multi-gigabyte bulk string will be allowed to
-  attempt it before any rejection occurs. This is a real gap relative to Redis's
-  `proto-max-bulk-len`, not a claimed advantage — see
-  [`docs/design/03_resp_engine.md`](design/03_resp_engine.md) §5.
+* **Rudis**: Enforces both `proto-max-bulk-len` (default 512 MB, configurable at runtime via `CONFIG SET proto-max-bulk-len`, minimum 1 MB) and `client-query-buffer-limit` (default 1 GB, configurable via `CONFIG SET client-query-buffer-limit`, minimum 1 KB) in the RESP parser (`src/resp.rs`) and connection read loop (`src/connection.rs`).
 
 ### Integer & Numeric Precision
 * **Redis**: Integers in commands like `INCRBY` are signed 64-bit integers (`[-2^63, 2^63 - 1]`).
@@ -40,11 +35,7 @@ This document summarizes the architectural, operational, and semantic difference
 ### Expiry Precision & Lifetime
 * **Redis**: Millisecond-accurate TTLs with a probabilistic active expiration cycle.
 * **Dragonfly**: Rounding to nearest second for expiration intervals exceeding $2^{28}\text{ ms}$ (~3 days).
-* **Rudis**: Millisecond precision. `expire_at: Option<Instant>` is stored inline inside each
-  `RudisEntry` (no separate expirations table, no time-wheel structure); an expired key is
-  reclaimed passively the next time any operation touches it, plus an active sampling cycle
-  that periodically scans for and evicts already-expired keys. See
-  [`docs/design/05_storage_engine.md`](design/05_storage_engine.md).
+* **Rudis**: Millisecond precision. Expiry is bit-packed as a 54-bit Unix millisecond timestamp directly inside the 16-byte `CompactKey` header of each `RudisEntry` (no separate expirations table, no extra 16-byte `Option<Instant>` field); an expired key is reclaimed passively the next time any operation touches it, plus an active sampling cycle that periodically scans for and evicts already-expired keys. See [`docs/design/05_storage_engine.md`](design/05_storage_engine.md).
 
 ---
 

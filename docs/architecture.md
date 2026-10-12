@@ -104,11 +104,12 @@ Rudis employs a **Thread-Per-Core (Shared-Nothing)** multi-reactor architecture 
 High-throughput thread-per-core architectures are frequently memory-bandwidth bound. Rudis enforces compact data structure layouts to maximize CPU L1/L2/L3 cache line utilization:
 
 ```
-                  RudisEntry (88 Bytes Total, 8-byte aligned)
-  ┌─────────────────────────┬─────────────────────────┬─────────────────────────┐
-  │      key: Bytes         │   val: RudisValue       │  expire_at: Option<Inst>│
-  │       (32 Bytes)        │       (40 Bytes)        │       (16 Bytes)        │
-  └─────────────────────────┴─────────────────────────┴─────────────────────────┘
+                  RudisEntry (56 Bytes Total, 8-byte aligned)
+  ┌────────────────────────────────────┬────────────────────────────────────┐
+  │ key: CompactKey (16 Bytes)         │ val: RudisValue (40 Bytes)         │
+  │ • Inline keys <= 14B (0 heap alloc)│ • CompactStr inline <= 23B         │
+  │ • 54-bit packed Unix-ms expiry     │ • 8-bit LFU counter + 16-bit LRU   │
+  └────────────────────────────────────┴────────────────────────────────────┘
 ```
 
 (Sizes measured against the current build; see
@@ -116,10 +117,10 @@ High-throughput thread-per-core architectures are frequently memory-bandwidth bo
 `size_of::<RudisValue>()` verification and field-by-field breakdown.)
 
 1. **Boxed Large Variants in `RudisValue` (40 Bytes)**:
-   - In Rust, an enum's size is determined by its largest variant. Collections like `RudisHashMap`, `RudisSet`, `RudisZSet`, and `RudisStream` are boxed (`Box<T>`).
-   - This shrinks `RudisValue` from 88 bytes down to **40 bytes** (-54.5%), ensuring string and scalar values incur minimal memory overhead.
-2. **`RudisEntry` Cache Line Density (88 Bytes)**:
-   - Shrunk from 136 bytes to **88 bytes** (-35.3%), significantly improving CPU cache locality during hash probe traversals.
+   - In Rust, an enum's size is determined by its largest variant. Collections like `RudisHashMap`, `RudisSet`, `RudisZSet`, and `RudisStream` are boxed (`Box<T>`), while strings up to 23 bytes are stored inline via `CompactStr`, alongside an 8-bit logarithmic LFU counter and 16-bit LRU clock in the enum niche.
+   - This keeps `RudisValue` at **40 bytes**, ensuring string and scalar values incur minimal memory overhead.
+2. **`RudisEntry` Cache Line Density (56 Bytes)**:
+   - `CompactKey` stores keys up to 14 bytes inline and bit-packs the 54-bit millisecond expiry timestamp into the same 16-byte header, shrinking `RudisEntry` to **56 bytes** so a full entry fits within a single 64-byte CPU cache line.
 3. **Sparse Cluster Slot States**:
    - Instead of allocating a dense 16,384-element vector per shard, `Router` uses a sparse `HashMap<u16, SlotState>` (`src/router.rs`), which only pays for slots actually assigned locally.
 4. **SPSC Queue Footprint**:
@@ -167,7 +168,7 @@ sequenceDiagram
 1. If the key belongs to Shard 1, Core 0 encapsulates the command in a `ShardMessage` envelope.
 2. Core 0 pushes the message into the bounded lock-free SPSC ring leading to Shard 1 (`src/mailbox.rs`); if the ring is full, the message spills into that ring's `Mutex`-guarded overflow queue.
 3. If Shard 1 is idle, a `flume` channel dedicated to that shard pair is used purely as a sleep/wake signal to resume its reactor — Rudis does not use `eventfd` for this; the message payload itself always travels through the SPSC ring, never through the `flume` channel.
-4. Shard 1 dequeues the message, executes against its local `ShardDb`, and returns the result. The hottest call sites (`GET`/`SET`/batched multi-key commands) return the result through a pooled reply descriptor (`src/mailbox.rs`) rather than an ad hoc channel; other call sites still use a per-call `flume::bounded(1)` reply channel today.
+4. Shard 1 dequeues the message, executes against its local `ShardDb`, and returns the result. Hot single-key and batched multi-key paths (`GET`, `SET`, `DEL`, `EXISTS`, `INCRBY`, `EXPIRE`, `PERSIST`, `TTL`, `EXPIRETIME`, `SPUBLISH`, shard notifications, and batched `MGET`/`MSET`/pipelines) reuse pooled descriptors and responder channels on `Router` (`src/mailbox.rs`, `src/router.rs`) rather than allocating a channel per call.
 5. Core 0 flushes the response to the client socket.
 
 ---

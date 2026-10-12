@@ -1534,4 +1534,35 @@ mod tests {
         assert_eq!(quoted.maxmemory_policy, "volatile-lru");
         assert_eq!(quoted.maxmemory_bytes, Some(700 * 1024 * 1024));
     }
+
+    #[test]
+    fn test_docs_truthfulness_and_no_stale_contradictions() {
+        let readme = fs::read_to_string("README.md").unwrap();
+        assert!(readme.contains("Type=notify"));
+        assert!(readme.contains("MIT License"));
+        assert!(readme.contains("EXT_TYPE_LLM_QUOTA"));
+        assert!(!readme.contains("save is not currently acted on"));
+        assert!(!readme.contains("does not currently include a `LICENSE` file"));
+
+        let diffs = fs::read_to_string("docs/differences.md").unwrap();
+        assert!(diffs.contains("proto-max-bulk-len"));
+        assert!(diffs.contains("client-query-buffer-limit"));
+        assert!(!diffs.contains("No maximum bulk-string/array length is currently enforced"));
+
+        let repl = fs::read_to_string("docs/replication.md").unwrap();
+        assert!(repl.contains("masterauth"));
+        assert!(repl.contains("repl-backlog-size"));
+        assert!(repl.contains("master_last_io_seconds_ago"));
+        assert!(!repl.contains("no `masterauth`-equivalent"));
+
+        let rdbsave = fs::read_to_string("docs/rdbsave.md").unwrap();
+        assert!(rdbsave.contains("EXT_TYPE_SEARCH_INDEX"));
+        assert!(rdbsave.contains("EXT_TYPE_LLM_QUOTA"));
+        assert!(rdbsave.contains("dbfilename"));
+        assert!(!rdbsave.contains("There is no `dbfilename` directive"));
+
+        let arch = fs::read_to_string("docs/architecture.md").unwrap();
+        assert!(arch.contains("RudisEntry (56 Bytes Total"));
+        assert!(arch.contains("CompactKey (16 Bytes)"));
+    }
 }

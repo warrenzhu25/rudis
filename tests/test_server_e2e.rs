@@ -26439,3 +26439,71 @@ fn test_perf_regression_gate_live_and_static_e2e() {
 
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_documented_config_and_persistence_invariants_e2e() {
+    let port = 17981u16;
+    let port_s = port.to_string();
+    let dir = std::env::temp_dir().join(format!(
+        "rudis_doc_invariants_{}_{}",
+        std::process::id(),
+        port
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap().to_string();
+
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "1",
+            "--no-pin",
+            "--aof",
+            "false",
+            "--aof-dir",
+            &dir_s,
+        ],
+        port,
+    );
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Verify runtime CONFIG SET for dbfilename, repl-backlog-size, and proto-max-bulk-len
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &[
+                "CONFIG",
+                "SET",
+                "dbfilename",
+                "custom_snap.rdb",
+                "repl-backlog-size",
+                "2097152",
+                "proto-max-bulk-len",
+                "16777216",
+            ]
+        ),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["CONFIG", "GET", "dbfilename"]).contains("custom_snap.rdb"));
+    assert!(resp_cmd(&mut c, &["CONFIG", "GET", "repl-backlog-size"]).contains("2097152"));
+    assert!(resp_cmd(&mut c, &["CONFIG", "GET", "proto-max-bulk-len"]).contains("16777216"));
+
+    assert_eq!(resp_cmd(&mut c, &["SET", "doc:key", "doc:val"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    assert!(dir.join("custom_snap.rdb").exists());
+
+    let info_p = resp_cmd(&mut c, &["INFO", "persistence"]);
+    assert!(
+        info_p.contains("rdb_last_bgsave_status:ok")
+            && !info_p.contains("rdb_last_save_time:0\r\n"),
+        "{info_p}"
+    );
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

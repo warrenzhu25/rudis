@@ -40,9 +40,10 @@ familiar with real Redis might expect, that is called out explicitly.
   (`ShardDb::save_rdb_chunk`), because the replication stream is cut right after serializing.
 - **NVMe-tiered keys are saved with their real value and type.** A `RudisValue::Tiered` entry
   is read back from the tier file (CRC- and type-checked) and its payload is written verbatim,
-  before anything else for that key, so a failed read skips the key cleanly (logged) instead of
-  corrupting the file. Tiering state itself is not persisted: the key loads as an ordinary
-  in-memory key. `BGREWRITEAOF` decodes tiered values the same way.
+  before anything else for that key. If a tiered key is unreadable (I/O error or CRC mismatch),
+  the save fails cleanly and leaves any prior `dump.rdb` untouched rather than silently dropping
+  records. Tiering state itself is not persisted: the key loads as an ordinary in-memory key.
+  `BGREWRITEAOF` decodes tiered values the same way.
 - **CRC64 checksum is a plain bitwise loop, not SIMD.** `crc64`/`crc64_update` in `src/table.rs`
   are a textbook bit-at-a-time CRC-64/XZ implementation (poly `0x42F0E1EBA9EA3693`). There is no
   vectorized/SIMD CRC64 anywhere in the codebase.
@@ -78,11 +79,9 @@ shares the same flag) with a compare-and-swap — a `SAVE`/`BGSAVE`/`BGREWRITEAO
 is already in flight is rejected with an error rather than queued.
 
 `LASTSAVE` returns the real Unix timestamp of the most recent successful save
-(`Router::lastsave`, backed by an `AtomicU64` updated at the end of `perform_save_rdb`). Note,
-however, that `INFO`'s `# Persistence` section hardcodes `rdb_bgsave_in_progress:0` and
-`rdb_last_save_time:0` regardless of actual state — those two fields do not reflect reality; only
-the dedicated `LASTSAVE` command does. `rdb_changes_since_last_save` in the same `INFO` section is
-backed by a real global dirty-write counter.
+(`Router::lastsave`, backed by an `AtomicU64` updated at the end of `perform_save_rdb`). `INFO`'s
+`# Persistence` section also reports live `rdb_bgsave_in_progress`, `rdb_last_save_time`,
+`rdb_last_bgsave_status`, and `rdb_changes_since_last_save`.
 
 ---
 
@@ -108,15 +107,18 @@ backed by a real global dirty-write counter.
 
 `ShardDb::save_rdb_chunk` itself does two things, not one:
 - `self.table.save_rdb_chunk(buf)` — walks the shard's main hash table (see §4 for the record
-  format) covering strings/ints, lists, sets, sorted sets, hashes, HyperLogLogs, and streams.
+  format) covering strings/ints, lists, sets, sorted sets, hashes (including per-field TTLs),
+  HyperLogLogs, and streams (including consumer groups and PEL).
 - `self.save_extended_rdb_chunk(buf)` — additionally serializes, into the **same** chunk stream
-  using their own type tags: JSON documents (`json_store`), Bloom filters, Cuckoo filters,
-  Count-Min sketches, Top-K trackers (all from `probabilistic_store`), HNSW vector index entries
-  (`vector_indexes`), and a CRDT sync payload (`crdt_store.export_sync_payload()`, written under
-  a synthetic key `__rudis_crdt_sync__`).
+  using their own type tags / `RDBX` records: JSON documents (`json_store`), Bloom filters, Cuckoo
+  filters, Count-Min sketches, Top-K trackers (all from `probabilistic_store`), HNSW vector index
+  entries (`vector_indexes`), RediSearch `FT.*` index schemas (`EXT_TYPE_SEARCH_INDEX`), CRDT sync
+  payloads (`crdt_store.export_sync_payload()`), AI agent working/episodic memory, DAG checkpoints,
+  tool leases, semantic cache entries, and LLM RPM/TPM quota governors (`EXT_TYPE_LLM_QUOTA`).
 
 So an RDB file produced by `SAVE`/`BGSAVE` is not limited to the classic Redis value types — it
-also round-trips Rudis's JSON store, probabilistic structures, vector indexes, and CRDT state.
+also round-trips Rudis's JSON store, probabilistic structures, vector/search indexes, CRDT state,
+and AI-native agent/quota state.
 
 ### 3.1 Tiered (spilled) values
 
@@ -125,10 +127,9 @@ also round-trips Rudis's JSON store, probabilistic structures, vector indexes, a
 but tracked for eviction). `Cooled` is saved from its in-memory `val`. For `Tiered`,
 `ShardDb::save_rdb_entry` reads the record back from the tier file (`read_ptr_sync`, which checks
 the record's CRC and header type) and, since the record already holds the value in
-`serialize_val_payload` form, writes that payload verbatim after checking its type tag. The read
-happens before the expiry opcode or key is written, so a failed read skips the key (logged as an
-error) without corrupting the rest of the chunk. Earlier versions wrote nothing for `Tiered`
-(desynchronizing the reader) and later re-encoded the payload as a string (losing the value's type).
+`serialize_val_payload` form, writes that payload verbatim after checking its type tag. If reading
+the tiered record fails, `save_rdb_entry` returns an error that aborts the save and preserves the
+previous `dump.rdb` file rather than producing a partial snapshot.
 
 ---
 
@@ -214,12 +215,10 @@ backlog diff instead and does not involve RDB serialization at all.
 
 | Directive / setting | Effect |
 | :--- | :--- |
-| `dir` | Data directory; `dump.rdb` (and its `dump.rdb.tmp.*` staging files) are always written directly under it. |
+| `dir` | Data directory; the RDB snapshot (and its `.tmp.*` staging files) are written directly under it. |
+| `dbfilename` | Filename for the RDB snapshot inside `dir` (default `dump.rdb`, configurable in `rudis.conf` and at runtime via `CONFIG SET dbfilename`). |
 | `appendonly` | If `yes`, RDB restore on startup is skipped in favor of AOF replay (§2). Does not disable `SAVE`/`BGSAVE` themselves. |
-| `save <seconds> <changes>` | Parsed and stored, but **not acted upon** — see §2. Present for `rudis.conf` compatibility with Redis-style configs, not a functioning save-point scheduler today. |
-
-There is no `dbfilename` directive — the snapshot filename is hardcoded to `dump.rdb` in
-`src/router.rs` and `src/server.rs`; it cannot be renamed via configuration.
+| `save <seconds> <changes>` | Schedules automatic background RDB snapshots when at least `<changes>` writes have occurred after `<seconds>` elapsed since the last save, and triggers an RDB save on graceful `SHUTDOWN` / `SIGTERM` (§2). Configurable in `rudis.conf` and via `CONFIG SET save`. |
 
 ---
 
