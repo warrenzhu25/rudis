@@ -142,7 +142,18 @@ jobs:
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           ulimit -l
-          cargo test --release --test test_server_e2e -- --test-threads=1
+          set -o pipefail
+          cargo test --release --test test_server_e2e -- --test-threads=1 2>&1 | tee e2e.log || {
+            # Annotations are readable on the run page (and the public API)
+            # without downloading logs.
+            sed -n '/^failures:$/,$p' e2e.log | grep -E '^    test_' | head -n 20 | while read -r t; do
+              echo "::error title=Failed e2e test::$t"
+            done
+            grep -A 2 "panicked at" e2e.log | grep -v '^--$' | head -n 30 | while IFS= read -r line; do
+              echo "::error title=Panic::$line"
+            done
+            exit 1
+          }
 
   redis_tcl_suites:
     name: Redis TCL compatibility suites (io_uring)
