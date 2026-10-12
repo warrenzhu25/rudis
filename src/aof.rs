@@ -39,6 +39,12 @@ pub struct AofWriter {
     path: PathBuf,
     offset: u64,
     current_db: usize,
+    /// Chunks handed out by `take_flush_chunk` whose write hasn't finished.
+    /// Chunks go to pre-assigned offsets from several tasks, so an fsync
+    /// only covers everything up to `offset` once none is in flight.
+    inflight: usize,
+    /// Everything before this offset is on disk (see [`AofWriter::sync_durable`]).
+    durable: u64,
 }
 
 impl AofWriter {
@@ -59,6 +65,8 @@ impl AofWriter {
             path,
             offset,
             current_db: 0,
+            inflight: 0,
+            durable: offset,
         })
     }
 
@@ -70,6 +78,8 @@ impl AofWriter {
             path: PathBuf::new(),
             offset: 0,
             current_db: 0,
+            inflight: 0,
+            durable: 0,
         }
     }
 
@@ -90,6 +100,9 @@ impl AofWriter {
             self.emit_select_db(db);
         }
         self.buffer.extend_from_slice(data);
+        if APPENDFSYNC_ALWAYS_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+            AOF_APPENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     #[cold]
@@ -109,6 +122,16 @@ impl AofWriter {
         }
     }
 
+    /// Reports that a chunk from `take_flush_chunk` finished writing (with
+    /// its buffer back for reuse, if the write succeeded).
+    #[inline]
+    pub fn chunk_written(&mut self, chunk: Option<Vec<u8>>) {
+        self.inflight = self.inflight.saturating_sub(1);
+        if let Some(c) = chunk {
+            self.recycle_chunk(c);
+        }
+    }
+
     #[inline]
     pub fn take_flush_chunk(&mut self) -> Option<(std::rc::Rc<monoio::fs::File>, Vec<u8>, u64)> {
         if self.buffer.is_empty() {
@@ -122,6 +145,7 @@ impl AofWriter {
         let chunk = std::mem::replace(&mut self.buffer, next_buf);
         let off = self.offset;
         self.offset += chunk.len() as u64;
+        self.inflight += 1;
         Some((file, chunk, off))
     }
 
@@ -132,7 +156,8 @@ impl AofWriter {
 
     pub async fn flush(&mut self) -> std::io::Result<()> {
         if let Some((file, chunk, offset)) = self.take_flush_chunk() {
-            let (res, _) = file.write_all_at(chunk, offset).await;
+            let (res, buf) = file.write_all_at(chunk, offset).await;
+            self.chunk_written(res.is_ok().then_some(buf));
             res?;
         }
         Ok(())
@@ -141,8 +166,49 @@ impl AofWriter {
     pub async fn flush_rc(aof: &std::rc::Rc<std::cell::RefCell<Self>>) -> std::io::Result<()> {
         let chunk_and_off = aof.borrow_mut().take_flush_chunk();
         if let Some((file, chunk, offset)) = chunk_and_off {
-            let (res, _) = file.write_all_at(chunk, offset).await;
+            let (res, buf) = file.write_all_at(chunk, offset).await;
+            aof.borrow_mut().chunk_written(res.is_ok().then_some(buf));
             res?;
+        }
+        Ok(())
+    }
+
+    /// Makes everything appended so far durable: writes the pending buffer,
+    /// waits for chunks other tasks are still writing, then fsyncs. Group
+    /// commit: a caller whose data an fsync already covered returns without
+    /// another one.
+    pub async fn sync_durable(aof: &std::rc::Rc<std::cell::RefCell<Self>>) -> std::io::Result<()> {
+        let (chunk, target) = {
+            let mut w = aof.borrow_mut();
+            let c = w.take_flush_chunk();
+            (c, w.offset)
+        };
+        if let Some((file, chunk, offset)) = chunk {
+            let (res, buf) = file.write_all_at(chunk, offset).await;
+            aof.borrow_mut().chunk_written(res.is_ok().then_some(buf));
+            res?;
+        }
+        loop {
+            let (durable, inflight) = {
+                let w = aof.borrow();
+                (w.durable, w.inflight)
+            };
+            if durable >= target {
+                return Ok(());
+            }
+            if inflight == 0 {
+                break;
+            }
+            monoio::time::sleep(std::time::Duration::from_micros(20)).await;
+        }
+        let file = aof.borrow().get_file();
+        if let Some(file) = file {
+            file.sync_data().await?;
+        }
+        let mut w = aof.borrow_mut();
+        // A rewrite may have swapped in a new (already synced) file meanwhile.
+        if w.offset >= target {
+            w.durable = w.durable.max(target);
         }
         Ok(())
     }
@@ -172,6 +238,8 @@ impl AofWriter {
         let new_size = std_file.metadata()?.len();
         self.file = Some(std::rc::Rc::new(monoio::fs::File::from_std(std_file)?));
         self.offset = new_size;
+        // The rewrite fsynced the new file before renaming it in.
+        self.durable = new_size;
         self.buffer.clear();
         self.current_db = 0;
         Ok(new_size)
@@ -2619,20 +2687,15 @@ pub fn aof_load_truncated() -> bool {
     AOF_LOAD_TRUNCATED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Parses an `appendfsync` value into "fsync every second?".
-///
-/// `always` is rejected rather than silently downgraded: writes reach the AOF
-/// through a background flusher, so a reply can't wait for its fsync.
+/// Parses an `appendfsync` value into "fsync every second?" (`always`
+/// fsyncs every second too, on top of its per-write fsyncs; see
+/// [`appendfsync_is_always`]).
 pub fn parse_appendfsync(v: &str) -> Result<bool, String> {
     match v.to_ascii_lowercase().as_str() {
-        "everysec" => Ok(true),
+        "everysec" | "always" => Ok(true),
         "no" => Ok(false),
-        "always" => Err(
-            "appendfsync always is not supported (the AOF is flushed in the background); use everysec or no"
-                .to_string(),
-        ),
         other => Err(format!(
-            "invalid appendfsync '{}' (expected everysec or no)",
+            "invalid appendfsync '{}' (expected always, everysec or no)",
             other
         )),
     }
@@ -2640,6 +2703,16 @@ pub fn parse_appendfsync(v: &str) -> Result<bool, String> {
 
 type FsyncFlags = std::collections::HashMap<u16, std::sync::Arc<std::sync::atomic::AtomicBool>>;
 static FSYNC_EVERY_SEC: parking_lot::Mutex<Option<FsyncFlags>> = parking_lot::Mutex::new(None);
+static FSYNC_ALWAYS: parking_lot::Mutex<Option<FsyncFlags>> = parking_lot::Mutex::new(None);
+
+/// Whether any server in the process runs `appendfsync always`: only then
+/// do AOF appends bump [`AOF_APPENDS`] (one shared counter would otherwise
+/// cost every write a contended cache line).
+pub static APPENDFSYNC_ALWAYS_ANY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// AOF appends while [`APPENDFSYNC_ALWAYS_ANY`] is set. A connection that
+/// sees it move during a batch fsyncs the AOFs before replying.
+pub static AOF_APPENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Live `appendfsync` policy for the server on `port` (true = everysec). The
 /// AOF flusher reads it on every tick, so `CONFIG SET appendfsync` applies
@@ -2652,13 +2725,42 @@ pub fn fsync_every_sec_flag(port: u16) -> std::sync::Arc<std::sync::atomic::Atom
         .clone()
 }
 
+/// `appendfsync always` for the server on `port`.
+pub fn fsync_always_flag(port: u16) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let mut map = FSYNC_ALWAYS.lock();
+    map.get_or_insert_with(Default::default)
+        .entry(port)
+        .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .clone()
+}
+
 pub fn set_fsync_every_sec(port: u16, every_sec: bool) {
     fsync_every_sec_flag(port).store(every_sec, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Sets the full `appendfsync` policy from its config value.
+pub fn set_appendfsync(port: u16, value: &str) -> Result<(), String> {
+    let every_sec = parse_appendfsync(value)?;
+    let always = value.eq_ignore_ascii_case("always");
+    set_fsync_every_sec(port, every_sec);
+    fsync_always_flag(port).store(always, std::sync::atomic::Ordering::Relaxed);
+    if always {
+        APPENDFSYNC_ALWAYS_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+#[inline]
+pub fn appendfsync_is_always(port: u16) -> bool {
+    APPENDFSYNC_ALWAYS_ANY.load(std::sync::atomic::Ordering::Relaxed)
+        && fsync_always_flag(port).load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The `appendfsync` value reported by CONFIG GET.
 pub fn appendfsync_name(port: u16) -> &'static str {
-    if fsync_every_sec_flag(port).load(std::sync::atomic::Ordering::Relaxed) {
+    if appendfsync_is_always(port) {
+        "always"
+    } else if fsync_every_sec_flag(port).load(std::sync::atomic::Ordering::Relaxed) {
         "everysec"
     } else {
         "no"
@@ -5082,7 +5184,7 @@ mod tests {
     fn test_appendfsync_parse_and_live_policy() {
         assert_eq!(parse_appendfsync("everysec"), Ok(true));
         assert_eq!(parse_appendfsync("No"), Ok(false));
-        assert!(parse_appendfsync("always").is_err());
+        assert_eq!(parse_appendfsync("always"), Ok(true));
         assert!(parse_appendfsync("").is_err());
 
         // Per-port, defaults to everysec, and the flusher's handle sees updates.
@@ -6278,6 +6380,51 @@ mod tests {
             15,
             "only this layout's shard files"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sync_durable_waits_for_in_flight_chunks() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-durable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appendonly-0.aof");
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let aof = std::rc::Rc::new(std::cell::RefCell::new(
+                AofWriter::open(path.clone()).await.unwrap(),
+            ));
+            aof.borrow_mut().append(b"first;");
+            // Another task took this chunk and hasn't written it yet.
+            let (file, chunk, off) = aof.borrow_mut().take_flush_chunk().unwrap();
+            aof.borrow_mut().append(b"second;");
+            let done = std::rc::Rc::new(std::cell::Cell::new(false));
+            let (a, d) = (aof.clone(), done.clone());
+            let syncer = monoio::spawn(async move {
+                AofWriter::sync_durable(&a).await.unwrap();
+                d.set(true);
+            });
+            monoio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(
+                !done.get(),
+                "returned before the in-flight chunk was written"
+            );
+            let (res, buf) = file.write_all_at(chunk, off).await;
+            res.unwrap();
+            aof.borrow_mut().chunk_written(Some(buf));
+            syncer.await;
+            assert!(done.get());
+            assert_eq!(std::fs::read(&path).unwrap(), b"first;second;");
+            {
+                let w = aof.borrow();
+                assert_eq!((w.durable, w.inflight), (w.offset, 0));
+            }
+            // Nothing new: covered by the last fsync.
+            AofWriter::sync_durable(&aof).await.unwrap();
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2548,23 +2548,11 @@ impl Router {
         }
     }
 
+    /// Makes every shard's AOF durable: everything appended before the call
+    /// is written and fsynced when it returns (see `AofWriter::sync_durable`).
     pub async fn sync_aof(&self) {
-        let (file, chunk, offset) = if let Some(aof) = &self.aof {
-            let mut writer = aof.borrow_mut();
-            let file = writer.get_file();
-            if let Some((f, c, o)) = writer.take_flush_chunk() {
-                (Some(f), c, o)
-            } else {
-                (file, Vec::new(), 0)
-            }
-        } else {
-            (None, Vec::new(), 0)
-        };
-        if let Some(file) = file {
-            if !chunk.is_empty() {
-                let _ = file.write_all_at(chunk, offset).await;
-            }
-            let _ = file.sync_data().await;
+        if self.aof.is_none() {
+            return;
         }
         let mut responders = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
@@ -2575,6 +2563,10 @@ impl Router {
                     responders.push(rx);
                 }
             }
+        }
+        // The local fsync overlaps the remote ones.
+        if let Some(aof) = &self.aof {
+            let _ = crate::aof::AofWriter::sync_durable(aof).await;
         }
         for rx in responders {
             let _ = rx.recv_async().await;

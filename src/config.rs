@@ -14,9 +14,10 @@ pub struct RudisConfig {
     pub maxmemory_bytes: Option<u64>,
     pub maxmemory_policy: String,
     pub appendonly: bool,
-    /// `appendfsync`: true = everysec (default), false = no. `always` is
-    /// rejected at parse time.
+    /// `appendfsync`: true = everysec (default) or always, false = no.
     pub appendfsync_every_sec: bool,
+    /// `appendfsync always`: replies to writes wait for their fsync.
+    pub appendfsync_always: bool,
     /// `cross-shard-spin`: polls before parking on a cross-shard reply.
     pub cross_shard_spin: usize,
     /// `idle-poll-us`: how long a shard thread busy-polls for work before it
@@ -66,6 +67,7 @@ impl Default for RudisConfig {
             maxmemory_policy: "noeviction".to_string(),
             appendonly: false,
             appendfsync_every_sec: true,
+            appendfsync_always: false,
             cross_shard_spin: 0,
             idle_poll_us: 50,
             enable_experimental_commands: false,
@@ -593,6 +595,7 @@ impl RudisConfig {
                         crate::aof::parse_appendfsync(rest[0]).map_err(|e| {
                             format!("Invalid appendfsync at line {}: {}", line_num + 1, e)
                         })?;
+                    config.appendfsync_always = rest[0].eq_ignore_ascii_case("always");
                 }
                 "aof-load-truncated" => {
                     config.aof_load_truncated = match rest[0].to_lowercase().as_str() {
@@ -1088,9 +1091,13 @@ mod tests {
         assert!(!cfg.appendfsync_every_sec);
         let cfg = RudisConfig::parse_str("appendfsync EVERYSEC").unwrap();
         assert!(cfg.appendfsync_every_sec);
-        // `always` can't be honoured, so it must not load as something weaker.
-        let err = RudisConfig::parse_str("appendfsync always").unwrap_err();
-        assert!(err.contains("always is not supported"), "{}", err);
+        let cfg = RudisConfig::parse_str("appendfsync always").unwrap();
+        assert!(cfg.appendfsync_always && cfg.appendfsync_every_sec);
+        assert!(
+            !RudisConfig::parse_str("appendfsync everysec")
+                .unwrap()
+                .appendfsync_always
+        );
         assert!(RudisConfig::parse_str("appendfsync sometimes").is_err());
         assert!(RudisConfig::parse_str("appendonly on").is_err());
     }

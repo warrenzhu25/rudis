@@ -331,9 +331,9 @@ pub fn run_shard_worker(
                             let flush_chunk = flush_writer.borrow_mut().take_flush_chunk();
                             if let Some((file, chunk, offset)) = flush_chunk {
                                 let (res, returned_chunk) = file.write_all_at(chunk, offset).await;
-                                if res.is_ok() {
-                                    flush_writer.borrow_mut().recycle_chunk(returned_chunk);
-                                }
+                                flush_writer
+                                    .borrow_mut()
+                                    .chunk_written(res.is_ok().then_some(returned_chunk));
                             }
                             ticker += 1;
                             if ticker.is_multiple_of(200)
@@ -1882,24 +1882,15 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let _ = responder.send(());
                     }
                     ShardMessage::SyncAof { responder } => {
-                        let (file, chunk, offset) = if let Some(aof) = &cross_shard_aof {
-                            let mut writer = aof.borrow_mut();
-                            let file = writer.get_file();
-                            if let Some((f, c, o)) = writer.take_flush_chunk() {
-                                (Some(f), c, o)
-                            } else {
-                                (file, Vec::new(), 0)
+                        // In a task: the fsync must not hold up this shard's
+                        // mailbox (appendfsync always sends one per batch).
+                        let aof = cross_shard_aof.clone();
+                        monoio::spawn(async move {
+                            if let Some(aof) = aof {
+                                let _ = crate::aof::AofWriter::sync_durable(&aof).await;
                             }
-                        } else {
-                            (None, Vec::new(), 0)
-                        };
-                        if let Some(file) = file {
-                            if !chunk.is_empty() {
-                                let _ = file.write_all_at(chunk, offset).await;
-                            }
-                            let _ = file.sync_data().await;
-                        }
-                        let _ = responder.send(());
+                            let _ = responder.send(());
+                        });
                     }
                     ShardMessage::SaveRdbChunk { responder, arm_replica } => {
                         // Full syncs and shard flows arm their stream right
@@ -2607,21 +2598,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             monoio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         if let Some(aof) = aof_writer {
-            let (file, chunk, offset) = {
-                let mut writer = aof.borrow_mut();
-                let file = writer.get_file();
-                if let Some((f, c, o)) = writer.take_flush_chunk() {
-                    (Some(f), c, o)
-                } else {
-                    (file, Vec::new(), 0)
-                }
-            };
-            if let Some(file) = file {
-                if !chunk.is_empty() {
-                    let _ = file.write_all_at(chunk, offset).await;
-                }
-                let _ = file.sync_data().await;
-            }
+            let _ = crate::aof::AofWriter::sync_durable(&aof).await;
         }
     });
 }

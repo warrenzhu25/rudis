@@ -3158,9 +3158,7 @@ pub fn apply_config_value(
             }
             *LATENCY_PERCENTILES.write() = ps;
         }
-        "appendfsync" => {
-            crate::aof::set_fsync_every_sec(base_port, crate::aof::parse_appendfsync(val_str)?)
-        }
+        "appendfsync" => crate::aof::set_appendfsync(base_port, val_str)?,
         "save" => {
             crate::config::set_save_points(base_port, crate::config::parse_save_points(val_str)?)
         }
@@ -4253,6 +4251,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
         .is_auth_required_for_default();
     let mut auth_user = "default".to_string();
     let mut soft_limit_start: Option<Instant> = None;
+    let mut aof_appends_seen = crate::aof::AOF_APPENDS.load(std::sync::atomic::Ordering::Relaxed);
 
     use crate::transport::MIN_READ_SPARE;
     // Set when the previous batch stopped at MAX_DRAIN_BATCH_CMDS with
@@ -4502,6 +4501,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         continue;
                     }
                     if !out_buf.is_empty() {
+                        aof_always_barrier(&router, &mut aof_appends_seen).await;
                         stats
                             .tot_net_out
                             .fetch_add(out_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -4678,6 +4678,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 ))
                                 && !out_buf.is_empty()
                             {
+                                aof_always_barrier(&router, &mut aof_appends_seen).await;
                                 stats.tot_net_out.fetch_add(
                                     out_buf.len() as u64,
                                     std::sync::atomic::Ordering::Relaxed,
@@ -4812,6 +4813,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                 }
 
                 if !out_buf.is_empty() {
+                    aof_always_barrier(&router, &mut aof_appends_seen).await;
                     let len = out_buf.len();
                     stats
                         .tot_net_out
@@ -8578,6 +8580,23 @@ pub fn acl_channels_denied(user: &crate::acl::AclUser, cmd: &Command) -> bool {
 /// AUTH/ACL gate for mode-switching commands, which bypass execute_command.
 /// Returns the error reply if the client may not run `cmd`; `None` otherwise
 /// (and always `None` for commands that are not mode switches).
+/// `appendfsync always`: if any AOF was appended to since this connection
+/// last checked, makes every shard's AOF durable before its replies go out.
+/// One relaxed load when no server in the process runs `always`.
+#[inline]
+async fn aof_always_barrier(router: &Router, seen: &mut u64) {
+    if !crate::aof::APPENDFSYNC_ALWAYS_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let now = crate::aof::AOF_APPENDS.load(std::sync::atomic::Ordering::Relaxed);
+    if now != *seen {
+        *seen = now;
+        if crate::aof::appendfsync_is_always(router.base_port) {
+            router.sync_aof().await;
+        }
+    }
+}
+
 fn mode_switch_denied(
     cmd: &Command,
     port: u16,

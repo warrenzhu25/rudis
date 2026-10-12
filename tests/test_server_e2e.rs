@@ -15597,15 +15597,11 @@ fn test_appendonly_and_appendfsync_are_reported_truthfully_e2e() {
         conf.to_str().unwrap(),
     ];
 
-    // `appendfsync always` can't be honoured: refuse to start rather than
-    // run with weaker durability than configured.
-    std::fs::write(&conf, "appendonly yes\nappendfsync always\n").unwrap();
+    // A bad value refuses to start rather than run with some other policy.
+    std::fs::write(&conf, "appendonly yes\nappendfsync sometimes\n").unwrap();
     let (status, stderr) = run_rudis_until_exit(&args);
     assert!(!status.success(), "{stderr}");
-    assert!(
-        stderr.contains("appendfsync always is not supported"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("invalid appendfsync"), "{stderr}");
 
     std::fs::write(&conf, "appendonly yes\nappendfsync no\n").unwrap();
     let mut child = spawn_rudis_listening(&args, port);
@@ -15621,7 +15617,7 @@ fn test_appendonly_and_appendfsync_are_reported_truthfully_e2e() {
         "*2\r\n$10\r\nappendonly\r\n$3\r\nyes\r\n"
     );
 
-    // appendfsync switches at runtime between the supported policies.
+    // appendfsync switches at runtime (always is covered by its own test).
     assert_eq!(
         resp_cmd(&mut c, &["CONFIG", "SET", "appendfsync", "everysec"]),
         "+OK\r\n"
@@ -15630,8 +15626,8 @@ fn test_appendonly_and_appendfsync_are_reported_truthfully_e2e() {
         get(&mut c, "appendfsync"),
         "*2\r\n$11\r\nappendfsync\r\n$8\r\neverysec\r\n"
     );
-    let r = resp_cmd(&mut c, &["CONFIG", "SET", "appendfsync", "always"]);
-    assert!(r.starts_with("-ERR") && r.contains("not supported"), "{r}");
+    let r = resp_cmd(&mut c, &["CONFIG", "SET", "appendfsync", "sometimes"]);
+    assert!(r.starts_with("-ERR"), "{r}");
     assert_eq!(
         get(&mut c, "appendfsync"),
         "*2\r\n$11\r\nappendfsync\r\n$8\r\neverysec\r\n"
@@ -25362,6 +25358,106 @@ fn test_auto_aof_rewrite_triggers_on_growth_e2e() {
         resp_cmd(&mut c, &["GET", "k9"]),
         format!("${}\r\n{val}4999\r\n", val.len() + 4)
     );
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_appendfsync_always_writes_before_replying_e2e() {
+    let port = 17969u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-fsync-always-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+        "--save",
+        "",
+    ];
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    };
+    let aof_bytes = || -> Vec<u8> {
+        (0..4)
+            .flat_map(|i| {
+                std::fs::read(dir.join(format!("appendonly-{i}.aof"))).unwrap_or_default()
+            })
+            .collect()
+    };
+    let contains =
+        |hay: &[u8], needle: &str| hay.windows(needle.len()).any(|w| w == needle.as_bytes());
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = connect();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "appendfsync"]),
+        "*2\r\n$11\r\nappendfsync\r\n$6\r\nalways\r\n"
+    );
+    // Every write is in its shard's AOF file by the time +OK arrives,
+    // whichever shard owns the key (the connection's or another).
+    for i in 0..40 {
+        let (k, v) = (format!("dur:{i}"), format!("val-{i}-x"));
+        assert_eq!(resp_cmd(&mut c, &["SET", &k, &v]), "+OK\r\n");
+        assert!(
+            contains(&aof_bytes(), &v),
+            "{k} not in the AOF when SET replied"
+        );
+    }
+    // A pipeline: one fsync round for the batch, all of it on disk.
+    let mut pipe = Vec::new();
+    for i in 0..50 {
+        pipe.extend_from_slice(&format_resp_cmd(&[
+            "SET",
+            &format!("p:{i}"),
+            &format!("pv-{i}-y"),
+        ]));
+    }
+    c.write_all(&pipe).unwrap();
+    let mut got = Vec::new();
+    while got.windows(5).filter(|w| *w == b"+OK\r\n").count() < 50 {
+        let mut b = [0u8; 4096];
+        let n = c.read(&mut b).unwrap();
+        got.extend_from_slice(&b[..n]);
+    }
+    let bytes = aof_bytes();
+    assert!((0..50).all(|i| contains(&bytes, &format!("pv-{i}-y"))));
+    // Switchable at runtime, like Redis.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "appendfsync", "everysec"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "appendfsync"]),
+        "*2\r\n$11\r\nappendfsync\r\n$8\r\neverysec\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "appendfsync", "always"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["SET", "last", "last-z"]), "+OK\r\n");
+    assert!(contains(&aof_bytes(), "last-z"));
+    drop(c);
+    // A crash right after the replies loses nothing.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = connect();
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":91\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "dur:39"]), "$8\r\nval-39-x\r\n");
     drop(c);
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);

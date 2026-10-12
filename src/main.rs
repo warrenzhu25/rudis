@@ -427,6 +427,9 @@ fn main() {
             std::process::exit(1);
         }
     }
+    if server_config.appendfsync_always {
+        let _ = rudis::aof::set_appendfsync(port, "always");
+    }
     let aof_config = rudis::aof::AofConfig {
         enabled: server_config.appendonly,
         dir: server_config.dir.clone(),
