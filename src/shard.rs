@@ -2379,6 +2379,11 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn lfu_freq(&mut self, key: &[u8]) -> Option<u8> {
+        self.table.lfu_freq(key)
+    }
+
+    #[inline]
     pub fn lru_and_idletime(&mut self, key: &[u8]) -> Option<(u32, u64)> {
         self.table.lru_and_idletime(key)
     }

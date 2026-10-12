@@ -3105,6 +3105,12 @@ pub fn apply_config_value(
         "maxmemory-samples" => {
             CONFIG_MAXMEMORY_SAMPLES.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
+        "lfu-log-factor" => {
+            crate::table::LFU_LOG_FACTOR.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "lfu-decay-time" => {
+            crate::table::LFU_DECAY_TIME.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
         "client-query-buffer-limit" => {
             let limit = parse_config_bytes(name, val_str)?;
             if limit < MIN_CLIENT_QUERY_BUFFER_LIMIT {
@@ -3281,6 +3287,7 @@ pub fn set_max_memory_policy(policy: &str) {
     {
         let mut lock = MAX_MEMORY_POLICY.write();
         *lock = policy.to_lowercase();
+        crate::table::LFU_ACTIVE.store(lock.contains("lfu"), std::sync::atomic::Ordering::Relaxed);
     }
     crate::tiering::bump_maxmemory_epoch();
 }
@@ -10568,7 +10575,7 @@ async fn execute_command_inner(
                     let repl_ping_period = crate::replication::REPL_PING_PERIOD
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let all_configs: [(&str, String); 69] = [
+                    let all_configs: [(&str, String); 71] = [
                         ("port", port_str),
                         ("databases", crate::config::databases_count().to_string()),
                         ("loglevel", crate::log::loglevel().to_string()),
@@ -10618,6 +10625,18 @@ async fn execute_command_inner(
                         ),
                         ("maxmemory", max_mem),
                         ("maxmemory-samples", maxmem_samples),
+                        (
+                            "lfu-log-factor",
+                            crate::table::LFU_LOG_FACTOR
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .to_string(),
+                        ),
+                        (
+                            "lfu-decay-time",
+                            crate::table::LFU_DECAY_TIME
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .to_string(),
+                        ),
                         ("maxmemory-clients", maxmem_clients),
                         ("maxmemory-policy", policy),
                         ("client-query-buffer-limit", qbuf_limit),
@@ -19791,11 +19810,18 @@ pub fn execute_local_command(
                         }
                     }
                     crate::resp::ObjectSubcommand::Freq(key) => {
-                        if db.exists(key) {
-                            out.extend_from_slice(b":0\r\n");
+                        if !crate::table::LFU_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+                            out.extend_from_slice(b"-ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.\r\n");
+                        } else if let Some(freq) = db.lfu_freq(key) {
+                            write_resp_integer(out, freq as i64);
                         } else {
                             out.extend_from_slice(b"$-1\r\n");
                         }
+                    }
+                    crate::resp::ObjectSubcommand::Idletime(_)
+                        if crate::table::LFU_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) =>
+                    {
+                        out.extend_from_slice(b"-ERR An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.\r\n");
                     }
                     crate::resp::ObjectSubcommand::Idletime(key) => {
                         if let Some(idle) = db.idletime(key) {
@@ -28237,7 +28263,8 @@ mod tests {
             &mut out,
             None,
         );
-        assert_eq!(&out[..], b":0\r\n");
+        // Not tracked unless an LFU maxmemory policy is selected.
+        assert!(out.starts_with(b"-ERR An LFU maxmemory policy is not selected"));
         out.clear();
 
         // OBJECT HELP

@@ -1784,6 +1784,84 @@ pub fn lru_now() -> u16 {
     coarse_now_secs() as u16
 }
 
+/// Whether a `*-lfu` maxmemory policy is active. The 16-bit per-slot access
+/// word then holds Redis-style LFU data instead of an LRU clock: the high
+/// byte is the last decrement time in minutes (mod 256), the low byte a
+/// logarithmic access counter. Keys keep the same 2 B either way.
+pub static LFU_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `lfu-log-factor` (Redis default 10): higher makes the counter saturate later.
+pub static LFU_LOG_FACTOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(10);
+/// `lfu-decay-time` in minutes (Redis default 1): the counter loses one per
+/// period without access. 0 never decays.
+pub static LFU_DECAY_TIME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+/// Counter of a new key (Redis `LFU_INIT_VAL`), so it isn't evicted at once.
+pub const LFU_INIT_VAL: u8 = 5;
+
+#[inline(always)]
+fn lfu_minutes() -> u8 {
+    (coarse_now_secs() / 60) as u8
+}
+
+/// The LFU counter of access word `word` after decay (Redis
+/// `LFUDecrAndReturn`). Minutes wrap at 256, so a key idle longer than
+/// ~4.3 h decays as if idle for the remainder (Redis's 16-bit minutes wrap
+/// at ~45 days).
+pub fn lfu_decayed_counter(word: u16) -> u8 {
+    let (last, counter) = ((word >> 8) as u8, word as u8);
+    let period = LFU_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed);
+    if period == 0 {
+        return counter;
+    }
+    let periods = lfu_minutes().wrapping_sub(last) as u32 / period;
+    counter.saturating_sub(periods.min(255) as u8)
+}
+
+/// Redis `LFULogIncr`: increments with probability 1 / ((c - INIT) * factor + 1).
+fn lfu_log_incr(counter: u8) -> u8 {
+    if counter == u8::MAX {
+        return counter;
+    }
+    thread_local! {
+        static RNG: std::cell::Cell<u64> = const { std::cell::Cell::new(0x9E37_79B9_7F4A_7C15) };
+    }
+    let r = RNG.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    });
+    let base = counter.saturating_sub(LFU_INIT_VAL) as f64;
+    let factor = LFU_LOG_FACTOR.load(std::sync::atomic::Ordering::Relaxed) as f64;
+    if r < 1.0 / (base * factor + 1.0) {
+        counter + 1
+    } else {
+        counter
+    }
+}
+
+/// The access word a key gets when it is created.
+#[inline(always)]
+pub fn access_word_new() -> u16 {
+    if LFU_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        ((lfu_minutes() as u16) << 8) | LFU_INIT_VAL as u16
+    } else {
+        lru_now()
+    }
+}
+
+/// The access word after the key is accessed (Redis `updateLFU` / LRU clock).
+#[inline(always)]
+pub fn access_word_touched(old: u16) -> u16 {
+    if LFU_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        let counter = lfu_log_incr(lfu_decayed_counter(old));
+        ((lfu_minutes() as u16) << 8) | counter as u16
+    } else {
+        lru_now()
+    }
+}
+
 #[inline(always)]
 pub fn coarse_now_secs() -> u32 {
     let mut ts = libc::timespec {
@@ -1917,7 +1995,8 @@ impl RawSegment {
     #[inline(always)]
     pub fn touch_entry_mut(&mut self, slot: usize) -> Option<&mut RudisEntry> {
         let i = *self.slot_idx.get(slot)? as usize;
-        *self.last_access.get_mut(i)? = lru_now();
+        let acc = self.last_access.get_mut(i)?;
+        *acc = access_word_touched(*acc);
         self.entries.get_mut(i)
     }
 
@@ -2342,11 +2421,11 @@ impl RawSegment {
         debug_assert_eq!(self.slot_idx[insert_idx], NO_ENTRY);
         let i = if let Some(i) = hole {
             self.entries[i] = entry;
-            self.last_access[i] = lru_now();
+            self.last_access[i] = access_word_new();
             i
         } else {
             self.entries.push(entry);
-            self.last_access.push(lru_now());
+            self.last_access.push(access_word_new());
             self.entries.len() - 1
         };
         self.slot_idx[insert_idx] = i as u16;
@@ -2817,7 +2896,7 @@ impl RudisFlatTable {
         if let Some(seg) = self.segments.get_mut(seg_id)
             && let Some(acc) = seg.slot_access_mut(local_idx)
         {
-            *acc = lru_now();
+            *acc = access_word_touched(*acc);
         }
     }
 
@@ -3768,8 +3847,8 @@ impl RudisTable {
 
         let policy_lower = policy.to_lowercase();
         let is_volatile = policy_lower.starts_with("volatile");
-        // LFU has no frequency counter yet; recency is the closer proxy.
-        let by_age = policy_lower.contains("lru") || policy_lower.contains("lfu");
+        let by_lfu = policy_lower.contains("lfu");
+        let by_age = policy_lower.contains("lru") || by_lfu;
         let now = lru_now();
         let mut max_age: u16 = 0;
         // Nothing is evictable, and the sampling loop below would otherwise
@@ -3804,9 +3883,14 @@ impl RudisTable {
                         best_slot = Some(idx);
                     }
                 } else if by_age {
-                    // Sampled LRU (as Redis): evict the least recently
-                    // accessed of the sampled keys.
-                    let age = now.wrapping_sub(self.table.get_slot_last_access(idx));
+                    // Sampled LRU / LFU (as Redis): evict the least
+                    // recently / least frequently accessed sampled key.
+                    let word = self.table.get_slot_last_access(idx);
+                    let age = if by_lfu {
+                        (u8::MAX - lfu_decayed_counter(word)) as u16
+                    } else {
+                        now.wrapping_sub(word)
+                    };
                     if best_slot.is_none() || age > max_age {
                         max_age = age;
                         best_slot = Some(idx);
@@ -5026,6 +5110,19 @@ impl RudisTable {
         {
             let last = self.table.get_slot_last_access(idx);
             Some(lru_now().wrapping_sub(last) as u64)
+        } else {
+            None
+        }
+    }
+
+    /// `OBJECT FREQ`: the key's decayed LFU counter (without counting this
+    /// lookup as an access).
+    pub fn lfu_freq(&mut self, key: &[u8]) -> Option<u8> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && !self.check_expired_slot(idx)
+        {
+            Some(lfu_decayed_counter(self.table.get_slot_last_access(idx)))
         } else {
             None
         }
@@ -17432,6 +17529,64 @@ mod tests {
             best_set,
             best_del
         );
+    }
+
+    #[test]
+    fn test_lfu_counter_decays_and_grows_logarithmically() {
+        let now = lfu_minutes();
+        let word =
+            |mins_ago: u8, counter: u8| ((now.wrapping_sub(mins_ago) as u16) << 8) | counter as u16;
+        // lfu-decay-time 1: one point per idle minute, never below 0.
+        assert_eq!(lfu_decayed_counter(word(0, 40)), 40);
+        assert_eq!(lfu_decayed_counter(word(7, 40)), 33);
+        assert_eq!(lfu_decayed_counter(word(200, 40)), 0);
+        // A new key starts at LFU_INIT_VAL, which increments almost surely.
+        assert_eq!(lfu_log_incr(0), 1);
+        assert_eq!(lfu_log_incr(LFU_INIT_VAL), LFU_INIT_VAL + 1);
+        assert_eq!(lfu_log_incr(u8::MAX), u8::MAX);
+        // With the default factor, a million hits land near Redis's ~200
+        // (it reaches 255 only around 10M hits).
+        let mut c = LFU_INIT_VAL;
+        for _ in 0..1_000_000 {
+            c = lfu_log_incr(c);
+        }
+        assert!((150..=255).contains(&c), "{c}");
+        let mut c100 = LFU_INIT_VAL;
+        for _ in 0..100 {
+            c100 = lfu_log_incr(c100);
+        }
+        assert!(c100 < c, "{c100} vs {c}");
+    }
+
+    #[test]
+    fn test_lfu_eviction_prefers_rarely_used_keys() {
+        let mut table = RudisTable::new();
+        let n = 2_000usize;
+        let now = lfu_minutes() as u16;
+        for i in 0..n {
+            let k = format!("k{i}");
+            table.set(Bytes::from(k.clone()), Bytes::from_static(b"v"), None);
+            // Odd keys cold (counter 1), even keys hot (counter 100), all
+            // touched this minute: recency alone can't tell them apart.
+            let counter = if i % 2 == 1 { 1 } else { 100 };
+            set_key_access(&mut table, k.as_bytes(), (now << 8) | counter);
+        }
+        let mut cold_evicted = 0;
+        for _ in 0..100 {
+            let before: Vec<bool> = (0..n)
+                .map(|i| table.key_is_live(format!("k{i}").as_bytes()))
+                .collect();
+            assert!(table.try_evict_one_key("allkeys-lfu").is_some());
+            let gone = (0..n)
+                .find(|&i| before[i] && !table.key_is_live(format!("k{i}").as_bytes()))
+                .unwrap();
+            if gone % 2 == 1 {
+                cold_evicted += 1;
+            }
+        }
+        assert_eq!(cold_evicted, 100, "every eviction must pick a cold key");
+        // 100, or 99 if the minute ticked over since it was set.
+        assert!(matches!(table.lfu_freq(b"k0"), Some(99..=100)));
     }
 
     #[test]

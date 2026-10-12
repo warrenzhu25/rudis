@@ -11700,9 +11700,10 @@ fn test_e2e_unlink_readonly_wait_object_and_proto_max() {
         send_and_read(&mut stream, b"OBJECT REFCOUNT obj_k\r\n"),
         ":1\r\n"
     );
-    assert_eq!(
-        send_and_read(&mut stream, b"OBJECT FREQ obj_k\r\n"),
-        ":0\r\n"
+    // Not tracked unless an LFU maxmemory policy is selected, as in Redis.
+    assert!(
+        send_and_read(&mut stream, b"OBJECT FREQ obj_k\r\n")
+            .starts_with("-ERR An LFU maxmemory policy is not selected")
     );
     let help_resp = send_and_read(&mut stream, b"OBJECT HELP\r\n");
     assert!(help_resp.contains("ENCODING"));
@@ -25100,6 +25101,96 @@ fn test_enable_debug_command_gates_debug_e2e() {
             &["EVAL", "return redis.call('DEBUG','SLEEP','0')", "0"]
         )
         .contains("not allowed"),
+    );
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
+
+#[test]
+fn test_allkeys_lfu_keeps_frequently_used_keys_e2e() {
+    let port = 17965u16;
+    let ps = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &ps, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    // Under LRU, OBJECT FREQ isn't tracked (Redis' error).
+    assert_eq!(resp_cmd(&mut c, &["SET", "probe", "v"]), "+OK\r\n");
+    assert!(
+        resp_cmd(&mut c, &["OBJECT", "FREQ", "probe"])
+            .starts_with("-ERR An LFU maxmemory policy is not selected")
+    );
+
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "maxmemory-policy", "allkeys-lfu"]
+        ),
+        "+OK\r\n"
+    );
+    // Factor 0 makes every access count, so "hot" is unambiguous.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "lfu-log-factor", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "lfu-log-factor"]),
+        "*2\r\n$14\r\nlfu-log-factor\r\n$1\r\n0\r\n"
+    );
+    assert!(
+        resp_cmd(&mut c, &["OBJECT", "IDLETIME", "probe"])
+            .starts_with("-ERR An LFU maxmemory policy is selected")
+    );
+    assert_eq!(resp_cmd(&mut c, &["SET", "fresh", "v"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["OBJECT", "FREQ", "fresh"]), ":5\r\n");
+    assert_eq!(resp_cmd(&mut c, &["OBJECT", "FREQ", "missing"]), "$-1\r\n");
+
+    let val = "x".repeat(1000);
+    for i in 0..100 {
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", &format!("hot:{i}"), &val]),
+            "+OK\r\n"
+        );
+    }
+    for _ in 0..50 {
+        for i in 0..100 {
+            assert!(resp_cmd(&mut c, &["GET", &format!("hot:{i}")]).starts_with("$1000"));
+        }
+    }
+    let freq = resp_cmd(&mut c, &["OBJECT", "FREQ", "hot:7"]);
+    let f: i64 = freq.trim_start_matches(':').trim().parse().unwrap();
+    assert!(f >= 50, "{freq}");
+
+    // Cap memory near what's used, then write cold keys well past it.
+    let used = info_u64(&mut c, "memory", "used_memory");
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &[
+                "CONFIG",
+                "SET",
+                "maxmemory",
+                &(used + 2_000_000).to_string()
+            ]
+        ),
+        "+OK\r\n"
+    );
+    for i in 0..10_000 {
+        let r = resp_cmd(&mut c, &["SET", &format!("cold:{i}"), &val]);
+        assert!(r == "+OK\r\n" || r.starts_with("-OOM"), "{r}");
+    }
+    assert!(info_u64(&mut c, "stats", "evicted_keys") > 1000);
+    let hot_alive = (0..100)
+        .filter(|i| resp_cmd(&mut c, &["EXISTS", &format!("hot:{i}")]) == ":1\r\n")
+        .count();
+    assert!(
+        hot_alive >= 95,
+        "only {hot_alive}/100 hot keys survived LFU eviction"
+    );
+
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "0"]),
+        "+OK\r\n"
     );
     drop(c);
     shutdown_and_wait(port, &mut child);
