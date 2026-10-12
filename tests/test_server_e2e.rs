@@ -3285,28 +3285,46 @@ fn test_replica_partial_resync_reconnect_e2e() {
     assert!(rep_info.contains("role:slave"));
     assert!(rep_info.contains("master_link_status:up"));
 
-    // 4. Trigger reconnect on replica: re-issuing REPLICAOF to same master
-    // preserves cached master_replid and offset, performing partial resync (PSYNC <replid> <offset>)
+    // 4. Drop the replication link from the master side. The replica
+    // reconnects on its own with its cached master_replid and offset and
+    // resumes from the backlog (PSYNC <replid> <offset>). Re-issuing
+    // REPLICAOF to the same master is a no-op ("Already connected"), as in
+    // Redis, so it can't be used to force a reconnect.
     assert_eq!(
         send_and_read(&mut master_client, b"SET k4 v4\r\n"),
         "+OK\r\n"
     );
+    // In-process servers share the process-wide stats with other tests, so
+    // compare counters before and after rather than absolute values.
+    let stat = |c: &mut TcpStream, name: &str| -> u64 {
+        let info = send_and_read(c, b"INFO stats\r\n");
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no {name} in {info}"))
+    };
+    let partial_before = stat(&mut master_client, "sync_partial_ok");
+    let full_before = stat(&mut master_client, "sync_full");
     assert_eq!(
-        send_and_read(
-            &mut replica_client,
-            format!("REPLICAOF 127.0.0.1 {}\r\n", master_port).as_bytes()
-        ),
-        "+OK\r\n"
+        send_and_read(&mut master_client, b"CLIENT KILL TYPE replica\r\n"),
+        ":1\r\n"
     );
 
-    // Wait for reconnection
-    for _ in 0..40 {
-        let role = send_and_read(&mut replica_client, b"ROLE\r\n");
-        if role.contains("connected") {
+    // Wait for the partial resync.
+    let mut partial = partial_before;
+    for _ in 0..100 {
+        partial = stat(&mut master_client, "sync_partial_ok");
+        if partial > partial_before {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
+    assert_eq!(partial, partial_before + 1, "no partial resync");
+    assert_eq!(
+        stat(&mut master_client, "sync_full"),
+        full_before,
+        "the reconnect fell back to a full sync"
+    );
 
     // Verify k4 is replicated after partial sync
     for _ in 0..40 {
@@ -17986,11 +18004,22 @@ fn test_full_sync_under_concurrent_writes_matches_master_e2e() {
     );
     wait_connected(&mut r);
     thread::sleep(Duration::from_millis(300));
-    // Reconnect to the same master: this resumes from the backlog.
+    // Drop the link from the master side: the replica reconnects on its
+    // own and resumes from the backlog. (Re-issuing REPLICAOF to the same
+    // master is a no-op, as in Redis.)
     assert_eq!(
-        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
-        "+OK\r\n"
+        resp_cmd(&mut m, &["CLIENT", "KILL", "TYPE", "replica"]),
+        ":1\r\n"
     );
+    let mut stats = String::new();
+    for _ in 0..200 {
+        stats = resp_cmd(&mut m, &["INFO", "stats"]);
+        if stats.contains("sync_partial_ok:1\r\n") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(stats.contains("sync_partial_ok:1\r\n"), "{stats}");
     wait_connected(&mut r);
     thread::sleep(Duration::from_millis(300));
     stop.store(true, Ordering::Relaxed);
