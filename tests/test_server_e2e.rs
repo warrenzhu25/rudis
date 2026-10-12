@@ -24934,3 +24934,57 @@ fn test_redis7_multipart_aof_is_imported_once_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// With only 64 KB of locked memory, io_uring probes fine but a full shard
+/// ring can't be set up (the same ENOMEM as running out of the limit). Shards
+/// used to panic, leaving keys on them unreachable; they now fall back to
+/// the epoll driver and keep serving.
+#[test]
+fn test_shards_fall_back_to_epoll_when_io_uring_cannot_start_e2e() {
+    let port = 17961u16;
+    let ps = port.to_string();
+    let cwd = std::env::temp_dir().join(format!("rudis-memlock0-{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut child = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "ulimit -l 64 && exec \"$0\" \"$@\"",
+            env!("CARGO_BIN_EXE_rudis"),
+            "--port",
+            &ps,
+            "--threads",
+            "4",
+            "--no-pin",
+        ])
+        .current_dir(&cwd)
+        .env("MONOIO_FORCE_LEGACY_DRIVER", "0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rudis");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut c = loop {
+        if let Ok(c) = TcpStream::connect(("127.0.0.1", port)) {
+            break c;
+        }
+        if let Some(s) = child.try_wait().unwrap() {
+            panic!("rudis exited early: {s}");
+        }
+        assert!(std::time::Instant::now() < deadline, "rudis did not start");
+        thread::sleep(Duration::from_millis(50));
+    };
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Keys on every shard are reachable.
+    for i in 0..64 {
+        let k = format!("k{i}");
+        assert_eq!(resp_cmd(&mut c, &["SET", &k, "v"]), "+OK\r\n");
+    }
+    for i in 0..64 {
+        let k = format!("k{i}");
+        assert_eq!(resp_cmd(&mut c, &["GET", &k]), "$1\r\nv\r\n");
+    }
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":64\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&cwd);
+}

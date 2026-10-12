@@ -192,11 +192,30 @@ pub fn run_shard_worker(
 
     ADOPTED_CLIENT_SEQ.with(|s| s.set(((shard_id as u64) << 48) | (1u64 << 47) | 1));
 
-    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+    let mut rt = match monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
         .enable_timer()
         .uring_builder(shard_uring_builder())
         .build()
-        .expect("Failed to initialize Monoio io_uring runtime");
+    {
+        Ok(rt) => rt,
+        // io_uring is supported (monoio probed it) but this ring couldn't be
+        // set up, typically ENOMEM from RLIMIT_MEMLOCK. Serving on epoll is
+        // slower but beats a shard thread that never starts.
+        Err(e) => {
+            crate::log_warning!(
+                "WARNING: shard {} could not set up io_uring ({}); falling back to the epoll driver, \
+                 which is slower. Raise the locked-memory limit (ulimit -l / systemd \
+                 LimitMEMLOCK=infinity / docker --ulimit memlock=-1) to use io_uring.",
+                shard_id,
+                e
+            );
+            monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+                .enable_timer()
+                .build()
+                .expect("Failed to initialize the Monoio epoll runtime")
+                .into()
+        }
+    };
 
     rt.block_on(async move {
         let base_port = port;
