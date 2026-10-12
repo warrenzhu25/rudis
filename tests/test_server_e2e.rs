@@ -25319,12 +25319,20 @@ fn test_auto_aof_rewrite_triggers_on_growth_e2e() {
     assert_eq!(info_u64(&mut c, "persistence", "aof_rewrites"), 0);
     // Overwrite a few keys many times: the AOF grows, its rewrite is tiny.
     let val = "v".repeat(100);
-    for i in 0..5000 {
-        let k = format!("k{}", i % 10);
-        assert_eq!(
-            resp_cmd(&mut c, &["SET", &k, &format!("{val}{i}")]),
-            "+OK\r\n"
-        );
+    for chunk in 0..50 {
+        let mut pipe = Vec::new();
+        for j in 0..100 {
+            let i = chunk * 100 + j;
+            let k = format!("k{}", i % 10);
+            pipe.extend_from_slice(&format_resp_cmd(&["SET", &k, &format!("{val}{i}")]));
+        }
+        c.write_all(&pipe).unwrap();
+        let mut got = Vec::new();
+        while got.windows(5).filter(|w| *w == b"+OK\r\n").count() < 100 {
+            let mut b = [0u8; 4096];
+            let n = c.read(&mut b).unwrap();
+            got.extend_from_slice(&b[..n]);
+        }
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while info_u64(&mut c, "persistence", "aof_rewrites") == 0
@@ -26595,6 +26603,71 @@ fn test_pipelined_mset_folding_e2e() {
         "$11\r\nv5_override\r\n",
         "$4\r\nv6_a\r\n",
         "$4\r\nv7_a\r\n",
+    );
+    assert_eq!(resp, expected);
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}
+
+#[test]
+fn test_pipelined_unlink_touch_hmget_smismember_zmscore_e2e() {
+    let port = 17984u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Send a single pipeline exercising cross-shard HSET+HMGET, SADD+SMISMEMBER, ZADD+ZMSCORE,
+    // multi-key TOUCH, and multi-key UNLINK across 4 shards.
+    let mut pipe = String::new();
+    pipe.push_str("HSET pipe_h_1 f1 v1 f2 v2\r\n");
+    pipe.push_str("HSET pipe_h_2 fa va fb vb\r\n");
+    pipe.push_str("HMGET pipe_h_1 f1 missing f2\r\n");
+    pipe.push_str("HMGET pipe_h_2 fb missing fa\r\n");
+    pipe.push_str("SADD pipe_s_1 m1 m2\r\n");
+    pipe.push_str("SADD pipe_s_2 ma mb\r\n");
+    pipe.push_str("SMISMEMBER pipe_s_1 m1 m_none m2\r\n");
+    pipe.push_str("SMISMEMBER pipe_s_2 mb m_none ma\r\n");
+    pipe.push_str("ZADD pipe_z_1 1.5 zm1 2.5 zm2\r\n");
+    pipe.push_str("ZADD pipe_z_2 3.5 zma 4.5 zmb\r\n");
+    pipe.push_str("ZMSCORE pipe_z_1 zm1 zm_none zm2\r\n");
+    pipe.push_str("ZMSCORE pipe_z_2 zmb zm_none zma\r\n");
+    pipe.push_str(
+        "TOUCH pipe_h_1 pipe_h_2 pipe_s_1 pipe_s_2 pipe_z_1 pipe_z_2 pipe_missing_key\r\n",
+    );
+    pipe.push_str("UNLINK pipe_h_1 pipe_s_2 pipe_z_1 pipe_missing_key\r\n");
+    pipe.push_str("TOUCH pipe_h_1 pipe_h_2 pipe_s_1 pipe_s_2 pipe_z_1 pipe_z_2\r\n");
+
+    let resp = send_and_read(&mut c, pipe.as_bytes());
+    let expected = concat!(
+        ":2\r\n",
+        ":2\r\n",
+        "*3\r\n$2\r\nv1\r\n$-1\r\n$2\r\nv2\r\n",
+        "*3\r\n$2\r\nvb\r\n$-1\r\n$2\r\nva\r\n",
+        ":2\r\n",
+        ":2\r\n",
+        "*3\r\n:1\r\n:0\r\n:1\r\n",
+        "*3\r\n:1\r\n:0\r\n:1\r\n",
+        ":2\r\n",
+        ":2\r\n",
+        "*3\r\n$3\r\n1.5\r\n$-1\r\n$3\r\n2.5\r\n",
+        "*3\r\n$3\r\n4.5\r\n$-1\r\n$3\r\n3.5\r\n",
+        ":6\r\n",
+        ":3\r\n",
+        ":3\r\n",
     );
     assert_eq!(resp, expected);
 

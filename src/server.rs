@@ -925,13 +925,24 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                         crate::server_stats::note_key_lookup(exists);
                                         responder.write_slot(idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 });
                                         continue;
+                                    } else if let Command::Touch(ref keys) = cmd && keys.len() == 1 {
+                                        let touched = r.local_db.borrow_mut().table.touch_with_hash(keys[0].as_ref(), key_hash);
+                                        responder.write_slot(idx, if touched { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 });
+                                        continue;
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
                                         && !crate::search::has_active_search_indices()
-                                        && let Command::Del(ref keys) = cmd && keys.len() == 1
+                                        && let Command::Del(ref keys) | Command::Unlink(ref keys) = cmd && keys.len() == 1
                                     {
-                                        let deleted = r.local_db.borrow_mut().del_with_hash(keys[0].as_ref(), key_hash);
+                                        let is_unlink = matches!(cmd, Command::Unlink(_));
+                                        let mut db = r.local_db.borrow_mut();
+                                        let lazy = is_unlink && db.table.is_lazyfree_worthy(keys[0].as_ref());
+                                        let deleted = db.del_with_hash(keys[0].as_ref(), key_hash);
+                                        drop(db);
                                         if deleted {
+                                            if lazy {
+                                                crate::table::add_lazyfreed_objects(1);
+                                            }
                                             has_writes = true;
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(r.port, keys[0].as_ref());
@@ -943,6 +954,16 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                         continue;
                                     } else if let Command::Hget { ref key, ref field } = cmd {
                                         match r.local_db.borrow_mut().table.hget_compact_with_hash(key.as_ref(), key_hash, field.as_ref()) {
+                                            Ok(resp) => {
+                                                responder.write_slot(idx, resp);
+                                                continue;
+                                            }
+                                            Err(err) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, err);
+                                            }
+                                        }
+                                    } else if let Command::Hmget { ref key, ref fields } = cmd {
+                                        match r.local_db.borrow_mut().table.hmget_compact_with_hash(key.as_ref(), key_hash, fields, &mut temp_buf) {
                                             Ok(resp) => {
                                                 responder.write_slot(idx, resp);
                                                 continue;
@@ -983,6 +1004,22 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                         }
                                     } else if let Command::Sismember { ref key, ref member } = cmd {
                                         match r.local_db.borrow_mut().table.sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref()) {
+                                            Ok(resp) => {
+                                                responder.write_slot(idx, resp);
+                                                continue;
+                                            }
+                                            Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
+                                        }
+                                    } else if let Command::Smismember { ref key, ref members } = cmd {
+                                        match r.local_db.borrow_mut().table.smismember_compact_with_hash(key.as_ref(), key_hash, members, &mut temp_buf) {
+                                            Ok(resp) => {
+                                                responder.write_slot(idx, resp);
+                                                continue;
+                                            }
+                                            Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
+                                        }
+                                    } else if let Command::Zmscore { ref key, ref members } = cmd {
+                                        match r.local_db.borrow_mut().table.zmscore_compact_with_hash(key.as_ref(), key_hash, members, &mut temp_buf) {
                                             Ok(resp) => {
                                                 responder.write_slot(idx, resp);
                                                 continue;
@@ -1214,7 +1251,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                             Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                         }
                                     } else {
-                                        if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
+                                        if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::Unlink(_) | Command::IncrBy { .. }) {
                                             has_writes = true;
                                         }
                                         let mut db = r.local_db.borrow_mut();
@@ -1326,15 +1363,27 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     responder.write_slot(idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 });
                                     continue;
                                 } else if !has_tracking
+                                    && let Command::Touch(ref keys) = cmd
+                                    && keys.len() == 1
+                                {
+                                    let touched = db.table.touch_with_hash(keys[0].as_ref(), key_hash);
+                                    responder.write_slot(idx, if touched { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 });
+                                    continue;
+                                } else if !has_tracking
                                     && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && !crate::search::has_active_search_indices()
-                                    && let Command::Del(ref keys) = cmd
+                                    && let Command::Del(ref keys) | Command::Unlink(ref keys) = cmd
                                     && keys.len() == 1
                                 {
+                                    let is_unlink = matches!(cmd, Command::Unlink(_));
+                                    let lazy = is_unlink && db.table.is_lazyfree_worthy(keys[0].as_ref());
                                     let deleted = db.del_with_hash(keys[0].as_ref(), key_hash);
                                     if deleted {
+                                        if lazy {
+                                            crate::table::add_lazyfreed_objects(1);
+                                        }
                                         has_writes = true;
                                         if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                             crate::connection::touch_watched_key(cross_shard_router.port, keys[0].as_ref());
@@ -1348,6 +1397,18 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     && let Command::Hget { ref key, ref field } = cmd
                                 {
                                     match db.table.hget_compact_with_hash(key.as_ref(), key_hash, field.as_ref()) {
+                                        Ok(resp) => {
+                                            responder.write_slot(idx, resp);
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
+                                    }
+                                } else if !has_tracking
+                                    && let Command::Hmget { ref key, ref fields } = cmd
+                                {
+                                    match db.table.hmget_compact_with_hash(key.as_ref(), key_hash, fields, &mut temp_buf) {
                                         Ok(resp) => {
                                             responder.write_slot(idx, resp);
                                             continue;
@@ -1392,6 +1453,26 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     && let Command::Sismember { ref key, ref member } = cmd
                                 {
                                     match db.table.sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref()) {
+                                        Ok(resp) => {
+                                            responder.write_slot(idx, resp);
+                                            continue;
+                                        }
+                                        Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
+                                    }
+                                } else if !has_tracking
+                                    && let Command::Smismember { ref key, ref members } = cmd
+                                {
+                                    match db.table.smismember_compact_with_hash(key.as_ref(), key_hash, members, &mut temp_buf) {
+                                        Ok(resp) => {
+                                            responder.write_slot(idx, resp);
+                                            continue;
+                                        }
+                                        Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
+                                    }
+                                } else if !has_tracking
+                                    && let Command::Zmscore { ref key, ref members } = cmd
+                                {
+                                    match db.table.zmscore_compact_with_hash(key.as_ref(), key_hash, members, &mut temp_buf) {
                                         Ok(resp) => {
                                             responder.write_slot(idx, resp);
                                             continue;

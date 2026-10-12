@@ -5103,6 +5103,18 @@ impl RudisTable {
         count
     }
 
+    #[inline(always)]
+    pub fn touch_with_hash(&mut self, key: &[u8], h: u64) -> bool {
+        if let Some(idx) = self.table.find(key, h)
+            && !self.check_expired_slot(idx)
+        {
+            self.table.touch_slot(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn idletime(&mut self, key: &[u8]) -> Option<u64> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h)
@@ -7428,6 +7440,84 @@ impl RudisTable {
             }
         } else {
             Ok(vec![None; fields.len()])
+        }
+    }
+
+    #[inline(always)]
+    pub fn hmget_compact_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        fields: &[Bytes],
+        out: &mut Vec<u8>,
+    ) -> Result<crate::shard::CompactResp, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at()
+                && !crate::connection::access_expired_allowed()
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                crate::server_stats::note_key_lookup(false);
+                out.clear();
+                out.reserve(16 + fields.len() * 5);
+                crate::connection::write_resp_array_header(out, fields.len());
+                for _ in 0..fields.len() {
+                    crate::connection::write_resp_null(out);
+                }
+                return Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)));
+            }
+            crate::server_stats::note_key_lookup(true);
+            match &entry.val {
+                RudisValue::SmallHash(pairs) => {
+                    out.clear();
+                    out.reserve(16 + fields.len() * 24);
+                    crate::connection::write_resp_array_header(out, fields.len());
+                    for f in fields {
+                        let f_bytes = f.as_ref();
+                        let f_len = f_bytes.len();
+                        let mut found = None;
+                        for (k, v) in pairs.iter() {
+                            if k.len() == f_len && k.as_ref() == f_bytes {
+                                found = Some(v);
+                                break;
+                            }
+                        }
+                        if let Some(v) = found {
+                            crate::connection::write_resp_bulk(out, v);
+                        } else {
+                            crate::connection::write_resp_null(out);
+                        }
+                    }
+                    Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)))
+                }
+                RudisValue::Hash(map) => {
+                    out.clear();
+                    out.reserve(16 + fields.len() * 24);
+                    crate::connection::write_resp_array_header(out, fields.len());
+                    for f in fields {
+                        if let Some(v) = map.get(f.as_ref()) {
+                            crate::connection::write_resp_bulk(out, v);
+                        } else {
+                            crate::connection::write_resp_null(out);
+                        }
+                    }
+                    Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)))
+                }
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        } else {
+            crate::server_stats::note_key_lookup(false);
+            out.clear();
+            out.reserve(16 + fields.len() * 5);
+            crate::connection::write_resp_array_header(out, fields.len());
+            for _ in 0..fields.len() {
+                crate::connection::write_resp_null(out);
+            }
+            Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)))
         }
     }
 
@@ -10154,6 +10244,61 @@ impl RudisTable {
         }
     }
 
+    #[inline(always)]
+    pub fn smismember_compact_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        members: &[Bytes],
+        out: &mut Vec<u8>,
+    ) -> Result<crate::shard::CompactResp, &'static str> {
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at()
+                && !crate::connection::access_expired_allowed()
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                crate::server_stats::note_key_lookup(false);
+                out.clear();
+                out.reserve(16 + members.len() * 4);
+                crate::connection::write_resp_array_header(out, members.len());
+                for _ in 0..members.len() {
+                    out.extend_from_slice(b":0\r\n");
+                }
+                return Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)));
+            }
+            crate::server_stats::note_key_lookup(true);
+            match &entry.val {
+                RudisValue::Set(set) => {
+                    out.clear();
+                    out.reserve(16 + members.len() * 4);
+                    crate::connection::write_resp_array_header(out, members.len());
+                    for m in members {
+                        let m_bytes = m.as_ref();
+                        let m_hash = hash64(m_bytes);
+                        if set.contains_with_hash(m_bytes, m_hash) {
+                            out.extend_from_slice(b":1\r\n");
+                        } else {
+                            out.extend_from_slice(b":0\r\n");
+                        }
+                    }
+                    Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)))
+                }
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        } else {
+            crate::server_stats::note_key_lookup(false);
+            out.clear();
+            out.reserve(16 + members.len() * 4);
+            crate::connection::write_resp_array_header(out, members.len());
+            for _ in 0..members.len() {
+                out.extend_from_slice(b":0\r\n");
+            }
+            Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)))
+        }
+    }
+
     pub fn srandmember(
         &mut self,
         key: &[u8],
@@ -11703,6 +11848,59 @@ impl RudisTable {
             }
         } else {
             Ok(vec![None; members.len()])
+        }
+    }
+
+    #[inline(always)]
+    pub fn zmscore_compact_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        members: &[Bytes],
+        out: &mut Vec<u8>,
+    ) -> Result<crate::shard::CompactResp, &'static str> {
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at()
+                && !crate::connection::access_expired_allowed()
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                crate::server_stats::note_key_lookup(false);
+                out.clear();
+                out.reserve(16 + members.len() * 5);
+                crate::connection::write_resp_array_header(out, members.len());
+                for _ in 0..members.len() {
+                    crate::connection::write_resp_null(out);
+                }
+                return Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)));
+            }
+            crate::server_stats::note_key_lookup(true);
+            match &entry.val {
+                RudisValue::ZSet(zset) => {
+                    out.clear();
+                    out.reserve(16 + members.len() * 16);
+                    crate::connection::write_resp_array_header(out, members.len());
+                    for m in members {
+                        if let Some(score) = zset.get_score(m.as_ref()) {
+                            crate::connection::write_resp_score(out, score);
+                        } else {
+                            crate::connection::write_resp_null(out);
+                        }
+                    }
+                    Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)))
+                }
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        } else {
+            crate::server_stats::note_key_lookup(false);
+            out.clear();
+            out.reserve(16 + members.len() * 5);
+            crate::connection::write_resp_array_header(out, members.len());
+            for _ in 0..members.len() {
+                crate::connection::write_resp_null(out);
+            }
+            Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)))
         }
     }
 

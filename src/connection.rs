@@ -18706,16 +18706,22 @@ pub fn target_shard_and_hash_of_cmd(cmd: &Command, num_shards: usize) -> Option<
         Command::Exists(keys) if keys.len() == 1 => {
             Some(crate::router::target_shard_and_hash(&keys[0], num_shards))
         }
+        Command::Touch(keys) if keys.len() == 1 => {
+            Some(crate::router::target_shard_and_hash(&keys[0], num_shards))
+        }
         Command::Del(keys) | Command::Unlink(keys) if keys.len() == 1 => {
             Some(crate::router::target_shard_and_hash(&keys[0], num_shards))
         }
         Command::Sismember { key, .. }
+        | Command::Smismember { key, .. }
         | Command::Sadd { key, .. }
         | Command::Hset { key, .. }
         | Command::Hget { key, .. }
+        | Command::Hmget { key, .. }
         | Command::Lpop { key, .. }
         | Command::Lpush { key, .. }
         | Command::Zadd { key, .. }
+        | Command::Zmscore { key, .. }
         | Command::Get(key)
         | Command::Set { key, .. }
         | Command::IncrBy(key, _, _)
@@ -26094,7 +26100,9 @@ async fn execute_commands_squashed_inner(
                                         Command::Mget(_)
                                             | Command::Mset(_)
                                             | Command::Del(_)
+                                            | Command::Unlink(_)
                                             | Command::Exists(_)
+                                            | Command::Touch(_)
                                     )
                                 {
                                     invalid_slot = true;
@@ -26214,6 +26222,9 @@ async fn execute_commands_squashed_inner(
             }
             stat_run.note(get_cmd_name(&cmd));
             if target == router.shard_id {
+                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                    for_each_read_key(&cmd, |k| record_client_read(router.port, client_id, k));
+                }
                 local_buf.clear();
                 local_db.hydrate_cmd_keys(&cmd);
                 if let Command::Get(ref key) = cmd {
@@ -26294,13 +26305,28 @@ async fn execute_commands_squashed_inner(
                         crate::shard::CompactResp::INT_0
                     };
                     continue;
-                } else if write_fast_path
-                    && !crate::search::has_active_search_indices()
-                    && let Command::Del(ref keys) = cmd
+                } else if let Command::Touch(ref keys) = cmd
                     && keys.len() == 1
                 {
+                    let touched = local_db.table.touch_with_hash(keys[0].as_ref(), key_hash);
+                    responses[idx] = if touched {
+                        crate::shard::CompactResp::INT_1
+                    } else {
+                        crate::shard::CompactResp::INT_0
+                    };
+                    continue;
+                } else if write_fast_path
+                    && !crate::search::has_active_search_indices()
+                    && let Command::Del(ref keys) | Command::Unlink(ref keys) = cmd
+                    && keys.len() == 1
+                {
+                    let is_unlink = matches!(cmd, Command::Unlink(_));
+                    let lazy = is_unlink && local_db.table.is_lazyfree_worthy(keys[0].as_ref());
                     let deleted = local_db.del_with_hash(keys[0].as_ref(), key_hash);
                     if deleted {
+                        if lazy {
+                            crate::table::add_lazyfreed_objects(1);
+                        }
                         has_local_writes = true;
                         if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                             touch_watched_key(router.port, keys[0].as_ref());
@@ -26318,6 +26344,25 @@ async fn execute_commands_squashed_inner(
                         key.as_ref(),
                         key_hash,
                         field.as_ref(),
+                    ) {
+                        Ok(resp) => {
+                            responses[idx] = resp;
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if let Command::Hmget {
+                    ref key,
+                    ref fields,
+                } = cmd
+                {
+                    match local_db.table.hmget_compact_with_hash(
+                        key.as_ref(),
+                        key_hash,
+                        fields,
+                        &mut local_buf,
                     ) {
                         Ok(resp) => {
                             responses[idx] = resp;
@@ -26374,6 +26419,44 @@ async fn execute_commands_squashed_inner(
                         key.as_ref(),
                         key_hash,
                         member.as_ref(),
+                    ) {
+                        Ok(resp) => {
+                            responses[idx] = resp;
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if let Command::Smismember {
+                    ref key,
+                    ref members,
+                } = cmd
+                {
+                    match local_db.table.smismember_compact_with_hash(
+                        key.as_ref(),
+                        key_hash,
+                        members,
+                        &mut local_buf,
+                    ) {
+                        Ok(resp) => {
+                            responses[idx] = resp;
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if let Command::Zmscore {
+                    ref key,
+                    ref members,
+                } = cmd
+                {
+                    match local_db.table.zmscore_compact_with_hash(
+                        key.as_ref(),
+                        key_hash,
+                        members,
+                        &mut local_buf,
                     ) {
                         Ok(resp) => {
                             responses[idx] = resp;
@@ -26629,7 +26712,10 @@ async fn execute_commands_squashed_inner(
                 } else {
                     if matches!(
                         cmd,
-                        Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }
+                        Command::Set { .. }
+                            | Command::Del(_)
+                            | Command::Unlink(_)
+                            | Command::IncrBy { .. }
                     ) {
                         has_local_writes = true;
                     }
@@ -26705,11 +26791,32 @@ async fn execute_commands_squashed_inner(
                 }
             }
             folded_int_sums.push((idx, start, responses.len() - start));
+        } else if let Command::Touch(keys) = cmd {
+            stat_run.note("TOUCH");
+            let start = responses.len();
+            for key in keys {
+                let slot = responses.len();
+                responses.push(CompactResp::INT_0);
+                let (target, key_hash) = router.target_shard_and_hash(key.as_ref());
+                if target == router.shard_id {
+                    if local_db.table.touch_with_hash(key.as_ref(), key_hash) {
+                        responses[slot] = CompactResp::INT_1;
+                    }
+                } else {
+                    remote_batches[target].push((slot, key_hash, Command::Touch(vec![key])));
+                }
+            }
+            folded_int_sums.push((idx, start, responses.len() - start));
         } else if write_fast_path
             && !crate::search::has_active_search_indices()
-            && let Command::Del(keys) = cmd
+            && matches!(cmd, Command::Del(_) | Command::Unlink(_))
         {
-            stat_run.note("DEL");
+            let (is_unlink, keys) = match cmd {
+                Command::Del(keys) => (false, keys),
+                Command::Unlink(keys) => (true, keys),
+                _ => unreachable!(),
+            };
+            stat_run.note(if is_unlink { "UNLINK" } else { "DEL" });
             let start = responses.len();
             for key in keys {
                 let slot = responses.len();
@@ -26717,7 +26824,11 @@ async fn execute_commands_squashed_inner(
                 let (target, key_hash) = router.target_shard_and_hash(key.as_ref());
                 if target == router.shard_id {
                     local_db.hydrate_key(key.as_ref());
+                    let lazy = is_unlink && local_db.table.is_lazyfree_worthy(key.as_ref());
                     if local_db.del_with_hash(key.as_ref(), key_hash) {
+                        if lazy {
+                            crate::table::add_lazyfreed_objects(1);
+                        }
                         has_local_writes = true;
                         if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                             touch_watched_key(router.port, key.as_ref());
@@ -26731,11 +26842,12 @@ async fn execute_commands_squashed_inner(
                     if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                         notify_key_invalidation(router.port, key.as_ref(), client_id);
                     }
-                    remote_batches[target].push((
-                        slot,
-                        key_hash,
-                        Command::Del(smallvec::smallvec![key]),
-                    ));
+                    let single_cmd = if is_unlink {
+                        Command::Unlink(smallvec::smallvec![key])
+                    } else {
+                        Command::Del(smallvec::smallvec![key])
+                    };
+                    remote_batches[target].push((slot, key_hash, single_cmd));
                 }
             }
             folded_int_sums.push((idx, start, responses.len() - start));
@@ -30022,6 +30134,124 @@ mod tests {
                 out,
                 b"+OK\r\n+OK\r\n*3\r\n$7\r\nv1_last\r\n$7\r\nv2_next\r\n$2\r\nv3\r\n"
             );
+        });
+    }
+
+    #[test]
+    fn test_squashed_pipeline_unlink_touch_and_container_multi_reads() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
+            let db = Rc::new(RefCell::new(ShardDb::new(9995)));
+            let router = Router::new(
+                0,
+                1,
+                9995,
+                db,
+                senders_mesh[0].clone(),
+                None,
+                Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+                std::env::temp_dir(),
+            );
+            let client_registry = RefCell::new(hashbrown::HashMap::new());
+            let mut asking = false;
+            let mut authenticated = true;
+            let mut auth_user = String::from("default");
+            let mut out = Vec::new();
+            let responders = vec![std::sync::Arc::new(crate::mailbox::BatchResponder::new())];
+            let mut remote_batches = vec![Vec::new()];
+            let mut items_pool = vec![Vec::new()];
+            let mut results_pool = vec![Vec::new()];
+            let mut squashed_responses = Vec::new();
+
+            let mut cmds = vec![
+                Command::Hset {
+                    key: Bytes::from("h1"),
+                    fields: smallvec::smallvec![
+                        (Bytes::from("f1"), Bytes::from("v1")),
+                        (Bytes::from("f2"), Bytes::from("v2")),
+                    ],
+                },
+                Command::Hmget {
+                    key: Bytes::from("h1"),
+                    fields: vec![Bytes::from("f1"), Bytes::from("missing"), Bytes::from("f2")],
+                },
+                Command::Sadd {
+                    key: Bytes::from("s1"),
+                    members: smallvec::smallvec![Bytes::from("m1"), Bytes::from("m2")],
+                },
+                Command::Smismember {
+                    key: Bytes::from("s1"),
+                    members: vec![Bytes::from("m1"), Bytes::from("m_none"), Bytes::from("m2")],
+                },
+                Command::Zadd {
+                    key: Bytes::from("z1"),
+                    elements: smallvec::smallvec![
+                        (1.5, Bytes::from("zm1")),
+                        (2.5, Bytes::from("zm2")),
+                    ],
+                    flags: crate::table::ZAddFlags::default(),
+                },
+                Command::Zmscore {
+                    key: Bytes::from("z1"),
+                    members: vec![
+                        Bytes::from("zm1"),
+                        Bytes::from("zm_none"),
+                        Bytes::from("zm2"),
+                    ],
+                },
+                Command::Touch(vec![
+                    Bytes::from("h1"),
+                    Bytes::from("s1"),
+                    Bytes::from("z1"),
+                    Bytes::from("no_such_key"),
+                ]),
+                Command::Unlink(smallvec::smallvec![
+                    Bytes::from("h1"),
+                    Bytes::from("s1"),
+                    Bytes::from("no_such_key"),
+                ]),
+                Command::Touch(vec![
+                    Bytes::from("h1"),
+                    Bytes::from("s1"),
+                    Bytes::from("z1"),
+                ]),
+            ];
+
+            let quit = execute_commands_squashed(
+                &mut cmds,
+                false,
+                &router,
+                &responders,
+                &mut remote_batches,
+                &mut items_pool,
+                &mut results_pool,
+                &mut squashed_responses,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert!(!quit);
+            let expected = concat!(
+                ":2\r\n",
+                "*3\r\n$2\r\nv1\r\n$-1\r\n$2\r\nv2\r\n",
+                ":2\r\n",
+                "*3\r\n:1\r\n:0\r\n:1\r\n",
+                ":2\r\n",
+                "*3\r\n$3\r\n1.5\r\n$-1\r\n$3\r\n2.5\r\n",
+                ":3\r\n",
+                ":2\r\n",
+                ":1\r\n",
+            );
+            assert_eq!(out, expected.as_bytes());
         });
     }
 }
