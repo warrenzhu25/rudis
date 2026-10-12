@@ -25110,7 +25110,10 @@ fn test_enable_debug_command_gates_debug_e2e() {
 fn test_allkeys_lfu_keeps_frequently_used_keys_e2e() {
     let port = 17965u16;
     let ps = port.to_string();
-    let mut child = spawn_rudis_listening(&["--port", &ps, "--threads", "2", "--no-pin"], port);
+    // One shard: this checks LFU ranking. With several shards, eviction
+    // balance between them (a separate concern) decides which shard's keys
+    // go first, whatever their frequency.
+    let mut child = spawn_rudis_listening(&["--port", &ps, "--threads", "1", "--no-pin"], port);
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
 
