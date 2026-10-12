@@ -24548,3 +24548,261 @@ fn test_client_query_buffer_limit_allows_large_drained_pipeline_e2e() {
 
     shutdown_and_wait(port, &mut child);
 }
+
+/// `FT.SEARCH index query NOCONTENT LIMIT 0 100`'s total and document ids.
+fn ft_search_ids(c: &mut TcpStream, index: &str, query: &str) -> (i64, Vec<String>) {
+    let r = resp_cmd_all(
+        c,
+        &["FT.SEARCH", index, query, "NOCONTENT", "LIMIT", "0", "100"],
+    );
+    let mut lines = r.split("\r\n");
+    assert!(
+        lines.next().is_some_and(|l| l.starts_with('*')),
+        "FT.SEARCH {index} {query}: {r:?}"
+    );
+    let total = lines
+        .next()
+        .and_then(|l| l.strip_prefix(':'))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("FT.SEARCH {index} {query}: {r:?}"));
+    let mut ids: Vec<String> = lines
+        .filter(|l| !l.is_empty() && !l.starts_with('$'))
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    (total, ids)
+}
+
+fn wait_aof_rewrite_done(c: &mut TcpStream) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !resp_cmd_all(c, &["INFO", "persistence"]).contains("aof_rewrite_in_progress:0") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "BGREWRITEAOF did not finish"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Search indexes (FT.CREATE / FT.ALTER / FT.DROPINDEX) survive restarts
+/// from the AOF (before and after BGREWRITEAOF) and from the RDB (SAVE and
+/// DEBUG RELOAD), and reach replicas by full sync and by the stream. The
+/// documents are ordinary hashes spread over several shards; each shard
+/// re-indexes its own after the load.
+#[test]
+fn test_search_indexes_persist_and_replicate_e2e() {
+    let (port, rport) = (17181u16, 17182u16);
+    let dir = std::env::temp_dir().join(format!("rudis-ft-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (adir, rdir, repdir) = (dir.join("aof"), dir.join("rdb"), dir.join("replica"));
+    for d in [&adir, &rdir, &repdir] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let ps = port.to_string();
+    let rps = rport.to_string();
+    let docs: Vec<String> = (0..12).map(|i| format!("ftp:{i:02}")).collect();
+    let expect_all = |c: &mut TcpStream, what: &str| {
+        assert_eq!(
+            ft_search_ids(c, "idx:ftp", "hello"),
+            (docs.len() as i64, docs.clone()),
+            "{what}"
+        );
+        // The field added by FT.ALTER is indexed too.
+        assert_eq!(
+            ft_search_ids(c, "idx:ftp", "@n:[5 7]"),
+            (3, vec!["ftp:05".into(), "ftp:06".into(), "ftp:07".into()]),
+            "{what}"
+        );
+        let list = resp_cmd_all(c, &["FT._LIST"]);
+        assert!(
+            list.contains("idx:ftp") && !list.contains("idx:gone"),
+            "{what}: {list:?}"
+        );
+    };
+    let populate = |c: &mut TcpStream| {
+        // Half the documents before FT.CREATE (backfilled), half after.
+        for d in &docs[..6] {
+            let n = d[4..].trim_start_matches('0').to_string();
+            let n = if n.is_empty() { "0".to_string() } else { n };
+            assert_eq!(
+                resp_cmd(c, &["HSET", d, "title", "hello", "n", &n]),
+                ":2\r\n"
+            );
+        }
+        assert_eq!(
+            resp_cmd(
+                c,
+                &[
+                    "FT.CREATE",
+                    "idx:ftp",
+                    "ON",
+                    "HASH",
+                    "PREFIX",
+                    "1",
+                    "ftp:",
+                    "SCHEMA",
+                    "title",
+                    "TEXT"
+                ]
+            ),
+            "+OK\r\n"
+        );
+        for d in &docs[6..] {
+            let n = d[4..].trim_start_matches('0').to_string();
+            assert_eq!(
+                resp_cmd(c, &["HSET", d, "title", "hello", "n", &n]),
+                ":2\r\n"
+            );
+        }
+        assert_eq!(
+            resp_cmd(c, &["FT.ALTER", "idx:ftp", "SCHEMA", "ADD", "n", "NUMERIC"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            resp_cmd(
+                c,
+                &[
+                    "FT.CREATE",
+                    "idx:gone",
+                    "ON",
+                    "HASH",
+                    "SCHEMA",
+                    "title",
+                    "TEXT"
+                ]
+            ),
+            "+OK\r\n"
+        );
+        assert_eq!(resp_cmd(c, &["FT.DROPINDEX", "idx:gone"]), "+OK\r\n");
+    };
+
+    // 1. AOF: restart replays every shard's AOF, then again after a rewrite.
+    let aargs = [
+        "--port",
+        &ps,
+        "--threads",
+        "3",
+        "--no-pin",
+        "--enable-experimental-commands",
+        "yes",
+        "--dir",
+        adir.to_str().unwrap(),
+        "--appendonly",
+        "yes",
+    ];
+    let mut child = spawn_rudis_listening(&aargs, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    populate(&mut c);
+    expect_all(&mut c, "before restart");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_file(adir.join("dump.rdb"));
+    let mut child = spawn_rudis_listening(&aargs, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    expect_all(&mut c, "after AOF replay");
+    assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+    wait_aof_rewrite_done(&mut c);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_file(adir.join("dump.rdb"));
+    let mut child = spawn_rudis_listening(&aargs, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    expect_all(&mut c, "after rewritten AOF replay");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    // 2. RDB: SAVE + restart, DEBUG RELOAD, and full sync + stream to a replica.
+    let rargs = [
+        "--port",
+        &ps,
+        "--threads",
+        "3",
+        "--no-pin",
+        "--enable-experimental-commands",
+        "yes",
+        "--dir",
+        rdir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&rargs, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    populate(&mut c);
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    drop(c);
+    let _ = TcpStream::connect(("127.0.0.1", port))
+        .unwrap()
+        .write_all(&format_resp_cmd(&["SHUTDOWN", "NOSAVE"]));
+    let _ = child.wait();
+    let mut child = spawn_rudis_listening(&rargs, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    expect_all(&mut c, "after RDB load");
+    assert_eq!(resp_cmd_all(&mut c, &["DEBUG", "RELOAD"]), "+OK\r\n");
+    expect_all(&mut c, "after DEBUG RELOAD");
+
+    let repargs = [
+        "--port",
+        &rps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--enable-experimental-commands",
+        "yes",
+        "--dir",
+        repdir.to_str().unwrap(),
+    ];
+    let mut replica = spawn_rudis_listening(&repargs, rport);
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &ps]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !resp_cmd_all(&mut r, &["INFO", "replication"]).contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica did not sync");
+        thread::sleep(Duration::from_millis(20));
+    }
+    expect_all(&mut r, "replica after full sync");
+    // Live: a new index, an altered one and a dropped one over the stream.
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &[
+                "FT.CREATE",
+                "idx:live",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "ftp:",
+                "SCHEMA",
+                "n",
+                "NUMERIC"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["HSET", "ftp:99", "n", "99"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FT.DROPINDEX", "idx:ftp"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["WAIT", "1", "5000"]), ":1\r\n");
+    let list = resp_cmd_all(&mut r, &["FT._LIST"]);
+    assert!(
+        list.contains("idx:live") && !list.contains("idx:ftp"),
+        "{list:?}"
+    );
+    assert_eq!(
+        ft_search_ids(&mut r, "idx:live", "@n:[90 100]"),
+        (1, vec!["ftp:99".to_string()])
+    );
+    assert_eq!(ft_search_ids(&mut r, "idx:live", "@n:[0 100]").0, 13);
+
+    drop(r);
+    shutdown_and_wait(rport, &mut replica);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

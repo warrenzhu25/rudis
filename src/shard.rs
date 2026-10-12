@@ -554,12 +554,19 @@ pub enum ShardMessage {
     RemoveClientPubSub {
         client_id: u64,
     },
+    /// Defines (or redefines) a search index on the shard. `aof_record` is
+    /// the RESP of the FT.* command to append to the shard's AOF: every
+    /// shard's AOF holds the index definitions, as each replays on its own.
     InitSearchIndex {
         schema: Box<crate::search::IndexSchema>,
+        aof_record: Option<Bytes>,
         responder: flume::Sender<()>,
     },
+    /// Drops a search index; `aof_record` as for `InitSearchIndex`, logged
+    /// only if the shard had the index.
     DropSearchIndex {
         name: String,
+        aof_record: Option<Bytes>,
         responder: flume::Sender<bool>,
     },
     SearchQuery {
@@ -964,6 +971,54 @@ impl ShardDb {
 
     pub fn drop_search_index(&mut self, name: &str) -> bool {
         self.search_indices.remove(name).is_some()
+    }
+
+    /// Defines `schema` from a persisted `FT.CREATE` (AOF replay, RDB load):
+    /// replaces this shard's index of that name, re-indexing its keys, and
+    /// makes sure the global registry has the definition.
+    pub fn define_search_index(&mut self, schema: crate::search::IndexSchema) {
+        crate::search::ensure_search_index(&schema);
+        // A stale index of that name must not leak documents into the new one.
+        self.search_indices.remove(&schema.name);
+        self.init_search_index(schema);
+    }
+
+    /// Applies a persisted `FT.ALTER` to this shard's index (see
+    /// [`Self::define_search_index`]). Errors if the index is unknown.
+    pub fn alter_search_index(
+        &mut self,
+        index: &str,
+        fields: std::collections::HashMap<String, crate::search::FieldType>,
+        schema_fields: Vec<crate::search::SchemaField>,
+    ) -> Result<(), String> {
+        let mut schema = self
+            .search_indices
+            .get(index)
+            .and_then(|idx| idx.schema.clone())
+            .ok_or_else(|| format!("Unknown Index name: {}", index))?;
+        crate::search::merge_schema_fields(&mut schema, fields, schema_fields);
+        crate::search::ensure_search_index(&schema);
+        self.init_search_index(schema);
+        Ok(())
+    }
+
+    /// Re-indexes every search index from this shard's DB 0 keys, after a
+    /// load replaced the keyspace without going through the indexing hooks.
+    pub fn rebuild_search_indices(&mut self) {
+        if self.search_indices.is_empty() {
+            return;
+        }
+        let schemas: Vec<crate::search::IndexSchema> = self
+            .search_indices
+            .values()
+            .filter_map(|idx| idx.schema.clone())
+            .collect();
+        let saved_db = self.current_db;
+        self.select_db(0);
+        for schema in schemas {
+            self.define_search_index(schema);
+        }
+        self.select_db(saved_db);
     }
 
     /// Re-indexes the full content of HASH `key` into matching local search indexes and returns
@@ -2275,6 +2330,8 @@ impl ShardDb {
     ) -> Result<(), String> {
         self.select_db(0);
         self.flushall();
+        // The file's index definitions replace ours (a FLUSHALL keeps them).
+        self.search_indices.clear();
         let loaded = crate::table::load_rdb_bytes(data, self, shard_id, num_shards)
             .map(|_| ())
             .map_err(|e| {
@@ -3336,13 +3393,28 @@ impl ShardDb {
                 }
             }
         }
+
+        // 13. Search index definitions (FT.CREATE), as their canonical
+        // FT.CREATE command. Only the definition: the documents are this
+        // shard's HASH/JSON keys, re-indexed once the load is done (see
+        // `rebuild_search_indices`). Every shard writes the same records;
+        // each shard loading the file keeps one copy of each.
+        let mut names: Vec<&String> = self.search_indices.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(schema) = &self.search_indices[name].schema {
+                write_bytes(buf, name.as_bytes());
+                buf.push(crate::redis_rdb::EXT_TYPE_SEARCH_INDEX);
+                write_bytes(buf, &crate::aof::resp_argv(&schema.ft_create_args()));
+            }
+        }
     }
 
     /// Loads a [`Self::save_rdb_chunk`] record stream, keeping every key.
     pub fn restore_rdb_chunk(&mut self, data: &[u8]) -> Result<(), String> {
-        crate::redis_rdb::load_chunk(data, self)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        crate::redis_rdb::load_chunk(data, self).map_err(|e| e.to_string())?;
+        self.rebuild_search_indices();
+        Ok(())
     }
 
     pub(crate) fn restore_ai_native_rdb_record(
@@ -4960,5 +5032,103 @@ mod tests {
             drop(rx);
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn ft_schema(line: &str) -> crate::search::IndexSchema {
+        let mut buf = bytes::BytesMut::from(format!("{line}\r\n").as_str());
+        match crate::resp::parse_command(&mut buf) {
+            Ok(Some(crate::resp::Command::FtCreate {
+                index,
+                on_type,
+                prefixes,
+                fields,
+                schema_fields,
+            })) => crate::search::IndexSchema {
+                name: index,
+                on_type,
+                prefixes,
+                fields,
+                schema_fields,
+            },
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+
+    fn ft_hits(db: &ShardDb, index: &str, query: &str) -> Vec<String> {
+        let idx = db.search_indices.get(index).expect("index defined");
+        let ast = crate::search::parse_query(query);
+        let (_, hits) =
+            crate::search::execute_search(idx, &ast, &crate::search::SearchOptions::default());
+        let mut ids: Vec<String> = hits.into_iter().map(|h| h.doc_id).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Search index definitions are saved in the RDB (the `rudis-ext`
+    /// field) and the loaded keys are indexed again, wherever the
+    /// definition sits relative to the keys in the file.
+    #[test]
+    fn test_search_index_definitions_survive_rdb_round_trip() {
+        let mut db = ShardDb::new(0);
+        db.hset(
+            Bytes::from_static(b"rdbft:1"),
+            vec![(Bytes::from_static(b"title"), Bytes::from_static(b"hello"))],
+        )
+        .unwrap();
+        db.define_search_index(ft_schema(
+            "FT.CREATE idx:rdbft ON HASH PREFIX 1 rdbft: SCHEMA title TEXT WEIGHT 2 n NUMERIC SORTABLE",
+        ));
+        db.hset(
+            Bytes::from_static(b"rdbft:2"),
+            vec![
+                (Bytes::from_static(b"title"), Bytes::from_static(b"hello")),
+                (Bytes::from_static(b"n"), Bytes::from_static(b"7")),
+            ],
+        )
+        .unwrap();
+        db.reindex_hash_local(b"rdbft:2");
+        assert_eq!(ft_hits(&db, "idx:rdbft", "hello"), ["rdbft:1", "rdbft:2"]);
+
+        let mut chunk = Vec::new();
+        db.save_rdb_chunk(&mut chunk).unwrap();
+        let mut restored = ShardDb::new(0);
+        restored.restore_rdb_chunk(&chunk).unwrap();
+        let schema = restored.search_indices["idx:rdbft"].schema.clone().unwrap();
+        assert!(schema.same_definition(db.search_indices["idx:rdbft"].schema.as_ref().unwrap()));
+        assert_eq!(
+            ft_hits(&restored, "idx:rdbft", "hello"),
+            ["rdbft:1", "rdbft:2"]
+        );
+        assert_eq!(ft_hits(&restored, "idx:rdbft", "@n:[5 10]"), ["rdbft:2"]);
+        let _ = crate::search::drop_search_index("idx:rdbft");
+    }
+
+    /// A full resync (or DEBUG RELOAD) replaces the index definitions with
+    /// the file's, dropping indexes the file doesn't have.
+    #[test]
+    fn test_full_sync_load_replaces_search_indexes() {
+        let mut master = ShardDb::new(0);
+        master
+            .hset(
+                Bytes::from_static(b"fsft:1"),
+                vec![(Bytes::from_static(b"title"), Bytes::from_static(b"hello"))],
+            )
+            .unwrap();
+        master.define_search_index(ft_schema(
+            "FT.CREATE idx:fsft ON HASH PREFIX 1 fsft: SCHEMA title TEXT",
+        ));
+        let mut file = b"REDIS0011".to_vec();
+        master.save_rdb_chunk(&mut file).unwrap();
+        file.push(0xFF);
+        let crc = crate::table::crc64(&file);
+        file.extend_from_slice(&crc.to_le_bytes());
+
+        let mut replica = ShardDb::new(0);
+        replica.define_search_index(ft_schema("FT.CREATE idx:fsft_stale ON HASH SCHEMA t TEXT"));
+        replica.load_full_sync_rdb(&file, 0, 1, None).unwrap();
+        assert!(!replica.search_indices.contains_key("idx:fsft_stale"));
+        assert_eq!(ft_hits(&replica, "idx:fsft", "hello"), ["fsft:1"]);
+        let _ = crate::search::drop_search_index("idx:fsft");
+        let _ = crate::search::drop_search_index("idx:fsft_stale");
     }
 }

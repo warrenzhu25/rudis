@@ -47,6 +47,10 @@ pub const EXT_AUX_KEY: &[u8] = b"rudis-ext";
 /// Legacy-format record type of a stream's IDMP / XNACK state, written in a
 /// [`EXT_AUX_KEY`] field right after the stream itself.
 pub const EXT_TYPE_STREAM_EXTRAS: u8 = 19;
+/// Legacy-format record type of a search index definition: the index name
+/// as the key, then the index's canonical `FT.CREATE` command as RESP. The
+/// indexed documents are ordinary keys and are re-indexed after the load.
+pub const EXT_TYPE_SEARCH_INDEX: u8 = 20;
 
 pub const TYPE_STRING: u8 = 0;
 pub const TYPE_LIST: u8 = 1;

@@ -1897,6 +1897,35 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             payload,
             policy.as_bytes(),
         ])),
+        // Search index definitions are server-wide too. The documents are
+        // the HASH/JSON keys, logged as their own writes; every shard logs
+        // the definition and re-indexes its keys on replay. FT.CREATE is
+        // written in canonical form (see `search::ft_create_args`).
+        Command::FtCreate {
+            index,
+            on_type,
+            prefixes,
+            schema_fields,
+            ..
+        } => Some(resp_argv(&crate::search::ft_create_args(
+            index,
+            on_type,
+            prefixes,
+            schema_fields,
+        ))),
+        Command::FtAlter {
+            index,
+            schema_fields,
+            ..
+        } => Some(resp_argv(&crate::search::ft_alter_args(
+            index,
+            schema_fields,
+        ))),
+        Command::FtDropIndex { index, dd } => Some(if *dd {
+            resp_argv(&[b"FT.DROPINDEX".as_slice(), index.as_bytes(), b"DD"])
+        } else {
+            resp_argv(&[b"FT.DROPINDEX".as_slice(), index.as_bytes()])
+        }),
         Command::CrdtGc(horizon) => Some(match horizon {
             crate::crdt::GcHorizon::Ttl(None) => resp_argv(&[b"CRDT.GC"]),
             crate::crdt::GcHorizon::Ttl(Some(ttl)) => {
@@ -2513,7 +2542,7 @@ fn push_stream_ids(args: &mut Vec<Vec<u8>>, ids: &[crate::table::StreamId]) {
 }
 
 /// Encodes `args` as a RESP array of bulk strings.
-fn resp_argv<A: AsRef<[u8]>>(args: &[A]) -> Vec<u8> {
+pub(crate) fn resp_argv<A: AsRef<[u8]>>(args: &[A]) -> Vec<u8> {
     let mut buf =
         Vec::with_capacity(16 + args.iter().map(|a| a.as_ref().len() + 16).sum::<usize>());
     buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
@@ -2865,6 +2894,11 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
     // 2. Rewrite to canonical per-key commands and split them by owner.
     std::fs::create_dir_all(&staging)?;
     rewrite_shard_aof(&mut combined, &staging, 0)?;
+    // Replaying registered the indexes globally; the shards register them
+    // again when they replay their new files.
+    for name in combined.search_indices.keys() {
+        let _ = crate::search::drop_search_index(name);
+    }
     drop(combined);
     let rewritten = std::fs::read(staging.join("appendonly-0.aof"))?;
     let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); num_shards];
@@ -2882,6 +2916,14 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
             continue;
         }
         let raw = &rewritten[start..rewritten.len() - buf.len()];
+        // Every shard needs the index definitions (they lead the rewrite,
+        // in DB 0, before any SELECT).
+        if matches!(cmd, Command::FtCreate { .. }) {
+            for out in outputs.iter_mut() {
+                out.extend_from_slice(raw);
+            }
+            continue;
+        }
         let shard = crate::connection::target_shard_of_cmd(&cmd, num_shards)
             .or_else(|| raw_resp_arg(raw, 1).map(|k| crate::router::target_shard(k, num_shards)))
             .unwrap_or(0);
@@ -2971,6 +3013,17 @@ fn write_rewritten_aof(
     let file = std::fs::File::create(tmp_path)?;
     let mut writer = std::io::BufWriter::with_capacity(65536, file);
     let mut emitted_db: usize = 0;
+
+    // 0. Search index definitions, before the keys: replaying the key
+    //    writes after them indexes the documents again.
+    let mut index_names: Vec<&String> = db.search_indices.keys().collect();
+    index_names.sort();
+    for name in index_names {
+        if let Some(schema) = &db.search_indices[name].schema {
+            writer.write_all(&resp_argv(&schema.ft_create_args()))?;
+            count += 1;
+        }
+    }
 
     // 1. Snapshot all non-expired entries across all DBs in RudisTable as canonical RESP commands
     for db_idx in 0..max_db {
@@ -3998,6 +4051,135 @@ mod tests {
             assert!(cmd.is_write_command(), "{line} should be a write");
             assert!(command_to_resp(&cmd).is_some(), "{line} not encoded");
         }
+    }
+
+    /// FT.CREATE / FT.ALTER / FT.DROPINDEX encode to commands that parse
+    /// back to the same definition (FT.CREATE in canonical form).
+    #[test]
+    fn test_search_index_commands_round_trip_through_aof_encoding() {
+        let lines = [
+            "FT.CREATE i ON HASH PREFIX 2 a: b: SCHEMA t TEXT WEIGHT 2.5 NOSTEM SORTABLE n NUMERIC SORTABLE g TAG SEPARATOR ; CASESENSITIVE",
+            "FT.CREATE i SCHEMA t TEXT",
+            "FT.CREATE i ON JSON PREFIX 1 u: SCHEMA $.name AS name TEXT $.tags.* AS tags TAG $.age NUMERIC",
+            "FT.CREATE i ON HASH SCHEMA v VECTOR HNSW 10 TYPE FLOAT64 DIM 4 DISTANCE_METRIC IP M 8 EF_RUNTIME 20 EPSILON 0.5",
+            "FT.CREATE i ON HASH SCHEMA v AS vec VECTOR FLAT 8 TYPE FLOAT32 DIM 3 DISTANCE_METRIC L2 BLOCK_SIZE 64",
+            "FT.ALTER i SCHEMA ADD x NUMERIC y AS z TEXT WEIGHT 3 SORTABLE",
+            "FT.ALTER i SCHEMA ADD w TAG SEPARATOR |",
+            "FT.ALTER i SCHEMA ADD v VECTOR HNSW 6 TYPE FLOAT32 DIM 2 DISTANCE_METRIC COSINE",
+            "FT.DROPINDEX i",
+            "FT.DROPINDEX i DD",
+        ];
+        for line in lines {
+            let cmd = parse_line(line);
+            assert!(cmd.is_write_command(), "{line} should be a write");
+            let bytes = command_to_resp(&cmd).unwrap_or_else(|| panic!("{line} not encoded"));
+            assert_eq!(parse_resp(&bytes), cmd, "{line}");
+        }
+    }
+
+    /// Replaying a shard's AOF, or a rewrite of the result, redefines its
+    /// search indexes and re-indexes its keys; a logged FT.DROPINDEX stays
+    /// dropped.
+    #[test]
+    fn test_search_indexes_survive_aof_replay_and_rewrite() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-ft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = ShardDb::new(6379);
+        let aof = std::cell::RefCell::new(AofWriter::new_in_memory());
+        let mut out = Vec::new();
+        let mut run = |db: &mut ShardDb, line: &str| {
+            out.clear();
+            crate::connection::execute_local_command(&parse_line(line), db, &mut out, Some(&aof));
+            let reply = String::from_utf8_lossy(&out).into_owned();
+            assert!(!reply.starts_with('-'), "{line}: {reply}");
+        };
+        // A document from before the index (backfilled), one after (hooked),
+        // one outside the prefix, and an index that is dropped again.
+        run(&mut db, "HSET aofft:1 title hello price 5");
+        run(
+            &mut db,
+            "FT.CREATE idx:aofft ON HASH PREFIX 1 aofft: SCHEMA title TEXT",
+        );
+        run(&mut db, "HSET aofft:2 title hello price 50");
+        run(&mut db, "HSET other:3 title hello");
+        run(
+            &mut db,
+            "FT.ALTER idx:aofft SCHEMA ADD price NUMERIC SORTABLE",
+        );
+        run(
+            &mut db,
+            "FT.CREATE idx:aofft_gone ON HASH SCHEMA title TEXT",
+        );
+        run(&mut db, "FT.DROPINDEX idx:aofft_gone");
+
+        let hits = |db: &ShardDb, query: &str| -> Vec<String> {
+            let idx = db.search_indices.get("idx:aofft").expect("index defined");
+            let ast = crate::search::parse_query(query);
+            let (_, hits) =
+                crate::search::execute_search(idx, &ast, &crate::search::SearchOptions::default());
+            let mut ids: Vec<String> = hits.into_iter().map(|h| h.doc_id).collect();
+            ids.sort();
+            ids
+        };
+        let check = |db: &ShardDb| {
+            assert_eq!(hits(db, "hello"), ["aofft:1", "aofft:2"]);
+            assert_eq!(hits(db, "@price:[10 100]"), ["aofft:2"]);
+            assert!(!db.search_indices.contains_key("idx:aofft_gone"));
+            let schema = db.search_indices["idx:aofft"].schema.clone().unwrap();
+            assert_eq!(schema.schema_fields.len(), 2);
+        };
+        check(&db);
+
+        let log = dir.join("log.aof");
+        std::fs::write(&log, aof.borrow().buffer()).unwrap();
+        let mut replayed = ShardDb::new(6379);
+        replay_aof(&log, &mut replayed).unwrap();
+        check(&replayed);
+
+        rewrite_shard_aof(&mut db, &dir, 0).unwrap();
+        let mut rewritten = ShardDb::new(6379);
+        replay_aof(&dir.join("appendonly-0.aof"), &mut rewritten).unwrap();
+        check(&rewritten);
+
+        let _ = crate::search::drop_search_index("idx:aofft");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Resharding the AOF gives every new shard file the index definitions.
+    #[test]
+    fn test_reshard_aof_dir_copies_search_indexes_to_every_shard() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-ft-reshard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let create = command_to_resp(&parse_line(
+            "FT.CREATE idx:reshardft ON HASH PREFIX 1 rft: SCHEMA title TEXT",
+        ))
+        .unwrap();
+        let mut old = create.clone();
+        for i in 0..20 {
+            old.extend_from_slice(&resp_argv(&[
+                "HSET".to_string(),
+                format!("rft:{i}"),
+                "title".to_string(),
+                "hello".to_string(),
+            ]));
+        }
+        std::fs::write(dir.join("appendonly-0.aof"), &old).unwrap();
+        assert_eq!(reshard_aof_dir(&dir, 3, 0).unwrap(), Some(1));
+        let mut total = 0;
+        for i in 0..3 {
+            let mut db = ShardDb::new(6379);
+            replay_aof(&dir.join(format!("appendonly-{i}.aof")), &mut db).unwrap();
+            let idx = db
+                .search_indices
+                .get("idx:reshardft")
+                .expect("shard has the index");
+            total += idx.key_to_id.len();
+        }
+        assert_eq!(total, 20, "every document indexed on exactly one shard");
+        let _ = crate::search::drop_search_index("idx:reshardft");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A change `command_to_resp` cannot encode is counted (and logged once

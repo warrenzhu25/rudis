@@ -262,6 +262,162 @@ pub struct IndexSchema {
     pub schema_fields: Vec<SchemaField>,
 }
 
+impl IndexSchema {
+    /// The `FT.CREATE` arguments that define this index (see [`ft_create_args`]).
+    pub fn ft_create_args(&self) -> Vec<Vec<u8>> {
+        ft_create_args(
+            &self.name,
+            &self.on_type,
+            &self.prefixes,
+            &self.schema_fields,
+        )
+    }
+
+    /// Whether `other` defines the same index: name, key type, prefixes and
+    /// schema. (`fields` is derived from `schema_fields`.)
+    pub fn same_definition(&self, other: &IndexSchema) -> bool {
+        self.name == other.name
+            && self.on_type.eq_ignore_ascii_case(&other.on_type)
+            && self.prefixes == other.prefixes
+            && self.schema_fields == other.schema_fields
+    }
+}
+
+/// Appends `identifier AS alias <type> [options]` for one schema field, in the
+/// form both `FT.CREATE` and `FT.ALTER` parse back to the same field.
+fn push_schema_field_args(sf: &SchemaField, args: &mut Vec<Vec<u8>>) {
+    let mut push = |s: &str| args.push(s.as_bytes().to_vec());
+    push(&sf.identifier);
+    push("AS");
+    push(&sf.alias);
+    match &sf.field_type {
+        FieldType::Text {
+            weight,
+            sortable,
+            nostem,
+        } => {
+            push("TEXT");
+            push("WEIGHT");
+            push(&weight.to_string());
+            if *nostem {
+                push("NOSTEM");
+            }
+            if *sortable {
+                push("SORTABLE");
+            }
+        }
+        FieldType::Numeric { sortable } => {
+            push("NUMERIC");
+            if *sortable {
+                push("SORTABLE");
+            }
+        }
+        FieldType::Tag {
+            separator,
+            casesensitive,
+        } => {
+            push("TAG");
+            push("SEPARATOR");
+            push(&separator.to_string());
+            if *casesensitive {
+                push("CASESENSITIVE");
+            }
+        }
+        FieldType::Vector {
+            dim,
+            distance_metric,
+            algorithm,
+            attrs,
+        } => {
+            let mut pairs: Vec<(&str, String)> = vec![
+                ("TYPE", attrs.data_type.as_str().to_string()),
+                ("DIM", dim.to_string()),
+                ("DISTANCE_METRIC", distance_metric.clone()),
+                ("INITIAL_CAP", attrs.initial_cap.to_string()),
+            ];
+            if algorithm == "HNSW" {
+                pairs.push(("M", attrs.m.to_string()));
+                pairs.push(("EF_CONSTRUCTION", attrs.ef_construction.to_string()));
+                pairs.push(("EF_RUNTIME", attrs.ef_runtime.to_string()));
+                pairs.push(("EPSILON", attrs.epsilon.to_string()));
+            } else {
+                pairs.push(("BLOCK_SIZE", attrs.block_size.to_string()));
+            }
+            push("VECTOR");
+            push(algorithm);
+            push(&(pairs.len() * 2).to_string());
+            for (k, v) in &pairs {
+                push(k);
+                push(v);
+            }
+        }
+    }
+}
+
+/// `FT.CREATE name ON <type> [PREFIX n p...] SCHEMA <fields...>`: the
+/// canonical command that recreates an index definition. Used for the AOF,
+/// replication and the RDB, so it must parse back to the same schema.
+pub fn ft_create_args(
+    name: &str,
+    on_type: &str,
+    prefixes: &[String],
+    schema_fields: &[SchemaField],
+) -> Vec<Vec<u8>> {
+    let mut args: Vec<Vec<u8>> = vec![
+        b"FT.CREATE".to_vec(),
+        name.as_bytes().to_vec(),
+        b"ON".to_vec(),
+        on_type.to_ascii_uppercase().into_bytes(),
+    ];
+    if !prefixes.is_empty() {
+        args.push(b"PREFIX".to_vec());
+        args.push(prefixes.len().to_string().into_bytes());
+        args.extend(prefixes.iter().map(|p| p.as_bytes().to_vec()));
+    }
+    args.push(b"SCHEMA".to_vec());
+    for sf in schema_fields {
+        push_schema_field_args(sf, &mut args);
+    }
+    args
+}
+
+/// `FT.ALTER name SCHEMA ADD <fields...>`.
+pub fn ft_alter_args(name: &str, schema_fields: &[SchemaField]) -> Vec<Vec<u8>> {
+    let mut args: Vec<Vec<u8>> = vec![
+        b"FT.ALTER".to_vec(),
+        name.as_bytes().to_vec(),
+        b"SCHEMA".to_vec(),
+        b"ADD".to_vec(),
+    ];
+    for sf in schema_fields {
+        push_schema_field_args(sf, &mut args);
+    }
+    args
+}
+
+/// Merges `FT.ALTER ... SCHEMA ADD` fields into `schema`: a field with the
+/// same alias or identifier is replaced, others are appended.
+pub fn merge_schema_fields(
+    schema: &mut IndexSchema,
+    new_fields: HashMap<String, FieldType>,
+    new_schema_fields: Vec<SchemaField>,
+) {
+    for (k, v) in new_fields {
+        schema.fields.insert(k, v);
+    }
+    for sf in new_schema_fields {
+        if let Some(existing) = schema
+            .schema_fields
+            .iter_mut()
+            .find(|e| e.alias == sf.alias || e.identifier == sf.identifier)
+        {
+            *existing = sf;
+        } else {
+            schema.schema_fields.push(sf);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Posting {
     pub doc_id: DocId,
@@ -1059,6 +1215,26 @@ pub fn reset_search_index(schema: IndexSchema) {
     let name = schema.name.clone();
     let idx = Arc::new(RwLock::new(InvertedIndex::new(schema)));
     registry.insert(name, idx);
+    SEARCH_INDICES_COUNT.store(registry.len(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Registers `schema` in the global registry unless an index with the same
+/// definition is already there (which is kept, documents included). Shards
+/// loading the same definition in parallel (AOF replay, RDB load) all call
+/// this and then backfill their own documents into the one shared index.
+pub fn ensure_search_index(schema: &IndexSchema) {
+    let mut registry = SEARCH_INDICES.write();
+    if let Some(existing) = registry.get(&schema.name)
+        && existing
+            .read()
+            .schema
+            .as_ref()
+            .is_some_and(|s| s.same_definition(schema))
+    {
+        return;
+    }
+    let idx = Arc::new(RwLock::new(InvertedIndex::new(schema.clone())));
+    registry.insert(schema.name.clone(), idx);
     SEARCH_INDICES_COUNT.store(registry.len(), std::sync::atomic::Ordering::Relaxed);
 }
 

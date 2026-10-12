@@ -1985,12 +1985,28 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             .borrow_mut()
                             .remove_client_with_presence(client_id, None);
                     }
-                    ShardMessage::InitSearchIndex { schema, responder } => {
+                    ShardMessage::InitSearchIndex {
+                        schema,
+                        aof_record,
+                        responder,
+                    } => {
                         cross_shard_db.borrow_mut().init_search_index(*schema);
+                        if let (Some(aof), Some(rec)) = (cross_shard_aof.as_deref(), aof_record) {
+                            aof.borrow_mut().append(&rec);
+                        }
                         let _ = responder.send(());
                     }
-                    ShardMessage::DropSearchIndex { name, responder } => {
+                    ShardMessage::DropSearchIndex {
+                        name,
+                        aof_record,
+                        responder,
+                    } => {
                         let dropped = cross_shard_db.borrow_mut().drop_search_index(&name);
+                        if dropped
+                            && let (Some(aof), Some(rec)) = (cross_shard_aof.as_deref(), aof_record)
+                        {
+                            aof.borrow_mut().append(&rec);
+                        }
                         let _ = responder.send(dropped);
                     }
                     ShardMessage::SearchQuery {

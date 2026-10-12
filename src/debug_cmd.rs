@@ -318,6 +318,8 @@ pub fn execute_shard_debug(
         };
         let path = aof.borrow().path().to_path_buf();
         db.flushdb();
+        // The AOF's index definitions replace ours, documents included.
+        db.search_indices.clear();
         // The replayed commands are already on the replicas.
         let _quiet = crate::replication::SuppressPropagation::new();
         match crate::aof::replay_aof(&path, db) {

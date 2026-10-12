@@ -16181,7 +16181,7 @@ pub fn load_rdb_bytes(
             "RDB file is truncated (shorter than header + EOF + checksum)",
         ));
     }
-    match classify(data) {
+    let loaded = match classify(data) {
         FileKind::Redis => {
             load_file(data, db, shard_id, num_shards, false).map_err(|e| invalid(e.to_string()))
         }
@@ -16197,7 +16197,13 @@ pub fn load_rdb_bytes(
                 })
             }
         },
+    };
+    // The keys bypassed the indexing hooks: index them now that all of
+    // them (and every index definition) are in.
+    if loaded.is_ok() {
+        db.rebuild_search_indices();
     }
+    loaded
 }
 
 /// Loads an RDB file in the encoding Rudis wrote before it adopted the
@@ -16664,6 +16670,43 @@ fn load_legacy_records(
                 Ok(used) => cursor += used,
                 Err(_) => break,
             }
+            continue;
+        } else if type_byte == crate::redis_rdb::EXT_TYPE_SEARCH_INDEX {
+            // A search index definition, as its FT.CREATE command. Every
+            // shard keeps it; `rebuild_search_indices` indexes the keys once
+            // the whole file is loaded.
+            cursor += 1;
+            if cursor + 4 > content_len {
+                break;
+            }
+            let len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if cursor + len > content_len {
+                break;
+            }
+            let mut resp = bytes::BytesMut::from(&data[cursor..cursor + len]);
+            let Ok(Some(crate::resp::Command::FtCreate {
+                index,
+                on_type,
+                prefixes,
+                fields,
+                schema_fields,
+            })) = crate::resp::parse_command(&mut resp)
+            else {
+                break;
+            };
+            cursor += len;
+            let schema = crate::search::IndexSchema {
+                name: index,
+                on_type,
+                prefixes,
+                fields,
+                schema_fields,
+            };
+            db.search_indices.insert(
+                schema.name.clone(),
+                crate::search::InvertedIndex::new(schema),
+            );
             continue;
         }
 

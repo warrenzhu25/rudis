@@ -16611,8 +16611,8 @@ async fn execute_command_inner(
             }
             false
         }
-        Command::FtDropIndex { index, dd: _ } => {
-            match router.drop_search_index(&index).await {
+        Command::FtDropIndex { index, dd } => {
+            match router.drop_search_index(&index, dd).await {
                 Ok(()) => out.extend_from_slice(b"+OK\r\n"),
                 Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
             }
@@ -24830,6 +24830,51 @@ pub fn execute_local_command(
                 }
                 false
             }
+            // From this shard's AOF: every shard logs the index definitions
+            // (see `Router::create_search_index`), so replay (re)defines the
+            // index on this shard alone and re-indexes its keys.
+            Command::FtCreate {
+                index,
+                on_type,
+                prefixes,
+                fields,
+                schema_fields,
+            } => {
+                db.define_search_index(crate::search::IndexSchema {
+                    name: index.clone(),
+                    on_type: on_type.clone(),
+                    prefixes: prefixes.clone(),
+                    fields: fields.clone(),
+                    schema_fields: schema_fields.clone(),
+                });
+                record_change!(cmd);
+                out.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::FtAlter {
+                index,
+                fields,
+                schema_fields,
+            } => {
+                match db.alter_search_index(index, fields.clone(), schema_fields.clone()) {
+                    Ok(()) => {
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(e) => write_resp_err(out, format!("ERR {}", e)),
+                }
+                false
+            }
+            Command::FtDropIndex { index, .. } => {
+                let dropped = db.drop_search_index(index);
+                if crate::search::drop_search_index(index).is_ok() || dropped {
+                    record_change!(cmd);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    write_resp_err(out, format!("ERR Unknown Index name: {}", index));
+                }
+                false
+            }
             Command::FunctionKill => {
                 out.extend_from_slice(b"+OK\r\n");
                 false
@@ -26446,6 +26491,41 @@ pub async fn execute_cross_shard_replica_command(router: &Router, cmd: Command) 
             ref destkey,
             ref srckeys,
         } => bitop_across_shards(router, op, destkey, srckeys, false).await,
+        // Index definitions live on every shard.
+        Command::FtCreate {
+            index,
+            on_type,
+            prefixes,
+            fields,
+            schema_fields,
+        } => {
+            let schema = crate::search::IndexSchema {
+                name: index,
+                on_type,
+                prefixes,
+                fields,
+                schema_fields,
+            };
+            match router.create_search_index(schema).await {
+                Ok(()) => b"+OK\r\n".to_vec(),
+                Err(e) => format!("-ERR {}\r\n", e).into_bytes(),
+            }
+        }
+        Command::FtAlter {
+            ref index,
+            ref fields,
+            ref schema_fields,
+        } => match router
+            .alter_search_index(index, fields.clone(), schema_fields.clone())
+            .await
+        {
+            Ok(()) => b"+OK\r\n".to_vec(),
+            Err(e) => format!("-ERR {}\r\n", e).into_bytes(),
+        },
+        Command::FtDropIndex { ref index, dd } => match router.drop_search_index(index, dd).await {
+            Ok(()) => b"+OK\r\n".to_vec(),
+            Err(e) => format!("-ERR {}\r\n", e).into_bytes(),
+        },
         other => {
             let mut dummy_out = Vec::new();
             execute_local_command(

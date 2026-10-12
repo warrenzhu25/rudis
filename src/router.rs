@@ -3278,6 +3278,7 @@ impl Router {
             return Ok(());
         }
         self.sync_aof().await;
+        self.forget_global_search_indices();
         let cmd = || Command::Debug(vec![Bytes::from_static(DEBUG_LOADAOF_SHARD)]);
         let mut replies = vec![self.execute_on_shard(self.shard_id, cmd()).await];
         replies.extend(self.execute_remote_many(self.to_other_shards(cmd)).await);
@@ -3709,6 +3710,33 @@ impl Router {
             || crate::search::get_search_index(name).is_some()
     }
 
+    /// The RESP of `cmd` for the other shards' AOFs, if the AOF is on (all
+    /// shards share the setting).
+    fn search_aof_record(&self, cmd: &Command) -> Option<Bytes> {
+        self.aof.as_ref()?;
+        crate::aof::command_to_resp(cmd).map(Bytes::from)
+    }
+
+    /// Drops the global registry entries of this server's indexes (every
+    /// shard has all of them) before the shards reload in parallel: each
+    /// shard then registers the reloaded definitions and backfills its keys
+    /// into a fresh entry, without stale documents.
+    fn forget_global_search_indices(&self) {
+        let names: Vec<String> = self
+            .local_db
+            .borrow()
+            .search_indices
+            .keys()
+            .cloned()
+            .collect();
+        for name in names {
+            let _ = crate::search::drop_search_index(&name);
+        }
+    }
+
+    /// Defines `schema` on every shard (each backfills its own keys) and
+    /// logs the `FT.CREATE`: to this shard's AOF and the replicas, and to
+    /// every other shard's AOF, since each shard replays only its own file.
     pub async fn create_search_index(
         &self,
         schema: crate::search::IndexSchema,
@@ -3717,12 +3745,21 @@ impl Router {
         if self.has_search_index(&name) {
             return Err(format!("Index already exists: {}", name));
         }
+        let cmd = || Command::FtCreate {
+            index: schema.name.clone(),
+            on_type: schema.on_type.clone(),
+            prefixes: schema.prefixes.clone(),
+            fields: schema.fields.clone(),
+            schema_fields: schema.schema_fields.clone(),
+        };
+        let aof_record = self.search_aof_record(&cmd());
 
         // Register in global search registry first so per-shard backfill also populates the mirror
         let _ = crate::search::create_search_index(schema.clone());
 
         // Initialize and backfill on local shard
         self.local_db.borrow_mut().init_search_index(schema.clone());
+        self.log_mutation(cmd);
 
         // Broadcast to all other shards
         for (sid, sender) in self.senders.iter().enumerate() {
@@ -3730,6 +3767,7 @@ impl Router {
                 let (tx, rx) = flume::bounded(1);
                 let msg = ShardMessage::InitSearchIndex {
                     schema: Box::new(schema.clone()),
+                    aof_record: aof_record.clone(),
                     responder: tx,
                 };
                 if sender.send(msg).is_ok() {
@@ -3741,7 +3779,14 @@ impl Router {
         Ok(())
     }
 
-    pub async fn drop_search_index(&self, name: &str) -> Result<(), String> {
+    /// Drops index `name` on every shard; logged like
+    /// [`Self::create_search_index`], by the shards that had it.
+    pub async fn drop_search_index(&self, name: &str, dd: bool) -> Result<(), String> {
+        let cmd = || Command::FtDropIndex {
+            index: name.to_string(),
+            dd,
+        };
+        let aof_record = self.search_aof_record(&cmd());
         let mut any_dropped = self.local_db.borrow_mut().drop_search_index(name);
 
         for (sid, sender) in self.senders.iter().enumerate() {
@@ -3749,6 +3794,7 @@ impl Router {
                 let (tx, rx) = flume::bounded(1);
                 let msg = ShardMessage::DropSearchIndex {
                     name: name.to_string(),
+                    aof_record: aof_record.clone(),
                     responder: tx,
                 };
                 if sender.send(msg).is_ok()
@@ -3762,12 +3808,15 @@ impl Router {
         let _ = crate::search::drop_search_index(name);
 
         if any_dropped {
+            self.log_mutation(cmd);
             Ok(())
         } else {
             Err(format!("Unknown Index name: {}", name))
         }
     }
 
+    /// Adds fields to index `index` on every shard (each re-indexes its own
+    /// keys); logged like [`Self::create_search_index`].
     pub async fn alter_search_index(
         &self,
         index: &str,
@@ -3789,30 +3838,29 @@ impl Router {
                 return Err(format!("Unknown Index name: {}", index));
             }
         };
+        let cmd = || Command::FtAlter {
+            index: index.to_string(),
+            fields: new_fields.clone(),
+            schema_fields: new_schema_fields.clone(),
+        };
+        let aof_record = self.search_aof_record(&cmd());
 
-        for (k, v) in new_fields {
-            schema.fields.insert(k, v);
-        }
-        for sf in new_schema_fields {
-            if let Some(existing) = schema
-                .schema_fields
-                .iter_mut()
-                .find(|e| e.alias == sf.alias || e.identifier == sf.identifier)
-            {
-                *existing = sf;
-            } else {
-                schema.schema_fields.push(sf);
-            }
-        }
+        crate::search::merge_schema_fields(
+            &mut schema,
+            new_fields.clone(),
+            new_schema_fields.clone(),
+        );
 
         crate::search::reset_search_index(schema.clone());
         self.local_db.borrow_mut().init_search_index(schema.clone());
+        self.log_mutation(cmd);
 
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
                 let msg = ShardMessage::InitSearchIndex {
                     schema: Box::new(schema.clone()),
+                    aof_record: aof_record.clone(),
                     responder: tx,
                 };
                 if sender.send(msg).is_ok() {
@@ -4392,6 +4440,7 @@ impl Router {
 
     async fn load_full_sync_rdb_on_all_shards(&self, data: Bytes) -> Result<(), String> {
         let aof_dir = self.aof.as_ref().map(|_| self.db_dir.clone());
+        self.forget_global_search_indices();
         let mut responders = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
