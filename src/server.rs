@@ -2223,7 +2223,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let _ = responder.send((used, track));
                     }
                     ShardMessage::TryEvictOneKey { policy, responder } => {
-                        let freed = cross_shard_db.borrow_mut().try_evict_one_key(&policy);
+                        let freed = cross_shard_db
+                            .borrow_mut()
+                            .try_evict_one_key(&policy, cross_shard_router.aof.as_deref());
                         let _ = responder.send(freed);
                     }
                     ShardMessage::StreamColdRead { key, responder } => {

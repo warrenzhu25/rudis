@@ -23783,6 +23783,163 @@ fn test_multi_db_persistence_and_replication_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Keys evicted under `maxmemory` must be propagated like Redis does (a
+/// `DEL` in the AOF and the replication stream, in the key's DB): they used
+/// to be dropped silently, so the replica kept every evicted key and an AOF
+/// replay resurrected them.
+#[test]
+fn test_evicted_keys_propagate_to_replica_and_aof_e2e() {
+    let (mport, rport) = (17950u16, 17951u16);
+    let dir = std::env::temp_dir().join(format!("rudis-evict-prop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mdir = dir.join("m");
+    let rdir = dir.join("r");
+    std::fs::create_dir_all(&mdir).unwrap();
+    std::fs::create_dir_all(&rdir).unwrap();
+    let (ms, rs) = (mport.to_string(), rport.to_string());
+    let (mds, rds) = (
+        mdir.to_str().unwrap().to_string(),
+        rdir.to_str().unwrap().to_string(),
+    );
+    let margs = [
+        "--port",
+        &ms,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--bind",
+        "127.0.0.1",
+        "--dir",
+        &mds,
+        "--appendonly",
+        "yes",
+    ];
+    let rargs = [
+        "--port",
+        &rs,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--bind",
+        "127.0.0.1",
+        "--dir",
+        &rds,
+    ];
+    let mut master = spawn_rudis_listening(&margs, mport);
+    let mut replica = spawn_rudis_listening(&rargs, rport);
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    wait_for("replica link up", || {
+        resp_cmd(&mut r, &["INFO", "replication"]).contains("master_link_status:up")
+    });
+
+    const LIMIT: u64 = 24 << 20;
+    assert_eq!(
+        resp_cmd(&mut m, &["CONFIG", "SET", "maxmemory", &LIMIT.to_string()]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut m,
+            &["CONFIG", "SET", "maxmemory-policy", "allkeys-lru"]
+        ),
+        "+OK\r\n"
+    );
+
+    // Far more than fits, in DB 0 and DB 2, so both DBs see evictions.
+    for (db, n) in [("0", 400_000usize), ("2", 200_000)] {
+        let mut c = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        assert_eq!(resp_cmd(&mut c, &["SELECT", db]), "+OK\r\n");
+        let mut writer = c.try_clone().unwrap();
+        let w = thread::spawn(move || {
+            let val = "v".repeat(64);
+            let mut chunk = Vec::with_capacity(1 << 20);
+            for i in 0..n {
+                let key = format!("db{db}:{i:08}");
+                chunk.extend_from_slice(
+                    format!(
+                        "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n$64\r\n{}\r\n",
+                        key.len(),
+                        key,
+                        val
+                    )
+                    .as_bytes(),
+                );
+                if chunk.len() >= 1 << 20 {
+                    writer.write_all(&chunk).unwrap();
+                    chunk.clear();
+                }
+            }
+            writer.write_all(&chunk).unwrap();
+        });
+        let mut lines = 0usize;
+        let mut buf = vec![0u8; 1 << 16];
+        let mut oom = false;
+        while lines < n {
+            let got = c.read(&mut buf).expect("load reply");
+            assert!(got > 0, "server closed the load connection");
+            lines += buf[..got].iter().filter(|&&b| b == b'\n').count();
+            oom |= buf[..got].windows(4).any(|w| w == b"-OOM");
+        }
+        w.join().unwrap();
+        assert!(!oom, "allkeys-lru rejected writes in db {db}");
+    }
+
+    // Stop evicting (CONFIG SET skips the maxmemory check) so the keyspace
+    // holds still while it is compared.
+    assert_eq!(
+        resp_cmd(&mut m, &["CONFIG", "SET", "maxmemory", "0"]),
+        "+OK\r\n"
+    );
+    let evicted = info_field_u64(&mut m, "stats", "evicted_keys");
+    assert!(evicted > 0, "nothing was evicted");
+    let dbsize = |c: &mut TcpStream, db: &str| -> String {
+        assert_eq!(resp_cmd(c, &["SELECT", db]), "+OK\r\n");
+        resp_cmd(c, &["DBSIZE"])
+    };
+    let (m0, m2) = (dbsize(&mut m, "0"), dbsize(&mut m, "2"));
+    assert_ne!(m0, ":400000\r\n", "db 0 saw no eviction");
+    assert_ne!(m2, ":200000\r\n", "db 2 saw no eviction");
+    assert_eq!(resp_cmd(&mut m, &["WAIT", "1", "10000"]), ":1\r\n");
+    wait_for("replica keyspace matches the master's", || {
+        dbsize(&mut r, "0") == m0 && dbsize(&mut r, "2") == m2
+    });
+    let m_digest = resp_cmd(&mut m, &["DEBUG", "DIGEST"]);
+    assert_eq!(
+        resp_cmd(&mut r, &["DEBUG", "DIGEST"]),
+        m_digest,
+        "replica kept keys the master evicted"
+    );
+
+    // Replaying the AOF alone (no RDB) yields the same keyspace.
+    drop(r);
+    shutdown_and_wait(rport, &mut replica);
+    let _ = m.write_all(&format_resp_cmd(&["SHUTDOWN", "NOSAVE"]));
+    drop(m);
+    let _ = master.wait();
+    let _ = std::fs::remove_file(mdir.join("dump.rdb"));
+    let mut master = spawn_rudis_listening(&margs, mport);
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    wait_for("AOF loaded", || {
+        !resp_cmd(&mut m, &["PING"]).starts_with("-LOADING")
+    });
+    assert_eq!(dbsize(&mut m, "0"), m0, "AOF replay resurrected db 0 keys");
+    assert_eq!(dbsize(&mut m, "2"), m2, "AOF replay resurrected db 2 keys");
+    assert_eq!(resp_cmd(&mut m, &["DEBUG", "DIGEST"]), m_digest);
+    drop(m);
+    shutdown_and_wait(mport, &mut master);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `field` of `INFO <section>` as a string.
 fn info_str(c: &mut TcpStream, section: &str, field: &str) -> String {
     let info = resp_cmd(c, &["INFO", section]);

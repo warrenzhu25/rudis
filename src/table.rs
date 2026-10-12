@@ -3751,6 +3751,17 @@ impl RudisTable {
     /// Attempts to evict one key under the specified eviction policy (allkeys-lru, volatile-lru, volatile-ttl, allkeys-random).
     /// Returns the number of bytes freed, or None if no evictable key was found.
     pub fn try_evict_one_key(&mut self, policy: &str) -> Option<usize> {
+        self.try_evict_one_key_with(policy, |_| {})
+    }
+
+    /// [`Self::try_evict_one_key`], calling `on_evict` with the evicted
+    /// key right after it is removed (before its `evicted` keyspace event),
+    /// so the caller can propagate the deletion to the AOF and replicas.
+    pub fn try_evict_one_key_with(
+        &mut self,
+        policy: &str,
+        on_evict: impl FnOnce(&[u8]),
+    ) -> Option<usize> {
         let bound = self.table.cursor_bound();
         if bound == 0 || self.table.is_empty() {
             return None;
@@ -3824,6 +3835,7 @@ impl RudisTable {
             let freed = removed.key.heap_bytes() + removed.val.mem_bytes() + ENTRY_OVERHEAD;
             self.data_bytes = self.data_bytes.saturating_sub(freed);
             inc_evicted_keys();
+            on_evict(removed.key.as_ref());
             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::connection::touch_watched_key_any_port(removed.key.as_ref());
             }

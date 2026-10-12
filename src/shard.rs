@@ -809,14 +809,31 @@ impl ShardDb {
         total
     }
 
-    #[inline]
-    pub fn try_evict_one_key(&mut self, policy: &str) -> Option<usize> {
-        if let Some(freed) = self.table.try_evict_one_key(policy) {
-            return Some(freed);
-        }
-        let max_db = self.max_db_len();
+    /// Evicts one key under `policy`, trying the selected DB first and then
+    /// the others. Like Redis, the eviction is logged as `DEL key` to `aof`
+    /// and the replication stream (under the evicted key's DB, which AOF and
+    /// replication pick up from `CURRENT_DB` to emit a `SELECT`), so neither
+    /// an AOF replay nor a replica keeps a key the master dropped.
+    pub fn try_evict_one_key(
+        &mut self,
+        policy: &str,
+        aof: Option<&std::cell::RefCell<crate::aof::AofWriter>>,
+    ) -> Option<usize> {
+        let (port, shard_id) = (self.port, self.shard_id);
+        let log_del = |key: &[u8]| {
+            crate::replication::log_shard_mutation(port, shard_id, aof, || {
+                crate::resp::Command::Del(smallvec::smallvec![Bytes::copy_from_slice(key)])
+            });
+        };
         let saved_db = self.current_db;
         let prev_tl = crate::connection::CURRENT_DB.get();
+        crate::connection::CURRENT_DB.set(saved_db);
+        let res = self.table.try_evict_one_key_with(policy, log_del);
+        crate::connection::CURRENT_DB.set(prev_tl);
+        if res.is_some() {
+            return res;
+        }
+        let max_db = self.max_db_len();
         for db_idx in 0..max_db {
             if db_idx == saved_db {
                 continue;
@@ -824,7 +841,7 @@ impl ShardDb {
             if self.table_for_db(db_idx).is_some_and(|t| !t.is_empty()) {
                 self.select_db(db_idx);
                 crate::connection::CURRENT_DB.set(db_idx);
-                let res = self.table.try_evict_one_key(policy);
+                let res = self.table.try_evict_one_key_with(policy, log_del);
                 self.select_db(saved_db);
                 crate::connection::CURRENT_DB.set(prev_tl);
                 if let Some(freed) = res {
@@ -4468,6 +4485,46 @@ mod tests {
             }
         }
         keys
+    }
+
+    /// A maxmemory eviction is logged as `DEL key` (AOF and replication
+    /// share `log_shard_mutation`), under a `SELECT` of the DB the key was
+    /// evicted from, even when that is not the selected DB; otherwise an AOF
+    /// replay or a replica would resurrect the key.
+    #[test]
+    fn eviction_logs_del_in_the_evicted_keys_db() {
+        let mut db = ShardDb::new(0);
+        db.select_db(3);
+        db.table.set(
+            Bytes::from_static(b"victim"),
+            Bytes::from_static(b"v"),
+            None,
+        );
+        db.select_db(0);
+        let prev_tl = crate::connection::CURRENT_DB.get();
+        let aof = std::cell::RefCell::new(crate::aof::AofWriter::new_in_memory());
+
+        assert!(db.try_evict_one_key("allkeys-lru", Some(&aof)).is_some());
+        assert_eq!(
+            aof.borrow().buffer(),
+            b"*2\r\n$6\r\nSELECT\r\n$1\r\n3\r\n*2\r\n$3\r\nDEL\r\n$6\r\nvictim\r\n"
+        );
+        assert_eq!(db.current_db, 0, "selected DB restored");
+        assert_eq!(crate::connection::CURRENT_DB.get(), prev_tl);
+        db.select_db(3);
+        assert!(db.table.is_empty());
+        db.select_db(0);
+
+        // A key of the selected DB: DEL goes back to DB 0.
+        db.table
+            .set(Bytes::from_static(b"k0"), Bytes::from_static(b"v"), None);
+        assert!(db.try_evict_one_key("allkeys-random", Some(&aof)).is_some());
+        assert!(
+            aof.borrow()
+                .buffer()
+                .ends_with(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n*2\r\n$3\r\nDEL\r\n$2\r\nk0\r\n")
+        );
+        assert!(db.try_evict_one_key("allkeys-random", Some(&aof)).is_none());
     }
 
     /// Segments split while a yielding save runs must not get their keys

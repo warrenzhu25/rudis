@@ -918,7 +918,7 @@ impl Router {
                 if others + local <= target || db.total_used_memory() <= floor {
                     break;
                 }
-                if db.try_evict_one_key(policy).is_none() {
+                if db.try_evict_one_key(policy, self.aof.as_deref()).is_none() {
                     break;
                 }
             }
