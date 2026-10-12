@@ -26089,7 +26089,13 @@ async fn execute_commands_squashed_inner(
                             let shard = router.target_shard_for_slot(slot);
                             if let Some(fsh) = first_shard {
                                 if fsh != shard
-                                    && !matches!(cmd, Command::Mget(_) | Command::Mset(_))
+                                    && !matches!(
+                                        cmd,
+                                        Command::Mget(_)
+                                            | Command::Mset(_)
+                                            | Command::Del(_)
+                                            | Command::Exists(_)
+                                    )
                                 {
                                     invalid_slot = true;
                                 }
@@ -26171,8 +26177,9 @@ async fn execute_commands_squashed_inner(
     // Cross-shard MSETs are dispatched without awaiting so that every command in
     // the pipeline is in flight before we pay a single round-trip stall. These hold
     // the handles until the gather phase below.
-    // MGETs are folded into the per-shard batches: (pipeline idx, first slot, keys).
+    // MGETs and multi-key DEL/EXISTS are folded into the per-shard batches: (pipeline idx, first slot, keys).
     let mut folded_mgets: Vec<(usize, usize, usize)> = Vec::new();
+    let mut folded_int_sums: Vec<(usize, usize, usize)> = Vec::new();
     let mut inflight_msets: Vec<(usize, crate::router::MsetInFlight)> = Vec::new();
     let mut local_cold_gets: smallvec::SmallVec<[(usize, bytes::Bytes); 8]> =
         smallvec::SmallVec::new();
@@ -26671,6 +26678,67 @@ async fn execute_commands_squashed_inner(
                 }
             }
             folded_mgets.push((idx, start, responses.len() - start));
+        } else if let Command::Exists(keys) = cmd {
+            stat_run.note("EXISTS");
+            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                for key in &keys {
+                    record_client_read(router.port, client_id, key.as_ref());
+                }
+            }
+            let start = responses.len();
+            for key in keys {
+                let slot = responses.len();
+                responses.push(CompactResp::INT_0);
+                let (target, key_hash) = router.target_shard_and_hash(key.as_ref());
+                if target == router.shard_id {
+                    let exists = local_db.table.exists_with_hash(key.as_ref(), key_hash);
+                    crate::server_stats::note_key_lookup(exists);
+                    if exists {
+                        responses[slot] = CompactResp::INT_1;
+                    }
+                } else {
+                    remote_batches[target].push((
+                        slot,
+                        key_hash,
+                        Command::Exists(smallvec::smallvec![key]),
+                    ));
+                }
+            }
+            folded_int_sums.push((idx, start, responses.len() - start));
+        } else if write_fast_path
+            && !crate::search::has_active_search_indices()
+            && let Command::Del(keys) = cmd
+        {
+            stat_run.note("DEL");
+            let start = responses.len();
+            for key in keys {
+                let slot = responses.len();
+                responses.push(CompactResp::INT_0);
+                let (target, key_hash) = router.target_shard_and_hash(key.as_ref());
+                if target == router.shard_id {
+                    local_db.hydrate_key(key.as_ref());
+                    if local_db.del_with_hash(key.as_ref(), key_hash) {
+                        has_local_writes = true;
+                        if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                            touch_watched_key(router.port, key.as_ref());
+                        }
+                        if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                            notify_key_invalidation(router.port, key.as_ref(), client_id);
+                        }
+                        responses[slot] = CompactResp::INT_1;
+                    }
+                } else {
+                    if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                        notify_key_invalidation(router.port, key.as_ref(), client_id);
+                    }
+                    remote_batches[target].push((
+                        slot,
+                        key_hash,
+                        Command::Del(smallvec::smallvec![key]),
+                    ));
+                }
+            }
+            folded_int_sums.push((idx, start, responses.len() - start));
         } else if let Command::Mset(pairs) = cmd {
             local_db.drain_dropped_tier();
             drop(local_db);
@@ -26779,10 +26847,23 @@ async fn execute_commands_squashed_inner(
         }
     }
 
-    // 4. Assemble folded MGET arrays from their per-key slots, then gather the
-    //    cross-shard MSETs dispatched in step 1.
+    // 4. Assemble folded MGET arrays and multi-key DEL/EXISTS sums from their per-key slots,
+    //    then gather the cross-shard MSETs dispatched in step 1.
     for (idx, start, len) in folded_mgets.drain(..) {
         responses[idx] = assemble_mget_reply(&responses[start..start + len], is_resp3);
+    }
+    for (idx, start, len) in folded_int_sums.drain(..) {
+        let mut sum = 0i64;
+        for slot in &responses[start..start + len] {
+            if slot.as_slice() == b":1\r\n" {
+                sum += 1;
+            }
+        }
+        responses[idx] = match sum {
+            0 => CompactResp::INT_0,
+            1 => CompactResp::INT_1,
+            n => CompactResp::from_integer(n),
+        };
     }
     responses.truncate(n);
     let batch_len = n;
@@ -29745,5 +29826,95 @@ mod tests {
             remaining_wait_ms(dl, dl + std::time::Duration::from_nanos(1)),
             0
         );
+    }
+
+    #[test]
+    fn test_squashed_pipeline_folds_multikey_del_and_exists() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
+            let db = Rc::new(RefCell::new(ShardDb::new(9995)));
+            let router = Router::new(
+                0,
+                1,
+                9995,
+                db,
+                senders_mesh[0].clone(),
+                None,
+                Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+                std::env::temp_dir(),
+            );
+            let client_registry = RefCell::new(hashbrown::HashMap::new());
+            let mut asking = false;
+            let mut authenticated = true;
+            let mut auth_user = String::from("default");
+            let mut out = Vec::new();
+            let responders = vec![std::sync::Arc::new(crate::mailbox::BatchResponder::new())];
+            let mut remote_batches = vec![Vec::new()];
+            let mut items_pool = vec![Vec::new()];
+            let mut results_pool = vec![Vec::new()];
+            let mut squashed_responses = Vec::new();
+
+            let mut cmds = vec![
+                Command::Set {
+                    key: Bytes::from("mk_a"),
+                    value: Bytes::from("va"),
+                    expire_in: None,
+                    condition: crate::resp::SetCondition::None,
+                    get: false,
+                    keepttl: false,
+                    past_expired: false,
+                },
+                Command::Set {
+                    key: Bytes::from("mk_b"),
+                    value: Bytes::from("vb"),
+                    expire_in: None,
+                    condition: crate::resp::SetCondition::None,
+                    get: false,
+                    keepttl: false,
+                    past_expired: false,
+                },
+                Command::Exists(smallvec::smallvec![
+                    Bytes::from("mk_a"),
+                    Bytes::from("mk_a"),
+                    Bytes::from("mk_b"),
+                    Bytes::from("mk_missing"),
+                ]),
+                Command::Del(smallvec::smallvec![
+                    Bytes::from("mk_a"),
+                    Bytes::from("mk_a"),
+                    Bytes::from("mk_b"),
+                    Bytes::from("mk_missing"),
+                ]),
+                Command::Exists(smallvec::smallvec![
+                    Bytes::from("mk_a"),
+                    Bytes::from("mk_b"),
+                ]),
+            ];
+
+            let quit = execute_commands_squashed(
+                &mut cmds,
+                false,
+                &router,
+                &responders,
+                &mut remote_batches,
+                &mut items_pool,
+                &mut results_pool,
+                &mut squashed_responses,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert!(!quit);
+            assert_eq!(out, b"+OK\r\n+OK\r\n:3\r\n:2\r\n:0\r\n");
+        });
     }
 }

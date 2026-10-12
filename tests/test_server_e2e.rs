@@ -26507,3 +26507,46 @@ fn test_documented_config_and_persistence_invariants_e2e() {
     shutdown_and_wait(port, &mut srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_pipelined_multikey_del_and_exists_folding_e2e() {
+    let port = 17982u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Send a single pipeline mixing SETs, scattered multi-key EXISTS (with duplicates),
+    // scattered multi-key DEL (with duplicates), and post-delete EXISTS across 4 shards.
+    let mut pipe = String::new();
+    for i in 0..8 {
+        pipe.push_str(&format!("SET fold_k_{i} fold_v_{i}\r\n"));
+    }
+    pipe.push_str("EXISTS fold_k_0 fold_k_1 fold_k_2 fold_k_3 fold_k_0 fold_k_missing\r\n");
+    pipe.push_str("DEL fold_k_0 fold_k_1 fold_k_2 fold_k_3 fold_k_0 fold_k_missing\r\n");
+    pipe.push_str("EXISTS fold_k_0 fold_k_1 fold_k_4 fold_k_5\r\n");
+
+    let resp = send_and_read(&mut c, pipe.as_bytes());
+    let expected = concat!(
+        "+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
+        ":5\r\n",
+        ":4\r\n",
+        ":2\r\n",
+    );
+    assert_eq!(resp, expected);
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}
