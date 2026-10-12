@@ -44,6 +44,8 @@ fn server() -> Arc<rustls::ClientConfig> {
                 fsync_every_sec: false,
             };
             rudis::shutdown::reset_shutdown();
+            // The real binary defaults to `no`, as Redis; tests use DEBUG.
+            rudis::netsec::set_enable_debug_command(PORT, rudis::netsec::ProtectedAction::Yes);
             let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(NUM_SHARDS);
             for (shard_id, rx) in receivers.into_iter().enumerate() {
                 let shard_senders = senders_mesh[shard_id].clone();

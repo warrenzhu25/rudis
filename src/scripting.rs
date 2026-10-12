@@ -2196,6 +2196,9 @@ fn register_redis_module<'scope, 'env: 'scope>(
                 "Unknown Redis command called from script".to_string(),
             ));
         }
+        if let Some(err) = script_debug_denied(port, &cmd) {
+            return Err(mlua::Error::RuntimeError(err));
+        }
         if let Some(err) = script_acl_denied(port, &cmd) {
             crate::connection::record_rejected_stat(crate::connection::get_cmd_name(&cmd));
             crate::connection::record_error_stat("NOPERM", None);
@@ -2365,6 +2368,11 @@ fn register_redis_module<'scope, 'env: 'scope>(
         if let Command::Unknown(_) = &cmd {
             let tbl = lua.create_table()?;
             tbl.set("err", "ERR Unknown Redis command called from script")?;
+            return Ok(Value::Table(tbl));
+        }
+        if let Some(err) = script_debug_denied(port, &cmd) {
+            let tbl = lua.create_table()?;
+            tbl.set("err", err)?;
             return Ok(Value::Table(tbl));
         }
         if let Some(err) = script_acl_denied(port, &cmd) {
@@ -2590,6 +2598,16 @@ fn register_redis_module<'scope, 'env: 'scope>(
     let proxy = make_table_readonly_proxy(lua, redis.clone())?;
     real_g.set("redis", proxy)?;
     Ok(redis)
+}
+
+/// `enable-debug-command` for `redis.call('DEBUG', ...)`. A script has no
+/// client address to judge `local` by, so only `yes` lets it run DEBUG.
+fn script_debug_denied(port: u16, cmd: &Command) -> Option<String> {
+    if !matches!(cmd, Command::Debug(_)) || crate::netsec::enable_debug_command(port).allows(None) {
+        return None;
+    }
+    let msg = crate::netsec::DEBUG_COMMAND_NOT_ALLOWED;
+    Some(String::from_utf8_lossy(&msg[1..msg.len() - 2]).into_owned())
 }
 
 /// ACL check for commands issued by a script (Redis scriptVerifyACL): they
@@ -2984,6 +3002,30 @@ mod tests {
             format_eval_error("runtime error: NOPERM denied", "abc"),
             "NOPERM denied script: abc, on @user_script:1."
         );
+    }
+
+    #[test]
+    fn test_script_debug_follows_enable_debug_command() {
+        let cmd = |args: &[&str]| {
+            crate::resp::build_command(
+                args.iter()
+                    .map(|a| Bytes::copy_from_slice(a.as_bytes()))
+                    .collect(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let debug = cmd(&["DEBUG", "SLEEP", "0"]);
+        let get = cmd(&["GET", "k"]);
+        let (no, local, yes) = (65042, 65043, 65044);
+        crate::netsec::set_enable_debug_command(local, crate::netsec::ProtectedAction::Local);
+        crate::netsec::set_enable_debug_command(yes, crate::netsec::ProtectedAction::Yes);
+        let e = script_debug_denied(no, &debug).unwrap();
+        assert!(e.starts_with("ERR DEBUG command not allowed"), "{e}");
+        assert!(!e.ends_with('\n'), "{e:?}");
+        assert!(script_debug_denied(local, &debug).is_some());
+        assert_eq!(script_debug_denied(yes, &debug), None);
+        assert_eq!(script_debug_denied(no, &get), None);
     }
 
     #[test]

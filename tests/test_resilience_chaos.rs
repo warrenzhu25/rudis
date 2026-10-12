@@ -25,6 +25,10 @@ fn start_test_server(port: u16, num_shards: usize) {
         fsync_every_sec: false,
     };
 
+    // The real binary defaults to `no`, as Redis; tests use DEBUG.
+
+    rudis::netsec::set_enable_debug_command(port, rudis::netsec::ProtectedAction::Yes);
+
     let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {

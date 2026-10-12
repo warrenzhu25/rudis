@@ -119,6 +119,87 @@ pub fn protected_mode_denies(port: u16, peer: IpAddr) -> bool {
         .is_some_and(|u| u.nopass)
 }
 
+/// Redis' "protected" configs (`enable-debug-command`,
+/// `enable-module-command`): whether a dangerous command family may run at
+/// all (`yes`), only from loopback clients (`local`), or never (`no`, the
+/// default). Like Redis they are read from the config file / command line
+/// only; `CONFIG SET` refuses them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtectedAction {
+    No,
+    Yes,
+    Local,
+}
+
+impl ProtectedAction {
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v.to_ascii_lowercase().as_str() {
+            "no" => Ok(Self::No),
+            "yes" => Ok(Self::Yes),
+            "local" => Ok(Self::Local),
+            _ => Err("argument(s) must be one of the following: no, yes, local".to_string()),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::Yes => "yes",
+            Self::Local => "local",
+        }
+    }
+
+    /// Whether a client at `peer` may run the command (`None`: the peer is
+    /// unknown, e.g. a script, so only `yes` allows it).
+    pub fn allows(self, peer: Option<IpAddr>) -> bool {
+        match self {
+            Self::Yes => true,
+            Self::No => false,
+            Self::Local => peer.is_some_and(is_loopback_peer),
+        }
+    }
+}
+
+static DEBUG_COMMAND: LazyLock<RwLock<HashMap<u16, ProtectedAction>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static MODULE_COMMAND: LazyLock<RwLock<HashMap<u16, ProtectedAction>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Sets `enable-debug-command` for the server on base port `port`. Keyed by
+/// port so in-process test servers do not see each other's setting.
+pub fn set_enable_debug_command(port: u16, v: ProtectedAction) {
+    DEBUG_COMMAND.write().insert(port, v);
+}
+
+/// `enable-debug-command` for base port `port` (Redis default: `no`).
+pub fn enable_debug_command(port: u16) -> ProtectedAction {
+    DEBUG_COMMAND
+        .read()
+        .get(&port)
+        .copied()
+        .unwrap_or(ProtectedAction::No)
+}
+
+/// Sets `enable-module-command` for the server on base port `port`.
+pub fn set_enable_module_command(port: u16, v: ProtectedAction) {
+    MODULE_COMMAND.write().insert(port, v);
+}
+
+/// `enable-module-command` for base port `port` (Redis default: `no`).
+pub fn enable_module_command(port: u16) -> ProtectedAction {
+    MODULE_COMMAND
+        .read()
+        .get(&port)
+        .copied()
+        .unwrap_or(ProtectedAction::No)
+}
+
+/// Redis' reply when `enable-debug-command` refuses `DEBUG`.
+pub const DEBUG_COMMAND_NOT_ALLOWED: &[u8] = b"-ERR DEBUG command not allowed. If the enable-debug-command option is set to \"local\", you can run it from a local connection, otherwise you need to set this option in the configuration file, and then restart the server.\r\n";
+
+/// Redis' reply when `enable-module-command` refuses `MODULE`.
+pub const MODULE_COMMAND_NOT_ALLOWED: &[u8] = b"-ERR MODULE command not allowed. If the enable-module-command option is set to \"local\", you can run it from a local connection, otherwise you need to set this option in the configuration file, and then restart the server.\r\n";
+
 /// Reply sent (then the connection is closed) when protected mode refuses a client.
 pub const PROTECTED_MODE_DENIED: &[u8] = b"-DENIED Running in protected mode because protected mode is enabled and no password is set for the default user. In this mode connections are only accepted from the loopback interface. If you want to connect from external computers you may adopt one of the following solutions: 1) Just disable protected mode sending the command 'CONFIG SET protected-mode no' from the loopback interface by connecting from the same host the server is running, however MAKE SURE the server is not publicly accessible from internet if you do so. Use CONFIG REWRITE to make this change permanent. 2) Alternatively you can just disable the protected mode by editing the configuration file, and setting the protected mode option to 'no', and then restarting the server. 3) If you started the server manually just for testing, restart it with the '--protected-mode no' option. 4) Set up an authentication password for the default user. NOTE: You only need to do one of the above things in order for the server to start accepting connections from the outside.\r\n";
 
@@ -376,5 +457,47 @@ mod tests {
         assert_eq!(bind_addrs(port), parse_bind_spec(DEFAULT_BIND).unwrap());
         set_bind_addrs(port, parse_bind_spec("127.0.0.1").unwrap());
         assert_eq!(format_bind_spec(&bind_addrs(port)), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_protected_action_parse_and_allows() {
+        assert_eq!(ProtectedAction::parse("NO"), Ok(ProtectedAction::No));
+        assert_eq!(ProtectedAction::parse("yes"), Ok(ProtectedAction::Yes));
+        assert_eq!(ProtectedAction::parse("Local"), Ok(ProtectedAction::Local));
+        assert!(ProtectedAction::parse("maybe").is_err());
+        for v in [
+            ProtectedAction::No,
+            ProtectedAction::Yes,
+            ProtectedAction::Local,
+        ] {
+            assert_eq!(ProtectedAction::parse(v.name()), Ok(v));
+        }
+
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let lo6: IpAddr = "::1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let ext: IpAddr = "10.1.2.3".parse().unwrap();
+        assert!(!ProtectedAction::No.allows(Some(lo)));
+        assert!(ProtectedAction::Yes.allows(Some(ext)));
+        assert!(ProtectedAction::Yes.allows(None));
+        assert!(ProtectedAction::Local.allows(Some(lo)));
+        assert!(ProtectedAction::Local.allows(Some(lo6)));
+        assert!(ProtectedAction::Local.allows(Some(mapped)));
+        assert!(!ProtectedAction::Local.allows(Some(ext)));
+        assert!(!ProtectedAction::Local.allows(None));
+    }
+
+    #[test]
+    fn test_enable_debug_command_is_per_port_and_defaults_to_no() {
+        let (a, b) = (65021, 65022);
+        assert_eq!(enable_debug_command(a), ProtectedAction::No);
+        assert_eq!(enable_module_command(a), ProtectedAction::No);
+        set_enable_debug_command(a, ProtectedAction::Yes);
+        set_enable_module_command(a, ProtectedAction::Local);
+        assert_eq!(enable_debug_command(a), ProtectedAction::Yes);
+        assert_eq!(enable_module_command(a), ProtectedAction::Local);
+        // Another server in the same process keeps the default.
+        assert_eq!(enable_debug_command(b), ProtectedAction::No);
+        assert_eq!(enable_module_command(b), ProtectedAction::No);
     }
 }

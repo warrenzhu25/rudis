@@ -35,6 +35,10 @@ fn sweep_dead_test_server_dirs() {
 /// The server binary, run from a per-process scratch dir (swept like the
 /// others) so files it puts in its working dir, such as the default tier
 /// dir, stay out of the repo.
+/// Appended to spawned servers' arguments: the binary defaults to
+/// `enable-debug-command no`, as Redis does, and many tests use DEBUG.
+const DEBUG_ON: [&str; 2] = ["--enable-debug-command", "yes"];
+
 fn rudis_bin() -> std::process::Command {
     sweep_dead_test_server_dirs();
     let cwd = std::env::temp_dir().join(format!("rudis-srv-{}-cwd", std::process::id()));
@@ -64,6 +68,8 @@ fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::a
     // These in-process servers also cover the experimental families; the
     // default (off) is tested against the real binary.
     rudis::resp::set_experimental_commands(true);
+    // The real binary defaults to `no`, as Redis; tests use DEBUG.
+    rudis::netsec::set_enable_debug_command(port, rudis::netsec::ProtectedAction::Yes);
     let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {
@@ -114,6 +120,10 @@ fn start_test_server_cluster(port: u16, num_shards: usize) {
         dir,
         fsync_every_sec: false,
     };
+
+    // The real binary defaults to `no`, as Redis; tests use DEBUG.
+
+    rudis::netsec::set_enable_debug_command(port, rudis::netsec::ProtectedAction::Yes);
 
     let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
 
@@ -172,6 +182,10 @@ fn start_test_server_with_tls(port: u16, tls_port: u16, num_shards: usize) -> (V
         dir,
         fsync_every_sec: false,
     };
+
+    // The real binary defaults to `no`, as Redis; tests use DEBUG.
+
+    rudis::netsec::set_enable_debug_command(port, rudis::netsec::ProtectedAction::Yes);
 
     let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
 
@@ -7289,6 +7303,10 @@ fn test_graceful_shutdown_command_and_worker_exit_e2e() {
         dir,
         ..Default::default()
     };
+
+    // The real binary defaults to `no`, as Redis; tests use DEBUG.
+
+    rudis::netsec::set_enable_debug_command(port, rudis::netsec::ProtectedAction::Yes);
 
     let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(2);
     let mut handles = Vec::new();
@@ -14862,6 +14880,7 @@ fn test_script_redis_call_enforces_caller_acl_e2e() {
 fn run_rudis_until_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
     let mut child = rudis_bin()
         .args(args)
+        .args(DEBUG_ON)
         .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -14949,6 +14968,7 @@ fn test_startup_refuses_unloadable_rdb_and_aof_e2e() {
 fn spawn_rudis_listening(args: &[&str], port: u16) -> std::process::Child {
     let mut child = rudis_bin()
         .args(args)
+        .args(DEBUG_ON)
         .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -18170,6 +18190,7 @@ fn test_config_file_directives_are_applied_or_rejected_e2e() {
         std::fs::write(&conf, bad).unwrap();
         let status = rudis_bin()
             .args(args)
+            .args(DEBUG_ON)
             .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -19195,6 +19216,7 @@ fn test_metrics_port_serves_prometheus_over_http_e2e() {
 fn rudis_startup_error(args: &[&str]) -> String {
     let mut child = rudis_bin()
         .args(args)
+        .args(DEBUG_ON)
         .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -19850,6 +19872,7 @@ fn test_config_rewrite_targets_the_startup_config_file_e2e() {
     let spawn = |args: &[&str], stderr: std::process::Stdio| {
         rudis_bin()
             .args(args)
+            .args(DEBUG_ON)
             .current_dir(&cwd)
             .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
             .stdout(std::process::Stdio::null())
@@ -24987,4 +25010,97 @@ fn test_shards_fall_back_to_epoll_when_io_uring_cannot_start_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// Spawns rudis without [`DEBUG_ON`], so `enable-debug-command` takes the
+/// value from `extra` (or the default).
+fn spawn_rudis_debug_setting(port: u16, extra: &[&str]) -> std::process::Child {
+    let ps = port.to_string();
+    let mut child = rudis_bin()
+        .args(["--port", &ps, "--threads", "2", "--no-pin"])
+        .args(extra)
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rudis");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        if let Some(s) = child.try_wait().unwrap() {
+            panic!("rudis exited early: {s}");
+        }
+        assert!(std::time::Instant::now() < deadline, "rudis did not start");
+        thread::sleep(Duration::from_millis(50));
+    }
+    child
+}
+
+#[test]
+fn test_enable_debug_command_gates_debug_e2e() {
+    const NOT_ALLOWED: &str = "-ERR DEBUG command not allowed.";
+    let connect = |port: u16| {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+
+    // Default: refused, as in Redis.
+    let port = 17962u16;
+    let mut child = spawn_rudis_debug_setting(port, &[]);
+    let mut c = connect(port);
+    assert!(
+        resp_cmd(&mut c, &["DEBUG", "SLEEP", "0"]).starts_with(NOT_ALLOWED),
+        "DEBUG must be refused by default"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "enable-debug-command"]),
+        "*2\r\n$20\r\nenable-debug-command\r\n$2\r\nno\r\n"
+    );
+    assert!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "enable-debug-command", "yes"])
+            .contains("can't set immutable config"),
+    );
+    // Queued in MULTI it aborts the transaction.
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    assert!(resp_cmd(&mut c, &["DEBUG", "SLEEP", "0"]).starts_with(NOT_ALLOWED));
+    assert!(resp_cmd(&mut c, &["EXEC"]).starts_with("-EXECABORT"));
+    // Scripts can't get around it.
+    assert!(
+        resp_cmd(
+            &mut c,
+            &["EVAL", "return redis.call('DEBUG','SLEEP','0')", "0"]
+        )
+        .contains("DEBUG command not allowed"),
+    );
+    // Everything else is unaffected.
+    assert_eq!(resp_cmd(&mut c, &["SET", "k", "v"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    // `local`: allowed from a loopback client.
+    let port = 17963u16;
+    let mut child = spawn_rudis_debug_setting(port, &["--enable-debug-command", "local"]);
+    let mut c = connect(port);
+    assert_eq!(resp_cmd(&mut c, &["DEBUG", "SLEEP", "0"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "enable-debug-command"]),
+        "*2\r\n$20\r\nenable-debug-command\r\n$5\r\nlocal\r\n"
+    );
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    // `yes`.
+    let port = 17964u16;
+    let mut child = spawn_rudis_debug_setting(port, &["--enable-debug-command", "yes"]);
+    let mut c = connect(port);
+    assert_eq!(resp_cmd(&mut c, &["DEBUG", "SLEEP", "0"]), "+OK\r\n");
+    assert!(
+        !resp_cmd(
+            &mut c,
+            &["EVAL", "return redis.call('DEBUG','SLEEP','0')", "0"]
+        )
+        .contains("not allowed"),
+    );
+    drop(c);
+    shutdown_and_wait(port, &mut child);
 }

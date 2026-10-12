@@ -3178,6 +3178,14 @@ pub fn apply_config_value(
         "log-timestamp-format" => crate::log::set_log_timestamp_format(val_str)?,
         // Config file only (immutable in CONFIG SET, as in Redis).
         "logfile" => crate::log::set_logfile(val_str)?,
+        "enable-debug-command" => crate::netsec::set_enable_debug_command(
+            base_port,
+            crate::netsec::ProtectedAction::parse(val_str)?,
+        ),
+        "enable-module-command" => crate::netsec::set_enable_module_command(
+            base_port,
+            crate::netsec::ProtectedAction::parse(val_str)?,
+        ),
         "databases" => {
             let n: usize = parse_config_num(name, val_str)?;
             if n == 0 {
@@ -3900,6 +3908,14 @@ async fn execute_tx_step(
             Command::Save | Command::Bgsave | Command::Shutdown { .. } => {
                 *tx_has_error = true;
                 out_buf.extend_from_slice(b"-ERR Command not allowed inside a transaction\r\n");
+                false
+            }
+            Command::Debug(_)
+                if protected_command_denied(&cmd, router.base_port, client_id, client_registry)
+                    .is_some() =>
+            {
+                *tx_has_error = true;
+                out_buf.extend_from_slice(crate::netsec::DEBUG_COMMAND_NOT_ALLOWED);
                 false
             }
             Command::Unknown(cmd_name) => {
@@ -8583,6 +8599,33 @@ fn mode_switch_denied(
     }
 }
 
+/// Redis' `enable-debug-command` / `enable-module-command` gate
+/// (`allowProtectedAction`): the error reply if the client may not run
+/// `cmd`, `None` otherwise. Anything but DEBUG/MODULE costs one tag compare.
+fn protected_command_denied(
+    cmd: &Command,
+    base_port: u16,
+    client_id: u64,
+    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+) -> Option<&'static [u8]> {
+    let (setting, reply) = match cmd {
+        Command::Debug(_) => (
+            crate::netsec::enable_debug_command(base_port),
+            crate::netsec::DEBUG_COMMAND_NOT_ALLOWED,
+        ),
+        Command::Unknown(name) if name.starts_with("MODULE ") => (
+            crate::netsec::enable_module_command(base_port),
+            crate::netsec::MODULE_COMMAND_NOT_ALLOWED,
+        ),
+        _ => return None,
+    };
+    let peer = client_registry
+        .borrow()
+        .get(&client_id)
+        .map(|c| c.addr.ip());
+    (!setting.allows(peer)).then_some(reply)
+}
+
 /// Commands Redis flags `loading`: what a client may run while a replica
 /// loads its master's dataset. Everything else gets `-LOADING`.
 fn allowed_while_loading(cmd: &Command) -> bool {
@@ -8832,6 +8875,14 @@ async fn execute_command_inner(
     let ret: bool = async {
 
     CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+
+    // Before the auth checks, as in Redis' processCommand.
+    if let Some(reply) =
+        protected_command_denied(&cmd, router.base_port, client_id, client_registry)
+    {
+        out.extend_from_slice(reply);
+        return false;
+    }
 
     if MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0
         && cmd.is_write_command()
@@ -10517,7 +10568,7 @@ async fn execute_command_inner(
                     let repl_ping_period = crate::replication::REPL_PING_PERIOD
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let all_configs: [(&str, String); 67] = [
+                    let all_configs: [(&str, String); 69] = [
                         ("port", port_str),
                         ("databases", crate::config::databases_count().to_string()),
                         ("loglevel", crate::log::loglevel().to_string()),
@@ -10553,6 +10604,18 @@ async fn execute_command_inner(
                             },
                         ),
                         ("daemonize", "no".to_string()),
+                        (
+                            "enable-debug-command",
+                            crate::netsec::enable_debug_command(router.base_port)
+                                .name()
+                                .to_string(),
+                        ),
+                        (
+                            "enable-module-command",
+                            crate::netsec::enable_module_command(router.base_port)
+                                .name()
+                                .to_string(),
+                        ),
                         ("maxmemory", max_mem),
                         ("maxmemory-samples", maxmem_samples),
                         ("maxmemory-clients", maxmem_clients),
@@ -10742,7 +10805,14 @@ async fn execute_command_inner(
                             return false;
                         }
 
-                        if matches!(p_str.as_str(), "daemonize" | "logfile" | "databases") {
+                        if matches!(
+                            p_str.as_str(),
+                            "daemonize"
+                                | "logfile"
+                                | "databases"
+                                | "enable-debug-command"
+                                | "enable-module-command"
+                        ) {
                             out.extend_from_slice(
                                 format!(
                                     "-ERR CONFIG SET failed (possibly related to argument '{}') - can't set immutable config\r\n",

@@ -63,7 +63,7 @@ start_server() {
     # Run in a scratch dir: suites SAVE, and a dump.rdb left in the repo
     # would be loaded by every server later started there (e.g. e2e tests).
     rm -rf "$SERVER_DIR" && mkdir -p "$SERVER_DIR"
-    (cd "$SERVER_DIR" && exec "$REPO_ROOT/target/release/rudis" --port "$PORT" --threads "$threads" --no-pin) >> "$TEST_LOG" 2>&1 &
+    (cd "$SERVER_DIR" && exec "$REPO_ROOT/target/release/rudis" --port "$PORT" --threads "$threads" --no-pin --enable-debug-command yes --enable-module-command yes) >> "$TEST_LOG" 2>&1 &
     RUDIS_PID=$!
     for _ in $(seq 1 50); do
         if timeout 1 bash -c "</dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then

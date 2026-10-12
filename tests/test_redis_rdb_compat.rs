@@ -308,6 +308,8 @@ fn start_rudis(port: u16, dir: &Path, threads: usize) -> Server {
             "--no-pin",
             "--aof-dir",
             dir.to_str().unwrap(),
+            "--enable-debug-command",
+            "yes",
         ])
         .current_dir(dir)
         .stdin(Stdio::null())
