@@ -4331,8 +4331,12 @@ impl Router {
             }
             Err(e) => crate::log_warning!("[Shard {}] BGREWRITEAOF failed: {}", self.shard_id, e),
         }
+        let state = crate::snapshot::aof_rewrite_state(self.base_port);
+        if res.is_ok() {
+            state.set_base_size(crate::aof::aof_files_size(&self.db_dir, self.num_shards));
+        }
         self.is_saving.store(false, Ordering::SeqCst);
-        crate::snapshot::aof_rewrite_state(self.base_port).finish(res.is_ok());
+        state.finish(res.is_ok());
         res
     }
 

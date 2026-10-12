@@ -3105,6 +3105,12 @@ pub fn apply_config_value(
         "maxmemory-samples" => {
             CONFIG_MAXMEMORY_SAMPLES.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
+        "auto-aof-rewrite-percentage" => crate::aof::auto_rewrite_config(base_port)
+            .percentage
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "auto-aof-rewrite-min-size" => crate::aof::auto_rewrite_config(base_port)
+            .min_size
+            .store(parse_config_bytes(name, val_str)?, Ordering::Relaxed),
         "lfu-log-factor" => {
             crate::table::LFU_LOG_FACTOR.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
@@ -10014,7 +10020,7 @@ async fn execute_command_inner(
             let persistence_str = format!(
                 // The fork/COW fields are always 0: snapshots are taken in
                 // place, without a child process.
-                "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:ok\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\nunpropagated_changes:{}\r\n",
+                "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:ok\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\naof_rewrites:{}\r\naof_rewrites_consecutive_failures:{}\r\n{}unpropagated_changes:{}\r\n",
                 u8::from(crate::replication::is_loading(router.port)),
                 snap.changes_since_last_save(),
                 u8::from(
@@ -10028,6 +10034,18 @@ async fn execute_command_inner(
                 u8::from(router.aof.is_some()),
                 u8::from(aof_rw.in_progress()),
                 if aof_rw.last_ok() { "ok" } else { "err" },
+                aof_rw.rewrites(),
+                aof_rw.consecutive_failures(),
+                // Redis lists these only while the AOF is on.
+                if router.aof.is_some() {
+                    format!(
+                        "aof_current_size:{}\r\naof_base_size:{}\r\n",
+                        crate::aof::aof_files_size(&router.db_dir, router.num_shards),
+                        aof_rw.base_size()
+                    )
+                } else {
+                    String::new()
+                },
                 crate::aof::unpropagated_changes()
             );
             let cmdstat_str = {
@@ -10575,7 +10593,7 @@ async fn execute_command_inner(
                     let repl_ping_period = crate::replication::REPL_PING_PERIOD
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
-                    let all_configs: [(&str, String); 71] = [
+                    let all_configs: [(&str, String); 73] = [
                         ("port", port_str),
                         ("databases", crate::config::databases_count().to_string()),
                         ("loglevel", crate::log::loglevel().to_string()),
@@ -10625,6 +10643,20 @@ async fn execute_command_inner(
                         ),
                         ("maxmemory", max_mem),
                         ("maxmemory-samples", maxmem_samples),
+                        (
+                            "auto-aof-rewrite-percentage",
+                            crate::aof::auto_rewrite_config(router.base_port)
+                                .percentage
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .to_string(),
+                        ),
+                        (
+                            "auto-aof-rewrite-min-size",
+                            crate::aof::auto_rewrite_config(router.base_port)
+                                .min_size
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .to_string(),
+                        ),
                         (
                             "lfu-log-factor",
                             crate::table::LFU_LOG_FACTOR

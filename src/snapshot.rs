@@ -155,10 +155,42 @@ pub fn format_save_points(points: &[(u64, u64)]) -> String {
 }
 
 /// BGREWRITEAOF status for INFO persistence (`aof_rewrite_in_progress`,
-/// `aof_last_bgrewrite_status`).
+/// `aof_last_bgrewrite_status`, `aof_rewrites`,
+/// `aof_rewrites_consecutive_failures`).
 pub struct AofRewriteState {
     in_progress: AtomicBool,
     last_ok: AtomicBool,
+    /// Rewrites started (Redis `stat_aof_rewrites`).
+    rewrites: AtomicU64,
+    /// Failed rewrites since the last successful one.
+    consecutive_failures: AtomicU64,
+    /// Unix time of the last failed rewrite.
+    last_failure_unix: AtomicU64,
+    /// AOF size right after the last rewrite or the startup load (Redis
+    /// `aof_rewrite_base_size`), the base `auto-aof-rewrite-percentage`
+    /// growth is measured from.
+    base_size: AtomicU64,
+}
+
+/// Automatic rewrites back off after this many consecutive failures
+/// (Redis `AOF_REWRITE_LIMITE_THRESHOLD`).
+pub const AOF_REWRITE_LIMIT_THRESHOLD: u64 = 3;
+/// Longest back-off between automatic rewrite attempts (Redis
+/// `AOF_REWRITE_LIMITE_MAX_MINUTES`).
+pub const AOF_REWRITE_LIMIT_MAX_SECS: u64 = 3600;
+
+/// How long automatic rewrites wait after the last failure: nothing below
+/// the threshold, then one minute doubling per further failure up to an
+/// hour, like Redis `aofRewriteLimited`. A manual BGREWRITEAOF is never
+/// delayed.
+pub fn aof_rewrite_retry_delay_secs(consecutive_failures: u64) -> u64 {
+    if consecutive_failures < AOF_REWRITE_LIMIT_THRESHOLD {
+        return 0;
+    }
+    // Past 2^6 minutes the cap applies anyway; shifting further would
+    // overflow (checked_shl only rejects shifts of 64+ bits).
+    let doublings = (consecutive_failures - AOF_REWRITE_LIMIT_THRESHOLD).min(6) as u32;
+    (60u64 << doublings).min(AOF_REWRITE_LIMIT_MAX_SECS)
 }
 
 static AOF_REWRITE_STATES: Mutex<Option<HashMap<u16, Arc<AofRewriteState>>>> = Mutex::new(None);
@@ -171,6 +203,10 @@ pub fn aof_rewrite_state(port: u16) -> Arc<AofRewriteState> {
             Arc::new(AofRewriteState {
                 in_progress: AtomicBool::new(false),
                 last_ok: AtomicBool::new(true),
+                rewrites: AtomicU64::new(0),
+                consecutive_failures: AtomicU64::new(0),
+                last_failure_unix: AtomicU64::new(0),
+                base_size: AtomicU64::new(0),
             })
         })
         .clone()
@@ -193,12 +229,47 @@ pub fn is_saving(port: u16) -> Arc<AtomicBool> {
 /// `in_progress` reads false (INFO may run on another shard thread).
 impl AofRewriteState {
     pub fn begin(&self) {
+        self.rewrites.fetch_add(1, Ordering::Relaxed);
         self.in_progress.store(true, Ordering::SeqCst);
     }
 
     pub fn finish(&self, ok: bool) {
+        if ok {
+            self.consecutive_failures.store(0, Ordering::Relaxed);
+        } else {
+            self.last_failure_unix.store(unix_now(), Ordering::Relaxed);
+            self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+        }
         self.last_ok.store(ok, Ordering::SeqCst);
         self.in_progress.store(false, Ordering::SeqCst);
+    }
+
+    pub fn base_size(&self) -> u64 {
+        self.base_size.load(Ordering::Relaxed)
+    }
+
+    pub fn set_base_size(&self, size: u64) {
+        self.base_size.store(size, Ordering::Relaxed);
+    }
+
+    pub fn rewrites(&self) -> u64 {
+        self.rewrites.load(Ordering::Relaxed)
+    }
+
+    pub fn consecutive_failures(&self) -> u64 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    /// Whether an automatic rewrite must still wait at `now` because the
+    /// last ones failed (see [`aof_rewrite_retry_delay_secs`]).
+    pub fn auto_rewrite_limited(&self, now: u64) -> bool {
+        let delay = aof_rewrite_retry_delay_secs(self.consecutive_failures());
+        delay > 0
+            && now
+                < self
+                    .last_failure_unix
+                    .load(Ordering::Relaxed)
+                    .saturating_add(delay)
     }
 
     pub fn in_progress(&self) -> bool {
@@ -254,5 +325,35 @@ mod tests {
         assert!(st.last_save_ok());
         assert!(st.changes_since_last_save() <= dirty_now() - before);
         assert!(st.last_save_unix() >= t0);
+    }
+
+    #[test]
+    fn test_aof_rewrite_retry_backoff() {
+        assert_eq!(aof_rewrite_retry_delay_secs(0), 0);
+        assert_eq!(aof_rewrite_retry_delay_secs(2), 0);
+        assert_eq!(aof_rewrite_retry_delay_secs(3), 60);
+        assert_eq!(aof_rewrite_retry_delay_secs(4), 120);
+        assert_eq!(aof_rewrite_retry_delay_secs(8), 1920);
+        assert_eq!(aof_rewrite_retry_delay_secs(9), 3600);
+        assert_eq!(aof_rewrite_retry_delay_secs(500), 3600);
+
+        let st = aof_rewrite_state(2);
+        let now = unix_now();
+        st.begin();
+        st.finish(true);
+        assert_eq!(st.rewrites(), 1);
+        assert!(!st.auto_rewrite_limited(now));
+        for _ in 0..3 {
+            st.begin();
+            st.finish(false);
+        }
+        assert_eq!(st.rewrites(), 4);
+        assert_eq!(st.consecutive_failures(), 3);
+        assert!(st.auto_rewrite_limited(unix_now()));
+        assert!(!st.auto_rewrite_limited(unix_now() + 61));
+        st.begin();
+        st.finish(true);
+        assert_eq!(st.consecutive_failures(), 0);
+        assert!(!st.auto_rewrite_limited(unix_now()));
     }
 }

@@ -25276,3 +25276,93 @@ fn test_eviction_spreads_across_shards_and_keeps_hot_keys_e2e() {
         shutdown_and_wait(port, &mut child);
     }
 }
+
+#[test]
+fn test_auto_aof_rewrite_triggers_on_growth_e2e() {
+    let port = 17968u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-auto-aofrw-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--save",
+        "",
+    ];
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    };
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = connect();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "auto-aof-rewrite-percentage"]),
+        "*2\r\n$27\r\nauto-aof-rewrite-percentage\r\n$3\r\n100\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "auto-aof-rewrite-min-size", "200kb"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(info_u64(&mut c, "persistence", "aof_rewrites"), 0);
+    // Overwrite a few keys many times: the AOF grows, its rewrite is tiny.
+    let val = "v".repeat(100);
+    for i in 0..5000 {
+        let k = format!("k{}", i % 10);
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", &k, &format!("{val}{i}")]),
+            "+OK\r\n"
+        );
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while info_u64(&mut c, "persistence", "aof_rewrites") == 0
+        || info_u64(&mut c, "persistence", "aof_rewrite_in_progress") == 1
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no automatic AOF rewrite"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let current = info_u64(&mut c, "persistence", "aof_current_size");
+    let base = info_u64(&mut c, "persistence", "aof_base_size");
+    // The rewrite left ~10 keys (writes after it, if it ran mid-loop,
+    // regrow the file, but never back past min-size).
+    assert!(base < 10_000, "the rewrite compacted the AOF: base {base}");
+    assert!(current < 200 * 1024, "current {current}");
+    assert!(base > 0 && base <= current, "base {base} current {current}");
+    assert_eq!(
+        info_u64(&mut c, "persistence", "aof_rewrites_consecutive_failures"),
+        0
+    );
+    // Below min-size again: no more rewrites.
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(info_u64(&mut c, "persistence", "aof_rewrites"), 1);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    // The rewritten AOF replays to the same data.
+    let _ = std::fs::remove_file(dir.join("dump.rdb"));
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = connect();
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":10\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["GET", "k9"]),
+        format!("${}\r\n{val}4999\r\n", val.len() + 4)
+    );
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

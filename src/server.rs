@@ -2494,27 +2494,53 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             let r = router.clone();
             // Counts start now: data loaded at startup is not "changes".
             crate::snapshot::state(r.base_port);
+            // The AOF as loaded is the base automatic rewrites grow from.
+            let aof_on = r.aof.is_some();
+            let rewrite_state = crate::snapshot::aof_rewrite_state(r.base_port);
+            if aof_on {
+                rewrite_state.set_base_size(crate::aof::aof_files_size(&r.db_dir, r.num_shards));
+            }
             monoio::spawn(async move {
+                let mut tick: u64 = 0;
                 while !crate::shutdown::is_shutting_down() {
                     monoio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let points = crate::config::save_points(r.base_port);
+                    tick += 1;
                     let snap = crate::snapshot::state(r.base_port);
                     // `in_progress` too: a save releases `is_saving` just
                     // before it records what it covered.
-                    if points.is_empty()
-                        || r.is_saving.load(std::sync::atomic::Ordering::SeqCst)
+                    if r.is_saving.load(std::sync::atomic::Ordering::SeqCst)
                         || snap.in_progress()
+                        || rewrite_state.in_progress()
                     {
                         continue;
                     }
                     let now = crate::snapshot::unix_now();
-                    if snap.save_due(&points, now) {
+                    let points = crate::config::save_points(r.base_port);
+                    if !points.is_empty() && snap.save_due(&points, now) {
                         crate::log_notice!(
                             "{} changes in {} seconds. Saving...",
                             snap.changes_since_last_save(),
                             now.saturating_sub(snap.last_save_unix())
                         );
                         let _ = r.bgsave().await;
+                        continue;
+                    }
+                    // `auto-aof-rewrite-*`, checked once a second (it stats
+                    // every shard's file).
+                    if aof_on && tick.is_multiple_of(10) && !rewrite_state.auto_rewrite_limited(now) {
+                        let cfg = crate::aof::auto_rewrite_config(r.base_port);
+                        if let Some(growth) = crate::aof::auto_rewrite_due(
+                            cfg.percentage.load(std::sync::atomic::Ordering::Relaxed),
+                            cfg.min_size.load(std::sync::atomic::Ordering::Relaxed),
+                            crate::aof::aof_files_size(&r.db_dir, r.num_shards),
+                            rewrite_state.base_size(),
+                        ) {
+                            crate::log_notice!(
+                                "Starting automatic rewriting of AOF on {}% growth",
+                                growth
+                            );
+                            let _ = r.bgrewriteaof().await;
+                        }
                     }
                 }
             });

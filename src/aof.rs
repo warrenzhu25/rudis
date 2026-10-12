@@ -218,6 +218,58 @@ pub fn unpropagated_changes() -> u64 {
     UNPROPAGATED_CHANGES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Total size of the per-shard `appendonly-{i}.aof` files in `dir` (what
+/// the kernel has; the writer's unflushed buffer is at most ~1 s of
+/// writes). Drives `auto-aof-rewrite-*` and INFO `aof_current_size`.
+pub fn aof_files_size(dir: &Path, num_shards: usize) -> u64 {
+    (0..num_shards)
+        .filter_map(|i| std::fs::metadata(dir.join(format!("appendonly-{}.aof", i))).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Redis default `auto-aof-rewrite-percentage`.
+pub const DEFAULT_AUTO_AOF_REWRITE_PERCENTAGE: u64 = 100;
+/// Redis default `auto-aof-rewrite-min-size` (64mb).
+pub const DEFAULT_AUTO_AOF_REWRITE_MIN_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Live `auto-aof-rewrite-percentage` / `auto-aof-rewrite-min-size` of
+/// the server on one port.
+pub struct AutoRewriteConfig {
+    pub percentage: std::sync::atomic::AtomicU64,
+    pub min_size: std::sync::atomic::AtomicU64,
+}
+
+type AutoRewriteByPort = std::collections::HashMap<u16, std::sync::Arc<AutoRewriteConfig>>;
+static AUTO_REWRITE: parking_lot::Mutex<Option<AutoRewriteByPort>> = parking_lot::Mutex::new(None);
+
+pub fn auto_rewrite_config(port: u16) -> std::sync::Arc<AutoRewriteConfig> {
+    AUTO_REWRITE
+        .lock()
+        .get_or_insert_with(Default::default)
+        .entry(port)
+        .or_insert_with(|| {
+            std::sync::Arc::new(AutoRewriteConfig {
+                percentage: std::sync::atomic::AtomicU64::new(DEFAULT_AUTO_AOF_REWRITE_PERCENTAGE),
+                min_size: std::sync::atomic::AtomicU64::new(DEFAULT_AUTO_AOF_REWRITE_MIN_SIZE),
+            })
+        })
+        .clone()
+}
+
+/// Redis `serverCron` rule for an automatic AOF rewrite: the AOF is larger
+/// than `min_size` and has grown by at least `percentage` percent over its
+/// size after the last rewrite (`base`, 1 if unknown). `percentage == 0`
+/// disables it. Returns the growth in percent when a rewrite is due.
+pub fn auto_rewrite_due(percentage: u64, min_size: u64, current: u64, base: u64) -> Option<u64> {
+    if percentage == 0 || current <= min_size {
+        return None;
+    }
+    let growth = (u128::from(current) * 100 / u128::from(base.max(1))).saturating_sub(100);
+    let growth = u64::try_from(growth).unwrap_or(u64::MAX);
+    (growth >= percentage).then_some(growth)
+}
+
 pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     match cmd {
@@ -6198,5 +6250,34 @@ mod tests {
         db.select_db(3);
         assert_eq!(db.get(b"k"), Some(Bytes::from_static(b"v")));
         assert_eq!(db.get(b"later"), None);
+    }
+
+    #[test]
+    fn test_auto_aof_rewrite_trigger_and_file_sizes() {
+        // Redis serverCron: over min-size and grown by >= percentage.
+        assert_eq!(
+            auto_rewrite_due(100, 1000, 1000, 100),
+            None,
+            "not over min-size"
+        );
+        assert_eq!(auto_rewrite_due(100, 1000, 3000, 1500), Some(100));
+        assert_eq!(auto_rewrite_due(100, 1000, 2999, 1500), None);
+        assert_eq!(auto_rewrite_due(0, 0, u64::MAX, 1), None, "0 disables it");
+        // No base yet (e.g. empty at startup) counts as 1 byte.
+        assert!(auto_rewrite_due(100, 10, 5000, 0).is_some());
+
+        let dir = std::env::temp_dir().join(format!("rudis-aof-sizes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(aof_files_size(&dir, 3), 0);
+        std::fs::write(dir.join("appendonly-0.aof"), [0u8; 10]).unwrap();
+        std::fs::write(dir.join("appendonly-2.aof"), [0u8; 5]).unwrap();
+        std::fs::write(dir.join("appendonly-3.aof"), [0u8; 100]).unwrap();
+        assert_eq!(
+            aof_files_size(&dir, 3),
+            15,
+            "only this layout's shard files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
