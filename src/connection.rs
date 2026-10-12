@@ -1755,7 +1755,6 @@ pub fn watch_keys(port: u16, client_id: u64, keys: &[Bytes]) {
         return;
     }
     let db = CURRENT_DB.get();
-    HAS_WATCHED_KEYS.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut map = WATCHED_KEYS.write();
     let port_map = map.entry(port).or_default();
     for k in keys {
@@ -1768,6 +1767,11 @@ pub fn watch_keys(port: u16, client_id: u64, keys: &[Bytes]) {
         .write()
         .entry((port, client_id))
         .or_insert(false);
+    // Set under the WATCHED_KEYS lock, after the insert: `unwatch_keys`
+    // clears the flag under the same lock when the map is empty, so setting
+    // it before taking the lock let a concurrent UNWATCH clear it while this
+    // key was watched, and later writes then skipped the WATCH taint check.
+    HAS_WATCHED_KEYS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn unwatch_keys(port: u16, client_id: u64) {
@@ -27140,6 +27144,34 @@ mod tests {
         // Unwatch clears taint
         unwatch_keys(port, cid);
         assert!(!is_watch_tainted(port, cid));
+    }
+
+    /// A concurrent UNWATCH on another port must never clear
+    /// `HAS_WATCHED_KEYS` while a key is still watched; otherwise writes skip
+    /// the taint check and EXEC runs on stale data.
+    #[test]
+    fn test_concurrent_unwatch_never_clears_the_watched_flag() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    watch_keys(65433, 1, &[Bytes::from("churn")]);
+                    unwatch_keys(65433, 1);
+                }
+            })
+        };
+        for _ in 0..20_000 {
+            watch_keys(65432, 2, &[Bytes::from("held")]);
+            touch_watched_key(65432, b"held");
+            assert!(
+                is_watch_tainted(65432, 2),
+                "write to a watched key was missed"
+            );
+            unwatch_keys(65432, 2);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
     }
 
     #[test]
