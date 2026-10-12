@@ -2402,7 +2402,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             next_tls_client_id.set(client_id + 1);
                             let router_clone = r.clone();
                             let reg_clone = reg.clone();
-                            let s_cfg = tls_cfg.server_config.clone();
+                            let s_cfg =
+                                crate::tls::active_tls_server_config(router_clone.base_port)
+                                    .unwrap_or_else(|| tls_cfg.server_config.clone());
                             monoio::spawn(async move {
                                 let res = catch_unwind_async(async move {
                                     let mut session = match crate::tls::TlsSession::new(s_cfg) {

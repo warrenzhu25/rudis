@@ -494,12 +494,24 @@ fn main() {
         }
     }
 
+    {
+        let tls_rt = rudis::tls::get_tls_runtime(port);
+        let mut rt = tls_rt.write();
+        rt.cert_file = server_config.tls_cert_file.clone();
+        rt.key_file = server_config.tls_key_file.clone();
+        rt.ca_cert_file = server_config.tls_ca_cert_file.clone();
+        rt.auth_clients = server_config.tls_auth_clients;
+    }
+
     let tls_config = if let Some(tls_port) = server_config.tls_port {
         let server_config_tls = match (&server_config.tls_cert_file, &server_config.tls_key_file) {
-            (Some(cert_path), Some(key_path)) => {
-                rudis::tls::load_certs_and_key_from_files(cert_path, key_path)
-                    .expect("Failed to load TLS cert/key files")
-            }
+            (Some(cert_path), Some(key_path)) => rudis::tls::load_server_config_from_files(
+                cert_path,
+                key_path,
+                server_config.tls_ca_cert_file.as_deref(),
+                server_config.tls_auth_clients,
+            )
+            .expect("Failed to load TLS cert/key/CA files"),
             _ => {
                 let (cert_der, key_der) = rudis::tls::generate_self_signed_cert(vec![
                     "localhost".to_string(),
@@ -510,6 +522,7 @@ fn main() {
                     .expect("Failed to create TLS server config")
             }
         };
+        rudis::tls::get_tls_runtime(port).write().server_config = Some(server_config_tls.clone());
         Some(rudis::tls::TlsWorkerConfig {
             tls_port,
             server_config: server_config_tls,

@@ -33,6 +33,8 @@ pub struct RudisConfig {
     pub tls_port: Option<u16>,
     pub tls_cert_file: Option<PathBuf>,
     pub tls_key_file: Option<PathBuf>,
+    pub tls_ca_cert_file: Option<PathBuf>,
+    pub tls_auth_clients: crate::tls::TlsAuthClients,
     pub cluster_enabled: bool,
     pub tiered_offload_threshold: u64,
     pub tiered_upload_threshold: u64,
@@ -77,6 +79,8 @@ impl Default for RudisConfig {
             tls_port: None,
             tls_cert_file: None,
             tls_key_file: None,
+            tls_ca_cert_file: None,
+            tls_auth_clients: crate::tls::TlsAuthClients::Yes,
             cluster_enabled: false,
             tiered_offload_threshold: 60,
             tiered_upload_threshold: 80,
@@ -636,10 +640,37 @@ impl RudisConfig {
                     config.tls_port = Some(p);
                 }
                 "tls-cert-file" => {
-                    config.tls_cert_file = Some(PathBuf::from(rest.join(" ")));
+                    let joined = rest.join(" ");
+                    let p = unquote(&joined);
+                    config.tls_cert_file = if p.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(p))
+                    };
                 }
                 "tls-key-file" => {
-                    config.tls_key_file = Some(PathBuf::from(rest.join(" ")));
+                    let joined = rest.join(" ");
+                    let p = unquote(&joined);
+                    config.tls_key_file = if p.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(p))
+                    };
+                }
+                "tls-ca-cert-file" => {
+                    let joined = rest.join(" ");
+                    let p = unquote(&joined);
+                    config.tls_ca_cert_file = if p.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(p))
+                    };
+                }
+                "tls-auth-clients" => {
+                    config.tls_auth_clients = crate::tls::TlsAuthClients::parse(unquote(rest[0]))
+                        .map_err(|e| {
+                        format!("Invalid tls-auth-clients at line {}: {}", line_num + 1, e)
+                    })?;
                 }
                 "cluster-enabled" => {
                     config.cluster_enabled =
@@ -926,6 +957,25 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
     if cluster_cfg_name != "nodes.conf" {
         directives.insert("cluster-config-file".to_string(), cluster_cfg_name);
     }
+    {
+        let tls_rt = crate::tls::get_tls_runtime(port);
+        let rt = tls_rt.read();
+        if rt.auth_clients != crate::tls::TlsAuthClients::Yes {
+            directives.insert(
+                "tls-auth-clients".to_string(),
+                rt.auth_clients.as_str().to_string(),
+            );
+        }
+        if let Some(ref p) = rt.ca_cert_file {
+            directives.insert("tls-ca-cert-file".to_string(), p.display().to_string());
+        }
+        if let Some(ref p) = rt.cert_file {
+            directives.insert("tls-cert-file".to_string(), p.display().to_string());
+        }
+        if let Some(ref p) = rt.key_file {
+            directives.insert("tls-key-file".to_string(), p.display().to_string());
+        }
+    }
 
     // Directives written as a whole, replacing every line of theirs (and
     // of their aliases): `save` may span lines, and `replicaof` goes away
@@ -1147,6 +1197,8 @@ mod tests {
         tls-port 7778
         tls-cert-file /etc/ssl/cert.pem
         tls-key-file /etc/ssl/key.pem
+        tls-ca-cert-file /etc/ssl/ca.pem
+        tls-auth-clients optional
         cluster-enabled yes
         tiered-offload-threshold 65
         tiered-upload-threshold 85
@@ -1166,6 +1218,8 @@ mod tests {
         assert_eq!(cfg.tls_port, Some(7778));
         assert_eq!(cfg.tls_cert_file, Some(PathBuf::from("/etc/ssl/cert.pem")));
         assert_eq!(cfg.tls_key_file, Some(PathBuf::from("/etc/ssl/key.pem")));
+        assert_eq!(cfg.tls_ca_cert_file, Some(PathBuf::from("/etc/ssl/ca.pem")));
+        assert_eq!(cfg.tls_auth_clients, crate::tls::TlsAuthClients::Optional);
         assert!(cfg.cluster_enabled);
         assert_eq!(cfg.tiered_offload_threshold, 65);
         assert_eq!(cfg.tiered_upload_threshold, 85);

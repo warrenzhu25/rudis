@@ -3235,6 +3235,59 @@ pub fn apply_config_value(
                 .unwrap_or_else(|| std::path::PathBuf::from(val_str));
             hub.set_config_file(new_path);
         }
+        "tls-auth-clients" => {
+            let mode = crate::tls::TlsAuthClients::parse(val_str)?;
+            let tls_rt = crate::tls::get_tls_runtime(base_port);
+            let mut rt = tls_rt.write();
+            let prev = rt.auth_clients;
+            rt.auth_clients = mode;
+            if let Err(e) = rt.rebuild_server_config() {
+                rt.auth_clients = prev;
+                return Err(format!("Unable to update TLS configuration: {}", e));
+            }
+        }
+        "tls-ca-cert-file" => {
+            let tls_rt = crate::tls::get_tls_runtime(base_port);
+            let mut rt = tls_rt.write();
+            let prev = rt.ca_cert_file.clone();
+            rt.ca_cert_file = if val_str.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(val_str))
+            };
+            if let Err(e) = rt.rebuild_server_config() {
+                rt.ca_cert_file = prev;
+                return Err(format!("Unable to update TLS configuration: {}", e));
+            }
+        }
+        "tls-cert-file" => {
+            let tls_rt = crate::tls::get_tls_runtime(base_port);
+            let mut rt = tls_rt.write();
+            let prev = rt.cert_file.clone();
+            rt.cert_file = if val_str.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(val_str))
+            };
+            if let Err(e) = rt.rebuild_server_config() {
+                rt.cert_file = prev;
+                return Err(format!("Unable to update TLS configuration: {}", e));
+            }
+        }
+        "tls-key-file" => {
+            let tls_rt = crate::tls::get_tls_runtime(base_port);
+            let mut rt = tls_rt.write();
+            let prev = rt.key_file.clone();
+            rt.key_file = if val_str.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(val_str))
+            };
+            if let Err(e) = rt.rebuild_server_config() {
+                rt.key_file = prev;
+                return Err(format!("Unable to update TLS configuration: {}", e));
+            }
+        }
         "masterauth" => crate::replication::set_masterauth(port, val_str),
         "masteruser" => crate::replication::set_masteruser(port, val_str),
         "jemalloc-bg-thread" => {
@@ -3263,6 +3316,371 @@ pub fn apply_config_value(
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+#[inline(never)]
+fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>) {
+    let max_mem = crate::tiering::get_max_memory(router.port).to_string();
+    let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
+    let upload = crate::tiering::get_upload_threshold_pct(router.port).to_string();
+    let hash_entries = HASH_MAX_ENTRIES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let hash_value = HASH_MAX_VALUE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let stream_entries = crate::table::STREAM_NODE_MAX_ENTRIES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let stream_idmp_dur = crate::table::STREAM_IDMP_DURATION
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let stream_idmp_max = crate::table::STREAM_IDMP_MAXSIZE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let max_c = get_max_clients().to_string();
+    let policy = get_max_memory_policy();
+    let slow_than = crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let slow_len = crate::slowlog::SLOWLOG_MAX_LEN
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let slow_argc = crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let slow_str = crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let obuf = format_client_output_buffer_limit_config();
+    let acl = crate::acl::get_acl_for_port(router.port);
+    let (pass, acllog_max_len, acl_pubsub_default, aclfile_str) = {
+        let g = acl.read();
+        (
+            g.requirepass.clone().unwrap_or_default(),
+            g.acllog_max_len.to_string(),
+            if g.acl_pubsub_default_all {
+                "allchannels".to_string()
+            } else {
+                "resetchannels".to_string()
+            },
+            g.aclfile
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        )
+    };
+    let app = if router.aof.is_some() {
+        "yes".to_string()
+    } else {
+        "no".to_string()
+    };
+    let proto_bulk = crate::resp::get_proto_max_bulk_len().to_string();
+    let notify_ev = get_notify_keyspace_events_str();
+    let lazy_exp = if crate::table::is_lazyfree_lazy_expire() {
+        "yes".to_string()
+    } else {
+        "no".to_string()
+    };
+    let latency_thresh = LATENCY_MONITOR_THRESHOLD
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let tracking_max = TRACKING_TABLE_MAX_KEYS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let port_str = router.port.to_string();
+    let repl_backlog = crate::replication::repl_backlog_size().to_string();
+    let backup_ttl = CONFIG_BACKUP_SEALED_TTL
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let maxmem_samples = CONFIG_MAXMEMORY_SAMPLES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let qbuf_limit = CONFIG_CLIENT_QUERY_BUFFER_LIMIT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let key_load_delay = CONFIG_KEY_LOAD_DELAY
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let rdb_save_delay = RDB_KEY_SAVE_DELAY
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let lua_time_limit = CONFIG_LUA_TIME_LIMIT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let oom_adj = CONFIG_OOM_SCORE_ADJ.read().clone();
+    let oom_adj_vals = CONFIG_OOM_SCORE_ADJ_VALUES.read().clone();
+    let save_cfg =
+        crate::snapshot::format_save_points(&crate::config::save_points(router.base_port));
+    let maxmem_clients = CONFIG_MAXMEMORY_CLIENTS.read().clone();
+    let bind_cfg = crate::netsec::format_bind_spec(&crate::netsec::bind_addrs(router.base_port));
+    let backup_dir = CONFIG_BACKUPDIRNAME.read().clone();
+    let slaveof_cfg = CONFIG_SLAVEOF.read().clone();
+
+    let ro = if REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        "yes"
+    } else {
+        "no"
+    };
+    let ignore_maxmem = if REPLICA_IGNORE_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) {
+        "yes"
+    } else {
+        "no"
+    };
+    let min_replicas = MIN_REPLICAS_TO_WRITE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let min_replicas_lag = MIN_REPLICAS_MAX_LAG
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let repl_ping_period = crate::replication::REPL_PING_PERIOD
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let hub = crate::replication::get_replication_hub(router.base_port);
+    let replica_priority = hub
+        .replica_priority
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let announce_ip = hub.announce_ip.read().clone().unwrap_or_default();
+    let announce_port = hub
+        .announce_port
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    let (tls_auth_clients, tls_ca_cert_file, tls_cert_file, tls_key_file) = {
+        let tls_rt = crate::tls::get_tls_runtime(router.base_port);
+        let rt = tls_rt.read();
+        (
+            rt.auth_clients.as_str().to_string(),
+            rt.ca_cert_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            rt.cert_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            rt.key_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        )
+    };
+    let all_configs: [(&str, String); 87] = [
+        ("port", port_str),
+        ("tls-auth-clients", tls_auth_clients),
+        ("tls-ca-cert-file", tls_ca_cert_file),
+        ("tls-cert-file", tls_cert_file),
+        ("tls-key-file", tls_key_file),
+        (
+            "cluster-config-file",
+            crate::cluster::get_cluster_hub(router.base_port).config_file_name(),
+        ),
+        ("acllog-max-len", acllog_max_len),
+        ("acl-pubsub-default", acl_pubsub_default),
+        ("aclfile", aclfile_str),
+        ("databases", crate::config::databases_count().to_string()),
+        ("loglevel", crate::log::loglevel().to_string()),
+        ("logfile", crate::log::logfile()),
+        ("log-format", crate::log::log_format().to_string()),
+        (
+            "log-timestamp-format",
+            crate::log::log_timestamp_format().to_string(),
+        ),
+        ("idle-poll-us", monoio::idle_poll_us().to_string()),
+        (
+            "latency-tracking",
+            if LATENCY_TRACKING.load(std::sync::atomic::Ordering::Relaxed) {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            },
+        ),
+        (
+            "latency-tracking-info-percentiles",
+            latency_percentiles()
+                .iter()
+                .map(|p| format_percentile(*p))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        (
+            "protected-mode",
+            if crate::netsec::protected_mode(router.base_port) {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            },
+        ),
+        ("daemonize", "no".to_string()),
+        (
+            "enable-debug-command",
+            crate::netsec::enable_debug_command(router.base_port)
+                .name()
+                .to_string(),
+        ),
+        (
+            "enable-module-command",
+            crate::netsec::enable_module_command(router.base_port)
+                .name()
+                .to_string(),
+        ),
+        ("maxmemory", max_mem),
+        ("maxmemory-samples", maxmem_samples),
+        (
+            "auto-aof-rewrite-percentage",
+            crate::aof::auto_rewrite_config(router.base_port)
+                .percentage
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "auto-aof-rewrite-min-size",
+            crate::aof::auto_rewrite_config(router.base_port)
+                .min_size
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "lfu-log-factor",
+            crate::table::LFU_LOG_FACTOR
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "lfu-decay-time",
+            crate::table::LFU_DECAY_TIME
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        ("maxmemory-clients", maxmem_clients),
+        ("maxmemory-policy", policy),
+        ("client-query-buffer-limit", qbuf_limit),
+        ("repl-backlog-size", repl_backlog),
+        ("save", save_cfg),
+        ("backup-sealed-ttl", backup_ttl),
+        ("backupdirname", backup_dir),
+        ("bind", bind_cfg),
+        ("slaveof", slaveof_cfg.clone()),
+        ("replicaof", slaveof_cfg),
+        ("oom-score-adj", oom_adj),
+        ("oom-score-adj-values", oom_adj_vals),
+        ("busy-reply-threshold", lua_time_limit.clone()),
+        ("lua-time-limit", lua_time_limit),
+        ("tiered-offload-threshold", offload),
+        ("tiered-upload-threshold", upload),
+        ("hash-max-listpack-entries", hash_entries.clone()),
+        ("hash-max-ziplist-entries", hash_entries),
+        ("hash-max-listpack-value", hash_value.clone()),
+        ("hash-max-ziplist-value", hash_value),
+        ("stream-node-max-entries", stream_entries),
+        ("stream-idmp-duration", stream_idmp_dur),
+        ("stream-idmp-maxsize", stream_idmp_max),
+        ("maxclients", max_c),
+        ("slowlog-log-slower-than", slow_than),
+        ("slowlog-max-len", slow_len),
+        ("slowlog-entry-max-argc", slow_argc),
+        ("slowlog-entry-max-string-len", slow_str),
+        ("client-output-buffer-limit", obuf),
+        ("requirepass", pass),
+        ("appendonly", app),
+        (
+            "appendfsync",
+            crate::aof::appendfsync_name(router.base_port).to_string(),
+        ),
+        (
+            "cross-shard-spin",
+            crate::mailbox::cross_shard_spin().to_string(),
+        ),
+        (
+            "aof-load-truncated",
+            if crate::aof::aof_load_truncated() {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
+        ("proto-max-bulk-len", proto_bulk),
+        ("notify-keyspace-events", notify_ev),
+        ("lazyfree-lazy-expire", lazy_exp),
+        ("latency-monitor-threshold", latency_thresh),
+        ("tracking-table-max-keys", tracking_max),
+        (
+            "dir",
+            std::fs::canonicalize(&router.db_dir)
+                .unwrap_or_else(|_| router.db_dir.clone())
+                .display()
+                .to_string(),
+        ),
+        ("dbfilename", crate::config::dbfilename(router.base_port)),
+        (
+            "timeout",
+            CLIENT_IDLE_TIMEOUT_SECS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "tcp-keepalive",
+            TCP_KEEPALIVE_SECS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        ("replica-read-only", ro.to_string()),
+        ("slave-read-only", ro.to_string()),
+        ("replica-ignore-maxmemory", ignore_maxmem.to_string()),
+        ("slave-ignore-maxmemory", ignore_maxmem.to_string()),
+        ("replica-priority", replica_priority.clone()),
+        ("slave-priority", replica_priority),
+        ("replica-announce-ip", announce_ip.clone()),
+        ("slave-announce-ip", announce_ip),
+        ("replica-announce-port", announce_port.clone()),
+        ("slave-announce-port", announce_port),
+        ("min-replicas-to-write", min_replicas.clone()),
+        ("min-slaves-to-write", min_replicas),
+        ("min-replicas-max-lag", min_replicas_lag.clone()),
+        ("min-slaves-max-lag", min_replicas_lag),
+        (
+            "repl-backlog-ttl",
+            crate::replication::REPL_BACKLOG_TTL
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        ("repl-ping-replica-period", repl_ping_period.clone()),
+        ("repl-ping-slave-period", repl_ping_period),
+    ];
+    let hidden_configs: [(&str, String); 2] = [
+        ("key-load-delay", key_load_delay),
+        ("rdb-key-save-delay", rdb_save_delay),
+    ];
+
+    let mut matched: Vec<(&str, &str)> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for pat in patterns {
+        let pat_str = String::from_utf8_lossy(pat).to_lowercase();
+        let is_exact = !pat_str.contains('*') && !pat_str.contains('?') && !pat_str.contains('[');
+        for (name, val) in &all_configs {
+            if ((is_exact && pat_str == *name)
+                || (!is_exact && crate::pubsub::glob_match(pat_str.as_bytes(), name.as_bytes())))
+                && seen.insert(*name)
+            {
+                matched.push((*name, val.as_str()));
+            }
+        }
+        if is_exact {
+            for (name, val) in &hidden_configs {
+                if pat_str == *name && seen.insert(*name) {
+                    matched.push((*name, val.as_str()));
+                }
+            }
+        }
+    }
+
+    out.extend_from_slice(format!("*{}\r\n", matched.len() * 2).as_bytes());
+    for (k, v) in matched {
+        out.extend_from_slice(format!("${}\r\n{}\r\n", k.len(), k).as_bytes());
+        out.extend_from_slice(format!("${}\r\n{}\r\n", v.len(), v).as_bytes());
+    }
 }
 
 pub fn set_max_clients(limit: usize) {
@@ -10771,356 +11189,7 @@ async fn execute_command_inner(
         Command::ConfigGet(_) | Command::ConfigSet(_) => {
             match cmd {
                 Command::ConfigGet(patterns) => {
-                    let max_mem = crate::tiering::get_max_memory(router.port).to_string();
-                    let offload =
-                        crate::tiering::get_offload_threshold_pct(router.port).to_string();
-                    let upload = crate::tiering::get_upload_threshold_pct(router.port).to_string();
-                    let hash_entries = HASH_MAX_ENTRIES
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let hash_value = HASH_MAX_VALUE
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let stream_entries = crate::table::STREAM_NODE_MAX_ENTRIES
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let stream_idmp_dur = crate::table::STREAM_IDMP_DURATION
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let stream_idmp_max = crate::table::STREAM_IDMP_MAXSIZE
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let max_c = get_max_clients().to_string();
-                    let policy = get_max_memory_policy();
-                    let slow_than = crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let slow_len = crate::slowlog::SLOWLOG_MAX_LEN
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let slow_argc = crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let slow_str = crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let obuf = format_client_output_buffer_limit_config();
-                    let acl = crate::acl::get_acl_for_port(router.port);
-                    let (pass, acllog_max_len, acl_pubsub_default, aclfile_str) = {
-                        let g = acl.read();
-                        (
-                            g.requirepass.clone().unwrap_or_default(),
-                            g.acllog_max_len.to_string(),
-                            if g.acl_pubsub_default_all {
-                                "allchannels".to_string()
-                            } else {
-                                "resetchannels".to_string()
-                            },
-                            g.aclfile
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default(),
-                        )
-                    };
-                    let app = if router.aof.is_some() {
-                        "yes".to_string()
-                    } else {
-                        "no".to_string()
-                    };
-                    let proto_bulk = crate::resp::get_proto_max_bulk_len().to_string();
-                    let notify_ev = get_notify_keyspace_events_str();
-                    let lazy_exp = if crate::table::is_lazyfree_lazy_expire() {
-                        "yes".to_string()
-                    } else {
-                        "no".to_string()
-                    };
-                    let latency_thresh = LATENCY_MONITOR_THRESHOLD
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let tracking_max = TRACKING_TABLE_MAX_KEYS
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let port_str = router.port.to_string();
-                    let repl_backlog = crate::replication::repl_backlog_size().to_string();
-                    let backup_ttl = CONFIG_BACKUP_SEALED_TTL
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let maxmem_samples = CONFIG_MAXMEMORY_SAMPLES
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let qbuf_limit = CONFIG_CLIENT_QUERY_BUFFER_LIMIT
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let key_load_delay = CONFIG_KEY_LOAD_DELAY
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let rdb_save_delay = RDB_KEY_SAVE_DELAY
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let lua_time_limit = CONFIG_LUA_TIME_LIMIT
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let oom_adj = CONFIG_OOM_SCORE_ADJ.read().clone();
-                    let oom_adj_vals = CONFIG_OOM_SCORE_ADJ_VALUES.read().clone();
-                    let save_cfg = crate::snapshot::format_save_points(
-                        &crate::config::save_points(router.base_port),
-                    );
-                    let maxmem_clients = CONFIG_MAXMEMORY_CLIENTS.read().clone();
-                    let bind_cfg = crate::netsec::format_bind_spec(&crate::netsec::bind_addrs(
-                        router.base_port,
-                    ));
-                    let backup_dir = CONFIG_BACKUPDIRNAME.read().clone();
-                    let slaveof_cfg = CONFIG_SLAVEOF.read().clone();
-
-                    let ro = if REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
-                        "yes"
-                    } else {
-                        "no"
-                    };
-                    let ignore_maxmem =
-                        if REPLICA_IGNORE_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) {
-                            "yes"
-                        } else {
-                            "no"
-                        };
-                    let min_replicas = MIN_REPLICAS_TO_WRITE
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let min_replicas_lag = MIN_REPLICAS_MAX_LAG
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let repl_ping_period = crate::replication::REPL_PING_PERIOD
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let hub = crate::replication::get_replication_hub(router.base_port);
-                    let replica_priority = hub
-                        .replica_priority
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let announce_ip = hub.announce_ip.read().clone().unwrap_or_default();
-                    let announce_port = hub
-                        .announce_port
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
-                    let all_configs: [(&str, String); 83] = [
-                        ("port", port_str),
-                        (
-                            "cluster-config-file",
-                            crate::cluster::get_cluster_hub(router.base_port).config_file_name(),
-                        ),
-                        ("acllog-max-len", acllog_max_len),
-                        ("acl-pubsub-default", acl_pubsub_default),
-                        ("aclfile", aclfile_str),
-                        ("databases", crate::config::databases_count().to_string()),
-                        ("loglevel", crate::log::loglevel().to_string()),
-                        ("logfile", crate::log::logfile()),
-                        ("log-format", crate::log::log_format().to_string()),
-                        (
-                            "log-timestamp-format",
-                            crate::log::log_timestamp_format().to_string(),
-                        ),
-                        ("idle-poll-us", monoio::idle_poll_us().to_string()),
-                        (
-                            "latency-tracking",
-                            if LATENCY_TRACKING.load(std::sync::atomic::Ordering::Relaxed) {
-                                "yes".to_string()
-                            } else {
-                                "no".to_string()
-                            },
-                        ),
-                        (
-                            "latency-tracking-info-percentiles",
-                            latency_percentiles()
-                                .iter()
-                                .map(|p| format_percentile(*p))
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        ),
-                        (
-                            "protected-mode",
-                            if crate::netsec::protected_mode(router.base_port) {
-                                "yes".to_string()
-                            } else {
-                                "no".to_string()
-                            },
-                        ),
-                        ("daemonize", "no".to_string()),
-                        (
-                            "enable-debug-command",
-                            crate::netsec::enable_debug_command(router.base_port)
-                                .name()
-                                .to_string(),
-                        ),
-                        (
-                            "enable-module-command",
-                            crate::netsec::enable_module_command(router.base_port)
-                                .name()
-                                .to_string(),
-                        ),
-                        ("maxmemory", max_mem),
-                        ("maxmemory-samples", maxmem_samples),
-                        (
-                            "auto-aof-rewrite-percentage",
-                            crate::aof::auto_rewrite_config(router.base_port)
-                                .percentage
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                .to_string(),
-                        ),
-                        (
-                            "auto-aof-rewrite-min-size",
-                            crate::aof::auto_rewrite_config(router.base_port)
-                                .min_size
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                .to_string(),
-                        ),
-                        (
-                            "lfu-log-factor",
-                            crate::table::LFU_LOG_FACTOR
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                .to_string(),
-                        ),
-                        (
-                            "lfu-decay-time",
-                            crate::table::LFU_DECAY_TIME
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                .to_string(),
-                        ),
-                        ("maxmemory-clients", maxmem_clients),
-                        ("maxmemory-policy", policy),
-                        ("client-query-buffer-limit", qbuf_limit),
-                        ("repl-backlog-size", repl_backlog),
-                        ("save", save_cfg),
-                        ("backup-sealed-ttl", backup_ttl),
-                        ("backupdirname", backup_dir),
-                        ("bind", bind_cfg),
-                        ("slaveof", slaveof_cfg.clone()),
-                        ("replicaof", slaveof_cfg),
-                        ("oom-score-adj", oom_adj),
-                        ("oom-score-adj-values", oom_adj_vals),
-                        ("busy-reply-threshold", lua_time_limit.clone()),
-                        ("lua-time-limit", lua_time_limit),
-                        ("tiered-offload-threshold", offload),
-                        ("tiered-upload-threshold", upload),
-                        ("hash-max-listpack-entries", hash_entries.clone()),
-                        ("hash-max-ziplist-entries", hash_entries),
-                        ("hash-max-listpack-value", hash_value.clone()),
-                        ("hash-max-ziplist-value", hash_value),
-                        ("stream-node-max-entries", stream_entries),
-                        ("stream-idmp-duration", stream_idmp_dur),
-                        ("stream-idmp-maxsize", stream_idmp_max),
-                        ("maxclients", max_c),
-                        ("slowlog-log-slower-than", slow_than),
-                        ("slowlog-max-len", slow_len),
-                        ("slowlog-entry-max-argc", slow_argc),
-                        ("slowlog-entry-max-string-len", slow_str),
-                        ("client-output-buffer-limit", obuf),
-                        ("requirepass", pass),
-                        ("appendonly", app),
-                        (
-                            "appendfsync",
-                            crate::aof::appendfsync_name(router.base_port).to_string(),
-                        ),
-                        (
-                            "cross-shard-spin",
-                            crate::mailbox::cross_shard_spin().to_string(),
-                        ),
-                        (
-                            "aof-load-truncated",
-                            if crate::aof::aof_load_truncated() {
-                                "yes"
-                            } else {
-                                "no"
-                            }
-                            .to_string(),
-                        ),
-                        ("proto-max-bulk-len", proto_bulk),
-                        ("notify-keyspace-events", notify_ev),
-                        ("lazyfree-lazy-expire", lazy_exp),
-                        ("latency-monitor-threshold", latency_thresh),
-                        ("tracking-table-max-keys", tracking_max),
-                        (
-                            "dir",
-                            std::fs::canonicalize(&router.db_dir)
-                                .unwrap_or_else(|_| router.db_dir.clone())
-                                .display()
-                                .to_string(),
-                        ),
-                        ("dbfilename", crate::config::dbfilename(router.base_port)),
-                        (
-                            "timeout",
-                            CLIENT_IDLE_TIMEOUT_SECS
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                .to_string(),
-                        ),
-                        (
-                            "tcp-keepalive",
-                            TCP_KEEPALIVE_SECS
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                .to_string(),
-                        ),
-                        ("replica-read-only", ro.to_string()),
-                        ("slave-read-only", ro.to_string()),
-                        ("replica-ignore-maxmemory", ignore_maxmem.to_string()),
-                        ("slave-ignore-maxmemory", ignore_maxmem.to_string()),
-                        ("replica-priority", replica_priority.clone()),
-                        ("slave-priority", replica_priority),
-                        ("replica-announce-ip", announce_ip.clone()),
-                        ("slave-announce-ip", announce_ip),
-                        ("replica-announce-port", announce_port.clone()),
-                        ("slave-announce-port", announce_port),
-                        ("min-replicas-to-write", min_replicas.clone()),
-                        ("min-slaves-to-write", min_replicas),
-                        ("min-replicas-max-lag", min_replicas_lag.clone()),
-                        ("min-slaves-max-lag", min_replicas_lag),
-                        (
-                            "repl-backlog-ttl",
-                            crate::replication::REPL_BACKLOG_TTL
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                .to_string(),
-                        ),
-                        ("repl-ping-replica-period", repl_ping_period.clone()),
-                        ("repl-ping-slave-period", repl_ping_period),
-                    ];
-                    let hidden_configs: [(&str, String); 2] = [
-                        ("key-load-delay", key_load_delay),
-                        ("rdb-key-save-delay", rdb_save_delay),
-                    ];
-
-                    let mut matched: Vec<(&str, &str)> = Vec::new();
-                    let mut seen: std::collections::HashSet<&str> =
-                        std::collections::HashSet::new();
-
-                    for pat in &patterns {
-                        let pat_str = String::from_utf8_lossy(pat).to_lowercase();
-                        let is_exact = !pat_str.contains('*')
-                            && !pat_str.contains('?')
-                            && !pat_str.contains('[');
-                        for (name, val) in &all_configs {
-                            if ((is_exact && pat_str == *name)
-                                || (!is_exact
-                                    && crate::pubsub::glob_match(
-                                        pat_str.as_bytes(),
-                                        name.as_bytes(),
-                                    )))
-                                && seen.insert(*name)
-                            {
-                                matched.push((*name, val.as_str()));
-                            }
-                        }
-                        if is_exact {
-                            for (name, val) in &hidden_configs {
-                                if pat_str == *name && seen.insert(*name) {
-                                    matched.push((*name, val.as_str()));
-                                }
-                            }
-                        }
-                    }
-
-                    out.extend_from_slice(format!("*{}\r\n", matched.len() * 2).as_bytes());
-                    for (k, v) in matched {
-                        out.extend_from_slice(format!("${}\r\n{}\r\n", k.len(), k).as_bytes());
-                        out.extend_from_slice(format!("${}\r\n{}\r\n", v.len(), v).as_bytes());
-                    }
+                    write_config_get_reply(router, &patterns, out);
                     false
                 }
                 Command::ConfigSet(pairs) => {

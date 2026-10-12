@@ -25946,3 +25946,166 @@ fn test_cluster_persistence_restore_asking_and_dynamic_slots_e2e() {
     shutdown_and_wait(port, &mut srv2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_mtls_client_auth_and_config_set_e2e() {
+    let port = 17975;
+    let tls_port = 17976;
+    let dir = std::env::temp_dir().join(format!("rudis-mtls-e2e-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Generate CA, server cert, valid client cert, and untrusted client cert
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let srv_key = rcgen::KeyPair::generate().unwrap();
+    let srv_cert =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .unwrap()
+            .signed_by(&srv_key, &issuer)
+            .unwrap();
+
+    let cli_key = rcgen::KeyPair::generate().unwrap();
+    let cli_cert = rcgen::CertificateParams::new(vec!["client.local".to_string()])
+        .unwrap()
+        .signed_by(&cli_key, &issuer)
+        .unwrap();
+
+    let bad_key = rcgen::KeyPair::generate().unwrap();
+    let bad_cert = rcgen::CertificateParams::new(vec!["untrusted.local".to_string()])
+        .unwrap()
+        .self_signed(&bad_key)
+        .unwrap();
+
+    let ca_path = dir.join("ca.pem");
+    let srv_cert_path = dir.join("server.pem");
+    let srv_key_path = dir.join("server.key");
+    let conf_path = dir.join("rudis.conf");
+
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+    std::fs::write(&srv_cert_path, srv_cert.pem()).unwrap();
+    std::fs::write(&srv_key_path, srv_key.serialize_pem()).unwrap();
+    std::fs::write(
+        &conf_path,
+        format!(
+            "port {}\ntls-port {}\ntls-cert-file {}\ntls-key-file {}\ntls-ca-cert-file {}\ntls-auth-clients yes\n",
+            port,
+            tls_port,
+            srv_cert_path.display(),
+            srv_key_path.display(),
+            ca_path.display(),
+        ),
+    )
+    .unwrap();
+
+    let mut srv = spawn_rudis_listening(
+        &[conf_path.to_str().unwrap(), "--threads", "1", "--no-pin"],
+        port,
+    );
+
+    let mut plain = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    plain
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let cfg_auth = resp_cmd(&mut plain, &["CONFIG", "GET", "tls-auth-clients"]);
+    assert!(cfg_auth.contains("\r\nyes\r\n"), "{cfg_auth}");
+    let cfg_ca = resp_cmd(&mut plain, &["CONFIG", "GET", "tls-ca-cert-file"]);
+    assert!(cfg_ca.contains(&ca_path.display().to_string()), "{cfg_ca}");
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            ca_cert.der().to_vec(),
+        ))
+        .unwrap();
+
+    let anon_cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth(),
+    );
+    let valid_cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots.clone())
+            .with_client_auth_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    cli_cert.der().to_vec(),
+                )],
+                rustls::pki_types::PrivateKeyDer::try_from(cli_key.serialize_der()).unwrap(),
+            )
+            .unwrap(),
+    );
+    let untrusted_cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    bad_cert.der().to_vec(),
+                )],
+                rustls::pki_types::PrivateKeyDer::try_from(bad_key.serialize_der()).unwrap(),
+            )
+            .unwrap(),
+    );
+
+    let tls_ping = |cfg: std::sync::Arc<rustls::ClientConfig>| -> Result<String, String> {
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .unwrap()
+            .to_owned();
+        let conn = rustls::ClientConnection::new(cfg, server_name).map_err(|e| e.to_string())?;
+        let sock = TcpStream::connect(("127.0.0.1", tls_port)).map_err(|e| e.to_string())?;
+        sock.set_read_timeout(Some(Duration::from_secs(3)))
+            .map_err(|e| e.to_string())?;
+        let mut stream = rustls::StreamOwned::new(conn, sock);
+        stream
+            .write_all(b"*1\r\n$4\r\nPING\r\n")
+            .map_err(|e| e.to_string())?;
+        stream.flush().map_err(|e| e.to_string())?;
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("EOF".to_string());
+        }
+        Ok(String::from_utf8_lossy(&buf[..n]).to_string())
+    };
+
+    // 1. With tls-auth-clients=yes: anonymous & untrusted fail, valid client cert succeeds
+    assert!(tls_ping(anon_cfg.clone()).is_err());
+    assert!(tls_ping(untrusted_cfg.clone()).is_err());
+    assert_eq!(tls_ping(valid_cfg.clone()).unwrap(), "+PONG\r\n");
+
+    // 2. CONFIG SET tls-auth-clients no -> anonymous client now succeeds
+    assert_eq!(
+        resp_cmd(&mut plain, &["CONFIG", "SET", "tls-auth-clients", "no"]),
+        "+OK\r\n"
+    );
+    assert_eq!(tls_ping(anon_cfg.clone()).unwrap(), "+PONG\r\n");
+
+    // 3. CONFIG SET tls-auth-clients optional -> anonymous and valid succeed, untrusted fails
+    assert_eq!(
+        resp_cmd(
+            &mut plain,
+            &["CONFIG", "SET", "tls-auth-clients", "optional"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(tls_ping(anon_cfg).unwrap(), "+PONG\r\n");
+    assert_eq!(tls_ping(valid_cfg).unwrap(), "+PONG\r\n");
+    assert!(tls_ping(untrusted_cfg).is_err());
+
+    // 4. CONFIG REWRITE persists tls-auth-clients optional
+    assert_eq!(resp_cmd(&mut plain, &["CONFIG", "REWRITE"]), "+OK\r\n");
+    let rewritten = std::fs::read_to_string(&conf_path).unwrap();
+    assert!(
+        rewritten.contains("tls-auth-clients optional"),
+        "{rewritten}"
+    );
+
+    drop(plain);
+    shutdown_and_wait(port, &mut srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

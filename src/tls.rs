@@ -57,41 +57,91 @@ pub fn generate_self_signed_cert(
     Ok((cert_der, key_der))
 }
 
+/// Client certificate authentication mode (`tls-auth-clients`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsAuthClients {
+    /// Do not request or verify client certificates (`no`).
+    No,
+    /// Request a client certificate and verify it if presented, but allow
+    /// unauthenticated clients (`optional`).
+    Optional,
+    /// Require a valid client certificate signed by `tls-ca-cert-file` (`yes`).
+    #[default]
+    Yes,
+}
+
+impl TlsAuthClients {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "yes" | "true" | "1" => Ok(Self::Yes),
+            "no" | "false" | "0" => Ok(Self::No),
+            "optional" => Ok(Self::Optional),
+            other => Err(format!(
+                "Invalid tls-auth-clients '{}' (expected yes|no|optional)",
+                other
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::Optional => "optional",
+            Self::Yes => "yes",
+        }
+    }
+}
+
 /// Builds a `rustls::ServerConfig` from DER-encoded certificate and private key.
 pub fn create_server_config(cert_der: &[u8], key_der: &[u8]) -> Result<Arc<ServerConfig>, String> {
     let cert = CertificateDer::from(cert_der.to_vec());
     let key = PrivateKeyDer::try_from(key_der.to_vec())
         .map_err(|e| format!("Invalid private key DER: {:?}", e))?;
-    server_config_from(vec![cert], key)
+    server_config_from(vec![cert], key, None, TlsAuthClients::No)
 }
 
 fn server_config_from(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    ca_certs: Option<Vec<CertificateDer<'static>>>,
+    auth_clients: TlsAuthClients,
 ) -> Result<Arc<ServerConfig>, String> {
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("Failed to create rustls ServerConfig: {}", e))?;
+    let config = match (ca_certs, auth_clients) {
+        (Some(roots_der), TlsAuthClients::Yes | TlsAuthClients::Optional) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for ca in roots_der {
+                roots
+                    .add(ca)
+                    .map_err(|e| format!("Invalid CA certificate: {}", e))?;
+            }
+            let builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots));
+            let builder = if auth_clients == TlsAuthClients::Optional {
+                builder.allow_unauthenticated()
+            } else {
+                builder
+            };
+            let verifier = builder
+                .build()
+                .map_err(|e| format!("Failed to build client cert verifier: {}", e))?;
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+                .map_err(|e| format!("Failed to create rustls ServerConfig: {}", e))?
+        }
+        _ => ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("Failed to create rustls ServerConfig: {}", e))?,
+    };
 
     Ok(Arc::new(config))
 }
 
-/// Loads the certificate chain and private key from files.
-///
-/// PEM files, the format `tls-cert-file`/`tls-key-file` take in Redis, may
-/// hold a full chain (leaf first) and a PKCS#8, PKCS#1 or SEC1 key. Files that
-/// are not PEM are read as one DER certificate and a DER key.
-pub fn load_certs_and_key_from_files(
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<Arc<ServerConfig>, String> {
+/// Loads a PEM or DER certificate chain from `cert_path`.
+pub fn load_certs_from_file(cert_path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     let cert_bytes = std::fs::read(cert_path)
         .map_err(|e| format!("Cannot read cert file {}: {}", cert_path.display(), e))?;
-    let key_bytes = std::fs::read(key_path)
-        .map_err(|e| format!("Cannot read key file {}: {}", key_path.display(), e))?;
-
-    let certs = if is_pem(&cert_bytes) {
+    if is_pem(&cert_bytes) {
         let certs = CertificateDer::pem_slice_iter(&cert_bytes)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Invalid certificate PEM in {}: {}", cert_path.display(), e))?;
@@ -101,18 +151,48 @@ pub fn load_certs_and_key_from_files(
                 cert_path.display()
             ));
         }
-        certs
+        Ok(certs)
     } else {
-        vec![CertificateDer::from(cert_bytes)]
-    };
-    let key = if is_pem(&key_bytes) {
+        Ok(vec![CertificateDer::from(cert_bytes)])
+    }
+}
+
+/// Loads a PEM or DER private key from `key_path`.
+pub fn load_key_from_file(key_path: &Path) -> Result<PrivateKeyDer<'static>, String> {
+    let key_bytes = std::fs::read(key_path)
+        .map_err(|e| format!("Cannot read key file {}: {}", key_path.display(), e))?;
+    if is_pem(&key_bytes) {
         PrivateKeyDer::from_pem_slice(&key_bytes)
-            .map_err(|e| format!("Invalid private key PEM in {}: {}", key_path.display(), e))?
+            .map_err(|e| format!("Invalid private key PEM in {}: {}", key_path.display(), e))
     } else {
         PrivateKeyDer::try_from(key_bytes)
-            .map_err(|e| format!("Invalid private key DER in {}: {}", key_path.display(), e))?
+            .map_err(|e| format!("Invalid private key DER in {}: {}", key_path.display(), e))
+    }
+}
+
+/// Loads the certificate chain and private key from files without client auth.
+pub fn load_certs_and_key_from_files(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<Arc<ServerConfig>, String> {
+    load_server_config_from_files(cert_path, key_path, None, TlsAuthClients::No)
+}
+
+/// Loads server certificates, private key, and optional client CA roots from
+/// files according to `auth_clients`.
+pub fn load_server_config_from_files(
+    cert_path: &Path,
+    key_path: &Path,
+    ca_cert_path: Option<&Path>,
+    auth_clients: TlsAuthClients,
+) -> Result<Arc<ServerConfig>, String> {
+    let certs = load_certs_from_file(cert_path)?;
+    let key = load_key_from_file(key_path)?;
+    let ca_certs = match ca_cert_path {
+        Some(ca_path) => Some(load_certs_from_file(ca_path)?),
+        None => None,
     };
-    server_config_from(certs, key)
+    server_config_from(certs, key, ca_certs, auth_clients)
 }
 
 /// Whether `bytes` look like PEM text rather than binary DER.
@@ -583,6 +663,62 @@ pub struct TlsWorkerConfig {
     pub server_config: Arc<ServerConfig>,
 }
 
+/// Per-server runtime TLS configuration, allowing `CONFIG GET`/`CONFIG SET`
+/// and `CONFIG REWRITE` to inspect and update `tls-auth-clients`,
+/// `tls-ca-cert-file`, `tls-cert-file`, and `tls-key-file`.
+pub struct TlsRuntimeState {
+    pub cert_file: Option<std::path::PathBuf>,
+    pub key_file: Option<std::path::PathBuf>,
+    pub ca_cert_file: Option<std::path::PathBuf>,
+    pub auth_clients: TlsAuthClients,
+    pub server_config: Option<Arc<ServerConfig>>,
+}
+
+impl Default for TlsRuntimeState {
+    fn default() -> Self {
+        Self {
+            cert_file: None,
+            key_file: None,
+            ca_cert_file: None,
+            auth_clients: TlsAuthClients::Yes,
+            server_config: None,
+        }
+    }
+}
+
+impl TlsRuntimeState {
+    /// Rebuilds `self.server_config` when both `cert_file` and `key_file` are set.
+    pub fn rebuild_server_config(&mut self) -> Result<(), String> {
+        if let (Some(cert_path), Some(key_path)) = (&self.cert_file, &self.key_file) {
+            let cfg = load_server_config_from_files(
+                cert_path,
+                key_path,
+                self.ca_cert_file.as_deref(),
+                self.auth_clients,
+            )?;
+            self.server_config = Some(cfg);
+        }
+        Ok(())
+    }
+}
+
+static TLS_RUNTIMES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<u16, Arc<parking_lot::RwLock<TlsRuntimeState>>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+pub fn get_tls_runtime(base_port: u16) -> Arc<parking_lot::RwLock<TlsRuntimeState>> {
+    let mut map = TLS_RUNTIMES.lock();
+    map.entry(base_port)
+        .or_insert_with(|| Arc::new(parking_lot::RwLock::new(TlsRuntimeState::default())))
+        .clone()
+}
+
+pub fn active_tls_server_config(base_port: u16) -> Option<Arc<ServerConfig>> {
+    let map = TLS_RUNTIMES.lock();
+    map.get(&base_port)
+        .and_then(|rt| rt.read().server_config.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,5 +987,150 @@ mod tests {
             }
         }
         assert_eq!(got, reply);
+    }
+
+    fn try_handshake_with_client_config(
+        server_config: Arc<ServerConfig>,
+        client_config: Arc<rustls::ClientConfig>,
+    ) -> Result<(), String> {
+        let mut client =
+            rustls::ClientConnection::new(client_config, "localhost".try_into().unwrap())
+                .map_err(|e| e.to_string())?;
+        let mut server = ServerConnection::new(server_config).map_err(|e| e.to_string())?;
+        while client.is_handshaking() || server.is_handshaking() {
+            let mut c2s = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut c2s).map_err(|e| e.to_string())?;
+            }
+            let mut slice = &c2s[..];
+            while !slice.is_empty() {
+                server.read_tls(&mut slice).map_err(|e| e.to_string())?;
+                server.process_new_packets().map_err(|e| e.to_string())?;
+            }
+            let mut s2c = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut s2c).map_err(|e| e.to_string())?;
+            }
+            let mut slice = &s2c[..];
+            while !slice.is_empty() {
+                client.read_tls(&mut slice).map_err(|e| e.to_string())?;
+                client.process_new_packets().map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_mtls_client_auth_modes() {
+        assert_eq!(TlsAuthClients::parse("yes").unwrap(), TlsAuthClients::Yes);
+        assert_eq!(TlsAuthClients::parse("no").unwrap(), TlsAuthClients::No);
+        assert_eq!(
+            TlsAuthClients::parse("optional").unwrap(),
+            TlsAuthClients::Optional
+        );
+        assert!(TlsAuthClients::parse("invalid").is_err());
+
+        // Mint a CA, a server cert signed by the CA, a valid client cert signed
+        // by the CA, and an untrusted self-signed client cert.
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        let srv_key = rcgen::KeyPair::generate().unwrap();
+        let srv_cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&srv_key, &issuer)
+            .unwrap();
+
+        let cli_key = rcgen::KeyPair::generate().unwrap();
+        let cli_cert = rcgen::CertificateParams::new(vec!["client.local".to_string()])
+            .unwrap()
+            .signed_by(&cli_key, &issuer)
+            .unwrap();
+
+        let bad_key = rcgen::KeyPair::generate().unwrap();
+        let bad_cert = rcgen::CertificateParams::new(vec!["untrusted.local".to_string()])
+            .unwrap()
+            .self_signed(&bad_key)
+            .unwrap();
+
+        let dir = temp_files(
+            "mtls",
+            &[
+                ("ca.pem", ca_cert.pem().as_bytes()),
+                ("server.pem", srv_cert.pem().as_bytes()),
+                ("server.key", srv_key.serialize_pem().as_bytes()),
+            ],
+        );
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca_cert.der().to_vec()))
+            .unwrap();
+
+        let anon_client = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth(),
+        );
+        let valid_client = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots.clone())
+                .with_client_auth_cert(
+                    vec![CertificateDer::from(cli_cert.der().to_vec())],
+                    PrivateKeyDer::try_from(cli_key.serialize_der()).unwrap(),
+                )
+                .unwrap(),
+        );
+        let untrusted_client = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(
+                    vec![CertificateDer::from(bad_cert.der().to_vec())],
+                    PrivateKeyDer::try_from(bad_key.serialize_der()).unwrap(),
+                )
+                .unwrap(),
+        );
+
+        // 1. tls-auth-clients yes: requires valid CA-signed client cert
+        let srv_yes = load_server_config_from_files(
+            &dir.join("server.pem"),
+            &dir.join("server.key"),
+            Some(&dir.join("ca.pem")),
+            TlsAuthClients::Yes,
+        )
+        .unwrap();
+        assert!(try_handshake_with_client_config(srv_yes.clone(), anon_client.clone()).is_err());
+        assert!(
+            try_handshake_with_client_config(srv_yes.clone(), untrusted_client.clone()).is_err()
+        );
+        assert!(try_handshake_with_client_config(srv_yes, valid_client.clone()).is_ok());
+
+        // 2. tls-auth-clients optional: allows anonymous + valid cert, rejects untrusted cert
+        let srv_opt = load_server_config_from_files(
+            &dir.join("server.pem"),
+            &dir.join("server.key"),
+            Some(&dir.join("ca.pem")),
+            TlsAuthClients::Optional,
+        )
+        .unwrap();
+        assert!(try_handshake_with_client_config(srv_opt.clone(), anon_client.clone()).is_ok());
+        assert!(try_handshake_with_client_config(srv_opt.clone(), valid_client.clone()).is_ok());
+        assert!(try_handshake_with_client_config(srv_opt, untrusted_client.clone()).is_err());
+
+        // 3. tls-auth-clients no: does not request client cert, allows all
+        let srv_no = load_server_config_from_files(
+            &dir.join("server.pem"),
+            &dir.join("server.key"),
+            Some(&dir.join("ca.pem")),
+            TlsAuthClients::No,
+        )
+        .unwrap();
+        assert!(try_handshake_with_client_config(srv_no.clone(), anon_client).is_ok());
+        assert!(try_handshake_with_client_config(srv_no, valid_client).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
