@@ -301,6 +301,11 @@ pub struct ClientTracker {
 thread_local! {
     pub static CURRENT_CLIENT_RESP3: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub static CURRENT_DB: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Set while this thread replays AOF files written by Redis (see
+    /// `aof::import_external_aof`): like Redis loading, nothing expires
+    /// during the load, so a past `PEXPIREAT` followed by more writes to the
+    /// key replays the way Redis applied it.
+    pub static LOADING_EXTERNAL_AOF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub static CURRENT_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static EXECUTING_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static DEFER_BCAST_FLUSH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2877,6 +2882,14 @@ pub static HASH_MAX_ENTRIES: std::sync::atomic::AtomicUsize =
 pub static HASH_MAX_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 pub static ALLOW_ACCESS_EXPIRED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Whether expired keys must be treated as live: set process-wide by `DEBUG
+/// SET-ALLOW-ACCESS-EXPIRED`, or for this thread while it imports
+/// Redis-written AOF files.
+#[inline]
+pub fn access_expired_allowed() -> bool {
+    ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed) || LOADING_EXTERNAL_AOF.get()
+}
 pub static PAUSE_CRON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static ACTIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static MAX_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);

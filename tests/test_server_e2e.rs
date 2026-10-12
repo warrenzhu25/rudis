@@ -24835,3 +24835,102 @@ fn test_search_indexes_persist_and_replicate_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One RESP array command, as written to an AOF.
+fn resp_argv_bytes(args: &[&str]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        out.extend_from_slice(format!("${}\r\n{}\r\n", a.len(), a).as_bytes());
+    }
+    out
+}
+
+#[test]
+fn test_redis7_multipart_aof_is_imported_once_e2e() {
+    let port = 17960u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-redis7-aof-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let aof_dir = dir.join("appendonlydir");
+    std::fs::create_dir_all(&aof_dir).unwrap();
+
+    // Base: a Redis-format RDB. Incr: what Redis 7 appends after it.
+    let mut base = rudis::shard::ShardDb::new(0);
+    base.set(
+        bytes::Bytes::from_static(b"base:k"),
+        bytes::Bytes::from_static(b"base:v"),
+        None,
+    );
+    let mut rdb = Vec::new();
+    rudis::redis_rdb::write_file_header(&mut rdb, 0);
+    base.save_rdb_chunk(&mut rdb).unwrap();
+    rdb.push(rudis::redis_rdb::OP_EOF);
+    let crc = rudis::table::crc64(&rdb);
+    rdb.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(aof_dir.join("appendonly.aof.1.base.rdb"), &rdb).unwrap();
+    let mut incr = b"#TS:1700000000\r\n".to_vec();
+    for cmd in [
+        &["MULTI"][..],
+        &["SET", "tx:a", "1"],
+        &["INCR", "tx:a"],
+        &["EXEC"],
+        &["SELECT", "3"],
+        &["SET", "db3:k", "v3"],
+        &["SELECT", "0"],
+        &["RPUSH", "gone", "a"],
+        &["PEXPIREAT", "gone", "1000"],
+        &["RPUSH", "gone", "b"],
+    ] {
+        incr.extend_from_slice(&resp_argv_bytes(cmd));
+    }
+    std::fs::write(aof_dir.join("appendonly.aof.1.incr.aof"), &incr).unwrap();
+    std::fs::write(
+        aof_dir.join("appendonly.aof.manifest"),
+        "file appendonly.aof.1.base.rdb seq 1 type b\nfile appendonly.aof.1.incr.aof seq 1 type i\n",
+    )
+    .unwrap();
+
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+    ];
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    };
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = connect();
+    assert_eq!(resp_cmd(&mut c, &["GET", "base:k"]), "$6\r\nbase:v\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "tx:a"]), "$1\r\n2\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "gone"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":2\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SELECT", "3"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "db3:k"]), "$2\r\nv3\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SELECT", "0"]), "+OK\r\n");
+    // Written by rudis after the import: must survive restarts.
+    assert_eq!(resp_cmd(&mut c, &["SET", "after", "x"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["INCR", "tx:a"]), ":3\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_file(dir.join("dump.rdb"));
+
+    // Restart: the unchanged Redis files are not imported again.
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = connect();
+    assert_eq!(resp_cmd(&mut c, &["GET", "after"]), "$1\r\nx\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "tx:a"]), "$1\r\n3\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "base:k"]), "$6\r\nbase:v\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -3538,8 +3538,7 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -3727,7 +3726,7 @@ impl RudisTable {
         if self.num_expires == 0 {
             return false;
         }
-        if crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed) {
+        if crate::connection::access_expired_allowed() {
             return false;
         }
         let is_exp = if let Some(entry) = self.table.get_slot(slot_idx) {
@@ -3859,9 +3858,7 @@ impl RudisTable {
         match self.table.find_entry(key, hash_key(key)) {
             Some((_, entry)) => match entry.expire_at() {
                 Some(expire_at) => {
-                    crate::connection::ALLOW_ACCESS_EXPIRED
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        || Instant::now() < expire_at
+                    crate::connection::access_expired_allowed() || Instant::now() < expire_at
                 }
                 None => true,
             },
@@ -3889,8 +3886,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -3947,8 +3943,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -3997,8 +3992,7 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -4274,8 +4268,7 @@ impl RudisTable {
         }
         if let Some((idx, entry)) = self.table.find_entry(key, hash) {
             if let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -4312,8 +4305,7 @@ impl RudisTable {
         }
         if let Some((idx, entry)) = self.table.find_entry(key, hash) {
             if let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -4356,8 +4348,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -4445,15 +4436,20 @@ impl RudisTable {
                 {
                     return false;
                 }
-                if duration.is_zero() {
+                if duration.is_zero() && !crate::connection::access_expired_allowed() {
                     self.expire_slot(idx);
                     return true;
                 }
+                let effective_instant = if duration.is_zero() {
+                    expiry_base()
+                } else {
+                    target_instant
+                };
                 if entry.expire_at().is_none() {
                     self.num_expires += 1;
                 }
                 let old_key = entry.key.heap_bytes();
-                entry.set_expire_at(Some(target_instant));
+                entry.set_expire_at(Some(effective_instant));
                 self.data_bytes = self.data_bytes.saturating_sub(old_key) + entry.key.heap_bytes();
                 return true;
             }
@@ -6075,8 +6071,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key.as_ref(), h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -6181,8 +6176,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -7154,8 +7148,7 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot(idx)
         {
             if let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -7202,8 +7195,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -7261,8 +7253,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -7989,8 +7980,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -8069,8 +8059,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -8194,8 +8183,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -8288,8 +8276,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -8386,8 +8373,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -8447,8 +8433,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -8677,8 +8662,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -8738,8 +8722,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -9326,8 +9309,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key.as_ref(), h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -9415,8 +9397,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -9573,8 +9554,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -9612,8 +9592,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -9649,8 +9628,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -10900,8 +10878,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -11197,8 +11174,7 @@ impl RudisTable {
             if let Some((idx, entry)) = self.table.find_entry(key, h) {
                 if self.num_expires > 0
                     && let Some(expire_at) = entry.expire_at()
-                    && !crate::connection::ALLOW_ACCESS_EXPIRED
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                    && !crate::connection::access_expired_allowed()
                     && Instant::now() >= expire_at
                 {
                     self.expire_slot(idx);
@@ -11331,8 +11307,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::access_expired_allowed()
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -16243,6 +16218,31 @@ fn load_legacy_rdb(
         ));
     }
     Ok(count)
+}
+
+/// Attempts to decode a legacy Rudis RDB preamble from the start of `data`,
+/// returning `(preamble_byte_len, keys_loaded)` if valid.
+pub(crate) fn try_load_legacy_rdb_preamble(
+    data: &[u8],
+    db: &mut crate::shard::ShardDb,
+) -> Option<(usize, usize)> {
+    if data.len() < 18 {
+        return None;
+    }
+    db.flushall();
+    let (cursor, saw_eof, count) = load_legacy_records(data, 9, data.len(), db, 0, 1);
+    if !saw_eof || cursor + 1 + 8 > data.len() {
+        db.flushall();
+        return None;
+    }
+    let eof_end = cursor + 1;
+    let expected_crc = u64::from_le_bytes(data[eof_end..eof_end + 8].try_into().ok()?);
+    let actual_crc = crc64(&data[..eof_end]);
+    if expected_crc != 0 && expected_crc != actual_crc {
+        db.flushall();
+        return None;
+    }
+    Some((eof_end + 8, count))
 }
 
 /// Loads the legacy-format records of a `rudis-ext` AUX field (see

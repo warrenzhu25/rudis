@@ -2640,64 +2640,505 @@ pub fn replay_aof_with(
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "bad AOF format at offset {} of {}: {}",
+                "Bad file format reading the append only file {:?}: bad AOF format at offset {} of {}: {}",
+                path,
                 offset,
                 data.len(),
                 why
             ),
         )
     };
-    let mut buf = BytesMut::from(&data[..]);
-    let mut count = 0;
+    let eof_err = |offset: usize, why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "Unexpected end of file reading the append only file {:?}: bad AOF format at offset {} of {}: {}",
+                path,
+                offset,
+                data.len(),
+                why
+            ),
+        )
+    };
+    let (rdb_preamble_len, mut count) = if data.starts_with(b"REDIS") {
+        crate::redis_rdb::load_rdb_preamble(&data, db)
+            .map_err(|e| bad(0, &format!("invalid RDB preamble: {}", e)))?
+    } else {
+        (0, 0)
+    };
+    let mut buf = BytesMut::from(&data[rdb_preamble_len..]);
     let mut dummy_out = Vec::new();
     let saved_db = crate::connection::CURRENT_DB.get();
     crate::connection::CURRENT_DB.set(0);
     db.select_db(0);
+    // A MULTI ... EXEC block (as Redis logs transactions): the offset of its
+    // MULTI and the commands queued so far. They apply only at EXEC, so a
+    // block cut off at the end of the file is dropped as a whole.
+    let mut in_multi: Option<(usize, Vec<Command>)> = None;
     let res = (|| -> std::io::Result<usize> {
         while !buf.is_empty() {
+            // Skip Redis 7+ `#TS:<unix_ts>\r\n` timestamp annotations.
+            while buf.starts_with(b"#") {
+                if let Some(nl_pos) = buf.iter().position(|&b| b == b'\n') {
+                    let _ = buf.split_to(nl_pos + 1);
+                } else {
+                    buf.clear();
+                    break;
+                }
+            }
+            if buf.is_empty() {
+                break;
+            }
             let offset = data.len() - buf.len();
-            // rudis only ever appends RESP arrays; anything else is corruption
-            // (the inline parser would otherwise accept garbage as a command).
+            // rudis and Redis only ever append RESP arrays (after #TS comments);
+            // anything else is corruption.
             if buf[0] != b'*' {
                 return Err(bad(offset, "expected a RESP array"));
             }
             match crate::resp::parse_command(&mut buf) {
-                Ok(Some(cmd)) => {
-                    let is_select = matches!(cmd, Command::Select(_));
-                    crate::connection::execute_local_command(&cmd, db, &mut dummy_out, None);
-                    dummy_out.clear();
-                    if !is_select {
-                        count += 1;
+                Ok(Some(cmd)) => match cmd {
+                    Command::Unknown(ref name) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Unknown command '{}' reading the append only file {:?}",
+                                name.to_ascii_lowercase(),
+                                path
+                            ),
+                        ));
                     }
-                }
+                    // Redis rejects a nested MULTI and an EXEC or DISCARD
+                    // outside one; loading ignores the error replies.
+                    Command::Multi => {
+                        if in_multi.is_none() {
+                            in_multi = Some((offset, Vec::new()));
+                        }
+                    }
+                    Command::Discard => {
+                        in_multi = None;
+                    }
+                    Command::Exec => {
+                        if let Some((_, queued)) = in_multi.take() {
+                            for qcmd in queued {
+                                apply_aof_command(&qcmd, db, &mut dummy_out, &mut count);
+                            }
+                        }
+                    }
+                    other => {
+                        if let Some((_, ref mut queued)) = in_multi {
+                            queued.push(other);
+                        } else {
+                            apply_aof_command(&other, db, &mut dummy_out, &mut count);
+                        }
+                    }
+                },
                 Ok(None) if buf.is_empty() => break,
                 Ok(None) => {
+                    // An open MULTI block is cut off along with the command.
+                    let trunc_offset = in_multi.as_ref().map_or(offset, |(m_off, _)| *m_off);
                     if !load_truncated {
-                        return Err(bad(
+                        return Err(eof_err(
                             offset,
                             "truncated final command (set aof-load-truncated yes to load anyway)",
                         ));
                     }
+                    in_multi = None;
                     crate::log_warning!(
                         "!!! Warning: short read while loading the AOF file {:?}: truncating it from {} to {} bytes (last complete command).",
                         path,
                         data.len(),
-                        offset
+                        trunc_offset
                     );
                     std::fs::OpenOptions::new()
                         .write(true)
                         .open(path)?
-                        .set_len(offset as u64)?;
+                        .set_len(trunc_offset as u64)?;
                     break;
                 }
                 Err(e) => return Err(bad(offset, &e)),
             }
+        }
+        // Like Redis, a MULTI without its EXEC at the end of the file is a
+        // truncated transaction: dropped (and cut off) under
+        // aof-load-truncated, an error otherwise.
+        if let Some((multi_offset, _)) = in_multi.take() {
+            if !load_truncated {
+                return Err(eof_err(
+                    multi_offset,
+                    "unfinished MULTI transaction at end of AOF (set aof-load-truncated yes to load anyway)",
+                ));
+            }
+            crate::log_warning!(
+                "!!! Warning: unfinished MULTI while loading the AOF file {:?}: truncating it from {} to {} bytes.",
+                path,
+                data.len(),
+                multi_offset
+            );
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)?
+                .set_len(multi_offset as u64)?;
         }
         Ok(count)
     })();
     crate::connection::CURRENT_DB.set(saved_db);
     db.select_db(saved_db);
     res
+}
+
+/// Applies one replayed command. `EVAL`/`EVALSHA` (which Redis before 5.0
+/// logged verbatim) run the script against `db`; everything else goes
+/// through the shard executor.
+fn apply_aof_command(cmd: &Command, db: &mut ShardDb, dummy_out: &mut Vec<u8>, count: &mut usize) {
+    match cmd {
+        Command::Eval {
+            script, keys, args, ..
+        } => {
+            crate::scripting::load_script(script);
+            replay_script(&String::from_utf8_lossy(script), keys, args, db);
+            *count += 1;
+        }
+        Command::Evalsha {
+            sha, keys, args, ..
+        } => {
+            let sha_str = String::from_utf8_lossy(sha).into_owned();
+            if let Some(script_str) = crate::scripting::get_script(&sha_str) {
+                replay_script(&script_str, keys, args, db);
+            }
+            *count += 1;
+        }
+        _ => {
+            let is_select = matches!(cmd, Command::Select(_));
+            crate::connection::execute_local_command(cmd, db, dummy_out, None);
+            dummy_out.clear();
+            if !is_select {
+                *count += 1;
+            }
+        }
+    }
+}
+
+/// Runs a replayed script against `db`, which `eval_script` needs behind an
+/// `Rc<RefCell<_>>`: `db` is moved in for the call and back out after it.
+fn replay_script(script: &str, keys: &[bytes::Bytes], args: &[bytes::Bytes], db: &mut ShardDb) {
+    let saved_db = crate::connection::CURRENT_DB.get();
+    let placeholder = ShardDb::new(db.port);
+    let cell = std::rc::Rc::new(std::cell::RefCell::new(std::mem::replace(db, placeholder)));
+    let _ = crate::scripting::eval_script(script, keys, args, &cell, None, false);
+    // The script's `redis.call` closures are scoped to `eval_script`, so
+    // this is the only reference left.
+    *db = std::rc::Rc::try_unwrap(cell)
+        .map_err(|_| ())
+        .expect("a replayed script kept a reference to the db")
+        .into_inner();
+    crate::connection::CURRENT_DB.set(saved_db);
+    db.select_db(saved_db);
+}
+
+/// Splits a manifest line like Redis's `sdssplitargs`: whitespace-separated
+/// tokens, where a token may be `"double quoted"` (with `\"`, `\\`, `\n`,
+/// `\r`, `\t`, `\xHH` escapes) or `'single quoted'` (with `\'`). Returns
+/// `None` for unbalanced quotes or a closing quote not followed by a space.
+fn split_manifest_args(line: &str) -> Option<Vec<String>> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == b.len() {
+            return Some(out);
+        }
+        let mut tok: Vec<u8> = Vec::new();
+        match b[i] {
+            b'"' => {
+                i += 1;
+                loop {
+                    match *b.get(i)? {
+                        b'"' => break,
+                        b'\\' => {
+                            let c = *b.get(i + 1)?;
+                            if c == b'x'
+                                && let Some(hex) = b.get(i + 2..i + 4)
+                                && let Ok(v) =
+                                    u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16)
+                            {
+                                tok.push(v);
+                                i += 4;
+                                continue;
+                            }
+                            tok.push(match c {
+                                b'n' => b'\n',
+                                b'r' => b'\r',
+                                b't' => b'\t',
+                                b'b' => 8,
+                                b'a' => 7,
+                                other => other,
+                            });
+                            i += 2;
+                        }
+                        c => {
+                            tok.push(c);
+                            i += 1;
+                        }
+                    }
+                }
+                i += 1;
+                if b.get(i).is_some_and(|c| !c.is_ascii_whitespace()) {
+                    return None;
+                }
+            }
+            b'\'' => {
+                i += 1;
+                loop {
+                    match *b.get(i)? {
+                        b'\'' => break,
+                        b'\\' if b.get(i + 1) == Some(&b'\'') => {
+                            tok.push(b'\'');
+                            i += 2;
+                        }
+                        c => {
+                            tok.push(c);
+                            i += 1;
+                        }
+                    }
+                }
+                i += 1;
+                if b.get(i).is_some_and(|c| !c.is_ascii_whitespace()) {
+                    return None;
+                }
+            }
+            _ => {
+                while i < b.len() && !b[i].is_ascii_whitespace() {
+                    tok.push(b[i]);
+                    i += 1;
+                }
+            }
+        }
+        out.push(String::from_utf8(tok).ok()?);
+    }
+}
+
+/// Parses a Redis 7+ `appendonly.aof.manifest` file and returns the ordered
+/// list of AOF files to load (base file first, then incremental files ordered
+/// by `seq`).
+fn parse_redis_aof_manifest(manifest_path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    let parent = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let content = std::fs::read_to_string(manifest_path)?;
+    if content.is_empty() {
+        return Err(invalid(format!(
+            "Found an empty AOF manifest in {:?}",
+            manifest_path
+        )));
+    }
+    let mut base_files: Vec<(u64, PathBuf)> = Vec::new();
+    let mut incr_files: Vec<(u64, PathBuf)> = Vec::new();
+    let mut saw_any_entry = false;
+    for raw_line in content.lines() {
+        if raw_line.len() > 1024 {
+            return Err(invalid(format!(
+                "The AOF manifest file contains too long line in {:?}",
+                manifest_path
+            )));
+        }
+        let line = raw_line.trim();
+        if line.is_empty() {
+            return Err(invalid(format!(
+                "Invalid AOF manifest file format in {:?}: blank line",
+                manifest_path
+            )));
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let bad_line = || {
+            invalid(format!(
+                "Invalid AOF manifest file format in {:?}: {:?}",
+                manifest_path, line
+            ))
+        };
+        let parts = split_manifest_args(line).ok_or_else(bad_line)?;
+        if !parts.len().is_multiple_of(2) {
+            return Err(bad_line());
+        }
+        // `key value` pairs in any order; unknown keys are ignored, as in Redis.
+        let (mut file_name, mut seq, mut kind) = (None, None, None);
+        for pair in parts.chunks(2) {
+            match pair[0].as_str() {
+                "file" => file_name = Some(pair[1].as_str()),
+                "seq" => seq = Some(pair[1].as_str()),
+                "type" => kind = Some(pair[1].as_str()),
+                _ => {}
+            }
+        }
+        let (Some(file_name), Some(seq), Some(kind)) = (file_name, seq, kind) else {
+            return Err(bad_line());
+        };
+        let seq: u64 = match seq.parse::<u64>() {
+            Ok(s) if s > 0 => s,
+            _ => return Err(bad_line()),
+        };
+        // Like Redis: entries are file names inside the AOF dir, never paths.
+        if file_name.is_empty()
+            || file_name == "."
+            || file_name == ".."
+            || file_name.contains('/')
+            || file_name.contains('\\')
+        {
+            return Err(invalid(format!(
+                "File can't be a path, just a filename, in {:?}: {:?}",
+                manifest_path, file_name
+            )));
+        }
+        let file_path = parent.join(file_name);
+        saw_any_entry = true;
+        match kind {
+            "b" => {
+                if !base_files.is_empty() {
+                    return Err(invalid(format!(
+                        "Found duplicate base file information in {:?}",
+                        manifest_path
+                    )));
+                }
+                base_files.push((seq, file_path));
+            }
+            "i" => {
+                if let Some(&(prev_seq, _)) = incr_files.last()
+                    && seq <= prev_seq
+                {
+                    return Err(invalid(format!(
+                        "Found a non-monotonic sequence number in {:?}: {:?}",
+                        manifest_path, line
+                    )));
+                }
+                incr_files.push((seq, file_path));
+            }
+            "h" => {} // history file: ignored by Redis on load
+            other => {
+                return Err(invalid(format!(
+                    "Unknown AOF file type '{}' in {:?}: {:?}",
+                    other, manifest_path, line
+                )));
+            }
+        }
+    }
+    if !saw_any_entry {
+        return Err(invalid(format!(
+            "Found an empty AOF manifest in {:?}",
+            manifest_path
+        )));
+    }
+    let mut out: Vec<PathBuf> = base_files.into_iter().map(|(_, p)| p).collect();
+    out.extend(incr_files.into_iter().map(|(_, p)| p));
+    for p in &out {
+        if !p.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Failed to open AOF file {:?}: No such file or directory", p),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Discovers Redis 7+ multi-part AOF (`appendonlydir/appendonly.aof.manifest`)
+/// or legacy single-file Redis AOF (`appendonly.aof`) inside `dir`.
+fn find_external_redis_aof_files(
+    dir: &Path,
+) -> std::io::Result<Option<(Option<PathBuf>, Vec<PathBuf>)>> {
+    let manifest_in_subdir = dir.join("appendonlydir").join("appendonly.aof.manifest");
+    if manifest_in_subdir.exists() {
+        let files = parse_redis_aof_manifest(&manifest_in_subdir)?;
+        return Ok(Some((Some(manifest_in_subdir), files)));
+    }
+    let manifest_in_dir = dir.join("appendonly.aof.manifest");
+    if manifest_in_dir.exists() {
+        let files = parse_redis_aof_manifest(&manifest_in_dir)?;
+        return Ok(Some((Some(manifest_in_dir), files)));
+    }
+    let single_in_subdir = dir.join("appendonlydir").join("appendonly.aof");
+    if single_in_subdir.exists() {
+        return Ok(Some((None, vec![single_in_subdir])));
+    }
+    let single_in_dir = dir.join("appendonly.aof");
+    if single_in_dir.exists() {
+        return Ok(Some((None, vec![single_in_dir])));
+    }
+    Ok(None)
+}
+
+fn compute_external_aof_crc(manifest: &Option<PathBuf>, files: &[PathBuf]) -> u64 {
+    let mut buf = Vec::new();
+    if let Some(m) = manifest
+        && let Ok(bytes) = std::fs::read(m)
+    {
+        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&bytes);
+    }
+    for f in files {
+        // Basenames only: moving the whole dir must not look like a change.
+        if let Some(name) = f.file_name() {
+            buf.extend_from_slice(name.to_string_lossy().as_bytes());
+        }
+        if let Ok(bytes) = std::fs::read(f) {
+            buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&bytes);
+        }
+    }
+    crate::table::crc64(&buf)
+}
+
+/// Splits a canonical rewritten AOF buffer across `num_shards` per-shard buffers.
+fn split_rewritten_aof_to_shards(
+    rewritten: &[u8],
+    num_shards: usize,
+) -> std::io::Result<Vec<Vec<u8>>> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); num_shards];
+    let mut cur_db: usize = 0;
+    let mut shard_db: Vec<usize> = vec![0; num_shards];
+    let mut buf = BytesMut::from(rewritten);
+    while !buf.is_empty() {
+        let start = rewritten.len() - buf.len();
+        let cmd = match crate::resp::parse_command(&mut buf) {
+            Ok(Some(cmd)) => cmd,
+            _ => return Err(invalid(format!("bad rewritten AOF at offset {}", start))),
+        };
+        if let Command::Select(idx) = &cmd {
+            cur_db = *idx as usize;
+            continue;
+        }
+        let raw = &rewritten[start..rewritten.len() - buf.len()];
+        // Every shard needs the index definitions (they lead the rewrite,
+        // in DB 0, before any SELECT).
+        if matches!(cmd, Command::FtCreate { .. }) {
+            for out in outputs.iter_mut() {
+                out.extend_from_slice(raw);
+            }
+            continue;
+        }
+        let shard = crate::connection::target_shard_of_cmd(&cmd, num_shards)
+            .or_else(|| raw_resp_arg(raw, 1).map(|k| crate::router::target_shard(k, num_shards)))
+            .unwrap_or(0);
+        if shard_db[shard] != cur_db {
+            let db_str = cur_db.to_string();
+            outputs[shard].extend_from_slice(
+                format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{}\r\n", db_str.len(), db_str).as_bytes(),
+            );
+            shard_db[shard] = cur_db;
+        }
+        outputs[shard].extend_from_slice(raw);
+    }
+    // The live writer appends assuming each file ends in DB 0 (it only logs
+    // SELECT on a change), so leave every file there, as the rewrite does.
+    for (out, db) in outputs.iter_mut().zip(shard_db) {
+        if db != 0 {
+            out.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
+        }
+    }
+    Ok(outputs)
 }
 
 /// Records how many shards wrote the `appendonly-{i}.aof` files in a dir.
@@ -2743,17 +3184,39 @@ impl AofLayout {
     }
 }
 
-fn write_aof_shards_manifest(dir: &Path, layout: AofLayout) -> std::io::Result<()> {
+fn write_aof_shards_manifest_with_ext(
+    dir: &Path,
+    layout: AofLayout,
+    ext_crc: Option<u64>,
+) -> std::io::Result<()> {
     let tmp = dir.join(format!("{}.tmp", AOF_SHARDS_MANIFEST));
-    let text = format!(
-        "shards {}\nrouting {}\n",
-        layout.shards,
-        layout.routing_name()
-    );
+    let text = match ext_crc {
+        Some(crc) => format!(
+            "shards {}\nrouting {}\next_crc {}\n",
+            layout.shards,
+            layout.routing_name(),
+            crc
+        ),
+        None => format!(
+            "shards {}\nrouting {}\n",
+            layout.shards,
+            layout.routing_name()
+        ),
+    };
     write_file_synced(&tmp, text.as_bytes())?;
     let target = dir.join(AOF_SHARDS_MANIFEST);
     std::fs::rename(&tmp, &target)?;
     sync_parent_dir(&target)
+}
+
+fn read_aof_shards_manifest_ext_crc(dir: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(dir.join(AOF_SHARDS_MANIFEST)).ok()?;
+    for line in text.lines() {
+        if let Some(("ext_crc", v)) = line.trim().split_once(' ') {
+            return v.trim().parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 fn read_aof_shards_manifest(dir: &Path) -> std::io::Result<Option<AofLayout>> {
@@ -2860,6 +3323,53 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
     }
 
     let new_layout = AofLayout::current(num_shards);
+    let prev_ext_crc = read_aof_shards_manifest_ext_crc(dir);
+    // AOF files written by Redis (a Redis 7+ multi-part manifest, or a single
+    // `appendonly.aof`) are imported into per-shard files the first time they
+    // are seen, and again only if they change. If they later disappear the
+    // imported shard files are kept: they hold every write since.
+    if let Some((manifest_opt, ext_files)) = find_external_redis_aof_files(dir)? {
+        let cur_crc = compute_external_aof_crc(&manifest_opt, &ext_files);
+        if prev_ext_crc != Some(cur_crc) {
+            let rudis_has_data = max_index.is_some_and(|max| {
+                (0..=max).any(|i| {
+                    dir.join(format!("appendonly-{}.aof", i))
+                        .metadata()
+                        .is_ok_and(|m| m.len() > 0)
+                })
+            });
+            if rudis_has_data && prev_ext_crc.is_none() {
+                return Err(invalid(format!(
+                    "{:?} holds both Redis AOF files ({:?}) and non-empty rudis appendonly-*.aof \
+                     files that were not imported from them. Refusing to guess which to load: move \
+                     one set away and restart",
+                    dir,
+                    manifest_opt.as_ref().unwrap_or(&ext_files[0])
+                )));
+            }
+            let old_shards = read_aof_shards_manifest(dir)?
+                .map(|l| l.shards)
+                .or(max_index.map(|i| i + 1))
+                .unwrap_or(0);
+            import_external_aof(&ext_files, num_shards, port, &staging)?;
+            swap_in_staged_aof(
+                dir,
+                &staging,
+                &marker,
+                old_shards,
+                new_layout,
+                Some(cur_crc),
+                &format!("aof-import-backup-{}", unix_ms_now()),
+            )?;
+            crate::log_notice!(
+                "Imported the Redis AOF files {:?} into {} shard AOF files",
+                ext_files,
+                num_shards
+            );
+            return Ok(None);
+        }
+    }
+
     let old_layout = match (read_aof_shards_manifest(dir)?, max_index) {
         (Some(l), Some(i)) if i >= l.shards => {
             return Err(invalid(format!(
@@ -2879,7 +3389,7 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
     let old_shards = old_layout.shards;
     if old_layout == new_layout {
         if !dir.join(AOF_SHARDS_MANIFEST).exists() {
-            write_aof_shards_manifest(dir, new_layout)?;
+            write_aof_shards_manifest_with_ext(dir, new_layout, prev_ext_crc)?;
         }
         return Ok(None);
     }
@@ -2901,57 +3411,93 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
     }
     drop(combined);
     let rewritten = std::fs::read(staging.join("appendonly-0.aof"))?;
-    let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); num_shards];
-    let mut cur_db: usize = 0;
-    let mut shard_db: Vec<usize> = vec![0; num_shards];
-    let mut buf = BytesMut::from(&rewritten[..]);
-    while !buf.is_empty() {
-        let start = rewritten.len() - buf.len();
-        let cmd = match crate::resp::parse_command(&mut buf) {
-            Ok(Some(cmd)) => cmd,
-            _ => return Err(invalid(format!("bad rewritten AOF at offset {}", start))),
-        };
-        if let Command::Select(idx) = &cmd {
-            cur_db = *idx as usize;
-            continue;
-        }
-        let raw = &rewritten[start..rewritten.len() - buf.len()];
-        // Every shard needs the index definitions (they lead the rewrite,
-        // in DB 0, before any SELECT).
-        if matches!(cmd, Command::FtCreate { .. }) {
-            for out in outputs.iter_mut() {
-                out.extend_from_slice(raw);
-            }
-            continue;
-        }
-        let shard = crate::connection::target_shard_of_cmd(&cmd, num_shards)
-            .or_else(|| raw_resp_arg(raw, 1).map(|k| crate::router::target_shard(k, num_shards)))
-            .unwrap_or(0);
-        if shard_db[shard] != cur_db {
-            let db_str = cur_db.to_string();
-            outputs[shard].extend_from_slice(
-                format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{}\r\n", db_str.len(), db_str).as_bytes(),
-            );
-            shard_db[shard] = cur_db;
-        }
-        outputs[shard].extend_from_slice(raw);
-    }
+    let outputs = split_rewritten_aof_to_shards(&rewritten, num_shards)?;
     for (i, out) in outputs.iter().enumerate() {
         write_file_synced(&staging.join(format!("appendonly-{}.aof", i)), out)?;
     }
     sync_parent_dir(&staging.join("appendonly-0.aof"))?;
 
     // 3. Swap: old files to a backup dir, new files in, manifest last.
-    let unix_ms = std::time::SystemTime::now()
+    swap_in_staged_aof(
+        dir,
+        &staging,
+        &marker,
+        old_shards,
+        new_layout,
+        prev_ext_crc,
+        &format!(
+            "aof-reshard-backup-{}to{}-{}",
+            old_shards,
+            num_shards,
+            unix_ms_now()
+        ),
+    )?;
+    Ok(Some(old_shards))
+}
+
+fn unix_ms_now() -> u128 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    let backup = dir.join(format!(
-        "aof-reshard-backup-{}to{}-{}",
-        old_shards, num_shards, unix_ms
-    ));
-    write_file_synced(&marker, backup.to_string_lossy().as_bytes())?;
-    sync_parent_dir(&marker)?;
+        .as_millis()
+}
+
+/// Replays AOF files written by Redis, in order, into one in-memory db and
+/// writes it to `staging` as `appendonly-{i}.aof` files split by key owner.
+///
+/// Replay follows Redis's loading rules (nothing expires mid-load; see
+/// [`crate::connection::LOADING_EXTERNAL_AOF`]); keys already expired at
+/// the end are left out of the rewrite.
+fn import_external_aof(
+    ext_files: &[PathBuf],
+    num_shards: usize,
+    port: u16,
+    staging: &Path,
+) -> std::io::Result<()> {
+    let mut combined = ShardDb::new(port);
+    crate::connection::LOADING_EXTERNAL_AOF.set(true);
+    let replayed = (|| {
+        for (idx, ext_path) in ext_files.iter().enumerate() {
+            // Only the newest file can end in a torn write.
+            let allow_trunc = idx + 1 == ext_files.len() && aof_load_truncated();
+            replay_aof_with(ext_path, &mut combined, allow_trunc)?;
+        }
+        Ok::<(), std::io::Error>(())
+    })();
+    crate::connection::LOADING_EXTERNAL_AOF.set(false);
+    replayed?;
+    std::fs::create_dir_all(staging)?;
+    rewrite_shard_aof(&mut combined, staging, 0)?;
+    // Replaying registered the indexes globally; the shards register them
+    // again when they replay their new files.
+    for name in combined.search_indices.keys() {
+        let _ = crate::search::drop_search_index(name);
+    }
+    drop(combined);
+    let rewritten = std::fs::read(staging.join("appendonly-0.aof"))?;
+    let outputs = split_rewritten_aof_to_shards(&rewritten, num_shards)?;
+    for (i, out) in outputs.iter().enumerate() {
+        write_file_synced(&staging.join(format!("appendonly-{}.aof", i)), out)?;
+    }
+    sync_parent_dir(&staging.join("appendonly-0.aof"))
+}
+
+/// Moves the current `appendonly-{0..old_shards}.aof` files into a backup
+/// dir named `backup_name`, moves the staged per-shard files in, and writes
+/// the shards manifest last. A marker file naming the backup exists for the
+/// whole swap, so an interrupted swap is detected at the next start.
+fn swap_in_staged_aof(
+    dir: &Path,
+    staging: &Path,
+    marker: &Path,
+    old_shards: usize,
+    layout: AofLayout,
+    ext_crc: Option<u64>,
+    backup_name: &str,
+) -> std::io::Result<()> {
+    let backup = dir.join(backup_name);
+    write_file_synced(marker, backup.to_string_lossy().as_bytes())?;
+    sync_parent_dir(marker)?;
     std::fs::create_dir_all(&backup)?;
     for i in 0..old_shards {
         let name = format!("appendonly-{}.aof", i);
@@ -2961,15 +3507,15 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
         }
     }
     sync_parent_dir(&backup.join("x"))?;
-    for i in 0..num_shards {
+    for i in 0..layout.shards {
         let name = format!("appendonly-{}.aof", i);
         std::fs::rename(staging.join(&name), dir.join(&name))?;
     }
-    write_aof_shards_manifest(dir, new_layout)?;
-    std::fs::remove_file(&marker)?;
-    sync_parent_dir(&marker)?;
-    let _ = std::fs::remove_dir_all(&staging);
-    Ok(Some(old_shards))
+    write_aof_shards_manifest_with_ext(dir, layout, ext_crc)?;
+    std::fs::remove_file(marker)?;
+    sync_parent_dir(marker)?;
+    let _ = std::fs::remove_dir_all(staging);
+    Ok(())
 }
 
 pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::io::Result<usize> {
@@ -5414,5 +5960,243 @@ mod tests {
             assert_eq!(restored.get(b"lost").map(|v| v.len()), Some(64 * 1024));
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Redis-format RDB file holding `db`'s keys.
+    fn redis_rdb_of(db: &mut ShardDb) -> Vec<u8> {
+        let mut file = Vec::new();
+        crate::redis_rdb::write_file_header(&mut file, 0);
+        db.save_rdb_chunk(&mut file).unwrap();
+        file.push(crate::redis_rdb::OP_EOF);
+        let crc = crate::table::crc64(&file);
+        file.extend_from_slice(&crc.to_le_bytes());
+        file
+    }
+
+    /// A Redis 7 multi-part AOF dir: a base RDB plus an incremental AOF.
+    fn write_redis7_aof_dir(dir: &Path, incr: &[u8]) {
+        let aof_dir = dir.join("appendonlydir");
+        std::fs::create_dir_all(&aof_dir).unwrap();
+        let mut base_db = ShardDb::new(0);
+        base_db.set(
+            Bytes::from_static(b"k_base"),
+            Bytes::from_static(b"v_base"),
+            None,
+        );
+        std::fs::write(
+            aof_dir.join("appendonly.aof.1.base.rdb"),
+            redis_rdb_of(&mut base_db),
+        )
+        .unwrap();
+        std::fs::write(aof_dir.join("appendonly.aof.1.incr.aof"), incr).unwrap();
+        std::fs::write(
+            aof_dir.join("appendonly.aof.manifest"),
+            "file appendonly.aof.1.base.rdb seq 1 type b\n\
+             file appendonly.aof.0.incr.aof seq 1 type h\n\
+             file appendonly.aof.1.incr.aof seq 1 type i\n",
+        )
+        .unwrap();
+    }
+
+    fn redis7_incr_sample() -> Vec<u8> {
+        let mut incr = Vec::new();
+        incr.extend_from_slice(b"#TS:1700000000\r\n");
+        incr.extend_from_slice(&resp_argv(&[b"MULTI".as_slice()]));
+        incr.extend_from_slice(&resp_argv(&[b"SET".as_slice(), b"k_tx", b"v_tx"]));
+        incr.extend_from_slice(&resp_argv(&[b"EXEC".as_slice()]));
+        // Redis applied the second RPUSH to the list it had not yet expired,
+        // so the whole list is gone once loaded.
+        incr.extend_from_slice(&resp_argv(&[b"RPUSH".as_slice(), b"exp_list", b"foo"]));
+        incr.extend_from_slice(&resp_argv(&[b"PEXPIREAT".as_slice(), b"exp_list", b"1000"]));
+        incr.extend_from_slice(&resp_argv(&[b"RPUSH".as_slice(), b"exp_list", b"bar"]));
+        incr
+    }
+
+    fn load_shards(dir: &Path, n: usize) -> ShardDb {
+        let mut loaded = ShardDb::new(0);
+        for i in 0..n {
+            replay_aof(&dir.join(format!("appendonly-{}.aof", i)), &mut loaded).unwrap();
+        }
+        loaded
+    }
+
+    #[test]
+    fn test_redis_multipart_aof_manifest_and_past_pexpireat_replay() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-mp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_redis7_aof_dir(&dir, &redis7_incr_sample());
+
+        assert_eq!(reshard_aof_dir(&dir, 2, 0).unwrap(), None);
+        let mut loaded = load_shards(&dir, 2);
+        assert_eq!(loaded.get(b"k_base"), Some(Bytes::from_static(b"v_base")));
+        assert_eq!(loaded.get(b"k_tx"), Some(Bytes::from_static(b"v_tx")));
+        assert_eq!(loaded.llen(b"exp_list").unwrap(), 0);
+        // The expired list was left out of the import, not kept until accessed.
+        assert_eq!(loaded.table.dbsize(), 2);
+        // The import flag is per-thread and was reset.
+        assert!(!crate::connection::LOADING_EXTERNAL_AOF.get());
+
+        // A restart with unchanged Redis files keeps rudis's own writes.
+        let shard0 = dir.join("appendonly-0.aof");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&shard0)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            &resp_argv(&[b"SET".as_slice(), b"after_import", b"1"]),
+        )
+        .unwrap();
+        drop(f);
+        assert_eq!(reshard_aof_dir(&dir, 2, 0).unwrap(), None);
+        let mut loaded = load_shards(&dir, 2);
+        assert_eq!(loaded.get(b"after_import"), Some(Bytes::from_static(b"1")));
+
+        // A reshard keeps the record of what was imported.
+        assert_eq!(reshard_aof_dir(&dir, 3, 0).unwrap(), Some(2));
+        assert!(read_aof_shards_manifest_ext_crc(&dir).is_some());
+        assert_eq!(reshard_aof_dir(&dir, 3, 0).unwrap(), None);
+        let mut loaded = load_shards(&dir, 3);
+        assert_eq!(loaded.get(b"after_import"), Some(Bytes::from_static(b"1")));
+
+        // Removing the Redis files keeps the imported data.
+        std::fs::remove_dir_all(dir.join("appendonlydir")).unwrap();
+        assert_eq!(reshard_aof_dir(&dir, 3, 0).unwrap(), None);
+        let mut loaded = load_shards(&dir, 3);
+        assert_eq!(loaded.get(b"k_base"), Some(Bytes::from_static(b"v_base")));
+        assert_eq!(loaded.get(b"after_import"), Some(Bytes::from_static(b"1")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_changed_redis_aof_is_reimported_with_a_backup() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-reimport-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let single = dir.join("appendonly.aof");
+        std::fs::write(&single, resp_argv(&[b"SET".as_slice(), b"a", b"1"])).unwrap();
+        assert_eq!(reshard_aof_dir(&dir, 1, 0).unwrap(), None);
+        assert_eq!(
+            load_shards(&dir, 1).get(b"a"),
+            Some(Bytes::from_static(b"1"))
+        );
+
+        std::fs::write(&single, resp_argv(&[b"SET".as_slice(), b"b", b"2"])).unwrap();
+        assert_eq!(reshard_aof_dir(&dir, 1, 0).unwrap(), None);
+        let mut loaded = load_shards(&dir, 1);
+        assert_eq!(loaded.get(b"a"), None);
+        assert_eq!(loaded.get(b"b"), Some(Bytes::from_static(b"2")));
+        // The previous shard file went to a backup dir, and no marker is left.
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("aof-import-backup-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 2, "one per import");
+        assert!(!dir.join(AOF_RESHARD_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_redis_aof_next_to_unimported_rudis_data_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-both-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("appendonly-0.aof"),
+            resp_argv(&[b"SET".as_slice(), b"rudis", b"1"]),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("appendonly.aof"),
+            resp_argv(&[b"SET".as_slice(), b"redis", b"1"]),
+        )
+        .unwrap();
+        let err = reshard_aof_dir(&dir, 1, 0).unwrap_err();
+        assert!(err.to_string().contains("Refusing to guess"), "{err}");
+        // Nothing was touched.
+        assert_eq!(
+            load_shards(&dir, 1).get(b"rudis"),
+            Some(Bytes::from_static(b"1"))
+        );
+
+        // Empty rudis files (created at startup) don't count as data.
+        std::fs::write(dir.join("appendonly-0.aof"), b"").unwrap();
+        assert_eq!(reshard_aof_dir(&dir, 1, 0).unwrap(), None);
+        assert_eq!(
+            load_shards(&dir, 1).get(b"redis"),
+            Some(Bytes::from_static(b"1"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_redis_aof_manifest_parsing() {
+        assert_eq!(
+            split_manifest_args(r#"file "a b.aof" seq 1 type 'i'"#).unwrap(),
+            ["file", "a b.aof", "seq", "1", "type", "i"]
+        );
+        assert_eq!(
+            split_manifest_args(r#"file "q\"\x41" seq 2"#).unwrap(),
+            ["file", "q\"A", "seq", "2"]
+        );
+        assert!(split_manifest_args(r#"file "unterminated"#).is_none());
+        assert!(split_manifest_args(r#"file "a"b seq 1"#).is_none());
+
+        let dir = std::env::temp_dir().join(format!("rudis-aof-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("appendonly.aof.manifest");
+        for f in ["b.rdb", "i 1.aof", "i2.aof"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        // Any key order, quoted names, history entries ignored.
+        std::fs::write(
+            &manifest,
+            "type b seq 1 file b.rdb\n\
+             file old.aof seq 1 type h\n\
+             file \"i 1.aof\" seq 1 type i\n\
+             seq 2 type i file i2.aof\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_redis_aof_manifest(&manifest).unwrap(),
+            [dir.join("b.rdb"), dir.join("i 1.aof"), dir.join("i2.aof")]
+        );
+        // Paths are rejected.
+        std::fs::write(&manifest, "file ../evil.aof seq 1 type i\n").unwrap();
+        let err = parse_redis_aof_manifest(&manifest).unwrap_err();
+        assert!(err.to_string().contains("just a filename"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_split_shard_files_end_in_db_0() {
+        let mut rewritten = resp_argv(&[b"SELECT".as_slice(), b"3"]);
+        rewritten.extend_from_slice(&resp_argv(&[b"SET".as_slice(), b"k", b"v"]));
+        rewritten.extend_from_slice(&resp_argv(&[b"SELECT".as_slice(), b"0"]));
+        let outputs = split_rewritten_aof_to_shards(&rewritten, 2).unwrap();
+        // A write the live writer appends afterwards (no SELECT, DB 0).
+        let mut db = ShardDb::new(0);
+        for mut out in outputs {
+            out.extend_from_slice(&resp_argv(&[b"SET".as_slice(), b"later", b"x"]));
+            let path = std::env::temp_dir().join(format!(
+                "rudis-split-db0-{}-{}.aof",
+                std::process::id(),
+                db.table.dbsize()
+            ));
+            std::fs::write(&path, &out).unwrap();
+            replay_aof(&path, &mut db).unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+        assert_eq!(db.get(b"later"), Some(Bytes::from_static(b"x")));
+        db.select_db(3);
+        assert_eq!(db.get(b"k"), Some(Bytes::from_static(b"v")));
+        assert_eq!(db.get(b"later"), None);
     }
 }

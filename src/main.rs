@@ -444,7 +444,7 @@ fn main() {
             Ok(None) => {}
             Err(e) => {
                 log_fatal!(
-                    "FATAL: cannot reshard the AOF files in {:?}: {}",
+                    "FATAL: cannot prepare (import or reshard) the AOF files in {:?}: {}",
                     aof_config.dir,
                     e
                 );

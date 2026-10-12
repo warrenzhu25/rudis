@@ -2179,6 +2179,63 @@ pub fn load_chunk(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResult<usiz
     Ok(ctx.count)
 }
 
+/// Loads an RDB preamble from the start of `data` (a pure RDB file or a
+/// hybrid RDB-preamble + RESP-tail AOF file) into `db`, keeping every key,
+/// and returns `(preamble_byte_len, keys_loaded)`.
+pub fn load_rdb_preamble(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResult<(usize, usize)> {
+    let ver = header_version(data)?;
+    if ver == 0 || ver > MAX_RDB_VERSION {
+        return Err(RdbError::new(format!(
+            "unsupported RDB version {ver} (rudis reads versions 1 to {MAX_RDB_VERSION})"
+        )));
+    }
+    if ver >= 5 && data.len() < 9 + 1 + 8 {
+        return Err(truncated());
+    }
+    let strict = matches!(classify(data), FileKind::Ambiguous);
+    // The legacy fallback below must flush `db` to discard a partial
+    // Redis-format parse, so it is only safe when `db` held nothing before
+    // this load; otherwise pre-existing keys would be wiped.
+    let db_was_empty = db.keyspace_stats_by_db().is_empty();
+    let mut r = Reader::new(&data[9..]);
+    let mut ctx = LoadCtx {
+        db,
+        shard: None,
+        strict,
+        load_functions: true,
+        now_ms: unix_ms_now(),
+        count: 0,
+    };
+    let res = load_records(&mut r, &mut ctx, false);
+    ctx.db.select_db(0);
+    if let Err(redis_err) = res {
+        if strict
+            && db_was_empty
+            && let Some((end_pos, count)) = crate::table::try_load_legacy_rdb_preamble(data, ctx.db)
+        {
+            return Ok((end_pos, count));
+        }
+        return Err(RdbError::new(format!(
+            "RDB parse error at offset {}: {redis_err}",
+            9 + r.position()
+        )));
+    }
+    let eof_end = 9 + r.position();
+    let end_pos = if ver >= 5 {
+        if data.len() < eof_end + 8 {
+            return Err(truncated());
+        }
+        let expected = le_u64(data, eof_end)?;
+        if expected != 0 && expected != crate::table::crc64(&data[..eof_end]) {
+            return corrupt("RDB CRC error: CRC64 checksum mismatch in RDB file");
+        }
+        eof_end + 8
+    } else {
+        eof_end
+    };
+    Ok((end_pos, ctx.count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2822,5 +2879,19 @@ mod tests {
                 let _ = decode_dump_body(&m, 0);
             }
         }
+    }
+
+    /// A corrupt ambiguous (`REDIS0011` + `SELECTDB 0`) preamble must fail
+    /// without the legacy fallback flushing keys the db already held.
+    #[test]
+    fn failed_preamble_load_keeps_existing_keys() {
+        let mut db = crate::shard::ShardDb::new(0);
+        db.set(Bytes::from("keep"), Bytes::from("v"), None);
+        let mut data = b"REDIS0011".to_vec();
+        data.extend_from_slice(&[OP_SELECTDB, 0, 0x7F]);
+        data.extend_from_slice(&[0u8; 16]);
+        assert!(matches!(classify(&data), FileKind::Ambiguous));
+        assert!(load_rdb_preamble(&data, &mut db).is_err());
+        assert_eq!(db.get(b"keep"), Some(Bytes::from("v")));
     }
 }
