@@ -5,13 +5,14 @@ Wants=network-online.target
 Documentation=https://github.com/warrenzhu25/rudis
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
 User=rudis
 Group=rudis
 ExecStart=/usr/local/bin/rudis -c /etc/rudis/rudis.conf
 Restart=always
 RestartSec=3s
-TimeoutStopSec=30s
+TimeoutStopSec=300s
 KillMode=mixed
 KillSignal=SIGTERM
 

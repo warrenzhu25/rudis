@@ -3071,7 +3071,10 @@ pub fn apply_config_value(
         "protected-mode" => {
             crate::netsec::set_protected_mode(base_port, parse_config_bool(name, val_str)?)
         }
-        "maxmemory-policy" => set_max_memory_policy(val_str),
+        "maxmemory-policy" => {
+            let p = crate::config::validate_maxmemory_policy(val_str)?;
+            set_max_memory_policy(&p);
+        }
         "requirepass" => {
             let acl = crate::acl::get_acl_for_port(port);
             acl.write().set_requirepass(val_str);
@@ -11490,6 +11493,17 @@ async fn execute_command_inner(
                             if crate::tiering::parse_memory_bytes(&val_str).is_none() {
                                 out.extend_from_slice(
                                     b"-ERR CONFIG SET failed (Invalid argument for 'maxmemory')\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "maxmemory-policy" {
+                            if let Err(e) = crate::config::validate_maxmemory_policy(&val_str) {
+                                out.extend_from_slice(
+                                    format!(
+                                        "-ERR CONFIG SET failed (possibly related to argument 'maxmemory-policy') - {}\r\n",
+                                        e
+                                    )
+                                    .as_bytes(),
                                 );
                                 return false;
                             }

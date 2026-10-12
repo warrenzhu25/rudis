@@ -468,6 +468,18 @@ pub fn set_databases_count(n: usize) {
     NUM_DATABASES.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
+pub fn validate_maxmemory_policy(policy: &str) -> Result<String, String> {
+    let p = policy.trim().to_ascii_lowercase();
+    match p.as_str() {
+        "noeviction" | "volatile-lru" | "allkeys-lru" | "volatile-lfu" | "allkeys-lfu"
+        | "volatile-random" | "allkeys-random" | "volatile-ttl" => Ok(p),
+        other => Err(format!(
+            "Invalid maxmemory-policy '{}' (expected noeviction|allkeys-lru|volatile-lru|allkeys-lfu|volatile-lfu|allkeys-random|volatile-random|volatile-ttl)",
+            other
+        )),
+    }
+}
+
 /// Redis rule: `SHUTDOWN SAVE` always snapshots, `NOSAVE` never does, and
 /// plain `SHUTDOWN` (or SIGTERM) snapshots when save points are configured.
 pub fn should_save_on_shutdown(save: Option<bool>, has_save_points: bool) -> bool {
@@ -540,13 +552,16 @@ impl RudisConfig {
                     })?;
                 }
                 "maxmemory" => {
-                    let raw_mem = rest[0].to_string();
+                    let raw_mem = unquote(rest[0]).to_string();
                     let bytes = crate::tiering::parse_memory_bytes(&raw_mem);
                     config.maxmemory = Some(raw_mem);
                     config.maxmemory_bytes = bytes;
                 }
                 "maxmemory-policy" => {
-                    config.maxmemory_policy = rest[0].to_lowercase();
+                    config.maxmemory_policy =
+                        validate_maxmemory_policy(unquote(rest[0])).map_err(|e| {
+                            format!("Invalid maxmemory-policy at line {}: {}", line_num + 1, e)
+                        })?;
                 }
                 "appendonly" => {
                     config.appendonly = match rest[0].to_lowercase().as_str() {
@@ -1468,5 +1483,19 @@ mod tests {
             dockerfile.contains("HEALTHCHECK"),
             "Dockerfile must define a HEALTHCHECK instruction"
         );
+        let service = fs::read_to_string("rudis.service").unwrap();
+        assert!(service.contains("Type=notify"));
+        assert!(service.contains("TimeoutStopSec=300s"));
+        assert!(Path::new("LICENSE").exists());
+        assert_eq!(
+            validate_maxmemory_policy("ALLKEYS-LFU").unwrap(),
+            "allkeys-lfu"
+        );
+        assert!(validate_maxmemory_policy("bogus-policy").is_err());
+        assert!(RudisConfig::parse_str("maxmemory-policy bogus").is_err());
+        let quoted =
+            RudisConfig::parse_str("maxmemory '700mb'\nmaxmemory-policy 'volatile-lru'").unwrap();
+        assert_eq!(quoted.maxmemory_policy, "volatile-lru");
+        assert_eq!(quoted.maxmemory_bytes, Some(700 * 1024 * 1024));
     }
 }

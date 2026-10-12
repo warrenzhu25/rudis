@@ -3413,6 +3413,66 @@ impl ShardDb {
                 write_bytes(buf, &crate::aof::resp_argv(&schema.ft_create_args()));
             }
         }
+
+        // 14. LLM quota buckets (LLM.QUOTA.*)
+        if !self.llm_quotas.is_empty() {
+            let now = std::time::Instant::now();
+            let unix_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            for (quota_key, bucket) in &self.llm_quotas {
+                let active_reqs: Vec<(u64, u64)> = bucket
+                    .requests
+                    .iter()
+                    .filter_map(|&(ts, tokens)| {
+                        let elapsed = now.duration_since(ts).as_millis() as u64;
+                        if elapsed < bucket.window_ms {
+                            Some((unix_now + (bucket.window_ms - elapsed).max(1), tokens))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let mut active_res: Vec<(u64, u64, u64)> = bucket
+                    .reservations
+                    .iter()
+                    .filter_map(|(&res_id, &(ts, est_tokens))| {
+                        let elapsed = now.duration_since(ts).as_millis() as u64;
+                        if elapsed < bucket.window_ms {
+                            Some((
+                                res_id,
+                                unix_now + (bucket.window_ms - elapsed).max(1),
+                                est_tokens,
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                active_res.sort_by_key(|(id, _, _)| *id);
+                if !active_reqs.is_empty()
+                    || !active_res.is_empty()
+                    || bucket.next_reservation_id > 1
+                {
+                    write_bytes(buf, quota_key);
+                    buf.push(21u8);
+                    buf.extend_from_slice(&bucket.window_ms.to_le_bytes());
+                    buf.extend_from_slice(&bucket.next_reservation_id.to_le_bytes());
+                    buf.extend_from_slice(&(active_reqs.len() as u32).to_le_bytes());
+                    for (exp_unix_ms, tokens) in active_reqs {
+                        buf.extend_from_slice(&exp_unix_ms.to_le_bytes());
+                        buf.extend_from_slice(&tokens.to_le_bytes());
+                    }
+                    buf.extend_from_slice(&(active_res.len() as u32).to_le_bytes());
+                    for (res_id, exp_unix_ms, est_tokens) in active_res {
+                        buf.extend_from_slice(&res_id.to_le_bytes());
+                        buf.extend_from_slice(&exp_unix_ms.to_le_bytes());
+                        buf.extend_from_slice(&est_tokens.to_le_bytes());
+                    }
+                }
+            }
+        }
     }
 
     /// Loads a [`Self::save_rdb_chunk`] record stream, keeping every key.
@@ -3658,6 +3718,46 @@ impl ShardDb {
                 }
                 if is_owned && !reg.calls.is_empty() {
                     self.agent_tools.insert(key, reg);
+                }
+                Ok(())
+            }
+            21 => {
+                let window_ms = read_u64(data)?.max(1);
+                let next_reservation_id = read_u64(data)?;
+                let reqs_len = read_u32(data)? as usize;
+                let now = std::time::Instant::now();
+                let mut bucket = crate::agent::LlmQuotaBucket::new(window_ms);
+                bucket.next_reservation_id = next_reservation_id;
+                for _ in 0..reqs_len {
+                    let exp_unix_ms = read_u64(data)?;
+                    let tokens = read_u64(data)?;
+                    if !is_owned || exp_unix_ms <= unix_now {
+                        continue;
+                    }
+                    let rem_ms = (exp_unix_ms - unix_now).min(window_ms);
+                    let age_ms = window_ms.saturating_sub(rem_ms);
+                    let ts = now
+                        .checked_sub(std::time::Duration::from_millis(age_ms))
+                        .unwrap_or(now);
+                    bucket.requests.push_back((ts, tokens));
+                }
+                let res_len = read_u32(data)? as usize;
+                for _ in 0..res_len {
+                    let res_id = read_u64(data)?;
+                    let exp_unix_ms = read_u64(data)?;
+                    let est_tokens = read_u64(data)?;
+                    if !is_owned || exp_unix_ms <= unix_now {
+                        continue;
+                    }
+                    let rem_ms = (exp_unix_ms - unix_now).min(window_ms);
+                    let age_ms = window_ms.saturating_sub(rem_ms);
+                    let ts = now
+                        .checked_sub(std::time::Duration::from_millis(age_ms))
+                        .unwrap_or(now);
+                    bucket.reservations.insert(res_id, (ts, est_tokens));
+                }
+                if is_owned {
+                    self.llm_quotas.insert(key, bucket);
                 }
                 Ok(())
             }
@@ -5135,5 +5235,36 @@ mod tests {
         assert_eq!(ft_hits(&replica, "idx:fsft", "hello"), ["fsft:1"]);
         let _ = crate::search::drop_search_index("idx:fsft");
         let _ = crate::search::drop_search_index("idx:fsft_stale");
+    }
+
+    #[test]
+    fn test_llm_quotas_round_trip_through_rdb() {
+        let mut db = ShardDb::new(0);
+        let key = Bytes::from_static(b"quota:gpt4");
+        let r1 = db.llm_quota_reserve(key.clone(), 10, 10_000, 500, Some(60_000));
+        assert!(r1.allowed);
+        assert_eq!(
+            db.llm_quota_settle(&key, r1.reservation_id.unwrap(), 420),
+            (true, -80)
+        );
+        let r2 = db.llm_quota_reserve(key.clone(), 10, 10_000, 300, Some(60_000));
+        assert!(r2.allowed);
+
+        let mut chunk = Vec::new();
+        db.save_rdb_chunk(&mut chunk).unwrap();
+
+        let mut restored = ShardDb::new(0);
+        restored.restore_rdb_chunk(&chunk).unwrap();
+        let (active_reqs, used_tok, res_tok, pending_res, window_ms) =
+            restored.llm_quota_info(&key);
+        assert_eq!(active_reqs, 2);
+        assert_eq!(used_tok, 420);
+        assert_eq!(res_tok, 300);
+        assert_eq!(pending_res, 1);
+        assert_eq!(window_ms, 60_000);
+        assert_eq!(
+            restored.llm_quota_settle(&key, r2.reservation_id.unwrap(), 250),
+            (true, -50)
+        );
     }
 }

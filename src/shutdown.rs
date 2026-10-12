@@ -9,7 +9,40 @@ pub fn is_shutting_down() -> bool {
 
 /// Initiates a graceful server shutdown.
 pub fn request_shutdown() {
-    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    if !SHUTDOWN_REQUESTED.swap(true, Ordering::SeqCst) {
+        let _ = sd_notify("STOPPING=1\n");
+    }
+}
+
+/// Sends a systemd notification datagram (`READY=1\n`, `STOPPING=1\n`, ...) to
+/// the socket path in `$NOTIFY_SOCKET`, if set.
+pub fn sd_notify(state: &str) -> bool {
+    let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") else {
+        return false;
+    };
+    sd_notify_to(&socket_path, state)
+}
+
+/// Sends a systemd notification datagram to `socket_path` (filesystem path or
+/// `@abstract` Linux socket).
+pub fn sd_notify_to(socket_path: &str, state: &str) -> bool {
+    if socket_path.is_empty() {
+        return false;
+    }
+    let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() else {
+        return false;
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(abstract_name) = socket_path.strip_prefix('@') {
+        use std::os::linux::net::SocketAddrExt;
+        if let Ok(addr) =
+            std::os::unix::net::SocketAddr::from_abstract_name(abstract_name.as_bytes())
+        {
+            return sock.send_to_addr(state.as_bytes(), &addr).is_ok();
+        }
+        return false;
+    }
+    sock.send_to(state.as_bytes(), socket_path).is_ok()
 }
 
 /// Resets the shutdown state (primarily used in tests between test cases).
@@ -159,5 +192,39 @@ mod tests {
         assert!(!all_shards_drained(4));
         reset_shutdown();
         assert!(!all_shards_drained(1));
+    }
+
+    #[test]
+    fn test_sd_notify_to_filesystem_and_abstract_sockets() {
+        let dir = std::env::temp_dir().join(format!("rudis-sd-notify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("notify.sock");
+        let receiver = std::os::unix::net::UnixDatagram::bind(&sock_path).unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        assert!(sd_notify_to(sock_path.to_str().unwrap(), "READY=1\n"));
+        let mut buf = [0u8; 32];
+        let n = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"READY=1\n");
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            let abs_name = format!("rudis-sd-notify-abs-{}", std::process::id());
+            let addr =
+                std::os::unix::net::SocketAddr::from_abstract_name(abs_name.as_bytes()).unwrap();
+            let abs_rx = std::os::unix::net::UnixDatagram::bind_addr(&addr).unwrap();
+            abs_rx
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            assert!(sd_notify_to(&format!("@{}", abs_name), "STOPPING=1\n"));
+            let n = abs_rx.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"STOPPING=1\n");
+        }
+
+        assert!(!sd_notify_to("", "READY=1\n"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

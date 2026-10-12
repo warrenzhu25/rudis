@@ -2370,6 +2370,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             if *n == num_shards {
                 router.calibrate_real_memory();
                 crate::log_notice!("Ready to accept connections tcp");
+                let _ = crate::shutdown::sd_notify("READY=1\n");
             }
         }
 

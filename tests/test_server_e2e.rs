@@ -26109,3 +26109,154 @@ fn test_mtls_client_auth_and_config_set_e2e() {
     shutdown_and_wait(port, &mut srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_ops_maxmemory_policy_validation_sd_notify_and_llm_quota_persistence_e2e() {
+    use std::os::unix::net::UnixDatagram;
+
+    let port = 17977;
+    let port_s = port.to_string();
+    let dir = std::env::temp_dir().join(format!(
+        "rudis_ops_e2e_{}_{}",
+        port,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap().to_string();
+
+    // 1. Bind a UnixDatagram socket for systemd NOTIFY_SOCKET
+    let notify_sock_path = dir.join("notify.sock");
+    let notify_rx = UnixDatagram::bind(&notify_sock_path).unwrap();
+    notify_rx
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 2. Startup with an invalid maxmemory-policy in config file must fail fast
+    let bad_conf = dir.join("bad.conf");
+    std::fs::write(&bad_conf, "maxmemory-policy definitely-invalid-policy\n").unwrap();
+    let bad_status = rudis_bin()
+        .args([bad_conf.to_str().unwrap(), "--port", &port_s, "--no-pin"])
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn rudis with invalid config");
+    assert!(
+        !bad_status.success(),
+        "server should reject invalid maxmemory-policy at startup"
+    );
+
+    // 3. Start valid server with NOTIFY_SOCKET and experimental commands enabled
+    let mut srv = rudis_bin()
+        .args([
+            "--port",
+            &port_s,
+            "--dir",
+            &dir_s,
+            "--threads",
+            "1",
+            "--no-pin",
+            "--enable-experimental-commands",
+            "yes",
+        ])
+        .env("NOTIFY_SOCKET", &notify_sock_path)
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rudis");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut c = loop {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            break s;
+        }
+        assert!(std::time::Instant::now() < deadline, "server did not start");
+        thread::sleep(Duration::from_millis(25));
+    };
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Verify systemd READY=1 notification was received
+    let mut notify_buf = [0u8; 64];
+    let n = notify_rx
+        .recv(&mut notify_buf)
+        .expect("expected READY=1 on NOTIFY_SOCKET");
+    assert_eq!(&notify_buf[..n], b"READY=1\n");
+
+    // 4. Runtime CONFIG SET maxmemory-policy validation
+    let bad_policy_resp = resp_cmd(
+        &mut c,
+        &["CONFIG", "SET", "maxmemory-policy", "not-a-valid-policy"],
+    );
+    assert!(bad_policy_resp.starts_with("-ERR "), "{bad_policy_resp}");
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "maxmemory-policy", "volatile-ttl"]
+        ),
+        "+OK\r\n"
+    );
+    assert!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "maxmemory-policy"]).contains("\r\nvolatile-ttl\r\n")
+    );
+
+    // 5. Populate LLM.QUOTA state and persist via SAVE
+    let reserve_resp = resp_cmd(
+        &mut c,
+        &[
+            "LLM.QUOTA.RESERVE",
+            "org:prod:quota",
+            "RPM",
+            "100",
+            "TPM",
+            "1000",
+            "EST_TOKENS",
+            "300",
+            "WINDOW",
+            "60000",
+        ],
+    );
+    assert!(reserve_resp.contains(":1\r\n"), "{reserve_resp}");
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+
+    // Verify systemd STOPPING=1 notification was sent during shutdown
+    let n_stop = notify_rx
+        .recv(&mut notify_buf)
+        .expect("expected STOPPING=1 on NOTIFY_SOCKET");
+    assert_eq!(&notify_buf[..n_stop], b"STOPPING=1\n");
+
+    // 6. Restart server from RDB and verify LLM.QUOTA state survived
+    let mut srv2 = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--dir",
+            &dir_s,
+            "--threads",
+            "1",
+            "--no-pin",
+            "--enable-experimental-commands",
+            "yes",
+        ],
+        port,
+    );
+    let mut c2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let quota_info = resp_cmd(&mut c2, &["LLM.QUOTA.INFO", "org:prod:quota"]);
+    assert!(
+        quota_info.contains("reserved_tokens\r\n:300\r\n")
+            && quota_info.contains("active_reservations\r\n:1\r\n"),
+        "LLM.QUOTA state did not survive RDB reload: {quota_info}"
+    );
+
+    drop(c2);
+    shutdown_and_wait(port, &mut srv2);
+    let _ = std::fs::remove_dir_all(&dir);
+}

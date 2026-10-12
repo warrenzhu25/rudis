@@ -16739,7 +16739,7 @@ fn load_legacy_records(
                 let _ = db.table.hdel(&key, &expired_on_disk);
             }
             continue;
-        } else if matches!(type_byte, 15..=18) {
+        } else if matches!(type_byte, 15..=18 | 21) {
             cursor += 1;
             let is_owned = crate::router::target_shard(&key, num_shards) == shard_id;
             let mut slice = &data[cursor..content_len];
