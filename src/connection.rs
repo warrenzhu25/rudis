@@ -5862,35 +5862,77 @@ async fn no_master_link(writer: &mut monoio::net::tcp::TcpOwnedWriteHalf, name: 
         .await;
 }
 
+/// Why [`snapshot_for_replica`] produced no snapshot.
+enum ReplicaSnapshotError {
+    /// We are a replica whose own master link is down.
+    NoMasterLink,
+    /// The snapshot could not be made (e.g. a tiered value was unreadable);
+    /// the replica is unregistered and should retry.
+    Failed(String),
+}
+
 /// The full-sync snapshot for replica `client_id`: the RDB, the replication
 /// id and offset it is at, the stream bytes that must follow it, and the
-/// registered replica. None when we are a replica whose master link is
-/// down. On a replica the snapshot is taken holding the apply token, so it
-/// matches the announced offset of our master's stream exactly.
+/// registered replica. An error when we are a replica whose master link is
+/// down, or when the snapshot failed. On a replica the snapshot is taken
+/// holding the apply token, so it matches the announced offset of our
+/// master's stream exactly.
 async fn snapshot_for_replica(
     hub: &std::sync::Arc<crate::replication::ReplicationHub>,
     router: &Rc<Router>,
     client_id: u64,
     write_tx: &flume::Sender<Vec<u8>>,
-) -> Option<(
-    Vec<u8>,
-    String,
-    u64,
-    Vec<u8>,
-    std::sync::Arc<crate::replication::ConnectedReplica>,
-)> {
+) -> Result<
+    (
+        Vec<u8>,
+        String,
+        u64,
+        Vec<u8>,
+        std::sync::Arc<crate::replication::ConnectedReplica>,
+    ),
+    ReplicaSnapshotError,
+> {
     let _apply = if hub.is_slave() {
         Some(hub.lock_apply().await)
     } else {
         None
     };
     hub.reset_stream_db();
-    let rep = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards)?;
+    let rep = hub
+        .register_full_sync_replica(client_id, write_tx.clone(), router.num_shards)
+        .ok_or(ReplicaSnapshotError::NoMasterLink)?;
     crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
     crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
-    let rdb = router.generate_full_rdb(Some(client_id)).await;
+    let rdb = match router.generate_full_rdb(Some(client_id)).await {
+        Ok(rdb) => rdb,
+        Err(e) => {
+            // Never ship a partial dataset: drop this attempt, the replica
+            // reconnects and asks again.
+            hub.unregister_replica(client_id);
+            crate::log_warning!("BGSAVE for replication failed: {}", e);
+            return Err(ReplicaSnapshotError::Failed(e));
+        }
+    };
     let (replid, offset, after_snapshot) = hub.finish_full_sync(client_id);
-    Some((rdb, replid, offset, after_snapshot, rep))
+    Ok((rdb, replid, offset, after_snapshot, rep))
+}
+
+/// Ends a (P)SYNC whose snapshot [`snapshot_for_replica`] could not make.
+async fn replica_snapshot_failed(
+    writer: &mut monoio::net::tcp::TcpOwnedWriteHalf,
+    name: &str,
+    err: ReplicaSnapshotError,
+) {
+    match err {
+        ReplicaSnapshotError::NoMasterLink => no_master_link(writer, name).await,
+        ReplicaSnapshotError::Failed(e) => {
+            let msg = format!(
+                "-ERR full sync failed: {}\r\n",
+                e.replace(['\r', '\n'], " ")
+            );
+            let _ = writer.write_all(msg.into_bytes()).await;
+        }
+    }
 }
 
 async fn run_master_replica_stream(
@@ -5972,12 +6014,14 @@ async fn run_master_replica_stream(
             }
             // Register before any shard serializes, so each shard's changes
             // after its snapshot reach the replica (see FullSyncCut).
-            let Some((rdb, replid, offset, after_snapshot, rep)) =
-                snapshot_for_replica(&hub, &router, client_id, &write_tx).await
-            else {
-                no_master_link(&mut writer, &name).await;
-                return;
-            };
+            let (rdb, replid, offset, after_snapshot, rep) =
+                match snapshot_for_replica(&hub, &router, client_id, &write_tx).await {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        replica_snapshot_failed(&mut writer, &name, e).await;
+                        return;
+                    }
+                };
             repl = rep;
             if repl.is_overflowed() || repl.is_disconnected() {
                 if repl.is_overflowed() {
@@ -5998,12 +6042,14 @@ async fn run_master_replica_stream(
         }
     } else {
         crate::log_notice!("Full resync requested by replica {}", name);
-        let Some((rdb, _, _, after_snapshot, rep)) =
-            snapshot_for_replica(&hub, &router, client_id, &write_tx).await
-        else {
-            no_master_link(&mut writer, &name).await;
-            return;
-        };
+        let (rdb, _, _, after_snapshot, rep) =
+            match snapshot_for_replica(&hub, &router, client_id, &write_tx).await {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    replica_snapshot_failed(&mut writer, &name, e).await;
+                    return;
+                }
+            };
         repl = rep;
         if repl.is_overflowed() || repl.is_disconnected() {
             if repl.is_overflowed() {
@@ -6087,11 +6133,16 @@ async fn run_shard_replication_flow(
         flow: hub.register_shard_flow(shard_id, client_id, write_tx.clone(), Some(raw_fd)),
     };
 
-    // Fetch this shard's RDB chunk
+    // Fetch this shard's RDB chunk. A shard that can't serialize all its
+    // keys fails the flow rather than hand out a partial dataset.
     let chunk = if shard_id == router.shard_id {
         let mut buf = Vec::new();
-        router.local_db.borrow_mut().save_rdb_chunk(&mut buf);
-        buf
+        router
+            .local_db
+            .borrow_mut()
+            .save_rdb_chunk(&mut buf)
+            .map(|()| buf)
+            .map_err(|e| e.to_string())
     } else {
         let (tx, rx) = flume::bounded(1);
         let msg = crate::shard::ShardMessage::SaveRdbChunk {
@@ -6099,9 +6150,25 @@ async fn run_shard_replication_flow(
             arm_replica: None,
         };
         if router.senders[shard_id].send(msg).is_ok() {
-            rx.recv_async().await.unwrap_or_default()
+            match rx.recv_async().await {
+                Ok(res) => res.map_err(|e| e.to_string()),
+                Err(_) => Err("shard did not return its data".to_string()),
+            }
         } else {
-            Vec::new()
+            Err("shard is not reachable".to_string())
+        }
+    };
+    let chunk = match chunk {
+        Ok(chunk) => chunk,
+        Err(e) => {
+            crate::log_warning!("Shard {} replication flow failed: {}", shard_id, e);
+            hub.unregister_shard_flow(shard_id, client_id);
+            let msg = format!(
+                "-ERR shard flow failed: {}\r\n",
+                e.replace(['\r', '\n'], " ")
+            );
+            let _ = writer.write_all(msg.into_bytes()).await;
+            return;
         }
     };
 

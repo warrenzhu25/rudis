@@ -321,6 +321,24 @@ pub struct ScanParams {
     pub key_type: Option<Bytes>,
 }
 
+/// A snapshot (RDB save, full sync) could not read a key's tiered value back
+/// from disk. The snapshot must then fail as a whole: writing it without the
+/// key would silently lose it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TieredReadError {
+    pub key: Bytes,
+}
+
+impl std::fmt::Display for TieredReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to read the tiered value of key '{}' from disk",
+            String::from_utf8_lossy(&self.key)
+        )
+    }
+}
+
 /// Messages passed across CPU cores to access or mutate a shard's data.
 pub enum ShardMessage {
     /// Transfer an accepted connection to a less loaded shard.
@@ -477,18 +495,20 @@ pub enum ShardMessage {
         responder: flume::Sender<()>,
     },
     SaveRdbChunk {
-        responder: flume::Sender<Vec<u8>>,
+        /// The chunk, or the failure that makes the snapshot unusable.
+        responder: flume::Sender<Result<Vec<u8>, TieredReadError>>,
         /// Replica (client id) whose full sync this chunk is for; the shard
         /// arms the replica's stream cut right after serializing.
         arm_replica: Option<u64>,
     },
     /// SAVE/BGSAVE: stream this shard's keyspace into `sink` in pieces,
     /// yielding in between (see [`save_rdb_chunk_yielding`]), then report on
-    /// `done` (`false` if the sink hung up). Unlike `SaveRdbChunk` this is a
+    /// `done` (`Ok(false)` if the sink hung up or the save was aborted, `Err`
+    /// if a tiered value could not be read). Unlike `SaveRdbChunk` this is a
     /// fuzzy snapshot, so it must not be used where an exact cut is needed.
     StreamRdbChunk {
         sink: flume::Sender<Option<Vec<u8>>>,
-        done: flume::Sender<bool>,
+        done: flume::Sender<Result<bool, TieredReadError>>,
     },
     Publish {
         channel: Bytes,
@@ -2776,19 +2796,26 @@ impl ShardDb {
         self.table.xinfo_consumers(key, group)
     }
 
+    /// Serializes this shard's keyspace into `buf`. Fails, with `buf` holding
+    /// a partial chunk the caller must discard, if a tiered value can't be
+    /// read back from disk.
     #[inline]
-    pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
+    pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) -> Result<(), TieredReadError> {
         let clock = RdbClock::now(self.port);
         if let Some(t0) = self.table_for_db(0) {
             for entry in t0.entries() {
-                self.save_rdb_entry(entry, &clock, buf);
+                self.save_rdb_entry(entry, &clock, buf)?;
             }
         }
         self.save_extended_rdb_chunk(buf);
-        self.save_other_dbs_rdb_chunk(&clock, buf);
+        self.save_other_dbs_rdb_chunk(&clock, buf)
     }
 
-    fn save_other_dbs_rdb_chunk(&self, clock: &RdbClock, buf: &mut Vec<u8>) {
+    fn save_other_dbs_rdb_chunk(
+        &self,
+        clock: &RdbClock,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), TieredReadError> {
         let max_db = self.max_db_len();
         let mut switched_db = false;
         for db_idx in 1..max_db {
@@ -2801,7 +2828,7 @@ impl ShardDb {
             crate::redis_rdb::write_selectdb(buf, db_idx);
             switched_db = true;
             for entry in table.entries() {
-                self.save_rdb_entry(entry, clock, buf);
+                self.save_rdb_entry(entry, clock, buf)?;
             }
             if !table.hash_field_expires.is_empty() {
                 let mut records = Vec::new();
@@ -2816,6 +2843,7 @@ impl ShardDb {
         if switched_db {
             crate::redis_rdb::write_selectdb(buf, 0);
         }
+        Ok(())
     }
 
     fn write_hash_field_expires_legacy(
@@ -2850,12 +2878,18 @@ impl ShardDb {
     }
 
     /// Serializes one table segment (see [`crate::table::RudisFlatTable::layout_epoch`]).
-    fn save_rdb_segment_db0(&self, seg: usize, clock: &RdbClock, buf: &mut Vec<u8>) {
+    fn save_rdb_segment_db0(
+        &self,
+        seg: usize,
+        clock: &RdbClock,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), TieredReadError> {
         if let Some(t0) = self.table_for_db(0) {
             for entry in t0.segment_entries(seg) {
-                self.save_rdb_entry(entry, clock, buf);
+                self.save_rdb_entry(entry, clock, buf)?;
             }
         }
+        Ok(())
     }
 
     fn save_rdb_entry(
@@ -2863,28 +2897,27 @@ impl ShardDb {
         entry: &crate::table::RudisEntry,
         clock: &RdbClock,
         buf: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), TieredReadError> {
         if let Some(exp) = entry.expire_at()
             && exp <= clock.now
             && !clock.keep_expired
         {
-            return;
+            return Ok(());
         }
         // A tiered record holds the value in `serialize_val_payload` form
         // (see `RudisTable::get_value_for_spill`); it is decoded so it can
-        // be written in the Redis encoding. It must be read before anything
-        // is written for this entry: a failed read has to skip the whole
-        // entry, never leave an expiry opcode or a key without a value
-        // behind.
+        // be written in the Redis encoding. A failed read fails the whole
+        // snapshot: like Redis, a save that cannot write every key must not
+        // produce (and rename into place) a file missing that key.
         let hydrated = match &entry.val {
             crate::table::RudisValue::Tiered(ptr) => match self.hydrate_tiered(**ptr) {
                 Some(val) => Some(val),
                 None => {
-                    tracing::error!(
-                        key = %String::from_utf8_lossy(&entry.key),
-                        "RDB save: failed to read tiered value, key skipped"
-                    );
-                    return;
+                    let err = TieredReadError {
+                        key: bytes::Bytes::copy_from_slice(&entry.key),
+                    };
+                    tracing::error!("RDB save failed: {}", err);
+                    return Err(err);
                 }
             },
             _ => None,
@@ -2905,6 +2938,7 @@ impl ShardDb {
             crate::redis_rdb::encode_stream_extras(&entry.key, s, &mut ext);
             crate::redis_rdb::write_ext_aux(buf, &ext);
         }
+        Ok(())
     }
 
     /// Reads a tiered record's value payload, already in
@@ -4313,26 +4347,28 @@ const RDB_SAVE_STEP: std::time::Duration = std::time::Duration::from_millis(1);
 ///
 /// Output goes to `sink` as `Some(piece)` every ~[`RDB_FLUSH_BYTES`] (and a
 /// final tail), which keeps memory bounded and avoids reallocating (copying)
-/// one huge buffer on the shard thread. Returns `false` if the sink hung up.
+/// one huge buffer on the shard thread. Returns `Ok(false)` if the sink hung
+/// up or the save was aborted, and an error if a tiered value can't be read
+/// back (the pieces sent so far must then be discarded).
 pub async fn save_rdb_chunk_yielding(
     db: &std::cell::RefCell<ShardDb>,
     sink: &flume::Sender<Option<Vec<u8>>>,
-) -> bool {
+) -> Result<bool, TieredReadError> {
     let mut cursor = RdbSaveCursor::new(&db.borrow());
     let mut buf = Vec::with_capacity(RDB_FLUSH_BYTES * 2);
     loop {
         if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
-            return false;
+            return Ok(false);
         }
         let prev_seg = cursor.seg;
-        let done = cursor.step(&db.borrow(), &mut buf, RDB_SAVE_STEP, RDB_FLUSH_BYTES);
+        let done = cursor.step(&db.borrow(), &mut buf, RDB_SAVE_STEP, RDB_FLUSH_BYTES)?;
         if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
-            return false;
+            return Ok(false);
         }
         if buf.len() >= RDB_FLUSH_BYTES {
             let piece = std::mem::replace(&mut buf, Vec::with_capacity(RDB_FLUSH_BYTES * 2));
             if sink.send_async(Some(piece)).await.is_err() {
-                return false;
+                return Ok(false);
             }
         }
         let delay_us =
@@ -4342,7 +4378,7 @@ pub async fn save_rdb_chunk_yielding(
             let sleep_ms = (delay_us.saturating_mul(segs_done) / 1000).clamp(1, 50);
             monoio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
             if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
-                return false;
+                return Ok(false);
             }
         }
         if done {
@@ -4353,9 +4389,9 @@ pub async fn save_rdb_chunk_yielding(
         crate::mailbox::yield_now().await;
     }
     if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
-        return false;
+        return Ok(false);
     }
-    buf.is_empty() || sink.send_async(Some(buf)).await.is_ok()
+    Ok(buf.is_empty() || sink.send_async(Some(buf)).await.is_ok())
 }
 
 /// Directory patterns (see [`crate::table::RudisFlatTable::segment_pattern`])
@@ -4406,19 +4442,20 @@ impl RdbSaveCursor {
 
     /// Serializes at least one segment, then more until `budget` has passed
     /// or `buf` holds `flush_bytes`. Returns true once everything, the
-    /// extended state included, is in `buf`.
+    /// extended state included, is in `buf`; fails if a tiered value can't
+    /// be read back.
     fn step(
         &mut self,
         db: &ShardDb,
         buf: &mut Vec<u8>,
         budget: Duration,
         flush_bytes: usize,
-    ) -> bool {
+    ) -> Result<bool, TieredReadError> {
         let clock = RdbClock::now(db.port);
         let Some(t0) = db.table_for_db(0) else {
             db.save_extended_rdb_chunk(buf);
-            db.save_other_dbs_rdb_chunk(&clock, buf);
-            return true;
+            db.save_other_dbs_rdb_chunk(&clock, buf)?;
+            return Ok(true);
         };
         if t0.layout_epoch() != self.epoch {
             // Renumbered (FLUSHALL, collapsing defrag): what is left is
@@ -4426,12 +4463,12 @@ impl RdbSaveCursor {
             for entry in t0.entries() {
                 let bits = crate::table::key_dir_bits(&entry.key);
                 if !self.written.covers(u8::MAX, bits) {
-                    db.save_rdb_entry(entry, &clock, buf);
+                    db.save_rdb_entry(entry, &clock, buf)?;
                 }
             }
             db.save_extended_rdb_chunk(buf);
-            db.save_other_dbs_rdb_chunk(&clock, buf);
-            return true;
+            db.save_other_dbs_rdb_chunk(&clock, buf)?;
+            return Ok(true);
         }
         let segments = t0.segment_count();
         let mut first = true;
@@ -4442,7 +4479,7 @@ impl RdbSaveCursor {
             let pattern = t0.segment_pattern(self.seg);
             if let Some((depth, bits)) = pattern {
                 if !self.written.covers(depth, bits) {
-                    db.save_rdb_segment_db0(self.seg, &clock, buf);
+                    db.save_rdb_segment_db0(self.seg, &clock, buf)?;
                 }
                 self.written.insert(depth, bits);
             }
@@ -4450,10 +4487,10 @@ impl RdbSaveCursor {
         }
         if self.seg >= segments {
             db.save_extended_rdb_chunk(buf);
-            db.save_other_dbs_rdb_chunk(&clock, buf);
-            return true;
+            db.save_other_dbs_rdb_chunk(&clock, buf)?;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 }
 
@@ -4540,7 +4577,10 @@ mod tests {
         let mut buf = Vec::new();
         let mut next = 6000;
         let mut steps = 0;
-        while !cursor.step(&db, &mut buf, Duration::ZERO, usize::MAX) {
+        while !cursor
+            .step(&db, &mut buf, Duration::ZERO, usize::MAX)
+            .unwrap()
+        {
             steps += 1;
             // Splits while the walk is under way, then let it finish.
             let grow = if steps <= 6 { 1500 } else { 0 };
@@ -4679,7 +4719,7 @@ mod tests {
 
         // Serialize to RDB chunk
         let mut chunk = Vec::new();
-        db.save_rdb_chunk(&mut chunk);
+        db.save_rdb_chunk(&mut chunk).unwrap();
         assert!(!chunk.is_empty());
 
         // Restore into new ShardDb
@@ -4851,7 +4891,7 @@ mod tests {
             }
 
             let mut chunk = Vec::new();
-            db.save_rdb_chunk(&mut chunk);
+            db.save_rdb_chunk(&mut chunk).unwrap();
             let mut restored = ShardDb::new(0);
             restored.restore_rdb_chunk(&chunk).unwrap();
 
@@ -4868,28 +4908,57 @@ mod tests {
     }
 
     #[test]
-    fn test_rdb_save_skips_unreadable_tiered_key_cleanly() {
-        let mut db = ShardDb::new(0);
-        db.set(
-            Bytes::from_static(b"lost"),
-            Bytes::from_static(b"v"),
-            Some(Duration::from_secs(1000)),
-        );
-        db.set(Bytes::from_static(b"kept"), Bytes::from_static(b"k"), None);
-        // No tier manager: the tiered value can't be read back.
-        let ptr = crate::table::TieredPointer {
-            file_id: 0,
-            offset: 0,
-            length: 32,
-            value_type: 0,
-        };
-        assert!(db.table.set_tiered_pointer(b"lost", ptr));
+    fn test_rdb_save_fails_on_unreadable_tiered_key() {
+        let dir = std::env::temp_dir().join(format!("rudis_tier_rdb_fail_{}", std::process::id()));
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut db = ShardDb::new(0);
+            let tm = std::rc::Rc::new(
+                crate::tiering::ShardTierManager::open(0, 55580, &dir)
+                    .await
+                    .unwrap(),
+            );
+            db.tier_manager = Some(tm.clone());
+            // Big enough to bypass the in-memory small bins: it is read
+            // from the backing file.
+            db.set(
+                Bytes::from_static(b"lost"),
+                Bytes::from(vec![b'v'; 64 * 1024]),
+                Some(Duration::from_secs(1000)),
+            );
+            db.set(Bytes::from_static(b"kept"), Bytes::from_static(b"k"), None);
+            spill_for_test(&mut db, b"lost").await;
 
-        let mut chunk = Vec::new();
-        db.save_rdb_chunk(&mut chunk);
-        let mut restored = ShardDb::new(0);
-        restored.restore_rdb_chunk(&chunk).unwrap();
-        assert_eq!(restored.get(b"kept"), Some(Bytes::from_static(b"k")));
-        assert_eq!(restored.get(b"lost"), None);
+            // Readable: the save succeeds and keeps the tiered key.
+            let mut chunk = Vec::new();
+            db.save_rdb_chunk(&mut chunk).unwrap();
+            let mut restored = ShardDb::new(0);
+            restored.restore_rdb_chunk(&chunk).unwrap();
+            assert_eq!(restored.get(b"lost").map(|v| v.len()), Some(64 * 1024));
+
+            // A real fault: the backing file loses its data.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tm.path)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+
+            let mut chunk = Vec::new();
+            let err = db.save_rdb_chunk(&mut chunk).unwrap_err();
+            assert_eq!(err.key, Bytes::from_static(b"lost"));
+            assert!(err.to_string().contains("'lost'"), "{err}");
+
+            // The streaming SAVE/BGSAVE path fails the same way.
+            let cell = std::cell::RefCell::new(db);
+            let (tx, rx) = flume::unbounded();
+            let err = save_rdb_chunk_yielding(&cell, &tx).await.unwrap_err();
+            assert_eq!(err.key, Bytes::from_static(b"lost"));
+            drop(rx);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

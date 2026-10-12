@@ -2940,10 +2940,13 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
         tmp_id
     ));
     let target_path = dir.join(format!("appendonly-{}.aof", shard_id));
+    let orig_db = db.current_db;
     let res = write_rewritten_aof(db, &tmp_path, &target_path);
     if res.is_err() {
-        // Don't leave a partial rewrite behind.
+        // Don't leave a partial rewrite behind; the live AOF is untouched.
         let _ = std::fs::remove_file(&tmp_path);
+        // A failure mid-way can leave another DB selected.
+        db.select_db(orig_db);
     }
     res
 }
@@ -3008,11 +3011,13 @@ fn write_rewritten_aof(
                         &hydrated_val
                     }
                     None => {
-                        tracing::error!(
-                            key = %String::from_utf8_lossy(k),
-                            "AOF rewrite: failed to read tiered value, key skipped"
-                        );
-                        continue;
+                        // Fail the rewrite: renaming a file without this key
+                        // over the complete old AOF would lose it for good.
+                        let err = crate::shard::TieredReadError {
+                            key: bytes::Bytes::copy_from_slice(&entry.key),
+                        };
+                        tracing::error!("AOF rewrite failed: {}", err);
+                        return Err(std::io::Error::other(err.to_string()));
                     }
                 },
                 other => other,
@@ -4417,7 +4422,7 @@ mod tests {
         let mut master = ShardDb::new(6379);
         master.set(Bytes::from("fresh"), Bytes::from("1"), None);
         let mut rdb = b"REDIS0011\xFE\x00".to_vec();
-        master.save_rdb_chunk(&mut rdb);
+        master.save_rdb_chunk(&mut rdb).unwrap();
         rdb.push(0xFF);
         let crc = crate::table::crc64(&rdb);
         rdb.extend_from_slice(&crc.to_le_bytes());
@@ -4499,7 +4504,7 @@ mod tests {
 
         // 1. Verify RDB chunk round-trip preserves field TTL
         let mut rdb_chunk = Vec::new();
-        db.save_rdb_chunk(&mut rdb_chunk);
+        db.save_rdb_chunk(&mut rdb_chunk).unwrap();
 
         let mut restored_rdb_db = ShardDb::new(6379);
         restored_rdb_db.restore_rdb_chunk(&rdb_chunk).unwrap();
@@ -4794,7 +4799,7 @@ mod tests {
 
         // Test 1: RDB chunk save & restore round-trip
         let mut rdb_chunk = Vec::new();
-        db.save_rdb_chunk(&mut rdb_chunk);
+        db.save_rdb_chunk(&mut rdb_chunk).unwrap();
         let mut rdb_restored = ShardDb::new(6379);
         rdb_restored.restore_rdb_chunk(&rdb_chunk).unwrap();
         verify_restored(&mut rdb_restored);
@@ -4867,6 +4872,78 @@ mod tests {
                 Some(bytes::Bytes::from_static(b"v"))
             );
             assert_eq!(restored.zscore(b"z", b"m").unwrap(), Some(2.5));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_aof_rewrite_fails_on_unreadable_tiered_value_and_keeps_old_aof() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-tier-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut db = ShardDb::new(0);
+            let tm = std::rc::Rc::new(
+                crate::tiering::ShardTierManager::open(0, 55581, &dir.join("tier"))
+                    .await
+                    .unwrap(),
+            );
+            db.tier_manager = Some(tm.clone());
+            db.set(
+                bytes::Bytes::from_static(b"kept"),
+                bytes::Bytes::from_static(b"k"),
+                None,
+            );
+            // In DB 1, so the failure happens with another DB selected.
+            db.select_db(1);
+            // Big enough to bypass the in-memory small bins.
+            db.set(
+                bytes::Bytes::from_static(b"lost"),
+                bytes::Bytes::from(vec![b'v'; 64 * 1024]),
+                None,
+            );
+            let (payload, val_type) = db.table.get_value_for_spill(b"lost").unwrap();
+            let ptr = tm
+                .stash_record(&bytes::Bytes::from_static(b"lost"), &payload, val_type)
+                .await
+                .unwrap();
+            assert!(db.table.set_tiered_pointer(b"lost", ptr));
+            db.select_db(0);
+
+            // A complete AOF from before the fault.
+            rewrite_shard_aof(&mut db, &dir, 0).unwrap();
+            let aof_path = dir.join("appendonly-0.aof");
+            let before = std::fs::read(&aof_path).unwrap();
+
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tm.path)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+
+            let err = rewrite_shard_aof(&mut db, &dir, 0).unwrap_err();
+            assert!(err.to_string().contains("'lost'"), "{err}");
+            // The old AOF is untouched, no temp file is left behind, and
+            // the selected DB is restored.
+            assert_eq!(std::fs::read(&aof_path).unwrap(), before);
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".tmp."))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+            assert_eq!(db.current_db, 0);
+
+            let mut restored = ShardDb::new(0);
+            replay_aof(&aof_path, &mut restored).unwrap();
+            restored.select_db(1);
+            assert_eq!(restored.get(b"lost").map(|v| v.len()), Some(64 * 1024));
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -4312,19 +4312,29 @@ impl Router {
 
     /// Serializes every shard into one RDB. With `arm_replica`, each shard
     /// arms that replica's stream cut right after serializing (see
-    /// `replication::FullSyncCut`).
-    pub async fn generate_full_rdb(&self, arm_replica: Option<u64>) -> Vec<u8> {
+    /// `replication::FullSyncCut`). Fails if any shard can't serialize all
+    /// its keys (a tiered value unreadable) or doesn't answer: a replica must
+    /// never load a partial dataset.
+    pub async fn generate_full_rdb(&self, arm_replica: Option<u64>) -> Result<Vec<u8>, String> {
         let mut full_rdb = Vec::new();
         let used_mem = self.local_db.borrow().total_used_memory() as u64;
         crate::redis_rdb::write_file_header(&mut full_rdb, used_mem);
 
         // Local shard chunk
-        self.local_db.borrow_mut().save_rdb_chunk(&mut full_rdb);
-        if let Some(id) = arm_replica {
+        let mut first_err = self
+            .local_db
+            .borrow_mut()
+            .save_rdb_chunk(&mut full_rdb)
+            .err()
+            .map(|e| format!("shard {}: {}", self.shard_id, e));
+        if let Some(id) = arm_replica
+            && first_err.is_none()
+        {
             crate::replication::get_replication_hub(self.port).arm_full_sync(id, self.shard_id);
         }
 
-        // Remote shard chunks
+        // Remote shard chunks. Every shard is waited for even after a
+        // failure, so none is still serializing when the caller gives up.
         let mut responders = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
@@ -4336,14 +4346,25 @@ impl Router {
                     })
                     .is_ok()
                 {
-                    responders.push(rx);
+                    responders.push((sid, rx));
+                } else if first_err.is_none() {
+                    first_err = Some(format!("shard {} is not reachable", sid));
                 }
             }
         }
-        for rx in responders {
-            if let Ok(chunk) = rx.recv_async().await {
-                full_rdb.extend_from_slice(&chunk);
-            }
+        for (sid, rx) in responders {
+            let err = match rx.recv_async().await {
+                Ok(Ok(chunk)) => {
+                    full_rdb.extend_from_slice(&chunk);
+                    continue;
+                }
+                Ok(Err(e)) => format!("shard {}: {}", sid, e),
+                Err(_) => format!("shard {} did not return its data", sid),
+            };
+            first_err.get_or_insert(err);
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
 
         if let Some((replid, offset, stream_db)) =
@@ -4354,7 +4375,7 @@ impl Router {
         full_rdb.push(0xFF);
         let crc = crate::table::crc64(&full_rdb);
         full_rdb.extend_from_slice(&crc.to_le_bytes());
-        full_rdb
+        Ok(full_rdb)
     }
 
     /// Replaces the whole dataset with a master's full-sync RDB. If any
@@ -4723,11 +4744,15 @@ impl Router {
                 return Err(WRITER_GONE.to_string());
             }
         }
-        if !crate::shard::save_rdb_chunk_yielding(&self.local_db, chunk_tx).await {
-            if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
-                return Err("save aborted by FLUSHALL".to_string());
+        match crate::shard::save_rdb_chunk_yielding(&self.local_db, chunk_tx).await {
+            Ok(true) => {}
+            Ok(false) => {
+                if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
+                    return Err("save aborted by FLUSHALL".to_string());
+                }
+                return Err(WRITER_GONE.to_string());
             }
-            return Err(WRITER_GONE.to_string());
+            Err(e) => return Err(format!("shard {}: {}", self.shard_id, e)),
         }
 
         // Shards stream in turn (each finishes before the next starts), so
@@ -4746,13 +4771,14 @@ impl Router {
                     })
                     .map_err(|_| format!("shard {} is not reachable", sid))?;
                 match done_rx.recv_async().await {
-                    Ok(true) => {}
-                    Ok(false) => {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
                         if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
                             return Err("save aborted by FLUSHALL".to_string());
                         }
                         return Err(WRITER_GONE.to_string());
                     }
+                    Ok(Err(e)) => return Err(format!("shard {}: {}", sid, e)),
                     Err(_) => return Err(format!("shard {} did not return its data", sid)),
                 }
             }

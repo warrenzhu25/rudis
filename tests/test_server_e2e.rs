@@ -18382,6 +18382,109 @@ fn test_bgrewriteaof_keeps_tiered_keys_with_their_types_e2e() {
 }
 
 #[test]
+fn test_unreadable_tiered_value_fails_saves_and_keeps_old_files_e2e() {
+    let port = 17190;
+    let dir = std::env::temp_dir().join(format!("rudis-tier-savefail-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Bigger than the tier's small-value bins, so it is read from the file.
+    let big = "v".repeat(64 * 1024);
+    assert_eq!(resp_cmd(&mut c, &["SET", "sf:big", &big]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "sf:small", "s"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["TIER", "SPILL", "sf:big"]), ":1\r\n");
+
+    // Complete files from before the fault.
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    let wait_rewrite = |c: &mut TcpStream| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while info_field(c, "aof_rewrite_in_progress") != "0" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rewrite never finished"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        info_field(c, "aof_last_bgrewrite_status")
+    };
+    assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+    assert_eq!(wait_rewrite(&mut c), "ok");
+    let rdb = dir.join("dump.rdb");
+    let aof = dir.join("appendonly-0.aof");
+    let rdb_before = std::fs::read(&rdb).unwrap();
+    let aof_before = std::fs::read(&aof).unwrap();
+    assert!(rdb_before.len() > 64 * 1024);
+    assert!(aof_before.len() > 64 * 1024);
+
+    // A real fault: the tier backing file loses its data.
+    let tier_file = dir
+        .join(format!("rudis_tier_{}", port))
+        .join("tier_shard_0.db");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tier_file)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+
+    let reply = resp_cmd(&mut c, &["SAVE"]);
+    assert!(reply.starts_with("-ERR"), "{reply}");
+    assert!(reply.contains("sf:big"), "{reply}");
+    assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "err");
+    assert_eq!(std::fs::read(&rdb).unwrap(), rdb_before);
+
+    assert!(resp_cmd(&mut c, &["BGSAVE"]).starts_with('+'));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while info_field(&mut c, "rdb_bgsave_in_progress") != "0" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bgsave never finished"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "err");
+    assert_eq!(std::fs::read(&rdb).unwrap(), rdb_before);
+
+    assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+    assert_eq!(wait_rewrite(&mut c), "err");
+    assert_eq!(std::fs::read(&aof).unwrap(), aof_before);
+
+    // A replica's full sync fails rather than ship a partial dataset.
+    let mut r = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let reply = send_and_read(&mut r, b"SYNC\r\n");
+    assert!(reply.starts_with("-ERR full sync failed"), "{reply}");
+    drop(r);
+
+    // The server stays up and still serves the in-memory key.
+    assert_eq!(resp_cmd(&mut c, &["GET", "sf:small"]), "$1\r\ns\r\n");
+    drop(c);
+    drop(_child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_dump_of_tiered_key_over_maxmemory_is_restorable_e2e() {
     let port = 17074;
     let port_s = port.to_string();
@@ -20316,7 +20419,7 @@ fn test_full_sync_replaces_dataset_and_failed_load_leaves_none_e2e() {
         None,
     );
     let mut chunk = Vec::new();
-    src.save_rdb_chunk(&mut chunk);
+    src.save_rdb_chunk(&mut chunk).unwrap();
     let rdb = |chunk: &[u8]| {
         let mut v = b"REDIS0011\xFE\x00".to_vec();
         v.extend_from_slice(chunk);
@@ -20826,7 +20929,7 @@ fn test_replica_replies_loading_while_it_loads_a_full_sync_e2e() {
         );
     }
     let mut rdb = b"REDIS0011\xFE\x00".to_vec();
-    src.save_rdb_chunk(&mut rdb);
+    src.save_rdb_chunk(&mut rdb).unwrap();
     rdb.push(0xFF);
     let crc = rudis::table::crc64(&rdb);
     rdb.extend_from_slice(&crc.to_le_bytes());

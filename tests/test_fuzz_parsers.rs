@@ -365,7 +365,7 @@ fn rdb_seed_payloads() -> Vec<Vec<u8>> {
     // A whole file in the Redis encoding.
     let mut file = Vec::new();
     rudis::redis_rdb::write_file_header(&mut file, 0);
-    db.save_rdb_chunk(&mut file);
+    db.save_rdb_chunk(&mut file).unwrap();
     file.push(0xFF);
     let crc = rudis::table::crc64(&file);
     file.extend_from_slice(&crc.to_le_bytes());

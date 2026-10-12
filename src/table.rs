@@ -17509,7 +17509,7 @@ mod tests {
         src.crdt_incrby(Bytes::from_static(b"crdt:b"), 5).unwrap();
         src.crdt_sadd(Bytes::from_static(b"crdt:c"), Bytes::from_static(b"m"));
         let mut chunk = Vec::new();
-        src.save_rdb_chunk(&mut chunk);
+        src.save_rdb_chunk(&mut chunk).unwrap();
         let mut body = vec![0xFE, 0x00];
         body.extend_from_slice(&chunk);
         body.push(0xFF);
@@ -17567,7 +17567,7 @@ mod tests {
         src.table
             .set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None);
         let mut chunk = Vec::new();
-        src.save_rdb_chunk(&mut chunk);
+        src.save_rdb_chunk(&mut chunk).unwrap();
 
         // Well-formed file loads.
         let mut body = vec![0xFE, 0x00];
@@ -17630,7 +17630,7 @@ mod tests {
             src.crdt_sadd(k.clone(), Bytes::from_static(b"m"));
         }
         let mut chunk = Vec::new();
-        src.save_rdb_chunk(&mut chunk);
+        src.save_rdb_chunk(&mut chunk).unwrap();
         let mut body = vec![0xFE, 0x00];
         body.extend_from_slice(&chunk);
         body.push(0xFF);
@@ -20318,7 +20318,7 @@ mod tests {
             .table
             .set(Bytes::from_static(b"fresh"), Bytes::from_static(b"1"), None);
         let mut chunk = Vec::new();
-        master.save_rdb_chunk(&mut chunk);
+        master.save_rdb_chunk(&mut chunk).unwrap();
         let body = |chunk: &[u8]| {
             let mut b = vec![0xFE, 0x00];
             b.extend_from_slice(chunk);
