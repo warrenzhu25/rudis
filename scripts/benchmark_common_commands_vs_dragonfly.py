@@ -169,6 +169,17 @@ WORKLOADS = [
         "command": "LPUSH __key__ __data__",
     },
     {
+        "id": "RPUSH",
+        "category": "Lists",
+        "name": "RPUSH",
+        "pipeline": 16,
+        "requests": 2000,
+        "data_size": 128,
+        "ratio": None,
+        "populate_type": None,
+        "command": "RPUSH __key__ __data__",
+    },
+    {
         "id": "LPOP",
         "category": "Lists",
         "name": "LPOP",
@@ -214,6 +225,17 @@ WORKLOADS = [
         "populate_type": "set",
         "command": "SISMEMBER __key__ __data__",
     },
+    {
+        "id": "SPOP",
+        "category": "Sets",
+        "name": "SPOP",
+        "pipeline": 16,
+        "requests": 2000,
+        "data_size": None,
+        "ratio": None,
+        "populate_type": "set",
+        "command": "SPOP __key__",
+    },
 
     # 5. Sorted Sets (ZSets)
     {
@@ -237,6 +259,17 @@ WORKLOADS = [
         "ratio": None,
         "populate_type": "zset",
         "command": "ZRANGE __key__ 0 10",
+    },
+    {
+        "id": "ZPOPMIN",
+        "category": "Sorted Sets",
+        "name": "ZPOPMIN",
+        "pipeline": 16,
+        "requests": 2000,
+        "data_size": None,
+        "ratio": None,
+        "populate_type": "zset",
+        "command": "ZPOPMIN __key__",
     },
 
     # 6. Keyspace / Generic
