@@ -26778,3 +26778,51 @@ fn test_hdel_srem_zrem_touch_single_and_multi_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_rpush_rpop_spop_zpopmin_parse_forms_e2e() {
+    let port = 17987u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Key-only and counted forms, mixed case, across several shards.
+    let mut pipe = String::new();
+    let mut expected = String::new();
+    for i in 0..4 {
+        pipe.push_str(&format!("rpush pf_l_{i} a\r\n"));
+        pipe.push_str(&format!("RPUSH pf_l_{i} b c d\r\n"));
+        pipe.push_str(&format!("RpOp pf_l_{i}\r\n"));
+        pipe.push_str(&format!("RPOP pf_l_{i} 2\r\n"));
+        pipe.push_str(&format!("SADD pf_s_{i} x\r\n"));
+        pipe.push_str(&format!("spop pf_s_{i}\r\n"));
+        pipe.push_str(&format!("SPOP pf_s_{i} 2\r\n"));
+        pipe.push_str(&format!("ZADD pf_z_{i} 1 p 2 q 3 r\r\n"));
+        pipe.push_str(&format!("zpopmin pf_z_{i}\r\n"));
+        pipe.push_str(&format!("ZPOPMIN pf_z_{i} 2\r\n"));
+        expected.push_str(":1\r\n:4\r\n$1\r\nd\r\n*2\r\n$1\r\nc\r\n$1\r\nb\r\n");
+        expected.push_str(":1\r\n$1\r\nx\r\n*0\r\n");
+        expected.push_str(
+            ":3\r\n*2\r\n$1\r\np\r\n$1\r\n1\r\n*4\r\n$1\r\nq\r\n$1\r\n2\r\n$1\r\nr\r\n$1\r\n3\r\n",
+        );
+    }
+
+    let resp = send_and_read(&mut c, pipe.as_bytes());
+    assert_eq!(resp, expected);
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

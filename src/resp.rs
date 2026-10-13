@@ -2557,6 +2557,20 @@ fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Com
                             members: items,
                         }));
                     }
+                    if cmd_bytes.eq_ignore_ascii_case(b"RPOP") && num_args == 2 {
+                        let (k_start, k_len) = offsets[1];
+                        return Ok(Some(Command::Rpop {
+                            key: frame.slice(k_start..k_start + k_len),
+                            count: None,
+                        }));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"SPOP") && num_args == 2 {
+                        let (k_start, k_len) = offsets[1];
+                        return Ok(Some(Command::Spop {
+                            key: frame.slice(k_start..k_start + k_len),
+                            count: None,
+                        }));
+                    }
                     if cmd_bytes.eq_ignore_ascii_case(b"PING") && num_args == 1 {
                         return Ok(Some(Command::Ping(None)));
                     }
@@ -2591,6 +2605,17 @@ fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Com
                             keys.push(frame.slice(k_s..k_s + k_l));
                         }
                         return Ok(Some(Command::Touch(keys)));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"RPUSH") && num_args >= 3 {
+                        let (k_start, k_len) = offsets[1];
+                        let mut values = SmallVec::with_capacity(num_args - 2);
+                        for &(v_s, v_l) in offsets[2..num_args].iter() {
+                            values.push(frame.slice(v_s..v_s + v_l));
+                        }
+                        return Ok(Some(Command::Rpush {
+                            key: frame.slice(k_start..k_start + k_len),
+                            values,
+                        }));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"LPUSH") && num_args == 3 {
                         let (k_start, k_len) = offsets[1];
@@ -2666,6 +2691,15 @@ fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Com
                             keys.push(frame.slice(k_s..k_s + k_l));
                         }
                         return Ok(Some(Command::Unlink(keys)));
+                    }
+                }
+                7 => {
+                    if cmd_bytes.eq_ignore_ascii_case(b"ZPOPMIN") && num_args == 2 {
+                        let (k_start, k_len) = offsets[1];
+                        return Ok(Some(Command::Zpopmin {
+                            key: frame.slice(k_start..k_start + k_len),
+                            count: None,
+                        }));
                     }
                 }
                 8 => {
@@ -15322,6 +15356,79 @@ mod tests {
         let mut buf = BytesMut::from("*1\r\n$7\r\nunknown\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(cmd, Command::Unknown("UNKNOWN".to_string()));
+    }
+
+    #[test]
+    fn test_fast_parse_rpush_rpop_spop_zpopmin() {
+        let k = || Bytes::from_static(b"k");
+        for (wire, want) in [
+            (
+                "*3\r\n$5\r\nrpush\r\n$1\r\nk\r\n$1\r\na\r\n",
+                Command::Rpush {
+                    key: k(),
+                    values: smallvec![Bytes::from_static(b"a")],
+                },
+            ),
+            (
+                "*4\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n$1\r\na\r\n$1\r\nb\r\n",
+                Command::Rpush {
+                    key: k(),
+                    values: smallvec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+                },
+            ),
+            (
+                "*2\r\n$4\r\nRpOp\r\n$1\r\nk\r\n",
+                Command::Rpop {
+                    key: k(),
+                    count: None,
+                },
+            ),
+            (
+                "*2\r\n$4\r\nspop\r\n$1\r\nk\r\n",
+                Command::Spop {
+                    key: k(),
+                    count: None,
+                },
+            ),
+            (
+                "*2\r\n$7\r\nZPOPMIN\r\n$1\r\nk\r\n",
+                Command::Zpopmin {
+                    key: k(),
+                    count: None,
+                },
+            ),
+            // With a count, the generic parser still handles them.
+            (
+                "*3\r\n$4\r\nRPOP\r\n$1\r\nk\r\n$1\r\n2\r\n",
+                Command::Rpop {
+                    key: k(),
+                    count: Some(2),
+                },
+            ),
+            (
+                "*3\r\n$4\r\nSPOP\r\n$1\r\nk\r\n$1\r\n2\r\n",
+                Command::Spop {
+                    key: k(),
+                    count: Some(2),
+                },
+            ),
+            (
+                "*3\r\n$7\r\nzpopmin\r\n$1\r\nk\r\n$1\r\n2\r\n",
+                Command::Zpopmin {
+                    key: k(),
+                    count: Some(2),
+                },
+            ),
+        ] {
+            let mut buf = BytesMut::from(wire);
+            assert_eq!(parse_command(&mut buf).unwrap().unwrap(), want, "{wire:?}");
+            assert!(buf.is_empty());
+        }
+        // Arity errors are unchanged.
+        let mut buf = BytesMut::from("*2\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n");
+        assert!(parse_command(&mut buf).is_err());
+        let mut buf = BytesMut::from("*3\r\n$7\r\nZPOPMIN\r\n$1\r\nk\r\n$2\r\n-1\r\n");
+        assert!(parse_command(&mut buf).is_err());
     }
 
     #[test]
