@@ -3,203 +3,27 @@
 //!
 //! Like Dragonfly's `DenseSet`, a bucket points straight at the member: no id,
 //! no side location table. A bucket is a `u32` handle, `page << 12 | offset`
-//! (pages are 4096 bytes, so the offset fits 12 bits). A page entry is
-//! `[varint(len << 1 | dead)][bytes]`, so a 5-byte member costs 6 bytes of
-//! page plus a 4-byte bucket (and the table's control byte and slack).
+//! into a [`PageStore`]; a 5-byte member costs a 6-byte page entry plus a
+//! 4-byte bucket (and the table's control byte and slack).
 //!
-//! Removing a member sets the entry's dead bit. A page is compacted in place
-//! once at least half of it is dead; each moved member is re-hashed to find
-//! and repoint its bucket. A member longer than [`OWN_PAGE_MIN`] gets a page
-//! of its own (offset 0) that is freed when the member is removed.
+//! Removing a member sets the entry's dead bit; a half-dead page is compacted
+//! in place and each moved member re-hashed to find and repoint its bucket.
 //!
 //! `u32` handles address 2^20 pages. A set that would need more switches,
-//! once, to `u64` handles (`page << 32 | offset`), so there is no size limit.
+//! once, to `u64` handles, so there is no size limit.
 
+use crate::pagestore::{Handle, PageStore};
 use bytes::Bytes;
-
-/// Normal page size: an exact allocator size class.
-const PAGE_BYTES: usize = 4096;
-/// Members longer than this get a page of their own.
-const OWN_PAGE_MIN: usize = PAGE_BYTES / 4;
-/// `current` when no page takes appends.
-const NO_PAGE: u32 = u32::MAX;
 
 #[inline(always)]
 fn hash_member(m: &[u8]) -> u64 {
     fxhash::hash64(m)
 }
 
-#[inline]
-fn varint_len(n: usize) -> usize {
-    match n {
-        0..=0x7F => 1,
-        0x80..=0x3FFF => 2,
-        0x4000..=0x1F_FFFF => 3,
-        0x20_0000..=0xFFF_FFFF => 4,
-        _ => 5,
-    }
-}
-
-#[inline]
-fn write_varint(buf: &mut Vec<u8>, mut n: usize) {
-    while n >= 0x80 {
-        buf.push((n as u8) | 0x80);
-        n >>= 7;
-    }
-    buf.push(n as u8);
-}
-
-/// (member length, dead, start of the member bytes) of the entry at `off`.
-/// The dead flag is bit 0 of the varint, i.e. bit 0 of its first byte.
-#[inline]
-fn parse_entry(buf: &[u8], off: usize) -> (usize, bool, usize) {
-    let mut n = 0usize;
-    let mut shift = 0;
-    let mut i = off;
-    loop {
-        let b = buf[i];
-        n |= ((b & 0x7F) as usize) << shift;
-        i += 1;
-        if b & 0x80 == 0 {
-            return (n >> 1, n & 1 == 1, i);
-        }
-        shift += 7;
-    }
-}
-
-/// Where a member lives: page index and byte offset of its entry.
-trait Handle: Copy + Eq + Default + std::fmt::Debug {
-    fn max_pages() -> usize;
-    fn pack(page: usize, off: usize) -> Self;
-    fn page(self) -> usize;
-    fn off(self) -> usize;
-}
-
-impl Handle for u32 {
-    #[inline(always)]
-    fn max_pages() -> usize {
-        narrow_page_limit()
-    }
-    #[inline(always)]
-    fn pack(page: usize, off: usize) -> u32 {
-        debug_assert!(off < PAGE_BYTES);
-        ((page as u32) << 12) | off as u32
-    }
-    #[inline(always)]
-    fn page(self) -> usize {
-        (self >> 12) as usize
-    }
-    #[inline(always)]
-    fn off(self) -> usize {
-        (self & 0xFFF) as usize
-    }
-}
-
-impl Handle for u64 {
-    #[inline(always)]
-    fn max_pages() -> usize {
-        NO_PAGE as usize
-    }
-    #[inline(always)]
-    fn pack(page: usize, off: usize) -> u64 {
-        ((page as u64) << 32) | off as u64
-    }
-    #[inline(always)]
-    fn page(self) -> usize {
-        (self >> 32) as usize
-    }
-    #[inline(always)]
-    fn off(self) -> usize {
-        (self & 0xFFFF_FFFF) as usize
-    }
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-fn narrow_page_limit() -> usize {
-    1 << 20
-}
-
-#[cfg(test)]
-thread_local! {
-    static NARROW_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(1 << 20) };
-}
-
-#[cfg(test)]
-fn narrow_page_limit() -> usize {
-    NARROW_LIMIT.with(|c| c.get())
-}
-
-#[derive(Clone, Debug, Default)]
-struct Page {
-    buf: Vec<u8>,
-    dead: usize,
-}
-
-/// The set's pages. Page 0 lives inline in the set, so a set that fits one
-/// page (a few hundred short members) reaches its members without first
-/// loading a separate page table: one dependent cache miss fewer per lookup.
-#[derive(Clone, Debug, Default)]
-struct Pages {
-    first: Page,
-    rest: Vec<Page>,
-    n: usize,
-}
-
-impl Pages {
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.n
-    }
-
-    fn push(&mut self, p: Page) {
-        if self.n == 0 {
-            self.first = p;
-        } else {
-            self.rest.push(p);
-        }
-        self.n += 1;
-    }
-}
-
-impl std::ops::Index<usize> for Pages {
-    type Output = Page;
-    #[inline(always)]
-    fn index(&self, i: usize) -> &Page {
-        if i == 0 {
-            &self.first
-        } else {
-            &self.rest[i - 1]
-        }
-    }
-}
-
-impl std::ops::IndexMut<usize> for Pages {
-    #[inline(always)]
-    fn index_mut(&mut self, i: usize) -> &mut Page {
-        if i == 0 {
-            &mut self.first
-        } else {
-            &mut self.rest[i - 1]
-        }
-    }
-}
-
-#[inline]
-fn get_in<H: Handle>(pages: &Pages, h: H) -> &[u8] {
-    let buf = &pages[h.page()].buf;
-    let (len, _, start) = parse_entry(buf, h.off());
-    &buf[start..start + len]
-}
-
 #[derive(Clone, Debug)]
 struct Inner<H> {
     dict: hashbrown::HashTable<H>,
-    pages: Pages,
-    /// Pages released (fully dead), reusable.
-    free_pages: Vec<u32>,
-    /// Normal page new members are appended to, or `NO_PAGE`.
-    current: u32,
+    store: PageStore<H>,
     len: usize,
 }
 
@@ -207,9 +31,7 @@ impl<H> Default for Inner<H> {
     fn default() -> Self {
         Inner {
             dict: hashbrown::HashTable::new(),
-            pages: Pages::default(),
-            free_pages: Vec::new(),
-            current: NO_PAGE,
+            store: PageStore::default(),
             len: 0,
         }
     }
@@ -218,67 +40,23 @@ impl<H> Default for Inner<H> {
 impl<H: Handle> Inner<H> {
     #[inline]
     fn find(&self, m: &[u8], hash: u64) -> Option<H> {
-        let pages = &self.pages;
-        self.dict.find(hash, |&h| get_in(pages, h) == m).copied()
-    }
-
-    fn alloc_page(&mut self, cap: usize) -> Option<usize> {
-        if let Some(p) = self.free_pages.pop() {
-            let p = p as usize;
-            self.pages[p] = Page {
-                buf: Vec::with_capacity(cap),
-                dead: 0,
-            };
-            return Some(p);
-        }
-        if self.pages.len() >= H::max_pages() {
-            return None;
-        }
-        self.pages.push(Page {
-            buf: Vec::with_capacity(cap),
-            dead: 0,
-        });
-        Some(self.pages.len() - 1)
+        let store = &self.store;
+        self.dict.find(hash, |&h| store.get(h) == m).copied()
     }
 
     /// Adds `m` (known absent). False, with nothing changed, when its
     /// location would not fit a handle `H`.
     fn insert_new(&mut self, m: &[u8], hash: u64) -> bool {
-        let need = varint_len(m.len() << 1) + m.len();
-        let page = if m.len() > OWN_PAGE_MIN {
-            match self.alloc_page(need) {
-                Some(p) => p,
-                None => return false,
-            }
-        } else {
-            let cur = self.current as usize;
-            if self.current != NO_PAGE && self.pages[cur].buf.len() + need <= PAGE_BYTES {
-                cur
-            } else {
-                let Some(p) = self.alloc_page(PAGE_BYTES) else {
-                    return false;
-                };
-                if self.current != NO_PAGE {
-                    // The retired page was exempt from compaction while it
-                    // took appends; compact it now if it needs it.
-                    self.current = NO_PAGE;
-                    let old = &self.pages[cur];
-                    if old.dead * 2 >= old.buf.len() {
-                        self.compact(cur);
-                    }
-                }
-                self.current = p as u32;
-                p
-            }
+        let Some((h, retired)) = self.store.insert(&[m]) else {
+            return false;
         };
-        let buf = &mut self.pages[page].buf;
-        let off = buf.len();
-        write_varint(buf, m.len() << 1);
-        buf.extend_from_slice(m);
-        let pages = &self.pages;
+        let store = &self.store;
         self.dict
-            .insert_unique(hash, H::pack(page, off), |&x| hash_member(get_in(pages, x)));
+            .insert_unique(hash, h, |&x| hash_member(store.get(x)));
         self.len += 1;
+        if let Some(page) = retired {
+            self.compact(page);
+        }
         true
     }
 
@@ -289,57 +67,31 @@ impl<H: Handle> Inner<H> {
             *self = Self::default();
             return;
         }
-        let page = h.page();
-        let p = &mut self.pages[page];
-        let (len, dead, start) = parse_entry(&p.buf, h.off());
-        debug_assert!(!dead);
-        p.buf[h.off()] |= 1;
-        p.dead += start + len - h.off();
-        let (dead, used) = (p.dead, p.buf.len());
-        if dead == used {
-            if self.current == page as u32 {
-                self.current = NO_PAGE;
-            }
-            self.pages[page] = Page::default();
-            self.free_pages.push(page as u32);
-        } else if dead * 2 >= used && self.current != page as u32 {
+        if let Some(page) = self.store.release(h) {
             self.compact(page);
         }
     }
 
-    /// Slides `page`'s live entries to the front of its buffer, in place,
-    /// repointing each moved member's bucket.
+    /// Compacts `page`, repointing each moved member's bucket.
     fn compact(&mut self, page: usize) {
-        let Self { dict, pages, .. } = self;
-        let buf = &mut pages[page].buf;
-        let (mut off, mut dst) = (0, 0);
-        while off < buf.len() {
-            let (len, dead, start) = parse_entry(buf, off);
-            let size = start + len - off;
-            if !dead {
-                if dst != off {
-                    // Handles are unique among live entries, and every
-                    // already-moved entry now sits below `dst`.
-                    let old = H::pack(page, off);
-                    let hash = hash_member(&buf[start..start + len]);
-                    if let Some(slot) = dict.find_mut(hash, |&x| x == old) {
-                        *slot = H::pack(page, dst);
-                    } else {
-                        debug_assert!(false, "live entry without a bucket");
-                    }
-                    buf.copy_within(off..off + size, dst);
-                }
-                dst += size;
+        let fixes: Vec<(H, H, u64)> = self
+            .store
+            .moves(page)
+            .map(|(old, new, m)| (old, new, hash_member(m)))
+            .collect();
+        self.store.compact(page);
+        for (old, new, hash) in fixes {
+            if let Some(slot) = self.dict.find_mut(hash, |&x| x == old) {
+                *slot = new;
+            } else {
+                debug_assert!(false, "live entry without a bucket");
             }
-            off += size;
         }
-        buf.truncate(dst);
-        pages[page].dead = 0;
     }
 
     fn remove(&mut self, m: &[u8], hash: u64) -> bool {
-        let pages = &self.pages;
-        match self.dict.find_entry(hash, |&h| get_in(pages, h) == m) {
+        let store = &self.store;
+        match self.dict.find_entry(hash, |&h| store.get(h) == m) {
             Ok(entry) => {
                 let (h, _) = entry.remove();
                 self.release(h);
@@ -353,7 +105,7 @@ impl<H: Handle> Inner<H> {
         // Take the first bucket in table order directly: no re-hash or second
         // probe. A dropped `ExtractIf` keeps the elements it did not visit.
         let h = self.dict.extract_if(|_| true).next()?;
-        let m = Bytes::copy_from_slice(get_in(&self.pages, h));
+        let m = Bytes::copy_from_slice(self.store.get(h));
         self.release(h);
         Some(m)
     }
@@ -361,21 +113,21 @@ impl<H: Handle> Inner<H> {
     fn iter(&self) -> InnerIter<'_, H> {
         InnerIter {
             it: self.dict.iter(),
-            pages: &self.pages,
+            store: &self.store,
         }
     }
 }
 
 struct InnerIter<'a, H> {
     it: hashbrown::hash_table::Iter<'a, H>,
-    pages: &'a Pages,
+    store: &'a PageStore<H>,
 }
 
 impl<'a, H: Handle> Iterator for InnerIter<'a, H> {
     type Item = &'a [u8];
     #[inline]
     fn next(&mut self) -> Option<&'a [u8]> {
-        self.it.next().map(|&h| get_in(self.pages, h))
+        self.it.next().map(|&h| self.store.get(h))
     }
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -597,9 +349,9 @@ mod tests {
 
     #[test]
     fn widens_past_the_narrow_page_limit_and_stays_correct() {
-        NARROW_LIMIT.with(|c| c.set(4));
+        crate::pagestore::NARROW_LIMIT.with(|c| c.set(4));
         let s = run_model(60_000, 0x2545_F491_4F6C_DD1D);
-        NARROW_LIMIT.with(|c| c.set(1 << 20));
+        crate::pagestore::NARROW_LIMIT.with(|c| c.set(1 << 20));
         assert!(
             matches!(s.0, Repr::Wide(_)),
             "a 4-page limit must force widening"

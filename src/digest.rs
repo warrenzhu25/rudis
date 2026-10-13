@@ -714,7 +714,7 @@ mod tests {
         let mut z = crate::zindex::ZIndex::default();
         for (s, m) in items.iter().rev() {
             let s = if *s == 0.0 { 0.0 } else { *s };
-            z.insert(crate::compact::CompactKey::new(m.as_bytes()), s);
+            z.insert(m.as_bytes(), s);
         }
         let full = RudisZSet::Full(z);
         assert_eq!(

@@ -1,158 +1,127 @@
-//! Ordered member index for large sorted sets, storing each member once.
+//! Ordered member index for large sorted sets, each member stored once,
+//! packed.
 //!
-//! The previous encoding kept every member twice, as a `HashMap` key (for
-//! `ZSCORE`) and inside a `BTreeSet<(score, member)>` (for ordered access).
-//! Here each `(score, member)` pair lives once in a slot array with stable
-//! `u32` ids; a hash table maps members to ids (4 bytes per entry, members
-//! compared through the slot), and the order is kept as a list of sorted
-//! runs of ids, each at most [`CHUNK_MAX`] long.
+//! Each `(score, member)` lives once as a [`PageStore`] entry whose payload is
+//! `[score: f64 LE][member bytes]`: a 5-byte member costs 14 bytes of page
+//! instead of a 32-byte `(OrderedScore, CompactKey)` slot. A hash table maps
+//! members to entry handles (4 bytes each, members compared through the
+//! page), and the order is a list of sorted runs of handles, each at most
+//! [`CHUNK_MAX`] long.
 //!
-//! - `get`/`contains_key`: one hash lookup.
+//! - `get`/`contains_key`: one hash lookup, then the entry.
 //! - `insert`/`remove`: hash lookup, binary search over the runs and within
-//!   one run, then a `memmove` of at most `CHUNK_MAX` ids.
+//!   one run, then a `memmove` of at most `CHUNK_MAX` handles.
 //! - Rank and offset access walk the run lengths: O(len / CHUNK_MAX).
+//! - A score update rewrites the entry's 8 score bytes in place.
 //!
-//! Iteration yields `&(OrderedScore, CompactKey)` in (score, member) order,
-//! the same items a `BTreeSet<(OrderedScore, CompactKey)>` would.
+//! When a half-dead page is compacted, each moved entry's run slot is found
+//! by binary search on its (score, member) and its bucket by re-hashing, both
+//! before anything moves, then repointed.
+//!
+//! Iteration yields `(OrderedScore, &[u8])` in (score, member) order. `u32`
+//! handles address 2^20 pages; a bigger set switches once to `u64` handles.
 
-use crate::compact::CompactKey;
+use crate::pagestore::{Handle, PageStore};
 use crate::table::OrderedScore;
+use bytes::Bytes;
 use std::cmp::Ordering;
 
-/// Longest run of ids; a run that grows past it is split in two. Runs are
-/// allocated at `CHUNK_MAX + 1` ids = 512 bytes, an exact allocator size
-/// class (one id more spills into the next class, 640 bytes).
+/// Longest run of handles; a run that grows past it is split in two. Runs
+/// are allocated at `CHUNK_MAX + 1` handles = 512 bytes (`u32`), an exact
+/// allocator size class.
 const CHUNK_MAX: usize = 127;
-
-/// Slots per page: 64 x 32 bytes = 2048 bytes, an exact size class. A single
-/// growing `Vec` was on average ~70% full after doubling, and its large
-/// allocation was then rounded up again by the allocator (16.6 KB -> 20 KB
-/// for 375 members).
-const PAGE: usize = 64;
-
-type Item = (OrderedScore, CompactKey);
 
 #[inline(always)]
 fn hash_member(m: &[u8]) -> u64 {
     fxhash::hash64(m)
 }
 
+/// (score, member) of an entry payload.
 #[inline(always)]
-fn slot_in(pages: &[Vec<Item>], id: u32) -> &Item {
-    &pages[id as usize / PAGE][id as usize % PAGE]
+fn split(p: &[u8]) -> (OrderedScore, &[u8]) {
+    let (s, m) = p.split_at(8);
+    (
+        OrderedScore(f64::from_le_bytes(s.try_into().expect("8 score bytes"))),
+        m,
+    )
 }
 
-#[derive(Clone, Default)]
-pub struct ZIndex {
-    /// `(score, member)` by id, in pages of `PAGE` slots (id = page * PAGE +
-    /// offset). Freed ids hold an empty member and are reused from `free`.
-    pages: Vec<Vec<Item>>,
-    free: Vec<u32>,
-    /// Member -> id.
-    dict: hashbrown::HashTable<u32>,
-    /// Ids in (score, member) order, split into sorted runs.
-    runs: Vec<Vec<u32>>,
+#[derive(Clone)]
+struct Inner<H> {
+    store: PageStore<H>,
+    /// Member -> handle.
+    dict: hashbrown::HashTable<H>,
+    /// Handles in (score, member) order, split into sorted runs.
+    runs: Vec<Vec<H>>,
     len: usize,
 }
 
-impl std::fmt::Debug for ZIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.iter()).finish()
-    }
-}
-
-impl ZIndex {
-    pub fn with_capacity(n: usize) -> Self {
-        ZIndex {
-            pages: Vec::with_capacity(n.div_ceil(PAGE)),
-            free: Vec::new(),
-            dict: hashbrown::HashTable::with_capacity(n),
+impl<H> Default for Inner<H> {
+    fn default() -> Self {
+        Inner {
+            store: PageStore::default(),
+            dict: hashbrown::HashTable::new(),
             runs: Vec::new(),
             len: 0,
         }
     }
+}
 
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
+impl<H: Handle> Inner<H> {
     #[inline(always)]
-    fn slot(&self, id: u32) -> &Item {
-        slot_in(&self.pages, id)
-    }
-
-    #[inline(always)]
-    fn slot_mut(&mut self, id: u32) -> &mut Item {
-        &mut self.pages[id as usize / PAGE][id as usize % PAGE]
+    fn entry(&self, h: H) -> (OrderedScore, &[u8]) {
+        split(self.store.get(h))
     }
 
     #[inline]
-    fn find_id(&self, member: &[u8]) -> Option<u32> {
-        let pages = &self.pages;
+    fn find(&self, member: &[u8]) -> Option<H> {
+        let store = &self.store;
         self.dict
-            .find(hash_member(member), |&id| {
-                slot_in(pages, id).1.as_slice() == member
-            })
+            .find(hash_member(member), |&h| &store.get(h)[8..] == member)
             .copied()
     }
 
     #[inline]
-    pub fn get(&self, member: &[u8]) -> Option<f64> {
-        self.find_id(member).map(|id| self.slot(id).0.0)
-    }
-
-    #[inline]
-    pub fn contains_key(&self, member: &[u8]) -> bool {
-        self.find_id(member).is_some()
-    }
-
-    #[inline]
-    fn cmp_id(&self, id: u32, score: OrderedScore, member: &[u8]) -> Ordering {
-        let (s, m) = self.slot(id);
-        s.cmp(&score).then_with(|| m.as_slice().cmp(member))
+    fn cmp_h(&self, h: H, score: OrderedScore, member: &[u8]) -> Ordering {
+        let (s, m) = self.entry(h);
+        s.cmp(&score).then_with(|| m.cmp(member))
     }
 
     /// Run and position of the first element not less than `(score, member)`.
     /// `(runs.len(), 0)` when every element is less.
     fn lower_bound(&self, score: OrderedScore, member: &[u8]) -> (usize, usize) {
         let ri = self.runs.partition_point(|r| {
-            self.cmp_id(*r.last().expect("runs are never empty"), score, member) == Ordering::Less
+            self.cmp_h(*r.last().expect("runs are never empty"), score, member) == Ordering::Less
         });
         if ri == self.runs.len() {
             return (ri, 0);
         }
         let pos =
-            self.runs[ri].partition_point(|&id| self.cmp_id(id, score, member) == Ordering::Less);
+            self.runs[ri].partition_point(|&h| self.cmp_h(h, score, member) == Ordering::Less);
         (ri, pos)
     }
 
     #[inline]
-    fn new_run() -> Vec<u32> {
+    fn new_run() -> Vec<H> {
         Vec::with_capacity(CHUNK_MAX + 1)
     }
 
-    /// Links slot `id` into the order.
-    fn place(&mut self, id: u32) {
+    /// Links entry `h` into the order.
+    fn place(&mut self, h: H) {
         if self.runs.is_empty() {
             let mut run = Self::new_run();
-            run.push(id);
+            run.push(h);
             self.runs.push(run);
             return;
         }
-        let (score, member) = self.slot(id);
-        let (mut ri, mut pos) = self.lower_bound(*score, member.as_slice());
+        let (score, member) = self.entry(h);
+        let (mut ri, mut pos) = self.lower_bound(score, member);
         if ri == self.runs.len() {
             ri -= 1;
             pos = self.runs[ri].len();
         }
         let run = &mut self.runs[ri];
-        run.insert(pos, id);
+        run.insert(pos, h);
         if run.len() > CHUNK_MAX {
             // Split into fresh exact-size runs rather than letting `Vec` grow.
             let mut tail = Self::new_run();
@@ -162,11 +131,11 @@ impl ZIndex {
         }
     }
 
-    /// Unlinks slot `id` from the order.
-    fn unplace(&mut self, id: u32) {
-        let (score, member) = self.slot(id);
-        let (ri, pos) = self.lower_bound(*score, member.as_slice());
-        debug_assert_eq!(self.runs[ri][pos], id);
+    /// Unlinks entry `h` from the order.
+    fn unplace(&mut self, h: H) {
+        let (score, member) = self.entry(h);
+        let (ri, pos) = self.lower_bound(score, member);
+        debug_assert_eq!(self.runs[ri][pos], h);
         self.unplace_at(ri, pos);
     }
 
@@ -184,103 +153,316 @@ impl ZIndex {
         }
     }
 
-    /// Sets `member`'s score; returns the previous one.
-    pub fn insert(&mut self, member: CompactKey, score: f64) -> Option<f64> {
-        if let Some(id) = self.find_id(member.as_slice()) {
-            let old = self.slot(id).0.0;
+    /// Sets `member`'s score; returns the previous one. `Err(())`, with
+    /// nothing changed, when a new entry's location would not fit `H`.
+    fn insert(&mut self, member: &[u8], score: f64) -> Result<Option<f64>, ()> {
+        if let Some(h) = self.find(member) {
+            let old = self.entry(h).0.0;
             if old.total_cmp(&score) != Ordering::Equal {
-                self.unplace(id);
-                self.slot_mut(id).0 = OrderedScore(score);
-                self.place(id);
+                self.unplace(h);
+                self.store.get_mut(h)[..8].copy_from_slice(&score.to_le_bytes());
+                self.place(h);
             }
-            return Some(old);
+            return Ok(Some(old));
         }
-        let h = hash_member(member.as_slice());
-        let id = match self.free.pop() {
-            Some(id) => {
-                *self.slot_mut(id) = (OrderedScore(score), member);
-                id
-            }
-            None => {
-                if self.pages.last().is_none_or(|p| p.len() == PAGE) {
-                    self.pages.push(Vec::with_capacity(PAGE));
-                }
-                let last = self.pages.len() - 1;
-                let id = u32::try_from(last * PAGE + self.pages[last].len())
-                    .expect("sorted set exceeds u32 members");
-                self.pages[last].push((OrderedScore(score), member));
-                id
-            }
-        };
-        let pages = &self.pages;
+        let (h, retired) = self
+            .store
+            .insert(&[&score.to_le_bytes(), member])
+            .ok_or(())?;
+        let store = &self.store;
         self.dict
-            .insert_unique(h, id, |&i| hash_member(slot_in(pages, i).1.as_slice()));
-        self.place(id);
+            .insert_unique(hash_member(member), h, |&x| hash_member(&store.get(x)[8..]));
+        self.place(h);
         self.len += 1;
-        None
+        if let Some(page) = retired {
+            self.compact(page);
+        }
+        Ok(None)
     }
 
-    /// Frees slot `id` (already unlinked from the order) and returns its item.
-    fn release(&mut self, id: u32) -> Item {
-        let member = slot_in(&self.pages, id).1.as_slice();
-        if let Ok(entry) = self.dict.find_entry(hash_member(member), |&i| i == id) {
+    /// Frees entry `h` (already unlinked from the order); returns its item.
+    fn release(&mut self, h: H) -> (OrderedScore, Bytes) {
+        let (score, member) = self.entry(h);
+        let item = (score, Bytes::copy_from_slice(member));
+        if let Ok(entry) = self.dict.find_entry(hash_member(member), |&x| x == h) {
             entry.remove();
         }
-        let item = std::mem::replace(
-            self.slot_mut(id),
-            (OrderedScore(0.0), CompactKey::default()),
-        );
         self.len -= 1;
         if self.len == 0 {
-            *self = ZIndex::default();
-        } else {
-            self.free.push(id);
+            *self = Self::default();
+        } else if let Some(page) = self.store.release(h) {
+            self.compact(page);
         }
         item
     }
 
-    pub fn remove(&mut self, member: &[u8]) -> Option<f64> {
-        let id = self.find_id(member)?;
-        self.unplace(id);
-        Some(self.release(id).0.0)
+    /// Compacts `page`, repointing each moved entry's run slot and bucket.
+    fn compact(&mut self, page: usize) {
+        // Locate everything while the page is still intact.
+        let fixes: Vec<(H, H, u64, usize, usize)> = self
+            .store
+            .moves(page)
+            .map(|(old, new, p)| {
+                let (score, member) = split(p);
+                let (ri, pos) = self.lower_bound(score, member);
+                debug_assert_eq!(self.runs[ri][pos], old);
+                (old, new, hash_member(member), ri, pos)
+            })
+            .collect();
+        self.store.compact(page);
+        for (old, new, hash, ri, pos) in fixes {
+            self.runs[ri][pos] = new;
+            if let Some(slot) = self.dict.find_mut(hash, |&x| x == old) {
+                *slot = new;
+            } else {
+                debug_assert!(false, "live entry without a bucket");
+            }
+        }
     }
 
-    pub fn pop_first(&mut self) -> Option<Item> {
-        let id = *self.runs.first()?.first()?;
+    fn remove(&mut self, member: &[u8]) -> Option<f64> {
+        let h = self.find(member)?;
+        self.unplace(h);
+        Some(self.release(h).0.0)
+    }
+
+    fn pop_first(&mut self) -> Option<(OrderedScore, Bytes)> {
+        let h = *self.runs.first()?.first()?;
         self.unplace_at(0, 0);
-        Some(self.release(id))
+        Some(self.release(h))
     }
 
-    pub fn pop_last(&mut self) -> Option<Item> {
+    fn pop_last(&mut self) -> Option<(OrderedScore, Bytes)> {
         let ri = self.runs.len().checked_sub(1)?;
         let pos = self.runs[ri].len() - 1;
-        let id = self.runs[ri][pos];
+        let h = self.runs[ri][pos];
         self.unplace_at(ri, pos);
-        Some(self.release(id))
+        Some(self.release(h))
+    }
+
+    fn rank(&self, member: &[u8]) -> Option<usize> {
+        let h = self.find(member)?;
+        let (score, m) = self.entry(h);
+        let (ri, pos) = self.lower_bound(score, m);
+        Some(self.runs[..ri].iter().map(Vec::len).sum::<usize>() + pos)
+    }
+
+    fn iter_at(&self, ri: usize, pos: usize) -> RawIter<'_, H> {
+        let first: &[H] = self.runs.get(ri).map_or(&[], |r| &r[pos..]);
+        let rest = self.runs.get(ri + 1..).unwrap_or(&[]);
+        RawIter {
+            it: first.iter().chain(rest.iter().flatten()),
+            store: &self.store,
+        }
+    }
+
+    fn iter(&self) -> RawIter<'_, H> {
+        self.iter_at(0, 0)
+    }
+
+    fn iter_from_score(&self, min: f64) -> RawIter<'_, H> {
+        let (ri, pos) = self.lower_bound(OrderedScore(min), &[]);
+        self.iter_at(ri, pos)
+    }
+
+    #[cfg(test)]
+    fn check_runs(&self) {
+        assert!(
+            self.runs
+                .iter()
+                .all(|r| !r.is_empty() && r.len() <= CHUNK_MAX)
+        );
+        assert!(
+            self.runs.iter().all(|r| r.capacity() <= CHUNK_MAX + 1),
+            "a run reallocated"
+        );
+    }
+}
+
+type HandleIter<'a, H> =
+    std::iter::Chain<std::slice::Iter<'a, H>, std::iter::Flatten<std::slice::Iter<'a, Vec<H>>>>;
+
+struct RawIter<'a, H> {
+    it: HandleIter<'a, H>,
+    store: &'a PageStore<H>,
+}
+
+impl<'a, H: Handle> Iterator for RawIter<'a, H> {
+    type Item = (OrderedScore, &'a [u8]);
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.it.next().map(|&h| split(self.store.get(h)))
+    }
+}
+
+impl<H: Handle> DoubleEndedIterator for RawIter<'_, H> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.it.next_back().map(|&h| split(self.store.get(h)))
+    }
+}
+
+#[derive(Clone)]
+enum Repr {
+    Narrow(Inner<u32>),
+    Wide(Inner<u64>),
+}
+
+#[derive(Clone)]
+pub struct ZIndex(Repr);
+
+impl Default for ZIndex {
+    fn default() -> Self {
+        ZIndex(Repr::Narrow(Inner::default()))
+    }
+}
+
+impl std::fmt::Debug for ZIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// Dispatches a read-only call to the narrow or wide representation.
+macro_rules! with {
+    ($self:expr, $z:ident => $e:expr) => {
+        match &$self.0 {
+            Repr::Narrow($z) => $e,
+            Repr::Wide($z) => $e,
+        }
+    };
+}
+
+/// Dispatches a mutating call to the narrow or wide representation.
+macro_rules! with_mut {
+    ($self:expr, $z:ident => $e:expr) => {
+        match &mut $self.0 {
+            Repr::Narrow($z) => $e,
+            Repr::Wide($z) => $e,
+        }
+    };
+}
+
+impl ZIndex {
+    pub fn with_capacity(n: usize) -> Self {
+        ZIndex(Repr::Narrow(Inner {
+            dict: hashbrown::HashTable::with_capacity(n),
+            ..Inner::default()
+        }))
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        with!(self, z => z.len)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn get(&self, member: &[u8]) -> Option<f64> {
+        with!(self, z => z.find(member).map(|h| z.entry(h).0.0))
+    }
+
+    #[inline]
+    pub fn contains_key(&self, member: &[u8]) -> bool {
+        with!(self, z => z.find(member).is_some())
+    }
+
+    /// Sets `member`'s score; returns the previous one.
+    pub fn insert(&mut self, member: &[u8], score: f64) -> Option<f64> {
+        if let Repr::Narrow(z) = &mut self.0 {
+            match z.insert(member, score) {
+                Ok(old) => return old,
+                Err(()) => self.widen(),
+            }
+        }
+        let Repr::Wide(z) = &mut self.0 else {
+            unreachable!("narrow inserts returned above or widened")
+        };
+        z.insert(member, score)
+            .expect("u64 handles address every page")
+    }
+
+    /// Switches to `u64` handles: the set outgrew 2^20 pages.
+    #[cold]
+    fn widen(&mut self) {
+        let Repr::Narrow(n) = &self.0 else {
+            return;
+        };
+        let mut w = Inner::<u64> {
+            dict: hashbrown::HashTable::with_capacity(n.len + 1),
+            ..Inner::default()
+        };
+        for (score, member) in n.iter() {
+            let fresh = w.insert(member, score.0).expect("u64 handles");
+            debug_assert!(fresh.is_none());
+        }
+        self.0 = Repr::Wide(w);
+    }
+
+    pub fn remove(&mut self, member: &[u8]) -> Option<f64> {
+        with_mut!(self, z => z.remove(member))
+    }
+
+    pub fn pop_first(&mut self) -> Option<(OrderedScore, Bytes)> {
+        with_mut!(self, z => z.pop_first())
+    }
+
+    pub fn pop_last(&mut self) -> Option<(OrderedScore, Bytes)> {
+        with_mut!(self, z => z.pop_last())
     }
 
     /// Zero-based rank of `member` in ascending order.
     pub fn rank(&self, member: &[u8]) -> Option<usize> {
-        let id = self.find_id(member)?;
-        let (score, m) = self.slot(id);
-        let (ri, pos) = self.lower_bound(*score, m.as_slice());
-        Some(self.runs[..ri].iter().map(Vec::len).sum::<usize>() + pos)
+        with!(self, z => z.rank(member))
     }
 
     /// All items in ascending (score, member) order.
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Item> + '_ {
-        self.runs.iter().flatten().map(move |&id| self.slot(id))
+    pub fn iter(&self) -> ZIter<'_> {
+        ZIter(match &self.0 {
+            Repr::Narrow(z) => IterRepr::Narrow(z.iter()),
+            Repr::Wide(z) => IterRepr::Wide(z.iter()),
+        })
     }
 
     /// Items from the first with a score of at least `min`, ascending.
-    pub fn iter_from_score(&self, min: f64) -> impl Iterator<Item = &Item> + '_ {
-        let (ri, pos) = self.lower_bound(OrderedScore(min), &[]);
-        let first: &[u32] = self.runs.get(ri).map_or(&[], |r| &r[pos..]);
-        let rest = self.runs.get(ri + 1..).unwrap_or(&[]);
-        first
-            .iter()
-            .chain(rest.iter().flatten())
-            .map(move |&id| self.slot(id))
+    pub fn iter_from_score(&self, min: f64) -> ZIter<'_> {
+        ZIter(match &self.0 {
+            Repr::Narrow(z) => IterRepr::Narrow(z.iter_from_score(min)),
+            Repr::Wide(z) => IterRepr::Wide(z.iter_from_score(min)),
+        })
+    }
+}
+
+enum IterRepr<'a> {
+    Narrow(RawIter<'a, u32>),
+    Wide(RawIter<'a, u64>),
+}
+
+/// `(score, member)` items of a [`ZIndex`] in order.
+pub struct ZIter<'a>(IterRepr<'a>);
+
+impl<'a> Iterator for ZIter<'a> {
+    type Item = (OrderedScore, &'a [u8]);
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            IterRepr::Narrow(i) => i.next(),
+            IterRepr::Wide(i) => i.next(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for ZIter<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            IterRepr::Narrow(i) => i.next_back(),
+            IterRepr::Wide(i) => i.next_back(),
+        }
     }
 }
 
@@ -288,10 +470,6 @@ impl ZIndex {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-
-    fn ck(s: &str) -> CompactKey {
-        CompactKey::new(s.as_bytes())
-    }
 
     fn ordered(z: &ZIndex) -> Vec<(f64, Vec<u8>)> {
         z.iter().map(|(s, m)| (s.0, m.to_vec())).collect()
@@ -307,10 +485,10 @@ mod tests {
     #[test]
     fn insert_update_remove_and_order() {
         let mut z = ZIndex::default();
-        assert_eq!(z.insert(ck("b"), 2.0), None);
-        assert_eq!(z.insert(ck("a"), 2.0), None);
-        assert_eq!(z.insert(ck("c"), 1.0), None);
-        assert_eq!(z.insert(ck("a"), 0.5), Some(2.0));
+        assert_eq!(z.insert(b"b", 2.0), None);
+        assert_eq!(z.insert(b"a", 2.0), None);
+        assert_eq!(z.insert(b"c", 1.0), None);
+        assert_eq!(z.insert(b"a", 0.5), Some(2.0));
         assert_eq!(
             ordered(&z),
             vec![
@@ -340,7 +518,7 @@ mod tests {
     fn iter_from_score_starts_at_the_first_member_with_that_score() {
         let mut z = ZIndex::default();
         for i in 0..1000 {
-            z.insert(ck(&format!("m{i:04}")), (i / 10) as f64);
+            z.insert(format!("m{i:04}").as_bytes(), (i / 10) as f64);
         }
         let from: Vec<_> = z
             .iter_from_score(50.0)
@@ -363,13 +541,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn matches_a_reference_model_under_random_operations() {
-        // Small key space and score range so updates, ties and removals are
-        // frequent and runs split and merge repeatedly.
+    /// Small key space and score range so updates, ties and removals are
+    /// frequent, runs split and merge, and pages compact repeatedly. Every
+    /// 25th member is over 1 KiB (a page of its own).
+    fn run_model(seed: u64) -> ZIndex {
         let mut z = ZIndex::default();
         let mut model: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut x: u64 = seed;
         let mut next = || {
             x ^= x << 13;
             x ^= x >> 7;
@@ -378,15 +556,15 @@ mod tests {
         };
         for step in 0..40_000 {
             let r = next();
-            let key = format!("k{}", r % 700).into_bytes();
+            let k = r % 700;
+            let key = if k % 25 == 0 {
+                format!("{}{k}", "L".repeat(1100)).into_bytes()
+            } else {
+                format!("k{k}").into_bytes()
+            };
             let score = ((r >> 20) % 50) as f64 - 25.0;
             match (r >> 40) % 10 {
-                0..=5 => {
-                    assert_eq!(
-                        z.insert(CompactKey::new(&key), score),
-                        model.insert(key, score)
-                    );
-                }
+                0..=5 => assert_eq!(z.insert(&key, score), model.insert(key, score)),
                 6 | 7 => assert_eq!(z.remove(&key), model.remove(&key)),
                 8 => {
                     let want = model_order(&model).first().cloned();
@@ -413,16 +591,59 @@ mod tests {
                     assert_eq!(z.get(k), Some(*s));
                     assert_eq!(z.rank(k), Some(i));
                 }
-                assert!(z.runs.iter().all(|r| !r.is_empty() && r.len() <= CHUNK_MAX));
-                assert!(
-                    z.runs.iter().all(|r| r.capacity() <= CHUNK_MAX + 1),
-                    "a run reallocated"
-                );
-                assert!(
-                    z.pages.iter().all(|p| p.capacity() == PAGE),
-                    "a page reallocated"
-                );
+                with!(z, inner => inner.check_runs());
             }
         }
+        z
+    }
+
+    #[test]
+    fn matches_a_reference_model_under_random_operations() {
+        let z = run_model(0x9E37_79B9_7F4A_7C15);
+        assert!(matches!(z.0, Repr::Narrow(_)));
+    }
+
+    #[test]
+    fn widens_past_the_narrow_page_limit_and_stays_correct() {
+        crate::pagestore::NARROW_LIMIT.with(|c| c.set(4));
+        let z = run_model(0x2545_F491_4F6C_DD1D);
+        crate::pagestore::NARROW_LIMIT.with(|c| c.set(1 << 20));
+        assert!(
+            matches!(z.0, Repr::Wide(_)),
+            "a 4-page limit must force widening"
+        );
+    }
+
+    #[test]
+    fn drains_with_compaction_keeping_order() {
+        let mut z = ZIndex::default();
+        for i in 0..20_000u32 {
+            z.insert(format!("member:{i:05}").as_bytes(), (i % 97) as f64);
+        }
+        // Remove two of every three, then rescore some survivors.
+        for i in (0..20_000u32).filter(|i| i % 3 != 0) {
+            assert!(z.remove(format!("member:{i:05}").as_bytes()).is_some());
+        }
+        for i in (0..20_000u32).step_by(9) {
+            assert!(
+                z.insert(format!("member:{i:05}").as_bytes(), -(i as f64))
+                    .is_some()
+            );
+        }
+        let items = ordered(&z);
+        assert_eq!(items.len(), z.len());
+        assert!(items.windows(2).all(|w| {
+            w[0].0.total_cmp(&w[1].0).then_with(|| w[0].1.cmp(&w[1].1)) == Ordering::Less
+        }));
+        for (i, (s, m)) in items.iter().enumerate() {
+            assert_eq!(z.get(m), Some(*s));
+            assert_eq!(z.rank(m), Some(i));
+        }
+        let mut n = 0;
+        while z.pop_last().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, items.len());
+        assert!(z.is_empty());
     }
 }

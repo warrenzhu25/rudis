@@ -30,6 +30,7 @@ pub mod mcp;
 pub mod netsec;
 pub mod packedlist;
 pub mod packedset;
+pub mod pagestore;
 pub mod probabilistic;
 pub mod pubsub;
 pub mod redis_rdb;

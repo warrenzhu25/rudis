@@ -27693,3 +27693,198 @@ fn test_packed_set_compaction_and_set_algebra_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_packed_zset_compaction_and_order_e2e() {
+    use std::collections::BTreeMap;
+    let port = 17999u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    enum V {
+        Bulk(Vec<u8>),
+        Arr(Vec<V>),
+        Other,
+    }
+    fn parse(b: &[u8], i: usize) -> Option<(V, usize)> {
+        let nl = i + b.get(i..)?.windows(2).position(|w| w == b"\r\n")?;
+        let head = std::str::from_utf8(&b[i + 1..nl]).unwrap();
+        match b[i] {
+            b'$' => {
+                let n: usize = head.parse().unwrap();
+                let end = nl + 2 + n + 2;
+                (b.len() >= end).then(|| (V::Bulk(b[nl + 2..nl + 2 + n].to_vec()), end))
+            }
+            b'*' => {
+                let n: usize = head.parse().unwrap();
+                let mut items = Vec::with_capacity(n);
+                let mut j = nl + 2;
+                for _ in 0..n {
+                    let (v, k) = parse(b, j)?;
+                    items.push(v);
+                    j = k;
+                }
+                Some((V::Arr(items), j))
+            }
+            _ => Some((V::Other, nl + 2)),
+        }
+    }
+    fn cmd(c: &mut TcpStream, args: &[&str]) -> V {
+        let mut out = format!("*{}\r\n", args.len());
+        for a in args {
+            out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        c.write_all(out.as_bytes()).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            if let Some((v, _)) = parse(&got, 0) {
+                return v;
+            }
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+    fn strings(v: V) -> Vec<String> {
+        let V::Arr(items) = v else {
+            panic!("expected an array")
+        };
+        items
+            .into_iter()
+            .map(|i| match i {
+                V::Bulk(b) => String::from_utf8(b).unwrap(),
+                _ => panic!("expected bulk strings"),
+            })
+            .collect()
+    }
+    fn pipeline(c: &mut TcpStream, cmds: &[String]) {
+        let mut out = String::new();
+        for line in cmds {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+        out.push_str("PING\r\n");
+        c.write_all(out.as_bytes()).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        while !got.ends_with(b"+PONG\r\n") {
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+    // Model: member -> integer score; order is (score, member).
+    fn order(m: &BTreeMap<String, i64>) -> Vec<(i64, String)> {
+        let mut v: Vec<(i64, String)> = m.iter().map(|(k, s)| (*s, k.clone())).collect();
+        v.sort();
+        v
+    }
+
+    // 3000 members, short ones packed several hundred per page and every
+    // 50th over 1 KiB (a page of its own); many score ties.
+    let name = |i: usize| {
+        if i.is_multiple_of(50) {
+            format!("{}{i:05}", "B".repeat(1500))
+        } else {
+            format!("m{i:05}")
+        }
+    };
+    let mut model: BTreeMap<String, i64> = BTreeMap::new();
+    let mut adds = Vec::new();
+    for i in 0..3000 {
+        let s = (i % 97) as i64 - 40;
+        adds.push(format!("ZADD pz {s} {}", name(i)));
+        model.insert(name(i), s);
+    }
+    pipeline(&mut c, &adds);
+    // Remove two of every three: pages pass half dead and compact.
+    let gone: Vec<String> = (0..3000).filter(|i| i % 3 != 0).map(name).collect();
+    pipeline(
+        &mut c,
+        &gone
+            .iter()
+            .map(|m| format!("ZREM pz {m}"))
+            .collect::<Vec<_>>(),
+    );
+    for m in &gone {
+        model.remove(m);
+    }
+    // Rescore survivors in place, and pop from both ends.
+    let mut rescores = Vec::new();
+    for i in (0..3000).step_by(9) {
+        let s = -(i as i64);
+        rescores.push(format!("ZADD pz {s} {}", name(i)));
+        model.insert(name(i), s);
+    }
+    pipeline(&mut c, &rescores);
+    for _ in 0..40 {
+        let want = order(&model);
+        let got = strings(cmd(&mut c, &["ZPOPMIN", "pz"]));
+        assert_eq!(got[0], want[0].1);
+        model.remove(&want[0].1);
+        let want = order(&model);
+        let got = strings(cmd(&mut c, &["ZPOPMAX", "pz"]));
+        assert_eq!(got[0], want.last().unwrap().1);
+        model.remove(&want.last().unwrap().1);
+    }
+
+    let want = order(&model);
+    assert_eq!(
+        resp_cmd(&mut c, &["ZCARD", "pz"]),
+        format!(":{}\r\n", want.len())
+    );
+    let got = strings(cmd(&mut c, &["ZRANGE", "pz", "0", "-1", "WITHSCORES"]));
+    let want_flat: Vec<String> = want
+        .iter()
+        .flat_map(|(s, m)| [m.clone(), s.to_string()])
+        .collect();
+    assert_eq!(got, want_flat);
+    let rev = strings(cmd(&mut c, &["ZREVRANGE", "pz", "0", "9"]));
+    let want_rev: Vec<String> = want.iter().rev().take(10).map(|(_, m)| m.clone()).collect();
+    assert_eq!(rev, want_rev);
+    for (rank, (s, m)) in want.iter().enumerate().step_by(37) {
+        assert_eq!(
+            resp_cmd(&mut c, &["ZRANK", "pz", m]),
+            format!(":{rank}\r\n"),
+            "{m}"
+        );
+        let V::Bulk(score) = cmd(&mut c, &["ZSCORE", "pz", m]) else {
+            panic!("ZSCORE")
+        };
+        assert_eq!(String::from_utf8(score).unwrap(), s.to_string());
+    }
+    let by_score = strings(cmd(&mut c, &["ZRANGEBYSCORE", "pz", "-10", "10"]));
+    let want_by: Vec<String> = want
+        .iter()
+        .filter(|(s, _)| (-10..=10).contains(s))
+        .map(|(_, m)| m.clone())
+        .collect();
+    assert_eq!(by_score, want_by);
+    assert_eq!(
+        resp_cmd(&mut c, &["ZCOUNT", "pz", "-10", "10"]),
+        format!(":{}\r\n", want_by.len())
+    );
+
+    // Draining empties and deletes the key.
+    let n = want.len().to_string();
+    let popped = strings(cmd(&mut c, &["ZPOPMIN", "pz", &n]));
+    assert_eq!(popped.len(), want.len() * 2);
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "pz"]), ":0\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}
