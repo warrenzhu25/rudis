@@ -16,6 +16,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -187,7 +188,7 @@ WORKLOADS = [
         "requests": 2000,
         "data_size": None,
         "ratio": None,
-        "populate_type": "list",
+        "populate_type": "list_deep",
         "command": "LPOP __key__",
     },
     {
@@ -233,7 +234,7 @@ WORKLOADS = [
         "requests": 2000,
         "data_size": None,
         "ratio": None,
-        "populate_type": "set",
+        "populate_type": "set_deep",
         "command": "SPOP __key__",
     },
 
@@ -268,7 +269,7 @@ WORKLOADS = [
         "requests": 2000,
         "data_size": None,
         "ratio": None,
-        "populate_type": "zset",
+        "populate_type": "zset_deep",
         "command": "ZPOPMIN __key__",
     },
 
@@ -361,8 +362,78 @@ def flushall(port):
     except Exception as e:
         print(f"Flushall error on port {port}: {e}")
 
+# Pop workloads (LPOP/SPOP/ZPOPMIN) need every key to hold far more members than the
+# measured window pops, or after the first pass over the keyspace nearly every request
+# hits an empty key and the benchmark measures the null-reply path. At ~3M ops/s for
+# TEST_TIME_SECS=5 that is ~15M pops, so each of the KEY_MAX keys gets POP_DEPTH
+# members (24M total by default).
+#
+# memtier cannot do this: --random-data draws from a small pool, so SADD/ZADD of
+# __data__ produced only 5-17 distinct members per key (verified with SCARD). Members
+# only need to be distinct within a key, so one constant multi-member argument block
+# (m000..mNNN) is reused for every key and the load is sent straight over sockets.
+POP_DEPTH = int(os.environ.get("BENCH_POP_DEPTH", "375"))
+DEEP_POPULATE = {
+    "list_deep": ("LPUSH", False),
+    "set_deep": ("SADD", False),
+    "zset_deep": ("ZADD", True),
+}
+
+
+def _resp_bulk(s):
+    b = s.encode()
+    return b"$%d\r\n%s\r\n" % (len(b), b)
+
+
+def populate_deep(port, pop_type):
+    verb, scored = DEEP_POPULATE[pop_type]
+    members = [f"m{j:04d}" for j in range(POP_DEPTH)]
+    tail_parts = []
+    for j, m in enumerate(members):
+        if scored:
+            tail_parts.append(_resp_bulk(str(j)))
+        tail_parts.append(_resp_bulk(m))
+    tail = b"".join(tail_parts)
+    nargs = 2 + len(tail_parts)
+    head = b"*%d\r\n" % nargs + _resp_bulk(verb)
+
+    def load(key_lo, key_hi):
+        s = socket.create_connection(("127.0.0.1", port), timeout=30)
+        try:
+            batch = 200
+            for start in range(key_lo, key_hi + 1, batch):
+                end = min(key_hi, start + batch - 1)
+                s.sendall(b"".join(
+                    head + _resp_bulk(f"memtier-{k}") + tail for k in range(start, end + 1)
+                ))
+                want, got, buf = end - start + 1, 0, b""
+                while got < want:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        raise RuntimeError("connection closed during deep populate")
+                    buf += chunk
+                    got = buf.count(b"\r\n")
+        finally:
+            s.close()
+
+    workers = 8
+    span = (KEY_MAX + workers - 1) // workers
+    threads = [
+        threading.Thread(target=load, args=(1 + i * span, min(KEY_MAX, (i + 1) * span)))
+        for i in range(workers)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
 def populate(port, pop_type):
     if not pop_type:
+        return
+
+    if pop_type in DEEP_POPULATE:
+        populate_deep(port, pop_type)
         return
 
     json_tmp = f"/tmp/pop_{port}_{pop_type}.json"
