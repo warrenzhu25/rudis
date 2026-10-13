@@ -1539,6 +1539,75 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
+                                    && !crate::block::has_blocked_waiters(cross_shard_router.port)
+                                    && let Command::Rpush { ref key, ref values } = cmd
+                                {
+                                    has_writes = true;
+                                    match db.table.rpush_slice_with_hash(key, key_hash, values) {
+                                        Ok(len) => {
+                                            if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                            }
+                                            responder.write_slot(idx, crate::shard::CompactResp::from_integer(len as i64));
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
+                                    }
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
+                                    && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
+                                    && let Command::Spop { ref key, count: None } = cmd
+                                {
+                                    match db.table.spop_one_with_hash(key.as_ref(), key_hash) {
+                                        Ok(Some(v)) => {
+                                            has_writes = true;
+                                            if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                            }
+                                            responder.write_slot(idx, crate::shard::CompactResp::from_owned_bulk(v));
+                                            continue;
+                                        }
+                                        Ok(None) => {
+                                            responder.write_slot(idx, crate::shard::CompactResp::NULL);
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
+                                    }
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
+                                    && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
+                                    && let Command::Zpopmin { ref key, count: None } = cmd
+                                {
+                                    match db.table.zpopmin_with_hash(key.as_ref(), key_hash, 1) {
+                                        Ok(popped) => {
+                                            if let Some((m, s)) = popped.into_iter().next() {
+                                                has_writes = true;
+                                                if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                    crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                                }
+                                                temp_buf.extend_from_slice(b"*2\r\n");
+                                                crate::connection::write_resp_bulk(&mut temp_buf, &m);
+                                                crate::connection::write_resp_score(&mut temp_buf, s);
+                                                responder.write_slot(idx, crate::shard::CompactResp::from_slice(&temp_buf));
+                                            } else {
+                                                responder.write_slot(idx, crate::shard::CompactResp::EMPTY_ARRAY);
+                                            }
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
+                                    }
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
+                                    && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::Lpop { ref key, count } = cmd
                                 {
                                     if count.is_none() {

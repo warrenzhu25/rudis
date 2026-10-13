@@ -26674,3 +26674,57 @@ fn test_pipelined_unlink_touch_hmget_smismember_zmscore_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_pipelined_rpush_spop_zpopmin_e2e() {
+    let port = 17985u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // One pipeline whose keys land on different shards, so both the local
+    // fast paths and the cross-shard batch fast paths run.
+    let mut pipe = String::new();
+    for i in 0..4 {
+        pipe.push_str(&format!("RPUSH rp_l_{i} a b\r\n"));
+        pipe.push_str(&format!("RPUSH rp_l_{i} c\r\n"));
+        pipe.push_str(&format!("LRANGE rp_l_{i} 0 -1\r\n"));
+        pipe.push_str(&format!("SADD rp_s_{i} m{i}\r\n"));
+        pipe.push_str(&format!("SPOP rp_s_{i}\r\n"));
+        pipe.push_str(&format!("SPOP rp_s_{i}\r\n"));
+        pipe.push_str(&format!("ZADD rp_z_{i} 2.5 zb 1.5 za\r\n"));
+        pipe.push_str(&format!("ZPOPMIN rp_z_{i}\r\n"));
+        pipe.push_str(&format!("ZPOPMIN rp_z_{i}\r\n"));
+        pipe.push_str(&format!("ZPOPMIN rp_z_{i}\r\n"));
+        pipe.push_str(&format!("EXISTS rp_s_{i} rp_z_{i}\r\n"));
+        pipe.push_str(&format!("SPOP rp_l_{i}\r\n"));
+    }
+
+    let resp = send_and_read(&mut c, pipe.as_bytes());
+    let mut expected = String::new();
+    for i in 0..4 {
+        expected.push_str(":2\r\n:3\r\n*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+        expected.push_str(&format!(":1\r\n$2\r\nm{i}\r\n$-1\r\n"));
+        expected
+            .push_str(":2\r\n*2\r\n$2\r\nza\r\n$3\r\n1.5\r\n*2\r\n$2\r\nzb\r\n$3\r\n2.5\r\n*0\r\n");
+        expected.push_str(":0\r\n");
+        expected.push_str("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    }
+    assert_eq!(resp, expected);
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

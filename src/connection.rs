@@ -18720,6 +18720,9 @@ pub fn target_shard_and_hash_of_cmd(cmd: &Command, num_shards: usize) -> Option<
         | Command::Hmget { key, .. }
         | Command::Lpop { key, .. }
         | Command::Lpush { key, .. }
+        | Command::Rpush { key, .. }
+        | Command::Spop { key, .. }
+        | Command::Zpopmin { key, .. }
         | Command::Zadd { key, .. }
         | Command::Zmscore { key, .. }
         | Command::Get(key)
@@ -26574,6 +26577,85 @@ async fn execute_commands_squashed_inner(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
+                } else if write_fast_path
+                    && !crate::block::has_blocked_waiters(router.port)
+                    && let Command::Rpush {
+                        ref key,
+                        ref values,
+                    } = cmd
+                {
+                    has_local_writes = true;
+                    match local_db.table.rpush_slice_with_hash(key, key_hash, values) {
+                        Ok(len) => {
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(router.port, key.as_ref());
+                            }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                            }
+                            responses[idx] = crate::shard::CompactResp::from_integer(len as i64);
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if write_fast_path
+                    && let Command::Spop {
+                        ref key,
+                        count: None,
+                    } = cmd
+                {
+                    match local_db.table.spop_one_with_hash(key.as_ref(), key_hash) {
+                        Ok(Some(v)) => {
+                            has_local_writes = true;
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(router.port, key.as_ref());
+                            }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                            }
+                            responses[idx] = CompactResp::from_owned_bulk(v);
+                            continue;
+                        }
+                        Ok(None) => {
+                            responses[idx] = crate::shard::CompactResp::NULL;
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if write_fast_path
+                    && let Command::Zpopmin {
+                        ref key,
+                        count: None,
+                    } = cmd
+                {
+                    match local_db.table.zpopmin_with_hash(key.as_ref(), key_hash, 1) {
+                        Ok(popped) => {
+                            if let Some((m, s)) = popped.into_iter().next() {
+                                has_local_writes = true;
+                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    touch_watched_key(router.port, key.as_ref());
+                                }
+                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                                }
+                                local_buf.extend_from_slice(b"*2\r\n");
+                                write_resp_bulk(&mut local_buf, &m);
+                                write_resp_score(&mut local_buf, s);
+                                responses[idx] =
+                                    CompactResp::from_vec(std::mem::take(&mut local_buf));
+                            } else {
+                                responses[idx] = crate::shard::CompactResp::EMPTY_ARRAY;
+                            }
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
                 } else if write_fast_path && let Command::Lpop { ref key, count } = cmd {
                     if count.is_none() {
                         match local_db.table.lpop_one_with_hash(key.as_ref(), key_hash) {
@@ -30252,6 +30334,132 @@ mod tests {
                 ":1\r\n",
             );
             assert_eq!(out, expected.as_bytes());
+        });
+    }
+
+    #[test]
+    fn test_squashed_pipeline_rpush_spop_zpopmin_fast_paths() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
+            let db = Rc::new(RefCell::new(ShardDb::new(9994)));
+            let router = Router::new(
+                0,
+                1,
+                9994,
+                db,
+                senders_mesh[0].clone(),
+                None,
+                Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+                std::env::temp_dir(),
+            );
+            let client_registry = RefCell::new(hashbrown::HashMap::new());
+            let mut asking = false;
+            let mut authenticated = true;
+            let mut auth_user = String::from("default");
+            let mut out = Vec::new();
+            let responders = vec![std::sync::Arc::new(crate::mailbox::BatchResponder::new())];
+            let mut remote_batches = vec![Vec::new()];
+            let mut items_pool = vec![Vec::new()];
+            let mut results_pool = vec![Vec::new()];
+            let mut squashed_responses = Vec::new();
+
+            let mut cmds = vec![
+                Command::Rpush {
+                    key: Bytes::from("l"),
+                    values: smallvec::smallvec![Bytes::from("a"), Bytes::from("b")],
+                },
+                Command::Rpush {
+                    key: Bytes::from("l"),
+                    values: smallvec::smallvec![Bytes::from("c")],
+                },
+                Command::Lrange {
+                    key: Bytes::from("l"),
+                    start: 0,
+                    stop: -1,
+                },
+                Command::Sadd {
+                    key: Bytes::from("s"),
+                    members: smallvec::smallvec![Bytes::from("m1")],
+                },
+                Command::Spop {
+                    key: Bytes::from("s"),
+                    count: None,
+                },
+                Command::Spop {
+                    key: Bytes::from("s"),
+                    count: None,
+                },
+                Command::Zadd {
+                    key: Bytes::from("z"),
+                    elements: smallvec::smallvec![
+                        (2.5, Bytes::from("zb")),
+                        (1.5, Bytes::from("za")),
+                    ],
+                    flags: crate::table::ZAddFlags::default(),
+                },
+                Command::Zpopmin {
+                    key: Bytes::from("z"),
+                    count: None,
+                },
+                Command::Zpopmin {
+                    key: Bytes::from("z"),
+                    count: None,
+                },
+                Command::Zpopmin {
+                    key: Bytes::from("z"),
+                    count: None,
+                },
+                // Popping the last member deletes the key.
+                Command::Exists(smallvec::smallvec![Bytes::from("s"), Bytes::from("z")]),
+                Command::Spop {
+                    key: Bytes::from("l"),
+                    count: None,
+                },
+                Command::Zpopmin {
+                    key: Bytes::from("l"),
+                    count: None,
+                },
+            ];
+
+            let quit = execute_commands_squashed(
+                &mut cmds,
+                false,
+                &router,
+                &responders,
+                &mut remote_batches,
+                &mut items_pool,
+                &mut results_pool,
+                &mut squashed_responses,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert!(!quit);
+            let expected = concat!(
+                ":2\r\n",
+                ":3\r\n",
+                "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",
+                ":1\r\n",
+                "$2\r\nm1\r\n",
+                "$-1\r\n",
+                ":2\r\n",
+                "*2\r\n$2\r\nza\r\n$3\r\n1.5\r\n",
+                "*2\r\n$2\r\nzb\r\n$3\r\n2.5\r\n",
+                "*0\r\n",
+                ":0\r\n",
+                "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+            );
+            assert_eq!(String::from_utf8_lossy(&out), expected);
         });
     }
 }

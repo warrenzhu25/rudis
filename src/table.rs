@@ -8236,6 +8236,16 @@ impl RudisTable {
     }
 
     #[inline(always)]
+    pub fn rpush_slice_with_hash(
+        &mut self,
+        key: &Bytes,
+        h: u64,
+        values: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        self.rpush_slice_internal(key.as_ref(), h, Some(key), values)
+    }
+
+    #[inline(always)]
     fn rpush_slice_internal(
         &mut self,
         key: &[u8],
@@ -9860,6 +9870,50 @@ impl RudisTable {
 
     pub fn spop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
         let h = hash_key(key);
+        self.spop_with_hash(key, h, count)
+    }
+
+    /// `SPOP key` (no count): pops one member without allocating a result `Vec`.
+    #[inline(always)]
+    pub fn spop_one_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+    ) -> Result<Option<Bytes>, &'static str> {
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(None);
+            }
+            let (popped, is_empty) = if let Some(entry) = self.get_slot_mut_warm(idx) {
+                match &mut entry.val {
+                    RudisValue::Set(set) => {
+                        let elem = set.pop();
+                        (elem, set.is_empty())
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            } else {
+                (None, false)
+            };
+            if is_empty {
+                self.table.remove(idx);
+            }
+            Ok(popped)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn spop_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        count: usize,
+    ) -> Result<Vec<Bytes>, &'static str> {
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
                 return Ok(Vec::new());
@@ -11766,6 +11820,15 @@ impl RudisTable {
 
     pub fn zpopmin(&mut self, key: &[u8], count: usize) -> Result<Vec<(Bytes, f64)>, &'static str> {
         let h = hash_key(key);
+        self.zpopmin_with_hash(key, h, count)
+    }
+
+    pub fn zpopmin_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        count: usize,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
                 return Ok(Vec::new());
