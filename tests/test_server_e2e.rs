@@ -27098,3 +27098,71 @@ fn test_zset_members_of_every_length_across_encodings_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_slowlog_args_survive_read_buffer_reuse_e2e() {
+    let port = 17997u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "slowlog-max-len", "1024"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "slowlog-log-slower-than", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["SLOWLOG", "RESET"]), "+OK\r\n");
+
+    // GET is parsed zero-copy out of the connection's read buffer. Log one,
+    // then push lots of unrelated traffic through the same connection so the
+    // buffer is reused, and check the logged arguments are intact.
+    assert_eq!(resp_cmd(&mut c, &["GET", "slowlog_marker_key"]), "$-1\r\n");
+    let big = "v".repeat(4000);
+    for i in 0..200 {
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", &format!("churn_{i}"), &big]),
+            "+OK\r\n"
+        );
+    }
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "slowlog-log-slower-than", "10000000"]
+        ),
+        "+OK\r\n"
+    );
+
+    c.write_all(b"SLOWLOG GET 1000\r\n").unwrap();
+    let mut log = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !String::from_utf8_lossy(&log).contains("slowlog_marker_key") {
+        match c.read(&mut buf) {
+            Ok(n) if n > 0 => log.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    let log = String::from_utf8_lossy(&log);
+    assert!(
+        log.contains("$3\r\nget\r\n$18\r\nslowlog_marker_key\r\n"),
+        "marker GET missing or corrupted in SLOWLOG ({} bytes): {}",
+        log.len(),
+        &log[..log.len().min(600)]
+    );
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

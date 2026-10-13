@@ -173,7 +173,10 @@ pub fn log_command_if_slow(cmd: &Command, duration_us: u64, client_addr: &str, c
 
     let (mut argv, original_argc) = command_to_slowlog_argv(cmd);
 
-    // 1. Truncate strings longer than slowlog-entry-max-string-len
+    // 1. Truncate strings longer than slowlog-entry-max-string-len. Shorter
+    // ones are copied: arguments can be slices of a connection's shared read
+    // buffer (zero-copy parsed commands), and an entry kept in the log would
+    // otherwise pin that whole buffer.
     let max_str_len = SLOWLOG_ENTRY_MAX_STRING_LEN.load(Ordering::Relaxed);
     for arg in &mut argv {
         if arg.len() > max_str_len {
@@ -181,6 +184,8 @@ pub fn log_command_if_slow(cmd: &Command, duration_us: u64, client_addr: &str, c
             let mut truncated = arg.slice(..max_str_len).to_vec();
             truncated.extend_from_slice(format!("... ({} more bytes)", excess).as_bytes());
             *arg = Bytes::from(truncated);
+        } else if !arg.is_empty() {
+            *arg = Bytes::copy_from_slice(arg);
         }
     }
 
@@ -1238,6 +1243,34 @@ pub(crate) mod tests {
 
         slowlog_reset();
         assert_eq!(slowlog_len(), 0);
+    }
+
+    #[test]
+    fn test_slowlog_entries_do_not_pin_the_request_buffer() {
+        let _guard = TEST_LOCK.lock();
+        slowlog_reset();
+        SLOWLOG_LOG_SLOWER_THAN.store(0, Ordering::Relaxed);
+        SLOWLOG_ENTRY_MAX_ARGC.store(32, Ordering::Relaxed);
+        SLOWLOG_ENTRY_MAX_STRING_LEN.store(128, Ordering::Relaxed);
+
+        // A command whose key is a slice of a large shared read buffer, as a
+        // zero-copy parsed GET is. The logged argument must be its own copy.
+        let buf = Bytes::from(vec![b'k'; 128 * 1024]);
+        let key = buf.slice(1000..1010);
+        let range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
+        log_command_if_slow(&Command::Get(key), 100, "127.0.0.1:5001", "pin-test");
+
+        let entries = slowlog_get(None);
+        let e = entries
+            .iter()
+            .find(|e| e.client_name == "pin-test")
+            .expect("entry logged");
+        assert_eq!(&e.argv[1][..], &[b'k'; 10]);
+        assert!(
+            !range.contains(&(e.argv[1].as_ptr() as usize)),
+            "slowlog entry still points into the request buffer"
+        );
+        slowlog_reset();
     }
 
     #[test]
