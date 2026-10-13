@@ -149,6 +149,7 @@ pub fn format_memory_info(
     )
 }
 
+#[cfg(test)]
 use bytes::Bytes;
 
 pub const MAX_ARENA_POOLED: usize = 1024;
@@ -159,7 +160,7 @@ pub const MAX_ARENA_POOLED: usize = 1024;
 #[derive(Debug, Default)]
 pub struct SmallCollectionArena {
     list_pool: Vec<crate::packedlist::PackedList>,
-    hash_pool: Vec<Vec<(Bytes, Bytes)>>,
+    hash_pool: Vec<Vec<u8>>,
     set_pool: Vec<Vec<crate::table::SmallSetEntry>>,
     zset_pool: Vec<Vec<(crate::table::OrderedScore, crate::compact::CompactKey)>>,
     pub allocations_saved: u64,
@@ -198,24 +199,22 @@ impl SmallCollectionArena {
     }
 
     #[inline(always)]
-    pub fn acquire_small_hash(&mut self, min_cap: usize) -> Vec<(Bytes, Bytes)> {
-        if let Some(mut v) = self.hash_pool.pop() {
-            self.allocations_saved += 1;
-            if v.capacity() < min_cap {
-                v.reserve(min_cap - v.capacity());
+    pub fn acquire_small_hash(&mut self, _min_pairs: usize) -> crate::smallhash::SmallHash {
+        match self.hash_pool.pop() {
+            Some(buf) => {
+                self.allocations_saved += 1;
+                crate::smallhash::SmallHash::with_buf(buf)
             }
-            v
-        } else {
-            Vec::with_capacity(min_cap.max(8))
+            None => crate::smallhash::SmallHash::default(),
         }
     }
 
     #[inline(always)]
-    pub fn recycle_small_hash(&mut self, mut v: Vec<(Bytes, Bytes)>) {
-        v.clear();
-        if v.capacity() <= 512 && self.hash_pool.len() < MAX_ARENA_POOLED {
+    pub fn recycle_small_hash(&mut self, h: crate::smallhash::SmallHash) {
+        let buf = h.into_buf();
+        if buf.capacity() > 0 && buf.capacity() <= 4096 && self.hash_pool.len() < MAX_ARENA_POOLED {
             self.recycles_count += 1;
-            self.hash_pool.push(v);
+            self.hash_pool.push(buf);
         }
     }
 
@@ -332,7 +331,7 @@ mod tests {
 
         // 2. Small Hash pool
         let mut h = arena.acquire_small_hash(4);
-        h.push((Bytes::from_static(b"f1"), Bytes::from_static(b"v1")));
+        h.push_new(b"f1", b"v1");
         arena.recycle_small_hash(h);
         assert_eq!(arena.recycles_count, 2);
         assert_eq!(arena.pool_stats().1, 1);

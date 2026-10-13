@@ -1379,7 +1379,7 @@ pub struct TieredPointer {
 pub enum RudisValue {
     String(crate::compact::CompactStr),
     Int(i64),
-    SmallHash(Box<Vec<(Bytes, Bytes)>>),
+    SmallHash(Box<crate::smallhash::SmallHash>),
     Hash(Box<RudisHashMap>),
     List(Box<crate::packedlist::PackedList>),
     Set(Box<RudisSet>),
@@ -1446,7 +1446,7 @@ impl RudisValue {
         match self {
             RudisValue::String(b) => b.len(),
             RudisValue::Int(_) => 8,
-            RudisValue::SmallHash(pairs) => pairs.iter().map(|(k, v)| k.len() + v.len() + 16).sum(),
+            RudisValue::SmallHash(pairs) => pairs.iter().map(|(k, v)| k.len() + v.len() + 2).sum(),
             RudisValue::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 32).sum(),
             RudisValue::List(l) => l.iter().map(|b| b.len() + 16).sum(),
             RudisValue::Set(s) => s.len() * 32,
@@ -3684,10 +3684,6 @@ impl RudisTable {
                 }
                 RudisValue::SmallHash(pairs) => {
                     pairs.shrink_to_fit();
-                    for (k, v) in pairs.iter_mut() {
-                        *k = Bytes::copy_from_slice(k.as_ref());
-                        *v = Bytes::copy_from_slice(v.as_ref());
-                    }
                 }
                 _ => {}
             }
@@ -6134,32 +6130,14 @@ impl RudisTable {
                 }
                 match &mut entry.val {
                     RudisValue::SmallHash(pairs) => {
-                        if pairs.len() == 1 && pairs[0].0 == *field {
-                            pairs[0].1 = val.clone();
-                            if val.len() > max_value {
-                                let map: RudisHashMap = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(Box::new(map));
-                            }
-                            return Ok(0);
+                        let added = pairs.set(field, val);
+                        if (added && pairs.len() > max_entries)
+                            || field.len() > max_value
+                            || val.len() > max_value
+                        {
+                            entry.val = RudisValue::Hash(Box::new(pairs.to_map()));
                         }
-                        if let Some(pos) = pairs.iter().position(|(k, _)| k == field) {
-                            pairs[pos].1 = val.clone();
-                            if val.len() > max_value {
-                                let map: RudisHashMap = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(Box::new(map));
-                            }
-                            return Ok(0);
-                        } else {
-                            pairs.push((field.clone(), val.clone()));
-                            if pairs.len() > max_entries
-                                || field.len() > max_value
-                                || val.len() > max_value
-                            {
-                                let map: RudisHashMap = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(Box::new(map));
-                            }
-                            return Ok(1);
-                        }
+                        return Ok(added as usize);
                     }
                     RudisValue::Hash(map) => {
                         if let Some(existing_val) = map.get_mut(field) {
@@ -6181,7 +6159,7 @@ impl RudisTable {
         let (_, insert_idx) = self.table.find_or_prepare_insert(key.as_ref(), h);
         let val = if field.len() <= max_value && val.len() <= max_value {
             let mut pairs = self.arena.acquire_small_hash(1);
-            pairs.push((field.clone(), val.clone()));
+            pairs.push_new(field, val);
             RudisValue::SmallHash(Box::new(pairs))
         } else {
             let mut map = RudisHashMap::with_capacity_and_hasher(1, FxBuildHasher::default());
@@ -6240,53 +6218,19 @@ impl RudisTable {
                 match &mut entry.val {
                     RudisValue::SmallHash(pairs) => {
                         let mut added = 0;
-                        if fields.len() == 1 {
-                            let (f, v) = &fields[0];
-                            if pairs.len() == 1 && pairs[0].0 == *f {
-                                pairs[0].1 = v.clone();
-                                if v.len() > max_value {
-                                    let map: RudisHashMap = pairs.drain(..).collect();
-                                    entry.val = RudisValue::Hash(Box::new(map));
-                                }
-                                return Ok(0);
+                        for (f, v) in fields {
+                            if pairs.set(f, v) {
+                                added += 1;
                             }
-                            if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
-                                pairs[pos].1 = v.clone();
-                                if v.len() > max_value {
-                                    let map: RudisHashMap = pairs.drain(..).collect();
-                                    entry.val = RudisValue::Hash(Box::new(map));
-                                }
-                            } else {
-                                pairs.push((f.clone(), v.clone()));
-                                if pairs.len() > max_entries
-                                    || f.len() > max_value
-                                    || v.len() > max_value
-                                {
-                                    let map: RudisHashMap = pairs.drain(..).collect();
-                                    entry.val = RudisValue::Hash(Box::new(map));
-                                }
-                                added = 1;
-                            }
-                            return Ok(added);
-                        } else {
-                            for (f, v) in fields {
-                                if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
-                                    pairs[pos].1 = v.clone();
-                                } else {
-                                    pairs.push((f.clone(), v.clone()));
-                                    added += 1;
-                                }
-                            }
-                            if pairs.len() > max_entries
-                                || fields
-                                    .iter()
-                                    .any(|(k, v)| k.len() > max_value || v.len() > max_value)
-                            {
-                                let map: RudisHashMap = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(Box::new(map));
-                            }
-                            return Ok(added);
                         }
+                        if pairs.len() > max_entries
+                            || fields
+                                .iter()
+                                .any(|(k, v)| k.len() > max_value || v.len() > max_value)
+                        {
+                            entry.val = RudisValue::Hash(Box::new(pairs.to_map()));
+                        }
+                        return Ok(added);
                     }
                     RudisValue::Hash(map) => {
                         let mut added = 0;
@@ -6328,21 +6272,12 @@ impl RudisTable {
                     .any(|(k, v)| k.len() > max_value || v.len() > max_value)
             }) {
             let mut pairs = self.arena.acquire_small_hash(fields.len());
-            let added = if fields.len() == 1 {
-                pairs.push((fields[0].0.clone(), fields[0].1.clone()));
-                1
-            } else {
-                let mut a = 0;
-                for (f, v) in fields {
-                    if let Some(pos) = pairs.iter().position(|(k, _): &(Bytes, Bytes)| k == f) {
-                        pairs[pos].1 = v.clone();
-                    } else {
-                        pairs.push((f.clone(), v.clone()));
-                        a += 1;
-                    }
+            let mut added = 0;
+            for (f, v) in fields {
+                if pairs.set(f, v) {
+                    added += 1;
                 }
-                a
-            };
+            }
             (RudisValue::SmallHash(Box::new(pairs)), added)
         } else {
             let mut map =
@@ -6383,16 +6318,15 @@ impl RudisTable {
         {
             match &mut entry.val {
                 RudisValue::SmallHash(pairs) => {
-                    if pairs.iter().any(|(k, _)| *k == field) {
+                    if pairs.contains(&field) {
                         return Ok(0);
                     }
                     let should_promote = pairs.len() >= max_entries
                         || field.len() > max_value
                         || value.len() > max_value;
-                    pairs.push((field, value));
+                    pairs.push_new(&field, &value);
                     if should_promote {
-                        let map: RudisHashMap = pairs.drain(..).collect();
-                        entry.val = RudisValue::Hash(Box::new(map));
+                        entry.val = RudisValue::Hash(Box::new(pairs.to_map()));
                     }
                     return Ok(1);
                 }
@@ -6416,7 +6350,9 @@ impl RudisTable {
             map.insert(field, value);
             RudisValue::Hash(Box::new(map))
         } else {
-            RudisValue::SmallHash(Box::new(vec![(field, value)]))
+            let mut pairs = crate::smallhash::SmallHash::default();
+            pairs.push_new(&field, &value);
+            RudisValue::SmallHash(Box::new(pairs))
         };
         let entry = RudisEntry::new(CompactKey::new(&key), val, Expiry::from(None));
         self.table.insert(entry);
@@ -6683,8 +6619,8 @@ impl RudisTable {
         match &entry.val {
             RudisValue::SmallHash(pairs) => {
                 for f in fields {
-                    if let Some((_, v)) = pairs.iter().find(|(k, _)| k == f) {
-                        vals.push(Some(v.clone()));
+                    if let Some(v) = pairs.get(f) {
+                        vals.push(Some(Bytes::copy_from_slice(v)));
                         existing_fields.push(f.clone());
                     } else {
                         vals.push(None);
@@ -7207,15 +7143,7 @@ impl RudisTable {
                 return Ok(None);
             }
             match &entry.val {
-                RudisValue::SmallHash(pairs) => {
-                    let f_len = field.len();
-                    for (k, v) in pairs.iter() {
-                        if k.len() == f_len && k.as_ref() == field {
-                            return Ok(Some(v.clone()));
-                        }
-                    }
-                    Ok(None)
-                }
+                RudisValue::SmallHash(pairs) => Ok(pairs.get(field).map(Bytes::copy_from_slice)),
                 RudisValue::Hash(map) => Ok(map.get(field).cloned()),
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             }
@@ -7256,27 +7184,10 @@ impl RudisTable {
             }
             crate::server_stats::note_key_lookup(true);
             match &entry.val {
-                RudisValue::SmallHash(pairs) => {
-                    let f_len = field.len();
-                    match pairs.len() {
-                        0 => Ok(crate::shard::CompactResp::NULL),
-                        1 => {
-                            if pairs[0].0.len() == f_len && pairs[0].0.as_ref() == field {
-                                Ok(crate::shard::CompactResp::from_bulk(&pairs[0].1))
-                            } else {
-                                Ok(crate::shard::CompactResp::NULL)
-                            }
-                        }
-                        _ => {
-                            for (k, v) in pairs.iter() {
-                                if k.len() == f_len && k.as_ref() == field {
-                                    return Ok(crate::shard::CompactResp::from_bulk(v));
-                                }
-                            }
-                            Ok(crate::shard::CompactResp::NULL)
-                        }
-                    }
-                }
+                RudisValue::SmallHash(pairs) => match pairs.get(field) {
+                    Some(v) => Ok(crate::shard::CompactResp::from_bulk_slice(v)),
+                    None => Ok(crate::shard::CompactResp::NULL),
+                },
                 RudisValue::Hash(map) => {
                     if let Some(v) = map.get(field) {
                         return Ok(crate::shard::CompactResp::from_bulk(v));
@@ -7314,27 +7225,9 @@ impl RudisTable {
             }
             match &entry.val {
                 RudisValue::SmallHash(pairs) => {
-                    let f_len = field.len();
-                    match pairs.len() {
-                        0 => {
-                            crate::connection::write_resp_null(out);
-                        }
-                        1 => {
-                            if pairs[0].0.len() == f_len && pairs[0].0.as_ref() == field {
-                                crate::connection::write_resp_bulk(out, &pairs[0].1);
-                            } else {
-                                crate::connection::write_resp_null(out);
-                            }
-                        }
-                        _ => {
-                            for (k, v) in pairs.iter() {
-                                if k.len() == f_len && k.as_ref() == field {
-                                    crate::connection::write_resp_bulk(out, v);
-                                    return Ok(());
-                                }
-                            }
-                            crate::connection::write_resp_null(out);
-                        }
+                    match pairs.get(field) {
+                        Some(v) => crate::connection::write_resp_bulk(out, v),
+                        None => crate::connection::write_resp_null(out),
                     }
                     Ok(())
                 }
@@ -7371,7 +7264,7 @@ impl RudisTable {
                 match &entry.val {
                     RudisValue::SmallHash(pairs) => Ok(fields
                         .iter()
-                        .map(|f| pairs.iter().find(|(k, _)| k == f).map(|(_, v)| v.clone()))
+                        .map(|f| pairs.get(f).map(Bytes::copy_from_slice))
                         .collect()),
                     RudisValue::Hash(map) => {
                         Ok(fields.iter().map(|f| map.get(f).cloned()).collect())
@@ -7420,16 +7313,7 @@ impl RudisTable {
                     out.reserve(16 + fields.len() * 24);
                     crate::connection::write_resp_array_header(out, fields.len());
                     for f in fields {
-                        let f_bytes = f.as_ref();
-                        let f_len = f_bytes.len();
-                        let mut found = None;
-                        for (k, v) in pairs.iter() {
-                            if k.len() == f_len && k.as_ref() == f_bytes {
-                                found = Some(v);
-                                break;
-                            }
-                        }
-                        if let Some(v) = found {
+                        if let Some(v) = pairs.get(f.as_ref()) {
                             crate::connection::write_resp_bulk(out, v);
                         } else {
                             crate::connection::write_resp_null(out);
@@ -7487,8 +7371,7 @@ impl RudisTable {
                     RudisValue::SmallHash(pairs) => {
                         let mut c = 0;
                         for f in fields {
-                            if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
-                                pairs.swap_remove(pos);
+                            if pairs.remove(f) {
                                 c += 1;
                             }
                         }
@@ -7617,9 +7500,10 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(pairs) => {
-                        Ok(pairs.iter().map(|(k, _)| k.clone()).collect())
-                    }
+                    RudisValue::SmallHash(pairs) => Ok(pairs
+                        .iter()
+                        .map(|(k, _)| Bytes::copy_from_slice(k))
+                        .collect()),
                     RudisValue::Hash(map) => Ok(map.keys().cloned().collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
@@ -7642,9 +7526,10 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(pairs) => {
-                        Ok(pairs.iter().map(|(_, v)| v.clone()).collect())
-                    }
+                    RudisValue::SmallHash(pairs) => Ok(pairs
+                        .iter()
+                        .map(|(_, v)| Bytes::copy_from_slice(v))
+                        .collect()),
                     RudisValue::Hash(map) => Ok(map.values().cloned().collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
@@ -7667,13 +7552,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(pairs) => {
-                        if let Some((_, v)) = pairs.iter().find(|(k, _)| k == field) {
-                            Ok(v.len())
-                        } else {
-                            Ok(0)
-                        }
-                    }
+                    RudisValue::SmallHash(pairs) => Ok(pairs.get(field).map_or(0, <[u8]>::len)),
                     RudisValue::Hash(map) => {
                         if let Some(v) = map.get(field) {
                             Ok(v.len())
@@ -7711,8 +7590,7 @@ impl RudisTable {
                     match &mut entry.val {
                         RudisValue::SmallHash(pairs) => {
                             for f in fields {
-                                if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
-                                    let (_, v) = pairs.remove(pos);
+                                if let Some(v) = pairs.take(f) {
                                     results.push(Some(v));
                                     deleted_fields.push(f.clone());
                                 } else {
@@ -7803,7 +7681,7 @@ impl RudisTable {
         {
             match &mut entry.val {
                 RudisValue::SmallHash(pairs) => {
-                    let curr = if let Some((_, v)) = pairs.iter().find(|(k, _)| k == &field) {
+                    let curr = if let Some(v) = pairs.get(&field) {
                         let s = std::str::from_utf8(v)
                             .map_err(|_| "ERR hash value is not an integer")?;
                         s.parse::<i64>()
@@ -7815,18 +7693,13 @@ impl RudisTable {
                         .checked_add(delta)
                         .ok_or("ERR increment or decrement would overflow")?;
                     let new_bytes = Bytes::from(new_val.to_string());
-                    if let Some(pos) = pairs.iter().position(|(k, _)| k == &field) {
-                        pairs[pos].1 = new_bytes;
-                    } else {
-                        pairs.push((field, new_bytes));
-                        if pairs.len() > max_entries
-                            || pairs
-                                .iter()
-                                .any(|(k, v)| k.len() > max_value || v.len() > max_value)
-                        {
-                            let map: RudisHashMap = pairs.drain(..).collect();
-                            entry.val = RudisValue::Hash(Box::new(map));
-                        }
+                    let added = pairs.set(&field, &new_bytes);
+                    if added
+                        && (pairs.len() > max_entries
+                            || field.len() > max_value
+                            || new_bytes.len() > max_value)
+                    {
+                        entry.val = RudisValue::Hash(Box::new(pairs.to_map()));
                     }
                     return Ok(new_val);
                 }
@@ -7860,7 +7733,10 @@ impl RudisTable {
         let val_bytes = Bytes::from(delta.to_string());
         let entry = RudisEntry::new(
             CompactKey::new(&key),
-            RudisValue::SmallHash(Box::new(vec![(field, val_bytes)])),
+            RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from_pairs([(
+                field.as_ref(),
+                val_bytes.as_ref(),
+            )]))),
             Expiry::from(None),
         );
         self.table.insert(entry);
@@ -7885,7 +7761,7 @@ impl RudisTable {
         {
             match &mut entry.val {
                 RudisValue::SmallHash(pairs) => {
-                    let curr = if let Some((_, v)) = pairs.iter().find(|(k, _)| k == &field) {
+                    let curr = if let Some(v) = pairs.get(&field) {
                         let s = std::str::from_utf8(v)
                             .map_err(|_| "ERR hash value is not a valid float")?;
                         s.parse::<f64>()
@@ -7898,18 +7774,13 @@ impl RudisTable {
                         return Err("ERR increment would produce NaN or Infinity");
                     }
                     let new_bytes = Bytes::from(new_val.to_string());
-                    if let Some(pos) = pairs.iter().position(|(k, _)| k == &field) {
-                        pairs[pos].1 = new_bytes;
-                    } else {
-                        pairs.push((field, new_bytes));
-                        if pairs.len() > max_entries
-                            || pairs
-                                .iter()
-                                .any(|(k, v)| k.len() > max_value || v.len() > max_value)
-                        {
-                            let map: RudisHashMap = pairs.drain(..).collect();
-                            entry.val = RudisValue::Hash(Box::new(map));
-                        }
+                    let added = pairs.set(&field, &new_bytes);
+                    if added
+                        && (pairs.len() > max_entries
+                            || field.len() > max_value
+                            || new_bytes.len() > max_value)
+                    {
+                        entry.val = RudisValue::Hash(Box::new(pairs.to_map()));
                     }
                     return Ok(new_val);
                 }
@@ -7947,7 +7818,10 @@ impl RudisTable {
         let val_bytes = Bytes::from(delta.to_string());
         let entry = RudisEntry::new(
             CompactKey::new(&key),
-            RudisValue::SmallHash(Box::new(vec![(field, val_bytes)])),
+            RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from_pairs([(
+                field.as_ref(),
+                val_bytes.as_ref(),
+            )]))),
             Expiry::from(None),
         );
         self.table.insert(entry);
@@ -14513,7 +14387,7 @@ impl RudisTable {
                     u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
                 if count <= 64 {
-                    let mut pairs = Vec::with_capacity(count);
+                    let mut pairs = crate::smallhash::SmallHash::default();
                     for _ in 0..count {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
@@ -14539,10 +14413,10 @@ impl RudisTable {
                         let v = Bytes::copy_from_slice(&data[cursor..cursor + v_len]);
                         cursor += v_len;
 
-                        if pairs.iter().any(|(k, _)| *k == f) {
+                        if pairs.contains(&f) {
                             return Err("DUMP payload version or checksum are wrong");
                         }
-                        pairs.push((f, v));
+                        pairs.push_new(&f, &v);
                     }
                     RudisValue::SmallHash(Box::new(pairs))
                 } else {

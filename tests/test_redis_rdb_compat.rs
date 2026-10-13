@@ -763,10 +763,10 @@ fn legacy_rudis_rdb_still_loads() {
     );
     record(
         b"legacy:hash",
-        RudisValue::SmallHash(Box::new(vec![(
+        RudisValue::SmallHash(Box::new(rudis::smallhash::SmallHash::from(vec![(
             bytes::Bytes::from_static(b"f"),
             bytes::Bytes::from_static(b"v"),
-        )])),
+        )]))),
         None,
     );
     let mut regs = Box::new([0u8; 16384]);

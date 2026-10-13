@@ -638,10 +638,11 @@ mod tests {
     #[test]
     fn small_and_full_hash_agree_and_are_order_independent() {
         let pairs = vec![(b("a"), b("1")), (b("b"), b("2")), (b("c"), b("3"))];
-        let small = RudisValue::SmallHash(Box::new(pairs.clone()));
+        let small =
+            RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from(pairs.clone())));
         let mut rev = pairs.clone();
         rev.reverse();
-        let small_rev = RudisValue::SmallHash(Box::new(rev));
+        let small_rev = RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from(rev)));
         let mut map = RudisHashMap::default();
         for (f, v) in &pairs {
             map.insert(f.clone(), v.clone());
@@ -649,13 +650,19 @@ mod tests {
         let full = RudisValue::Hash(Box::new(map));
         assert_eq!(vdigest(&small), vdigest(&small_rev));
         assert_eq!(vdigest(&small), vdigest(&full));
-        let other = RudisValue::SmallHash(Box::new(vec![(b("a"), b("1")), (b("b"), b("3"))]));
+        let other = RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from(vec![
+            (b("a"), b("1")),
+            (b("b"), b("3")),
+        ])));
         assert_ne!(vdigest(&small), vdigest(&other));
     }
 
     #[test]
     fn hash_field_ttl_presence_counts_but_not_its_value() {
-        let val = RudisValue::SmallHash(Box::new(vec![(b("f"), b("v")), (b("g"), b("w"))]));
+        let val = RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from(vec![
+            (b("f"), b("v")),
+            (b("g"), b("w")),
+        ])));
         let now = Instant::now();
         let ctx = DigestCtx {
             now,
@@ -675,7 +682,10 @@ mod tests {
         // An expired field is skipped entirely.
         let mut gone = FieldTtls::new();
         gone.insert(b("g"), now - Duration::from_millis(1));
-        let only_f = RudisValue::SmallHash(Box::new(vec![(b("f"), b("v"))]));
+        let only_f = RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from(vec![(
+            b("f"),
+            b("v"),
+        )])));
         let mut d = ZERO;
         object_digest(&mut d, &val, false, Some(&gone), &ctx);
         assert_eq!(d, vdigest(&only_f));

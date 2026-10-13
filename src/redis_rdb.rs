@@ -716,7 +716,11 @@ fn hash_value(pairs: Vec<(Bytes, Bytes)>) -> RdbResult<Option<RudisValue>> {
                 return corrupt("duplicate hash field");
             }
         }
-        return Ok(Some(RudisValue::SmallHash(Box::new(pairs))));
+        return Ok(Some(RudisValue::SmallHash(Box::new(
+            crate::smallhash::SmallHash::from_pairs(
+                pairs.iter().map(|(f, v)| (f.as_ref(), v.as_ref())),
+            ),
+        ))));
     }
     let mut map = RudisHashMap::with_capacity_and_hasher(pairs.len(), Default::default());
     for (f, v) in pairs {
@@ -2533,7 +2537,7 @@ mod tests {
         let pairs: Vec<(Bytes, Bytes)> = (0..10)
             .map(|i| (Bytes::from(format!("f{i}")), Bytes::from(format!("{i}"))))
             .collect();
-        let h = RudisValue::SmallHash(Box::new(pairs));
+        let h = RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from(pairs)));
         assert_eq!(round_trip(&h), h);
         let mut big = RudisHashMap::default();
         for i in 0..200 {
@@ -2750,10 +2754,10 @@ mod tests {
         write_raw_string(&mut body, &lp);
         assert_eq!(
             decode_dump_body(&body, 0).unwrap().value,
-            RudisValue::SmallHash(Box::new(vec![(
+            RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from(vec![(
                 Bytes::from_static(b"f"),
                 Bytes::from_static(b"7")
-            )]))
+            )])))
         );
         let zlp = lp_of(|w| {
             w.str(b"m");

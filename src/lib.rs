@@ -44,6 +44,7 @@ pub mod server_stats;
 pub mod shard;
 pub mod shutdown;
 pub mod slowlog;
+pub mod smallhash;
 pub mod snapshot;
 pub mod syscheck;
 pub mod table;

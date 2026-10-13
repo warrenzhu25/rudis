@@ -22153,10 +22153,12 @@ fn test_maxmemory_enforced_by_allocator_count_for_hashes() {
         resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", &limit.to_string()]),
         "+OK\r\n"
     );
-    // ~4x the headroom in hashes, pipelined 100 commands at a time.
+    // ~4x the headroom in hashes, pipelined 100 commands at a time. Small
+    // hashes are packed (~45 bytes per 32-byte field), so this takes 32000
+    // hashes of 20 fields.
     let val = "x".repeat(32);
     let mut buf = vec![0u8; 1 << 16];
-    for batch in 0..80 {
+    for batch in 0..320 {
         let mut pipe = String::new();
         for k in 0..100 {
             let key = format!("h:{batch}:{k}");
@@ -27884,6 +27886,201 @@ fn test_packed_zset_compaction_and_order_e2e() {
     let popped = strings(cmd(&mut c, &["ZPOPMIN", "pz", &n]));
     assert_eq!(popped.len(), want.len() * 2);
     assert_eq!(resp_cmd(&mut c, &["EXISTS", "pz"]), ":0\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}
+
+#[test]
+fn test_packed_small_hash_ops_and_promotion_e2e() {
+    use std::collections::HashMap;
+    let port = 17991u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Reads one RESP reply: bulk strings and arrays of them.
+    fn read_reply(c: &mut TcpStream) -> Vec<u8> {
+        fn complete(b: &[u8], i: usize) -> Option<usize> {
+            let nl = i + b.get(i..)?.windows(2).position(|w| w == b"\r\n")?;
+            let head = std::str::from_utf8(&b[i + 1..nl]).unwrap();
+            match b[i] {
+                b'$' => {
+                    let n: i64 = head.parse().unwrap();
+                    if n < 0 {
+                        return Some(nl + 2);
+                    }
+                    let end = nl + 2 + n as usize + 2;
+                    (b.len() >= end).then_some(end)
+                }
+                b'*' => {
+                    let n: usize = head.parse().unwrap();
+                    let mut j = nl + 2;
+                    for _ in 0..n {
+                        j = complete(b, j)?;
+                    }
+                    Some(j)
+                }
+                _ => Some(nl + 2),
+            }
+        }
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            if complete(&got, 0) == Some(got.len()) && !got.is_empty() {
+                return got;
+            }
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+    fn cmd(c: &mut TcpStream, args: &[&str]) -> String {
+        let mut out = format!("*{}\r\n", args.len());
+        for a in args {
+            out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        c.write_all(out.as_bytes()).unwrap();
+        String::from_utf8(read_reply(c)).unwrap()
+    }
+    fn bulk(s: &str) -> String {
+        format!("${}\r\n{s}\r\n", s.len())
+    }
+    // HGETALL as a map.
+    fn getall(c: &mut TcpStream, key: &str) -> HashMap<String, String> {
+        let r = cmd(c, &["HGETALL", key]);
+        let mut lines = r.split("\r\n");
+        let n: usize = lines.next().unwrap()[1..].parse().unwrap();
+        let mut items = Vec::new();
+        for _ in 0..n {
+            lines.next();
+            items.push(lines.next().unwrap().to_string());
+        }
+        items
+            .chunks(2)
+            .map(|p| (p[0].clone(), p[1].clone()))
+            .collect()
+    }
+
+    // Updates that change a value's length (including across the one-byte
+    // length prefix boundary), deletes, and counters, against a model.
+    let mut model: HashMap<String, String> = HashMap::new();
+    for i in 0..40 {
+        let f = format!("f{i}");
+        let v = "x".repeat(i % 7);
+        assert_eq!(cmd(&mut c, &["HSET", "sh", &f, &v]), ":1\r\n");
+        model.insert(f, v);
+    }
+    for i in (0..40).step_by(3) {
+        let f = format!("f{i}");
+        let v = "y".repeat(60 - i);
+        assert_eq!(cmd(&mut c, &["HSET", "sh", &f, &v]), ":0\r\n");
+        model.insert(f, v);
+    }
+    for i in (0..40).step_by(5) {
+        let f = format!("f{i}");
+        assert_eq!(cmd(&mut c, &["HDEL", "sh", &f, "nope"]), ":1\r\n");
+        model.remove(&f);
+    }
+    assert_eq!(cmd(&mut c, &["HSETNX", "sh", "f1", "z"]), ":0\r\n");
+    assert_eq!(cmd(&mut c, &["HSETNX", "sh", "new", "z"]), ":1\r\n");
+    model.insert("new".into(), "z".into());
+    assert_eq!(cmd(&mut c, &["HINCRBY", "sh", "ctr", "41"]), ":41\r\n");
+    assert_eq!(cmd(&mut c, &["HINCRBY", "sh", "ctr", "1"]), ":42\r\n");
+    model.insert("ctr".into(), "42".into());
+    assert_eq!(
+        cmd(&mut c, &["HINCRBYFLOAT", "sh", "fl", "1.5"]),
+        bulk("1.5")
+    );
+    model.insert("fl".into(), "1.5".into());
+    assert_eq!(cmd(&mut c, &["OBJECT", "ENCODING", "sh"]), bulk("listpack"));
+    assert_eq!(
+        cmd(&mut c, &["HLEN", "sh"]),
+        format!(":{}\r\n", model.len())
+    );
+    assert_eq!(getall(&mut c, "sh"), model);
+    for (f, v) in &model {
+        assert_eq!(cmd(&mut c, &["HGET", "sh", f]), bulk(v), "{f}");
+        assert_eq!(
+            cmd(&mut c, &["HSTRLEN", "sh", f]),
+            format!(":{}\r\n", v.len())
+        );
+    }
+    assert_eq!(cmd(&mut c, &["HGET", "sh", "f5"]), "$-1\r\n");
+    assert_eq!(
+        cmd(&mut c, &["HMGET", "sh", "f1", "f5", "ctr"]),
+        format!("*3\r\n{}$-1\r\n{}", bulk(&model["f1"]), bulk("42"))
+    );
+    assert_eq!(cmd(&mut c, &["HEXISTS", "sh", "f2"]), ":1\r\n");
+
+    // A value over hash-max-listpack-value (64) promotes to a hashtable and
+    // keeps every field.
+    let long = "L".repeat(65);
+    assert_eq!(cmd(&mut c, &["HSET", "sh", "f1", &long]), ":0\r\n");
+    model.insert("f1".into(), long);
+    assert_eq!(
+        cmd(&mut c, &["OBJECT", "ENCODING", "sh"]),
+        bulk("hashtable")
+    );
+    assert_eq!(getall(&mut c, "sh"), model);
+
+    // Past hash-max-listpack-entries (512) promotes too.
+    let mut big: HashMap<String, String> = HashMap::new();
+    for i in 0..512 {
+        let (f, v) = (format!("k{i}"), format!("v{i}"));
+        cmd(&mut c, &["HSET", "bh", &f, &v]);
+        big.insert(f, v);
+    }
+    assert_eq!(cmd(&mut c, &["OBJECT", "ENCODING", "bh"]), bulk("listpack"));
+    cmd(&mut c, &["HSET", "bh", "k512", "v512"]);
+    big.insert("k512".into(), "v512".into());
+    assert_eq!(
+        cmd(&mut c, &["OBJECT", "ENCODING", "bh"]),
+        bulk("hashtable")
+    );
+    assert_eq!(getall(&mut c, "bh"), big);
+
+    // DUMP/RESTORE of a small hash round-trips.
+    let mut small: HashMap<String, String> = HashMap::new();
+    for i in 0..10 {
+        let (f, v) = (format!("a{i}"), format!("b{i}"));
+        cmd(&mut c, &["HSET", "dh", &f, &v]);
+        small.insert(f, v);
+    }
+    let dump = {
+        c.write_all(b"*2\r\n$4\r\nDUMP\r\n$2\r\ndh\r\n").unwrap();
+        let r = read_reply(&mut c);
+        let nl = r.windows(2).position(|w| w == b"\r\n").unwrap();
+        r[nl + 2..r.len() - 2].to_vec()
+    };
+    let mut out = format!(
+        "*4\r\n$7\r\nRESTORE\r\n$3\r\ndh2\r\n$1\r\n0\r\n${}\r\n",
+        dump.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(&dump);
+    out.extend_from_slice(b"\r\n");
+    c.write_all(&out).unwrap();
+    assert_eq!(String::from_utf8(read_reply(&mut c)).unwrap(), "+OK\r\n");
+    assert_eq!(getall(&mut c, "dh2"), small);
+
+    // Deleting every field deletes the key.
+    for i in 0..10 {
+        cmd(&mut c, &["HDEL", "dh", &format!("a{i}")]);
+    }
+    assert_eq!(cmd(&mut c, &["EXISTS", "dh"]), ":0\r\n");
 
     drop(c);
     shutdown_and_wait(port, &mut srv);

@@ -97,6 +97,12 @@ impl CompactResp {
         Self::from_bulk_with(bytes, || bytes.clone())
     }
 
+    /// Like [`Self::from_bulk`] for borrowed bytes (copied only if long).
+    #[inline(always)]
+    pub fn from_bulk_slice(bytes: &[u8]) -> Self {
+        Self::from_bulk_with(bytes, || Bytes::copy_from_slice(bytes))
+    }
+
     /// Like [`Self::from_bulk`] for a table string value: short values are
     /// encoded inline, long ones share the value's allocation.
     #[inline(always)]
