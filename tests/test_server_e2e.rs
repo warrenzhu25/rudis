@@ -26996,3 +26996,105 @@ fn test_set_members_of_every_length_across_encodings_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_zset_members_of_every_length_across_encodings_e2e() {
+    let port = 17995u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Members at the inline-storage boundaries, long, binary and empty, in a
+    // sorted set that stays small and one that converts (> 64 members).
+    let special: Vec<String> = vec![
+        String::new(),
+        "x".repeat(22),
+        "y".repeat(23),
+        "z".repeat(24),
+        "w".repeat(300),
+        "bin\0ary".to_string(),
+    ];
+    for (key, fill) in [("ez_small", 0usize), ("ez_big", 100)] {
+        let mut args: Vec<String> = vec!["ZADD".into(), key.into()];
+        for (i, m) in special.iter().enumerate() {
+            args.push(i.to_string());
+            args.push(m.clone());
+        }
+        for i in 0..fill {
+            args.push("1000".into());
+            args.push(format!("m{i:03}"));
+        }
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let total = special.len() + fill;
+        assert_eq!(resp_cmd(&mut c, &argv), format!(":{total}\r\n"));
+        for (i, m) in special.iter().enumerate() {
+            assert_eq!(
+                resp_cmd(&mut c, &["ZSCORE", key, m]),
+                format!("${}\r\n{i}\r\n", i.to_string().len()),
+                "{key} {m:?}"
+            );
+            assert_eq!(
+                resp_cmd(&mut c, &["ZRANK", key, m]),
+                format!(":{i}\r\n"),
+                "{key} {m:?}"
+            );
+        }
+        // Score order, then member order among equal scores.
+        assert_eq!(
+            resp_cmd(&mut c, &["ZRANGE", key, "0", "1"]),
+            format!("*2\r\n$0\r\n\r\n$22\r\n{}\r\n", "x".repeat(22))
+        );
+        if fill > 0 {
+            assert_eq!(
+                resp_cmd(
+                    &mut c,
+                    &["ZRANGEBYSCORE", key, "1000", "1000", "LIMIT", "0", "2"]
+                ),
+                "*2\r\n$4\r\nm000\r\n$4\r\nm001\r\n"
+            );
+        }
+        assert_eq!(
+            resp_cmd(&mut c, &["ZRANGEBYSCORE", key, "3", "4"]),
+            format!(
+                "*2\r\n$24\r\n{}\r\n$300\r\n{}\r\n",
+                "z".repeat(24),
+                "w".repeat(300)
+            )
+        );
+        // Re-scoring a long member moves it to the front.
+        assert_eq!(
+            resp_cmd(&mut c, &["ZADD", key, "-1", &"w".repeat(300)]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["ZRANK", key, &"w".repeat(300)]),
+            ":0\r\n"
+        );
+        assert_eq!(resp_cmd(&mut c, &["ZREM", key, "bin\0ary"]), ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["ZSCORE", key, "bin\0ary"]), "$-1\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["ZPOPMIN", key]),
+            format!("*2\r\n$300\r\n{}\r\n$2\r\n-1\r\n", "w".repeat(300))
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["ZCARD", key]),
+            format!(":{}\r\n", total - 2)
+        );
+        assert_eq!(resp_cmd(&mut c, &["DEL", key]), ":1\r\n");
+    }
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

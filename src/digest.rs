@@ -711,8 +711,11 @@ mod tests {
         let mut tree = std::collections::BTreeSet::new();
         for (s, m) in items.iter().rev() {
             let s = if *s == 0.0 { 0.0 } else { *s };
-            dict.insert(b(m), s);
-            tree.insert((crate::table::OrderedScore(s), b(m)));
+            dict.insert(crate::compact::CompactKey::new(m.as_bytes()), s);
+            tree.insert((
+                crate::table::OrderedScore(s),
+                crate::compact::CompactKey::new(m.as_bytes()),
+            ));
         }
         let full = RudisZSet::Full { dict, tree };
         assert_eq!(

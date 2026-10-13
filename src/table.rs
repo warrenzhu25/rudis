@@ -146,10 +146,10 @@ const SMALL_ZSET_LIMIT: usize = 64;
 
 #[derive(Clone, Debug)]
 pub enum RudisZSet {
-    Small(Vec<(OrderedScore, Bytes)>),
+    Small(Vec<(OrderedScore, CompactKey)>),
     Full {
-        dict: hashbrown::HashMap<Bytes, f64>,
-        tree: std::collections::BTreeSet<(OrderedScore, Bytes)>,
+        dict: hashbrown::HashMap<CompactKey, f64>,
+        tree: std::collections::BTreeSet<(OrderedScore, CompactKey)>,
     },
 }
 
@@ -197,6 +197,7 @@ impl RudisZSet {
     }
 
     pub fn insert(&mut self, score: f64, member: Bytes) {
+        let member = CompactKey::new(&member);
         match self {
             RudisZSet::Small(v) => {
                 if v.is_empty() {
@@ -243,7 +244,7 @@ impl RudisZSet {
                 .map(|pos| v.remove(pos).0.0),
             RudisZSet::Full { dict, tree } => {
                 if let Some(old_score) = dict.remove(member) {
-                    tree.remove(&(OrderedScore(old_score), Bytes::copy_from_slice(member)));
+                    tree.remove(&(OrderedScore(old_score), CompactKey::new(member)));
                     Some(old_score)
                 } else {
                     None
@@ -305,7 +306,7 @@ impl RudisZSet {
             if opts.offset == usize::MAX {
                 return Vec::new();
             }
-            let filter_fn = |m: &Bytes| {
+            let filter_fn = |m: &CompactKey| {
                 opts.min_lex.matches(m.as_ref(), true) && opts.max_lex.matches(m.as_ref(), false)
             };
             if opts.rev {
@@ -313,12 +314,12 @@ impl RudisZSet {
                     RudisZSet::Small(v) => v
                         .iter()
                         .filter(|(_, m)| filter_fn(m))
-                        .map(|(s, m)| (m.clone(), s.0))
+                        .map(|(s, m)| (m.to_bytes(), s.0))
                         .collect(),
                     RudisZSet::Full { tree, .. } => tree
                         .iter()
                         .filter(|(_, m)| filter_fn(m))
-                        .map(|(s, m)| (m.clone(), s.0))
+                        .map(|(s, m)| (m.to_bytes(), s.0))
                         .collect(),
                 };
                 let skipped = items.into_iter().rev().skip(opts.offset);
@@ -332,12 +333,12 @@ impl RudisZSet {
                     RudisZSet::Small(v) => Box::new(
                         v.iter()
                             .filter(|(_, m)| filter_fn(m))
-                            .map(|(s, m)| (m.clone(), s.0)),
+                            .map(|(s, m)| (m.to_bytes(), s.0)),
                     ),
                     RudisZSet::Full { tree, .. } => Box::new(
                         tree.iter()
                             .filter(|(_, m)| filter_fn(m))
-                            .map(|(s, m)| (m.clone(), s.0)),
+                            .map(|(s, m)| (m.to_bytes(), s.0)),
                     ),
                 };
                 let skipped = items.skip(opts.offset);
@@ -355,18 +356,18 @@ impl RudisZSet {
             let min_inc = opts.min_inc;
             let max = opts.max_score;
             let max_inc = opts.max_inc;
-            let filter_fn = move |item: &&(OrderedScore, Bytes)| {
+            let filter_fn = move |item: &&(OrderedScore, CompactKey)| {
                 let s = item.0.0;
                 let ge_min = if min_inc { s >= min } else { s > min };
                 let le_max = if max_inc { s <= max } else { s < max };
                 ge_min && le_max
             };
 
-            let get_items: Box<dyn Iterator<Item = &(OrderedScore, Bytes)>> = match self {
+            let get_items: Box<dyn Iterator<Item = &(OrderedScore, CompactKey)>> = match self {
                 RudisZSet::Small(v) => Box::new(v.iter().filter(filter_fn)),
                 RudisZSet::Full { tree, .. } => Box::new(
                     tree.range((
-                        std::ops::Bound::Included((OrderedScore(min), Bytes::new())),
+                        std::ops::Bound::Included((OrderedScore(min), CompactKey::default())),
                         std::ops::Bound::Unbounded,
                     ))
                     .take_while(move |item| {
@@ -386,11 +387,11 @@ impl RudisZSet {
                 if let Some(c) = opts.count {
                     skipped
                         .take(c)
-                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                        .map(|(OrderedScore(s), m)| (m.to_bytes(), *s))
                         .collect()
                 } else {
                     skipped
-                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                        .map(|(OrderedScore(s), m)| (m.to_bytes(), *s))
                         .collect()
                 }
             } else {
@@ -398,11 +399,11 @@ impl RudisZSet {
                 if let Some(c) = opts.count {
                     skipped
                         .take(c)
-                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                        .map(|(OrderedScore(s), m)| (m.to_bytes(), *s))
                         .collect()
                 } else {
                     skipped
-                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                        .map(|(OrderedScore(s), m)| (m.to_bytes(), *s))
                         .collect()
                 }
             }
@@ -430,13 +431,13 @@ impl RudisZSet {
                             .rev()
                             .skip(start_u)
                             .take(limit)
-                            .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                            .map(|(OrderedScore(s), m)| (m.to_bytes(), *s))
                             .collect()
                     } else {
                         v.iter()
                             .skip(start_u)
                             .take(limit)
-                            .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                            .map(|(OrderedScore(s), m)| (m.to_bytes(), *s))
                             .collect()
                     }
                 }
@@ -446,13 +447,13 @@ impl RudisZSet {
                             .rev()
                             .skip(start_u)
                             .take(limit)
-                            .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                            .map(|(OrderedScore(s), m)| (m.to_bytes(), *s))
                             .collect()
                     } else {
                         tree.iter()
                             .skip(start_u)
                             .take(limit)
-                            .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                            .map(|(OrderedScore(s), m)| (m.to_bytes(), *s))
                             .collect()
                     }
                 }
@@ -467,14 +468,14 @@ impl RudisZSet {
             RudisZSet::Small(v) => {
                 for _ in 0..n {
                     let (OrderedScore(s), m) = v.remove(0);
-                    popped.push((m, s));
+                    popped.push((Bytes::from(m), s));
                 }
             }
             RudisZSet::Full { dict, tree } => {
                 for _ in 0..n {
                     if let Some((OrderedScore(s), m)) = tree.pop_first() {
                         dict.remove(&m);
-                        popped.push((m, s));
+                        popped.push((Bytes::from(m), s));
                     }
                 }
             }
@@ -489,14 +490,14 @@ impl RudisZSet {
             RudisZSet::Small(v) => {
                 for _ in 0..n {
                     let (OrderedScore(s), m) = v.pop().unwrap();
-                    popped.push((m, s));
+                    popped.push((Bytes::from(m), s));
                 }
             }
             RudisZSet::Full { dict, tree } => {
                 for _ in 0..n {
                     if let Some((OrderedScore(s), m)) = tree.pop_last() {
                         dict.remove(&m);
-                        popped.push((m, s));
+                        popped.push((Bytes::from(m), s));
                     }
                 }
             }
@@ -504,7 +505,7 @@ impl RudisZSet {
         popped
     }
 
-    pub fn for_each<F: FnMut(&Bytes, f64)>(&self, mut f: F) {
+    pub fn for_each<F: FnMut(&CompactKey, f64)>(&self, mut f: F) {
         match self {
             RudisZSet::Small(v) => {
                 for (OrderedScore(s), m) in v {
@@ -523,11 +524,11 @@ impl RudisZSet {
         match self {
             RudisZSet::Small(v) => v
                 .iter()
-                .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                .map(|(OrderedScore(s), m)| (m.to_bytes(), *s))
                 .collect(),
             RudisZSet::Full { tree, .. } => tree
                 .iter()
-                .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                .map(|(OrderedScore(s), m)| (m.to_bytes(), *s))
                 .collect(),
         }
     }
@@ -550,7 +551,7 @@ impl RudisZSet {
         }
         let start_u = s.max(0) as usize;
         let stop_u = (e.min(n - 1) as usize).max(start_u);
-        let to_remove: Vec<Bytes> = match self {
+        let to_remove: Vec<CompactKey> = match self {
             RudisZSet::Small(v) => v
                 .iter()
                 .skip(start_u)
@@ -578,7 +579,7 @@ impl RudisZSet {
         max: f64,
         max_inc: bool,
     ) -> usize {
-        let to_remove: Vec<Bytes> = match self {
+        let to_remove: Vec<CompactKey> = match self {
             RudisZSet::Small(v) => v
                 .iter()
                 .filter(|(OrderedScore(s), _)| {
@@ -606,7 +607,7 @@ impl RudisZSet {
     }
 
     pub fn rem_range_by_lex(&mut self, min: &LexBound, max: &LexBound) -> usize {
-        let to_remove: Vec<Bytes> = match self {
+        let to_remove: Vec<CompactKey> = match self {
             RudisZSet::Small(v) => v
                 .iter()
                 .filter(|(_, m)| min.matches(m.as_ref(), true) && max.matches(m.as_ref(), false))
@@ -647,10 +648,10 @@ impl PartialEq for RudisZSet {
         match (self, other) {
             (RudisZSet::Small(a), RudisZSet::Small(b)) => a == b,
             _ => {
-                let mut a_items: Vec<(OrderedScore, Bytes)> = Vec::with_capacity(self.len());
+                let mut a_items: Vec<(OrderedScore, CompactKey)> = Vec::with_capacity(self.len());
                 self.for_each(|m, s| a_items.push((OrderedScore(s), m.clone())));
                 a_items.sort();
-                let mut b_items: Vec<(OrderedScore, Bytes)> = Vec::with_capacity(other.len());
+                let mut b_items: Vec<(OrderedScore, CompactKey)> = Vec::with_capacity(other.len());
                 other.for_each(|m, s| b_items.push((OrderedScore(s), m.clone())));
                 b_items.sort();
                 a_items == b_items
@@ -10705,7 +10706,7 @@ impl RudisTable {
                                 } else {
                                     s * weight
                                 };
-                                acc.entry(m.clone())
+                                acc.entry(m.to_bytes())
                                     .and_modify(|cur| {
                                         *cur = match agg {
                                             Aggregate::Sum | Aggregate::Count => {
@@ -10781,7 +10782,7 @@ impl RudisTable {
                                 } else {
                                     s * weight
                                 };
-                                map.insert(m.clone(), if val.is_nan() { 0.0 } else { val });
+                                map.insert(m.to_bytes(), if val.is_nan() { 0.0 } else { val });
                             });
                         }
                         RudisValue::Set(s) => {
@@ -10968,7 +10969,7 @@ impl RudisTable {
                         RudisValue::ZSet(zs) => {
                             if i == 0 {
                                 let mut items = Vec::new();
-                                zs.for_each(|m, s| items.push((m.clone(), s)));
+                                zs.for_each(|m, s| items.push((m.to_bytes(), s)));
                                 first = Some(items);
                             } else {
                                 zs.for_each(|m, _| {
@@ -10985,7 +10986,7 @@ impl RudisTable {
                                 first = Some(items);
                             } else {
                                 for m in s.iter() {
-                                    other_members.insert(m.to_bytes());
+                                    other_members.insert(m.clone());
                                 }
                             }
                         }
@@ -11008,7 +11009,7 @@ impl RudisTable {
         let first = first.unwrap();
         let mut diff: Vec<(Bytes, f64)> = first
             .into_iter()
-            .filter(|(m, _)| !other_members.contains(m))
+            .filter(|(m, _)| !other_members.contains(m.as_ref()))
             .collect();
         diff.sort_by(|(m1, s1), (m2, s2)| {
             s1.partial_cmp(s2)
@@ -11524,14 +11525,17 @@ impl RudisTable {
                                         let elem_idx =
                                             if opts.rev { n - 1 - start_u } else { start_u };
                                         return Ok(crate::shard::CompactResp::Array1Bulk(
-                                            v[elem_idx].1.clone(),
+                                            v[elem_idx].1.to_bytes(),
                                         ));
                                     }
                                     RudisZSet::Full { tree, .. } => {
                                         let m_opt = if opts.rev {
-                                            tree.iter().rev().nth(start_u).map(|(_, m)| m.clone())
+                                            tree.iter()
+                                                .rev()
+                                                .nth(start_u)
+                                                .map(|(_, m)| m.to_bytes())
                                         } else {
-                                            tree.iter().nth(start_u).map(|(_, m)| m.clone())
+                                            tree.iter().nth(start_u).map(|(_, m)| m.to_bytes())
                                         };
                                         if let Some(m) = m_opt {
                                             return Ok(crate::shard::CompactResp::Array1Bulk(m));
@@ -18316,6 +18320,84 @@ mod tests {
         let idx = table.table.find(b"counter", h).unwrap();
         let entry = table.table.get_slot(idx).unwrap();
         assert_eq!(entry.val, RudisValue::Int(7));
+    }
+
+    #[test]
+    fn test_rudis_zset_compact_members_across_encodings() {
+        // Members of every length class (empty, inline, the 22/23/24-byte
+        // boundary, heap, binary) through both encodings: score updates,
+        // ordering ties broken by member bytes, rank, ranges, pops, removal.
+        let special: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![b'x'; 22],
+            vec![b'y'; 23],
+            vec![b'z'; 24],
+            vec![b'w'; 300],
+            b"bin\0ary".to_vec(),
+        ];
+        for fill in [0usize, 100] {
+            let mut z = RudisZSet::new();
+            let mut want: Vec<(Vec<u8>, f64)> = Vec::new();
+            for (i, m) in special.iter().enumerate() {
+                z.insert(i as f64, Bytes::from(m.clone()));
+                want.push((m.clone(), i as f64));
+            }
+            for i in 0..fill {
+                // Equal scores: order falls back to the member bytes.
+                let m = format!("m{i:03}").into_bytes();
+                z.insert(1000.0, Bytes::from(m.clone()));
+                want.push((m, 1000.0));
+            }
+            // Updating a score moves the member.
+            z.insert(-5.0, Bytes::from(vec![b'w'; 300]));
+            want.iter_mut()
+                .find(|(m, _)| m == &vec![b'w'; 300])
+                .unwrap()
+                .1 = -5.0;
+            assert_eq!(matches!(z, RudisZSet::Full { .. }), fill > 0);
+            want.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then_with(|| a.0.cmp(&b.0)));
+
+            let got: Vec<(Vec<u8>, f64)> = z
+                .to_vec()
+                .into_iter()
+                .map(|(m, s)| (m.to_vec(), s))
+                .collect();
+            assert_eq!(got, want, "fill {fill}");
+            for (rank, (m, s)) in want.iter().enumerate() {
+                assert_eq!(z.get_score(m), Some(*s));
+                assert_eq!(z.rank(m, false), Some(rank));
+            }
+            assert_eq!(z.get_score(&[b'z'; 25]), None);
+
+            let opts = ZRangeOpts {
+                by_score: true,
+                min_score: 0.0,
+                max_score: 5.0,
+                min_inc: true,
+                max_inc: true,
+                ..ZRangeOpts::default()
+            };
+            let in_range: Vec<Vec<u8>> = z
+                .range(&opts)
+                .into_iter()
+                .map(|(m, _)| m.to_vec())
+                .collect();
+            let expect: Vec<Vec<u8>> = want
+                .iter()
+                .filter(|(_, s)| (0.0..=5.0).contains(s))
+                .map(|(m, _)| m.clone())
+                .collect();
+            assert_eq!(in_range, expect);
+
+            assert_eq!(z.remove(b"bin\0ary"), Some(5.0));
+            assert_eq!(z.remove(b"bin\0ary"), None);
+            want.retain(|(m, _)| m != b"bin\0ary");
+            let (min_m, min_s) = z.pop_min(1).remove(0);
+            assert_eq!((min_m.to_vec(), min_s), want[0].clone());
+            let (max_m, max_s) = z.pop_max(1).remove(0);
+            assert_eq!((max_m.to_vec(), max_s), want.last().unwrap().clone());
+            assert_eq!(z.len(), want.len() - 2);
+        }
     }
 
     #[test]

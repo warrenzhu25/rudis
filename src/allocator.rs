@@ -162,7 +162,7 @@ pub struct SmallCollectionArena {
     list_pool: Vec<VecDeque<Bytes>>,
     hash_pool: Vec<Vec<(Bytes, Bytes)>>,
     set_pool: Vec<Vec<crate::table::SmallSetEntry>>,
-    zset_pool: Vec<Vec<(crate::table::OrderedScore, Bytes)>>,
+    zset_pool: Vec<Vec<(crate::table::OrderedScore, crate::compact::CompactKey)>>,
     pub allocations_saved: u64,
     pub recycles_count: u64,
 }
@@ -249,7 +249,7 @@ impl SmallCollectionArena {
     pub fn acquire_small_zset(
         &mut self,
         min_cap: usize,
-    ) -> Vec<(crate::table::OrderedScore, Bytes)> {
+    ) -> Vec<(crate::table::OrderedScore, crate::compact::CompactKey)> {
         if let Some(mut v) = self.zset_pool.pop() {
             self.allocations_saved += 1;
             if v.capacity() < min_cap {
@@ -262,7 +262,10 @@ impl SmallCollectionArena {
     }
 
     #[inline(always)]
-    pub fn recycle_small_zset(&mut self, mut v: Vec<(crate::table::OrderedScore, Bytes)>) {
+    pub fn recycle_small_zset(
+        &mut self,
+        mut v: Vec<(crate::table::OrderedScore, crate::compact::CompactKey)>,
+    ) {
         v.clear();
         if v.capacity() <= 512 && self.zset_pool.len() < MAX_ARENA_POOLED {
             self.recycles_count += 1;
@@ -361,7 +364,7 @@ mod tests {
 
         // 4. ZSet pool
         let mut z = arena.acquire_small_zset(8);
-        z.push((OrderedScore(1.0), Bytes::from_static(b"zm1")));
+        z.push((OrderedScore(1.0), crate::compact::CompactKey::new(b"zm1")));
         arena.recycle_small_zset(z);
         assert_eq!(arena.recycles_count, 4);
         assert_eq!(arena.pool_stats().3, 1);
