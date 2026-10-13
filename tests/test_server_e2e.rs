@@ -27241,3 +27241,134 @@ fn test_list_elements_of_every_length_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_large_sorted_set_order_rank_and_removal_e2e() {
+    let port = 17998u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Reads one full RESP reply (enough for these tests: arrays of bulks or
+    // integers) instead of a single read() that may return part of it.
+    fn read_reply(c: &mut TcpStream, want_lines: usize) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 65536];
+        while out.windows(2).filter(|w| *w == b"\r\n").count() < want_lines {
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            out.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    // 1000 members, scores 0..99 so many tie and order by member bytes.
+    let mut model: Vec<(i64, String)> = (0..1000)
+        .map(|i| ((i * 37) % 100, format!("m{i:04}")))
+        .collect();
+    let mut args = vec!["ZADD".to_string(), "big".to_string()];
+    for (s, m) in &model {
+        args.push(s.to_string());
+        args.push(m.clone());
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    assert_eq!(resp_cmd(&mut c, &argv), ":1000\r\n");
+    model.sort();
+
+    let check_order = |c: &mut TcpStream, model: &Vec<(i64, String)>| {
+        c.write_all(b"ZRANGE big 0 -1\r\n").unwrap();
+        let reply = read_reply(c, 1 + 2 * model.len());
+        let expect: String = std::iter::once(format!("*{}\r\n", model.len()))
+            .chain(
+                model
+                    .iter()
+                    .map(|(_, m)| format!("${}\r\n{m}\r\n", m.len())),
+            )
+            .collect();
+        assert_eq!(reply, expect);
+    };
+    check_order(&mut c, &model);
+    for probe in [0usize, 1, 63, 64, 127, 128, 500, 999] {
+        let (_, m) = &model[probe];
+        assert_eq!(
+            resp_cmd(&mut c, &["ZRANK", "big", m]),
+            format!(":{probe}\r\n")
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["ZREVRANK", "big", m]),
+            format!(":{}\r\n", model.len() - 1 - probe)
+        );
+    }
+
+    // Remove every third member, re-score some, pop both ends.
+    let mut pipe = String::new();
+    let mut removed = 0;
+    for (i, (_, m)) in model.iter().enumerate() {
+        if i % 3 == 0 {
+            pipe.push_str(&format!("ZREM big {m}\r\n"));
+            removed += 1;
+        }
+    }
+    c.write_all(pipe.as_bytes()).unwrap();
+    assert_eq!(read_reply(&mut c, removed), ":1\r\n".repeat(removed));
+    model = model
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| i % 3 != 0)
+        .map(|(_, x)| x)
+        .collect();
+    for m in ["m0001", "m0500", "m0998"] {
+        if let Some(e) = model.iter_mut().find(|(_, x)| x == m) {
+            e.0 = -1;
+            assert_eq!(resp_cmd(&mut c, &["ZADD", "big", "-1", m]), ":0\r\n");
+        }
+    }
+    model.sort();
+    check_order(&mut c, &model);
+    let (s, m) = model.remove(0);
+    assert_eq!(
+        resp_cmd(&mut c, &["ZPOPMIN", "big"]),
+        format!(
+            "*2\r\n${}\r\n{m}\r\n${}\r\n{s}\r\n",
+            m.len(),
+            s.to_string().len()
+        )
+    );
+    let (s, m) = model.pop().unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["ZPOPMAX", "big"]),
+        format!(
+            "*2\r\n${}\r\n{m}\r\n${}\r\n{s}\r\n",
+            m.len(),
+            s.to_string().len()
+        )
+    );
+    // Score range from a value with many ties starts at its first member.
+    let first_50 = model.iter().find(|(s, _)| *s == 50).unwrap().1.clone();
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["ZRANGEBYSCORE", "big", "50", "50", "LIMIT", "0", "1"]
+        ),
+        format!("*1\r\n${}\r\n{first_50}\r\n", first_50.len())
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["ZCARD", "big"]),
+        format!(":{}\r\n", model.len())
+    );
+    check_order(&mut c, &model);
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

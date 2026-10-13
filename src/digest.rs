@@ -263,9 +263,9 @@ fn zset_digest(d: &mut Digest20, z: &RudisZSet) {
                 add(member, score.0);
             }
         }
-        RudisZSet::Full { dict, .. } => {
-            for (member, &score) in dict {
-                add(member, score);
+        RudisZSet::Full(z) => {
+            for (score, member) in z.iter() {
+                add(member, score.0);
             }
         }
     }
@@ -711,17 +711,12 @@ mod tests {
         for (s, m) in items {
             small.insert(s, b(m));
         }
-        let mut dict = hashbrown::HashMap::new();
-        let mut tree = std::collections::BTreeSet::new();
+        let mut z = crate::zindex::ZIndex::default();
         for (s, m) in items.iter().rev() {
             let s = if *s == 0.0 { 0.0 } else { *s };
-            dict.insert(crate::compact::CompactKey::new(m.as_bytes()), s);
-            tree.insert((
-                crate::table::OrderedScore(s),
-                crate::compact::CompactKey::new(m.as_bytes()),
-            ));
+            z.insert(crate::compact::CompactKey::new(m.as_bytes()), s);
         }
-        let full = RudisZSet::Full { dict, tree };
+        let full = RudisZSet::Full(z);
         assert_eq!(
             vdigest(&RudisValue::ZSet(Box::new(small.clone()))),
             vdigest(&RudisValue::ZSet(Box::new(full)))
