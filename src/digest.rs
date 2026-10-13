@@ -693,9 +693,9 @@ mod tests {
                 })
                 .collect(),
         );
-        let mut full_set = hashbrown::HashSet::with_hasher(Default::default());
+        let mut full_set = crate::packedset::PackedSet::default();
         for m in members.iter().rev() {
-            full_set.insert(crate::compact::CompactKey::new(m.as_bytes()));
+            full_set.insert(m.as_bytes());
         }
         let full = RudisSet::Full(full_set);
         assert_eq!(

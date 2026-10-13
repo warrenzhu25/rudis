@@ -27491,3 +27491,205 @@ fn test_packed_list_across_chunk_boundaries_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_packed_set_compaction_and_set_algebra_e2e() {
+    use std::collections::HashSet;
+    let port = 18002u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    enum V {
+        Bulk(Vec<u8>),
+        Arr(Vec<V>),
+        Other,
+    }
+    // Parses one complete RESP value at `i`; None if more bytes are needed.
+    fn parse(b: &[u8], i: usize) -> Option<(V, usize)> {
+        let nl = i + b.get(i..)?.windows(2).position(|w| w == b"\r\n")?;
+        let head = std::str::from_utf8(&b[i + 1..nl]).unwrap();
+        match b[i] {
+            b'$' => {
+                let n: usize = head.parse().unwrap();
+                let end = nl + 2 + n + 2;
+                (b.len() >= end).then(|| (V::Bulk(b[nl + 2..nl + 2 + n].to_vec()), end))
+            }
+            b'*' => {
+                let n: usize = head.parse().unwrap();
+                let mut items = Vec::with_capacity(n);
+                let mut j = nl + 2;
+                for _ in 0..n {
+                    let (v, k) = parse(b, j)?;
+                    items.push(v);
+                    j = k;
+                }
+                Some((V::Arr(items), j))
+            }
+            _ => Some((V::Other, nl + 2)),
+        }
+    }
+    fn cmd(c: &mut TcpStream, args: &[&str]) -> V {
+        let mut out = format!("*{}\r\n", args.len());
+        for a in args {
+            out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        c.write_all(out.as_bytes()).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            if let Some((v, _)) = parse(&got, 0) {
+                return v;
+            }
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+    fn members(v: V) -> HashSet<String> {
+        let V::Arr(items) = v else {
+            panic!("expected an array")
+        };
+        items
+            .into_iter()
+            .map(|i| match i {
+                V::Bulk(b) => String::from_utf8(b).unwrap(),
+                _ => panic!("expected bulk strings"),
+            })
+            .collect()
+    }
+    fn pipeline(c: &mut TcpStream, cmds: &[String]) {
+        let mut out = String::new();
+        for line in cmds {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+        out.push_str("PING\r\n");
+        c.write_all(out.as_bytes()).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        while !got.ends_with(b"+PONG\r\n") {
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    // 3000 members: short ones share pages, every 50th is over 1 KB (a page
+    // of its own).
+    let name = |i: usize| {
+        if i.is_multiple_of(50) {
+            format!("{}{i}", "B".repeat(1500))
+        } else {
+            format!("m{i}")
+        }
+    };
+    let mut model: HashSet<String> = (0..3000).map(name).collect();
+    pipeline(
+        &mut c,
+        &(0..3000)
+            .map(|i| format!("SADD ps {}", name(i)))
+            .collect::<Vec<_>>(),
+    );
+    // Remove two of every three: most pages pass half dead and compact.
+    let gone: Vec<String> = (0..3000).filter(|i| i % 3 != 0).map(name).collect();
+    pipeline(
+        &mut c,
+        &gone
+            .iter()
+            .map(|m| format!("SREM ps {m}"))
+            .collect::<Vec<_>>(),
+    );
+    for m in &gone {
+        model.remove(m);
+    }
+    for _ in 0..150 {
+        let V::Bulk(p) = cmd(&mut c, &["SPOP", "ps"]) else {
+            panic!("SPOP")
+        };
+        assert!(model.remove(&String::from_utf8(p).unwrap()));
+    }
+    // Re-adding after compaction reuses space and still finds everything.
+    let again: Vec<String> = (3000..3300).map(name).collect();
+    pipeline(
+        &mut c,
+        &again
+            .iter()
+            .map(|m| format!("SADD ps {m}"))
+            .collect::<Vec<_>>(),
+    );
+    model.extend(again);
+
+    assert_eq!(
+        resp_cmd(&mut c, &["SCARD", "ps"]),
+        format!(":{}\r\n", model.len())
+    );
+    assert_eq!(members(cmd(&mut c, &["SMEMBERS", "ps"])), model);
+    for i in [0usize, 3, 50, 150, 300, 1, 2, 3050, 3100, 3299] {
+        let m = name(i);
+        let want = if model.contains(&m) {
+            ":1\r\n"
+        } else {
+            ":0\r\n"
+        };
+        assert_eq!(resp_cmd(&mut c, &["SISMEMBER", "ps", &m]), want, "{m}");
+    }
+
+    // Set algebra against a second set.
+    let other: HashSet<String> = (0..3300).filter(|i| i % 5 == 0).map(name).collect();
+    pipeline(
+        &mut c,
+        &other
+            .iter()
+            .map(|m| format!("SADD ps2 {m}"))
+            .collect::<Vec<_>>(),
+    );
+    let inter: HashSet<String> = model.intersection(&other).cloned().collect();
+    let union: HashSet<String> = model.union(&other).cloned().collect();
+    let diff: HashSet<String> = model.difference(&other).cloned().collect();
+    assert_eq!(members(cmd(&mut c, &["SINTER", "ps", "ps2"])), inter);
+    assert_eq!(members(cmd(&mut c, &["SUNION", "ps", "ps2"])), union);
+    assert_eq!(members(cmd(&mut c, &["SDIFF", "ps", "ps2"])), diff);
+
+    // A full SSCAN sees every member.
+    let mut seen = HashSet::new();
+    let mut cursor = "0".to_string();
+    loop {
+        let V::Arr(mut parts) = cmd(&mut c, &["SSCAN", "ps", &cursor, "COUNT", "200"]) else {
+            panic!("SSCAN")
+        };
+        let batch = parts.pop().unwrap();
+        let V::Bulk(next) = parts.pop().unwrap() else {
+            panic!("cursor")
+        };
+        seen.extend(members(batch));
+        cursor = String::from_utf8(next).unwrap();
+        if cursor == "0" {
+            break;
+        }
+    }
+    assert_eq!(seen, model);
+
+    // Draining with SPOP empties and deletes the key.
+    let n = model.len();
+    let V::Arr(popped) = cmd(&mut c, &["SPOP", "ps", &n.to_string()]) else {
+        panic!("SPOP n")
+    };
+    assert_eq!(popped.len(), n);
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "ps"]), ":0\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}
