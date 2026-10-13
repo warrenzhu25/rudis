@@ -10,6 +10,11 @@ Validates that:
    p99.9 tail latency (<= 15.0 ms) stay within the engineering invariants in agent.md.
 5. With `--live`, starts `target/release/rudis` and runs a live pipelined SET/GET
    smoke benchmark verifying live throughput, p99 latency, and zero GET page-faults/op.
+6. With `--memtier`, starts `target/release/rudis` pinned like the throughput suite,
+   measures SET/GET with memtier, and fails if either drops more than
+   `--max-drop-pct` below `benchmark_live_baseline.json` (machine-specific; updated only
+   with `--update-baseline`). Without `--live`/`--memtier`, checks 1-4 only re-read the
+   stored counter file and say nothing about the current build.
 
 Exit code 0 indicates all hardware counter, throughput, and latency thresholds are satisfied.
 """
@@ -266,10 +271,166 @@ def run_live_gate(rudis_bin, port, duration_sec, attach=False, throughput_floor=
     return regressions, rows
 
 
+def find_memtier():
+    env = os.environ.get("MEMTIER_BIN")
+    if env and os.path.exists(env):
+        return env
+    for p in (
+        os.path.expanduser("~/memtier_benchmark/memtier_benchmark"),
+        "/usr/local/bin/memtier_benchmark",
+        "/usr/bin/memtier_benchmark",
+    ):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+# memtier gate: same pinning as benchmark_common_commands_vs_dragonfly.py (server on
+# physical cores 16+, client on 0+, SMT siblings idle) so numbers are comparable.
+MEMTIER_WORKLOADS = {
+    "SET": {"args": ["--ratio", "1:0", "-d", "1024", "--key-pattern", "R:R"], "populate": False},
+    "GET": {"args": ["--ratio", "0:1", "-d", "1024", "--key-pattern", "R:R"], "populate": True},
+}
+MEMTIER_KEY_MAX = 64000
+DEFAULT_LIVE_BASELINE = os.path.join(REPO_DIR, "benchmark_live_baseline.json")
+# Launch-to-launch throughput spread on this host is 3-6% CV (see the RPUSH/SPOP A/B
+# in d12ae33); 12% keeps false failures rare while catching real regressions.
+DEFAULT_MAX_DROP_PCT = 12.0
+
+
+def _memtier_run(memtier, port, client_cpus, client_threads, args, secs, json_path):
+    cmd = [
+        "taskset", "-c", client_cpus, memtier,
+        "-s", "127.0.0.1", "-p", str(port),
+        "-t", str(client_threads), "-c", "4",
+        "--test-time", str(secs), "--pipeline", "16",
+        "--key-maximum", str(MEMTIER_KEY_MAX),
+        "--hide-histogram", "--json-out-file", json_path,
+    ] + args
+    if os.path.exists(json_path):
+        os.remove(json_path)
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        with open(json_path) as f:
+            return float(json.load(f)["ALL STATS"]["Totals"]["Ops/sec"])
+    except Exception:
+        return 0.0
+    finally:
+        if os.path.exists(json_path):
+            os.remove(json_path)
+
+
+def run_memtier_gate(rudis_bin, port, threads, launches, runs, secs):
+    """Measure live SET/GET throughput with memtier. Returns ({wl: [ops...]}, errors)."""
+    memtier = find_memtier()
+    if memtier is None:
+        return None, ["memtier_benchmark not found (set MEMTIER_BIN)"]
+    if not os.path.exists(rudis_bin):
+        return None, [f"Rudis binary not found: {rudis_bin} (run cargo build --release)"]
+    server_cpus = f"16-{16 + threads - 1}"
+    client_threads = min(threads, 16)
+    client_cpus = f"0-{client_threads - 1}"
+    json_path = f"/tmp/perf_gate_{port}.json"
+    samples = {wl: [] for wl in MEMTIER_WORKLOADS}
+    for _ in range(launches):
+        proc = subprocess.Popen(
+            ["taskset", "-c", server_cpus, rudis_bin, "--port", str(port), "--threads", str(threads)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            if not wait_ping(port, timeout=10.0):
+                return None, [f"Rudis failed to start on port {port}"]
+            for wl, spec in MEMTIER_WORKLOADS.items():
+                if spec["populate"]:
+                    # One connection walking the whole keyspace once, so reads hit.
+                    subprocess.run(
+                        ["taskset", "-c", client_cpus, memtier, "-s", "127.0.0.1", "-p", str(port),
+                         "-t", "1", "-c", "1", "-n", str(MEMTIER_KEY_MAX),
+                         "--key-minimum", "1", "--key-maximum", str(MEMTIER_KEY_MAX),
+                         "--pipeline", "64", "--ratio", "1:0", "-d", "1024", "--key-pattern", "S:S",
+                         "--hide-histogram"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                # Warmup (discarded): TCP slow start, allocator and table growth.
+                _memtier_run(memtier, port, client_cpus, client_threads, spec["args"], 1, json_path)
+                for _ in range(runs):
+                    ops = _memtier_run(memtier, port, client_cpus, client_threads, spec["args"], secs, json_path)
+                    if ops > 0:
+                        samples[wl].append(ops)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+            time.sleep(0.5)
+    return samples, []
+
+
+def check_memtier_gate(samples, baseline_path, max_drop_pct):
+    regressions, rows = [], []
+    baseline = {}
+    if os.path.exists(baseline_path):
+        with open(baseline_path) as f:
+            baseline = json.load(f).get("workloads", {})
+    if not baseline:
+        regressions.append(f"No live baseline at {baseline_path}; record one with --update-baseline")
+    for wl, vals in samples.items():
+        if not vals:
+            regressions.append(f"MT-{wl}: no successful memtier runs")
+            continue
+        med = statistics.median(vals)
+        base = baseline.get(wl, {}).get("ops_sec_median")
+        if not base:
+            rows.append((f"MT-{wl}", "throughput", f"{med:>12,.0f}/s", "no baseline", "SKIP"))
+            continue
+        floor = base * (1 - max_drop_pct / 100.0)
+        delta = (med / base - 1) * 100
+        status = "PASS" if med >= floor else "FAIL"
+        if status == "FAIL":
+            regressions.append(
+                f"MT-{wl} throughput {med:,.0f} ops/s is {delta:+.1f}% vs baseline {base:,.0f} "
+                f"(allowed -{max_drop_pct:.0f}%)"
+            )
+        rows.append((f"MT-{wl}", "throughput", f"{med:>12,.0f}/s", f">= {floor:,.0f} ({delta:+.1f}%)", status))
+    return regressions, rows
+
+
+def write_live_baseline(samples, baseline_path, threads, launches, runs, secs):
+    data = {
+        "_note": "Machine-specific memtier baseline for check_perf_regression.py --memtier. "
+                 "Only update deliberately (--update-baseline), never automatically.",
+        "host_cpus": os.cpu_count(),
+        "server_threads": threads,
+        "launches": launches,
+        "runs_per_launch": runs,
+        "secs_per_run": secs,
+        "workloads": {
+            wl: {"ops_sec_median": round(statistics.median(v), 2), "runs": [round(x, 2) for x in v]}
+            for wl, v in samples.items() if v
+        },
+    }
+    with open(baseline_path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Rudis performance & hardware counter regression gate")
     parser.add_argument("counter_file", nargs="?", default=DEFAULT_FILE, help="Path to benchmark_perf_counters.json")
     parser.add_argument("--live", action="store_true", help="Also run a live pipelined SET/GET check against rudis")
+    parser.add_argument(
+        "--memtier", action="store_true",
+        help="Measure live SET/GET throughput with memtier and compare to the live baseline",
+    )
+    parser.add_argument("--update-baseline", action="store_true", help="With --memtier: record the live baseline")
+    parser.add_argument("--live-baseline", default=DEFAULT_LIVE_BASELINE, help="Live baseline JSON for --memtier")
+    parser.add_argument("--max-drop-pct", type=float, default=DEFAULT_MAX_DROP_PCT,
+                        help="With --memtier: allowed throughput drop vs baseline")
+    parser.add_argument("--server-threads", type=int, default=8, help="With --memtier: rudis --threads")
+    parser.add_argument("--launches", type=int, default=2, help="With --memtier: server launches")
+    parser.add_argument("--runs", type=int, default=2, help="With --memtier: measured runs per launch")
+    parser.add_argument("--secs", type=int, default=3, help="With --memtier: seconds per run")
     parser.add_argument("--attach", action="store_true", help="Attach --live check to an already-running server on --port")
     parser.add_argument("--rudis-bin", default=DEFAULT_BIN, help="Path to rudis binary for --live")
     parser.add_argument("--port", type=int, default=17999, help="TCP port for --live server")
@@ -291,10 +452,26 @@ def main():
 
     print("=" * 84)
     print("  RUDIS AUTOMATED HARDWARE COUNTER, THROUGHPUT & LATENCY REGRESSION GATE")
-    print(f"  Verifying baseline results from: {args.counter_file}")
+    print(f"  Stored results (NOT re-measured on this build): {args.counter_file}")
+    if not (args.live or args.memtier):
+        print("  [!] No live measurement requested: pass --memtier (or --live) to test this build.")
     print("=" * 84)
 
     regressions, rows = validate_counter_data(data)
+    if args.memtier:
+        samples, errs = run_memtier_gate(
+            args.rudis_bin, args.port, args.server_threads, args.launches, args.runs, args.secs
+        )
+        regressions.extend(errs)
+        if samples is not None:
+            if args.update_baseline:
+                write_live_baseline(
+                    samples, args.live_baseline, args.server_threads, args.launches, args.runs, args.secs
+                )
+                print(f"  Recorded live baseline: {args.live_baseline}")
+            mt_regs, mt_rows = check_memtier_gate(samples, args.live_baseline, args.max_drop_pct)
+            regressions.extend(mt_regs)
+            rows.extend(mt_rows)
     if args.live:
         live_regs, live_rows = run_live_gate(
             args.rudis_bin,

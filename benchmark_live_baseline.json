@@ -1,0 +1,28 @@
+{
+  "_note": "Machine-specific memtier baseline for check_perf_regression.py --memtier. Only update deliberately (--update-baseline), never automatically.",
+  "host_cpus": 64,
+  "server_threads": 8,
+  "launches": 2,
+  "runs_per_launch": 2,
+  "secs_per_run": 3,
+  "workloads": {
+    "SET": {
+      "ops_sec_median": 2032718.46,
+      "runs": [
+        2024779.08,
+        2051285.79,
+        2029792.78,
+        2035644.13
+      ]
+    },
+    "GET": {
+      "ops_sec_median": 1236133.29,
+      "runs": [
+        1243003.98,
+        1252753.11,
+        1215653.23,
+        1229262.59
+      ]
+    }
+  }
+}

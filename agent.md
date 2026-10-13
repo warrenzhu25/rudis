@@ -101,7 +101,12 @@ Every commit to `main` must strictly adhere to the following four rules:
 
   # 5. Run end-to-end integration tests (serial)
   cargo test --test test_server_e2e -- --test-threads=1
+
+  # 6. Live throughput regression check on this host (memtier, vs benchmark_live_baseline.json).
+  #    Without --memtier the script only re-reads stored numbers and tests nothing.
+  cargo build --release && python3 scripts/check_perf_regression.py --memtier
   ```
+  Update `benchmark_live_baseline.json` only deliberately (`--memtier --update-baseline`, in its own commit, after an A/B shows the change is real), never to make a failing gate pass.
 * **Immediate Push Upon Green CI**:
   Once the CI suite passes cleanly, the commit must be pushed immediately to `origin main`:
   ```bash
