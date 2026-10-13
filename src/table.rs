@@ -7522,10 +7522,19 @@ impl RudisTable {
     }
 
     pub fn hdel(&mut self, key: &[u8], fields: &[Bytes]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        self.hdel_with_hash(key, h, fields)
+    }
+
+    pub fn hdel_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        fields: &[Bytes],
+    ) -> Result<usize, &'static str> {
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
         }
-        let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
                 return Ok(0);
@@ -9687,6 +9696,15 @@ impl RudisTable {
 
     pub fn srem(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
         let h = hash_key(key);
+        self.srem_with_hash(key, h, members)
+    }
+
+    pub fn srem_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        members: &[Bytes],
+    ) -> Result<usize, &'static str> {
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
                 return Ok(0);
@@ -11784,6 +11802,15 @@ impl RudisTable {
 
     pub fn zrem(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
         let h = hash_key(key);
+        self.zrem_with_hash(key, h, members)
+    }
+
+    pub fn zrem_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        members: &[Bytes],
+    ) -> Result<usize, &'static str> {
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
                 return Ok(0);

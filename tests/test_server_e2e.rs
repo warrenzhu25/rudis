@@ -26826,3 +26826,86 @@ fn test_rpush_rpop_spop_zpopmin_parse_forms_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_pipelined_hdel_srem_zrem_fast_paths_e2e() {
+    let port = 17988u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let mut c = connect();
+
+    // Counts, deletion of emptied keys and WRONGTYPE, across several shards.
+    let mut pipe = String::new();
+    let mut expected = String::new();
+    for i in 0..4 {
+        pipe.push_str(&format!(
+            "HSET fr_h_{i} a 1 b 2\r\nHDEL fr_h_{i} a x\r\nHDEL fr_h_{i} b\r\n"
+        ));
+        pipe.push_str(&format!(
+            "SADD fr_s_{i} a b\r\nSREM fr_s_{i} a x\r\nSREM fr_s_{i} b\r\n"
+        ));
+        pipe.push_str(&format!("ZADD fr_z_{i} 1 a 2 b\r\nZREM fr_z_{i} a b x\r\n"));
+        pipe.push_str(&format!("EXISTS fr_h_{i} fr_s_{i} fr_z_{i}\r\n"));
+        pipe.push_str(&format!("SET fr_str_{i} v\r\nSREM fr_str_{i} a\r\n"));
+        expected.push_str(":2\r\n:1\r\n:1\r\n:2\r\n:1\r\n:1\r\n:2\r\n:2\r\n:0\r\n+OK\r\n");
+        expected.push_str("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    }
+    assert_eq!(send_and_read(&mut c, pipe.as_bytes()), expected);
+
+    // A pipelined SREM that removes a member aborts another client's WATCH.
+    let mut watcher = connect();
+    assert_eq!(send_and_read(&mut c, b"SADD fr_watch m n\r\n"), ":2\r\n");
+    assert_eq!(
+        send_and_read(&mut watcher, b"WATCH fr_watch\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read(&mut watcher, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut watcher, b"SCARD fr_watch\r\n"),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c, b"SET fr_d1 v\r\nSREM fr_watch m\r\nSET fr_d2 v\r\n"),
+        "+OK\r\n:1\r\n+OK\r\n"
+    );
+    assert_eq!(send_and_read(&mut watcher, b"EXEC\r\n"), "*-1\r\n");
+
+    // One that removes nothing leaves the key unmodified, as in Redis.
+    assert_eq!(
+        send_and_read(&mut watcher, b"WATCH fr_watch\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read(&mut watcher, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut watcher, b"SCARD fr_watch\r\n"),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut c,
+            b"SET fr_d1 v\r\nSREM fr_watch missing\r\nSET fr_d2 v\r\n"
+        ),
+        "+OK\r\n:0\r\n+OK\r\n"
+    );
+    assert_eq!(send_and_read(&mut watcher, b"EXEC\r\n"), "*1\r\n:1\r\n");
+
+    drop(c);
+    drop(watcher);
+    shutdown_and_wait(port, &mut srv);
+}

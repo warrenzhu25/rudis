@@ -1106,6 +1106,39 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
+                                    && let Some((key, items, kind)) = match &cmd {
+                                        Command::Hdel { key, fields } if !crate::search::has_active_search_indices() => {
+                                            Some((key, fields, crate::connection::RemKind::Hash))
+                                        }
+                                        Command::Srem { key, members } => Some((key, members, crate::connection::RemKind::Set)),
+                                        Command::Zrem { key, members } => Some((key, members, crate::connection::RemKind::ZSet)),
+                                        _ => None,
+                                    }
+                                {
+                                    let res = match kind {
+                                        crate::connection::RemKind::Hash => db.table.hdel_with_hash(key, key_hash, items),
+                                        crate::connection::RemKind::Set => db.table.srem_with_hash(key, key_hash, items),
+                                        crate::connection::RemKind::ZSet => db.table.zrem_with_hash(key, key_hash, items),
+                                    };
+                                    match res {
+                                        Ok(count) => {
+                                            if count > 0 {
+                                                has_writes = true;
+                                                if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                    crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                                }
+                                            }
+                                            responder.write_slot(idx, crate::shard::CompactResp::from_integer(count as i64));
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
+                                    }
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
+                                    && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && !crate::block::has_blocked_waiters(cross_shard_router.port)
                                     && let Command::Rpush { ref key, ref values } = cmd
                                 {

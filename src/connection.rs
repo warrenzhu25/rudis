@@ -18704,6 +18704,14 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
     }
 }
 
+/// Which container a HDEL/SREM/ZREM fast path removes from.
+#[derive(Clone, Copy)]
+pub(crate) enum RemKind {
+    Hash,
+    Set,
+    ZSet,
+}
+
 #[inline(always)]
 pub fn target_shard_and_hash_of_cmd(cmd: &Command, num_shards: usize) -> Option<(usize, u64)> {
     match cmd {
@@ -18727,6 +18735,9 @@ pub fn target_shard_and_hash_of_cmd(cmd: &Command, num_shards: usize) -> Option<
         | Command::Rpush { key, .. }
         | Command::Spop { key, .. }
         | Command::Zpopmin { key, .. }
+        | Command::Hdel { key, .. }
+        | Command::Srem { key, .. }
+        | Command::Zrem { key, .. }
         | Command::Zadd { key, .. }
         | Command::Zmscore { key, .. }
         | Command::Get(key)
@@ -26660,6 +26671,43 @@ async fn execute_commands_squashed_inner(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
+                } else if write_fast_path
+                    && let Some((key, items, kind)) = match &cmd {
+                        // HDEL stays on the slow path while search indexes
+                        // exist, like HSET.
+                        Command::Hdel { key, fields }
+                            if !crate::search::has_active_search_indices() =>
+                        {
+                            Some((key, fields, RemKind::Hash))
+                        }
+                        Command::Srem { key, members } => Some((key, members, RemKind::Set)),
+                        Command::Zrem { key, members } => Some((key, members, RemKind::ZSet)),
+                        _ => None,
+                    }
+                {
+                    let res = match kind {
+                        RemKind::Hash => local_db.table.hdel_with_hash(key, key_hash, items),
+                        RemKind::Set => local_db.table.srem_with_hash(key, key_hash, items),
+                        RemKind::ZSet => local_db.table.zrem_with_hash(key, key_hash, items),
+                    };
+                    match res {
+                        Ok(count) => {
+                            if count > 0 {
+                                has_local_writes = true;
+                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    touch_watched_key(router.port, key.as_ref());
+                                }
+                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                                }
+                            }
+                            responses[idx] = crate::shard::CompactResp::from_integer(count as i64);
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
                 } else if write_fast_path && let Command::Lpop { ref key, count } = cmd {
                     if count.is_none() {
                         match local_db.table.lpop_one_with_hash(key.as_ref(), key_hash) {
@@ -30342,6 +30390,131 @@ mod tests {
                 ":1\r\n",
             );
             assert_eq!(out, expected.as_bytes());
+        });
+    }
+
+    #[test]
+    fn test_squashed_pipeline_hdel_srem_zrem_fast_paths() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
+            let db = Rc::new(RefCell::new(ShardDb::new(9993)));
+            let router = Router::new(
+                0,
+                1,
+                9993,
+                db,
+                senders_mesh[0].clone(),
+                None,
+                Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+                std::env::temp_dir(),
+            );
+            let client_registry = RefCell::new(hashbrown::HashMap::new());
+            let mut asking = false;
+            let mut authenticated = true;
+            let mut auth_user = String::from("default");
+            let mut out = Vec::new();
+            let responders = vec![std::sync::Arc::new(crate::mailbox::BatchResponder::new())];
+            let mut remote_batches = vec![Vec::new()];
+            let mut items_pool = vec![Vec::new()];
+            let mut results_pool = vec![Vec::new()];
+            let mut squashed_responses = Vec::new();
+            let b = |s: &'static str| Bytes::from_static(s.as_bytes());
+
+            let mut cmds = vec![
+                Command::Hset {
+                    key: b("h"),
+                    fields: smallvec::smallvec![
+                        (b("a"), b("1")),
+                        (b("b"), b("2")),
+                        (b("c"), b("3"))
+                    ],
+                },
+                Command::Hdel {
+                    key: b("h"),
+                    fields: smallvec::smallvec![b("a")],
+                },
+                Command::Hdel {
+                    key: b("h"),
+                    fields: smallvec::smallvec![b("b"), b("c"), b("x")],
+                },
+                Command::Hdel {
+                    key: b("h"),
+                    fields: smallvec::smallvec![b("a")],
+                },
+                Command::Sadd {
+                    key: b("s"),
+                    members: smallvec::smallvec![b("a"), b("b")],
+                },
+                Command::Srem {
+                    key: b("s"),
+                    members: smallvec::smallvec![b("a"), b("x")],
+                },
+                Command::Srem {
+                    key: b("s"),
+                    members: smallvec::smallvec![b("b")],
+                },
+                Command::Zadd {
+                    key: b("z"),
+                    elements: smallvec::smallvec![(1.0, b("a")), (2.0, b("b"))],
+                    flags: crate::table::ZAddFlags::default(),
+                },
+                Command::Zrem {
+                    key: b("z"),
+                    members: smallvec::smallvec![b("a"), b("b"), b("x")],
+                },
+                // Removing the last item deletes the key.
+                Command::Exists(smallvec::smallvec![b("h"), b("s"), b("z")]),
+                Command::Set {
+                    key: b("str"),
+                    value: b("v"),
+                    expire_in: None,
+                    condition: crate::resp::SetCondition::None,
+                    get: false,
+                    keepttl: false,
+                    past_expired: false,
+                },
+                Command::Hdel {
+                    key: b("str"),
+                    fields: smallvec::smallvec![b("a")],
+                },
+                Command::Srem {
+                    key: b("str"),
+                    members: smallvec::smallvec![b("a")],
+                },
+                Command::Zrem {
+                    key: b("str"),
+                    members: smallvec::smallvec![b("a")],
+                },
+            ];
+
+            let quit = execute_commands_squashed(
+                &mut cmds,
+                false,
+                &router,
+                &responders,
+                &mut remote_batches,
+                &mut items_pool,
+                &mut results_pool,
+                &mut squashed_responses,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert!(!quit);
+            let wt = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+            let expected = format!(
+                ":3\r\n:1\r\n:2\r\n:0\r\n:2\r\n:1\r\n:1\r\n:2\r\n:2\r\n:0\r\n+OK\r\n{wt}{wt}{wt}"
+            );
+            assert_eq!(String::from_utf8_lossy(&out), expected);
         });
     }
 
