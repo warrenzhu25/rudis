@@ -348,7 +348,7 @@ mod tests {
         let mut s = arena.acquire_small_set(8);
         s.push(crate::table::SmallSetEntry {
             hash: fxhash::hash64(b"m1"),
-            member: Bytes::from_static(b"m1"),
+            member: crate::compact::CompactKey::new(b"m1"),
         });
         arena.recycle_small_set(s);
         assert_eq!(arena.recycles_count, 3);

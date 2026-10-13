@@ -26909,3 +26909,90 @@ fn test_pipelined_hdel_srem_zrem_fast_paths_e2e() {
     drop(watcher);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_set_members_of_every_length_across_encodings_e2e() {
+    let port = 17989u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Members at the inline-storage boundaries (22/23/24 bytes), long, binary
+    // and empty, in sets that stay small and sets that convert (> 64 members).
+    let special: Vec<String> = vec![
+        String::new(),
+        "x".repeat(22),
+        "y".repeat(23),
+        "z".repeat(24),
+        "w".repeat(300),
+        "bin\0ary".to_string(),
+    ];
+    for (key, fill) in [("es_small", 0usize), ("es_big", 100)] {
+        let mut members = special.clone();
+        members.extend((0..fill).map(|i| format!("m{i:03}")));
+        let mut args = vec!["SADD", key];
+        args.extend(members.iter().map(String::as_str));
+        assert_eq!(resp_cmd(&mut c, &args), format!(":{}\r\n", members.len()));
+        for m in &special {
+            assert_eq!(
+                resp_cmd(&mut c, &["SISMEMBER", key, m]),
+                ":1\r\n",
+                "{key} {m:?}"
+            );
+        }
+        assert_eq!(
+            resp_cmd(&mut c, &["SISMEMBER", key, &"z".repeat(25)]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["SCARD", key]),
+            format!(":{}\r\n", members.len())
+        );
+        // SMEMBERS returns every member byte-for-byte.
+        let reply = resp_cmd(&mut c, &["SMEMBERS", key]);
+        for m in &members {
+            assert!(
+                reply.contains(&format!("${}\r\n{m}\r\n", m.len())),
+                "{key} missing {m:?}"
+            );
+        }
+        assert_eq!(resp_cmd(&mut c, &["SREM", key, &"w".repeat(300)]), ":1\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["SISMEMBER", key, &"w".repeat(300)]),
+            ":0\r\n"
+        );
+        // Draining with SPOP returns each remaining member exactly once.
+        let mut popped = Vec::new();
+        loop {
+            let r = resp_cmd(&mut c, &["SPOP", key]);
+            if r == "$-1\r\n" {
+                break;
+            }
+            popped.push(r);
+        }
+        assert_eq!(popped.len(), members.len() - 1, "{key}");
+        popped.sort();
+        popped.dedup();
+        assert_eq!(
+            popped.len(),
+            members.len() - 1,
+            "{key} popped a member twice"
+        );
+        assert_eq!(resp_cmd(&mut c, &["EXISTS", key]), ":0\r\n");
+    }
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

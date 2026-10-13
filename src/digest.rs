@@ -685,13 +685,13 @@ mod tests {
                 .iter()
                 .map(|m| SmallSetEntry {
                     hash: crate::table::hash_key(m.as_bytes()),
-                    member: b(m),
+                    member: crate::compact::CompactKey::new(m.as_bytes()),
                 })
                 .collect(),
         );
         let mut full_set = hashbrown::HashSet::with_hasher(Default::default());
         for m in members.iter().rev() {
-            full_set.insert(b(m));
+            full_set.insert(crate::compact::CompactKey::new(m.as_bytes()));
         }
         let full = RudisSet::Full(full_set);
         assert_eq!(
@@ -735,7 +735,7 @@ mod tests {
         // A one-member set and a one-element list differ by type.
         let set = RudisValue::Set(Box::new(RudisSet::Small(vec![SmallSetEntry {
             hash: crate::table::hash_key(b"a"),
-            member: b("a"),
+            member: crate::compact::CompactKey::new(b"a"),
         }])));
         let list = RudisValue::List(Box::new([b("a")].into_iter().collect()));
         assert_ne!(vdigest(&set), vdigest(&list));

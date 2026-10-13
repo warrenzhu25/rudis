@@ -666,13 +666,13 @@ const SMALL_SET_LIMIT: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SmallSetEntry {
     pub hash: u64,
-    pub member: Bytes,
+    pub member: CompactKey,
 }
 
 #[derive(Clone, Debug)]
 pub enum RudisSet {
     Small(Vec<SmallSetEntry>),
-    Full(hashbrown::HashSet<Bytes, FxBuildHasher>),
+    Full(hashbrown::HashSet<CompactKey, FxBuildHasher>),
 }
 
 impl Default for RudisSet {
@@ -683,11 +683,11 @@ impl Default for RudisSet {
 
 pub enum RudisSetIter<'a> {
     Small(std::slice::Iter<'a, SmallSetEntry>),
-    Full(hashbrown::hash_set::Iter<'a, Bytes>),
+    Full(hashbrown::hash_set::Iter<'a, CompactKey>),
 }
 
 impl<'a> Iterator for RudisSetIter<'a> {
-    type Item = &'a Bytes;
+    type Item = &'a CompactKey;
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -708,7 +708,7 @@ impl<'a> Iterator for RudisSetIter<'a> {
 impl<'a> ExactSizeIterator for RudisSetIter<'a> {}
 
 impl<'a> IntoIterator for &'a RudisSet {
-    type Item = &'a Bytes;
+    type Item = &'a CompactKey;
     type IntoIter = RudisSetIter<'a>;
     #[inline(always)]
     fn into_iter(self) -> Self::IntoIter {
@@ -798,7 +798,7 @@ impl RudisSet {
                 }
                 v.push(SmallSetEntry {
                     hash: m_hash,
-                    member,
+                    member: CompactKey::new(m_bytes),
                 });
                 if v.len() > SMALL_SET_LIMIT {
                     let mut set = hashbrown::HashSet::with_capacity_and_hasher(
@@ -812,7 +812,7 @@ impl RudisSet {
                 }
                 true
             }
-            RudisSet::Full(s) => s.insert(member),
+            RudisSet::Full(s) => s.insert(CompactKey::new(&member)),
         }
     }
 
@@ -829,7 +829,7 @@ impl RudisSet {
                 }
                 v.push(SmallSetEntry {
                     hash: m_hash,
-                    member: member.clone(),
+                    member: CompactKey::new(m_bytes),
                 });
                 if v.len() > SMALL_SET_LIMIT {
                     let mut set = hashbrown::HashSet::with_capacity_and_hasher(
@@ -844,10 +844,10 @@ impl RudisSet {
                 true
             }
             RudisSet::Full(s) => {
-                if s.contains(member) {
+                if s.contains(member.as_ref()) {
                     false
                 } else {
-                    s.insert(member.clone())
+                    s.insert(CompactKey::new(member))
                 }
             }
         }
@@ -873,18 +873,18 @@ impl RudisSet {
 
     pub fn to_vec(&self) -> Vec<Bytes> {
         match self {
-            RudisSet::Small(v) => v.iter().map(|e| e.member.clone()).collect(),
-            RudisSet::Full(s) => s.iter().cloned().collect(),
+            RudisSet::Small(v) => v.iter().map(|e| e.member.to_bytes()).collect(),
+            RudisSet::Full(s) => s.iter().map(CompactKey::to_bytes).collect(),
         }
     }
 
     pub fn pop(&mut self) -> Option<Bytes> {
         match self {
-            RudisSet::Small(v) => v.pop().map(|e| e.member),
+            RudisSet::Small(v) => v.pop().map(|e| Bytes::from(e.member)),
             RudisSet::Full(s) => {
                 if let Some(elem) = s.iter().next().cloned() {
                     s.remove(&elem);
-                    Some(elem)
+                    Some(Bytes::from(elem))
                 } else {
                     None
                 }
@@ -9537,7 +9537,7 @@ impl RudisTable {
                             }
                             v.push(SmallSetEntry {
                                 hash: m_hash,
-                                member: member.clone(),
+                                member: CompactKey::new(member),
                             });
                             self.data_bytes += 32;
                             return Ok(1);
@@ -9547,7 +9547,7 @@ impl RudisTable {
                             let m_hash = hash64(m_bytes);
                             v.push(SmallSetEntry {
                                 hash: m_hash,
-                                member: member.clone(),
+                                member: CompactKey::new(member),
                             });
                             self.data_bytes += 32;
                             return Ok(1);
@@ -9575,7 +9575,7 @@ impl RudisTable {
         let m_hash = hash64(m_bytes);
         v.push(SmallSetEntry {
             hash: m_hash,
-            member: member.clone(),
+            member: CompactKey::new(member),
         });
         let entry = RudisEntry::new(
             CompactKey::new(key),
@@ -9650,7 +9650,7 @@ impl RudisTable {
                 let m_hash = hash64(m_bytes);
                 v.push(SmallSetEntry {
                     hash: m_hash,
-                    member: m.clone(),
+                    member: CompactKey::new(m),
                 });
             } else {
                 for m in members {
@@ -9662,7 +9662,7 @@ impl RudisTable {
                     }) {
                         v.push(SmallSetEntry {
                             hash: m_hash,
-                            member: m.clone(),
+                            member: CompactKey::new(m),
                         });
                     }
                 }
@@ -9674,7 +9674,7 @@ impl RudisTable {
                 FxBuildHasher::default(),
             );
             for m in members {
-                set.insert(m.clone());
+                set.insert(CompactKey::new(m));
             }
             RudisSet::Full(set)
         };
@@ -10006,7 +10006,7 @@ impl RudisTable {
         let mut result = Vec::new();
         for m in first.iter() {
             if sets[1..].iter().all(|s| s.contains(m.as_ref())) {
-                result.push(m.clone());
+                result.push(m.to_bytes());
             }
         }
         Ok(result)
@@ -10036,7 +10036,7 @@ impl RudisTable {
                 }
             }
         }
-        Ok(union_set.into_iter().collect())
+        Ok(union_set.into_iter().map(Bytes::from).collect())
     }
 
     pub fn sdiff(&mut self, keys: &[Bytes]) -> Result<Vec<Bytes>, &'static str> {
@@ -10084,7 +10084,7 @@ impl RudisTable {
         let mut diff = Vec::new();
         for m in first.iter() {
             if !other_sets.iter().any(|s| s.contains(m.as_ref())) {
-                diff.push(m.clone());
+                diff.push(m.to_bytes());
             }
         }
         Ok(diff)
@@ -10581,7 +10581,7 @@ impl RudisTable {
         for m in s.iter() {
             let eh = xxhash_rust::xxh3::xxh3_64(m).max(1);
             if cursor == 0 || eh >= cursor {
-                candidates.push((eh, m.clone()));
+                candidates.push((eh, m.to_bytes()));
             }
         }
 
@@ -10722,7 +10722,7 @@ impl RudisTable {
                         RudisValue::Set(s) => {
                             for m in s.iter() {
                                 let val = 1.0 * weight;
-                                acc.entry(m.clone())
+                                acc.entry(m.to_bytes())
                                     .and_modify(|cur| {
                                         *cur = match agg {
                                             Aggregate::Sum | Aggregate::Count => {
@@ -10786,7 +10786,7 @@ impl RudisTable {
                         }
                         RudisValue::Set(s) => {
                             for m in s.iter() {
-                                map.insert(m.clone(), 1.0 * weight);
+                                map.insert(m.to_bytes(), 1.0 * weight);
                             }
                         }
                         _ => {
@@ -10980,12 +10980,12 @@ impl RudisTable {
                             if i == 0 {
                                 let mut items = Vec::new();
                                 for m in s.iter() {
-                                    items.push((m.clone(), 1.0));
+                                    items.push((m.to_bytes(), 1.0));
                                 }
                                 first = Some(items);
                             } else {
                                 for m in s.iter() {
-                                    other_members.insert(m.clone());
+                                    other_members.insert(m.to_bytes());
                                 }
                             }
                         }
@@ -18316,6 +18316,67 @@ mod tests {
         let idx = table.table.find(b"counter", h).unwrap();
         let entry = table.table.get_slot(idx).unwrap();
         assert_eq!(entry.val, RudisValue::Int(7));
+    }
+
+    #[test]
+    fn test_rudis_set_compact_members_across_encodings() {
+        // Members of every length class: empty, inline (<= 23 bytes), exactly
+        // at the inline boundary, heap, and binary with NULs. They must round
+        // trip through the small encoding, the switch to the hash set, pops
+        // and removals, and must not alias the caller's buffer.
+        let mut members: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"a".to_vec(),
+            vec![b'x'; 22],
+            vec![b'y'; 23],
+            vec![b'z'; 24],
+            vec![b'w'; 300],
+            b"bin\0ary\0".to_vec(),
+        ];
+        for i in 0..80 {
+            members.push(format!("member-{i:03}").into_bytes());
+        }
+        let mut set = RudisSet::new();
+        for m in &members {
+            let buf = Bytes::from(m.clone());
+            assert!(set.insert_slice(&buf), "{m:?}");
+            drop(buf);
+            assert!(!set.insert(Bytes::from(m.clone())), "duplicate {m:?}");
+        }
+        assert!(matches!(set, RudisSet::Full(_)));
+        assert_eq!(set.len(), members.len());
+        for m in &members {
+            assert!(set.contains(m), "{m:?}");
+        }
+        let mut listed: Vec<Vec<u8>> = set.to_vec().into_iter().map(|b| b.to_vec()).collect();
+        let mut iterated: Vec<Vec<u8>> = set.iter().map(|m| m.to_vec()).collect();
+        let mut want = members.clone();
+        listed.sort();
+        iterated.sort();
+        want.sort();
+        assert_eq!(listed, want);
+        assert_eq!(iterated, want);
+
+        assert!(set.remove(&vec![b'w'; 300]));
+        assert!(!set.remove(&vec![b'w'; 300]));
+        let mut popped = Vec::new();
+        while let Some(m) = set.pop() {
+            popped.push(m.to_vec());
+        }
+        popped.sort();
+        want.retain(|m| m != &vec![b'w'; 300]);
+        assert_eq!(popped, want);
+        assert!(set.is_empty());
+
+        // Small encoding stores the same bytes it was given.
+        let mut small = RudisSet::new();
+        assert!(small.insert(Bytes::from_static(&[b'q'; 40])));
+        assert!(small.insert(Bytes::new()));
+        assert!(matches!(small, RudisSet::Small(_)));
+        assert!(small.contains(&[b'q'; 40]));
+        assert!(small.contains(b""));
+        assert_eq!(small.pop().map(|b| b.len()), Some(0));
+        assert_eq!(small.pop().map(|b| b.to_vec()), Some(vec![b'q'; 40]));
     }
 
     #[test]
