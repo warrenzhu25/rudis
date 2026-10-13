@@ -338,6 +338,20 @@ pub fn auto_rewrite_due(percentage: u64, min_size: u64, current: u64, base: u64)
     (growth >= percentage).then_some(growth)
 }
 
+/// Appends `HDEL key field...` (also how HGETDEL is logged).
+fn encode_hdel(buf: &mut Vec<u8>, key: &[u8], fields: &[bytes::Bytes]) {
+    buf.extend_from_slice(
+        format!("*{}\r\n$4\r\nHDEL\r\n${}\r\n", 2 + fields.len(), key.len()).as_bytes(),
+    );
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(b"\r\n");
+    for f in fields {
+        buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+        buf.extend_from_slice(f);
+        buf.extend_from_slice(b"\r\n");
+    }
+}
+
 pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     match cmd {
@@ -531,17 +545,12 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
-        Command::Hdel { key, fields } | Command::Hgetdel { key, fields } => {
-            buf.extend_from_slice(
-                format!("*{}\r\n$4\r\nHDEL\r\n${}\r\n", 2 + fields.len(), key.len()).as_bytes(),
-            );
-            buf.extend_from_slice(key);
-            buf.extend_from_slice(b"\r\n");
-            for f in fields {
-                buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                buf.extend_from_slice(f);
-                buf.extend_from_slice(b"\r\n");
-            }
+        Command::Hdel { key, fields } => {
+            encode_hdel(&mut buf, key, fields);
+            Some(buf)
+        }
+        Command::Hgetdel { key, fields } => {
+            encode_hdel(&mut buf, key, fields);
             Some(buf)
         }
         Command::Lpush { key, values } => {

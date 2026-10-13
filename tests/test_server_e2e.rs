@@ -26728,3 +26728,53 @@ fn test_pipelined_rpush_spop_zpopmin_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_hdel_srem_zrem_touch_single_and_multi_e2e() {
+    let port = 17986u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Single- and multi-item forms, in mixed case, across several shards.
+    let mut pipe = String::new();
+    let mut expected = String::new();
+    for i in 0..4 {
+        pipe.push_str(&format!("HSET hd_{i} a 1 b 2 c 3\r\n"));
+        pipe.push_str(&format!("hdel hd_{i} a\r\n"));
+        pipe.push_str(&format!("HDEL hd_{i} b c missing\r\n"));
+        pipe.push_str(&format!("SADD sr_{i} a b c\r\n"));
+        pipe.push_str(&format!("SrEm sr_{i} a\r\n"));
+        pipe.push_str(&format!("SREM sr_{i} b c missing\r\n"));
+        pipe.push_str(&format!("ZADD zr_{i} 1 a 2 b 3 c\r\n"));
+        pipe.push_str(&format!("zrem zr_{i} a\r\n"));
+        pipe.push_str(&format!("ZREM zr_{i} b c missing\r\n"));
+        pipe.push_str(&format!("SET tk_{i} v\r\n"));
+        pipe.push_str(&format!("touch tk_{i}\r\n"));
+        pipe.push_str(&format!("TOUCH tk_{i} tk_missing hd_{i} tk_{i}\r\n"));
+        expected.push_str(":3\r\n:1\r\n:2\r\n");
+        expected.push_str(":3\r\n:1\r\n:2\r\n");
+        expected.push_str(":3\r\n:1\r\n:2\r\n");
+        // hd_{i} was emptied (and so deleted) above; tk_{i} counts twice.
+        expected.push_str("+OK\r\n:1\r\n:2\r\n");
+    }
+
+    let resp = send_and_read(&mut c, pipe.as_bytes());
+    assert_eq!(resp, expected);
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

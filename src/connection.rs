@@ -7390,7 +7390,8 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Blmove { source, .. }
         | Command::Lmovem { source, .. }
         | Command::Blmovem { source, .. } => Some(source),
-        Command::Touch(keys) | Command::Mget(keys) => keys.first(),
+        Command::Touch(keys) => keys.first(),
+        Command::Mget(keys) => keys.first(),
         Command::Pfcount { keys } => keys.first(),
         Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. } => keys.first(),
         Command::Blpop { keys, .. }
@@ -7681,12 +7682,15 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
             }
         }
 
-        Command::Mget(keys) | Command::Touch(keys) => {
+        Command::Mget(keys) => {
             for k in keys {
                 f(k.as_ref());
             }
         }
-        Command::Del(keys) | Command::Unlink(keys) | Command::Exists(keys) => {
+        Command::Del(keys)
+        | Command::Unlink(keys)
+        | Command::Exists(keys)
+        | Command::Touch(keys) => {
             for k in keys {
                 f(k.as_ref());
             }
@@ -16278,7 +16282,7 @@ async fn execute_command_inner(
             };
             let remote = remote
                 .into_iter()
-                .map(|(shard, ks)| (shard, Command::Touch(ks)))
+                .map(|(shard, ks)| (shard, Command::Touch(smallvec::SmallVec::from_vec(ks))))
                 .collect();
             count += sum_remote_counts(router, remote).await;
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
@@ -19971,7 +19975,7 @@ pub fn execute_local_command(
                             for chunk in popped.chunks(1024) {
                                 let srem_cmd = Command::Srem {
                                     key: key.clone(),
-                                    members: chunk.to_vec(),
+                                    members: chunk.iter().cloned().collect(),
                                 };
                                 record_change!(&srem_cmd);
                             }
@@ -26885,7 +26889,11 @@ async fn execute_commands_squashed_inner(
                         responses[slot] = CompactResp::INT_1;
                     }
                 } else {
-                    remote_batches[target].push((slot, key_hash, Command::Touch(vec![key])));
+                    remote_batches[target].push((
+                        slot,
+                        key_hash,
+                        Command::Touch(smallvec::smallvec![key]),
+                    ));
                 }
             }
             folded_int_sums.push((idx, start, responses.len() - start));
@@ -27549,7 +27557,7 @@ async fn move_element_across_shards(
                     s,
                     Command::Srem {
                         key: src.clone(),
-                        members: vec![member.clone()],
+                        members: smallvec::smallvec![member.clone()],
                     },
                 )
                 .await;
@@ -30286,7 +30294,7 @@ mod tests {
                         Bytes::from("zm2"),
                     ],
                 },
-                Command::Touch(vec![
+                Command::Touch(smallvec::smallvec![
                     Bytes::from("h1"),
                     Bytes::from("s1"),
                     Bytes::from("z1"),
@@ -30297,7 +30305,7 @@ mod tests {
                     Bytes::from("s1"),
                     Bytes::from("no_such_key"),
                 ]),
-                Command::Touch(vec![
+                Command::Touch(smallvec::smallvec![
                     Bytes::from("h1"),
                     Bytes::from("s1"),
                     Bytes::from("z1"),

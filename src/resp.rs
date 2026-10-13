@@ -570,7 +570,7 @@ pub enum Command {
     },
     Hdel {
         key: Bytes,
-        fields: Vec<Bytes>,
+        fields: SmallVec<[Bytes; 1]>,
     },
     Hexists {
         key: Bytes,
@@ -638,7 +638,7 @@ pub enum Command {
     },
     Srem {
         key: Bytes,
-        members: Vec<Bytes>,
+        members: SmallVec<[Bytes; 1]>,
     },
     Smembers(Bytes),
     Sismember {
@@ -685,7 +685,7 @@ pub enum Command {
     },
     Zrem {
         key: Bytes,
-        members: Vec<Bytes>,
+        members: SmallVec<[Bytes; 1]>,
     },
     Zscore {
         key: Bytes,
@@ -800,7 +800,7 @@ pub enum Command {
     Debug(Vec<Bytes>),
     Flushdb,
     Flushall,
-    Touch(Vec<Bytes>),
+    Touch(SmallVec<[Bytes; 1]>),
     Rename {
         key: Bytes,
         newkey: Bytes,
@@ -2524,6 +2524,39 @@ fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Com
                             }));
                         }
                     }
+                    if cmd_bytes.eq_ignore_ascii_case(b"HDEL") && num_args >= 3 {
+                        let (k_start, k_len) = offsets[1];
+                        let mut items = SmallVec::with_capacity(num_args - 2);
+                        for &(s, l) in offsets[2..num_args].iter() {
+                            items.push(frame.slice(s..s + l));
+                        }
+                        return Ok(Some(Command::Hdel {
+                            key: frame.slice(k_start..k_start + k_len),
+                            fields: items,
+                        }));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"SREM") && num_args >= 3 {
+                        let (k_start, k_len) = offsets[1];
+                        let mut items = SmallVec::with_capacity(num_args - 2);
+                        for &(s, l) in offsets[2..num_args].iter() {
+                            items.push(frame.slice(s..s + l));
+                        }
+                        return Ok(Some(Command::Srem {
+                            key: frame.slice(k_start..k_start + k_len),
+                            members: items,
+                        }));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"ZREM") && num_args >= 3 {
+                        let (k_start, k_len) = offsets[1];
+                        let mut items = SmallVec::with_capacity(num_args - 2);
+                        for &(s, l) in offsets[2..num_args].iter() {
+                            items.push(frame.slice(s..s + l));
+                        }
+                        return Ok(Some(Command::Zrem {
+                            key: frame.slice(k_start..k_start + k_len),
+                            members: items,
+                        }));
+                    }
                     if cmd_bytes.eq_ignore_ascii_case(b"PING") && num_args == 1 {
                         return Ok(Some(Command::Ping(None)));
                     }
@@ -2552,6 +2585,13 @@ fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Com
                     }
                 }
                 5 => {
+                    if cmd_bytes.eq_ignore_ascii_case(b"TOUCH") && num_args >= 2 {
+                        let mut keys = SmallVec::with_capacity(num_args - 1);
+                        for &(k_s, k_l) in offsets[1..num_args].iter() {
+                            keys.push(frame.slice(k_s..k_s + k_l));
+                        }
+                        return Ok(Some(Command::Touch(keys)));
+                    }
                     if cmd_bytes.eq_ignore_ascii_case(b"LPUSH") && num_args == 3 {
                         let (k_start, k_len) = offsets[1];
                         let (v_start, v_len) = offsets[2];
@@ -4605,7 +4645,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Hdel {
                 key: args[1].clone(),
-                fields: args[2..].to_vec(),
+                fields: SmallVec::from_vec(args[2..].to_vec()),
             }))
         }
         "HEXISTS" => {
@@ -4963,7 +5003,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Srem {
                 key: args[1].clone(),
-                members: args[2..].to_vec(),
+                members: SmallVec::from_vec(args[2..].to_vec()),
             }))
         }
         "SMEMBERS" => {
@@ -5173,7 +5213,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Zrem {
                 key: args[1].clone(),
-                members: args[2..].to_vec(),
+                members: SmallVec::from_vec(args[2..].to_vec()),
             }))
         }
         "ZSCORE" => {
@@ -6223,7 +6263,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'touch' command".to_string());
             }
             args.remove(0);
-            Ok(Some(Command::Touch(args)))
+            Ok(Some(Command::Touch(SmallVec::from_vec(args))))
         }
         "RENAME" => {
             if args.len() != 3 {
@@ -14644,7 +14684,7 @@ mod tests {
             cmd,
             Command::Hdel {
                 key: Bytes::from_static(b"myhash"),
-                fields: vec![Bytes::from_static(b"f1")],
+                fields: smallvec![Bytes::from_static(b"f1")],
             }
         );
 
@@ -15282,6 +15322,81 @@ mod tests {
         let mut buf = BytesMut::from("*1\r\n$7\r\nunknown\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(cmd, Command::Unknown("UNKNOWN".to_string()));
+    }
+
+    #[test]
+    fn test_smallvec_hdel_srem_zrem_touch_parsing() {
+        // Single-item forms are stored inline; mixed case takes the same path.
+        for (wire, want) in [
+            (
+                "*3\r\n$4\r\nhdel\r\n$1\r\nh\r\n$2\r\nf1\r\n",
+                Command::Hdel {
+                    key: Bytes::from_static(b"h"),
+                    fields: smallvec![Bytes::from_static(b"f1")],
+                },
+            ),
+            (
+                "*3\r\n$4\r\nSrEm\r\n$1\r\ns\r\n$2\r\nm1\r\n",
+                Command::Srem {
+                    key: Bytes::from_static(b"s"),
+                    members: smallvec![Bytes::from_static(b"m1")],
+                },
+            ),
+            (
+                "*3\r\n$4\r\nZREM\r\n$1\r\nz\r\n$2\r\nm1\r\n",
+                Command::Zrem {
+                    key: Bytes::from_static(b"z"),
+                    members: smallvec![Bytes::from_static(b"m1")],
+                },
+            ),
+            (
+                "*2\r\n$5\r\ntouch\r\n$1\r\nk\r\n",
+                Command::Touch(smallvec![Bytes::from_static(b"k")]),
+            ),
+        ] {
+            let mut buf = BytesMut::from(wire);
+            let cmd = parse_command(&mut buf).unwrap().unwrap();
+            assert_eq!(cmd, want, "{wire:?}");
+            let inline = match &cmd {
+                Command::Hdel { fields: v, .. }
+                | Command::Srem { members: v, .. }
+                | Command::Zrem { members: v, .. }
+                | Command::Touch(v) => !v.spilled(),
+                _ => unreachable!(),
+            };
+            assert!(inline, "{wire:?} spilled to the heap");
+            assert!(buf.is_empty());
+        }
+
+        // Multi-item forms keep every item, in order.
+        let mut buf =
+            BytesMut::from("*5\r\n$4\r\nHDEL\r\n$1\r\nh\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Hdel {
+                key: Bytes::from_static(b"h"),
+                fields: smallvec![
+                    Bytes::from_static(b"a"),
+                    Bytes::from_static(b"b"),
+                    Bytes::from_static(b"c"),
+                ],
+            }
+        );
+        let mut buf = BytesMut::from("*4\r\n$5\r\nTOUCH\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Touch(smallvec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ])
+        );
+
+        // Too few arguments still reach the generic parser's arity error.
+        let mut buf = BytesMut::from("*2\r\n$4\r\nSREM\r\n$1\r\ns\r\n");
+        assert!(parse_command(&mut buf).is_err());
+        let mut buf = BytesMut::from("*1\r\n$5\r\nTOUCH\r\n");
+        assert!(parse_command(&mut buf).is_err());
     }
 
     #[test]
