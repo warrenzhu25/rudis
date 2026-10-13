@@ -756,7 +756,7 @@ fn legacy_rudis_rdb_still_loads() {
         RudisValue::List(Box::new(
             ["a", "b"]
                 .iter()
-                .map(|s| rudis::compact::ListElem::from_slice(s.as_bytes()))
+                .map(|s| bytes::Bytes::copy_from_slice(s.as_bytes()))
                 .collect(),
         )),
         Some(in_an_hour),

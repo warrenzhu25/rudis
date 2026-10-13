@@ -3,7 +3,7 @@ use fxhash::{FxBuildHasher, hash64};
 use hashbrown::HashMap;
 
 pub type RudisHashMap = HashMap<Bytes, Bytes, FxBuildHasher>;
-use crate::compact::{CompactKey, CompactStr, ListElem};
+use crate::compact::{CompactKey, CompactStr};
 use crate::resp::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1414,7 +1414,7 @@ pub enum RudisValue {
     Int(i64),
     SmallHash(Box<Vec<(Bytes, Bytes)>>),
     Hash(Box<RudisHashMap>),
-    List(Box<std::collections::VecDeque<ListElem>>),
+    List(Box<crate::packedlist::PackedList>),
     Set(Box<RudisSet>),
     ZSet(Box<RudisZSet>),
     HyperLogLog(Box<[u8; 16384]>),
@@ -8164,11 +8164,12 @@ impl RudisTable {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         if values.len() == 1 {
-                            deque.push_front(ListElem::from_bytes(&values[0]));
+                            deque.push_front(&values[0]);
                             return Ok(deque.len());
                         }
+                        deque.reserve_for(values);
                         for v in values {
-                            deque.push_front(ListElem::from_bytes(v));
+                            deque.push_front(v);
                         }
                         return Ok(deque.len());
                     }
@@ -8183,11 +8184,12 @@ impl RudisTable {
 
         let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let mut deque = self.arena.acquire_list(values.len());
+        deque.reserve_for(values);
         if values.len() == 1 {
-            deque.push_front(ListElem::from_bytes(&values[0]));
+            deque.push_front(&values[0]);
         } else {
             for v in values {
-                deque.push_front(ListElem::from_bytes(v));
+                deque.push_front(v);
             }
         }
         let len = deque.len();
@@ -8253,11 +8255,12 @@ impl RudisTable {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         if values.len() == 1 {
-                            deque.push_back(ListElem::from_bytes(&values[0]));
+                            deque.push_back(&values[0]);
                             return Ok(deque.len());
                         }
+                        deque.reserve_for(values);
                         for v in values {
-                            deque.push_back(ListElem::from_bytes(v));
+                            deque.push_back(v);
                         }
                         return Ok(deque.len());
                     }
@@ -8272,11 +8275,12 @@ impl RudisTable {
 
         let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let mut deque = self.arena.acquire_list(values.len());
+        deque.reserve_for(values);
         if values.len() == 1 {
-            deque.push_back(ListElem::from_bytes(&values[0]));
+            deque.push_back(&values[0]);
         } else {
             for v in values {
-                deque.push_back(ListElem::from_bytes(v));
+                deque.push_back(v);
             }
         }
         let len = deque.len();
@@ -8303,8 +8307,9 @@ impl RudisTable {
             if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
+                        deque.reserve_for(values);
                         for v in values {
-                            deque.push_front(ListElem::from_bytes(v));
+                            deque.push_front(v);
                         }
                         return Ok(deque.len());
                     }
@@ -8333,8 +8338,9 @@ impl RudisTable {
             if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
+                        deque.reserve_for(values);
                         for v in values {
-                            deque.push_back(ListElem::from_bytes(v));
+                            deque.push_back(v);
                         }
                         return Ok(deque.len());
                     }
@@ -8568,7 +8574,7 @@ impl RudisTable {
             let (popped, is_empty) = match &mut entry.val {
                 RudisValue::List(deque) => {
                     if deque.len() == 1 {
-                        let val = deque.pop_front().map(Bytes::from);
+                        let val = deque.pop_front();
                         let entry = self.table.remove_present(idx);
                         if self.num_expires > 0 && entry.expire_at().is_some() {
                             self.num_expires = self.num_expires.saturating_sub(1);
@@ -8576,7 +8582,7 @@ impl RudisTable {
                         self.recycle_value(entry.val);
                         return Ok(val);
                     }
-                    let val = deque.pop_front().map(Bytes::from);
+                    let val = deque.pop_front();
                     let empty = deque.is_empty();
                     (val, empty)
                 }
@@ -8628,7 +8634,7 @@ impl RudisTable {
             let (popped, is_empty) = match &mut entry.val {
                 RudisValue::List(deque) => {
                     if deque.len() == 1 {
-                        let val = deque.pop_back().map(Bytes::from);
+                        let val = deque.pop_back();
                         let entry = self.table.remove_present(idx);
                         if self.num_expires > 0 && entry.expire_at().is_some() {
                             self.num_expires = self.num_expires.saturating_sub(1);
@@ -8636,7 +8642,7 @@ impl RudisTable {
                         self.recycle_value(entry.val);
                         return Ok(val);
                     }
-                    let val = deque.pop_back().map(Bytes::from);
+                    let val = deque.pop_back();
                     let empty = deque.is_empty();
                     (val, empty)
                 }
@@ -8672,7 +8678,7 @@ impl RudisTable {
                         let mut res = Vec::with_capacity(count.min(deque.len()));
                         for _ in 0..count {
                             if let Some(val) = deque.pop_front() {
-                                res.push(Bytes::from(val));
+                                res.push(val);
                             } else {
                                 break;
                             }
@@ -8711,7 +8717,7 @@ impl RudisTable {
                         let mut res = Vec::with_capacity(count.min(deque.len()));
                         for _ in 0..count {
                             if let Some(val) = deque.pop_back() {
-                                res.push(Bytes::from(val));
+                                res.push(val);
                             } else {
                                 break;
                             }
@@ -8769,7 +8775,7 @@ impl RudisTable {
                         let n = deque.len() as i64;
                         let actual_idx = if index < 0 { n + index } else { index };
                         if actual_idx >= 0 && actual_idx < n {
-                            Ok(deque.get(actual_idx as usize).map(ListElem::to_bytes))
+                            Ok(deque.get_bytes(actual_idx as usize))
                         } else {
                             Ok(None)
                         }
@@ -8813,12 +8819,11 @@ impl RudisTable {
                         }
                         let start_u = start.max(0) as usize;
                         let stop_u = (stop.min(n - 1) as usize).max(start_u);
-                        let mut res = Vec::with_capacity(stop_u - start_u + 1);
-                        for i in start_u..=stop_u {
-                            if let Some(v) = deque.get(i) {
-                                res.push(v.to_bytes());
-                            }
-                        }
+                        let res: Vec<Bytes> = deque
+                            .iter_from(start_u)
+                            .take(stop_u - start_u + 1)
+                            .map(Bytes::copy_from_slice)
+                            .collect();
                         Ok(res)
                     }
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -8869,17 +8874,15 @@ impl RudisTable {
                     let stop_u = (stop.min(n - 1) as usize).max(start_u);
                     let count = stop_u - start_u + 1;
                     if count == 1
-                        && let Some(v) = deque.get(start_u)
+                        && let Some(v) = deque.get_bytes(start_u)
                     {
-                        return Ok(crate::shard::CompactResp::Array1Bulk(v.to_bytes()));
+                        return Ok(crate::shard::CompactResp::Array1Bulk(v));
                     }
                     out.clear();
                     out.reserve(16 + count * 28);
                     crate::connection::write_resp_array_header(out, count);
-                    for i in start_u..=stop_u {
-                        if let Some(v) = deque.get(i) {
-                            crate::connection::write_resp_bulk(out, v);
-                        }
+                    for v in deque.iter_from(start_u).take(stop_u - start_u + 1) {
+                        crate::connection::write_resp_bulk(out, v);
                     }
                     return Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)));
                 }
@@ -8932,10 +8935,8 @@ impl RudisTable {
                     let stop_u = (stop.min(n - 1) as usize).max(start_u);
                     let count = stop_u - start_u + 1;
                     crate::connection::write_resp_array_header(out, count);
-                    for i in start_u..=stop_u {
-                        if let Some(v) = deque.get(i) {
-                            crate::connection::write_resp_bulk(out, v);
-                        }
+                    for v in deque.iter_from(start_u).take(stop_u - start_u + 1) {
+                        crate::connection::write_resp_bulk(out, v);
                     }
                     return Ok(());
                 }
@@ -8975,11 +8976,7 @@ impl RudisTable {
                             } else {
                                 let start_u = start.max(0) as usize;
                                 let stop_u = (stop.min(n - 1) as usize).max(start_u);
-                                **deque = deque
-                                    .drain(..)
-                                    .skip(start_u)
-                                    .take(stop_u - start_u + 1)
-                                    .collect();
+                                deque.retain_range(start_u, stop_u);
                                 deque.is_empty()
                             }
                         }
@@ -9014,7 +9011,7 @@ impl RudisTable {
                         if actual < 0 || actual >= n {
                             return Err("ERR index out of range");
                         }
-                        deque[actual as usize] = ListElem::from_bytes(&element);
+                        deque.set(actual as usize, &element);
                         Ok(())
                     }
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -9037,36 +9034,38 @@ impl RudisTable {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         let mut removed = 0;
-                        if count == 0 {
-                            let mut i = 0;
-                            while i < deque.len() {
-                                if deque[i].as_ref() == element {
-                                    deque.remove(i);
-                                    removed += 1;
-                                } else {
-                                    i += 1;
-                                }
-                            }
-                        } else if count > 0 {
-                            let limit = count as usize;
-                            let mut i = 0;
-                            while i < deque.len() && removed < limit {
-                                if deque[i].as_ref() == element {
-                                    deque.remove(i);
-                                    removed += 1;
-                                } else {
-                                    i += 1;
-                                }
+                        if count >= 0 {
+                            let limit = if count == 0 {
+                                usize::MAX
+                            } else {
+                                count as usize
+                            };
+                            if deque.iter().any(|v| v == element) {
+                                deque.retain(|v| {
+                                    if removed < limit && v == element {
+                                        removed += 1;
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
                             }
                         } else {
+                            // From the tail: find the positions first, then
+                            // remove them highest-first so earlier ones stay put.
                             let limit = (-count) as usize;
-                            let mut i = deque.len();
-                            while i > 0 && removed < limit {
-                                i -= 1;
-                                if deque[i].as_ref() == element {
-                                    deque.remove(i);
-                                    removed += 1;
-                                }
+                            let n = deque.len();
+                            let positions: Vec<usize> = deque
+                                .iter()
+                                .rev()
+                                .enumerate()
+                                .filter(|(_, v)| *v == element)
+                                .take(limit)
+                                .map(|(k, _)| n - 1 - k)
+                                .collect();
+                            for pos in positions {
+                                deque.remove(pos);
+                                removed += 1;
                             }
                         }
                         (removed, deque.is_empty())
@@ -9118,7 +9117,7 @@ impl RudisTable {
                             let skip_rank = (rank - 1) as usize;
                             let mut match_idx = 0;
                             for (pos, item) in deque.iter().take(max_inspect).enumerate() {
-                                if item.as_ref() == element {
+                                if item == element {
                                     if match_idx >= skip_rank {
                                         matches.push(pos);
                                         if let Some(c) = count {
@@ -9136,8 +9135,10 @@ impl RudisTable {
                             let skip_rank = (-rank - 1) as usize;
                             let mut match_idx = 0;
                             let start_back = total.saturating_sub(max_inspect);
-                            for pos in (start_back..total).rev() {
-                                if deque[pos].as_ref() == element {
+                            for (k, item) in deque.iter().rev().take(total - start_back).enumerate()
+                            {
+                                let pos = total - 1 - k;
+                                if item == element {
                                     if match_idx >= skip_rank {
                                         matches.push(pos);
                                         if let Some(c) = count {
@@ -9179,9 +9180,10 @@ impl RudisTable {
             if let Some(entry) = self.get_slot_mut_warm(idx) {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
-                        if let Some(pos) = deque.iter().position(|m| m.as_ref() == pivot) {
+                        let found = deque.iter().position(|m| m == pivot);
+                        if let Some(pos) = found {
                             let insert_pos = if before { pos } else { pos + 1 };
-                            deque.insert(insert_pos, ListElem::from_bytes(&element));
+                            deque.insert(insert_pos, &element);
                             Ok(deque.len() as i64)
                         } else {
                             Ok(-1)
@@ -9260,10 +9262,10 @@ impl RudisTable {
             match &mut entry.val {
                 RudisValue::List(deque) => {
                     match where_to {
-                        ListDirection::Left => deque.push_front(val.clone()),
-                        ListDirection::Right => deque.push_back(val.clone()),
+                        ListDirection::Left => deque.push_front(&val),
+                        ListDirection::Right => deque.push_back(&val),
                     }
-                    return Ok(Some(Bytes::from(val)));
+                    return Ok(Some(val));
                 }
                 _ => {
                     return Err(
@@ -9273,17 +9275,17 @@ impl RudisTable {
             }
         }
 
-        let mut deque = std::collections::VecDeque::new();
+        let mut deque = crate::packedlist::PackedList::new();
         match where_to {
-            ListDirection::Left => deque.push_front(val.clone()),
-            ListDirection::Right => deque.push_back(val.clone()),
+            ListDirection::Left => deque.push_front(&val),
+            ListDirection::Right => deque.push_back(&val),
         }
         self.table.insert(RudisEntry::new(
             CompactKey::new(&destination),
             RudisValue::List(Box::new(deque)),
             Expiry::from(None),
         ));
-        Ok(Some(Bytes::from(val)))
+        Ok(Some(val))
     }
 
     pub fn lmovem(
@@ -9372,16 +9374,16 @@ impl RudisTable {
                 match where_to {
                     ListDirection::Left => {
                         for v in vals.iter().rev() {
-                            deque.push_front(v.clone());
+                            deque.push_front(v);
                         }
                     }
                     ListDirection::Right => {
                         for v in &vals {
-                            deque.push_back(v.clone());
+                            deque.push_back(v);
                         }
                     }
                 }
-                return Ok(Some(vals.into_iter().map(Bytes::from).collect()));
+                return Ok(Some(vals));
             }
             return Ok(None);
         }
@@ -9429,16 +9431,16 @@ impl RudisTable {
                     match where_to {
                         ListDirection::Left => {
                             for v in vals.iter().rev() {
-                                deque.push_front(v.clone());
+                                deque.push_front(v);
                             }
                         }
                         ListDirection::Right => {
                             for v in &vals {
-                                deque.push_back(v.clone());
+                                deque.push_back(v);
                             }
                         }
                     }
-                    return Ok(Some(vals.into_iter().map(Bytes::from).collect()));
+                    return Ok(Some(vals));
                 }
                 _ => {
                     return Err(
@@ -9448,16 +9450,16 @@ impl RudisTable {
             }
         }
 
-        let mut deque = std::collections::VecDeque::with_capacity(vals.len());
+        let mut deque = crate::packedlist::PackedList::new();
         for v in &vals {
-            deque.push_back(v.clone());
+            deque.push_back(v);
         }
         self.table.insert(RudisEntry::new(
             CompactKey::new(&destination),
             RudisValue::List(Box::new(deque)),
             Expiry::from(None),
         ));
-        Ok(Some(vals.into_iter().map(Bytes::from).collect()))
+        Ok(Some(vals))
     }
 
     // SET METHODS
@@ -14461,9 +14463,7 @@ impl RudisTable {
                 let count =
                     u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
-                let mut list = std::collections::VecDeque::with_capacity(claimed_capacity(
-                    count, data, cursor, 4,
-                ));
+                let mut list = crate::packedlist::PackedList::new();
                 for _ in 0..count {
                     if cursor + 4 > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
@@ -14474,7 +14474,7 @@ impl RudisTable {
                     if cursor + len > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
                     }
-                    list.push_back(ListElem::from_slice(&data[cursor..cursor + len]));
+                    list.push_back_slice(&data[cursor..cursor + len]);
                     cursor += len;
                 }
                 RudisValue::List(Box::new(list))

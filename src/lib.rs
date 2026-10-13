@@ -28,6 +28,7 @@ pub mod log;
 pub mod mailbox;
 pub mod mcp;
 pub mod netsec;
+pub mod packedlist;
 pub mod probabilistic;
 pub mod pubsub;
 pub mod redis_rdb;

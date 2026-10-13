@@ -591,8 +591,8 @@ mod tests {
         d
     }
 
-    fn le(s: &str) -> crate::compact::ListElem {
-        crate::compact::ListElem::from_slice(s.as_bytes())
+    fn le(s: &str) -> Bytes {
+        Bytes::copy_from_slice(s.as_bytes())
     }
 
     fn b(s: &str) -> Bytes {

@@ -27372,3 +27372,122 @@ fn test_large_sorted_set_order_rank_and_removal_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_packed_list_across_chunk_boundaries_e2e() {
+    let port = 18001u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    fn read_reply(c: &mut TcpStream, want_lines: usize) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 65536];
+        while out.windows(2).filter(|w| *w == b"\r\n").count() < want_lines {
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            out.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8(out).unwrap()
+    }
+    let bulk = |s: &str| format!("${}\r\n{s}\r\n", s.len());
+    let range_of = |c: &mut TcpStream, start: i64, stop: i64, n: usize| -> String {
+        c.write_all(format!("LRANGE pl {start} {stop}\r\n").as_bytes())
+            .unwrap();
+        read_reply(c, 1 + 2 * n)
+    };
+
+    // 2000 elements: mostly short (packed several hundred per chunk), every
+    // 37th long (a chunk of its own), pushed from both ends.
+    let mut model: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut pipe = String::new();
+    for i in 0..2000 {
+        let v = if i % 37 == 0 {
+            format!("{}-{i}", "L".repeat(80))
+        } else {
+            format!("s{i}")
+        };
+        if i % 2 == 0 {
+            pipe.push_str(&format!("RPUSH pl {v}\r\n"));
+            model.push_back(v);
+        } else {
+            pipe.push_str(&format!("LPUSH pl {v}\r\n"));
+            model.push_front(v);
+        }
+    }
+    c.write_all(pipe.as_bytes()).unwrap();
+    read_reply(&mut c, 2000);
+    let model_range = |m: &std::collections::VecDeque<String>, a: usize, b: usize| -> String {
+        std::iter::once(format!("*{}\r\n", b - a + 1))
+            .chain(m.iter().skip(a).take(b - a + 1).map(|v| bulk(v)))
+            .collect()
+    };
+    assert_eq!(
+        range_of(&mut c, 0, -1, model.len()),
+        model_range(&model, 0, model.len() - 1)
+    );
+    for i in [0usize, 1, 63, 64, 255, 256, 999, 1000, 1500, 1998, 1999] {
+        assert_eq!(
+            resp_cmd(&mut c, &["LINDEX", "pl", &i.to_string()]),
+            bulk(&model[i]),
+            "LINDEX {i}"
+        );
+    }
+    assert_eq!(
+        range_of(&mut c, 990, 1010, 21),
+        model_range(&model, 990, 1010)
+    );
+
+    // Mid-list edits, short and long.
+    let pivot = model[700].clone();
+    assert_eq!(
+        resp_cmd(&mut c, &["LINSERT", "pl", "BEFORE", &pivot, "ins-short"]),
+        ":2001\r\n"
+    );
+    model.insert(700, "ins-short".into());
+    let long = "Q".repeat(100);
+    assert_eq!(
+        resp_cmd(&mut c, &["LINSERT", "pl", "AFTER", &pivot, &long]),
+        ":2002\r\n"
+    );
+    model.insert(702, long.clone());
+    assert_eq!(
+        resp_cmd(&mut c, &["LSET", "pl", "1234", "set-short"]),
+        "+OK\r\n"
+    );
+    model[1234] = "set-short".into();
+    assert_eq!(resp_cmd(&mut c, &["LSET", "pl", "1235", &long]), "+OK\r\n");
+    model[1235] = long.clone();
+    // LREM from the tail removes the last two copies of `long`.
+    assert_eq!(resp_cmd(&mut c, &["LREM", "pl", "-2", &long]), ":2\r\n");
+    model.remove(1235);
+    model.remove(702);
+    assert_eq!(
+        resp_cmd(&mut c, &["LPOS", "pl", "set-short", "RANK", "-1"]),
+        ":1233\r\n"
+    );
+    assert_eq!(
+        range_of(&mut c, 0, -1, model.len()),
+        model_range(&model, 0, model.len() - 1)
+    );
+
+    assert_eq!(resp_cmd(&mut c, &["LTRIM", "pl", "500", "1499"]), "+OK\r\n");
+    let trimmed: std::collections::VecDeque<String> =
+        model.iter().skip(500).take(1000).cloned().collect();
+    assert_eq!(range_of(&mut c, 0, -1, 1000), model_range(&trimmed, 0, 999));
+    assert_eq!(resp_cmd(&mut c, &["LLEN", "pl"]), ":1000\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

@@ -150,7 +150,6 @@ pub fn format_memory_info(
 }
 
 use bytes::Bytes;
-use std::collections::VecDeque;
 
 pub const MAX_ARENA_POOLED: usize = 1024;
 
@@ -159,7 +158,7 @@ pub const MAX_ARENA_POOLED: usize = 1024;
 /// List (LPUSH/LPOP), Hash (HSET/HDEL), Set (SADD/SREM), and ZSet (ZADD/ZREM) workloads.
 #[derive(Debug, Default)]
 pub struct SmallCollectionArena {
-    list_pool: Vec<VecDeque<crate::compact::ListElem>>,
+    list_pool: Vec<crate::packedlist::PackedList>,
     hash_pool: Vec<Vec<(Bytes, Bytes)>>,
     set_pool: Vec<Vec<crate::table::SmallSetEntry>>,
     zset_pool: Vec<Vec<(crate::table::OrderedScore, crate::compact::CompactKey)>>,
@@ -180,22 +179,19 @@ impl SmallCollectionArena {
     }
 
     #[inline(always)]
-    pub fn acquire_list(&mut self, min_cap: usize) -> VecDeque<crate::compact::ListElem> {
-        if let Some(mut d) = self.list_pool.pop() {
+    pub fn acquire_list(&mut self, _min_cap: usize) -> crate::packedlist::PackedList {
+        if let Some(d) = self.list_pool.pop() {
             self.allocations_saved += 1;
-            if d.capacity() < min_cap {
-                d.reserve(min_cap - d.capacity());
-            }
             d
         } else {
-            VecDeque::with_capacity(min_cap.max(16))
+            crate::packedlist::PackedList::new()
         }
     }
 
     #[inline(always)]
-    pub fn recycle_list(&mut self, mut d: VecDeque<crate::compact::ListElem>) {
+    pub fn recycle_list(&mut self, mut d: crate::packedlist::PackedList) {
         d.clear();
-        if d.capacity() <= 512 && self.list_pool.len() < MAX_ARENA_POOLED {
+        if self.list_pool.len() < MAX_ARENA_POOLED {
             self.recycles_count += 1;
             self.list_pool.push(d);
         }
@@ -322,8 +318,8 @@ mod tests {
 
         // 1. List pool
         let mut d = arena.acquire_list(10);
-        d.push_back(crate::compact::ListElem::from_slice(b"v1"));
-        d.push_front(crate::compact::ListElem::from_slice(b"v0"));
+        d.push_back(&Bytes::from_static(b"v1"));
+        d.push_front(&Bytes::from_static(b"v0"));
         assert_eq!(d.len(), 2);
         arena.recycle_list(d);
         assert_eq!(arena.recycles_count, 1);
@@ -332,7 +328,6 @@ mod tests {
         let d2 = arena.acquire_list(5);
         assert_eq!(arena.allocations_saved, 1);
         assert!(d2.is_empty());
-        assert!(d2.capacity() >= 10);
         assert_eq!(arena.pool_stats().0, 0);
 
         // 2. Small Hash pool

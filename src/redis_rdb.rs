@@ -665,9 +665,7 @@ fn list_value(list: VecDeque<Bytes>) -> Option<Decoded> {
         None
     } else {
         Decoded::plain(RudisValue::List(Box::new(
-            list.into_iter()
-                .map(crate::compact::ListElem::from)
-                .collect(),
+            list.into_iter().collect::<crate::packedlist::PackedList>(),
         )))
     }
 }
@@ -2507,9 +2505,7 @@ mod tests {
         }
         let list: VecDeque<Bytes> = (0..300).map(|i| Bytes::from(format!("e{i}"))).collect();
         let l = RudisValue::List(Box::new(
-            list.into_iter()
-                .map(crate::compact::ListElem::from)
-                .collect(),
+            list.into_iter().collect::<crate::packedlist::PackedList>(),
         ));
         assert_eq!(round_trip(&l), l);
 
@@ -2785,7 +2781,7 @@ mod tests {
         write_raw_string(&mut body, b"big plain");
         match decode_dump_body(&body, 0).unwrap().value {
             RudisValue::List(l) => assert_eq!(
-                l.iter().cloned().collect::<Vec<_>>(),
+                l.iter().map(Bytes::copy_from_slice).collect::<Vec<_>>(),
                 vec![
                     Bytes::from_static(b"f"),
                     Bytes::from_static(b"7"),
