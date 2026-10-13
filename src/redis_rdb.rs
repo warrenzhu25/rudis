@@ -664,7 +664,11 @@ fn list_value(list: VecDeque<Bytes>) -> Option<Decoded> {
     if list.is_empty() {
         None
     } else {
-        Decoded::plain(RudisValue::List(Box::new(list)))
+        Decoded::plain(RudisValue::List(Box::new(
+            list.into_iter()
+                .map(crate::compact::ListElem::from)
+                .collect(),
+        )))
     }
 }
 
@@ -2502,7 +2506,11 @@ mod tests {
             assert_eq!(round_trip(&RudisValue::Int(n)), RudisValue::Int(n));
         }
         let list: VecDeque<Bytes> = (0..300).map(|i| Bytes::from(format!("e{i}"))).collect();
-        let l = RudisValue::List(Box::new(list));
+        let l = RudisValue::List(Box::new(
+            list.into_iter()
+                .map(crate::compact::ListElem::from)
+                .collect(),
+        ));
         assert_eq!(round_trip(&l), l);
 
         let mut set = RudisSet::new();

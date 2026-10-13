@@ -159,7 +159,7 @@ pub const MAX_ARENA_POOLED: usize = 1024;
 /// List (LPUSH/LPOP), Hash (HSET/HDEL), Set (SADD/SREM), and ZSet (ZADD/ZREM) workloads.
 #[derive(Debug, Default)]
 pub struct SmallCollectionArena {
-    list_pool: Vec<VecDeque<Bytes>>,
+    list_pool: Vec<VecDeque<crate::compact::ListElem>>,
     hash_pool: Vec<Vec<(Bytes, Bytes)>>,
     set_pool: Vec<Vec<crate::table::SmallSetEntry>>,
     zset_pool: Vec<Vec<(crate::table::OrderedScore, crate::compact::CompactKey)>>,
@@ -180,7 +180,7 @@ impl SmallCollectionArena {
     }
 
     #[inline(always)]
-    pub fn acquire_list(&mut self, min_cap: usize) -> VecDeque<Bytes> {
+    pub fn acquire_list(&mut self, min_cap: usize) -> VecDeque<crate::compact::ListElem> {
         if let Some(mut d) = self.list_pool.pop() {
             self.allocations_saved += 1;
             if d.capacity() < min_cap {
@@ -193,7 +193,7 @@ impl SmallCollectionArena {
     }
 
     #[inline(always)]
-    pub fn recycle_list(&mut self, mut d: VecDeque<Bytes>) {
+    pub fn recycle_list(&mut self, mut d: VecDeque<crate::compact::ListElem>) {
         d.clear();
         if d.capacity() <= 512 && self.list_pool.len() < MAX_ARENA_POOLED {
             self.recycles_count += 1;
@@ -322,8 +322,8 @@ mod tests {
 
         // 1. List pool
         let mut d = arena.acquire_list(10);
-        d.push_back(Bytes::from_static(b"v1"));
-        d.push_front(Bytes::from_static(b"v0"));
+        d.push_back(crate::compact::ListElem::from_slice(b"v1"));
+        d.push_front(crate::compact::ListElem::from_slice(b"v0"));
         assert_eq!(d.len(), 2);
         arena.recycle_list(d);
         assert_eq!(arena.recycles_count, 1);

@@ -27166,3 +27166,78 @@ fn test_slowlog_args_survive_read_buffer_reuse_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_list_elements_of_every_length_e2e() {
+    let port = 17996u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let bulk = |s: &str| format!("${}\r\n{s}\r\n", s.len());
+
+    // Elements at the inline-storage boundaries, long, binary and empty.
+    let els: Vec<String> = vec![
+        String::new(),
+        "x".repeat(22),
+        "y".repeat(23),
+        "z".repeat(24),
+        "w".repeat(300),
+        "bin\0ary".to_string(),
+    ];
+    let mut args = vec!["RPUSH", "el"];
+    args.extend(els.iter().map(String::as_str));
+    assert_eq!(resp_cmd(&mut c, &args), ":6\r\n");
+    for (i, e) in els.iter().enumerate() {
+        assert_eq!(
+            resp_cmd(&mut c, &["LINDEX", "el", &i.to_string()]),
+            bulk(e),
+            "{e:?}"
+        );
+    }
+    let all: String = els.iter().map(|e| bulk(e)).collect();
+    assert_eq!(
+        resp_cmd(&mut c, &["LRANGE", "el", "0", "-1"]),
+        format!("*6\r\n{all}")
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["LSET", "el", "1", &"q".repeat(40)]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["LINSERT", "el", "BEFORE", &"z".repeat(24), "ins"]),
+        ":7\r\n"
+    );
+    // Move the long element to another list (possibly another shard) and back.
+    assert_eq!(
+        resp_cmd(&mut c, &["LMOVE", "el", "el2", "RIGHT", "LEFT"]),
+        bulk("bin\0ary")
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["LMOVE", "el2", "el", "LEFT", "LEFT"]),
+        bulk("bin\0ary")
+    );
+    assert_eq!(resp_cmd(&mut c, &["LPOP", "el"]), bulk("bin\0ary"));
+    assert_eq!(resp_cmd(&mut c, &["RPOP", "el"]), bulk(&"w".repeat(300)));
+    let expect = ["", &"q".repeat(40), &"y".repeat(23), "ins", &"z".repeat(24)];
+    let rest: String = expect.iter().map(|e| bulk(e)).collect();
+    assert_eq!(
+        resp_cmd(&mut c, &["LPOP", "el", "10"]),
+        format!("*5\r\n{rest}")
+    );
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "el", "el2"]), ":0\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

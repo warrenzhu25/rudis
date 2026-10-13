@@ -591,6 +591,10 @@ mod tests {
         d
     }
 
+    fn le(s: &str) -> crate::compact::ListElem {
+        crate::compact::ListElem::from_slice(s.as_bytes())
+    }
+
     fn b(s: &str) -> Bytes {
         Bytes::copy_from_slice(s.as_bytes())
     }
@@ -732,15 +736,15 @@ mod tests {
 
     #[test]
     fn list_order_matters_and_types_differ() {
-        let l1 = RudisValue::List(Box::new([b("a"), b("b")].into_iter().collect()));
-        let l2 = RudisValue::List(Box::new([b("b"), b("a")].into_iter().collect()));
+        let l1 = RudisValue::List(Box::new([le("a"), le("b")].into_iter().collect()));
+        let l2 = RudisValue::List(Box::new([le("b"), le("a")].into_iter().collect()));
         assert_ne!(vdigest(&l1), vdigest(&l2));
         // A one-member set and a one-element list differ by type.
         let set = RudisValue::Set(Box::new(RudisSet::Small(vec![SmallSetEntry {
             hash: crate::table::hash_key(b"a"),
             member: crate::compact::CompactKey::new(b"a"),
         }])));
-        let list = RudisValue::List(Box::new([b("a")].into_iter().collect()));
+        let list = RudisValue::List(Box::new([le("a")].into_iter().collect()));
         assert_ne!(vdigest(&set), vdigest(&list));
     }
 
