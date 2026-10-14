@@ -122,7 +122,7 @@ def main():
     max_rounds = args.max_rounds or rounds + 2
     cores = args.cores
     server_cpus = f"{s.SERVER_CPU_BASE}-{s.SERVER_CPU_BASE + cores - 1}"
-    s.CLIENT_CPUS_ACTIVE = f"{s.CLIENT_CPU_BASE}-{s.CLIENT_CPU_BASE + min(cores, s.CLIENT_THREADS) - 1}"
+    s.CLIENT_CPUS_ACTIVE = f"{s.CLIENT_CPU_BASE}-{s.CLIENT_CPU_BASE + s.client_cpu_count(cores) - 1}"
     port = 6390
 
     def run_binary(binary):

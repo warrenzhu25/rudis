@@ -624,11 +624,23 @@ def run_workload_benchmark(engine_name, port, workload):
         "runs": ops_list,
     }
 
+def client_cpu_count(cores):
+    """Client CPUs for a run: one per memtier thread (CLIENT_THREADS) whenever
+    they fit below the server's cores. Pinning the 16 threads to only
+    `cores` CPUs (as before) oversubscribed the client below 16 cores: at 8,
+    threads waiting for a CPU put GET (1KB)'s p99 at 6 ms (1.2 ms with one
+    thread per CPU) and capped GET at 1.25M ops/s and 5-key MGET at 289k
+    (1.90M and 613k with 16 client CPUs), understating the server."""
+    if CLIENT_CPU_BASE + CLIENT_THREADS <= SERVER_CPU_BASE:
+        return CLIENT_THREADS
+    return min(cores, CLIENT_THREADS)
+
+
 def benchmark_at_core_count(cores):
     global CLIENT_CPUS_ACTIVE
 
     server_cpus = f"{SERVER_CPU_BASE}-{SERVER_CPU_BASE + cores - 1}"
-    client_cores = min(cores, CLIENT_THREADS)
+    client_cores = client_cpu_count(cores)
     CLIENT_CPUS_ACTIVE = f"{CLIENT_CPU_BASE}-{CLIENT_CPU_BASE + client_cores - 1}"
 
     oversubscribed = (
