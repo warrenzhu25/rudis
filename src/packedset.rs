@@ -25,6 +25,9 @@ struct Inner<H> {
     dict: hashbrown::HashTable<H>,
     store: PageStore<H>,
     len: usize,
+    /// Bucket index where the next `pop` starts looking (a hint: the table
+    /// may have grown since).
+    pop_cursor: usize,
 }
 
 impl<H> Default for Inner<H> {
@@ -33,6 +36,7 @@ impl<H> Default for Inner<H> {
             dict: hashbrown::HashTable::new(),
             store: PageStore::default(),
             len: 0,
+            pop_cursor: 0,
         }
     }
 }
@@ -102,9 +106,34 @@ impl<H: Handle> Inner<H> {
     }
 
     fn pop(&mut self) -> Option<Bytes> {
-        // Take the first bucket in table order directly: no re-hash or second
-        // probe. A dropped `ExtractIf` keeps the elements it did not visit.
-        let h = self.dict.extract_if(|_| true).next()?;
+        if self.len == 0 {
+            return None;
+        }
+        // Resume the scan where the last pop stopped. Starting at bucket 0
+        // every time (as `extract_if` does) rescanned the emptied front of
+        // the table on each pop: draining a 200k-member set with SPOP 200
+        // put other clients' p99 at 1.5 ms. Resuming, a full drain scans
+        // the table about once.
+        let n = self.dict.num_buckets();
+        let mut i = if self.pop_cursor < n {
+            self.pop_cursor
+        } else {
+            0
+        };
+        for _ in 0..n {
+            if self.dict.get_bucket(i).is_some() {
+                break;
+            }
+            i += 1;
+            if i == n {
+                i = 0;
+            }
+        }
+        let Ok(entry) = self.dict.get_bucket_entry(i) else {
+            unreachable!("a non-empty table has an occupied bucket")
+        };
+        let (h, _) = entry.remove();
+        self.pop_cursor = i + 1;
         let m = Bytes::copy_from_slice(self.store.get(h));
         self.release(h);
         Some(m)
@@ -356,6 +385,28 @@ mod tests {
             matches!(s.0, Repr::Wide(_)),
             "a 4-page limit must force widening"
         );
+    }
+
+    #[test]
+    fn pop_resumes_its_scan_and_still_finds_members_inserted_behind_it() {
+        let mut s = PackedSet::default();
+        for i in 0..5_000u32 {
+            s.insert(format!("a:{i}").as_bytes());
+        }
+        let mut popped = HashSet::new();
+        // Pop half, then insert more: some land in buckets behind the
+        // cursor, which must wrap around to find them.
+        for _ in 0..2_500 {
+            assert!(popped.insert(s.pop().unwrap()));
+        }
+        for i in 0..3_000u32 {
+            s.insert(format!("b:{i}").as_bytes());
+        }
+        while let Some(p) = s.pop() {
+            assert!(popped.insert(p), "popped twice");
+        }
+        assert_eq!(popped.len(), 8_000);
+        assert!(s.is_empty());
     }
 
     #[test]
