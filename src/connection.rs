@@ -746,8 +746,35 @@ pub fn write_resp_null_array(out: &mut Vec<u8>) {
     }
 }
 
+/// Digits of `val` when it is a whole number below 10^15 in magnitude, the
+/// common case for scores, exactly as `%.17g` prints it: no `snprintf`.
+#[inline]
+fn integral_score_digits(val: f64, buf: &mut [u8; 20]) -> Option<usize> {
+    if val.fract() != 0.0 || val.abs() >= 1e15 || val == 0.0 {
+        return None;
+    }
+    let neg = val < 0.0;
+    let mut n = val.abs() as u64;
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    if neg {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    Some(i)
+}
+
 #[inline]
 pub fn format_score(val: f64) -> String {
+    let mut digits = [0u8; 20];
+    if let Some(start) = integral_score_digits(val, &mut digits) {
+        // ASCII digits and '-' only.
+        return String::from_utf8_lossy(&digits[start..]).into_owned();
+    }
     if val.is_nan() {
         "nan".to_string()
     } else if val.is_infinite() {
@@ -795,6 +822,11 @@ pub fn write_resp_score(out: &mut Vec<u8>, val: f64) {
             out.extend_from_slice(format!(",{}\r\n", s).as_bytes());
         }
     } else {
+        let mut digits = [0u8; 20];
+        if let Some(start) = integral_score_digits(val, &mut digits) {
+            write_resp_bulk(out, &digits[start..]);
+            return;
+        }
         let s = format_score(val);
         write_resp_bulk(out, s.as_bytes());
     }
@@ -28193,6 +28225,55 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integral_scores_format_like_printf_g17() {
+        fn g17(v: f64) -> String {
+            let mut buf = [0u8; 64];
+            // SAFETY: as in `format_score`.
+            let n = unsafe {
+                libc::snprintf(
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    64,
+                    c"%.17g".as_ptr(),
+                    v,
+                )
+            };
+            String::from_utf8_lossy(&buf[..n as usize]).into_owned()
+        }
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut vals = vec![
+            1.0,
+            -1.0,
+            7.0,
+            42.0,
+            -375.0,
+            1e14,
+            999_999_999_999_999.0,
+            -999_999_999_999_999.0,
+        ];
+        for _ in 0..10_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let v = (x % 2_000_000_000_000_000) as f64 - 1e15;
+            vals.push(v.trunc());
+        }
+        for v in vals {
+            let mut d = [0u8; 20];
+            match integral_score_digits(v, &mut d) {
+                Some(start) => assert_eq!(std::str::from_utf8(&d[start..]).unwrap(), g17(v), "{v}"),
+                None => assert!(v.abs() >= 1e15 || v == 0.0, "{v} should take the fast path"),
+            }
+            assert_eq!(
+                format_score(v),
+                if v == 0.0 { "0".to_string() } else { g17(v) },
+                "{v}"
+            );
+        }
+        assert_eq!(integral_score_digits(1.5, &mut [0u8; 20]), None);
+        assert_eq!(integral_score_digits(1e15, &mut [0u8; 20]), None);
+    }
 
     /// `replica-ignore-maxmemory` (alias `slave-…`) defaults to yes and only
     /// exempts a replica from `maxmemory`: a master keeps enforcing it, and
