@@ -3041,7 +3041,10 @@ impl ShardDb {
         let Some(tm) = self.tier_manager.as_ref() else {
             return;
         };
-        let stats = tm.stats.clone();
+        // Borrowed, not cloned: this runs for every command on every shard,
+        // and an Arc clone/drop is two atomic RMWs on a counter all shards
+        // share (3.5% of server time in a pipelined ZPOPMIN profile).
+        let stats = &tm.stats;
         if stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed) == 0
             && stats.cooled_keys.load(std::sync::atomic::Ordering::Relaxed) == 0
         {
