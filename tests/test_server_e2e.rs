@@ -28455,3 +28455,103 @@ fn test_packed_list_medium_elements_and_queue_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_slowlog_records_pipelined_commands_e2e() {
+    let port = 17994u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "slowlog-log-slower-than", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "slowlog-max-len", "256"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["SLOWLOG", "RESET"]), "+OK\r\n");
+
+    // One write carrying many commands of different kinds, on keys spread
+    // over the shards: every one must be logged, not just the first or last.
+    let cmds: Vec<Vec<String>> = (0..8)
+        .flat_map(|i| {
+            [
+                vec!["SET".into(), format!("plk:s{i}"), "v".into()],
+                vec!["GET".into(), format!("plk:s{i}")],
+                vec!["INCR".into(), format!("plk:n{i}")],
+                vec!["HSET".into(), format!("plk:h{i}"), "f".into(), "v".into()],
+                vec!["LPUSH".into(), format!("plk:l{i}"), "x".into()],
+                vec!["SADD".into(), format!("plk:z{i}"), "m".into()],
+            ]
+        })
+        .collect();
+    let mut out = String::new();
+    for args in &cmds {
+        out.push_str(&format!("*{}\r\n", args.len()));
+        for a in args {
+            out.push_str(&format!("${}\r\n{a}\r\n", a.len()));
+        }
+    }
+    out.push_str("*1\r\n$4\r\nPING\r\n");
+    c.write_all(out.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !got.ends_with(b"+PONG\r\n") {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0);
+        got.extend_from_slice(&buf[..n]);
+    }
+
+    let log = {
+        c.write_all(b"*3\r\n$7\r\nSLOWLOG\r\n$3\r\nGET\r\n$3\r\n256\r\n")
+            .unwrap();
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // Read until the reply stops growing.
+        c.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        while std::time::Instant::now() < deadline {
+            match c.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(_) if !got.is_empty() => break,
+                Err(_) => {}
+            }
+        }
+        String::from_utf8_lossy(&got).to_lowercase()
+    };
+    for args in &cmds {
+        // Each logged entry carries the command name and key as bulk strings
+        // (compared case-insensitively).
+        let needle = format!(
+            "${}\r\n{}\r\n${}\r\n{}\r\n",
+            args[0].len(),
+            args[0],
+            args[1].len(),
+            args[1]
+        )
+        .to_lowercase();
+        assert!(
+            log.contains(&needle),
+            "pipelined `{} {}` missing from SLOWLOG GET",
+            args[0],
+            args[1]
+        );
+    }
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

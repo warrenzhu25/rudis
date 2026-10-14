@@ -196,6 +196,8 @@ fn main() {
     }
 
     rudis::connection::mark_server_start();
+    // Calibrate the per-command pipeline timer (SLOWLOG) before serving.
+    rudis::cycleclock::init();
     rudis::telemetry::init_telemetry();
     rudis::shutdown::install_signal_handlers();
     let (clap_args, positional_config, extra_directives) =

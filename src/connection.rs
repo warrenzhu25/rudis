@@ -26227,6 +26227,9 @@ async fn execute_commands_squashed_inner(
     // Commands handed to `execute_command` below record their own stats; the
     // time spent awaiting other shards is left out of the batch segments.
     let mut stat_run = CmdStatBatch::new();
+    // Commands run here rather than through `execute_command` are timed one
+    // by one for SLOWLOG (and LATENCY's "command" event) the same way.
+    let slow_threshold = batch_slow_threshold();
     for (idx, cmd) in commands.drain(..).enumerate() {
         if cmd.is_write_command() && !dirty_counted_on_change(&cmd) {
             crate::snapshot::note_write();
@@ -26240,477 +26243,397 @@ async fn execute_commands_squashed_inner(
             }
             stat_run.note(get_cmd_name(&cmd));
             if target == router.shard_id {
-                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                    for_each_read_key(&cmd, |k| record_client_read(router.port, client_id, k));
-                }
-                local_buf.clear();
-                local_db.hydrate_cmd_keys(&cmd);
-                if let Command::Get(ref key) = cmd {
-                    let compact_res = local_db.table.get_compact_with_hash(key.as_ref(), key_hash);
-                    match compact_res {
-                        Ok(Some(resp)) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Ok(None) => {
-                            let is_tiered = local_db.tier_manager.is_some()
-                                && local_db.table.is_tiered(key).is_some();
-                            if is_tiered {
-                                local_cold_gets.push((idx, key.clone()));
-                            } else {
-                                responses[idx] = crate::shard::CompactResp::null(is_resp3);
-                            }
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if write_fast_path
-                    && let Command::Set {
-                        key,
-                        value,
-                        expire_in,
-                        condition: crate::resp::SetCondition::None,
-                        get: false,
-                        keepttl: false,
-                        past_expired: false,
-                    } = cmd
-                {
-                    has_local_writes = true;
-                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                        touch_watched_key(router.port, key.as_ref());
-                    }
+                let slow_t0 = slow_threshold.map(|_| crate::cycleclock::now());
+                'local: {
                     if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                        notify_key_invalidation(router.port, key.as_ref(), client_id);
+                        for_each_read_key(&cmd, |k| record_client_read(router.port, client_id, k));
                     }
-                    local_db
-                        .table
-                        .set_with_hash(key, key_hash, value, expire_in);
-                    responses[idx] = crate::shard::CompactResp::OK;
-                    continue;
-                } else if write_fast_path && let Command::IncrBy(ref key, delta, _) = cmd {
-                    has_local_writes = true;
-                    match local_db.table.incr_by_slice_with_hash(key, key_hash, delta) {
-                        Ok(val) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
+                    local_buf.clear();
+                    local_db.hydrate_cmd_keys(&cmd);
+                    if let Command::Get(ref key) = cmd {
+                        let compact_res =
+                            local_db.table.get_compact_with_hash(key.as_ref(), key_hash);
+                        match compact_res {
+                            Ok(Some(resp)) => {
+                                responses[idx] = resp;
+                                break 'local;
                             }
-                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                            Ok(None) => {
+                                let is_tiered = local_db.tier_manager.is_some()
+                                    && local_db.table.is_tiered(key).is_some();
+                                if is_tiered {
+                                    local_cold_gets.push((idx, key.clone()));
+                                } else {
+                                    responses[idx] = crate::shard::CompactResp::null(is_resp3);
+                                }
+                                break 'local;
                             }
-                            if val == 1 {
-                                responses[idx] = crate::shard::CompactResp::INT_1;
-                            } else if val == 0 {
-                                responses[idx] = crate::shard::CompactResp::INT_0;
-                            } else {
-                                responses[idx] = crate::shard::CompactResp::from_integer(val);
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
                             }
-                            continue;
                         }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if let Command::Exists(ref keys) = cmd
-                    && keys.len() == 1
-                {
-                    let exists = local_db.table.exists_with_hash(keys[0].as_ref(), key_hash);
-                    crate::server_stats::note_key_lookup(exists);
-                    responses[idx] = if exists {
-                        crate::shard::CompactResp::INT_1
-                    } else {
-                        crate::shard::CompactResp::INT_0
-                    };
-                    continue;
-                } else if let Command::Touch(ref keys) = cmd
-                    && keys.len() == 1
-                {
-                    let touched = local_db.table.touch_with_hash(keys[0].as_ref(), key_hash);
-                    responses[idx] = if touched {
-                        crate::shard::CompactResp::INT_1
-                    } else {
-                        crate::shard::CompactResp::INT_0
-                    };
-                    continue;
-                } else if write_fast_path
-                    && !crate::search::has_active_search_indices()
-                    && let Command::Del(ref keys) | Command::Unlink(ref keys) = cmd
-                    && keys.len() == 1
-                {
-                    let is_unlink = matches!(cmd, Command::Unlink(_));
-                    let lazy = is_unlink && local_db.table.is_lazyfree_worthy(keys[0].as_ref());
-                    let deleted = local_db.del_with_hash(keys[0].as_ref(), key_hash);
-                    if deleted {
-                        if lazy {
-                            crate::table::add_lazyfreed_objects(1);
-                        }
+                    } else if write_fast_path
+                        && let Command::Set {
+                            ref key,
+                            ref value,
+                            expire_in,
+                            condition: crate::resp::SetCondition::None,
+                            get: false,
+                            keepttl: false,
+                            past_expired: false,
+                        } = cmd
+                    {
                         has_local_writes = true;
                         if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                            touch_watched_key(router.port, keys[0].as_ref());
+                            touch_watched_key(router.port, key.as_ref());
                         }
                         if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                            notify_key_invalidation(router.port, keys[0].as_ref(), client_id);
+                            notify_key_invalidation(router.port, key.as_ref(), client_id);
                         }
-                        responses[idx] = crate::shard::CompactResp::INT_1;
-                    } else {
-                        responses[idx] = crate::shard::CompactResp::INT_0;
-                    }
-                    continue;
-                } else if let Command::Hget { ref key, ref field } = cmd {
-                    match local_db.table.hget_compact_with_hash(
-                        key.as_ref(),
-                        key_hash,
-                        field.as_ref(),
-                    ) {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
+                        // Borrowed, not moved: the command stays whole for the
+                        // slowlog check after the block.
+                        local_db.table.set_with_hash(
+                            key.clone(),
+                            key_hash,
+                            value.clone(),
+                            expire_in,
+                        );
+                        responses[idx] = crate::shard::CompactResp::OK;
+                        break 'local;
+                    } else if write_fast_path && let Command::IncrBy(ref key, delta, _) = cmd {
+                        has_local_writes = true;
+                        match local_db.table.incr_by_slice_with_hash(key, key_hash, delta) {
+                            Ok(val) => {
+                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    touch_watched_key(router.port, key.as_ref());
+                                }
+                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                                }
+                                if val == 1 {
+                                    responses[idx] = crate::shard::CompactResp::INT_1;
+                                } else if val == 0 {
+                                    responses[idx] = crate::shard::CompactResp::INT_0;
+                                } else {
+                                    responses[idx] = crate::shard::CompactResp::from_integer(val);
+                                }
+                                break 'local;
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
                         }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
+                    } else if let Command::Exists(ref keys) = cmd
+                        && keys.len() == 1
+                    {
+                        let exists = local_db.table.exists_with_hash(keys[0].as_ref(), key_hash);
+                        crate::server_stats::note_key_lookup(exists);
+                        responses[idx] = if exists {
+                            crate::shard::CompactResp::INT_1
+                        } else {
+                            crate::shard::CompactResp::INT_0
+                        };
+                        break 'local;
+                    } else if let Command::Touch(ref keys) = cmd
+                        && keys.len() == 1
+                    {
+                        let touched = local_db.table.touch_with_hash(keys[0].as_ref(), key_hash);
+                        responses[idx] = if touched {
+                            crate::shard::CompactResp::INT_1
+                        } else {
+                            crate::shard::CompactResp::INT_0
+                        };
+                        break 'local;
+                    } else if write_fast_path
+                        && !crate::search::has_active_search_indices()
+                        && let Command::Del(ref keys) | Command::Unlink(ref keys) = cmd
+                        && keys.len() == 1
+                    {
+                        let is_unlink = matches!(cmd, Command::Unlink(_));
+                        let lazy = is_unlink && local_db.table.is_lazyfree_worthy(keys[0].as_ref());
+                        let deleted = local_db.del_with_hash(keys[0].as_ref(), key_hash);
+                        if deleted {
+                            if lazy {
+                                crate::table::add_lazyfreed_objects(1);
+                            }
+                            has_local_writes = true;
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(router.port, keys[0].as_ref());
+                            }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                notify_key_invalidation(router.port, keys[0].as_ref(), client_id);
+                            }
+                            responses[idx] = crate::shard::CompactResp::INT_1;
+                        } else {
+                            responses[idx] = crate::shard::CompactResp::INT_0;
                         }
-                    }
-                } else if let Command::Hmget {
-                    ref key,
-                    ref fields,
-                } = cmd
-                {
-                    match local_db.table.hmget_compact_with_hash(
-                        key.as_ref(),
-                        key_hash,
-                        fields,
-                        &mut local_buf,
-                    ) {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
+                        break 'local;
+                    } else if let Command::Hget { ref key, ref field } = cmd {
+                        match local_db.table.hget_compact_with_hash(
+                            key.as_ref(),
+                            key_hash,
+                            field.as_ref(),
+                        ) {
+                            Ok(resp) => {
+                                responses[idx] = resp;
+                                break 'local;
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
                         }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if write_fast_path
-                    && !crate::search::has_active_search_indices()
-                    && let Command::Hset {
+                    } else if let Command::Hmget {
                         ref key,
                         ref fields,
                     } = cmd
-                {
-                    has_local_writes = true;
-                    let res = if fields.len() == 1 {
-                        let (ref f, ref v) = fields[0];
-                        local_db
-                            .table
-                            .hset_single_field_with_hash(key, key_hash, f, v)
-                    } else {
-                        local_db.table.hset_slice_with_hash(key, key_hash, fields)
-                    };
-                    match res {
-                        Ok(count) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
+                    {
+                        match local_db.table.hmget_compact_with_hash(
+                            key.as_ref(),
+                            key_hash,
+                            fields,
+                            &mut local_buf,
+                        ) {
+                            Ok(resp) => {
+                                responses[idx] = resp;
+                                break 'local;
                             }
-                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
                             }
-                            if count == 1 {
-                                responses[idx] = crate::shard::CompactResp::INT_1;
-                            } else if count == 0 {
-                                responses[idx] = crate::shard::CompactResp::INT_0;
-                            } else {
-                                responses[idx] =
-                                    crate::shard::CompactResp::from_integer(count as i64);
+                        }
+                    } else if write_fast_path
+                        && !crate::search::has_active_search_indices()
+                        && let Command::Hset {
+                            ref key,
+                            ref fields,
+                        } = cmd
+                    {
+                        has_local_writes = true;
+                        let res = if fields.len() == 1 {
+                            let (ref f, ref v) = fields[0];
+                            local_db
+                                .table
+                                .hset_single_field_with_hash(key, key_hash, f, v)
+                        } else {
+                            local_db.table.hset_slice_with_hash(key, key_hash, fields)
+                        };
+                        match res {
+                            Ok(count) => {
+                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    touch_watched_key(router.port, key.as_ref());
+                                }
+                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                                }
+                                if count == 1 {
+                                    responses[idx] = crate::shard::CompactResp::INT_1;
+                                } else if count == 0 {
+                                    responses[idx] = crate::shard::CompactResp::INT_0;
+                                } else {
+                                    responses[idx] =
+                                        crate::shard::CompactResp::from_integer(count as i64);
+                                }
+                                break 'local;
                             }
-                            continue;
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
                         }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
+                    } else if let Command::Sismember {
+                        ref key,
+                        ref member,
+                    } = cmd
+                    {
+                        match local_db.table.sismember_compact_with_hash(
+                            key.as_ref(),
+                            key_hash,
+                            member.as_ref(),
+                        ) {
+                            Ok(resp) => {
+                                responses[idx] = resp;
+                                break 'local;
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
                         }
-                    }
-                } else if let Command::Sismember {
-                    ref key,
-                    ref member,
-                } = cmd
-                {
-                    match local_db.table.sismember_compact_with_hash(
-                        key.as_ref(),
-                        key_hash,
-                        member.as_ref(),
-                    ) {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if let Command::Smismember {
-                    ref key,
-                    ref members,
-                } = cmd
-                {
-                    match local_db.table.smismember_compact_with_hash(
-                        key.as_ref(),
-                        key_hash,
-                        members,
-                        &mut local_buf,
-                    ) {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if let Command::Zmscore {
-                    ref key,
-                    ref members,
-                } = cmd
-                {
-                    match local_db.table.zmscore_compact_with_hash(
-                        key.as_ref(),
-                        key_hash,
-                        members,
-                        &mut local_buf,
-                    ) {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if write_fast_path
-                    && let Command::Sadd {
+                    } else if let Command::Smismember {
                         ref key,
                         ref members,
                     } = cmd
-                {
-                    has_local_writes = true;
-                    let res = if members.len() == 1 {
-                        local_db
-                            .table
-                            .sadd_single_member_with_hash(key, key_hash, &members[0])
-                    } else {
-                        local_db.table.sadd_slice_with_hash(key, key_hash, members)
-                    };
-                    match res {
-                        Ok(count) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
-                            }
-                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                notify_key_invalidation(router.port, key.as_ref(), client_id);
-                            }
-                            if count == 1 {
-                                responses[idx] = crate::shard::CompactResp::INT_1;
-                            } else if count == 0 {
-                                responses[idx] = crate::shard::CompactResp::INT_0;
-                            } else {
-                                responses[idx] =
-                                    crate::shard::CompactResp::from_integer(count as i64);
-                            }
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if write_fast_path
-                    && !crate::block::has_blocked_waiters(router.port)
-                    && let Command::Zadd {
-                        ref key,
-                        ref elements,
-                        flags,
-                    } = cmd
-                {
-                    has_local_writes = true;
-                    match local_db
-                        .table
-                        .zadd_slice_with_hash(key, key_hash, elements, flags)
                     {
-                        Ok((count, incr_score)) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
+                        match local_db.table.smismember_compact_with_hash(
+                            key.as_ref(),
+                            key_hash,
+                            members,
+                            &mut local_buf,
+                        ) {
+                            Ok(resp) => {
+                                responses[idx] = resp;
+                                break 'local;
                             }
-                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
                             }
-                            if flags.incr {
-                                local_buf.clear();
-                                if let Some(score) = incr_score {
-                                    write_resp_score(&mut local_buf, score);
-                                } else {
-                                    write_resp_null(&mut local_buf);
-                                }
-                                responses[idx] = CompactResp::from_slice(&local_buf);
-                            } else if count == 1 {
-                                responses[idx] = crate::shard::CompactResp::INT_1;
-                            } else if count == 0 {
-                                responses[idx] = crate::shard::CompactResp::INT_0;
-                            } else {
-                                responses[idx] =
-                                    crate::shard::CompactResp::from_integer(count as i64);
-                            }
-                            continue;
                         }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if write_fast_path
-                    && !crate::block::has_blocked_waiters(router.port)
-                    && let Command::Lpush {
+                    } else if let Command::Zmscore {
                         ref key,
-                        ref values,
+                        ref members,
                     } = cmd
-                {
-                    has_local_writes = true;
-                    match local_db.table.lpush_slice_with_hash(key, key_hash, values) {
-                        Ok(len) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
+                    {
+                        match local_db.table.zmscore_compact_with_hash(
+                            key.as_ref(),
+                            key_hash,
+                            members,
+                            &mut local_buf,
+                        ) {
+                            Ok(resp) => {
+                                responses[idx] = resp;
+                                break 'local;
                             }
-                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
                             }
-                            if len == 1 {
-                                responses[idx] = crate::shard::CompactResp::INT_1;
-                            } else if len == 0 {
-                                responses[idx] = crate::shard::CompactResp::INT_0;
-                            } else {
+                        }
+                    } else if write_fast_path
+                        && let Command::Sadd {
+                            ref key,
+                            ref members,
+                        } = cmd
+                    {
+                        has_local_writes = true;
+                        let res = if members.len() == 1 {
+                            local_db
+                                .table
+                                .sadd_single_member_with_hash(key, key_hash, &members[0])
+                        } else {
+                            local_db.table.sadd_slice_with_hash(key, key_hash, members)
+                        };
+                        match res {
+                            Ok(count) => {
+                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    touch_watched_key(router.port, key.as_ref());
+                                }
+                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                                }
+                                if count == 1 {
+                                    responses[idx] = crate::shard::CompactResp::INT_1;
+                                } else if count == 0 {
+                                    responses[idx] = crate::shard::CompactResp::INT_0;
+                                } else {
+                                    responses[idx] =
+                                        crate::shard::CompactResp::from_integer(count as i64);
+                                }
+                                break 'local;
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
+                        }
+                    } else if write_fast_path
+                        && !crate::block::has_blocked_waiters(router.port)
+                        && let Command::Zadd {
+                            ref key,
+                            ref elements,
+                            flags,
+                        } = cmd
+                    {
+                        has_local_writes = true;
+                        match local_db
+                            .table
+                            .zadd_slice_with_hash(key, key_hash, elements, flags)
+                        {
+                            Ok((count, incr_score)) => {
+                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    touch_watched_key(router.port, key.as_ref());
+                                }
+                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                                }
+                                if flags.incr {
+                                    local_buf.clear();
+                                    if let Some(score) = incr_score {
+                                        write_resp_score(&mut local_buf, score);
+                                    } else {
+                                        write_resp_null(&mut local_buf);
+                                    }
+                                    responses[idx] = CompactResp::from_slice(&local_buf);
+                                } else if count == 1 {
+                                    responses[idx] = crate::shard::CompactResp::INT_1;
+                                } else if count == 0 {
+                                    responses[idx] = crate::shard::CompactResp::INT_0;
+                                } else {
+                                    responses[idx] =
+                                        crate::shard::CompactResp::from_integer(count as i64);
+                                }
+                                break 'local;
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
+                        }
+                    } else if write_fast_path
+                        && !crate::block::has_blocked_waiters(router.port)
+                        && let Command::Lpush {
+                            ref key,
+                            ref values,
+                        } = cmd
+                    {
+                        has_local_writes = true;
+                        match local_db.table.lpush_slice_with_hash(key, key_hash, values) {
+                            Ok(len) => {
+                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    touch_watched_key(router.port, key.as_ref());
+                                }
+                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                                }
+                                if len == 1 {
+                                    responses[idx] = crate::shard::CompactResp::INT_1;
+                                } else if len == 0 {
+                                    responses[idx] = crate::shard::CompactResp::INT_0;
+                                } else {
+                                    responses[idx] =
+                                        crate::shard::CompactResp::from_integer(len as i64);
+                                }
+                                break 'local;
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
+                        }
+                    } else if write_fast_path
+                        && !crate::block::has_blocked_waiters(router.port)
+                        && let Command::Rpush {
+                            ref key,
+                            ref values,
+                        } = cmd
+                    {
+                        has_local_writes = true;
+                        match local_db.table.rpush_slice_with_hash(key, key_hash, values) {
+                            Ok(len) => {
+                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    touch_watched_key(router.port, key.as_ref());
+                                }
+                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                                }
                                 responses[idx] =
                                     crate::shard::CompactResp::from_integer(len as i64);
+                                break 'local;
                             }
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if write_fast_path
-                    && !crate::block::has_blocked_waiters(router.port)
-                    && let Command::Rpush {
-                        ref key,
-                        ref values,
-                    } = cmd
-                {
-                    has_local_writes = true;
-                    match local_db.table.rpush_slice_with_hash(key, key_hash, values) {
-                        Ok(len) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
                             }
-                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                notify_key_invalidation(router.port, key.as_ref(), client_id);
-                            }
-                            responses[idx] = crate::shard::CompactResp::from_integer(len as i64);
-                            continue;
                         }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if write_fast_path
-                    && let Command::Spop {
-                        ref key,
-                        count: None,
-                    } = cmd
-                {
-                    match local_db.table.spop_one_with_hash(key.as_ref(), key_hash) {
-                        Ok(Some(v)) => {
-                            has_local_writes = true;
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
-                            }
-                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                notify_key_invalidation(router.port, key.as_ref(), client_id);
-                            }
-                            responses[idx] = CompactResp::from_owned_bulk(v);
-                            continue;
-                        }
-                        Ok(None) => {
-                            responses[idx] = crate::shard::CompactResp::NULL;
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if write_fast_path
-                    && let Command::Zpopmin {
-                        ref key,
-                        count: None,
-                    } = cmd
-                {
-                    match local_db.table.zpopmin_with_hash(key.as_ref(), key_hash, 1) {
-                        Ok(popped) => {
-                            if let Some((m, s)) = popped.into_iter().next() {
-                                has_local_writes = true;
-                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                    touch_watched_key(router.port, key.as_ref());
-                                }
-                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
-                                }
-                                local_buf.extend_from_slice(b"*2\r\n");
-                                write_resp_bulk(&mut local_buf, &m);
-                                write_resp_score(&mut local_buf, s);
-                                responses[idx] =
-                                    CompactResp::from_vec(std::mem::take(&mut local_buf));
-                            } else {
-                                responses[idx] = crate::shard::CompactResp::EMPTY_ARRAY;
-                            }
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if write_fast_path
-                    && let Some((key, items, kind)) = match &cmd {
-                        // HDEL stays on the slow path while search indexes
-                        // exist, like HSET.
-                        Command::Hdel { key, fields }
-                            if !crate::search::has_active_search_indices() =>
-                        {
-                            Some((key, fields, RemKind::Hash))
-                        }
-                        Command::Srem { key, members } => Some((key, members, RemKind::Set)),
-                        Command::Zrem { key, members } => Some((key, members, RemKind::ZSet)),
-                        _ => None,
-                    }
-                {
-                    let res = match kind {
-                        RemKind::Hash => local_db.table.hdel_with_hash(key, key_hash, items),
-                        RemKind::Set => local_db.table.srem_with_hash(key, key_hash, items),
-                        RemKind::ZSet => local_db.table.zrem_with_hash(key, key_hash, items),
-                    };
-                    match res {
-                        Ok(count) => {
-                            if count > 0 {
-                                has_local_writes = true;
-                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                    touch_watched_key(router.port, key.as_ref());
-                                }
-                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
-                                }
-                            }
-                            responses[idx] = crate::shard::CompactResp::from_integer(count as i64);
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if write_fast_path && let Command::Lpop { ref key, count } = cmd {
-                    if count.is_none() {
-                        match local_db.table.lpop_one_with_hash(key.as_ref(), key_hash) {
+                    } else if write_fast_path
+                        && let Command::Spop {
+                            ref key,
+                            count: None,
+                        } = cmd
+                    {
+                        match local_db.table.spop_one_with_hash(key.as_ref(), key_hash) {
                             Ok(Some(v)) => {
                                 has_local_writes = true;
                                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -26720,25 +26643,74 @@ async fn execute_commands_squashed_inner(
                                     notify_key_invalidation(router.port, key.as_ref(), client_id);
                                 }
                                 responses[idx] = CompactResp::from_owned_bulk(v);
-                                continue;
+                                break 'local;
                             }
                             Ok(None) => {
-                                responses[idx] = crate::shard::CompactResp::null(is_resp3);
-                                continue;
+                                responses[idx] = crate::shard::CompactResp::NULL;
+                                break 'local;
                             }
                             Err(err) => {
                                 write_resp_err(&mut local_buf, err);
                             }
                         }
-                    } else {
-                        match local_db.write_lpop_resp_with_hash(
-                            key.as_ref(),
-                            key_hash,
-                            count,
-                            &mut local_buf,
-                        ) {
-                            Ok(has_pop) => {
-                                if has_pop {
+                    } else if write_fast_path
+                        && let Command::Zpopmin {
+                            ref key,
+                            count: None,
+                        } = cmd
+                    {
+                        match local_db.table.zpopmin_with_hash(key.as_ref(), key_hash, 1) {
+                            Ok(popped) => {
+                                if let Some((m, s)) = popped.into_iter().next() {
+                                    has_local_writes = true;
+                                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                        touch_watched_key(router.port, key.as_ref());
+                                    }
+                                    if HAS_TRACKING_CLIENTS
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        notify_key_invalidation(
+                                            router.port,
+                                            key.as_ref(),
+                                            client_id,
+                                        );
+                                    }
+                                    local_buf.extend_from_slice(b"*2\r\n");
+                                    write_resp_bulk(&mut local_buf, &m);
+                                    write_resp_score(&mut local_buf, s);
+                                    responses[idx] =
+                                        CompactResp::from_vec(std::mem::take(&mut local_buf));
+                                } else {
+                                    responses[idx] = crate::shard::CompactResp::EMPTY_ARRAY;
+                                }
+                                break 'local;
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
+                        }
+                    } else if write_fast_path
+                        && let Some((key, items, kind)) = match &cmd {
+                            // HDEL stays on the slow path while search indexes
+                            // exist, like HSET.
+                            Command::Hdel { key, fields }
+                                if !crate::search::has_active_search_indices() =>
+                            {
+                                Some((key, fields, RemKind::Hash))
+                            }
+                            Command::Srem { key, members } => Some((key, members, RemKind::Set)),
+                            Command::Zrem { key, members } => Some((key, members, RemKind::ZSet)),
+                            _ => None,
+                        }
+                    {
+                        let res = match kind {
+                            RemKind::Hash => local_db.table.hdel_with_hash(key, key_hash, items),
+                            RemKind::Set => local_db.table.srem_with_hash(key, key_hash, items),
+                            RemKind::ZSet => local_db.table.zrem_with_hash(key, key_hash, items),
+                        };
+                        match res {
+                            Ok(count) => {
+                                if count > 0 {
                                     has_local_writes = true;
                                     if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                         touch_watched_key(router.port, key.as_ref());
@@ -26753,76 +26725,110 @@ async fn execute_commands_squashed_inner(
                                         );
                                     }
                                 }
+                                responses[idx] =
+                                    crate::shard::CompactResp::from_integer(count as i64);
+                                break 'local;
                             }
                             Err(err) => {
                                 write_resp_err(&mut local_buf, err);
                             }
                         }
-                    }
-                } else if let Command::Lrange {
-                    ref key,
-                    start,
-                    stop,
-                } = cmd
-                {
-                    match local_db.table.lrange_compact_with_hash(
-                        key.as_ref(),
-                        key_hash,
+                    } else if write_fast_path && let Command::Lpop { ref key, count } = cmd {
+                        if count.is_none() {
+                            match local_db.table.lpop_one_with_hash(key.as_ref(), key_hash) {
+                                Ok(Some(v)) => {
+                                    has_local_writes = true;
+                                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                        touch_watched_key(router.port, key.as_ref());
+                                    }
+                                    if HAS_TRACKING_CLIENTS
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        notify_key_invalidation(
+                                            router.port,
+                                            key.as_ref(),
+                                            client_id,
+                                        );
+                                    }
+                                    responses[idx] = CompactResp::from_owned_bulk(v);
+                                    break 'local;
+                                }
+                                Ok(None) => {
+                                    responses[idx] = crate::shard::CompactResp::null(is_resp3);
+                                    break 'local;
+                                }
+                                Err(err) => {
+                                    write_resp_err(&mut local_buf, err);
+                                }
+                            }
+                        } else {
+                            match local_db.write_lpop_resp_with_hash(
+                                key.as_ref(),
+                                key_hash,
+                                count,
+                                &mut local_buf,
+                            ) {
+                                Ok(has_pop) => {
+                                    if has_pop {
+                                        has_local_writes = true;
+                                        if HAS_WATCHED_KEYS
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            touch_watched_key(router.port, key.as_ref());
+                                        }
+                                        if HAS_TRACKING_CLIENTS
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            notify_key_invalidation(
+                                                router.port,
+                                                key.as_ref(),
+                                                client_id,
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    write_resp_err(&mut local_buf, err);
+                                }
+                            }
+                        }
+                    } else if let Command::Lrange {
+                        ref key,
                         start,
                         stop,
-                        &mut local_buf,
-                    ) {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Err(err) => write_resp_err(&mut local_buf, err),
-                    }
-                } else if let Command::Zrange { ref key, ref opts } = cmd {
-                    match local_db.table.zrange_compact_with_hash(
-                        key.as_ref(),
-                        key_hash,
-                        opts,
-                        is_resp3,
-                        &mut local_buf,
-                    ) {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Err(err) => write_resp_err(&mut local_buf, err),
-                    }
-                } else if write_fast_path && let Command::Rpop { ref key, count } = cmd {
-                    if count.is_none() {
-                        match local_db.table.rpop_one_with_hash(key.as_ref(), key_hash) {
-                            Ok(Some(v)) => {
-                                has_local_writes = true;
-                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                    touch_watched_key(router.port, key.as_ref());
-                                }
-                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
-                                }
-                                responses[idx] = CompactResp::from_owned_bulk(v);
-                                continue;
-                            }
-                            Ok(None) => {
-                                responses[idx] = crate::shard::CompactResp::null(is_resp3);
-                                continue;
-                            }
-                            Err(err) => {
-                                write_resp_err(&mut local_buf, err);
-                            }
-                        }
-                    } else {
-                        match local_db.write_rpop_resp_with_hash(
+                    } = cmd
+                    {
+                        match local_db.table.lrange_compact_with_hash(
                             key.as_ref(),
                             key_hash,
-                            count,
+                            start,
+                            stop,
                             &mut local_buf,
                         ) {
-                            Ok(has_pop) => {
-                                if has_pop {
+                            Ok(resp) => {
+                                responses[idx] = resp;
+                                break 'local;
+                            }
+                            Err(err) => write_resp_err(&mut local_buf, err),
+                        }
+                    } else if let Command::Zrange { ref key, ref opts } = cmd {
+                        match local_db.table.zrange_compact_with_hash(
+                            key.as_ref(),
+                            key_hash,
+                            opts,
+                            is_resp3,
+                            &mut local_buf,
+                        ) {
+                            Ok(resp) => {
+                                responses[idx] = resp;
+                                break 'local;
+                            }
+                            Err(err) => write_resp_err(&mut local_buf, err),
+                        }
+                    } else if write_fast_path && let Command::Rpop { ref key, count } = cmd {
+                        if count.is_none() {
+                            match local_db.table.rpop_one_with_hash(key.as_ref(), key_hash) {
+                                Ok(Some(v)) => {
                                     has_local_writes = true;
                                     if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                         touch_watched_key(router.port, key.as_ref());
@@ -26836,33 +26842,75 @@ async fn execute_commands_squashed_inner(
                                             client_id,
                                         );
                                     }
+                                    responses[idx] = CompactResp::from_owned_bulk(v);
+                                    break 'local;
+                                }
+                                Ok(None) => {
+                                    responses[idx] = crate::shard::CompactResp::null(is_resp3);
+                                    break 'local;
+                                }
+                                Err(err) => {
+                                    write_resp_err(&mut local_buf, err);
                                 }
                             }
-                            Err(err) => {
-                                write_resp_err(&mut local_buf, err);
+                        } else {
+                            match local_db.write_rpop_resp_with_hash(
+                                key.as_ref(),
+                                key_hash,
+                                count,
+                                &mut local_buf,
+                            ) {
+                                Ok(has_pop) => {
+                                    if has_pop {
+                                        has_local_writes = true;
+                                        if HAS_WATCHED_KEYS
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            touch_watched_key(router.port, key.as_ref());
+                                        }
+                                        if HAS_TRACKING_CLIENTS
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            notify_key_invalidation(
+                                                router.port,
+                                                key.as_ref(),
+                                                client_id,
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    write_resp_err(&mut local_buf, err);
+                                }
                             }
                         }
+                    } else {
+                        if matches!(
+                            cmd,
+                            Command::Set { .. }
+                                | Command::Del(_)
+                                | Command::Unlink(_)
+                                | Command::IncrBy { .. }
+                        ) {
+                            has_local_writes = true;
+                        }
+                        if execute_local_command(
+                            &cmd,
+                            &mut local_db,
+                            &mut local_buf,
+                            router.aof.as_deref(),
+                        ) {
+                            should_close = true;
+                        }
                     }
-                } else {
-                    if matches!(
-                        cmd,
-                        Command::Set { .. }
-                            | Command::Del(_)
-                            | Command::Unlink(_)
-                            | Command::IncrBy { .. }
-                    ) {
-                        has_local_writes = true;
-                    }
-                    if execute_local_command(
-                        &cmd,
-                        &mut local_db,
-                        &mut local_buf,
-                        router.aof.as_deref(),
-                    ) {
-                        should_close = true;
+                    responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
+                }
+                if let (Some(t0), Some(thr)) = (slow_t0, slow_threshold) {
+                    let us = crate::cycleclock::micros_since(t0);
+                    if us >= thr {
+                        log_batched_slow(&cmd, us, client_id, client_registry);
                     }
                 }
-                responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
             } else {
                 remote_batches[target].push((idx, key_hash, cmd));
             }
@@ -27130,6 +27178,18 @@ async fn execute_commands_squashed_inner(
             responses[cold_idx] = crate::shard::CompactResp::null(is_resp3);
         }
     }
+    // Log batch items that ran slow on other shards. Slots past the
+    // pipeline's are per-key parts of folded multi-key commands, not
+    // commands of their own, and are skipped.
+    if slow_threshold.is_some() {
+        for r in responders {
+            for (slot, micros, cmd) in r.take_slow() {
+                if slot < n {
+                    log_batched_slow(&cmd, micros, client_id, client_registry);
+                }
+            }
+        }
+    }
 
     // 4. Assemble folded MGET arrays and multi-key DEL/EXISTS sums from their per-key slots,
     //    then gather the cross-shard MSETs dispatched in step 1.
@@ -27247,6 +27307,38 @@ fn assemble_mget_reply(items: &[CompactResp], is_resp3: bool) -> CompactResp {
 /// written its replies into `responses`. Commands that are not batched must
 /// call this first so they cannot overtake earlier commands of the same
 /// pipeline (e.g. `SET k v` to a remote shard followed by `MGET k x`).
+/// The SLOWLOG threshold in microseconds, or `None` when logging is off.
+#[inline(always)]
+pub(crate) fn batch_slow_threshold() -> Option<u64> {
+    let t = crate::slowlog::SLOWLOG_LOG_SLOWER_THAN.load(std::sync::atomic::Ordering::Relaxed);
+    (t >= 0).then_some(t as u64)
+}
+
+/// Logs a command that ran inside a batched pipeline (on this shard or,
+/// reported back, on another) for `micros` µs, at or over the threshold:
+/// what `execute_command`'s tracker does for commands run one at a time.
+#[cold]
+fn log_batched_slow(
+    cmd: &Command,
+    micros: u64,
+    client_id: u64,
+    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+) {
+    if matches!(cmd, Command::Quit | Command::Exec | Command::Commandlog(_)) {
+        return;
+    }
+    let ms = micros / 1000;
+    if ms > 0 {
+        record_latency_event("command", ms);
+    }
+    let (addr, name) = client_registry
+        .borrow()
+        .get(&client_id)
+        .map(|c| (c.addr.to_string(), c.name.clone().unwrap_or_default()))
+        .unwrap_or_default();
+    crate::slowlog::log_command_if_slow(cmd, micros, &addr, &name);
+}
+
 async fn flush_remote_batches(
     router: &Router,
     responders: &[std::sync::Arc<crate::mailbox::BatchResponder>],

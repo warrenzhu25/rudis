@@ -591,6 +591,11 @@ pub struct BatchResponder {
     pub responses_len: AtomicUsize,
     pub recycled_items: CachePadded<UnsafeCell<Option<Vec<(usize, u64, crate::resp::Command)>>>>,
     pub bell: Doorbell,
+    /// Batch items that ran at or over the slowlog threshold on the remote
+    /// shard: (response slot, microseconds, command). The owner logs them
+    /// with its client's address and name (see `take_slow`).
+    slow: parking_lot::Mutex<Vec<(usize, u64, crate::resp::Command)>>,
+    has_slow: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: Every field is Send; `UnsafeCell<T>` is Send for `T: Send`, and the
@@ -616,7 +621,27 @@ impl BatchResponder {
             responses_len: AtomicUsize::new(0),
             recycled_items: CachePadded(UnsafeCell::new(None)),
             bell: Doorbell::new(),
+            slow: parking_lot::Mutex::new(Vec::new()),
+            has_slow: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Called by the remote shard for an item that ran at or over the
+    /// slowlog threshold (rare: takes a lock).
+    #[cold]
+    pub fn report_slow(&self, slot: usize, micros: u64, cmd: crate::resp::Command) {
+        self.slow.lock().push((slot, micros, cmd));
+        self.has_slow.store(true, Ordering::Release);
+    }
+
+    /// Slow items reported since the last call, for the owner to log.
+    #[inline]
+    pub fn take_slow(&self) -> Vec<(usize, u64, crate::resp::Command)> {
+        if !self.has_slow.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.has_slow.store(false, Ordering::Relaxed);
+        std::mem::take(&mut *self.slow.lock())
     }
 
     #[inline(always)]
@@ -1073,6 +1098,20 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_responder_hands_slow_reports_to_the_owner_once() {
+        let r = BatchResponder::new();
+        assert!(r.take_slow().is_empty());
+        let cmd = crate::resp::Command::Get(bytes::Bytes::from_static(b"k"));
+        r.report_slow(3, 12_000, cmd.clone());
+        r.report_slow(9, 15_000, cmd);
+        let got = r.take_slow();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].0, got[0].1), (3, 12_000));
+        assert_eq!((got[1].0, got[1].1), (9, 15_000));
+        assert!(r.take_slow().is_empty(), "reports are handed over once");
+    }
     use std::sync::Arc;
     use std::thread;
 
