@@ -1,8 +1,8 @@
 use bytes::Bytes;
-use fxhash::{FxBuildHasher, hash64};
+use fxhash::hash64;
 use hashbrown::HashMap;
 
-pub type RudisHashMap = HashMap<Bytes, Bytes, FxBuildHasher>;
+pub type RudisHashMap = crate::packedhash::PackedHash;
 use crate::compact::{CompactKey, CompactStr};
 use crate::resp::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -6140,12 +6140,7 @@ impl RudisTable {
                         return Ok(added as usize);
                     }
                     RudisValue::Hash(map) => {
-                        if let Some(existing_val) = map.get_mut(field) {
-                            *existing_val = val.clone();
-                            return Ok(0);
-                        }
-                        map.insert(field.clone(), val.clone());
-                        return Ok(1);
+                        return Ok(map.insert(field, val) as usize);
                     }
                     _ => {
                         return Err(
@@ -6162,8 +6157,8 @@ impl RudisTable {
             pairs.push_new(field, val);
             RudisValue::SmallHash(Box::new(pairs))
         } else {
-            let mut map = RudisHashMap::with_capacity_and_hasher(1, FxBuildHasher::default());
-            map.insert(field.clone(), val.clone());
+            let mut map = RudisHashMap::with_capacity(1);
+            map.insert(field, val);
             RudisValue::Hash(Box::new(map))
         };
         let entry = RudisEntry::new(CompactKey::new(key), val, Expiry::from(None));
@@ -6234,20 +6229,8 @@ impl RudisTable {
                     }
                     RudisValue::Hash(map) => {
                         let mut added = 0;
-                        if fields.len() == 1 {
-                            let (f, v) = &fields[0];
-                            if let Some(existing_val) = map.get_mut(f) {
-                                *existing_val = v.clone();
-                                return Ok(0);
-                            }
-                            map.insert(f.clone(), v.clone());
-                            return Ok(1);
-                        }
                         for (f, v) in fields {
-                            if let Some(existing_val) = map.get_mut(f) {
-                                *existing_val = v.clone();
-                            } else {
-                                map.insert(f.clone(), v.clone());
+                            if map.insert(f, v) {
                                 added += 1;
                             }
                         }
@@ -6280,11 +6263,10 @@ impl RudisTable {
             }
             (RudisValue::SmallHash(Box::new(pairs)), added)
         } else {
-            let mut map =
-                RudisHashMap::with_capacity_and_hasher(fields.len(), FxBuildHasher::default());
+            let mut map = RudisHashMap::with_capacity(fields.len());
             let mut added = 0;
             for (f, v) in fields {
-                if map.insert(f.clone(), v.clone()).is_none() {
+                if map.insert(f, v) {
                     added += 1;
                 }
             }
@@ -6334,7 +6316,7 @@ impl RudisTable {
                     if map.contains_key(&field) {
                         return Ok(0);
                     }
-                    map.insert(field, value);
+                    map.insert(&field, &value);
                     return Ok(1);
                 }
                 _ => {
@@ -6347,7 +6329,7 @@ impl RudisTable {
 
         let val = if field.len() > max_value || value.len() > max_value {
             let mut map = RudisHashMap::default();
-            map.insert(field, value);
+            map.insert(&field, &value);
             RudisValue::Hash(Box::new(map))
         } else {
             let mut pairs = crate::smallhash::SmallHash::default();
@@ -6630,7 +6612,7 @@ impl RudisTable {
             RudisValue::Hash(map) => {
                 for f in fields {
                     if let Some(v) = map.get(f) {
-                        vals.push(Some(v.clone()));
+                        vals.push(Some(Bytes::copy_from_slice(v)));
                         existing_fields.push(f.clone());
                     } else {
                         vals.push(None);
@@ -7144,7 +7126,7 @@ impl RudisTable {
             }
             match &entry.val {
                 RudisValue::SmallHash(pairs) => Ok(pairs.get(field).map(Bytes::copy_from_slice)),
-                RudisValue::Hash(map) => Ok(map.get(field).cloned()),
+                RudisValue::Hash(map) => Ok(map.get(field).map(Bytes::copy_from_slice)),
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             }
         } else {
@@ -7190,7 +7172,7 @@ impl RudisTable {
                 },
                 RudisValue::Hash(map) => {
                     if let Some(v) = map.get(field) {
-                        return Ok(crate::shard::CompactResp::from_bulk(v));
+                        return Ok(crate::shard::CompactResp::from_bulk_slice(v));
                     }
                     Ok(crate::shard::CompactResp::NULL)
                 }
@@ -7266,9 +7248,10 @@ impl RudisTable {
                         .iter()
                         .map(|f| pairs.get(f).map(Bytes::copy_from_slice))
                         .collect()),
-                    RudisValue::Hash(map) => {
-                        Ok(fields.iter().map(|f| map.get(f).cloned()).collect())
-                    }
+                    RudisValue::Hash(map) => Ok(fields
+                        .iter()
+                        .map(|f| map.get(f).map(Bytes::copy_from_slice))
+                        .collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -7380,7 +7363,7 @@ impl RudisTable {
                     RudisValue::Hash(map) => {
                         let mut c = 0;
                         for f in fields {
-                            if map.remove(f).is_some() {
+                            if map.remove(f) {
                                 c += 1;
                             }
                         }
@@ -7476,9 +7459,10 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::SmallHash(pairs) => Ok(pairs.to_vec()),
-                    RudisValue::Hash(map) => {
-                        Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    }
+                    RudisValue::Hash(map) => Ok(map
+                        .iter()
+                        .map(|(k, v)| (Bytes::copy_from_slice(k), Bytes::copy_from_slice(v)))
+                        .collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -7504,7 +7488,7 @@ impl RudisTable {
                         .iter()
                         .map(|(k, _)| Bytes::copy_from_slice(k))
                         .collect()),
-                    RudisValue::Hash(map) => Ok(map.keys().cloned().collect()),
+                    RudisValue::Hash(map) => Ok(map.keys().map(Bytes::copy_from_slice).collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -7530,7 +7514,7 @@ impl RudisTable {
                         .iter()
                         .map(|(_, v)| Bytes::copy_from_slice(v))
                         .collect()),
-                    RudisValue::Hash(map) => Ok(map.values().cloned().collect()),
+                    RudisValue::Hash(map) => Ok(map.values().map(Bytes::copy_from_slice).collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -7601,7 +7585,7 @@ impl RudisTable {
                         }
                         RudisValue::Hash(map) => {
                             for f in fields {
-                                if let Some(v) = map.remove(f) {
+                                if let Some(v) = map.take(f) {
                                     results.push(Some(v));
                                     deleted_fields.push(f.clone());
                                 } else {
@@ -7716,11 +7700,7 @@ impl RudisTable {
                         .checked_add(delta)
                         .ok_or("ERR increment or decrement would overflow")?;
                     let new_bytes = Bytes::from(new_val.to_string());
-                    if let Some(existing_val) = map.get_mut(&field) {
-                        *existing_val = new_bytes;
-                    } else {
-                        map.insert(field, new_bytes);
-                    }
+                    map.insert(&field, &new_bytes);
                     return Ok(new_val);
                 }
                 _ => {
@@ -7798,11 +7778,7 @@ impl RudisTable {
                         return Err("ERR increment would produce NaN or Infinity");
                     }
                     let new_bytes = Bytes::from(new_val.to_string());
-                    if let Some(existing_val) = map.get_mut(&field) {
-                        *existing_val = new_bytes;
-                    } else {
-                        map.insert(field, new_bytes);
-                    }
+                    map.insert(&field, &new_bytes);
                     return Ok(new_val);
                 }
                 _ => {
@@ -7842,7 +7818,10 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::SmallHash(p) => p.to_vec(),
-                    RudisValue::Hash(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    RudisValue::Hash(m) => m
+                        .iter()
+                        .map(|(k, v)| (Bytes::copy_from_slice(k), Bytes::copy_from_slice(v)))
+                        .collect(),
                     _ => {
                         return Err(
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -7913,7 +7892,10 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::SmallHash(p) => p.to_vec(),
-                    RudisValue::Hash(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    RudisValue::Hash(m) => m
+                        .iter()
+                        .map(|(k, v)| (Bytes::copy_from_slice(k), Bytes::copy_from_slice(v)))
+                        .collect(),
                     _ => {
                         return Err(
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -14420,10 +14402,8 @@ impl RudisTable {
                     }
                     RudisValue::SmallHash(Box::new(pairs))
                 } else {
-                    let mut hash = RudisHashMap::with_capacity_and_hasher(
-                        claimed_capacity(count, data, cursor, 8),
-                        FxBuildHasher::default(),
-                    );
+                    let mut hash =
+                        RudisHashMap::with_capacity(claimed_capacity(count, data, cursor, 8));
                     for _ in 0..count {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
@@ -14449,7 +14429,7 @@ impl RudisTable {
                         let v = Bytes::copy_from_slice(&data[cursor..cursor + v_len]);
                         cursor += v_len;
 
-                        hash.insert(f, v);
+                        hash.insert(&f, &v);
                     }
                     RudisValue::Hash(Box::new(hash))
                 }

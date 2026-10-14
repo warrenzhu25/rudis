@@ -4,8 +4,8 @@
 //! `[varint(len << 1 | dead)][payload]` and addressed by a [`Handle`]: page
 //! index and byte offset. Normal pages hold up to [`PAGE_BYTES`]; a payload
 //! longer than [`OWN_PAGE_MIN`] gets a page of its own (offset 0). The page
-//! taking appends grows by doubling up to [`PAGE_BYTES`], so a small
-//! collection does not pay for a full page.
+//! taking appends grows by about a quarter at a time up to [`PAGE_BYTES`], so
+//! a small collection does not pay for a full page.
 //!
 //! Removing an entry sets its dead bit. Once at least half a page is dead the
 //! owner compacts it: [`PageStore::moves`] lists where each live entry will
@@ -245,8 +245,15 @@ impl<H: Handle> PageStore<H> {
             if self.current != NO_PAGE && self.pages[cur].buf.len() + need <= PAGE_BYTES {
                 let buf = &mut self.pages[cur].buf;
                 if buf.len() + need > buf.capacity() {
-                    // Double, but never past one page.
-                    let want = (buf.capacity() * 2).max(buf.len() + need).min(PAGE_BYTES);
+                    // Grow by a quarter (about one allocator size class
+                    // above 1 KiB), never past one page. Doubling left the
+                    // append page up to half empty; growing to exactly the
+                    // need called `realloc` on nearly every insert.
+                    let cap = buf.capacity();
+                    let want = (buf.len() + need)
+                        .max(cap + cap / 4)
+                        .min(PAGE_BYTES)
+                        .max(buf.len() + need);
                     buf.reserve_exact(want - buf.len());
                 }
                 cur

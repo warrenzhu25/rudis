@@ -28085,3 +28085,210 @@ fn test_packed_small_hash_ops_and_promotion_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_packed_large_hash_compaction_and_ops_e2e() {
+    use std::collections::HashMap;
+    let port = 17992u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    fn read_reply(c: &mut TcpStream) -> Vec<u8> {
+        fn complete(b: &[u8], i: usize) -> Option<usize> {
+            let nl = i + b.get(i..)?.windows(2).position(|w| w == b"\r\n")?;
+            let head = std::str::from_utf8(&b[i + 1..nl]).unwrap();
+            match b[i] {
+                b'$' => {
+                    let n: i64 = head.parse().unwrap();
+                    if n < 0 {
+                        return Some(nl + 2);
+                    }
+                    let end = nl + 2 + n as usize + 2;
+                    (b.len() >= end).then_some(end)
+                }
+                b'*' => {
+                    let n: usize = head.parse().unwrap();
+                    let mut j = nl + 2;
+                    for _ in 0..n {
+                        j = complete(b, j)?;
+                    }
+                    Some(j)
+                }
+                _ => Some(nl + 2),
+            }
+        }
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            if !got.is_empty() && complete(&got, 0) == Some(got.len()) {
+                return got;
+            }
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+    fn cmd(c: &mut TcpStream, args: &[&str]) -> String {
+        let mut out = format!("*{}\r\n", args.len());
+        for a in args {
+            out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        c.write_all(out.as_bytes()).unwrap();
+        String::from_utf8(read_reply(c)).unwrap()
+    }
+    fn pipeline(c: &mut TcpStream, cmds: &[Vec<String>]) {
+        let mut out = String::new();
+        for args in cmds {
+            out.push_str(&format!("*{}\r\n", args.len()));
+            for a in args {
+                out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+        }
+        out.push_str("*1\r\n$4\r\nPING\r\n");
+        c.write_all(out.as_bytes()).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        while !got.ends_with(b"+PONG\r\n") {
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+    fn bulk(s: &str) -> String {
+        format!("${}\r\n{s}\r\n", s.len())
+    }
+    fn pairs_of(r: &str) -> Vec<String> {
+        let mut lines = r.split("\r\n");
+        let n: usize = lines.next().unwrap()[1..].parse().unwrap();
+        (0..n)
+            .map(|_| {
+                lines.next();
+                lines.next().unwrap().to_string()
+            })
+            .collect()
+    }
+    fn getall(c: &mut TcpStream, key: &str) -> HashMap<String, String> {
+        pairs_of(&cmd(c, &["HGETALL", key]))
+            .chunks(2)
+            .map(|p| (p[0].clone(), p[1].clone()))
+            .collect()
+    }
+
+    // 3000 fields with values over hash-max-listpack-value (a hashtable
+    // from the first HSET), some over 1 KiB (a page of their own).
+    let val = |i: usize, round: usize| {
+        let len = if i.is_multiple_of(97) {
+            1500
+        } else {
+            70 + (i + round) % 90
+        };
+        format!("{i}-{round}-").repeat(len / 4 + 1)[..len].to_string()
+    };
+    let mut model: HashMap<String, String> = HashMap::new();
+    let mut cmds = Vec::new();
+    for i in 0..3000 {
+        let (f, v) = (format!("field:{i}"), val(i, 0));
+        cmds.push(vec!["HSET".into(), "lh".into(), f.clone(), v.clone()]);
+        model.insert(f, v);
+    }
+    pipeline(&mut c, &cmds);
+    assert_eq!(
+        cmd(&mut c, &["OBJECT", "ENCODING", "lh"]),
+        bulk("hashtable")
+    );
+    // Updates: same length (in place) and different length (re-appended).
+    let mut cmds = Vec::new();
+    for i in (0..3000usize).step_by(4) {
+        let f = format!("field:{i}");
+        let v = if i.is_multiple_of(8) {
+            "S".repeat(model[&f].len())
+        } else {
+            val(i, 1)
+        };
+        cmds.push(vec!["HSET".into(), "lh".into(), f.clone(), v.clone()]);
+        model.insert(f, v);
+    }
+    pipeline(&mut c, &cmds);
+    // Delete two of every three: pages pass half dead and compact.
+    let mut cmds = Vec::new();
+    for i in (0..3000).filter(|i| i % 3 != 0) {
+        let f = format!("field:{i}");
+        cmds.push(vec!["HDEL".into(), "lh".into(), f.clone()]);
+        model.remove(&f);
+    }
+    pipeline(&mut c, &cmds);
+    assert_eq!(cmd(&mut c, &["HINCRBY", "lh", "counter", "7"]), ":7\r\n");
+    model.insert("counter".into(), "7".into());
+    let gd = cmd(&mut c, &["HGETDEL", "lh", "FIELDS", "1", "field:3"]);
+    assert_eq!(gd, format!("*1\r\n{}", bulk(&model["field:3"])));
+    model.remove("field:3");
+
+    assert_eq!(
+        cmd(&mut c, &["HLEN", "lh"]),
+        format!(":{}\r\n", model.len())
+    );
+    assert_eq!(getall(&mut c, "lh"), model);
+    for i in [0usize, 6, 97, 194, 300, 2997, 1, 2] {
+        let f = format!("field:{i}");
+        let want = model.get(&f).map_or("$-1\r\n".to_string(), |v| bulk(v));
+        assert_eq!(cmd(&mut c, &["HGET", "lh", &f]), want, "{f}");
+    }
+    // HSCAN sees every field.
+    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut cursor = "0".to_string();
+    loop {
+        let r = cmd(&mut c, &["HSCAN", "lh", &cursor, "COUNT", "100"]);
+        let rest = &r[r.find("\r\n").unwrap() + 2..];
+        let (cur_line, after) = rest.split_once("\r\n").unwrap();
+        assert!(cur_line.starts_with('$'));
+        let (next, items) = after.split_once("\r\n").unwrap();
+        for p in pairs_of(items).chunks(2) {
+            seen.insert(p[0].clone(), p[1].clone());
+        }
+        cursor = next.to_string();
+        if cursor == "0" {
+            break;
+        }
+    }
+    assert_eq!(seen, model);
+
+    // DUMP/RESTORE of the large hash round-trips.
+    c.write_all(b"*2\r\n$4\r\nDUMP\r\n$2\r\nlh\r\n").unwrap();
+    let r = read_reply(&mut c);
+    let nl = r.windows(2).position(|w| w == b"\r\n").unwrap();
+    let dump = r[nl + 2..r.len() - 2].to_vec();
+    let mut out = format!(
+        "*4\r\n$7\r\nRESTORE\r\n$3\r\nlh2\r\n$1\r\n0\r\n${}\r\n",
+        dump.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(&dump);
+    out.extend_from_slice(b"\r\n");
+    c.write_all(&out).unwrap();
+    assert_eq!(String::from_utf8(read_reply(&mut c)).unwrap(), "+OK\r\n");
+    assert_eq!(getall(&mut c, "lh2"), model);
+
+    // Deleting every field deletes the key.
+    let mut cmds = Vec::new();
+    for f in model.keys() {
+        cmds.push(vec!["HDEL".into(), "lh".into(), f.clone()]);
+    }
+    pipeline(&mut c, &cmds);
+    assert_eq!(cmd(&mut c, &["EXISTS", "lh"]), ":0\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}

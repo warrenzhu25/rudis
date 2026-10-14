@@ -28,6 +28,7 @@ pub mod log;
 pub mod mailbox;
 pub mod mcp;
 pub mod netsec;
+pub mod packedhash;
 pub mod packedlist;
 pub mod packedset;
 pub mod pagestore;

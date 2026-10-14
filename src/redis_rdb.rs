@@ -722,9 +722,9 @@ fn hash_value(pairs: Vec<(Bytes, Bytes)>) -> RdbResult<Option<RudisValue>> {
             ),
         ))));
     }
-    let mut map = RudisHashMap::with_capacity_and_hasher(pairs.len(), Default::default());
+    let mut map = RudisHashMap::with_capacity(pairs.len());
     for (f, v) in pairs {
-        if map.insert(f, v).is_some() {
+        if !map.insert(&f, &v) {
             return corrupt("duplicate hash field");
         }
     }
@@ -2541,7 +2541,7 @@ mod tests {
         assert_eq!(round_trip(&h), h);
         let mut big = RudisHashMap::default();
         for i in 0..200 {
-            big.insert(Bytes::from(format!("f{i}")), Bytes::from(format!("v{i}")));
+            big.insert(format!("f{i}").as_bytes(), format!("v{i}").as_bytes());
         }
         let h = RudisValue::Hash(Box::new(big));
         assert_eq!(round_trip(&h), h);

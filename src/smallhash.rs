@@ -225,10 +225,9 @@ impl SmallHash {
 
     /// The pairs as a full hash map (promotion past the small limits).
     pub fn to_map(&self) -> crate::table::RudisHashMap {
-        let mut m =
-            crate::table::RudisHashMap::with_capacity_and_hasher(self.len(), Default::default());
+        let mut m = crate::table::RudisHashMap::with_capacity(self.len());
         for (k, v) in self.iter() {
-            m.insert(Bytes::copy_from_slice(k), Bytes::copy_from_slice(v));
+            m.insert(k, v);
         }
         m
     }

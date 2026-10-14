@@ -645,7 +645,7 @@ mod tests {
         let small_rev = RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from(rev)));
         let mut map = RudisHashMap::default();
         for (f, v) in &pairs {
-            map.insert(f.clone(), v.clone());
+            map.insert(f, v);
         }
         let full = RudisValue::Hash(Box::new(map));
         assert_eq!(vdigest(&small), vdigest(&small_rev));
