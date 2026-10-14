@@ -576,13 +576,13 @@ fn stream_xclaim_cmd(
         group: group.clone(),
         consumer,
         min_idle_time: 0,
-        ids: vec![Bytes::from(id.to_string())],
+        ids: Box::new(vec![Bytes::from(id.to_string())]),
         idle: None,
         time: Some(pel.delivery_time_ms),
         retrycount: Some(pel.delivery_count),
         force: true,
         justid: true,
-        lastid: Some(last_id),
+        lastid: Some(Box::new(last_id)),
     }
 }
 
@@ -9484,10 +9484,10 @@ async fn query_cross_shard_streams(
                 consumer: consumer.clone(),
                 count: *count,
                 maxcount: *maxcount,
-                maxsize: *maxsize,
+                maxsize: maxsize.clone(),
                 block_ms: None,
                 noack: *noack,
-                claim: *claim,
+                claim: claim.clone(),
                 keys: sub_keys,
                 ids: sub_ids,
             },
@@ -13135,7 +13135,7 @@ async fn execute_command_inner(
                             if first_target == router.shard_id {
                                 let mut db = router.local_db.borrow_mut();
                                 for k in keys {
-                                    if let Some(w) = db.earliest_claim_wait_ms(k, group, min_idle) {
+                                    if let Some(w) = db.earliest_claim_wait_ms(k, group, *min_idle) {
                                         earliest_pel_wait =
                                             Some(earliest_pel_wait.map_or(w, |m| m.min(w)));
                                     }
@@ -15382,7 +15382,7 @@ async fn execute_command_inner(
             zrange_opts.with_scores = true;
             let zrange_cmd = Command::Zrange {
                 key: src.clone(),
-                opts: zrange_opts,
+                opts: *zrange_opts,
             };
             let raw = if src_target == router.shard_id {
                 let mut tmp = Vec::new();
@@ -21785,7 +21785,7 @@ pub fn execute_local_command(
                     *minid,
                     *approx,
                     *trim_strategy,
-                    idmp.clone(),
+                    idmp.as_deref().cloned(),
                     *limit,
                 ) {
                     Ok(crate::table::StreamAddResult::Added(generated_id)) => {
@@ -21810,7 +21810,7 @@ pub fn execute_local_command(
                             // IDMP needs an auto ID, and the replica must not
                             // judge duplicates with its own clock: log the
                             // entry, its IID, then the trim.
-                            let (pid, iid) = match idmp {
+                            let (pid, iid) = match &**idmp {
                                 crate::table::StreamIdmpOption::Manual { producer, iid } => {
                                     (producer.clone(), iid.clone())
                                 }
@@ -22287,7 +22287,7 @@ pub fn execute_local_command(
                 let mut props: Vec<Command> = Vec::new();
                 let per_stream_limit = count.unwrap_or(usize::MAX);
                 let max_total = maxcount.unwrap_or(usize::MAX);
-                let max_bytes = maxsize.unwrap_or(usize::MAX);
+                let max_bytes = maxsize.as_deref().copied().unwrap_or(usize::MAX);
                 let mut total_entries = 0;
                 let mut total_bytes = 0;
 
@@ -22309,7 +22309,7 @@ pub fn execute_local_command(
                         id_str,
                         Some(remaining_count),
                         *noack,
-                        *claim,
+                        claim.as_deref().copied(),
                         max_bytes,
                         &mut total_entries,
                         &mut total_bytes,
@@ -24743,9 +24743,9 @@ pub fn execute_local_command(
                     id.clone(),
                     prompt.clone(),
                     response.clone(),
-                    vector.clone(),
+                    (**vector).clone(),
                     *ttl,
-                    scope.clone(),
+                    scope.as_deref().cloned(),
                     *quantize,
                     *tokens,
                 ) {
@@ -25721,7 +25721,7 @@ pub fn execute_local_command(
                     *retrycount,
                     *force,
                     *justid,
-                    *lastid,
+                    lastid.as_deref().copied(),
                 ) {
                     Ok(outcome) => {
                         if outcome.consumer_created {
@@ -29912,7 +29912,7 @@ mod tests {
                 group: bytes::Bytes::from("grp"),
                 consumer: bytes::Bytes::from("c2"),
                 min_idle_time: 0,
-                ids: vec![bytes::Bytes::from(sid.to_string())],
+                ids: Box::new(vec![bytes::Bytes::from(sid.to_string())]),
                 idle: None,
                 time: None,
                 retrycount: None,

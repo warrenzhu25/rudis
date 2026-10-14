@@ -401,6 +401,10 @@ impl IncrName {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+/// Every pipelined command is moved several times (parse vector, per-shard
+/// batches, the remote shard's drain), so the enum is kept small: rare
+/// commands box their large fields (`Command` was 248 bytes, set by FT.*,
+/// SEMANTIC.SET, ZRANGESTORE, XADD, XCLAIM, LMOVEM and XREADGROUP).
 pub enum Command {
     Object(ObjectSubcommand),
     Xinfo(XinfoSubcommand),
@@ -450,14 +454,14 @@ pub enum Command {
         group: Bytes,
         consumer: Bytes,
         min_idle_time: u64,
-        ids: Vec<Bytes>,
+        ids: Box<Vec<Bytes>>,
         idle: Option<u64>,
         time: Option<u64>,
         retrycount: Option<usize>,
         force: bool,
         justid: bool,
         /// `LASTID <id>`: raises the group's last-delivered-id to `id`.
-        lastid: Option<crate::table::StreamId>,
+        lastid: Option<Box<crate::table::StreamId>>,
     },
     Xautoclaim {
         key: Bytes,
@@ -721,7 +725,7 @@ pub enum Command {
     Zrangestore {
         dst: Bytes,
         src: Bytes,
-        opts: crate::table::ZRangeOpts,
+        opts: Box<crate::table::ZRangeOpts>,
     },
     Zpopmin {
         key: Bytes,
@@ -994,7 +998,7 @@ pub enum Command {
         minid: Option<crate::table::StreamId>,
         approx: bool,
         trim_strategy: crate::table::StreamTrimStrategy,
-        idmp: Option<crate::table::StreamIdmpOption>,
+        idmp: Option<Box<crate::table::StreamIdmpOption>>,
         id: crate::table::StreamAddId,
         fields: Vec<(Bytes, Bytes)>,
         limit: Option<usize>,
@@ -1093,10 +1097,10 @@ pub enum Command {
         consumer: Bytes,
         count: Option<usize>,
         maxcount: Option<usize>,
-        maxsize: Option<usize>,
+        maxsize: Option<Box<usize>>,
         block_ms: Option<u64>,
         noack: bool,
-        claim: Option<u64>,
+        claim: Option<Box<u64>>,
         keys: Vec<Bytes>,
         ids: Vec<String>,
     },
@@ -1262,7 +1266,7 @@ pub enum Command {
         mode: LmovemMode,
         count: usize,
         ordering: LmovemOrdering,
-        raw_tokens: Option<[Bytes; 4]>,
+        raw_tokens: Option<Box<[Bytes; 4]>>,
     },
     Blmovem {
         source: Bytes,
@@ -1392,9 +1396,9 @@ pub enum Command {
         id: Bytes,
         prompt: Bytes,
         response: Bytes,
-        vector: Vec<f32>,
+        vector: Box<Vec<f32>>,
         ttl: Option<Duration>,
-        scope: Option<Bytes>,
+        scope: Option<Box<Bytes>>,
         quantize: bool,
         tokens: Option<u64>,
     },
@@ -1782,7 +1786,7 @@ pub enum Command {
     FtSearch {
         index: String,
         query: String,
-        options: crate::search::SearchOptions,
+        options: Box<crate::search::SearchOptions>,
     },
     FtAggregate {
         index: String,
@@ -1813,7 +1817,7 @@ pub enum Command {
     FtProfile {
         index: String,
         query: String,
-        options: crate::search::SearchOptions,
+        options: Box<crate::search::SearchOptions>,
     },
     // AF_XDP & eBPF (XDP.*)
     XdpInfo,
@@ -1894,6 +1898,8 @@ pub enum Command {
     Memory(MemorySubcommand),
     Unknown(String),
 }
+
+const _: () = assert!(std::mem::size_of::<Command>() <= 184);
 
 impl Command {
     pub fn allows_oom(&self) -> bool {
@@ -5751,7 +5757,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Zrangestore {
                 dst: args[1].clone(),
                 src: args[2].clone(),
-                opts,
+                opts: Box::new(opts),
             }))
         }
         "ZPOPMIN" | "ZPOPMAX" => {
@@ -7872,7 +7878,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 minid,
                 approx,
                 trim_strategy,
-                idmp,
+                idmp: idmp.map(Box::new),
                 id,
                 fields,
                 limit,
@@ -8717,10 +8723,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 consumer,
                 count,
                 maxcount,
-                maxsize,
+                maxsize: maxsize.map(Box::new),
                 block_ms,
                 noack,
-                claim,
+                claim: claim.map(Box::new),
                 keys,
                 ids,
             }))
@@ -9415,13 +9421,13 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 group,
                 consumer,
                 min_idle_time,
-                ids,
+                ids: Box::new(ids),
                 idle,
                 time,
                 retrycount,
                 force,
                 justid,
-                lastid,
+                lastid: lastid.map(Box::new),
             }))
         }
         "XAUTOCLAIM" => {
@@ -10141,7 +10147,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 mode,
                 count,
                 ordering,
-                raw_tokens,
+                raw_tokens: raw_tokens.map(Box::new),
             }))
         }
         "BLMOVEM" => {
@@ -12846,7 +12852,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::FtSearch {
                 index,
                 query,
-                options,
+                options: Box::new(options),
             }))
         }
         "FT.AGGREGATE" => {
@@ -13304,7 +13310,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::FtProfile {
                 index,
                 query,
-                options,
+                options: Box::new(options),
             }))
         }
         "FT.HYBRID" => {
@@ -13437,7 +13443,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::FtSearch {
                 index,
                 query,
-                options,
+                options: Box::new(options),
             }))
         }
         "SEMANTIC.SET" => {
@@ -13538,9 +13544,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 id,
                 prompt,
                 response,
-                vector,
+                vector: Box::new(vector),
                 ttl,
-                scope,
+                scope: scope.map(Box::new),
                 quantize,
                 tokens,
             }))
@@ -15909,7 +15915,7 @@ mod tests {
                 group: Bytes::from_static(b"g1"),
                 consumer: Bytes::from_static(b"c2"),
                 min_idle_time: 0,
-                ids: vec![Bytes::from_static(b"100-0")],
+                ids: Box::new(vec![Bytes::from_static(b"100-0")]),
                 idle: None,
                 time: None,
                 retrycount: None,
@@ -15953,13 +15959,13 @@ mod tests {
                 group: Bytes::from_static(b"g1"),
                 consumer: Bytes::from_static(b"c2"),
                 min_idle_time: 0,
-                ids: vec![Bytes::from_static(b"1-1"), Bytes::from_static(b"2")],
+                ids: Box::new(vec![Bytes::from_static(b"1-1"), Bytes::from_static(b"2")]),
                 idle: None,
                 time: Some(1_700_000_000_000),
                 retrycount: Some(3),
                 force: true,
                 justid: true,
-                lastid: Some(crate::table::StreamId::new(5, 0)),
+                lastid: Some(Box::new(crate::table::StreamId::new(5, 0))),
             }
         );
         // Negative values behave like Redis: min-idle 0, delivery time now
@@ -16048,9 +16054,9 @@ mod tests {
                 id: Bytes::from_static(b"q1"),
                 prompt: Bytes::from_static(b"prompt"),
                 response: Bytes::from_static(b"resp"),
-                vector: vec![1.0, 0.0, 0.0],
+                vector: Box::new(vec![1.0, 0.0, 0.0]),
                 ttl: Some(Duration::from_secs(60)),
-                scope: Some(Bytes::from_static(b"t1")),
+                scope: Some(Box::new(Bytes::from_static(b"t1"))),
                 quantize: true,
                 tokens: None,
             }

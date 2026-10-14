@@ -1745,7 +1745,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 consumer.to_vec(),
                 min_idle_time.to_string().into_bytes(),
             ];
-            for id in ids {
+            for id in ids.iter() {
                 args.push(id.to_vec());
             }
             if let Some(i) = idle {
@@ -2087,7 +2087,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 b"VECTOR".to_vec(),
                 vector.len().to_string().into_bytes(),
             ];
-            for v in vector {
+            for v in vector.iter() {
                 args.push(v.to_string().into_bytes());
             }
             if let Some(d) = ttl {
@@ -4169,9 +4169,9 @@ fn write_rewritten_aof(
                     id: id.clone(),
                     prompt: entry.prompt.clone(),
                     response: entry.response.clone(),
-                    vector: cache.index.node_vector_cow(node).into_owned(),
+                    vector: Box::new(cache.index.node_vector_cow(node).into_owned()),
                     ttl,
-                    scope: entry.scope.clone(),
+                    scope: entry.scope.clone().map(Box::new),
                     quantize: node.quantized.is_some(),
                     tokens: Some(entry.tokens),
                 };

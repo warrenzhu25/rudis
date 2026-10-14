@@ -263,9 +263,9 @@ pub fn plan_tool_command(tool: &str, args: &Value) -> Result<Command, String> {
                 id: Bytes::from(id),
                 prompt: Bytes::from(prompt),
                 response: Bytes::from(response),
-                vector,
+                vector: Box::new(vector),
                 ttl,
-                scope,
+                scope: scope.map(Box::new),
                 quantize: false,
                 tokens,
             })
@@ -437,7 +437,7 @@ pub fn plan_tool_command(tool: &str, args: &Value) -> Result<Command, String> {
             Ok(Command::FtSearch {
                 index,
                 query,
-                options,
+                options: Box::new(options),
             })
         }
         _ => Err(format!("Unknown MCP tool: {}", tool)),
