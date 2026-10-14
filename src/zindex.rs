@@ -6,8 +6,9 @@
 //! instead of a 32-byte `(OrderedScore, CompactKey)` slot. A hash table maps
 //! members to entry handles (4 bytes each, members compared through the
 //! page), and the order is a deque of sorted runs of handles, each at most
-//! [`CHUNK_MAX`] long (a deque, so ZPOPMIN emptying or merging the first run
-//! does not shift every run behind it).
+//! [`CHUNK_MAX`] long. Both levels are deques: ZPOPMIN/ZPOPMAX take from a
+//! run's ends without shifting it, and emptying or merging the first run
+//! does not shift every run behind it.
 //!
 //! - `get`/`contains_key`: one hash lookup, then the entry.
 //! - `insert`/`remove`: hash lookup, binary search over the runs and within
@@ -53,7 +54,7 @@ struct Inner<H> {
     /// Member -> handle.
     dict: hashbrown::HashTable<H>,
     /// Handles in (score, member) order, split into sorted runs.
-    runs: std::collections::VecDeque<Vec<H>>,
+    runs: std::collections::VecDeque<std::collections::VecDeque<H>>,
     len: usize,
 }
 
@@ -92,7 +93,7 @@ impl<H: Handle> Inner<H> {
     /// `(runs.len(), 0)` when every element is less.
     fn lower_bound(&self, score: OrderedScore, member: &[u8]) -> (usize, usize) {
         let ri = self.runs.partition_point(|r| {
-            self.cmp_h(*r.last().expect("runs are never empty"), score, member) == Ordering::Less
+            self.cmp_h(*r.back().expect("runs are never empty"), score, member) == Ordering::Less
         });
         if ri == self.runs.len() {
             return (ri, 0);
@@ -103,15 +104,15 @@ impl<H: Handle> Inner<H> {
     }
 
     #[inline]
-    fn new_run() -> Vec<H> {
-        Vec::with_capacity(CHUNK_MAX + 1)
+    fn new_run() -> std::collections::VecDeque<H> {
+        std::collections::VecDeque::with_capacity(CHUNK_MAX + 1)
     }
 
     /// Links entry `h` into the order.
     fn place(&mut self, h: H) {
         if self.runs.is_empty() {
             let mut run = Self::new_run();
-            run.push(h);
+            run.push_back(h);
             self.runs.push_back(run);
             return;
         }
@@ -124,9 +125,9 @@ impl<H: Handle> Inner<H> {
         let run = &mut self.runs[ri];
         run.insert(pos, h);
         if run.len() > CHUNK_MAX {
-            // Split into fresh exact-size runs rather than letting `Vec` grow.
+            // Split into fresh exact-size runs rather than letting a run grow.
             let mut tail = Self::new_run();
-            tail.extend_from_slice(&run[CHUNK_MAX / 2..]);
+            tail.extend(run.range(CHUNK_MAX / 2..));
             run.truncate(CHUNK_MAX / 2);
             self.runs.insert(ri + 1, tail);
         }
@@ -150,7 +151,7 @@ impl<H: Handle> Inner<H> {
         {
             // Keep runs from fragmenting under deletes.
             let next = self.runs.remove(ri + 1).expect("checked above");
-            self.runs[ri].extend_from_slice(&next);
+            self.runs[ri].extend(next);
         }
     }
 
@@ -228,7 +229,7 @@ impl<H: Handle> Inner<H> {
     }
 
     fn pop_first(&mut self) -> Option<(OrderedScore, Bytes)> {
-        let h = *self.runs.front()?.first()?;
+        let h = *self.runs.front()?.front()?;
         self.unplace_at(0, 0);
         Some(self.release(h))
     }
@@ -245,14 +246,14 @@ impl<H: Handle> Inner<H> {
         let h = self.find(member)?;
         let (score, m) = self.entry(h);
         let (ri, pos) = self.lower_bound(score, m);
-        Some(self.runs.iter().take(ri).map(Vec::len).sum::<usize>() + pos)
+        Some(self.runs.iter().take(ri).map(|r| r.len()).sum::<usize>() + pos)
     }
 
     fn iter_at(&self, ri: usize, pos: usize) -> RawIter<'_, H> {
-        let first: &[H] = self.runs.get(ri).map_or(&[], |r| &r[pos..]);
+        let first = self.runs.get(ri).map(|r| r.range(pos..));
         let rest = self.runs.range((ri + 1).min(self.runs.len())..);
         RawIter {
-            it: first.iter().chain(rest.flatten()),
+            it: first.into_iter().flatten().chain(rest.flatten()),
             store: &self.store,
         }
     }
@@ -281,8 +282,8 @@ impl<H: Handle> Inner<H> {
 }
 
 type HandleIter<'a, H> = std::iter::Chain<
-    std::slice::Iter<'a, H>,
-    std::iter::Flatten<std::collections::vec_deque::Iter<'a, Vec<H>>>,
+    std::iter::Flatten<std::option::IntoIter<std::collections::vec_deque::Iter<'a, H>>>,
+    std::iter::Flatten<std::collections::vec_deque::Iter<'a, std::collections::VecDeque<H>>>,
 >;
 
 struct RawIter<'a, H> {
