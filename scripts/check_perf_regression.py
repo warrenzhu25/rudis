@@ -15,6 +15,13 @@ Validates that:
    `--max-drop-pct` below `benchmark_live_baseline.json` (machine-specific; updated only
    with `--update-baseline`). Without `--live`/`--memtier`, checks 1-4 only re-read the
    stored counter file and say nothing about the current build.
+7. With `--memtier --baseline-rev REV` (or `--baseline-bin PATH`), measures this build
+   and a baseline build back to back instead, in alternating launches (order swapped each
+   round), waiting before each launch until other processes leave the host quiet, and
+   adding rounds while either side's spread exceeds 5% CV. Fails if this build is more
+   than `--max-ab-drop-pct` (5%) below the baseline build. Drift on the host hits both
+   sides alike, so this tracks real regressions far better than fixed numbers do. The
+   baseline commit is built once in a temporary worktree and cached.
 
 Exit code 0 indicates all hardware counter, throughput, and latency thresholds are satisfied.
 """
@@ -22,6 +29,7 @@ Exit code 0 indicates all hardware counter, throughput, and latency thresholds a
 import argparse
 import json
 import os
+import shutil
 import socket
 import statistics
 import subprocess
@@ -396,6 +404,128 @@ def check_memtier_gate(samples, baseline_path, max_drop_pct):
     return regressions, rows
 
 
+# A/B mode (--baseline-rev/--baseline-bin): the candidate and a baseline build
+# measured back to back in alternating launches, so host drift (other tenants,
+# thermal state) hits both equally. Judged on the candidate/baseline ratio.
+DEFAULT_MAX_AB_DROP_PCT = 5.0
+# A side whose runs spread more than this (CV %) gets another round.
+AB_CV_LIMIT_PCT = 5.0
+BASELINE_CACHE = "/tmp/rudis_baseline_bins"
+
+
+def busy_cpus(window=2.0):
+    """CPUs' worth of non-idle time across the host over `window` seconds,
+    from /proc/stat. (The load average would still count our own previous
+    benchmark run for minutes.)"""
+    def snap():
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        idle = v[3] + v[4]
+        return sum(v) - idle, sum(v)
+    b0, t0 = snap()
+    time.sleep(window)
+    b1, t1 = snap()
+    return (b1 - b0) / max(1, t1 - t0) * (os.cpu_count() or 1)
+
+
+def wait_quiet(max_busy, timeout=180.0):
+    """Waits until other processes keep at most `max_busy` CPUs busy (other
+    tenants' bursts otherwise put 20-30% noise into throughput runs).
+    Returns the last measurement."""
+    deadline = time.time() + timeout
+    while True:
+        busy = busy_cpus()
+        if busy <= max_busy or time.time() >= deadline:
+            return busy
+        time.sleep(3)
+
+
+def build_baseline(rev):
+    """Path to a release binary of commit `rev`, built once per commit in a
+    temporary worktree and cached under BASELINE_CACHE."""
+    sha = subprocess.run(
+        ["git", "-C", REPO_DIR, "rev-parse", rev], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    out = os.path.join(BASELINE_CACHE, sha, "rudis")
+    if os.path.exists(out):
+        return out, sha
+    wt = os.path.join(BASELINE_CACHE, "worktree")
+    subprocess.run(["git", "-C", REPO_DIR, "worktree", "remove", "--force", wt],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "-C", REPO_DIR, "worktree", "add", "--detach", wt, sha], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        env = dict(os.environ, CARGO_TARGET_DIR=os.path.join(BASELINE_CACHE, "target"))
+        print(f"  Building baseline {sha[:10]} (cached for later runs)...", flush=True)
+        subprocess.run(["cargo", "build", "--release", "--quiet"], cwd=wt, env=env, check=True)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        shutil.copy2(os.path.join(BASELINE_CACHE, "target", "release", "rudis"), out)
+    finally:
+        subprocess.run(["git", "-C", REPO_DIR, "worktree", "remove", "--force", wt],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return out, sha
+
+
+def _cv(vals):
+    return statistics.pstdev(vals) / statistics.mean(vals) * 100 if len(vals) > 1 else 0.0
+
+
+def run_memtier_ab(cand_bin, base_bin, port, threads, rounds, max_rounds, runs, secs, max_busy):
+    """Alternating launches of candidate and baseline (order swapped each
+    round), waiting for a quiet host before each. Rounds continue past
+    `rounds` (up to `max_rounds`) while either side's CV exceeds the limit.
+    Returns ({"cand": {wl: [...]}, "base": {...}}, errors, notes)."""
+    samples = {"cand": {wl: [] for wl in MEMTIER_WORKLOADS},
+               "base": {wl: [] for wl in MEMTIER_WORKLOADS}}
+    notes = []
+    for r in range(max_rounds):
+        order = (("cand", cand_bin), ("base", base_bin))
+        if r % 2:
+            order = order[::-1]
+        for tag, binary in order:
+            load = wait_quiet(max_busy)
+            if load > max_busy:
+                notes.append(f"round {r + 1} {tag}: host still busy ({load:.1f} CPUs)")
+            got, errs = run_memtier_gate(binary, port, threads, 1, runs, secs)
+            if errs:
+                return None, errs, notes
+            for wl, v in got.items():
+                samples[tag][wl].extend(v)
+        noisy = [
+            f"{tag}/{wl} {_cv(v):.1f}%"
+            for tag in samples for wl, v in samples[tag].items()
+            if _cv(v) > AB_CV_LIMIT_PCT
+        ]
+        if r + 1 >= rounds and not noisy:
+            break
+        if r + 1 >= rounds and noisy:
+            notes.append(f"round {r + 1}: noisy ({', '.join(noisy)}), adding a round")
+    return samples, [], notes
+
+
+def check_memtier_ab(samples, max_drop_pct):
+    regressions, rows = [], []
+    for wl in MEMTIER_WORKLOADS:
+        cand, base = samples["cand"][wl], samples["base"][wl]
+        if not cand or not base:
+            regressions.append(f"MT-{wl}: no successful memtier runs")
+            continue
+        ratio = statistics.median(cand) / statistics.median(base)
+        delta = (ratio - 1) * 100
+        status = "PASS" if delta >= -max_drop_pct else "FAIL"
+        if status == "FAIL":
+            regressions.append(
+                f"MT-{wl} throughput is {delta:+.1f}% vs the baseline build measured back to back "
+                f"(allowed -{max_drop_pct:.0f}%; CV cand {_cv(cand):.1f}%, base {_cv(base):.1f}%)"
+            )
+        rows.append((
+            f"MT-{wl}", "vs baseline build",
+            f"{statistics.median(cand):>12,.0f}/s",
+            f"{delta:+.1f}% (cv {_cv(cand):.0f}/{_cv(base):.0f})", status,
+        ))
+    return regressions, rows
+
+
 def write_live_baseline(samples, baseline_path, threads, launches, runs, secs):
     data = {
         "_note": "Machine-specific memtier baseline for check_perf_regression.py --memtier. "
@@ -431,6 +561,20 @@ def main():
     parser.add_argument("--launches", type=int, default=2, help="With --memtier: server launches")
     parser.add_argument("--runs", type=int, default=2, help="With --memtier: measured runs per launch")
     parser.add_argument("--secs", type=int, default=3, help="With --memtier: seconds per run")
+    parser.add_argument(
+        "--baseline-rev",
+        help="With --memtier: A/B against this commit (e.g. HEAD), built once and cached, "
+             "instead of the stored baseline numbers",
+    )
+    parser.add_argument("--baseline-bin", help="With --memtier: A/B against this rudis binary")
+    parser.add_argument("--max-ab-drop-pct", type=float, default=DEFAULT_MAX_AB_DROP_PCT,
+                        help="With an A/B: allowed drop vs the baseline build")
+    parser.add_argument("--rounds", type=int, default=2, help="With an A/B: minimum rounds")
+    parser.add_argument("--max-rounds", type=int, default=4,
+                        help="With an A/B: rounds allowed while results are noisy")
+    parser.add_argument("--max-busy-cpus", type=float, default=2.0,
+                        help="With an A/B: before each launch, wait until other processes "
+                             "keep at most this many CPUs busy")
     parser.add_argument("--attach", action="store_true", help="Attach --live check to an already-running server on --port")
     parser.add_argument("--rudis-bin", default=DEFAULT_BIN, help="Path to rudis binary for --live")
     parser.add_argument("--port", type=int, default=17999, help="TCP port for --live server")
@@ -458,7 +602,25 @@ def main():
     print("=" * 84)
 
     regressions, rows = validate_counter_data(data)
-    if args.memtier:
+    if args.memtier and (args.baseline_rev or args.baseline_bin):
+        if args.baseline_bin:
+            base_bin, label = args.baseline_bin, args.baseline_bin
+        else:
+            base_bin, sha = build_baseline(args.baseline_rev)
+            label = f"{args.baseline_rev} ({sha[:10]})"
+        print(f"  A/B: {args.rudis_bin} vs {label}")
+        samples, errs, notes = run_memtier_ab(
+            args.rudis_bin, base_bin, args.port, args.server_threads,
+            args.rounds, args.max_rounds, args.runs, args.secs, args.max_busy_cpus,
+        )
+        for n in notes:
+            print(f"  [note] {n}")
+        regressions.extend(errs)
+        if samples is not None:
+            ab_regs, ab_rows = check_memtier_ab(samples, args.max_ab_drop_pct)
+            regressions.extend(ab_regs)
+            rows.extend(ab_rows)
+    elif args.memtier:
         samples, errs = run_memtier_gate(
             args.rudis_bin, args.port, args.server_threads, args.launches, args.runs, args.secs
         )
