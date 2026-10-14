@@ -5,8 +5,9 @@
 //! `[score: f64 LE][member bytes]`: a 5-byte member costs 14 bytes of page
 //! instead of a 32-byte `(OrderedScore, CompactKey)` slot. A hash table maps
 //! members to entry handles (4 bytes each, members compared through the
-//! page), and the order is a list of sorted runs of handles, each at most
-//! [`CHUNK_MAX`] long.
+//! page), and the order is a deque of sorted runs of handles, each at most
+//! [`CHUNK_MAX`] long (a deque, so ZPOPMIN emptying or merging the first run
+//! does not shift every run behind it).
 //!
 //! - `get`/`contains_key`: one hash lookup, then the entry.
 //! - `insert`/`remove`: hash lookup, binary search over the runs and within
@@ -52,7 +53,7 @@ struct Inner<H> {
     /// Member -> handle.
     dict: hashbrown::HashTable<H>,
     /// Handles in (score, member) order, split into sorted runs.
-    runs: Vec<Vec<H>>,
+    runs: std::collections::VecDeque<Vec<H>>,
     len: usize,
 }
 
@@ -61,7 +62,7 @@ impl<H> Default for Inner<H> {
         Inner {
             store: PageStore::default(),
             dict: hashbrown::HashTable::new(),
-            runs: Vec::new(),
+            runs: std::collections::VecDeque::new(),
             len: 0,
         }
     }
@@ -111,7 +112,7 @@ impl<H: Handle> Inner<H> {
         if self.runs.is_empty() {
             let mut run = Self::new_run();
             run.push(h);
-            self.runs.push(run);
+            self.runs.push_back(run);
             return;
         }
         let (score, member) = self.entry(h);
@@ -148,7 +149,7 @@ impl<H: Handle> Inner<H> {
             && self.runs[ri].len() + self.runs[ri + 1].len() <= CHUNK_MAX
         {
             // Keep runs from fragmenting under deletes.
-            let next = self.runs.remove(ri + 1);
+            let next = self.runs.remove(ri + 1).expect("checked above");
             self.runs[ri].extend_from_slice(&next);
         }
     }
@@ -227,7 +228,7 @@ impl<H: Handle> Inner<H> {
     }
 
     fn pop_first(&mut self) -> Option<(OrderedScore, Bytes)> {
-        let h = *self.runs.first()?.first()?;
+        let h = *self.runs.front()?.first()?;
         self.unplace_at(0, 0);
         Some(self.release(h))
     }
@@ -244,14 +245,14 @@ impl<H: Handle> Inner<H> {
         let h = self.find(member)?;
         let (score, m) = self.entry(h);
         let (ri, pos) = self.lower_bound(score, m);
-        Some(self.runs[..ri].iter().map(Vec::len).sum::<usize>() + pos)
+        Some(self.runs.iter().take(ri).map(Vec::len).sum::<usize>() + pos)
     }
 
     fn iter_at(&self, ri: usize, pos: usize) -> RawIter<'_, H> {
         let first: &[H] = self.runs.get(ri).map_or(&[], |r| &r[pos..]);
-        let rest = self.runs.get(ri + 1..).unwrap_or(&[]);
+        let rest = self.runs.range((ri + 1).min(self.runs.len())..);
         RawIter {
-            it: first.iter().chain(rest.iter().flatten()),
+            it: first.iter().chain(rest.flatten()),
             store: &self.store,
         }
     }
@@ -279,8 +280,10 @@ impl<H: Handle> Inner<H> {
     }
 }
 
-type HandleIter<'a, H> =
-    std::iter::Chain<std::slice::Iter<'a, H>, std::iter::Flatten<std::slice::Iter<'a, Vec<H>>>>;
+type HandleIter<'a, H> = std::iter::Chain<
+    std::slice::Iter<'a, H>,
+    std::iter::Flatten<std::collections::vec_deque::Iter<'a, Vec<H>>>,
+>;
 
 struct RawIter<'a, H> {
     it: HandleIter<'a, H>,
