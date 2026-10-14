@@ -1,39 +1,327 @@
-//! Packed list storage: short elements stored back to back in byte chunks.
+//! Packed list storage: elements stored back to back in byte chunks.
 //!
 //! A `VecDeque` of 32-byte element handles costs 32 bytes per element however
-//! short it is.
-//! Here elements of up to [`PACK_MAX`] bytes are packed into chunks of at
-//! most [`CHUNK_BYTES`] bytes, each entry encoded as `[len][bytes][len]` (the
-//! trailing length lets the chunk be walked backwards). Longer elements get a
-//! chunk of their own holding the `Bytes` they arrived in, shared rather than
-//! copied, as before.
+//! short it is. Here elements of up to [`PACK_MAX`] bytes are packed into
+//! chunks holding at most [`CHUNK_MAX`] bytes, each entry encoded as
+//! `[varint len][bytes][reversed varint len]` (the trailing length lets the
+//! chunk be walked backwards). Longer elements get a chunk of their own
+//! holding the `Bytes` they arrived in, shared rather than copied.
 //!
-//! - Push/pop at either end: O(1), plus a `memmove` of at most `CHUNK_BYTES`
-//!   when adding or removing at the front of a packed chunk.
+//! A packed chunk is a small byte deque: its live bytes are `buf[head..]`.
+//! Pushing at the back appends; pushing at the front writes into the gap
+//! before `head`, growing the gap (by moving the live bytes once) only when
+//! it runs out, so neither end ever shifts the whole chunk per push. Popping
+//! the front just advances `head`. A list's first chunk grows by a quarter
+//! (at least four entries) at a time, so small lists stay small; later
+//! chunks are allocated at full size, so long lists never reallocate.
+//!
+//! - Push/pop at either end: amortized O(1), no per-element allocation.
 //! - Index access: walks chunk element counts from the nearer end, then scans
 //!   within one chunk (like Redis's quicklist).
+//! - Insert/remove in the middle: a `memmove` of at most one chunk.
 
 use bytes::Bytes;
 use std::collections::VecDeque;
 
-/// Longest element stored packed; longer ones get their own chunk.
+/// Longest element stored packed; longer ones get their own chunk, sharing
+/// the `Bytes` they arrived in. Packing 128-byte values too saved ~25% of
+/// their memory but the copy cost LPUSH/RPUSH ~7% throughput.
 pub const PACK_MAX: usize = 63;
-/// Packed chunk capacity in bytes: an exact allocator size class.
-pub const CHUNK_BYTES: usize = 512;
+/// Most live bytes in one packed chunk.
+pub const CHUNK_MAX: usize = 4096;
+/// Smallest gap or growth step, so tiny lists don't reallocate per push.
+const MIN_STEP: usize = 32;
 
-/// Entries `[len: u8][bytes][len: u8]`, `count` of them.
+#[inline]
+fn varint_len(n: usize) -> usize {
+    match n {
+        0..=0x7F => 1,
+        0x80..=0x3FFF => 2,
+        0x4000..=0x1F_FFFF => 3,
+        _ => 4,
+    }
+}
+
+#[inline]
+fn entry_size(len: usize) -> usize {
+    2 * varint_len(len) + len
+}
+
+/// LEB128 bytes of `n`: (bytes, count).
+#[inline]
+fn leb(mut n: usize) -> ([u8; 5], usize) {
+    let mut out = [0u8; 5];
+    let mut i = 0;
+    while n >= 0x80 {
+        out[i] = (n as u8) | 0x80;
+        n >>= 7;
+        i += 1;
+    }
+    out[i] = n as u8;
+    (out, i + 1)
+}
+
+/// Writes the entry for `v` into `dst` (exactly `entry_size(v.len())` long).
+#[inline]
+fn encode_to(dst: &mut [u8], v: &[u8]) {
+    let (l, n) = leb(v.len());
+    dst[..n].copy_from_slice(&l[..n]);
+    dst[n..n + v.len()].copy_from_slice(v);
+    let tail = &mut dst[n + v.len()..];
+    for k in 0..n {
+        tail[k] = l[n - 1 - k];
+    }
+}
+
+/// (length, bytes used) of the forward varint at `off`.
+#[inline(always)]
+fn read_len(buf: &[u8], off: usize) -> (usize, usize) {
+    let b = buf[off];
+    if b < 0x80 {
+        return (b as usize, 1);
+    }
+    let mut n = (b & 0x7F) as usize;
+    let mut shift = 7;
+    let mut i = off + 1;
+    loop {
+        let b = buf[i];
+        n |= ((b & 0x7F) as usize) << shift;
+        i += 1;
+        if b & 0x80 == 0 {
+            return (n, i - off);
+        }
+        shift += 7;
+    }
+}
+
+/// (length, bytes used) of the reversed varint ending at `end`.
+#[inline(always)]
+fn read_len_back(buf: &[u8], end: usize) -> (usize, usize) {
+    let mut n = 0usize;
+    let mut shift = 0;
+    let mut i = end;
+    loop {
+        i -= 1;
+        let b = buf[i];
+        n |= ((b & 0x7F) as usize) << shift;
+        if b & 0x80 == 0 {
+            return (n, end - i);
+        }
+        shift += 7;
+    }
+}
+
+/// The element of the entry starting at `off`, and the entry's end.
+#[inline(always)]
+fn entry_at(buf: &[u8], off: usize) -> (&[u8], usize) {
+    let (len, n) = read_len(buf, off);
+    let start = off + n;
+    (&buf[start..start + len], start + len + n)
+}
+
+/// The element of the entry ending at `end`, and the entry's start.
+#[inline(always)]
+fn entry_before(buf: &[u8], end: usize) -> (&[u8], usize) {
+    let (len, n) = read_len_back(buf, end);
+    let stop = end - n;
+    (&buf[stop - len..stop], stop - len - n)
+}
+
+/// Bytes of the per-chunk header at the start of `buf`: `[count: u16 LE]
+/// [head: u16 LE]`. Keeping them in the buffer leaves `Packed` a bare `Vec`
+/// (24 bytes), which fits beside `Bytes` in a 32-byte [`Chunk`] without a box.
+const HDR: usize = 4;
+
+/// Entries `[varint len][bytes][rev varint len]`, live in `buf[head..]`
+/// after a [`HDR`]-byte header holding the entry count and `head`.
 #[derive(Clone, Debug)]
 struct Packed {
     buf: Vec<u8>,
-    count: u32,
 }
 
-/// Boxed packed contents keep a chunk at 32 bytes (a `Vec` plus a count
-/// beside `Bytes` made it 40), which matters when every element of a
-/// long-value list is a chunk of its own.
+impl Packed {
+    fn with_buf(mut buf: Vec<u8>, head: usize, count: usize) -> Self {
+        if buf.len() < HDR {
+            buf.resize(HDR, 0);
+        }
+        let mut p = Packed { buf };
+        p.set_head(head);
+        p.set_count(count);
+        p
+    }
+
+    fn new() -> Self {
+        Self::with_buf(Vec::with_capacity(HDR), HDR, 0)
+    }
+
+    /// A full-size chunk to be filled by back pushes.
+    fn full_for_back() -> Self {
+        Self::with_buf(Vec::with_capacity(HDR + CHUNK_MAX), HDR, 0)
+    }
+
+    /// A full-size chunk to be filled by front pushes: all gap.
+    fn full_for_front() -> Self {
+        Self::with_buf(vec![0; HDR + CHUNK_MAX], HDR + CHUNK_MAX, 0)
+    }
+
+    #[inline(always)]
+    fn count(&self) -> usize {
+        u16::from_le_bytes([self.buf[0], self.buf[1]]) as usize
+    }
+
+    #[inline(always)]
+    fn set_count(&mut self, n: usize) {
+        self.buf[..2].copy_from_slice(&(n as u16).to_le_bytes());
+    }
+
+    #[inline(always)]
+    fn head(&self) -> usize {
+        u16::from_le_bytes([self.buf[2], self.buf[3]]) as usize
+    }
+
+    #[inline(always)]
+    fn set_head(&mut self, h: usize) {
+        debug_assert!(h <= u16::MAX as usize);
+        self.buf[2..4].copy_from_slice(&(h as u16).to_le_bytes());
+    }
+
+    #[inline]
+    fn live_len(&self) -> usize {
+        self.buf.len() - self.head()
+    }
+
+    #[inline]
+    fn fits(&self, need: usize) -> bool {
+        self.live_len() + need <= CHUNK_MAX
+    }
+
+    fn push_back(&mut self, v: &[u8]) {
+        let need = entry_size(v.len());
+        let head = self.head();
+        if self.buf.len() + need > self.buf.capacity() && (head - HDR) * 2 >= self.buf.len() - HDR {
+            // Mostly popped from the front (a queue): reclaim the dead front
+            // instead of growing.
+            self.buf.copy_within(head.., HDR);
+            self.buf.truncate(self.buf.len() - (head - HDR));
+            self.set_head(HDR);
+        }
+        let len = self.buf.len();
+        if len + need > self.buf.capacity() {
+            let cap = self.buf.capacity();
+            let want = (len + need).max(cap + (cap / 4).max(4 * need).max(MIN_STEP));
+            let want = want.min(self.head() + CHUNK_MAX).max(len + need);
+            self.buf.reserve_exact(want - len);
+        }
+        self.buf.resize(len + need, 0);
+        encode_to(&mut self.buf[len..], v);
+        let n = self.count();
+        self.set_count(n + 1);
+    }
+
+    fn push_front(&mut self, v: &[u8]) {
+        let need = entry_size(v.len());
+        if self.head() < HDR + need {
+            // Re-lay the live bytes behind a fresh gap: a quarter of the live
+            // size (at least four entries), never past the chunk limit.
+            let live = self.live_len();
+            let gap = need
+                .max((live / 4).max(4 * need).max(MIN_STEP))
+                .min(CHUNK_MAX - live);
+            let mut buf = Vec::with_capacity(HDR + gap + live);
+            buf.extend_from_slice(&self.buf[..HDR]);
+            buf.resize(HDR + gap, 0);
+            buf.extend_from_slice(&self.buf[self.head()..]);
+            self.buf = buf;
+            self.set_head(HDR + gap);
+        }
+        let at = self.head() - need;
+        encode_to(&mut self.buf[at..at + need], v);
+        self.set_head(at);
+        let n = self.count();
+        self.set_count(n + 1);
+    }
+
+    fn pop_front(&mut self) -> Bytes {
+        let (v, end) = entry_at(&self.buf, self.head());
+        let v = Bytes::copy_from_slice(v);
+        self.set_head(end);
+        let n = self.count();
+        self.set_count(n - 1);
+        v
+    }
+
+    fn pop_back(&mut self) -> Bytes {
+        let (v, start) = entry_before(&self.buf, self.buf.len());
+        let v = Bytes::copy_from_slice(v);
+        self.buf.truncate(start);
+        let n = self.count();
+        self.set_count(n - 1);
+        v
+    }
+
+    /// Absolute offset of entry `j`.
+    fn offset_of(&self, j: usize) -> usize {
+        let mut off = self.head();
+        for _ in 0..j {
+            off = entry_at(&self.buf, off).1;
+        }
+        off
+    }
+
+    fn get(&self, j: usize) -> &[u8] {
+        entry_at(&self.buf, self.offset_of(j)).0
+    }
+
+    fn insert_at(&mut self, j: usize, v: &[u8]) {
+        if j == 0 {
+            return self.push_front(v);
+        }
+        if j == self.count() {
+            return self.push_back(v);
+        }
+        let off = self.offset_of(j);
+        let need = entry_size(v.len());
+        let mut enc = vec![0u8; need];
+        encode_to(&mut enc, v);
+        self.buf.splice(off..off, enc);
+        let n = self.count();
+        self.set_count(n + 1);
+    }
+
+    fn remove_at(&mut self, j: usize) -> Bytes {
+        let off = self.offset_of(j);
+        let (v, end) = entry_at(&self.buf, off);
+        let v = Bytes::copy_from_slice(v);
+        if off == self.head() {
+            self.set_head(end);
+        } else {
+            self.buf.drain(off..end);
+        }
+        let n = self.count();
+        self.set_count(n - 1);
+        v
+    }
+
+    /// Splits off entries `j..` into a new chunk.
+    fn split_off(&mut self, j: usize) -> Packed {
+        let off = self.offset_of(j);
+        let mut tail = Vec::with_capacity(HDR + self.buf.len() - off);
+        tail.resize(HDR, 0);
+        tail.extend_from_slice(&self.buf[off..]);
+        self.buf.truncate(off);
+        let tail_count = self.count() - j;
+        self.set_count(j);
+        Packed::with_buf(tail, HDR, tail_count)
+    }
+}
+
+/// Packed contents are a bare `Vec` (count and head live in its header), so
+/// a chunk stays 32 bytes with no box: a push touches the queue slot and the
+/// buffer, nothing in between, and a long-value list (a chunk per element)
+/// pays 32 bytes per element, not 40.
 #[derive(Clone, Debug)]
 enum Chunk {
-    Packed(Box<Packed>),
+    Packed(Packed),
     /// One long element, shared with whoever else holds it.
     Big(Bytes),
 }
@@ -44,47 +332,14 @@ impl Chunk {
     #[inline]
     fn count(&self) -> usize {
         match self {
-            Chunk::Packed(p) => p.count as usize,
+            Chunk::Packed(p) => p.count(),
             Chunk::Big(_) => 1,
         }
     }
 
     fn new_packed() -> Chunk {
-        Chunk::Packed(Box::new(Packed {
-            buf: Vec::with_capacity(CHUNK_BYTES),
-            count: 0,
-        }))
+        Chunk::Packed(Packed::new())
     }
-}
-
-#[inline]
-fn entry_size(len: usize) -> usize {
-    len + 2
-}
-
-/// Byte offset of entry `idx` in a packed buffer.
-fn offset_of(buf: &[u8], idx: usize) -> usize {
-    let mut off = 0;
-    for _ in 0..idx {
-        off += entry_size(buf[off] as usize);
-    }
-    off
-}
-
-#[inline]
-fn entry_at(buf: &[u8], off: usize) -> &[u8] {
-    let len = buf[off] as usize;
-    &buf[off + 1..off + 1 + len]
-}
-
-#[inline]
-fn encode_into(buf: &mut Vec<u8>, at: usize, v: &[u8]) {
-    let len = v.len() as u8;
-    let n = entry_size(v.len());
-    buf.splice(at..at, std::iter::repeat_n(0u8, n));
-    buf[at] = len;
-    buf[at + 1..at + 1 + v.len()].copy_from_slice(v);
-    buf[at + 1 + v.len()] = len;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -133,7 +388,7 @@ impl PackedList {
                 packed_bytes += entry_size(v.len());
             }
         }
-        let needed = big + packed_bytes.div_ceil(CHUNK_BYTES) + 1;
+        let needed = big + packed_bytes.div_ceil(CHUNK_MAX) + 1;
         let free = self.chunks.capacity() - self.chunks.len();
         if needed > free {
             self.chunks.reserve_exact(needed - free);
@@ -148,15 +403,18 @@ impl PackedList {
             return;
         }
         let need = entry_size(v.len());
-        let fits = matches!(self.chunks.back(), Some(Chunk::Packed(p)) if p.buf.len() + need <= CHUNK_BYTES);
-        if !fits {
-            self.chunks.push_back(Chunk::new_packed());
+        if !matches!(self.chunks.back(), Some(Chunk::Packed(p)) if p.fits(need)) {
+            // A list's first chunk grows gradually (small lists stay small);
+            // later ones are allocated full, so long lists never reallocate.
+            let p = if self.chunks.is_empty() {
+                Packed::new()
+            } else {
+                Packed::full_for_back()
+            };
+            self.chunks.push_back(Chunk::Packed(p));
         }
         if let Some(Chunk::Packed(p)) = self.chunks.back_mut() {
-            let Packed { buf, count } = &mut **p;
-            let at = buf.len();
-            encode_into(buf, at, v);
-            *count += 1;
+            p.push_back(v);
         }
     }
 
@@ -168,14 +426,16 @@ impl PackedList {
             return;
         }
         let need = entry_size(v.len());
-        let fits = matches!(self.chunks.front(), Some(Chunk::Packed(p)) if p.buf.len() + need <= CHUNK_BYTES);
-        if !fits {
-            self.chunks.push_front(Chunk::new_packed());
+        if !matches!(self.chunks.front(), Some(Chunk::Packed(p)) if p.fits(need)) {
+            let p = if self.chunks.is_empty() {
+                Packed::new()
+            } else {
+                Packed::full_for_front()
+            };
+            self.chunks.push_front(Chunk::Packed(p));
         }
         if let Some(Chunk::Packed(p)) = self.chunks.front_mut() {
-            let Packed { buf, count } = &mut **p;
-            encode_into(buf, 0, v);
-            *count += 1;
+            p.push_front(v);
         }
     }
 
@@ -203,11 +463,8 @@ impl PackedList {
                 _ => unreachable!(),
             },
             Chunk::Packed(p) => {
-                let Packed { buf, count } = &mut **p;
-                let v = Bytes::copy_from_slice(entry_at(buf, 0));
-                buf.drain(..entry_size(v.len()));
-                *count -= 1;
-                if *count == 0 {
+                let v = p.pop_front();
+                if p.count() == 0 {
                     self.chunks.pop_front();
                 }
                 v
@@ -224,13 +481,8 @@ impl PackedList {
                 _ => unreachable!(),
             },
             Chunk::Packed(p) => {
-                let Packed { buf, count } = &mut **p;
-                let len = *buf.last().expect("non-empty chunk") as usize;
-                let start = buf.len() - entry_size(len);
-                let v = Bytes::copy_from_slice(&buf[start + 1..start + 1 + len]);
-                buf.truncate(start);
-                *count -= 1;
-                if *count == 0 {
+                let v = p.pop_back();
+                if p.count() == 0 {
                     self.chunks.pop_back();
                 }
                 v
@@ -271,7 +523,7 @@ impl PackedList {
         let (ci, j) = self.locate(i);
         Some(match &self.chunks[ci] {
             Chunk::Big(b) => b,
-            Chunk::Packed(p) => entry_at(&p.buf, offset_of(&p.buf, j)),
+            Chunk::Packed(p) => p.get(j),
         })
     }
 
@@ -283,7 +535,7 @@ impl PackedList {
         let (ci, j) = self.locate(i);
         Some(match &self.chunks[ci] {
             Chunk::Big(b) => b.clone(),
-            Chunk::Packed(p) => Bytes::copy_from_slice(entry_at(&p.buf, offset_of(&p.buf, j))),
+            Chunk::Packed(p) => Bytes::copy_from_slice(p.get(j)),
         })
     }
 
@@ -299,12 +551,8 @@ impl PackedList {
                 _ => unreachable!(),
             },
             Chunk::Packed(p) => {
-                let Packed { buf, count } = &mut **p;
-                let off = offset_of(buf, j);
-                let v = Bytes::copy_from_slice(entry_at(buf, off));
-                buf.drain(off..off + entry_size(v.len()));
-                *count -= 1;
-                if *count == 0 {
+                let v = p.remove_at(j);
+                if p.count() == 0 {
                     self.chunks.remove(ci);
                 }
                 v
@@ -344,7 +592,7 @@ impl PackedList {
             }
             Chunk::Packed(_) => (ci, j),
         };
-        let full = matches!(&self.chunks[ci], Chunk::Packed(p) if p.buf.len() + need > CHUNK_BYTES);
+        let full = matches!(&self.chunks[ci], Chunk::Packed(p) if !p.fits(need));
         let (ci, j) = if full {
             let half = self.chunks[ci].count() / 2;
             let at = self.split_at(ci, half);
@@ -352,11 +600,16 @@ impl PackedList {
         } else {
             (ci, j)
         };
-        if let Chunk::Packed(p) = &mut self.chunks[ci] {
-            let Packed { buf, count } = &mut **p;
-            let off = offset_of(buf, j);
-            encode_into(buf, off, v);
-            *count += 1;
+        if matches!(&self.chunks[ci], Chunk::Packed(p) if !p.fits(need)) {
+            // Halves by count can still be too full when sizes are uneven
+            // (a few PACK_MAX elements among short ones): give `v` a chunk
+            // of its own at its position.
+            let at = self.split_at(ci, j);
+            let mut p = Packed::new();
+            p.push_back(v);
+            self.chunks.insert(at, Chunk::Packed(p));
+        } else if let Chunk::Packed(p) = &mut self.chunks[ci] {
+            p.insert_at(j, v);
         }
         self.len += 1;
     }
@@ -365,24 +618,12 @@ impl PackedList {
     /// where the second half (or, for `j == 0`/Big chunks, chunk `ci`) is.
     fn split_at(&mut self, ci: usize, j: usize) -> usize {
         match &mut self.chunks[ci] {
-            Chunk::Packed(p) if j > 0 && j < p.count as usize => {
-                let Packed { buf, count } = &mut **p;
-                let off = offset_of(buf, j);
-                let mut tail = Vec::with_capacity(CHUNK_BYTES);
-                tail.extend_from_slice(&buf[off..]);
-                buf.truncate(off);
-                let tail_count = *count - j as u32;
-                *count = j as u32;
-                self.chunks.insert(
-                    ci + 1,
-                    Chunk::Packed(Box::new(Packed {
-                        buf: tail,
-                        count: tail_count,
-                    })),
-                );
+            Chunk::Packed(p) if j > 0 && j < p.count() => {
+                let tail = p.split_off(j);
+                self.chunks.insert(ci + 1, Chunk::Packed(tail));
                 ci + 1
             }
-            Chunk::Packed(p) if j >= p.count as usize => ci + 1,
+            Chunk::Packed(p) if j >= p.count() => ci + 1,
             _ => ci,
         }
     }
@@ -417,12 +658,8 @@ impl PackedList {
                         out.len += 1;
                     }
                 }
-                Chunk::Packed(p) => {
-                    let Packed { buf, count } = *p;
-                    let mut off = 0;
-                    for _ in 0..count {
-                        let v = entry_at(&buf, off);
-                        off += entry_size(v.len());
+                c @ Chunk::Packed(_) => {
+                    for v in ChunkIter::new(&c) {
                         if keep(v) {
                             out.push_back_slice(v);
                         }
@@ -486,9 +723,9 @@ impl<'a> ChunkIter<'a> {
             Chunk::Packed(p) => ChunkIter {
                 buf: &p.buf,
                 big: false,
-                front: 0,
+                front: p.head(),
                 back: p.buf.len(),
-                remaining: p.count as usize,
+                remaining: p.count(),
             },
         }
     }
@@ -504,8 +741,8 @@ impl<'a> Iterator for ChunkIter<'a> {
         if self.big {
             return Some(self.buf);
         }
-        let v = entry_at(self.buf, self.front);
-        self.front += entry_size(v.len());
+        let (v, end) = entry_at(self.buf, self.front);
+        self.front = end;
         Some(v)
     }
 
@@ -523,9 +760,9 @@ impl<'a> DoubleEndedIterator for ChunkIter<'a> {
         if self.big {
             return Some(self.buf);
         }
-        let len = self.buf[self.back - 1] as usize;
-        self.back -= entry_size(len);
-        Some(&self.buf[self.back + 1..self.back + 1 + len])
+        let (v, start) = entry_before(self.buf, self.back);
+        self.back = start;
+        Some(v)
     }
 }
 
@@ -542,14 +779,21 @@ mod tests {
     }
 
     #[test]
-    fn short_elements_pack_and_long_ones_are_shared() {
+    fn short_and_medium_elements_pack_and_long_ones_are_shared() {
         let mut l = PackedList::new();
         for i in 0..200 {
             l.push_back(&b(format!("e{i}").as_bytes()));
         }
-        // 200 short entries fit in a handful of 512-byte chunks.
-        assert!(l.chunks.len() <= 4, "{} chunks", l.chunks.len());
-        let long = Bytes::from(vec![b'L'; 128]);
+        // 200 short entries fit in one chunk.
+        assert_eq!(l.chunks.len(), 1);
+        // PACK_MAX-byte elements pack: ~60 per 4 KiB chunk.
+        let mut m = PackedList::new();
+        for i in 0..300u32 {
+            m.push_front(&Bytes::from(vec![i as u8; PACK_MAX]));
+        }
+        assert!(m.chunks.len() <= 6, "{} chunks", m.chunks.len());
+        assert_eq!(m.get(0), Some(&[43u8; PACK_MAX][..]));
+        let long = Bytes::from(vec![b'L'; PACK_MAX + 1]);
         l.push_front(&long);
         assert!(matches!(l.chunks.front(), Some(Chunk::Big(x)) if x.as_ptr() == long.as_ptr()));
         assert_eq!(
@@ -561,10 +805,12 @@ mod tests {
         assert_eq!(l.get(199), Some(&b"e199"[..]));
         assert_eq!(l.iter().next_back(), Some(&b"e199"[..]));
         // Boundary sizes.
-        for n in [0usize, 1, PACK_MAX, PACK_MAX + 1] {
+        for n in [0usize, 1, PACK_MAX, PACK_MAX + 1, 128, 1024] {
             let v = Bytes::from(vec![b'x'; n]);
             l.push_back(&v);
-            assert_eq!(l.pop_back(), Some(v));
+            assert_eq!(l.pop_back(), Some(v.clone()));
+            l.push_front(&v);
+            assert_eq!(l.pop_front(), Some(v));
         }
     }
 
@@ -579,12 +825,13 @@ mod tests {
             x ^= x << 17;
             x
         };
-        for step in 0..60_000 {
+        for step in 0..80_000 {
             let r = next();
             // Mostly short values, some at the packing boundary, some long.
-            let len = match r % 10 {
-                0 => PACK_MAX,
-                1 => PACK_MAX + 1 + (r >> 8) as usize % 100,
+            let len = match r % 12 {
+                0 | 1 => PACK_MAX,
+                2 => PACK_MAX + 1 + (r >> 8) as usize % 100,
+                3 => 40 + (r >> 8) as usize % 24,
                 _ => (r >> 8) as usize % 12,
             };
             let v: Vec<u8> = (0..len)
@@ -635,12 +882,29 @@ mod tests {
                 for c in &l.chunks {
                     match c {
                         Chunk::Packed(p) => {
-                            assert!(p.count > 0 && p.buf.len() <= CHUNK_BYTES);
-                            assert!(p.buf.capacity() <= CHUNK_BYTES, "a chunk reallocated");
+                            assert!(p.count() > 0 && p.live_len() <= CHUNK_MAX);
                         }
                         Chunk::Big(x) => assert!(x.len() > PACK_MAX),
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn queue_use_never_grows_a_chunk_past_its_limit() {
+        // RPUSH + LPOP: the front advances by `head`, the back appends.
+        let mut l = PackedList::new();
+        for i in 0..100_000u32 {
+            l.push_back(&b(format!("job:{i}").as_bytes()));
+            if i >= 50 {
+                assert_eq!(l.pop_front().unwrap(), format!("job:{}", i - 50));
+            }
+        }
+        assert_eq!(l.len(), 50);
+        for c in &l.chunks {
+            if let Chunk::Packed(p) = c {
+                assert!(p.buf.capacity() <= p.head() + CHUNK_MAX + MIN_STEP);
             }
         }
     }

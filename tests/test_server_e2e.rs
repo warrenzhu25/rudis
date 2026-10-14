@@ -28292,3 +28292,166 @@ fn test_packed_large_hash_compaction_and_ops_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+#[test]
+fn test_packed_list_medium_elements_and_queue_e2e() {
+    use std::collections::VecDeque;
+    let port = 17993u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "4",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    fn read_reply(c: &mut TcpStream) -> Vec<u8> {
+        fn complete(b: &[u8], i: usize) -> Option<usize> {
+            let nl = i + b.get(i..)?.windows(2).position(|w| w == b"\r\n")?;
+            let head = std::str::from_utf8(&b[i + 1..nl]).unwrap();
+            match b[i] {
+                b'$' => {
+                    let n: i64 = head.parse().unwrap();
+                    if n < 0 {
+                        return Some(nl + 2);
+                    }
+                    let end = nl + 2 + n as usize + 2;
+                    (b.len() >= end).then_some(end)
+                }
+                b'*' => {
+                    let n: usize = head.parse().unwrap();
+                    let mut j = nl + 2;
+                    for _ in 0..n {
+                        j = complete(b, j)?;
+                    }
+                    Some(j)
+                }
+                _ => Some(nl + 2),
+            }
+        }
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            if !got.is_empty() && complete(&got, 0) == Some(got.len()) {
+                return got;
+            }
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+    fn cmd(c: &mut TcpStream, args: &[&str]) -> String {
+        let mut out = format!("*{}\r\n", args.len());
+        for a in args {
+            out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        c.write_all(out.as_bytes()).unwrap();
+        String::from_utf8(read_reply(c)).unwrap()
+    }
+    fn bulk(s: &str) -> String {
+        format!("${}\r\n{s}\r\n", s.len())
+    }
+    fn items(r: &str) -> Vec<String> {
+        let mut lines = r.split("\r\n");
+        let n: usize = lines.next().unwrap()[1..].parse().unwrap();
+        (0..n)
+            .map(|_| {
+                lines.next();
+                lines.next().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    // Elements from short to 1 KiB+ (packed up to 1024 bytes, crossing the
+    // two-byte length prefix at 128), pushed at both ends.
+    let elem = |i: usize| {
+        let len = match i % 7 {
+            0 => 3,
+            1 => 127,
+            2 => 128,
+            3 => 300,
+            4 => 1024,
+            5 => 1025,
+            _ => 20,
+        };
+        format!("{i}:").repeat(len)[..len].to_string()
+    };
+    let mut model: VecDeque<String> = VecDeque::new();
+    for i in 0..700 {
+        let v = elem(i);
+        if i % 3 == 0 {
+            cmd(&mut c, &["LPUSH", "ml", &v]);
+            model.push_front(v);
+        } else {
+            cmd(&mut c, &["RPUSH", "ml", &v]);
+            model.push_back(v);
+        }
+    }
+    let all = |c: &mut TcpStream| items(&cmd(c, &["LRANGE", "ml", "0", "-1"]));
+    assert_eq!(all(&mut c), Vec::from(model.clone()));
+    for i in [0usize, 1, 99, 350, 698, 699] {
+        assert_eq!(
+            cmd(&mut c, &["LINDEX", "ml", &i.to_string()]),
+            bulk(&model[i]),
+            "LINDEX {i}"
+        );
+    }
+    // Mid-list edits with medium values, including into full chunks.
+    for k in 0..40usize {
+        let i = (k * 37) % model.len();
+        let pivot = model[i].clone();
+        let v = elem(k + 1000);
+        let r = cmd(&mut c, &["LINSERT", "ml", "BEFORE", &pivot, &v]);
+        assert_eq!(r, format!(":{}\r\n", model.len() + 1));
+        let at = model.iter().position(|x| *x == pivot).unwrap();
+        model.insert(at, v);
+    }
+    for k in 0..40usize {
+        let i = (k * 53) % model.len();
+        let v = elem(k + 2000);
+        assert_eq!(cmd(&mut c, &["LSET", "ml", &i.to_string(), &v]), "+OK\r\n");
+        model[i] = v;
+    }
+    assert_eq!(all(&mut c), Vec::from(model.clone()));
+    assert_eq!(cmd(&mut c, &["LTRIM", "ml", "50", "-50"]), "+OK\r\n");
+    let trimmed: Vec<String> = model
+        .iter()
+        .skip(50)
+        .take(model.len() - 99)
+        .cloned()
+        .collect();
+    assert_eq!(all(&mut c), trimmed);
+    let rev = items(&cmd(&mut c, &["LRANGE", "ml", "-5", "-1"]));
+    assert_eq!(rev, trimmed[trimmed.len() - 5..].to_vec());
+
+    // A long-running queue: RPUSH at the back, LPOP at the front.
+    let mut q: VecDeque<String> = VecDeque::new();
+    for i in 0..20_000usize {
+        let v = elem(i);
+        cmd(&mut c, &["RPUSH", "q", &v]);
+        q.push_back(v);
+        if i >= 30 {
+            assert_eq!(
+                cmd(&mut c, &["LPOP", "q"]),
+                bulk(&q.pop_front().unwrap()),
+                "pop {i}"
+            );
+        }
+    }
+    assert_eq!(cmd(&mut c, &["LLEN", "q"]), format!(":{}\r\n", q.len()));
+    assert_eq!(
+        items(&cmd(&mut c, &["LRANGE", "q", "0", "-1"])),
+        Vec::from(q)
+    );
+
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+}
