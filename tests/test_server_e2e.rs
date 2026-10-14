@@ -28555,3 +28555,397 @@ fn test_slowlog_records_pipelined_commands_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut srv);
 }
+
+/// Randomized persistence round trips over every packed encoding: sets
+/// (PackedSet), sorted sets (ZIndex), small and large hashes (SmallHash,
+/// PackedHash) and lists (PackedList), in states only random operations
+/// reach (compacted pages, own-page members over 1 KiB, small hashes promoted,
+/// chunks split by inserts). After each phase the data must survive an RDB
+/// round trip (DEBUG RELOAD), an AOF rewrite and replay (BGREWRITEAOF +
+/// DEBUG LOADAOF) and DUMP/RESTORE, matching both its digest and an
+/// in-test model; then mutation continues on the reloaded encodings.
+#[test]
+fn test_persistence_round_trips_of_packed_encodings_e2e() {
+    use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+    let port = 18003u16;
+    let dir = std::env::temp_dir().join(format!("rudis-pfuzz-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    start_test_server_with_aof(
+        port,
+        4,
+        rudis::aof::AofConfig {
+            enabled: true,
+            dir: dir.clone(),
+            fsync_every_sec: false,
+        },
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+
+    #[derive(Debug)]
+    enum V {
+        Simple(String),
+        Int(i64),
+        Bulk(Option<Vec<u8>>),
+        Arr(Vec<V>),
+    }
+    fn parse(b: &[u8], i: usize) -> Option<(V, usize)> {
+        let nl = i + b.get(i..)?.windows(2).position(|w| w == b"\r\n")?;
+        let head = std::str::from_utf8(&b[i + 1..nl]).unwrap();
+        match b[i] {
+            b'+' | b'-' => Some((V::Simple(head.to_string()), nl + 2)),
+            b':' => Some((V::Int(head.parse().unwrap()), nl + 2)),
+            b'$' => {
+                let n: i64 = head.parse().unwrap();
+                if n < 0 {
+                    return Some((V::Bulk(None), nl + 2));
+                }
+                let end = nl + 2 + n as usize + 2;
+                (b.len() >= end).then(|| (V::Bulk(Some(b[nl + 2..end - 2].to_vec())), end))
+            }
+            b'*' => {
+                let n: i64 = head.parse().unwrap();
+                let mut items = Vec::new();
+                let mut j = nl + 2;
+                for _ in 0..n.max(0) {
+                    let (v, k) = parse(b, j)?;
+                    items.push(v);
+                    j = k;
+                }
+                Some((V::Arr(items), j))
+            }
+            other => panic!("unexpected RESP type {:?}", other as char),
+        }
+    }
+    // Sends commands pipelined and returns their replies.
+    fn pipe(c: &mut TcpStream, cmds: &[Vec<Vec<u8>>]) -> Vec<V> {
+        let mut out = Vec::new();
+        for args in cmds {
+            out.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                out.extend_from_slice(a);
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        c.write_all(&out).unwrap();
+        let (mut got, mut buf, mut replies, mut pos) =
+            (Vec::new(), vec![0u8; 1 << 16], Vec::new(), 0);
+        while replies.len() < cmds.len() {
+            match parse(&got, pos) {
+                Some((v, next)) => {
+                    replies.push(v);
+                    pos = next;
+                }
+                None => {
+                    let n = c.read(&mut buf).unwrap();
+                    assert!(n > 0, "connection closed");
+                    got.extend_from_slice(&buf[..n]);
+                }
+            }
+        }
+        replies
+    }
+    fn one(c: &mut TcpStream, args: &[&[u8]]) -> V {
+        pipe(c, &[args.iter().map(|a| a.to_vec()).collect()])
+            .pop()
+            .unwrap()
+    }
+    fn bulks(v: V) -> Vec<Vec<u8>> {
+        let V::Arr(items) = v else {
+            panic!("expected array, got {v:?}")
+        };
+        items
+            .into_iter()
+            .map(|i| match i {
+                V::Bulk(Some(b)) => b,
+                other => panic!("expected bulk, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[derive(Default)]
+    struct Model {
+        sets: HashMap<String, HashSet<Vec<u8>>>,
+        zsets: HashMap<String, BTreeMap<Vec<u8>, i64>>,
+        hashes: HashMap<String, HashMap<Vec<u8>, Vec<u8>>>,
+        lists: HashMap<String, VecDeque<Vec<u8>>>,
+    }
+    // Member/value bytes: mostly short, some medium, some over 1 KiB.
+    fn blob(r: u64, tag: &str) -> Vec<u8> {
+        let len = match r % 20 {
+            0 => 1100 + (r >> 8) as usize % 400,
+            1..=3 => 65 + (r >> 8) as usize % 200,
+            _ => 1 + (r >> 8) as usize % 30,
+        };
+        format!("{tag}{}-", r % 100_000)
+            .into_bytes()
+            .into_iter()
+            .cycle()
+            .take(len)
+            .collect()
+    }
+    let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    // Applies `n` random operations, keeping the model in step.
+    let mut mutate = |c: &mut TcpStream, m: &mut Model, n: usize| {
+        let mut batch: Vec<Vec<Vec<u8>>> = Vec::new();
+        for _ in 0..n {
+            let r = next();
+            let k = (r >> 40) % 6;
+            let b = |s: &str| s.as_bytes().to_vec();
+            match r % 4 {
+                0 => {
+                    // Sets: a few large (packed) and some small.
+                    let key = format!("pf:s{}", k);
+                    let set = m.sets.entry(key.clone()).or_default();
+                    let mem = blob(next() % 3000, "m");
+                    if (r >> 8) % 3 == 0 && !set.is_empty() {
+                        set.remove(&mem);
+                        batch.push(vec![b("SREM"), b(&key), mem]);
+                    } else {
+                        set.insert(mem.clone());
+                        batch.push(vec![b("SADD"), b(&key), mem]);
+                    }
+                }
+                1 => {
+                    let key = format!("pf:z{}", k);
+                    let z = m.zsets.entry(key.clone()).or_default();
+                    let mem = blob(next() % 3000, "z");
+                    if (r >> 8) % 4 == 0 {
+                        z.remove(&mem);
+                        batch.push(vec![b("ZREM"), b(&key), mem]);
+                    } else {
+                        let score = ((r >> 16) % 200) as i64 - 100;
+                        z.insert(mem.clone(), score);
+                        batch.push(vec![b("ZADD"), b(&key), b(&score.to_string()), mem]);
+                    }
+                }
+                2 => {
+                    // k 0-2: small hashes (5..30-byte values, <=40 fields);
+                    // k 3-5: large (long values, many fields).
+                    let key = format!("pf:h{}", k);
+                    let h = m.hashes.entry(key.clone()).or_default();
+                    let (f, v) = if k < 3 {
+                        (
+                            format!("f{}", next() % 40).into_bytes(),
+                            format!("v{}-", next())
+                                .into_bytes()
+                                .into_iter()
+                                .cycle()
+                                .take(5 + (r >> 8) as usize % 25)
+                                .collect(),
+                        )
+                    } else {
+                        (format!("f{}", next() % 900).into_bytes(), blob(next(), "v"))
+                    };
+                    if (r >> 8) % 5 == 0 {
+                        h.remove(&f);
+                        batch.push(vec![b("HDEL"), b(&key), f]);
+                    } else {
+                        h.insert(f.clone(), v.clone());
+                        batch.push(vec![b("HSET"), b(&key), f, v]);
+                    }
+                }
+                _ => {
+                    let key = format!("pf:l{}", k);
+                    let l = m.lists.entry(key.clone()).or_default();
+                    let v = blob(next(), "e");
+                    match (r >> 8) % 8 {
+                        0..=2 => {
+                            l.push_back(v.clone());
+                            batch.push(vec![b("RPUSH"), b(&key), v]);
+                        }
+                        3 | 4 => {
+                            l.push_front(v.clone());
+                            batch.push(vec![b("LPUSH"), b(&key), v]);
+                        }
+                        5 if !l.is_empty() => {
+                            l.pop_front();
+                            batch.push(vec![b("LPOP"), b(&key)]);
+                        }
+                        6 if !l.is_empty() => {
+                            let i = (next() % l.len() as u64) as usize;
+                            l[i] = v.clone();
+                            batch.push(vec![b("LSET"), b(&key), b(&i.to_string()), v]);
+                        }
+                        _ if !l.is_empty() => {
+                            l.pop_back();
+                            batch.push(vec![b("RPOP"), b(&key)]);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if batch.len() == 200 {
+                pipe(c, &batch);
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            pipe(c, &batch);
+        }
+        m.sets.retain(|_, s| !s.is_empty());
+        m.zsets.retain(|_, z| !z.is_empty());
+        m.hashes.retain(|_, h| !h.is_empty());
+        m.lists.retain(|_, l| !l.is_empty());
+    };
+    // Full contents of `key` read back under `name` must match the model.
+    fn check(c: &mut TcpStream, m: &Model, rename: &dyn Fn(&str) -> String, phase: &str) {
+        for (k, want) in &m.sets {
+            let got: HashSet<Vec<u8>> = bulks(one(c, &[b"SMEMBERS", rename(k).as_bytes()]))
+                .into_iter()
+                .collect();
+            assert_eq!(&got, want, "{phase}: set {k}");
+        }
+        for (k, want) in &m.zsets {
+            let got = bulks(one(
+                c,
+                &[b"ZRANGE", rename(k).as_bytes(), b"0", b"-1", b"WITHSCORES"],
+            ));
+            let mut exp: Vec<(i64, Vec<u8>)> = want.iter().map(|(m, s)| (*s, m.clone())).collect();
+            exp.sort();
+            let exp: Vec<Vec<u8>> = exp
+                .into_iter()
+                .flat_map(|(s, m)| [m, s.to_string().into_bytes()])
+                .collect();
+            assert_eq!(got, exp, "{phase}: zset {k}");
+        }
+        for (k, want) in &m.hashes {
+            let got: HashMap<Vec<u8>, Vec<u8>> = bulks(one(c, &[b"HGETALL", rename(k).as_bytes()]))
+                .chunks(2)
+                .map(|p| (p[0].clone(), p[1].clone()))
+                .collect();
+            assert_eq!(&got, want, "{phase}: hash {k}");
+        }
+        for (k, want) in &m.lists {
+            let got = bulks(one(c, &[b"LRANGE", rename(k).as_bytes(), b"0", b"-1"]));
+            assert_eq!(got, Vec::from(want.clone()), "{phase}: list {k}");
+        }
+    }
+    let same = |k: &str| k.to_string();
+    let digest = |c: &mut TcpStream| debug_digest(c);
+    let size = |c: &mut TcpStream| match one(c, &[b"DBSIZE"]) {
+        V::Int(n) => n,
+        other => panic!("DBSIZE: {other:?}"),
+    };
+
+    let mut m = Model::default();
+    for phase in 0..3 {
+        mutate(&mut c, &mut m, 12_000);
+        check(&mut c, &m, &same, &format!("phase {phase} live"));
+        if phase == 0 {
+            // The workload must reach the packed large forms and keep small
+            // hashes small, or the round trips below prove less.
+            let enc = |c: &mut TcpStream, k: &str| match one(
+                c,
+                &[b"OBJECT", b"ENCODING", k.as_bytes()],
+            ) {
+                V::Bulk(Some(e)) => String::from_utf8(e).unwrap(),
+                other => panic!("OBJECT ENCODING {k}: {other:?}"),
+            };
+            assert!(m.sets.values().all(|s| s.len() > 64), "sets stay small");
+            assert_eq!(enc(&mut c, "pf:s0"), "hashtable");
+            assert_eq!(enc(&mut c, "pf:z0"), "skiplist");
+            assert_eq!(enc(&mut c, "pf:h0"), "listpack");
+            assert_eq!(enc(&mut c, "pf:h4"), "hashtable");
+            assert!(m.lists.values().any(|l| l.len() > 100), "lists stay short");
+        }
+        let before = digest(&mut c);
+        let n = size(&mut c);
+        assert_eq!(
+            n as usize,
+            m.sets.len() + m.zsets.len() + m.hashes.len() + m.lists.len()
+        );
+
+        // RDB: save, flush, load.
+        assert!(matches!(one(&mut c, &[b"DEBUG", b"RELOAD"]), V::Simple(ref s) if s == "OK"));
+        assert_eq!(
+            digest(&mut c),
+            before,
+            "phase {phase}: digest after DEBUG RELOAD"
+        );
+        check(
+            &mut c,
+            &m,
+            &same,
+            &format!("phase {phase} after RDB reload"),
+        );
+
+        // AOF: rewrite, then replay into a flushed keyspace.
+        assert!(matches!(one(&mut c, &[b"BGREWRITEAOF"]), V::Simple(_)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let V::Bulk(Some(info)) = one(&mut c, &[b"INFO", b"persistence"]) else {
+                panic!("INFO persistence")
+            };
+            if String::from_utf8_lossy(&info).contains("aof_rewrite_in_progress:0") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "AOF rewrite did not finish"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(matches!(one(&mut c, &[b"DEBUG", b"LOADAOF"]), V::Simple(ref s) if s == "OK"));
+        assert_eq!(
+            digest(&mut c),
+            before,
+            "phase {phase}: digest after AOF replay"
+        );
+        check(
+            &mut c,
+            &m,
+            &same,
+            &format!("phase {phase} after AOF replay"),
+        );
+
+        // DUMP/RESTORE every key under a new name.
+        let keys: Vec<String> = m
+            .sets
+            .keys()
+            .chain(m.zsets.keys())
+            .chain(m.hashes.keys())
+            .chain(m.lists.keys())
+            .cloned()
+            .collect();
+        for k in &keys {
+            let V::Bulk(Some(dump)) = one(&mut c, &[b"DUMP", k.as_bytes()]) else {
+                panic!("DUMP {k}")
+            };
+            let copy = format!("{k}:copy");
+            let r = one(
+                &mut c,
+                &[b"RESTORE", copy.as_bytes(), b"0", &dump, b"REPLACE"],
+            );
+            assert!(
+                matches!(r, V::Simple(ref s) if s == "OK"),
+                "RESTORE {k}: {r:?}"
+            );
+        }
+        check(
+            &mut c,
+            &m,
+            &|k: &str| format!("{k}:copy"),
+            &format!("phase {phase} restored copies"),
+        );
+        for k in &keys {
+            one(&mut c, &[b"DEL", format!("{k}:copy").as_bytes()]);
+        }
+        assert_eq!(
+            digest(&mut c),
+            before,
+            "phase {phase}: digest after deleting copies"
+        );
+    }
+
+    drop(c);
+    let _ = std::fs::remove_dir_all(&dir);
+}
