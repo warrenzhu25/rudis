@@ -5,6 +5,32 @@ use crate::resp::Command;
 
 /// Inline compact representation of Redis responses for cross-core batch transfers.
 /// Avoids heap allocations for responses up to 30 bytes (integers, OK, simple errors, small bulk strings).
+/// Bytes of a value [`CompactResp::prefetch`] pulls in; past this the
+/// hardware prefetcher has the copy's sequential stream anyway.
+const PREFETCH_MAX: usize = 4096;
+
+/// Hints the CPU to load `b`'s cache lines (up to [`PREFETCH_MAX`] bytes).
+#[inline(always)]
+fn prefetch_bytes(b: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let n = b.len().min(PREFETCH_MAX);
+        let mut off = 0;
+        while off < n {
+            // SAFETY: a prefetch is only a hint: it never faults or changes
+            // memory, and `off < b.len()` keeps the address inside `b`.
+            unsafe {
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                    b.as_ptr().add(off) as *const i8,
+                );
+            }
+            off += 64;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = b;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactResp {
     Small { len: u8, data: [u8; 30] },
@@ -284,6 +310,17 @@ impl CompactResp {
                 crate::connection::write_resp_bulk(out, bytes);
             }
             CompactResp::RawBytes(bytes) => out.extend_from_slice(bytes),
+        }
+    }
+
+    /// Starts loading a shared value's bytes into cache ahead of
+    /// [`Self::write_to`]. A reply assembled from many values (a pipeline of
+    /// GETs or MGETs) otherwise takes each value's cache misses one after
+    /// another while copying it; prefetching them all first overlaps them.
+    #[inline(always)]
+    pub fn prefetch(&self) {
+        if let CompactResp::Bulk(b) | CompactResp::Array1Bulk(b) | CompactResp::RawBytes(b) = self {
+            prefetch_bytes(b);
         }
     }
 
@@ -4686,6 +4723,36 @@ const RDB_FLUSH_BYTES: usize = 4 << 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compact_resp_prefetch_leaves_replies_unchanged() {
+        let sizes = [0usize, 1, 21, 63, 64, 65, 1024, 4095, 4096, 4097, 100_000];
+        for n in sizes {
+            let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+            let b = Bytes::from(data.clone());
+            let variants = [
+                CompactResp::Bulk(b.clone()),
+                CompactResp::Array1Bulk(b.clone()),
+                CompactResp::RawBytes(b.clone()),
+                CompactResp::from_vec(data.clone()),
+                CompactResp::from_bulk(&b),
+            ];
+            for r in variants {
+                let mut before = Vec::new();
+                r.write_to(&mut before);
+                r.prefetch();
+                let mut after = Vec::new();
+                r.write_to(&mut after);
+                assert_eq!(before, after, "size {n}");
+            }
+        }
+        // Small and empty replies have nothing to prefetch.
+        CompactResp::empty().prefetch();
+        CompactResp::NULL.prefetch();
+        // A slice of a larger buffer only touches its own range.
+        let big = Bytes::from(vec![7u8; 10_000]);
+        CompactResp::Bulk(big.slice(9_990..)).prefetch();
+    }
 
     /// Keys of a `save_rdb_chunk` record stream, in order.
     fn chunk_keys(chunk: &[u8]) -> Vec<Bytes> {

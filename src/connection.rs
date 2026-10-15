@@ -27259,7 +27259,13 @@ async fn execute_commands_squashed_inner(
     //    capacity. A folded MGET's array is written directly from its
     //    per-key slots (in `responses` past the pipeline's), so its values
     //    are copied once rather than into an intermediate array first.
-    let total_len: usize = responses.iter().map(|r| r.estimated_len()).sum();
+    let total_len: usize = responses
+        .iter()
+        .map(|r| {
+            r.prefetch();
+            r.estimated_len()
+        })
+        .sum();
     out.reserve(total_len + folded_mgets.len() * 16);
     let mut mgets = folded_mgets.iter().peekable();
     for (i, resp) in responses[..n].iter().enumerate() {

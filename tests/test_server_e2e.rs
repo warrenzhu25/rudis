@@ -29013,3 +29013,66 @@ fn test_pipelined_cross_shard_batches_reuse_cleanly_e2e() {
     // Nothing left over: a PING gets exactly its own reply.
     assert_eq!(send_and_read(&mut client, b"PING\r\n"), "+PONG\r\n");
 }
+
+/// Pipelined GETs and MGETs whose values span the prefetch edge cases (empty,
+/// one cache line either side, the 4 KB prefetch cap, large) come back byte
+/// for byte, whether the key is local or on another shard.
+#[test]
+fn test_pipelined_reply_values_of_all_sizes_e2e() {
+    let port = 18005;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let sizes = [0usize, 1, 21, 63, 64, 65, 1024, 4095, 4096, 4097, 70_000];
+    let bulk = |v: &[u8]| {
+        let mut b = format!("${}\r\n", v.len()).into_bytes();
+        b.extend_from_slice(v);
+        b.extend_from_slice(b"\r\n");
+        b
+    };
+    let cmd = |args: &[&[u8]]| {
+        let mut c = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            c.extend(bulk(a));
+        }
+        c
+    };
+    let keys: Vec<String> = (0..sizes.len()).map(|i| format!("pfv_{i}")).collect();
+    let vals: Vec<Vec<u8>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (0..n).map(|j| b'a' + ((i + j) % 26) as u8).collect())
+        .collect();
+
+    let mut req = Vec::new();
+    let mut want = Vec::new();
+    for (k, v) in keys.iter().zip(&vals) {
+        req.extend(cmd(&[b"SET", k.as_bytes(), v]));
+        want.extend_from_slice(b"+OK\r\n");
+    }
+    for _ in 0..3 {
+        for (k, v) in keys.iter().zip(&vals) {
+            req.extend(cmd(&[b"GET", k.as_bytes()]));
+            want.extend(bulk(v));
+        }
+        let mut mget: Vec<&[u8]> = vec![b"MGET"];
+        mget.extend(keys.iter().rev().map(|k| k.as_bytes()));
+        req.extend(cmd(&mget));
+        want.extend(format!("*{}\r\n", keys.len()).into_bytes());
+        for v in vals.iter().rev() {
+            want.extend(bulk(v));
+        }
+    }
+    client.write_all(&req).unwrap();
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    while got.len() < want.len() {
+        let n = client.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert!(got == want, "pipelined replies differ");
+    assert_eq!(send_and_read(&mut client, b"PING\r\n"), "+PONG\r\n");
+}
