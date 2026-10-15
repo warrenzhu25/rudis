@@ -1434,10 +1434,16 @@ mod tests {
         let b = Bytes::from(big);
         assert_eq!(b.as_ptr(), ptr);
         assert_eq!(&b[..], &[7u8; 1024][..]);
-        // Medium heap values also reuse their allocation when owned.
-        let mid = CompactStr::new(&[3u8; 100]);
+        // Medium unpacked heap values also reuse their allocation when owned
+        // (non-ASCII, so not 7-bit packed).
+        let mid = CompactStr::new(&[0x83u8; 100]);
+        assert!(mid.is_heap());
         let ptr = mid.view().as_ptr();
         assert_eq!(Bytes::from(mid).as_ptr(), ptr);
+        // A packed value converts by unpacking into a new buffer.
+        let packed = CompactStr::new(&[3u8; 100]);
+        assert!(packed.is_heap_packed());
+        assert_eq!(&Bytes::from(packed)[..], &[3u8; 100][..]);
     }
 
     #[test]
