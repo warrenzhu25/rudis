@@ -29230,3 +29230,56 @@ fn test_packed_heap_strings_read_back_exactly_e2e() {
     assert_eq!(q(&[b"RESTORE", b"ps:restored", b"0", payload]), b"+OK\r\n");
     assert_eq!(q(&[b"GET", b"ps:restored"]), bulk(&v128));
 }
+
+/// Lists long enough to span many full chunks (4096 bytes each, header
+/// included) read back exactly from both ends, by index and by range, and
+/// after removals in the middle.
+#[test]
+fn test_long_lists_across_full_chunks_e2e() {
+    let port = 18009;
+    start_test_server(port, 4);
+    let mut c = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut q = |args: &[String]| -> String {
+        let mut cmd = format!("*{}\r\n", args.len());
+        for a in args {
+            cmd.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        send_and_read(&mut c, cmd.as_bytes())
+    };
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let bulk = |x: &str| format!("${}\r\n{}\r\n", x.len(), x);
+    // 3000 values pushed to the back in batches, 3000 to the front one by one.
+    for batch in 0..30 {
+        let mut args = s(&["RPUSH", "ll"]);
+        args.extend((0..100).map(|i| format!("r{:05}", batch * 100 + i)));
+        assert_eq!(q(&args), format!(":{}\r\n", (batch + 1) * 100));
+    }
+    for i in 0..3000 {
+        assert_eq!(
+            q(&s(&["LPUSH", "ll", &format!("l{i:05}")])),
+            format!(":{}\r\n", 3001 + i)
+        );
+    }
+    assert_eq!(q(&s(&["LLEN", "ll"])), ":6000\r\n");
+    assert_eq!(q(&s(&["LINDEX", "ll", "0"])), bulk("l02999"));
+    assert_eq!(q(&s(&["LINDEX", "ll", "2999"])), bulk("l00000"));
+    assert_eq!(q(&s(&["LINDEX", "ll", "3000"])), bulk("r00000"));
+    assert_eq!(q(&s(&["LINDEX", "ll", "-1"])), bulk("r02999"));
+    assert_eq!(
+        q(&s(&["LRANGE", "ll", "2998", "3001"])),
+        format!(
+            "*4\r\n{}{}{}{}",
+            bulk("l00001"),
+            bulk("l00000"),
+            bulk("r00000"),
+            bulk("r00001")
+        )
+    );
+    // Remove from the middle, then pop both ends.
+    assert_eq!(q(&s(&["LREM", "ll", "0", "r01500"])), ":1\r\n");
+    assert_eq!(q(&s(&["LINDEX", "ll", "4500"])), bulk("r01501"));
+    assert_eq!(q(&s(&["LPOP", "ll"])), bulk("l02999"));
+    assert_eq!(q(&s(&["RPOP", "ll"])), bulk("r02999"));
+    assert_eq!(q(&s(&["LLEN", "ll"])), ":5997\r\n");
+}

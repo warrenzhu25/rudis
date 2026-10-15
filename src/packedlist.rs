@@ -27,8 +27,10 @@ use std::collections::VecDeque;
 /// the `Bytes` they arrived in. Packing 128-byte values too saved ~25% of
 /// their memory but the copy cost LPUSH/RPUSH ~7% throughput.
 pub const PACK_MAX: usize = 63;
-/// Most live bytes in one packed chunk.
-pub const CHUNK_MAX: usize = 4096;
+/// Most live bytes in one packed chunk: with its 4-byte header a full chunk
+/// is exactly 4096 bytes, an allocator size class (4100 would round up to
+/// 5120, wasting a fifth of every full chunk).
+pub const CHUNK_MAX: usize = 4096 - HDR;
 /// Smallest gap or growth step, so tiny lists don't reallocate per push.
 const MIN_STEP: usize = 32;
 
@@ -205,11 +207,20 @@ impl Packed {
             self.buf.truncate(self.buf.len() - (head - HDR));
             self.set_head(HDR);
         }
+        if self.buf.len() + need > HDR + CHUNK_MAX {
+            // The front gap would push the chunk past its 4096-byte size
+            // class: slide the live bytes down over the gap instead
+            // (`fits` guarantees they and `v` fit in `CHUNK_MAX`).
+            let head = self.head();
+            self.buf.copy_within(head.., HDR);
+            self.buf.truncate(self.buf.len() - (head - HDR));
+            self.set_head(HDR);
+        }
         let len = self.buf.len();
         if len + need > self.buf.capacity() {
             let cap = self.buf.capacity();
             let want = (len + need).max(cap + (cap / 4).max(4 * need).max(MIN_STEP));
-            let want = want.min(self.head() + CHUNK_MAX).max(len + need);
+            let want = want.min(HDR + CHUNK_MAX).max(len + need);
             self.buf.reserve_exact(want - len);
         }
         self.buf.resize(len + need, 0);
@@ -889,6 +900,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A full chunk (header included) is exactly 4096 bytes, an allocator
+    /// size class; 4100 would round up to 5120 and waste a fifth of it.
+    #[test]
+    fn full_chunks_allocate_exactly_one_page_size_class() {
+        assert_eq!(HDR + CHUNK_MAX, 4096);
+        assert_eq!(Packed::full_for_back().buf.capacity(), 4096);
+        assert_eq!(Packed::full_for_front().buf.capacity(), 4096);
+        // Long lists built from both ends: every chunk stays within 4096 and
+        // the contents read back in order.
+        let mut l = PackedList::new();
+        for i in 0..5_000u32 {
+            l.push_back(&b(format!("r{i:05}").as_bytes()));
+            l.push_front(&b(format!("l{i:05}").as_bytes()));
+        }
+        assert!(l.chunks.len() > 4);
+        for c in &l.chunks {
+            if let Chunk::Packed(p) = c {
+                assert!(
+                    p.buf.capacity() <= 4096,
+                    "chunk capacity {}",
+                    p.buf.capacity()
+                );
+                assert!(p.live_len() <= CHUNK_MAX);
+            }
+        }
+        let all: Vec<Vec<u8>> = l.iter().map(<[u8]>::to_vec).collect();
+        assert_eq!(all.len(), 10_000);
+        assert_eq!(all[0], format!("l{:05}", 4_999).into_bytes());
+        assert_eq!(all[4_999], b"l00000");
+        assert_eq!(all[5_000], b"r00000");
+        assert_eq!(all[9_999], format!("r{:05}", 4_999).into_bytes());
     }
 
     #[test]
