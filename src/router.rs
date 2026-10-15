@@ -440,9 +440,19 @@ impl Router {
 
     #[inline(always)]
     pub fn target_shard_and_hash(&self, key: &[u8]) -> (usize, u64) {
-        let key_hash = crate::table::hash_key(key);
-        let target = self.target_shard(key);
-        (target, key_hash)
+        if self.cluster_enabled
+            || !self.slot_owners.borrow().is_empty()
+            || crate::cluster::has_active_cluster(self.port)
+        {
+            let slot = key_slot(key);
+            (
+                self.target_shard_for_slot(slot),
+                crate::table::hash_key(key),
+            )
+        } else {
+            // One hash for both: `target_shard` would hash the key again.
+            target_shard_and_hash(key, self.num_shards)
+        }
     }
 
     pub fn check_slot_redirection(
