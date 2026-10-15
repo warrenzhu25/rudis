@@ -29283,3 +29283,33 @@ fn test_long_lists_across_full_chunks_e2e() {
     assert_eq!(q(&s(&["RPOP", "ll"])), bulk("r02999"));
     assert_eq!(q(&s(&["LLEN", "ll"])), ":5997\r\n");
 }
+
+/// The perf gate refuses a verdict on a contended host: its classifier flags
+/// an A/B side whose spread stays above 8% CV, or a baseline build running
+/// under 75% of the host's recorded live baseline, and passes quiet samples.
+/// (`--self-test` exercises it on synthetic samples.)
+#[test]
+fn test_perf_gate_flags_noisy_or_slow_hosts_e2e() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("python3")
+        .arg(repo_root.join("scripts/check_perf_regression.py"))
+        .arg("--self-test")
+        .output()
+        .expect("run check_perf_regression.py --self-test");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "self-test failed:\n{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("self-test OK"), "{stdout}");
+    // The gate script itself is valid bash and wires in pipefail.
+    let gate = std::fs::read_to_string(repo_root.join("scripts/gate.sh")).unwrap();
+    assert!(gate.contains("set -euo pipefail"));
+    let syntax = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(repo_root.join("scripts/gate.sh"))
+        .status()
+        .unwrap();
+    assert!(syntax.success());
+}

@@ -21,7 +21,11 @@ Validates that:
    adding rounds while either side's spread exceeds 5% CV. Fails if this build is more
    than `--max-ab-drop-pct` (5%) below the baseline build. Drift on the host hits both
    sides alike, so this tracks real regressions far better than fixed numbers do. The
-   baseline commit is built once in a temporary worktree and cached.
+   baseline commit is built once in a temporary worktree and cached. If after the extra
+   rounds either side's spread is still above 8% CV, or the baseline build runs below 75%
+   of `benchmark_live_baseline.json`, the host is too contended for a verdict: the gate
+   fails as INCONCLUSIVE (rerun later, or `--allow-noisy`). `--self-test` checks that
+   classification on synthetic data.
 
 Exit code 0 indicates all hardware counter, throughput, and latency thresholds are satisfied.
 """
@@ -413,6 +417,13 @@ def check_memtier_gate(samples, baseline_path, max_drop_pct):
 DEFAULT_MAX_AB_DROP_PCT = 5.0
 # A side whose runs spread more than this (CV %) gets another round.
 AB_CV_LIMIT_PCT = 5.0
+# After the extra rounds, an A/B whose spread still exceeds this, or whose
+# baseline build runs under AB_DEGRADED_FRAC of this host's recorded live
+# baseline, gives no verdict: on a contended host a real regression can hide
+# inside the noise (on 2026-10-15 a degraded host ran at half speed with
+# 15-20% CV and the gate still passed).
+AB_NOISE_FAIL_PCT = 8.0
+AB_DEGRADED_FRAC = 0.75
 BASELINE_CACHE = "/tmp/rudis_baseline_bins"
 
 
@@ -506,6 +517,54 @@ def run_memtier_ab(cand_bin, base_bin, port, threads, rounds, max_rounds, runs, 
     return samples, [], notes
 
 
+def check_ab_host_health(samples, baseline_path):
+    """Reasons the A/B measurements cannot be trusted (empty when fine):
+    either side still noisier than AB_NOISE_FAIL_PCT, or the baseline build
+    slower than AB_DEGRADED_FRAC of the recorded live baseline."""
+    problems = []
+    for tag in ("cand", "base"):
+        for wl, v in samples[tag].items():
+            if v and _cv(v) > AB_NOISE_FAIL_PCT:
+                problems.append(f"{tag}/{wl} CV {_cv(v):.1f}% > {AB_NOISE_FAIL_PCT:.0f}%")
+    recorded = {}
+    if baseline_path and os.path.exists(baseline_path):
+        with open(baseline_path) as f:
+            recorded = json.load(f).get("workloads", {})
+    for wl, v in samples["base"].items():
+        ref = recorded.get(wl, {}).get("ops_sec_median")
+        if ref and v and statistics.median(v) < AB_DEGRADED_FRAC * ref:
+            problems.append(
+                f"base/{wl} {statistics.median(v):,.0f}/s is under "
+                f"{AB_DEGRADED_FRAC:.0%} of this host's recorded {ref:,.0f}/s"
+            )
+    return problems
+
+
+def self_test():
+    """Checks check_ab_host_health's classification on synthetic samples."""
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump({"workloads": {"SET": {"ops_sec_median": 2_000_000},
+                                 "GET": {"ops_sec_median": 1_800_000}}}, f)
+        path = f.name
+    try:
+        quiet = {"cand": {"SET": [2.00e6, 2.02e6, 1.99e6], "GET": [1.80e6, 1.81e6, 1.79e6]},
+                 "base": {"SET": [2.01e6, 2.00e6, 2.02e6], "GET": [1.79e6, 1.80e6, 1.81e6]}}
+        assert check_ab_host_health(quiet, path) == [], "quiet host flagged"
+        noisy = {"cand": {"SET": [2.0e6, 1.4e6, 2.2e6], "GET": [1.8e6, 1.8e6, 1.8e6]},
+                 "base": quiet["base"]}
+        got = check_ab_host_health(noisy, path)
+        assert len(got) == 1 and got[0].startswith("cand/SET CV"), got
+        slow = {"cand": {"SET": [1.0e6] * 3, "GET": [0.9e6] * 3},
+                "base": {"SET": [1.0e6] * 3, "GET": [0.9e6] * 3}}
+        got = check_ab_host_health(slow, path)
+        assert len(got) == 2 and all("recorded" in g for g in got), got
+        assert check_ab_host_health(slow, None) == [], "no recorded baseline: no slowness check"
+    finally:
+        os.unlink(path)
+    print("self-test OK")
+
+
 def check_memtier_ab(samples, max_drop_pct):
     regressions, rows = [], []
     for wl in MEMTIER_WORKLOADS:
@@ -573,6 +632,10 @@ def main():
     parser.add_argument("--max-ab-drop-pct", type=float, default=DEFAULT_MAX_AB_DROP_PCT,
                         help="With an A/B: allowed drop vs the baseline build")
     parser.add_argument("--rounds", type=int, default=3, help="With an A/B: minimum rounds")
+    parser.add_argument("--allow-noisy", action="store_true",
+                        help="With an A/B: give a verdict even when the host is too noisy or slow")
+    parser.add_argument("--self-test", action="store_true",
+                        help="Check the noisy/slow-host classification on synthetic data and exit")
     parser.add_argument("--max-rounds", type=int, default=4,
                         help="With an A/B: rounds allowed while results are noisy")
     parser.add_argument("--max-busy-cpus", type=float, default=2.0,
@@ -589,6 +652,9 @@ def main():
         help="Minimum ops/sec floor for --live mode",
     )
     args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return
 
     if not os.path.exists(args.counter_file):
         print(f"[!] Counter file not found: {args.counter_file}")
@@ -623,6 +689,15 @@ def main():
             ab_regs, ab_rows = check_memtier_ab(samples, args.max_ab_drop_pct)
             regressions.extend(ab_regs)
             rows.extend(ab_rows)
+            health = check_ab_host_health(samples, args.live_baseline)
+            if health and not args.allow_noisy:
+                regressions.append(
+                    "INCONCLUSIVE: host too noisy or slow for a verdict ("
+                    + "; ".join(health)
+                    + "). Rerun when the host is quiet (or pass --allow-noisy)."
+                )
+            elif health:
+                print(f"  [note] --allow-noisy: ignoring {'; '.join(health)}")
     elif args.memtier:
         samples, errs = run_memtier_gate(
             args.rudis_bin, args.port, args.server_threads, args.launches, args.runs, args.secs
