@@ -27422,7 +27422,10 @@ async fn flush_remote_batches(
         while check_mask != 0 {
             let target_shard = check_mask.trailing_zeros() as usize;
             let responder = &responders[target_shard];
-            if let Some(recycled_items) = responder.try_take() {
+            if let Some(mut recycled_items) = responder.try_take() {
+                // The remote shard leaves the commands in place; dropping them
+                // here keeps their key refcounts on this core.
+                recycled_items.clear();
                 items_pool.push(recycled_items);
                 pending_mask &= !(1u64 << target_shard);
             }
@@ -27436,7 +27439,8 @@ async fn flush_remote_batches(
     while pending_mask != 0 {
         let target_shard = pending_mask.trailing_zeros() as usize;
         let responder = &responders[target_shard];
-        if let Some(recycled_items) = responder.wait_take().await {
+        if let Some(mut recycled_items) = responder.wait_take().await {
+            recycled_items.clear();
             items_pool.push(recycled_items);
         }
         pending_mask &= !(1u64 << target_shard);
@@ -29451,6 +29455,85 @@ mod tests {
         responses[2].write_to(&mut out);
         assert_eq!(String::from_utf8_lossy(&out), ":100\r\n:102\r\n");
         assert!(scratch.remote_batches.iter().all(|b| b.is_empty()));
+        recycle_conn_scratch(scratch);
+    }
+
+    #[monoio::test]
+    async fn test_flush_remote_batches_drops_returned_commands_on_owner() {
+        // Records the thread that drops a key's buffer.
+        struct DropSpy(std::sync::Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>);
+        impl AsRef<[u8]> for DropSpy {
+            fn as_ref(&self) -> &[u8] {
+                b"spy-key"
+            }
+        }
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push(std::thread::current().id());
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("rudis-flush-owner-drop-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let router = Router::new(
+            0,
+            2,
+            6398,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::shard::ShardDb::new(6398))),
+            senders_mesh[0].clone(),
+            None,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::pubsub::PubSubHub::new())),
+            dir,
+        );
+        // Fake shard 1 that, like the real one, hands the batch back with its
+        // commands still in it.
+        let rx1 = receivers.remove(1);
+        let remote = std::thread::spawn(move || {
+            loop {
+                if let Ok(ShardMessage::Batch {
+                    items, responder, ..
+                }) = rx1.try_recv()
+                {
+                    for (idx, _, _) in items.iter() {
+                        responder.write_slot(*idx, CompactResp::OK);
+                    }
+                    responder.finish(items);
+                    return std::thread::current().id();
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        let drops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut scratch = take_conn_scratch(2);
+        let mut responses = vec![CompactResp::empty(); 2];
+        for idx in 0..2 {
+            let key = Bytes::from_owner(DropSpy(drops.clone()));
+            scratch.remote_batches[1].push((idx, 0, Command::Get(key)));
+        }
+        flush_remote_batches(
+            &router,
+            &scratch.responders,
+            &mut scratch.remote_batches,
+            &mut scratch.items_pool,
+            &mut responses,
+            false,
+        )
+        .await;
+        let remote_id = remote.join().unwrap();
+        assert!(responses.iter().all(|r| r.as_slice() == b"+OK\r\n"));
+        // The returned batch is emptied before it is pooled, and its keys were
+        // freed on this (the owner's) thread, not on the remote shard.
+        assert!(scratch.items_pool.iter().all(|v| v.is_empty()));
+        let drops = drops.lock().unwrap();
+        assert_eq!(drops.len(), 2);
+        assert!(
+            drops
+                .iter()
+                .all(|id| *id == std::thread::current().id() && *id != remote_id)
+        );
+        drop(drops);
         recycle_conn_scratch(scratch);
     }
 

@@ -28949,3 +28949,67 @@ fn test_persistence_round_trips_of_packed_encodings_e2e() {
     drop(c);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Remote shards hand pipelined batches back with their commands still in
+/// them, and the connection empties each batch before reusing it. Many rounds
+/// of mixed cross-shard pipelines on one connection must get exactly their own
+/// replies: a pooled batch that kept old commands would re-run them (extra or
+/// shifted replies, double INCRs).
+#[test]
+fn test_pipelined_cross_shard_batches_reuse_cleanly_e2e() {
+    let port = 18004;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let bulk = |s: &str| format!("${}\r\n{}\r\n", s.len(), s);
+    let cmd = |args: &[&str]| {
+        let mut c = format!("*{}\r\n", args.len());
+        for a in args {
+            c.push_str(&bulk(a));
+        }
+        c
+    };
+    for round in 1..=30 {
+        let mut req = String::new();
+        let mut want = String::new();
+        let keys: Vec<String> = (0..12).map(|i| format!("pbr_k{i}")).collect();
+        for (i, k) in keys.iter().enumerate() {
+            let v = format!("v{round}_{i}");
+            req.push_str(&cmd(&["SET", k, &v]));
+            want.push_str("+OK\r\n");
+            req.push_str(&cmd(&["INCR", &format!("pbr_c{i}")]));
+            want.push_str(&format!(":{round}\r\n"));
+        }
+        for (i, k) in keys.iter().enumerate() {
+            req.push_str(&cmd(&["GET", k]));
+            want.push_str(&bulk(&format!("v{round}_{i}")));
+        }
+        let mut mget: Vec<&str> = vec!["MGET"];
+        mget.extend(keys.iter().map(|k| k.as_str()));
+        mget.push("pbr_missing");
+        req.push_str(&cmd(&mget));
+        want.push_str(&format!("*{}\r\n", keys.len() + 1));
+        for i in 0..keys.len() {
+            want.push_str(&bulk(&format!("v{round}_{i}")));
+        }
+        want.push_str("$-1\r\n");
+        req.push_str(&cmd(&["DEL", &keys[round % keys.len()]]));
+        want.push_str(":1\r\n");
+        req.push_str(&cmd(&["EXISTS", &keys[round % keys.len()]]));
+        want.push_str(":0\r\n");
+
+        client.write_all(req.as_bytes()).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16384];
+        while got.len() < want.len() {
+            let n = client.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed in round {round}");
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(String::from_utf8_lossy(&got), want, "round {round}");
+    }
+    // Nothing left over: a PING gets exactly its own reply.
+    assert_eq!(send_and_read(&mut client, b"PING\r\n"), "+PONG\r\n");
+}
