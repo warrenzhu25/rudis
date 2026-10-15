@@ -2529,6 +2529,21 @@ impl RudisFlatTable {
                 .map_or(0, |_| std::mem::size_of::<[u32; 16384]>())
     }
 
+    /// [`Self::struct_bytes`] recomputed from every segment instead of the
+    /// incremental counter (O(segments)).
+    pub fn struct_bytes_exact(&self) -> usize {
+        self.segments
+            .iter()
+            .map(RawSegment::heap_bytes)
+            .sum::<usize>()
+            + self.segments.capacity() * std::mem::size_of::<RawSegment>()
+            + self.directory.capacity() * std::mem::size_of::<u32>()
+            + self
+                .slot_counts
+                .as_ref()
+                .map_or(0, |_| std::mem::size_of::<[u32; 16384]>())
+    }
+
     /// Bytes of entry arena allocated but not holding a live entry (holes
     /// left by deletes and growth slack). Inserts reuse them, so they are
     /// free memory as far as the dataset is concerned even though the
@@ -3211,6 +3226,34 @@ pub fn compute_digest(bytes: &[u8]) -> String {
     format!("{:016x}", h)
 }
 
+/// One table's (or a sum of tables') memory accounting; see
+/// [`RudisTable::memory_breakdown`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBreakdown {
+    pub keys: usize,
+    /// Incremental `data_bytes` (keys, values, per-entry overhead).
+    pub dataset: usize,
+    /// `dataset` recomputed by walking every entry.
+    pub dataset_exact: usize,
+    /// Incremental table structure bytes (slot arrays, entry arenas).
+    pub table: usize,
+    /// `table` recomputed from every segment.
+    pub table_exact: usize,
+    /// Entry arena allocated but holding no live entry.
+    pub free_arena: usize,
+}
+
+impl std::ops::AddAssign for MemoryBreakdown {
+    fn add_assign(&mut self, o: Self) {
+        self.keys += o.keys;
+        self.dataset += o.dataset;
+        self.dataset_exact += o.dataset_exact;
+        self.table += o.table;
+        self.table_exact += o.table_exact;
+        self.free_arena += o.free_arena;
+    }
+}
+
 /// The complete thread-local Rudis storage engine unifying:
 /// 1. Flat SIMD-accelerated hash table (`RudisFlatTable`)
 /// 2. Inlined TTL expiration
@@ -3650,6 +3693,25 @@ impl RudisTable {
     #[inline]
     pub fn free_arena_bytes(&self) -> usize {
         self.table.free_arena_bytes()
+    }
+
+    /// Memory accounting for `MEMORY STATS`: the counters `used_memory` is
+    /// built from, and the same figures recomputed from scratch (an O(n)
+    /// walk of every segment and entry), so a drift between the incremental
+    /// counters and reality shows up.
+    pub fn memory_breakdown(&self) -> MemoryBreakdown {
+        let mut dataset_exact = 0;
+        for entry in self.entries() {
+            dataset_exact += entry.key.heap_bytes() + entry.val.mem_bytes() + ENTRY_OVERHEAD;
+        }
+        MemoryBreakdown {
+            keys: self.len(),
+            dataset: self.data_bytes,
+            dataset_exact,
+            table: self.table.struct_bytes(),
+            table_exact: self.table.struct_bytes_exact(),
+            free_arena: self.table.free_arena_bytes(),
+        }
     }
 
     pub fn recalculate_used_memory(&mut self) -> usize {

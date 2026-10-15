@@ -1998,6 +1998,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             let _ = responder.send(used);
                         });
                     }
+                    ShardMessage::MemoryBreakdown { responder } => {
+                        let _ = responder.send(cross_shard_db.borrow().memory_breakdown());
+                    }
                     ShardMessage::GetUsedMemory { responder } => {
                         // Also republishes this shard's allocator count.
                         cross_shard_router.publish_memory_state();

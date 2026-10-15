@@ -706,6 +706,10 @@ pub enum ShardMessage {
     GetUsedMemory {
         responder: flume::Sender<usize>,
     },
+    /// This shard's [`crate::table::MemoryBreakdown`] (for `MEMORY STATS`).
+    MemoryBreakdown {
+        responder: flume::Sender<crate::table::MemoryBreakdown>,
+    },
     /// Run `check_auto_tier_local` (spill this shard's hot keys while the
     /// server is over `maxmemory`); replies with the shard's `used_memory`.
     TierAutoSpill {
@@ -867,6 +871,19 @@ impl ShardDb {
                 && let Some(t) = opt
             {
                 total += t.used_memory();
+            }
+        }
+        total
+    }
+
+    /// [`crate::table::RudisTable::memory_breakdown`] summed over every DB.
+    pub fn memory_breakdown(&self) -> crate::table::MemoryBreakdown {
+        let mut total = self.table.memory_breakdown();
+        for (idx, opt) in self.tables.iter().enumerate() {
+            if idx != self.current_db
+                && let Some(t) = opt
+            {
+                total += t.memory_breakdown();
             }
         }
         total

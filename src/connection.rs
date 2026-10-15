@@ -18163,17 +18163,22 @@ async fn execute_command_inner(
                         }
                     }
                 }
-                MemorySubcommand::Stats => {
-                    out.extend_from_slice(b"*2\r\n$10\r\npeak.alloc\r\n:1048576\r\n");
+                MemorySubcommand::Stats | MemorySubcommand::Doctor => {
+                    let report = crate::allocator::MemoryReport {
+                        breakdown: router.memory_breakdown().await,
+                        used: router.get_total_used_memory().await,
+                        maxmemory: crate::tiering::get_max_memory(router.port),
+                        alloc: crate::allocator::get_allocator_stats(),
+                    };
+                    if matches!(sub, MemorySubcommand::Stats) {
+                        crate::allocator::format_memory_stats(&report, out);
+                    } else {
+                        write_resp_bulk(out, crate::allocator::memory_doctor(&report).as_bytes());
+                    }
                 }
                 MemorySubcommand::Purge | MemorySubcommand::Defrag => {
                     let _ = router.active_defrag().await;
                     out.extend_from_slice(b"+OK\r\n");
-                }
-                MemorySubcommand::Doctor => {
-                    out.extend_from_slice(
-                        b"+Hi Sam, I can't find any memory issues in your instance.\r\n",
-                    );
                 }
             }
             false
@@ -24506,7 +24511,15 @@ pub fn execute_local_command(
                         }
                     }
                     MemorySubcommand::Stats => {
-                        out.extend_from_slice(b"*2\r\n$10\r\npeak.alloc\r\n:1048576\r\n");
+                        // Inside a script or another shard's batch: this
+                        // shard's figures only.
+                        let report = crate::allocator::MemoryReport {
+                            breakdown: db.memory_breakdown(),
+                            used: db.total_used_memory(),
+                            maxmemory: 0,
+                            alloc: crate::allocator::get_allocator_stats(),
+                        };
+                        crate::allocator::format_memory_stats(&report, out);
                     }
                     _ => {
                         out.extend_from_slice(b"+OK\r\n");

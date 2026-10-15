@@ -83,6 +83,116 @@ pub fn global_allocated() -> Option<usize> {
     tikv_jemalloc_ctl::stats::allocated::read().ok()
 }
 
+/// Inputs of [`format_memory_stats`] and [`memory_doctor`]: the server's
+/// accounting summed over shards, plus `used_memory` and `maxmemory`.
+pub struct MemoryReport {
+    pub breakdown: crate::table::MemoryBreakdown,
+    pub used: usize,
+    pub maxmemory: u64,
+    pub alloc: AllocatorStats,
+}
+
+impl MemoryReport {
+    /// Bytes the allocator holds that `used_memory` (what `maxmemory`
+    /// eviction compares) does not count.
+    pub fn untracked(&self) -> usize {
+        self.alloc.allocated.saturating_sub(self.used)
+    }
+}
+
+/// `MEMORY STATS` reply (RESP2 flat map). Field names follow Redis where one
+/// exists; `rudis.*` fields expose the incremental counters next to the
+/// same figures recomputed from scratch, and memory `used_memory` misses.
+pub fn format_memory_stats(r: &MemoryReport, out: &mut Vec<u8>) {
+    let b = &r.breakdown;
+    let ratio = |a: usize, d: usize| if d == 0 { 0.0 } else { a as f64 / d as f64 };
+    let ints: [(&str, usize); 13] = [
+        ("total.allocated", r.alloc.allocated),
+        ("used_memory", r.used),
+        ("maxmemory", r.maxmemory as usize),
+        ("keys.count", b.keys),
+        (
+            "keys.bytes-per-key",
+            r.used.checked_div(b.keys).unwrap_or(0),
+        ),
+        ("dataset.bytes", b.dataset),
+        ("overhead.hashtable.main", b.table),
+        ("allocator.allocated", r.alloc.allocated),
+        ("allocator.active", r.alloc.active),
+        ("allocator.resident", r.alloc.resident),
+        ("rudis.dataset.exact.bytes", b.dataset_exact),
+        ("rudis.hashtable.exact.bytes", b.table_exact),
+        ("rudis.untracked.bytes", r.untracked()),
+    ];
+    let floats: [(&str, f64); 3] = [
+        ("dataset.percentage", 100.0 * ratio(b.dataset, r.used)),
+        (
+            "allocator-fragmentation.ratio",
+            ratio(r.alloc.active, r.alloc.allocated),
+        ),
+        ("fragmentation", ratio(r.alloc.resident, r.used)),
+    ];
+    crate::connection::write_resp_array_header(out, 2 * (ints.len() + floats.len() + 1));
+    for (k, v) in ints {
+        crate::connection::write_resp_bulk(out, k.as_bytes());
+        crate::connection::write_resp_integer(out, v as i64);
+    }
+    crate::connection::write_resp_bulk(out, b"rudis.free-arena.bytes");
+    crate::connection::write_resp_integer(out, b.free_arena as i64);
+    for (k, v) in floats {
+        crate::connection::write_resp_bulk(out, k.as_bytes());
+        crate::connection::write_resp_bulk(out, format!("{v:.2}").as_bytes());
+    }
+}
+
+/// `MEMORY DOCTOR`: findings an operator should act on, or a clean bill.
+pub fn memory_doctor(r: &MemoryReport) -> String {
+    const MB: usize = 1 << 20;
+    let mut issues = Vec::new();
+    let b = &r.breakdown;
+    if r.alloc.resident > 100 * MB && r.alloc.resident as f64 > 1.4 * r.used as f64 {
+        issues.push(format!(
+            "High fragmentation: resident {} MB is {:.2}x used_memory {} MB. MEMORY PURGE \
+             compacts the keyspace; consider maxmemory headroom.",
+            r.alloc.resident / MB,
+            r.alloc.resident as f64 / r.used.max(1) as f64,
+            r.used / MB
+        ));
+    }
+    if r.maxmemory > 0 && r.alloc.resident as u64 > r.maxmemory + r.maxmemory / 5 {
+        issues.push(format!(
+            "Resident memory {} MB exceeds maxmemory {} MB by over 20%: maxmemory bounds \
+             used_memory, not RSS. Leave ~25% of RAM above maxmemory.",
+            r.alloc.resident / MB,
+            r.maxmemory as usize / MB
+        ));
+    }
+    let drift = |inc: usize, exact: usize| inc.abs_diff(exact) > exact / 50 + MB;
+    if drift(b.dataset, b.dataset_exact) || drift(b.table, b.table_exact) {
+        issues.push(format!(
+            "Memory accounting drift: dataset {} vs {} bytes recomputed, table {} vs {}. \
+             MEMORY PURGE recomputes it.",
+            b.dataset, b.dataset_exact, b.table, b.table_exact
+        ));
+    }
+    if r.untracked() > 64 * MB && r.untracked() > r.used / 10 {
+        issues.push(format!(
+            "{} MB allocated is not counted in used_memory ({} MB), so maxmemory eviction \
+             will not see it.",
+            r.untracked() / MB,
+            r.used / MB
+        ));
+    }
+    if issues.is_empty() {
+        "Hi Sam, I can't find any memory issues in your instance. I can only account for what occurs on this base.".to_string()
+    } else {
+        format!(
+            "Sam, I detected a few issues in this instance memory implementation:\n\n * {}",
+            issues.join("\n * ")
+        )
+    }
+}
+
 /// Format memory section for INFO command.
 pub fn format_memory_info(
     used_mem: usize,
@@ -113,7 +223,7 @@ pub fn format_memory_info(
         maxmemory_human:{}\r\n\
         mem_not_counted_for_evict:0\r\n\
         mem_fragmentation_ratio:{:.2}\r\n\
-        mem_allocator:libc\r\n\
+        mem_allocator:jemalloc\r\n\
         allocator_allocated:{}\r\n\
         allocator_active:{}\r\n\
         allocator_resident:{}\r\n\
@@ -291,6 +401,73 @@ mod tests {
         assert!(global_allocated().is_some_and(|g| g >= 1 << 20));
         drop(w);
         assert!(mid - thread_net_bytes() >= 1 << 20);
+    }
+
+    fn report(used_mb: usize, resident_mb: usize, alloc_mb: usize, max_mb: u64) -> MemoryReport {
+        const MB: usize = 1 << 20;
+        let b = crate::table::MemoryBreakdown {
+            keys: 1000,
+            dataset: 10 * MB,
+            dataset_exact: 10 * MB,
+            table: 5 * MB,
+            table_exact: 5 * MB,
+            free_arena: MB,
+        };
+        MemoryReport {
+            breakdown: b,
+            used: used_mb * MB,
+            maxmemory: max_mb << 20,
+            alloc: AllocatorStats {
+                allocated: alloc_mb * MB,
+                active: alloc_mb * MB,
+                resident: resident_mb * MB,
+                metadata: 0,
+                mapped: 0,
+                fragmentation_ratio: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn test_memory_stats_reply_is_a_flat_map_of_named_fields() {
+        let mut out = Vec::new();
+        format_memory_stats(&report(200, 220, 210, 256), &mut out);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("*34\r\n"), "{s}");
+        for f in [
+            "used_memory",
+            "maxmemory",
+            "keys.count",
+            "dataset.bytes",
+            "overhead.hashtable.main",
+            "allocator.allocated",
+            "allocator.resident",
+            "rudis.dataset.exact.bytes",
+            "rudis.hashtable.exact.bytes",
+            "rudis.untracked.bytes",
+            "rudis.free-arena.bytes",
+            "fragmentation",
+        ] {
+            assert!(s.contains(&format!("\r\n{f}\r\n")), "missing {f}");
+        }
+        assert!(s.contains("rudis.untracked.bytes\r\n:10485760\r\n"), "{s}");
+    }
+
+    #[test]
+    fn test_memory_doctor_flags_each_problem_and_passes_a_healthy_instance() {
+        assert!(memory_doctor(&report(200, 220, 205, 256)).contains("can't find any"));
+        let frag = memory_doctor(&report(200, 300, 205, 0));
+        assert!(frag.contains("High fragmentation"), "{frag}");
+        let over = memory_doctor(&report(250, 340, 255, 256));
+        assert!(over.contains("exceeds maxmemory"), "{over}");
+        let mut drift = report(200, 220, 205, 0);
+        drift.breakdown.dataset_exact += 64 << 20;
+        assert!(memory_doctor(&drift).contains("accounting drift"));
+        let untracked = memory_doctor(&report(200, 290, 290, 0));
+        assert!(
+            untracked.contains("not counted in used_memory"),
+            "{untracked}"
+        );
     }
 
     #[test]

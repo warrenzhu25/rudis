@@ -2586,6 +2586,26 @@ impl Router {
         total_deleted
     }
 
+    /// Every shard's [`crate::table::MemoryBreakdown`], summed (for
+    /// `MEMORY STATS` / `MEMORY DOCTOR`).
+    pub async fn memory_breakdown(&self) -> crate::table::MemoryBreakdown {
+        let mut total = self.local_db.borrow().memory_breakdown();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid == self.shard_id {
+                continue;
+            }
+            let (tx, rx) = flume::bounded(1);
+            if sender
+                .send(ShardMessage::MemoryBreakdown { responder: tx })
+                .is_ok()
+                && let Ok(b) = rx.recv_async().await
+            {
+                total += b;
+            }
+        }
+        total
+    }
+
     pub async fn active_defrag(&self) -> usize {
         let mut total_freed = self.local_db.borrow_mut().active_defrag();
         let mut responders = Vec::new();

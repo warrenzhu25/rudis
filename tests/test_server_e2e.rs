@@ -231,6 +231,47 @@ fn send_and_read(stream: &mut TcpStream, cmd: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..n]).to_string()
 }
 
+/// End of the complete RESP value starting at `at`, or `None` if `buf` holds
+/// only part of it.
+fn resp_value_end(buf: &[u8], at: usize) -> Option<usize> {
+    let nl = at + buf.get(at..)?.windows(2).position(|w| w == b"\r\n")?;
+    let line = std::str::from_utf8(&buf[at + 1..nl]).ok()?;
+    match buf[at] {
+        b'$' => {
+            let n: i64 = line.parse().ok()?;
+            if n < 0 {
+                return Some(nl + 2);
+            }
+            let end = nl + 2 + n as usize + 2;
+            (buf.len() >= end).then_some(end)
+        }
+        b'*' | b'%' | b'~' => {
+            let n: i64 = line.parse().ok()?;
+            let items = if buf[at] == b'%' { 2 * n } else { n };
+            let mut pos = nl + 2;
+            for _ in 0..items.max(0) {
+                pos = resp_value_end(buf, pos)?;
+            }
+            Some(pos)
+        }
+        _ => Some(nl + 2),
+    }
+}
+
+/// Like [`send_and_read`], but keeps reading until one complete RESP reply
+/// has arrived (a large reply can span several reads under load).
+fn send_and_read_reply(stream: &mut TcpStream, cmd: &[u8]) -> String {
+    stream.write_all(cmd).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 16384];
+    while resp_value_end(&got, 0).is_none() {
+        let n = stream.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed mid-reply");
+        got.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&got).to_string()
+}
+
 fn send_and_read_bytes(stream: &mut TcpStream, cmd: &[u8]) -> Vec<u8> {
     stream.write_all(cmd).unwrap();
     let mut buf = [0u8; 16384];
@@ -29312,4 +29353,54 @@ fn test_perf_gate_flags_noisy_or_slow_hosts_e2e() {
         .status()
         .unwrap();
     assert!(syntax.success());
+}
+
+/// `MEMORY STATS` reports real accounting (keys match DBSIZE, the
+/// incremental counters match a recount), `MEMORY DOCTOR` gives a clean bill
+/// for a small healthy instance, and INFO names the real allocator.
+#[test]
+fn test_memory_stats_and_doctor_report_real_accounting_e2e() {
+    let port = 18010;
+    start_test_server(port, 4);
+    let mut c = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for batch in 0..20 {
+        let mut cmd = String::from("MSET");
+        for i in 0..500 {
+            cmd.push_str(&format!(" ms:{} value-{}", batch * 500 + i, i));
+        }
+        cmd.push_str("\r\n");
+        assert_eq!(send_and_read_reply(&mut c, cmd.as_bytes()), "+OK\r\n");
+    }
+    let raw = send_and_read_reply(&mut c, b"MEMORY STATS\r\n");
+    let toks: Vec<&str> = raw
+        .split("\r\n")
+        .filter(|t| !t.is_empty() && !t.starts_with('*') && !t.starts_with('$'))
+        .collect();
+    let field = |name: &str| -> String {
+        let i = toks
+            .iter()
+            .position(|t| *t == name)
+            .unwrap_or_else(|| panic!("{name} missing: {raw}"));
+        toks[i + 1].trim_start_matches(':').to_string()
+    };
+    assert_eq!(field("keys.count"), "10000");
+    assert_eq!(field("dataset.bytes"), field("rudis.dataset.exact.bytes"));
+    assert_eq!(
+        field("overhead.hashtable.main"),
+        field("rudis.hashtable.exact.bytes")
+    );
+    assert!(field("used_memory").parse::<u64>().unwrap() > 0);
+    let doctor = send_and_read_reply(&mut c, b"MEMORY DOCTOR\r\n");
+    // Allocator figures are process-wide and this test process hosts many
+    // servers, so fragmentation findings may appear here; the server's own
+    // accounting must not drift.
+    assert!(doctor.starts_with('$'), "{doctor}");
+    assert!(
+        doctor.contains("can't find any memory issues") || doctor.contains("detected a few issues"),
+        "{doctor}"
+    );
+    assert!(!doctor.contains("accounting drift"), "{doctor}");
+    let info = send_and_read_reply(&mut c, b"INFO memory\r\n");
+    assert!(info.contains("mem_allocator:jemalloc"), "{info}");
 }
