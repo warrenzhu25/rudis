@@ -160,7 +160,6 @@ pub const MAX_ARENA_POOLED: usize = 1024;
 #[derive(Debug, Default)]
 pub struct SmallCollectionArena {
     list_pool: Vec<crate::packedlist::PackedList>,
-    hash_pool: Vec<Vec<u8>>,
     set_pool: Vec<Vec<crate::table::SmallSetEntry>>,
     zset_pool: Vec<Vec<(crate::table::OrderedScore, crate::compact::CompactKey)>>,
     pub allocations_saved: u64,
@@ -171,7 +170,6 @@ impl SmallCollectionArena {
     pub fn new() -> Self {
         Self {
             list_pool: Vec::new(),
-            hash_pool: Vec::new(),
             set_pool: Vec::new(),
             zset_pool: Vec::new(),
             allocations_saved: 0,
@@ -198,24 +196,17 @@ impl SmallCollectionArena {
         }
     }
 
+    /// A new empty small hash. Not pooled: a small hash is one exactly sized
+    /// allocation that every insert reallocates, so a recycled one saves
+    /// nothing over the allocator's own thread cache.
     #[inline(always)]
     pub fn acquire_small_hash(&mut self, _min_pairs: usize) -> crate::smallhash::SmallHash {
-        match self.hash_pool.pop() {
-            Some(buf) => {
-                self.allocations_saved += 1;
-                crate::smallhash::SmallHash::with_buf(buf)
-            }
-            None => crate::smallhash::SmallHash::default(),
-        }
+        crate::smallhash::SmallHash::new()
     }
 
     #[inline(always)]
     pub fn recycle_small_hash(&mut self, h: crate::smallhash::SmallHash) {
-        let buf = h.into_buf();
-        if buf.capacity() > 0 && buf.capacity() <= 4096 && self.hash_pool.len() < MAX_ARENA_POOLED {
-            self.recycles_count += 1;
-            self.hash_pool.push(buf);
-        }
+        drop(h);
     }
 
     #[inline(always)]
@@ -272,7 +263,7 @@ impl SmallCollectionArena {
     pub fn pool_stats(&self) -> (usize, usize, usize, usize) {
         (
             self.list_pool.len(),
-            self.hash_pool.len(),
+            0,
             self.set_pool.len(),
             self.zset_pool.len(),
         )
@@ -329,17 +320,16 @@ mod tests {
         assert!(d2.is_empty());
         assert_eq!(arena.pool_stats().0, 0);
 
-        // 2. Small Hash pool
+        // 2. Small hashes are not pooled (one exact allocation each).
         let mut h = arena.acquire_small_hash(4);
         h.push_new(b"f1", b"v1");
         arena.recycle_small_hash(h);
-        assert_eq!(arena.recycles_count, 2);
-        assert_eq!(arena.pool_stats().1, 1);
+        assert_eq!(arena.recycles_count, 1);
+        assert_eq!(arena.pool_stats().1, 0);
 
         let h2 = arena.acquire_small_hash(2);
-        assert_eq!(arena.allocations_saved, 2);
+        assert_eq!(arena.allocations_saved, 1);
         assert!(h2.is_empty());
-        assert_eq!(arena.pool_stats().1, 0);
 
         // 3. Set pool
         let mut s = arena.acquire_small_set(8);
@@ -348,11 +338,11 @@ mod tests {
             member: crate::compact::CompactKey::new(b"m1"),
         });
         arena.recycle_small_set(s);
-        assert_eq!(arena.recycles_count, 3);
+        assert_eq!(arena.recycles_count, 2);
         assert_eq!(arena.pool_stats().2, 1);
 
         let s2 = arena.acquire_small_set(4);
-        assert_eq!(arena.allocations_saved, 3);
+        assert_eq!(arena.allocations_saved, 2);
         assert!(s2.is_empty());
         assert_eq!(arena.pool_stats().2, 0);
 
@@ -360,11 +350,11 @@ mod tests {
         let mut z = arena.acquire_small_zset(8);
         z.push((OrderedScore(1.0), crate::compact::CompactKey::new(b"zm1")));
         arena.recycle_small_zset(z);
-        assert_eq!(arena.recycles_count, 4);
+        assert_eq!(arena.recycles_count, 3);
         assert_eq!(arena.pool_stats().3, 1);
 
         let z2 = arena.acquire_small_zset(4);
-        assert_eq!(arena.allocations_saved, 4);
+        assert_eq!(arena.allocations_saved, 3);
         assert!(z2.is_empty());
         assert_eq!(arena.pool_stats().3, 0);
     }
@@ -399,7 +389,7 @@ mod tests {
         );
         assert_eq!(table.hdel(hkey, std::slice::from_ref(&f1.0)).unwrap(), 1);
         assert!(!table.exists(hkey));
-        assert_eq!(table.arena.pool_stats().1, 1);
+        assert_eq!(table.arena.pool_stats().1, 0);
 
         // Set sadd_slice and srem to empty
         let skey = b"myset";

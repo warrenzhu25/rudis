@@ -75,11 +75,60 @@ fn parse_pair(buf: &[u8], off: usize) -> Pair {
     }
 }
 
-#[derive(Clone, Default, PartialEq, Eq)]
+/// Header bytes before the pairs: pair count and pair-byte length (`u32`
+/// each).
+const HDR: usize = 8;
+
+/// One exactly sized heap allocation, `[count: u32][len: u32][pairs]`, held
+/// by an 8-byte pointer. A `Vec` plus count needed a separate 32-byte box
+/// (`RudisValue` holds one pointer), so every small hash cost two
+/// allocations and two pointer hops per lookup.
 pub struct SmallHash {
-    buf: Vec<u8>,
-    len: u32,
+    ptr: std::ptr::NonNull<u8>,
 }
+
+// SAFETY: `SmallHash` uniquely owns its allocation (like `Box<[u8]>`); no
+// shared or thread-local state.
+unsafe impl Send for SmallHash {}
+// SAFETY: `&SmallHash` only allows reads of the owned bytes.
+unsafe impl Sync for SmallHash {}
+
+#[inline(always)]
+fn layout(len: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(HDR + len, 4).expect("small hash layout")
+}
+
+impl Drop for SmallHash {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` was allocated with `layout(byte_len)` and is not used
+        // after this.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout(self.byte_len())) }
+    }
+}
+
+impl Default for SmallHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for SmallHash {
+    fn clone(&self) -> Self {
+        let mut h = SmallHash::new();
+        h.resize(self.byte_len());
+        h.bytes_mut().copy_from_slice(self.bytes());
+        h.set_count(self.len());
+        h
+    }
+}
+
+impl PartialEq for SmallHash {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for SmallHash {}
 
 impl std::fmt::Debug for SmallHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,15 +142,106 @@ impl std::fmt::Debug for SmallHash {
 }
 
 impl SmallHash {
-    /// An empty hash reusing `buf`'s allocation.
-    pub fn with_buf(mut buf: Vec<u8>) -> Self {
-        buf.clear();
-        SmallHash { buf, len: 0 }
+    /// An empty hash: just the header.
+    pub fn new() -> Self {
+        // SAFETY: the layout is non-zero sized (`HDR > 0`).
+        let raw = unsafe { std::alloc::alloc(layout(0)) };
+        let ptr = std::ptr::NonNull::new(raw)
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout(0)));
+        let mut h = SmallHash { ptr };
+        h.set_header(0, 0);
+        h
     }
 
-    /// The buffer, for recycling.
-    pub fn into_buf(self) -> Vec<u8> {
-        self.buf
+    #[inline(always)]
+    fn header(&self) -> (u32, u32) {
+        // SAFETY: the allocation always starts with `HDR` initialized bytes,
+        // aligned to 4.
+        unsafe {
+            let p = self.ptr.as_ptr() as *const u32;
+            (p.read(), p.add(1).read())
+        }
+    }
+
+    #[inline(always)]
+    fn set_header(&mut self, count: u32, len: u32) {
+        // SAFETY: as in `header`; `&mut self` gives exclusive access.
+        unsafe {
+            let p = self.ptr.as_ptr() as *mut u32;
+            p.write(count);
+            p.add(1).write(len);
+        }
+    }
+
+    #[inline(always)]
+    fn byte_len(&self) -> usize {
+        self.header().1 as usize
+    }
+
+    /// The packed pairs.
+    #[inline(always)]
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the allocation holds `HDR + len` bytes, all initialized.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(HDR), self.byte_len()) }
+    }
+
+    #[inline(always)]
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in `bytes`, with exclusive access.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(HDR), self.byte_len()) }
+    }
+
+    /// Reallocates to exactly `new_len` pair bytes (count unchanged); new
+    /// bytes are zeroed.
+    fn resize(&mut self, new_len: usize) {
+        let old_len = self.byte_len();
+        if new_len == old_len {
+            return;
+        }
+        let len32 = u32::try_from(new_len).expect("small hash under 4 GiB");
+        // SAFETY: `ptr` was allocated with `layout(old_len)`; the new size is
+        // non-zero. On success the first `HDR + min(old, new)` bytes are kept.
+        let raw = unsafe { std::alloc::realloc(self.ptr.as_ptr(), layout(old_len), HDR + new_len) };
+        self.ptr = std::ptr::NonNull::new(raw)
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout(new_len)));
+        if new_len > old_len {
+            // SAFETY: the bytes past the old length are inside the new allocation.
+            unsafe {
+                self.ptr
+                    .as_ptr()
+                    .add(HDR + old_len)
+                    .write_bytes(0, new_len - old_len)
+            };
+        }
+        let count = self.header().0;
+        self.set_header(count, len32);
+    }
+
+    /// Replaces `range` of the pair bytes with `with` (a `Vec::splice`).
+    fn replace_range(&mut self, range: std::ops::Range<usize>, with: &[u8]) {
+        let old_len = self.byte_len();
+        let new_len = old_len - range.len() + with.len();
+        if new_len > old_len {
+            self.resize(new_len);
+            self.bytes_mut()
+                .copy_within(range.end..old_len, range.start + with.len());
+        } else {
+            self.bytes_mut()
+                .copy_within(range.end..old_len, range.start + with.len());
+            self.resize(new_len);
+        }
+        self.bytes_mut()[range.start..range.start + with.len()].copy_from_slice(with);
+    }
+
+    #[inline(always)]
+    fn set_count(&mut self, count: usize) {
+        let len = self.header().1;
+        self.set_header(count as u32, len);
+    }
+
+    /// Bytes this hash occupies on the heap (header included).
+    pub fn heap_bytes(&self) -> usize {
+        HDR + self.byte_len()
     }
 
     /// Builds a hash from pairs; a repeated field keeps its last value.
@@ -118,18 +258,18 @@ impl SmallHash {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.len as usize
+        self.header().0 as usize
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.header().0 == 0
     }
 
     /// Byte offset and ranges of `field`'s pair.
     #[inline]
     fn find(&self, field: &[u8]) -> Option<(usize, Pair)> {
-        let buf = &self.buf[..];
+        let buf = self.bytes();
         let mut off = 0;
         while off < buf.len() {
             let p = parse_pair(buf, off);
@@ -144,7 +284,7 @@ impl SmallHash {
     #[inline]
     pub fn get(&self, field: &[u8]) -> Option<&[u8]> {
         self.find(field)
-            .map(|(_, p)| &self.buf[p.value.0..p.value.1])
+            .map(|(_, p)| &self.bytes()[p.value.0..p.value.1])
     }
 
     #[inline]
@@ -154,14 +294,21 @@ impl SmallHash {
 
     /// Appends a pair whose field is known to be absent.
     pub fn push_new(&mut self, field: &[u8], value: &[u8]) {
-        self.buf.reserve_exact(
-            varint_len(field.len()) + field.len() + varint_len(value.len()) + value.len(),
-        );
-        write_varint(&mut self.buf, field.len());
-        self.buf.extend_from_slice(field);
-        write_varint(&mut self.buf, value.len());
-        self.buf.extend_from_slice(value);
-        self.len += 1;
+        let at = self.byte_len();
+        let (fl, vl) = (varint_len(field.len()), varint_len(value.len()));
+        self.resize(at + fl + field.len() + vl + value.len());
+        let mut enc = Vec::with_capacity(fl + vl);
+        write_varint(&mut enc, field.len());
+        let dst = &mut self.bytes_mut()[at..];
+        dst[..fl].copy_from_slice(&enc);
+        dst[fl..fl + field.len()].copy_from_slice(field);
+        enc.clear();
+        write_varint(&mut enc, value.len());
+        let dst = &mut dst[fl + field.len()..];
+        dst[..vl].copy_from_slice(&enc);
+        dst[vl..].copy_from_slice(value);
+        let n = self.len();
+        self.set_count(n + 1);
     }
 
     /// Sets `field` to `value`; true if the field was added.
@@ -169,12 +316,12 @@ impl SmallHash {
         match self.find(field) {
             Some((_, p)) => {
                 if p.value.1 - p.value.0 == value.len() {
-                    self.buf[p.value.0..p.value.1].copy_from_slice(value);
+                    self.bytes_mut()[p.value.0..p.value.1].copy_from_slice(value);
                 } else {
                     let mut enc = Vec::with_capacity(varint_len(value.len()) + value.len());
                     write_varint(&mut enc, value.len());
                     enc.extend_from_slice(value);
-                    self.buf.splice(p.vlen_at..p.value.1, enc);
+                    self.replace_range(p.vlen_at..p.value.1, &enc);
                 }
                 false
             }
@@ -188,9 +335,10 @@ impl SmallHash {
     /// Removes `field`, returning its value.
     pub fn take(&mut self, field: &[u8]) -> Option<Bytes> {
         let (off, p) = self.find(field)?;
-        let v = Bytes::copy_from_slice(&self.buf[p.value.0..p.value.1]);
-        self.buf.drain(off..p.value.1);
-        self.len -= 1;
+        let v = Bytes::copy_from_slice(&self.bytes()[p.value.0..p.value.1]);
+        self.replace_range(off..p.value.1, &[]);
+        let n = self.len();
+        self.set_count(n - 1);
         Some(v)
     }
 
@@ -198,8 +346,9 @@ impl SmallHash {
     pub fn remove(&mut self, field: &[u8]) -> bool {
         match self.find(field) {
             Some((off, p)) => {
-                self.buf.drain(off..p.value.1);
-                self.len -= 1;
+                self.replace_range(off..p.value.1, &[]);
+                let n = self.len();
+                self.set_count(n - 1);
                 true
             }
             None => false,
@@ -210,9 +359,9 @@ impl SmallHash {
     #[inline]
     pub fn iter(&self) -> SmallHashIter<'_> {
         SmallHashIter {
-            buf: &self.buf,
+            buf: self.bytes(),
             off: 0,
-            left: self.len as usize,
+            left: self.len(),
         }
     }
 
@@ -232,9 +381,8 @@ impl SmallHash {
         m
     }
 
-    pub fn shrink_to_fit(&mut self) {
-        self.buf.shrink_to_fit();
-    }
+    /// Allocations are always exact; kept for callers that shrink values.
+    pub fn shrink_to_fit(&mut self) {}
 
     /// Bytes of payload (fields and values, without length prefixes).
     pub fn payload_bytes(&self) -> usize {
@@ -342,6 +490,53 @@ mod tests {
         }
     }
 
+    /// The single exactly sized allocation is reallocated on every change:
+    /// growing and shrinking values in the middle, removals at both ends, and
+    /// clones must all keep the bytes and header consistent.
+    #[test]
+    fn thin_allocation_survives_resizes_in_place_and_clones() {
+        let mut h = SmallHash::new();
+        assert!(h.is_empty() && h.heap_bytes() == HDR);
+        let mut model: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut x: u64 = 7;
+        for round in 0..2000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let f = format!("f{}", x % 24).into_bytes();
+            let vlen = ((x >> 8) % 200) as usize; // crosses the 1/2-byte varint edge
+            let v = vec![b'a' + (round % 26) as u8; vlen];
+            match (x >> 20) % 4 {
+                0 | 1 => {
+                    h.set(&f, &v);
+                    match model.iter_mut().find(|(k, _)| *k == f) {
+                        Some(e) => e.1 = v,
+                        None => model.push((f, v)),
+                    }
+                }
+                2 => {
+                    let got = h.take(&f).map(|b| b.to_vec());
+                    let pos = model.iter().position(|(k, _)| *k == f);
+                    assert_eq!(got, pos.map(|i| model.remove(i).1));
+                }
+                _ => {
+                    let c = h.clone();
+                    assert_eq!(c, h);
+                    h = c;
+                }
+            }
+            let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+                h.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
+            assert_eq!(pairs, model, "round {round}");
+            assert_eq!(h.len(), model.len());
+            let enc: usize = model
+                .iter()
+                .map(|(k, v)| varint_len(k.len()) + k.len() + varint_len(v.len()) + v.len())
+                .sum();
+            assert_eq!(h.heap_bytes(), HDR + enc);
+        }
+    }
+
     #[test]
     fn packs_ten_short_pairs_into_one_small_buffer() {
         let mut h = SmallHash::default();
@@ -349,7 +544,9 @@ mod tests {
             h.set(format!("f{i:04}").as_bytes(), format!("v{i:04}").as_bytes());
         }
         // 10 pairs x (1 + 5 + 1 + 5) bytes, no per-pair handles.
-        assert_eq!(h.buf.len(), 120);
+        assert_eq!(h.byte_len(), 120);
+        assert_eq!(h.heap_bytes(), 128);
+        assert_eq!(std::mem::size_of::<SmallHash>(), 8);
         assert_eq!(h.get(b"f0007"), Some(&b"v0007"[..]));
         assert!(!h.contains(b"f0010"));
     }

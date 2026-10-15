@@ -29076,3 +29076,75 @@ fn test_pipelined_reply_values_of_all_sizes_e2e() {
     assert!(got == want, "pipelined replies differ");
     assert_eq!(send_and_read(&mut client, b"PING\r\n"), "+PONG\r\n");
 }
+
+/// Small hashes live in one exactly sized allocation that every write
+/// reallocates. Drive one through growing, shrinking and same-size value
+/// updates, field removal down to empty (key deleted), HINCRBY, and promotion
+/// past the listpack limits, checking every reply.
+#[test]
+fn test_small_hash_single_allocation_round_trips_e2e() {
+    let port = 18007;
+    start_test_server(port, 4);
+    let mut c = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut q = |args: &[&str]| -> String {
+        let mut cmd = format!("*{}\r\n", args.len());
+        for a in args {
+            cmd.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        send_and_read(&mut c, cmd.as_bytes())
+    };
+    let bulk = |s: &str| format!("${}\r\n{}\r\n", s.len(), s);
+    // Let a 200-byte value stay in the listpack so it needs a 2-byte prefix.
+    assert_eq!(
+        q(&["CONFIG", "SET", "hash-max-listpack-value", "1024"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        q(&["HSET", "sh", "a", "1", "b", "22", "c", "333"]),
+        ":3\r\n"
+    );
+    assert_eq!(q(&["OBJECT", "ENCODING", "sh"]), bulk("listpack"));
+    // Grow a middle value past the 1-byte length prefix, then shrink it.
+    let long = "x".repeat(200);
+    assert_eq!(q(&["HSET", "sh", "b", &long]), ":0\r\n");
+    assert_eq!(q(&["HGET", "sh", "b"]), bulk(&long));
+    assert_eq!(q(&["HGET", "sh", "c"]), bulk("333"));
+    assert_eq!(q(&["OBJECT", "ENCODING", "sh"]), bulk("listpack"));
+    assert_eq!(q(&["HSET", "sh", "b", "y"]), ":0\r\n");
+    assert_eq!(q(&["HSET", "sh", "b", "z"]), ":0\r\n"); // same size, in place
+    assert_eq!(
+        q(&["HGETALL", "sh"]),
+        format!(
+            "*6\r\n{}{}{}{}{}{}",
+            bulk("a"),
+            bulk("1"),
+            bulk("b"),
+            bulk("z"),
+            bulk("c"),
+            bulk("333")
+        )
+    );
+    assert_eq!(q(&["HINCRBY", "sh", "a", "41"]), ":42\r\n");
+    assert_eq!(q(&["HSTRLEN", "sh", "a"]), ":2\r\n");
+    // Remove from the front, the back, then the last field.
+    assert_eq!(q(&["HDEL", "sh", "a"]), ":1\r\n");
+    assert_eq!(q(&["HDEL", "sh", "c"]), ":1\r\n");
+    assert_eq!(q(&["HLEN", "sh"]), ":1\r\n");
+    assert_eq!(q(&["HDEL", "sh", "b"]), ":1\r\n");
+    assert_eq!(q(&["EXISTS", "sh"]), ":0\r\n");
+    // Promotion past hash-max-listpack-entries keeps every pair.
+    for i in 0..600 {
+        let (f, v) = (format!("f{i}"), format!("v{i}"));
+        assert_eq!(q(&["HSET", "big", &f, &v]), ":1\r\n");
+    }
+    assert_eq!(q(&["OBJECT", "ENCODING", "big"]), bulk("hashtable"));
+    assert_eq!(q(&["HLEN", "big"]), ":600\r\n");
+    assert_eq!(q(&["HGET", "big", "f0"]), bulk("v0"));
+    assert_eq!(q(&["HGET", "big", "f599"]), bulk("v599"));
+    // Copies are independent (each owns its allocation).
+    assert_eq!(q(&["HSET", "src", "k", "v"]), ":1\r\n");
+    assert_eq!(q(&["COPY", "src", "dst"]), ":1\r\n");
+    assert_eq!(q(&["HSET", "src", "k", "changed"]), ":0\r\n");
+    assert_eq!(q(&["HGET", "dst", "k"]), bulk("v"));
+}

@@ -1379,7 +1379,7 @@ pub struct TieredPointer {
 pub enum RudisValue {
     String(crate::compact::CompactStr),
     Int(i64),
-    SmallHash(Box<crate::smallhash::SmallHash>),
+    SmallHash(crate::smallhash::SmallHash),
     Hash(Box<RudisHashMap>),
     List(Box<crate::packedlist::PackedList>),
     Set(Box<RudisSet>),
@@ -3524,7 +3524,7 @@ impl RudisTable {
     pub fn recycle_value(&mut self, val: RudisValue) {
         match val {
             RudisValue::List(deque) => self.arena.recycle_list(*deque),
-            RudisValue::SmallHash(pairs) => self.arena.recycle_small_hash(*pairs),
+            RudisValue::SmallHash(pairs) => self.arena.recycle_small_hash(pairs),
             RudisValue::Set(s) => {
                 if let RudisSet::Small(v) = *s {
                     self.arena.recycle_small_set(v);
@@ -6155,7 +6155,7 @@ impl RudisTable {
         let val = if field.len() <= max_value && val.len() <= max_value {
             let mut pairs = self.arena.acquire_small_hash(1);
             pairs.push_new(field, val);
-            RudisValue::SmallHash(Box::new(pairs))
+            RudisValue::SmallHash(pairs)
         } else {
             let mut map = RudisHashMap::with_capacity(1);
             map.insert(field, val);
@@ -6261,7 +6261,7 @@ impl RudisTable {
                     added += 1;
                 }
             }
-            (RudisValue::SmallHash(Box::new(pairs)), added)
+            (RudisValue::SmallHash(pairs), added)
         } else {
             let mut map = RudisHashMap::with_capacity(fields.len());
             let mut added = 0;
@@ -6334,7 +6334,7 @@ impl RudisTable {
         } else {
             let mut pairs = crate::smallhash::SmallHash::default();
             pairs.push_new(&field, &value);
-            RudisValue::SmallHash(Box::new(pairs))
+            RudisValue::SmallHash(pairs)
         };
         let entry = RudisEntry::new(CompactKey::new(&key), val, Expiry::from(None));
         self.table.insert(entry);
@@ -7713,10 +7713,10 @@ impl RudisTable {
         let val_bytes = Bytes::from(delta.to_string());
         let entry = RudisEntry::new(
             CompactKey::new(&key),
-            RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from_pairs([(
+            RudisValue::SmallHash(crate::smallhash::SmallHash::from_pairs([(
                 field.as_ref(),
                 val_bytes.as_ref(),
-            )]))),
+            )])),
             Expiry::from(None),
         );
         self.table.insert(entry);
@@ -7794,10 +7794,10 @@ impl RudisTable {
         let val_bytes = Bytes::from(delta.to_string());
         let entry = RudisEntry::new(
             CompactKey::new(&key),
-            RudisValue::SmallHash(Box::new(crate::smallhash::SmallHash::from_pairs([(
+            RudisValue::SmallHash(crate::smallhash::SmallHash::from_pairs([(
                 field.as_ref(),
                 val_bytes.as_ref(),
-            )]))),
+            )])),
             Expiry::from(None),
         );
         self.table.insert(entry);
@@ -14400,7 +14400,7 @@ impl RudisTable {
                         }
                         pairs.push_new(&f, &v);
                     }
-                    RudisValue::SmallHash(Box::new(pairs))
+                    RudisValue::SmallHash(pairs)
                 } else {
                     let mut hash =
                         RudisHashMap::with_capacity(claimed_capacity(count, data, cursor, 8));
