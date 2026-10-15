@@ -336,8 +336,11 @@ def run_memtier_gate(rudis_bin, port, threads, launches, runs, secs):
     if not os.path.exists(rudis_bin):
         return None, [f"Rudis binary not found: {rudis_bin} (run cargo build --release)"]
     server_cpus = f"16-{16 + threads - 1}"
-    client_threads = min(threads, 16)
-    client_cpus = f"0-{client_threads - 1}"
+    # 16 client threads, one per CPU on 0-15 (below the server's CPUs). With
+    # only `threads` client CPUs (8), 1 KiB GET was client-bound at ~1.2M
+    # ops/s, and its run-to-run noise read as small server regressions.
+    client_threads = 16
+    client_cpus = "0-15"
     json_path = f"/tmp/perf_gate_{port}.json"
     samples = {wl: [] for wl in MEMTIER_WORKLOADS}
     for _ in range(launches):
@@ -569,7 +572,7 @@ def main():
     parser.add_argument("--baseline-bin", help="With --memtier: A/B against this rudis binary")
     parser.add_argument("--max-ab-drop-pct", type=float, default=DEFAULT_MAX_AB_DROP_PCT,
                         help="With an A/B: allowed drop vs the baseline build")
-    parser.add_argument("--rounds", type=int, default=2, help="With an A/B: minimum rounds")
+    parser.add_argument("--rounds", type=int, default=3, help="With an A/B: minimum rounds")
     parser.add_argument("--max-rounds", type=int, default=4,
                         help="With an A/B: rounds allowed while results are noisy")
     parser.add_argument("--max-busy-cpus", type=float, default=2.0,
