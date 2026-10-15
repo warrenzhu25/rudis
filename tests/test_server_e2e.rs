@@ -29148,3 +29148,85 @@ fn test_small_hash_single_allocation_round_trips_e2e() {
     assert_eq!(q(&["HSET", "src", "k", "changed"]), ":0\r\n");
     assert_eq!(q(&["HGET", "dst", "k"]), bulk("v"));
 }
+
+/// ASCII values of 25..=255 bytes may be stored 7 bits per byte. Every
+/// string command must still see the original bytes: plain and pipelined
+/// cross-shard reads, range reads and writes, APPEND, GETSET/GETDEL, DUMP and
+/// RESTORE, and the edges around the packed range (24/25, 255/256 bytes,
+/// non-ASCII).
+#[test]
+fn test_packed_heap_strings_read_back_exactly_e2e() {
+    let port = 18008;
+    start_test_server(port, 4);
+    let mut c = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut q = |args: &[&[u8]]| -> Vec<u8> {
+        let mut cmd = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            cmd.extend(format!("${}\r\n", a.len()).into_bytes());
+            cmd.extend_from_slice(a);
+            cmd.extend_from_slice(b"\r\n");
+        }
+        send_and_read_bytes(&mut c, &cmd)
+    };
+    let bulk = |v: &[u8]| {
+        let mut b = format!("${}\r\n", v.len()).into_bytes();
+        b.extend_from_slice(v);
+        b.extend_from_slice(b"\r\n");
+        b
+    };
+    let val = |n: usize, seed: usize| -> Vec<u8> {
+        (0..n)
+            .map(|i| b' ' + ((i * 31 + seed) % 95) as u8)
+            .collect()
+    };
+    let mut keys = Vec::new();
+    for (i, n) in [24usize, 25, 64, 97, 100, 128, 200, 255, 256]
+        .into_iter()
+        .enumerate()
+    {
+        let k = format!("ps:{n}").into_bytes();
+        let v = val(n, i);
+        assert_eq!(q(&[b"SET", &k, &v]), b"+OK\r\n");
+        assert_eq!(q(&[b"GET", &k]), bulk(&v), "GET {n}");
+        assert_eq!(q(&[b"STRLEN", &k]), format!(":{n}\r\n").into_bytes());
+        keys.push((k, v));
+    }
+    // Non-ASCII stays exact too.
+    let mut bin = val(100, 9);
+    bin[50] = 0xC3;
+    assert_eq!(q(&[b"SET", b"ps:bin", &bin]), b"+OK\r\n");
+    assert_eq!(q(&[b"GET", b"ps:bin"]), bulk(&bin));
+    // MGET across shards, one command and pipelined.
+    let mut mget: Vec<&[u8]> = vec![b"MGET"];
+    mget.extend(keys.iter().map(|(k, _)| k.as_slice()));
+    let mut want = format!("*{}\r\n", keys.len()).into_bytes();
+    for (_, v) in &keys {
+        want.extend(bulk(v));
+    }
+    assert_eq!(q(&mget), want);
+    // Range reads/writes and APPEND on a packed value.
+    let (k100, v100) = (&keys[4].0, keys[4].1.clone());
+    assert_eq!(q(&[b"GETRANGE", k100, b"10", b"19"]), bulk(&v100[10..20]));
+    assert_eq!(q(&[b"SETRANGE", k100, b"5", b"HELLO"]), b":100\r\n");
+    let mut v2 = v100.clone();
+    v2[5..10].copy_from_slice(b"HELLO");
+    assert_eq!(q(&[b"GET", k100]), bulk(&v2));
+    assert_eq!(q(&[b"APPEND", k100, b"!!"]), b":102\r\n");
+    v2.extend_from_slice(b"!!");
+    assert_eq!(q(&[b"GET", k100]), bulk(&v2));
+    // GETSET / GETDEL return the packed value.
+    let (k200, v200) = (&keys[6].0, keys[6].1.clone());
+    let new200 = val(200, 77);
+    assert_eq!(q(&[b"GETSET", k200, &new200]), bulk(&v200));
+    assert_eq!(q(&[b"GETDEL", k200]), bulk(&new200));
+    assert_eq!(q(&[b"EXISTS", k200]), b":0\r\n");
+    // DUMP / RESTORE round trip.
+    let (k128, v128) = (&keys[5].0, keys[5].1.clone());
+    let dump = q(&[b"DUMP", k128]);
+    assert!(dump.starts_with(b"$"));
+    let body_start = dump.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let payload = &dump[body_start..dump.len() - 2];
+    assert_eq!(q(&[b"RESTORE", b"ps:restored", b"0", payload]), b"+OK\r\n");
+    assert_eq!(q(&[b"GET", b"ps:restored"]), bulk(&v128));
+}

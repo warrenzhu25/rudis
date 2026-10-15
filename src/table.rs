@@ -4030,7 +4030,7 @@ impl RudisTable {
             };
             let res = match val_ref {
                 RudisValue::String(b) => {
-                    crate::connection::write_resp_bulk(out, &b.view());
+                    b.write_resp_bulk(out);
                     Ok(true)
                 }
                 RudisValue::Int(n) => {
@@ -17210,11 +17210,23 @@ mod tests {
         }
         assert_eq!(table.data_bytes, n * ENTRY_OVERHEAD);
 
-        // Heap keys/values are charged their full length.
+        // Heap keys/values are charged their full length (non-ASCII: unpacked).
         let long_key = vec![b'k'; 40];
-        let long_val = vec![b'v'; 100];
+        let long_val = vec![0xFFu8; 100];
         table.set(Bytes::from(long_key.clone()), Bytes::from(long_val), None);
         assert_eq!(table.data_bytes, (n + 1) * ENTRY_OVERHEAD + 40 + 100);
+        assert!(table.del(&long_key));
+        assert_eq!(table.data_bytes, n * ENTRY_OVERHEAD);
+        // A packed (7-bit ASCII) heap value is charged its packed length.
+        table.set(
+            Bytes::from(long_key.clone()),
+            Bytes::from(vec![b'v'; 100]),
+            None,
+        );
+        assert_eq!(
+            table.data_bytes,
+            (n + 1) * ENTRY_OVERHEAD + 40 + crate::compact::packed_len(100)
+        );
         assert!(table.del(&long_key));
         assert_eq!(table.data_bytes, n * ENTRY_OVERHEAD);
     }

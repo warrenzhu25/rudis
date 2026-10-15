@@ -133,6 +133,12 @@ impl CompactResp {
     /// encoded inline, long ones share the value's allocation.
     #[inline(always)]
     pub fn from_compact_str(s: &crate::compact::CompactStr) -> Self {
+        if s.is_heap_packed() {
+            // Unpack once, straight into the encoded reply.
+            let mut v = Vec::with_capacity(s.len() + 8);
+            s.write_resp_bulk(&mut v);
+            return CompactResp::Big(v);
+        }
         Self::from_bulk_with(&s.view(), || s.to_bytes())
     }
 

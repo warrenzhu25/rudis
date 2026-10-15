@@ -482,6 +482,14 @@ pub enum CompactStr {
         len: u32,
         ptr: NonNull<u8>,
     },
+    /// An ASCII value of `len` bytes ([`HEAP_PACK_MIN`]..=[`HEAP_PACK_MAX`])
+    /// stored 7 bits per byte in a leaked `Box<[u8]>` of
+    /// `packed_len(len)` bytes; used only when that lands in a smaller
+    /// allocator size class than the plain bytes would.
+    HeapPacked {
+        len: u32,
+        ptr: NonNull<u8>,
+    },
     Shared(Box<Bytes>),
 }
 
@@ -510,6 +518,130 @@ fn unpack7_u64(x: u64) -> u64 {
     let x = (x & 0x0000_0000_0fff_ffff) | ((x << 4) & 0x0fff_ffff_0000_0000);
     let x = (x & 0x0000_3fff_0000_3fff) | ((x << 2) & 0x3fff_0000_3fff_0000);
     (x & 0x007f_007f_007f_007f) | ((x << 1) & 0x7f00_7f00_7f00_7f00)
+}
+
+/// Shortest value [`CompactStr::HeapPacked`] holds (longer than any inline
+/// encoding).
+pub const HEAP_PACK_MIN: usize = STR_MAX_PACKED_CAP + 1;
+/// Longest value [`CompactStr::HeapPacked`] holds: values from
+/// [`SHARE_MIN`] up are shared zero-copy on read, which packing would undo.
+pub const HEAP_PACK_MAX: usize = SHARE_MIN - 1;
+
+/// Bytes `n` ASCII bytes take packed 7 bits each.
+#[inline(always)]
+pub(crate) fn packed_len(n: usize) -> usize {
+    (n * 7).div_ceil(8)
+}
+
+/// jemalloc's size class for a small allocation of `n` bytes (16-byte steps
+/// to 128, 32-byte steps to 256). Packing only pays when it changes this.
+#[inline(always)]
+fn alloc_class(n: usize) -> usize {
+    if n <= 128 {
+        n.div_ceil(16) * 16
+    } else {
+        n.div_ceil(32) * 32
+    }
+}
+
+/// True when `s` should be stored as [`CompactStr::HeapPacked`].
+#[inline]
+fn heap_pack_pays(s: &[u8]) -> bool {
+    let n = s.len();
+    (HEAP_PACK_MIN..=HEAP_PACK_MAX).contains(&n)
+        && alloc_class(packed_len(n)) < alloc_class(n)
+        && s.is_ascii()
+}
+
+/// Low 7 bits of each byte: the lanes [`pack7_heap`] keeps.
+const LANES7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+
+/// Packs ASCII `s`, 8 bytes into 7 at a time, into `packed_len(s.len())` bytes.
+fn pack7_heap(s: &[u8]) -> Box<[u8]> {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("bmi2") {
+        // SAFETY: BMI2 is available (checked just above).
+        return unsafe { pack7_heap_bmi2(s) };
+    }
+    pack7_heap_with(s, pack7_u64)
+}
+
+/// [`pack7_heap`] with `pext` packing each 8-byte group in one instruction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+fn pack7_heap_bmi2(s: &[u8]) -> Box<[u8]> {
+    pack7_heap_with(s, |w| std::arch::x86_64::_pext_u64(w, LANES7))
+}
+
+#[inline(always)]
+fn pack7_heap_with(s: &[u8], pack: impl Fn(u64) -> u64) -> Box<[u8]> {
+    let plen = packed_len(s.len());
+    let mut out = vec![0u8; plen].into_boxed_slice();
+    let mut at = 0;
+    let (groups, tail) = s.as_chunks::<8>();
+    for g in groups {
+        let p = pack(u64::from_le_bytes(*g)).to_le_bytes();
+        // Fixed-size stores: all 8 bytes while they fit (the 8th is
+        // overwritten by the next group), else the 7 that matter.
+        if at + 8 <= plen {
+            out[at..at + 8].copy_from_slice(&p);
+        } else {
+            out[at..at + 7].copy_from_slice(&p[..7]);
+        }
+        at += 7;
+    }
+    if !tail.is_empty() {
+        let mut w = [0u8; 8];
+        w[..tail.len()].copy_from_slice(tail);
+        let p = pack(u64::from_le_bytes(w)).to_le_bytes();
+        let n = plen - at;
+        out[at..].copy_from_slice(&p[..n]);
+    }
+    out
+}
+
+/// Appends the `len` bytes packed by [`pack7_heap`] to `out`.
+fn unpack7_heap_into(packed: &[u8], len: usize, out: &mut Vec<u8>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("bmi2") {
+        // SAFETY: BMI2 is available (checked just above).
+        return unsafe { unpack7_heap_bmi2(packed, len, out) };
+    }
+    unpack7_heap_with(packed, len, out, unpack7_u64)
+}
+
+/// [`unpack7_heap_into`] with `pdep` spreading each group in one instruction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+fn unpack7_heap_bmi2(packed: &[u8], len: usize, out: &mut Vec<u8>) {
+    unpack7_heap_with(packed, len, out, |w| {
+        std::arch::x86_64::_pdep_u64(w, LANES7)
+    })
+}
+
+#[inline(always)]
+fn unpack7_heap_with(packed: &[u8], len: usize, out: &mut Vec<u8>, unpack: impl Fn(u64) -> u64) {
+    out.reserve(len);
+    let full = len / 8;
+    for i in 0..full {
+        let at = i * 7;
+        let w = if at + 8 <= packed.len() {
+            u64::from_le_bytes(packed[at..at + 8].try_into().expect("8 bytes"))
+                & 0x00ff_ffff_ffff_ffff
+        } else {
+            let mut b = [0u8; 8];
+            b[..7].copy_from_slice(&packed[at..at + 7]);
+            u64::from_le_bytes(b)
+        };
+        out.extend_from_slice(&unpack(w).to_le_bytes());
+    }
+    let rest = len - full * 8;
+    if rest > 0 {
+        let at = full * 7;
+        let mut b = [0u8; 8];
+        b[..packed.len() - at].copy_from_slice(&packed[at..]);
+        out.extend_from_slice(&unpack(u64::from_le_bytes(b)).to_le_bytes()[..rest]);
+    }
 }
 
 /// Packs 15 or 16 ASCII bytes, 7 bits each, into 14 bytes (a 15-byte value
@@ -561,6 +693,8 @@ pub struct StrView<'a>(ViewRepr<'a>);
 
 enum ViewRepr<'a> {
     Slice(&'a [u8]),
+    /// A [`CompactStr::HeapPacked`] value, unpacked.
+    Owned(Vec<u8>),
     Unpacked {
         len: u8,
         buf: [u8; STR_MAX_PACKED_CAP],
@@ -573,6 +707,7 @@ impl Deref for StrView<'_> {
     fn deref(&self) -> &[u8] {
         match &self.0 {
             ViewRepr::Slice(s) => s,
+            ViewRepr::Owned(v) => v,
             ViewRepr::Unpacked { len, buf } => &buf[..*len as usize],
         }
     }
@@ -638,9 +773,66 @@ impl CompactStr {
             } else {
                 CompactStr::from_box(Box::from(s))
             }
+        } else if heap_pack_pays(s) {
+            let ptr = NonNull::from(Box::leak(pack7_heap(s))).cast::<u8>();
+            CompactStr::HeapPacked { len: n as u32, ptr }
         } else {
             CompactStr::from_box(Box::from(s))
         }
+    }
+
+    /// The packed bytes of a `HeapPacked` value (empty otherwise).
+    #[inline(always)]
+    fn packed_slice(&self) -> &[u8] {
+        match self {
+            // SAFETY: a `HeapPacked` value owns `packed_len(len)` initialized
+            // bytes at `ptr` (leaked from a `Box<[u8]>` in `new`) until it is
+            // dropped, which needs `&mut self`; the slice borrows `self`.
+            CompactStr::HeapPacked { len, ptr } => unsafe {
+                std::slice::from_raw_parts(ptr.as_ptr(), packed_len(*len as usize))
+            },
+            _ => &[],
+        }
+    }
+
+    /// Appends the value's bytes to `out` (unpacking packed values directly
+    /// there, without an intermediate buffer).
+    #[inline]
+    pub fn extend_into(&self, out: &mut Vec<u8>) {
+        match self {
+            CompactStr::HeapPacked { len, .. } => {
+                unpack7_heap_into(self.packed_slice(), *len as usize, out)
+            }
+            _ => out.extend_from_slice(&self.view()),
+        }
+    }
+
+    /// Appends the value as a RESP bulk string (`$len\r\n...\r\n`),
+    /// unpacking a packed heap value straight into `out`.
+    #[inline]
+    pub fn write_resp_bulk(&self, out: &mut Vec<u8>) {
+        match self {
+            CompactStr::HeapPacked { len, .. } => {
+                let n = *len as usize;
+                // 25..=255: two or three digits.
+                out.reserve(n + 16);
+                out.push(b'$');
+                if n >= 100 {
+                    out.push(b'0' + (n / 100) as u8);
+                }
+                out.extend_from_slice(&[b'0' + (n / 10 % 10) as u8, b'0' + (n % 10) as u8]);
+                out.extend_from_slice(b"\r\n");
+                self.extend_into(out);
+                out.extend_from_slice(b"\r\n");
+            }
+            _ => crate::connection::write_resp_bulk(out, &self.view()),
+        }
+    }
+
+    /// True for a [`CompactStr::HeapPacked`] value.
+    #[inline(always)]
+    pub fn is_heap_packed(&self) -> bool {
+        matches!(self, CompactStr::HeapPacked { .. })
     }
 
     /// Takes ownership of `b` without copying (as `Heap`; `Shared` past
@@ -762,6 +954,11 @@ impl CompactStr {
                 buf: unpack_bits::<5>(d, 24, ALPHABET_5B),
             },
             CompactStr::Heap { .. } => ViewRepr::Slice(self.heap_slice()),
+            CompactStr::HeapPacked { len, .. } => {
+                let mut v = Vec::new();
+                unpack7_heap_into(self.packed_slice(), *len as usize, &mut v);
+                ViewRepr::Owned(v)
+            }
             CompactStr::Shared(b) => ViewRepr::Slice(b),
         })
     }
@@ -792,7 +989,7 @@ impl CompactStr {
             CompactStr::Packed5A22(_) | CompactStr::Packed5B22(_) => 22,
             CompactStr::Packed5A23(_) | CompactStr::Packed5B23(_) => 23,
             CompactStr::Packed5A24(_) | CompactStr::Packed5B24(_) => 24,
-            CompactStr::Heap { len, .. } => *len as usize,
+            CompactStr::Heap { len, .. } | CompactStr::HeapPacked { len, .. } => *len as usize,
             CompactStr::Shared(b) => b.len(),
         }
     }
@@ -804,7 +1001,10 @@ impl CompactStr {
 
     #[inline(always)]
     pub fn is_inline(&self) -> bool {
-        !matches!(self, CompactStr::Heap { .. } | CompactStr::Shared(_))
+        !matches!(
+            self,
+            CompactStr::Heap { .. } | CompactStr::HeapPacked { .. } | CompactStr::Shared(_)
+        )
     }
 
     #[inline(always)]
@@ -817,6 +1017,7 @@ impl CompactStr {
     pub fn heap_bytes(&self) -> usize {
         match self {
             CompactStr::Heap { len, .. } => *len as usize,
+            CompactStr::HeapPacked { len, .. } => packed_len(*len as usize),
             CompactStr::Shared(b) => b.len() + std::mem::size_of::<Bytes>(),
             _ => 0,
         }
@@ -843,6 +1044,11 @@ impl CompactStr {
     pub fn to_bytes(&self) -> Bytes {
         match self {
             CompactStr::Shared(b) => Bytes::clone(b),
+            CompactStr::HeapPacked { .. } => {
+                let mut v = Vec::new();
+                self.extend_into(&mut v);
+                Bytes::from(v)
+            }
             other => {
                 let s = other.view();
                 if s.is_empty() {
@@ -857,13 +1063,23 @@ impl CompactStr {
     /// Copies the bytes into a new `Vec`.
     #[inline]
     pub fn to_vec(&self) -> Vec<u8> {
-        self.view().to_vec()
+        let mut v = Vec::new();
+        self.extend_into(&mut v);
+        v
     }
 }
 
 impl Drop for CompactStr {
     #[inline]
     fn drop(&mut self) {
+        if let CompactStr::HeapPacked { len, ptr } = self {
+            let raw = std::ptr::slice_from_raw_parts_mut(ptr.as_ptr(), packed_len(*len as usize));
+            // SAFETY: `raw` is exactly the pointer and length leaked from the
+            // `Box<[u8]>` built by `pack7_heap`; `self` is being dropped, so
+            // the box is rebuilt (and freed) exactly once.
+            drop(unsafe { Box::from_raw(raw) });
+            return;
+        }
         drop(self.take_box());
     }
 }
@@ -897,6 +1113,10 @@ impl Clone for CompactStr {
             CompactStr::Packed5B23(d) => CompactStr::Packed5B23(*d),
             CompactStr::Packed5B24(d) => CompactStr::Packed5B24(*d),
             CompactStr::Heap { .. } => CompactStr::from_box(Box::from(self.heap_slice())),
+            CompactStr::HeapPacked { len, .. } => CompactStr::HeapPacked {
+                len: *len,
+                ptr: NonNull::from(Box::leak(Box::<[u8]>::from(self.packed_slice()))).cast::<u8>(),
+            },
             CompactStr::Shared(b) => CompactStr::Shared(b.clone()),
         }
     }
@@ -1043,6 +1263,78 @@ impl fmt::Debug for CompactStr {
 mod tests {
     use super::*;
 
+    /// ASCII values of 25..=255 bytes are stored 7 bits per byte exactly when
+    /// that moves them to a smaller allocator size class, and every accessor
+    /// returns the original bytes.
+    #[test]
+    fn heap_packed_strings_round_trip_through_every_accessor() {
+        let mut packed = 0;
+        for n in [
+            0usize, 1, 24, 25, 32, 64, 80, 97, 100, 128, 129, 150, 200, 255, 256, 300,
+        ] {
+            for variant in 0..3 {
+                let s: Vec<u8> = match variant {
+                    0 => (0..n).map(|i| b'!' + (i * 7 % 94) as u8).collect(), // printable ASCII
+                    1 => (0..n).map(|i| (i % 128) as u8).collect(),           // all 7-bit values
+                    _ => (0..n)
+                        .map(|i| if i == n / 2 { 0xC3 } else { b'a' })
+                        .collect(), // one non-ASCII byte
+                };
+                let c = CompactStr::new(&s);
+                let want_packed = variant < 2
+                    && (HEAP_PACK_MIN..=HEAP_PACK_MAX).contains(&n)
+                    && alloc_class(packed_len(n)) < alloc_class(n);
+                assert_eq!(c.is_heap_packed(), want_packed, "n={n} variant={variant}");
+                packed += want_packed as usize;
+                assert_eq!(c.len(), n);
+                assert_eq!(&*c.view(), &s[..]);
+                assert_eq!(c.to_vec(), s);
+                assert_eq!(c.to_bytes(), Bytes::from(s.clone()));
+                let mut out = b"x".to_vec();
+                c.extend_into(&mut out);
+                assert_eq!(&out[1..], &s[..]);
+                let mut resp = Vec::new();
+                c.write_resp_bulk(&mut resp);
+                let mut want = Vec::new();
+                crate::connection::write_resp_bulk(&mut want, &s);
+                assert_eq!(resp, want);
+                let d = c.clone();
+                assert_eq!(d, c);
+                assert_eq!(&*d.view(), &s[..]);
+                if want_packed {
+                    assert_eq!(c.heap_bytes(), packed_len(n));
+                    assert!(c.as_contiguous().is_none() && !c.is_inline() && !c.needs_share());
+                }
+            }
+        }
+        assert!(packed >= 8, "some lengths must pack: {packed}");
+    }
+
+    /// The BMI2 (`pext`/`pdep`) and portable heap packers produce the same
+    /// bytes, so either path reads what the other wrote.
+    #[test]
+    fn heap_pack_bmi2_and_portable_paths_agree() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for n in HEAP_PACK_MIN..=HEAP_PACK_MAX {
+            let s: Vec<u8> = (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x % 128) as u8
+                })
+                .collect();
+            let portable = pack7_heap_with(&s, pack7_u64);
+            assert_eq!(&*pack7_heap(&s), &*portable, "n={n}");
+            let mut a = Vec::new();
+            unpack7_heap_with(&portable, n, &mut a, unpack7_u64);
+            let mut b = Vec::new();
+            unpack7_heap_into(&portable, n, &mut b);
+            assert_eq!(a, s);
+            assert_eq!(b, s);
+        }
+    }
+
     #[test]
     fn test_pack7_matches_bitwise_reference() {
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -1102,8 +1394,21 @@ mod tests {
                     n <= STR_INLINE_CAP || packable,
                     "gen {g} len {n}"
                 );
-                assert_eq!(v.as_contiguous().is_none(), packable, "gen {g} len {n}");
-                assert_eq!(v.heap_bytes(), if v.is_inline() { 0 } else { n });
+                let heap_packed = heap_pack_pays(&s);
+                assert_eq!(v.is_heap_packed(), heap_packed, "gen {g} len {n}");
+                assert_eq!(
+                    v.as_contiguous().is_none(),
+                    packable || heap_packed,
+                    "gen {g} len {n}"
+                );
+                let want_heap = if v.is_inline() {
+                    0
+                } else if heap_packed {
+                    packed_len(n)
+                } else {
+                    n
+                };
+                assert_eq!(v.heap_bytes(), want_heap);
                 assert_eq!(v.to_bytes(), Bytes::from(s.clone()));
                 assert_eq!(v.to_vec(), s);
                 assert_eq!(v, CompactStr::from(Bytes::from(s.clone())));
