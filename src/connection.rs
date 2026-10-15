@@ -27223,11 +27223,9 @@ async fn execute_commands_squashed_inner(
         }
     }
 
-    // 4. Assemble folded MGET arrays and multi-key DEL/EXISTS sums from their per-key slots,
-    //    then gather the cross-shard MSETs dispatched in step 1.
-    for (idx, start, len) in folded_mgets.drain(..) {
-        responses[idx] = assemble_mget_reply(&responses[start..start + len], is_resp3);
-    }
+    // 4. Sum multi-key DEL/EXISTS from their per-key slots, then gather the
+    //    cross-shard MSETs dispatched in step 1. Folded MGET arrays are
+    //    written straight from their per-key slots in step 5.
     for (idx, start, len) in folded_int_sums.drain(..) {
         let mut sum = 0i64;
         for slot in &responses[start..start + len] {
@@ -27241,7 +27239,6 @@ async fn execute_commands_squashed_inner(
             n => CompactResp::from_integer(n),
         };
     }
-    responses.truncate(n);
     let batch_len = n;
     if inflight_msets.len() == batch_len {
         out.reserve(batch_len * 5);
@@ -27258,12 +27255,25 @@ async fn execute_commands_squashed_inner(
         }
     }
 
-    // 5. Append responses in exact FIFO pipeline order with pre-reserved capacity
+    // 5. Append responses in exact FIFO pipeline order with pre-reserved
+    //    capacity. A folded MGET's array is written directly from its
+    //    per-key slots (in `responses` past the pipeline's), so its values
+    //    are copied once rather than into an intermediate array first.
     let total_len: usize = responses.iter().map(|r| r.estimated_len()).sum();
-    out.reserve(total_len);
-    for resp in responses.iter() {
+    out.reserve(total_len + folded_mgets.len() * 16);
+    let mut mgets = folded_mgets.iter().peekable();
+    for (i, resp) in responses[..n].iter().enumerate() {
+        if let Some(&&(idx, start, len)) = mgets.peek()
+            && idx == i
+        {
+            write_mget_reply(out, &responses[start..start + len], is_resp3);
+            mgets.next();
+            continue;
+        }
         resp.write_to(out);
     }
+    folded_mgets.clear();
+    responses.truncate(n);
 
     should_close
 }
@@ -27318,27 +27328,23 @@ fn notifies_same_when_batched(cmd: &Command) -> bool {
 
 /// Builds an MGET array from per-key GET replies. MGET answers nil for a key
 /// holding a non-string value, where GET answers WRONGTYPE.
-fn assemble_mget_reply(items: &[CompactResp], is_resp3: bool) -> CompactResp {
-    let mut buf = Vec::with_capacity(16 + items.iter().map(|r| r.estimated_len()).sum::<usize>());
-    write_resp_array_header(&mut buf, items.len());
+/// Writes a folded MGET's reply array from its per-key GET replies; an error
+/// for a key (e.g. WRONGTYPE) reads as nil, as MGET reports it.
+fn write_mget_reply(out: &mut Vec<u8>, items: &[CompactResp], is_resp3: bool) {
+    write_resp_array_header(out, items.len());
     for item in items {
         let is_error = matches!(
             item,
             CompactResp::Small { .. } | CompactResp::Big(_) | CompactResp::RawBytes(_)
         ) && item.as_slice().first() == Some(&b'-');
         if is_error {
-            CompactResp::null(is_resp3).write_to(&mut buf);
+            CompactResp::null(is_resp3).write_to(out);
         } else {
-            item.write_to(&mut buf);
+            item.write_to(out);
         }
     }
-    CompactResp::from_vec(buf)
 }
 
-/// Sends the per-shard batches built so far and waits until every shard has
-/// written its replies into `responses`. Commands that are not batched must
-/// call this first so they cannot overtake earlier commands of the same
-/// pipeline (e.g. `SET k v` to a remote shard followed by `MGET k x`).
 /// The SLOWLOG threshold in microseconds, or `None` when logging is off.
 #[inline(always)]
 pub(crate) fn batch_slow_threshold() -> Option<u64> {
@@ -27371,6 +27377,10 @@ fn log_batched_slow(
     crate::slowlog::log_command_if_slow(cmd, micros, &addr, &name);
 }
 
+/// Sends the per-shard batches built so far and waits until every shard has
+/// written its replies into `responses`. Commands that are not batched must
+/// call this first so they cannot overtake earlier commands of the same
+/// pipeline (e.g. `SET k v` to a remote shard followed by `MGET k x`).
 async fn flush_remote_batches(
     router: &Router,
     responders: &[std::sync::Arc<crate::mailbox::BatchResponder>],
@@ -29159,22 +29169,26 @@ mod tests {
     }
 
     #[test]
-    fn test_assemble_mget_reply_maps_errors_to_nil() {
+    fn test_write_mget_reply_maps_errors_to_nil() {
         let items = [
             CompactResp::from_bulk(&Bytes::from("v1")),
             CompactResp::null(false),
             CompactResp::from_slice(b"-WRONGTYPE Operation against a key\r\n"),
             CompactResp::Bulk(Bytes::from(vec![b'x'; 40])),
         ];
-        let got = assemble_mget_reply(&items, false).into_vec();
+        let mut got = Vec::new();
+        write_mget_reply(&mut got, &items, false);
         let mut want = b"*4\r\n$2\r\nv1\r\n$-1\r\n$-1\r\n$40\r\n".to_vec();
         want.extend_from_slice(&[b'x'; 40]);
         want.extend_from_slice(b"\r\n");
         assert_eq!(got, want);
         let resp3_items = [CompactResp::null(true), items[2].clone()];
-        let resp3 = assemble_mget_reply(&resp3_items, true).into_vec();
+        let mut resp3 = Vec::new();
+        write_mget_reply(&mut resp3, &resp3_items, true);
         assert_eq!(resp3, b"*2\r\n_\r\n_\r\n");
-        assert_eq!(assemble_mget_reply(&[], false).into_vec(), b"*0\r\n");
+        let mut empty = Vec::new();
+        write_mget_reply(&mut empty, &[], false);
+        assert_eq!(empty, b"*0\r\n");
     }
 
     #[test]
