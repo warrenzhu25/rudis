@@ -2493,6 +2493,8 @@ pub struct RudisFlatTable {
     /// and deletes only change the arenas, so this moves only when a
     /// segment is added, replaced or rebuilt.
     seg_fixed_bytes: usize,
+    /// Next segment [`Self::trim_step`] looks at.
+    trim_cursor: usize,
 }
 
 impl RudisFlatTable {
@@ -2512,6 +2514,7 @@ impl RudisFlatTable {
             layout_epoch: 0,
             seg_heap_bytes,
             seg_fixed_bytes,
+            trim_cursor: 0,
         }
     }
 
@@ -2527,6 +2530,30 @@ impl RudisFlatTable {
                 .slot_counts
                 .as_ref()
                 .map_or(0, |_| std::mem::size_of::<[u32; 16384]>())
+    }
+
+    /// Compacts the entry arenas of up to `budget` segments (round robin)
+    /// whose free share (holes left by deletes and eviction, plus growth
+    /// slack) is over an eighth, down to a sixteenth of slack. Deletes only
+    /// trim an arena once it is under half live, so without this a table
+    /// under steady eviction keeps ~1/5 of its arenas empty: real memory
+    /// `used_memory` (and so `maxmemory`) does not count, since evicting
+    /// can't free it. Returns the heap bytes freed.
+    pub fn trim_step(&mut self, budget: usize) -> usize {
+        let n = self.segments.len();
+        let mut freed = 0;
+        for _ in 0..budget.min(n) {
+            let i = self.trim_cursor % n;
+            self.trim_cursor = (i + 1) % n;
+            let seg = &mut self.segments[i];
+            let cap = seg.entries.capacity();
+            if cap >= 64 && (cap - seg.items) * 8 > cap {
+                freed += seg.trim_arena();
+            }
+        }
+        // Trimming changes only the arenas, never the fixed part.
+        self.seg_heap_bytes -= freed;
+        freed
     }
 
     /// [`Self::struct_bytes`] recomputed from every segment instead of the
@@ -3726,6 +3753,11 @@ impl RudisTable {
     /// Gives back table structure left over from deleted keys, a bounded
     /// step at a time; see [`RudisFlatTable::shrink_step`]. Collapses to a
     /// single small segment once the keyspace fits in one.
+    /// See [`RudisFlatTable::trim_step`]; keeps `used_memory` in step.
+    pub fn trim_arena_step(&mut self, budget: usize) -> usize {
+        self.table.trim_step(budget)
+    }
+
     pub fn shrink_step(&mut self, max_merges: usize) -> usize {
         let merges = self.table.shrink_step(max_merges);
         if self.table.segments.len() > 1 && self.table.len() * 2 <= SEG_CAP {
@@ -17036,6 +17068,58 @@ mod tests {
             assert!(e.is_some());
             assert!(e.get().unwrap() > now + Duration::from_secs(86_400 * 365 * 100));
         }
+    }
+
+    /// `trim_step` compacts arenas left part empty by deletes (which only
+    /// trim below half live), keeps the incremental byte counters exact and
+    /// every surviving key readable.
+    #[test]
+    fn test_trim_step_compacts_arenas_left_part_empty_by_deletes() {
+        let mut t = RudisTable::new();
+        let n = 200_000u64;
+        for k in 0..n {
+            t.set(
+                Bytes::from(format!("k:{k:08}")),
+                Bytes::from_static(b"v"),
+                None,
+            );
+        }
+        // Delete 30%: every arena stays over half live, so no inline trim.
+        for k in (0..n).filter(|k| k % 10 < 3) {
+            assert!(t.del(format!("k:{k:08}").as_bytes()));
+        }
+        let free_before = t.free_arena_bytes();
+        let used_before = t.used_memory();
+        let table_before = t.table.struct_bytes();
+        assert!(
+            free_before * 5 > table_before / 4,
+            "deletes should leave holes"
+        );
+        let segs = t.table.segments.len();
+        let mut freed = 0;
+        for _ in 0..segs.div_ceil(32) + 1 {
+            freed += t.trim_arena_step(32);
+        }
+        assert!(freed > 0);
+        assert_seg_heap_bytes_consistent(&t.table);
+        assert_eq!(t.table.struct_bytes(), table_before - freed);
+        assert_eq!(t.used_memory(), used_before - freed);
+        for seg in &t.table.segments {
+            let cap = seg.entries.capacity();
+            assert!(
+                cap < 64 || (cap - seg.items) * 8 <= cap,
+                "arena still over 1/8 free"
+            );
+        }
+        assert!(t.free_arena_bytes() < free_before / 2);
+        // A second pass finds nothing left to do (no thrashing).
+        assert_eq!(t.trim_arena_step(segs), 0);
+        for k in 0..n {
+            let got = t.get(format!("k:{k:08}").as_bytes()).unwrap();
+            assert_eq!(got.is_some(), k % 10 >= 3, "key {k}");
+        }
+        let b = t.memory_breakdown();
+        assert_eq!((b.dataset, b.table), (b.dataset_exact, b.table_exact));
     }
 
     fn assert_seg_heap_bytes_consistent(t: &RudisFlatTable) {

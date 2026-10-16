@@ -29404,3 +29404,64 @@ fn test_memory_stats_and_doctor_report_real_accounting_e2e() {
     let info = send_and_read_reply(&mut c, b"INFO memory\r\n");
     assert!(info.contains("mem_allocator:jemalloc"), "{info}");
 }
+
+/// Deletes that leave each table segment's entry arena still over half live
+/// do not trim it inline; the shard cron's arena trim then gives that space
+/// back, visible in `MEMORY STATS` as shrinking free-arena bytes, with every
+/// surviving key intact.
+#[test]
+fn test_cron_trims_entry_arenas_left_part_empty_by_deletes_e2e() {
+    let port = 18011;
+    start_test_server(port, 1);
+    let mut c = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let n = 100_000;
+    for batch in 0..(n / 1000) {
+        let mut cmd = String::from("MSET");
+        for i in 0..1000 {
+            cmd.push_str(&format!(" t:{:06} v", batch * 1000 + i));
+        }
+        cmd.push_str("\r\n");
+        assert_eq!(send_and_read(&mut c, cmd.as_bytes()), "+OK\r\n");
+    }
+    let free_arena = |c: &mut TcpStream| -> u64 {
+        let raw = send_and_read_reply(c, b"MEMORY STATS\r\n");
+        let toks: Vec<&str> = raw.split("\r\n").collect();
+        let i = toks
+            .iter()
+            .position(|t| *t == "rudis.free-arena.bytes")
+            .expect("field");
+        toks[i + 1].trim_start_matches(':').parse().unwrap()
+    };
+    // Delete 30% (every arena stays over half live).
+    for batch in 0..(n / 1000) {
+        let mut cmd = String::from("DEL");
+        for i in 0..1000 {
+            let k = batch * 1000 + i;
+            if k % 10 < 3 {
+                cmd.push_str(&format!(" t:{k:06}"));
+            }
+        }
+        cmd.push_str("\r\n");
+        assert_eq!(send_and_read(&mut c, cmd.as_bytes()), ":300\r\n");
+    }
+    let before = free_arena(&mut c);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut after = before;
+    while std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(300));
+        after = free_arena(&mut c);
+        if after * 2 < before {
+            break;
+        }
+    }
+    assert!(
+        after * 2 < before,
+        "free arena {before} -> {after}: cron trim did not run"
+    );
+    assert_eq!(send_and_read(&mut c, b"DBSIZE\r\n"), ":70000\r\n");
+    assert_eq!(
+        send_and_read(&mut c, b"EXISTS t:000002 t:000004 t:099999\r\n"),
+        ":2\r\n"
+    );
+}

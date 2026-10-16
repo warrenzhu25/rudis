@@ -417,7 +417,10 @@ pub fn run_shard_worker(
                 // Not while a snapshot walks the segments: moving entries
                 // would make it restart as one blocking pass.
                 if !mem_router.is_saving.load(std::sync::atomic::Ordering::Relaxed) {
-                    active_db.borrow_mut().table.shrink_step(32);
+                    let mut db = active_db.borrow_mut();
+                    db.table.shrink_step(32);
+                    // Compact arenas left part empty by deletes/eviction.
+                    db.table.trim_arena_step(32);
                 }
                 // Deletes, flushes and CONFIG SET maxmemory don't go through
                 // the post-write check; publish this shard's usage here.
