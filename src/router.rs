@@ -3849,7 +3849,7 @@ impl Router {
         &self,
         client_id: u64,
         channel: Bytes,
-        tx: flume::Sender<Bytes>,
+        tx: crate::pubsub::SubscriberTx,
         is_resp3: bool,
     ) -> usize {
         let slot = key_slot(&channel);
@@ -6680,9 +6680,12 @@ mod tests {
             std::env::temp_dir(),
         );
         let (tx, rx) = flume::unbounded();
-        pubsub
-            .borrow_mut()
-            .psubscribe(1, Bytes::from_static(b"__keyevent@0__:del"), tx, false);
+        pubsub.borrow_mut().psubscribe(
+            1,
+            Bytes::from_static(b"__keyevent@0__:del"),
+            crate::pubsub::SubscriberTx::new(tx, 0, 0),
+            false,
+        );
         db0.borrow_mut()
             .set(Bytes::from("d1"), Bytes::from("v"), None);
         db0.borrow_mut()
@@ -7300,7 +7303,14 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let (sub_tx, sub_rx) = flume::unbounded();
-            let count = router.ssubscribe(42, ch0.clone(), sub_tx, false).await;
+            let count = router
+                .ssubscribe(
+                    42,
+                    ch0.clone(),
+                    crate::pubsub::SubscriberTx::new(sub_tx, 0, 42),
+                    false,
+                )
+                .await;
             assert_eq!(count, 1);
             assert_eq!(router.notify_channel_pool.borrow().len(), 1);
 

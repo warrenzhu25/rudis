@@ -6005,8 +6005,11 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
         }
     }
     use crate::transport::{TransportRead, TransportWrite};
-    let (write_tx, write_rx) = flume::bounded::<Bytes>(4096);
-    let (mut reader, mut writer) = transport.into_split(&write_tx);
+    // Unbounded: `SubscriberTx` bounds it by bytes, per the pubsub output
+    // buffer limit.
+    let (raw_tx, write_rx) = flume::unbounded::<Bytes>();
+    let write_tx = crate::pubsub::SubscriberTx::new(raw_tx, router.port, client_id);
+    let (mut reader, mut writer) = transport.into_split(write_tx.raw());
     // Declared after the split so it drops (and unregisters the client from
     // GLOBAL_CLIENTS) before `reader` closes the socket: other threads use the
     // registered fd for CLIENT KILL / MONITOR, and must never see a closed,
@@ -6018,42 +6021,39 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
     };
 
     let reg_writer = client_registry.clone();
+    let writer_tx = write_tx.clone();
     monoio::spawn(async move {
-        let mut queued_bytes = 0usize;
-        let mut soft_start: Option<Instant> = None;
-        while let Ok(data) = write_rx.recv_async().await {
-            let data_len = data.len();
-            queued_bytes += data_len;
-            if let Some(c) = reg_writer.borrow_mut().get_mut(&client_id) {
-                c.omem = queued_bytes;
-            }
-
-            let ps_limits = get_client_output_buffer_limit(ClientClass::Pubsub);
-            if ps_limits.hard_limit > 0 && queued_bytes as u64 >= ps_limits.hard_limit {
-                client_output_limit_reached(client_id, queued_bytes);
-                break;
-            }
-            if ps_limits.soft_limit > 0 && queued_bytes as u64 >= ps_limits.soft_limit {
-                let now = Instant::now();
-                if let Some(st) = soft_start {
-                    if now.duration_since(st).as_secs() >= ps_limits.soft_seconds {
-                        client_output_limit_reached(client_id, queued_bytes);
-                        break;
-                    }
-                } else {
-                    soft_start = Some(now);
-                }
+        // Limits are enforced where messages are queued
+        // (`SubscriberTx::deliver`); this only writes and keeps the count.
+        // Everything already queued (up to WRITE_BATCH bytes) goes out in one
+        // write: one write per message could not keep up with several shards
+        // publishing, so a subscriber reading as fast as it could still fell
+        // behind and hit the output limit.
+        const WRITE_BATCH: usize = 256 * 1024;
+        let mut batch = bytes::BytesMut::new();
+        while let Ok(first) = write_rx.recv_async().await {
+            let data = if write_rx.is_empty() {
+                first
             } else {
-                soft_start = None;
+                batch.extend_from_slice(&first);
+                while batch.len() < WRITE_BATCH
+                    && let Ok(more) = write_rx.try_recv()
+                {
+                    batch.extend_from_slice(&more);
+                }
+                batch.split().freeze()
+            };
+            let data_len = data.len();
+            if let Some(c) = reg_writer.borrow_mut().get_mut(&client_id) {
+                c.omem = writer_tx.queued();
             }
-
             crate::server_stats::add(crate::server_stats::Stat::NetOutputBytes, data_len as u64);
             if writer.write_bytes(data).await.is_err() {
                 break;
             }
-            queued_bytes = queued_bytes.saturating_sub(data_len);
+            writer_tx.written(data_len);
             if let Some(c) = reg_writer.borrow_mut().get_mut(&client_id) {
-                c.omem = queued_bytes;
+                c.omem = writer_tx.queued();
             }
         }
     });
@@ -6071,7 +6071,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
         router: &Router,
         client_id: u64,
         client_registry: &Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
-        write_tx: &flume::Sender<Bytes>,
+        write_tx: &crate::pubsub::SubscriberTx,
         in_multi: &mut bool,
         tx_queue: &mut Vec<Command>,
         out: &mut Vec<u8>,
@@ -6767,6 +6767,37 @@ fn client_output_limit_reached(client_id: u64, omem: usize) {
             client_id,
             omem
         );
+    }
+}
+
+/// Disconnects pub/sub client `client_id` on `port` for going over its
+/// output buffer limit, from any thread (the publishing shard): logs and
+/// counts it like Redis, then shuts its socket down the way CLIENT KILL
+/// does, so its writer's pending write fails and the connection closes.
+pub fn close_client_over_output_limit(port: u16, client_id: u64, omem: usize) {
+    client_output_limit_reached(client_id, omem);
+    let map = GLOBAL_CLIENTS.read();
+    if let Some(entry) = map.get(&(port, client_id)) {
+        if entry
+            .stats
+            .killed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // SAFETY: shutdown(2) takes no pointers. The entry is read under the
+        // GLOBAL_CLIENTS read lock and the connection removes its registry
+        // entry (PubsubCleanup) before its socket is closed, so the fd is not
+        // a reused number.
+        unsafe {
+            libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
+        }
     }
 }
 
@@ -29283,9 +29314,12 @@ mod tests {
         ));
         set_current_router(router.clone());
         let (tx, rx) = flume::unbounded();
-        pubsub
-            .borrow_mut()
-            .psubscribe(1, Bytes::from_static(b"__keyevent@0__:*"), tx, false);
+        pubsub.borrow_mut().psubscribe(
+            1,
+            Bytes::from_static(b"__keyevent@0__:*"),
+            crate::pubsub::SubscriberTx::new(tx, 0, 0),
+            false,
+        );
         let prev_flags = get_notify_keyspace_events_str();
         set_notify_keyspace_events_str("KEA");
 

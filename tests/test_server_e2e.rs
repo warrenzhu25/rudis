@@ -29745,3 +29745,85 @@ fn test_set_churn_on_one_page_keeps_memory_flat_e2e() {
     let _ = srv.kill();
     let _ = srv.wait();
 }
+
+/// A subscriber that stops reading is disconnected at the pubsub output
+/// buffer limit (by bytes queued), and until then gets every message, in
+/// order (like Redis, what was still queued when it is cut off is
+/// discarded). Its queue was capped at 4096 messages instead: past that,
+/// messages were silently dropped while it stayed connected and subscribed.
+#[test]
+fn test_slow_subscriber_disconnected_at_pubsub_limit_not_dropped_e2e() {
+    let port = 18016u16;
+    let ps = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &ps, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    assert_eq!(
+        send_and_read_reply(
+            &mut c,
+            b"CONFIG SET client-output-buffer-limit \"pubsub 1mb 0 0\"\r\n"
+        ),
+        "+OK\r\n"
+    );
+    let mut sub = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sub.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let r = send_and_read_reply(&mut sub, b"SUBSCRIBE ch\r\n");
+    assert!(r.contains("subscribe"), "{r}");
+    // Publish 8000 numbered 1 KB messages while the subscriber reads nothing.
+    let pad = "m".repeat(992);
+    let mut counted = 0usize;
+    for batch in 0..80 {
+        let mut req = String::new();
+        for i in 0..100 {
+            req.push_str(&format!(
+                "*3\r\n$7\r\nPUBLISH\r\n$2\r\nch\r\n$1000\r\n{:08}{pad}\r\n",
+                batch * 100 + i
+            ));
+        }
+        c.write_all(req.as_bytes()).unwrap();
+        let (mut lines, mut reply, mut buf) = (0, Vec::new(), [0u8; 4096]);
+        while lines < 100 {
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0);
+            reply.extend_from_slice(&buf[..n]);
+            lines += buf[..n].iter().filter(|&&b| b == b'\n').count();
+        }
+        for l in String::from_utf8(reply).unwrap().lines() {
+            counted += l.trim_start_matches(':').parse::<usize>().unwrap();
+        }
+    }
+    assert!(counted < 8000, "never cut off: counted {counted}");
+    // Draining now, the subscriber gets messages 0, 1, 2, ... with no gap,
+    // then the server's close.
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match sub.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(e) => panic!("subscriber not disconnected: {e}"),
+        }
+    }
+    let text = String::from_utf8_lossy(&got);
+    let seqs: Vec<usize> = text
+        .split("$1000\r\n")
+        .skip(1)
+        .filter_map(|m| m.get(..8)?.parse().ok())
+        .collect();
+    assert!(
+        !seqs.is_empty() && seqs.len() <= counted,
+        "{} of {counted}",
+        seqs.len()
+    );
+    for (i, &s) in seqs.iter().enumerate() {
+        assert_eq!(s, i, "gap in delivered messages");
+    }
+    let stats = send_and_read_reply(&mut c, b"INFO stats\r\n");
+    assert!(
+        stats.contains("client_output_buffer_limit_disconnections:1"),
+        "{stats}"
+    );
+    let _ = srv.kill();
+    let _ = srv.wait();
+}

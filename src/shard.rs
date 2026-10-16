@@ -572,7 +572,7 @@ pub enum ShardMessage {
     Ssubscribe {
         client_id: u64,
         channel: Bytes,
-        sender: flume::Sender<Bytes>,
+        sender: crate::pubsub::SubscriberTx,
         is_resp3: bool,
         responder: flume::Sender<()>,
     },

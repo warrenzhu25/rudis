@@ -298,12 +298,131 @@ pub fn get_presence_table(port: u16) -> Arc<ShardedPresenceTable> {
         .clone()
 }
 
+fn pubsub_limit() -> crate::connection::BufferLimit {
+    crate::connection::get_client_output_buffer_limit(crate::connection::ClientClass::Pubsub)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_millis() as u64)
+        .max(1)
+}
+
+/// A subscriber's outgoing queue and the bytes waiting in it, shared by the
+/// shards that publish to it and the connection's writer.
+///
+/// Published messages go through [`Self::deliver`], which enforces the
+/// `client-output-buffer-limit pubsub` hard and soft limits by bytes queued,
+/// as Redis does: a subscriber over them is disconnected (and counted in
+/// `client_output_buffer_limit_disconnections`) instead of having messages
+/// dropped. (A queue bounded by message count dropped them silently once a
+/// slow subscriber's 4096 slots filled, while it stayed subscribed, and let
+/// large messages queue far past the byte limit.)
+#[derive(Clone, Debug)]
+pub struct SubscriberTx {
+    tx: flume::Sender<Bytes>,
+    state: std::sync::Arc<SubscriberState>,
+}
+
+#[derive(Debug)]
+struct SubscriberState {
+    queued: std::sync::atomic::AtomicUsize,
+    /// When the queue went over the soft limit (ms since the epoch), or 0.
+    soft_since_ms: std::sync::atomic::AtomicU64,
+    closing: std::sync::atomic::AtomicBool,
+    port: u16,
+    client_id: u64,
+}
+
+impl SubscriberTx {
+    pub fn new(tx: flume::Sender<Bytes>, port: u16, client_id: u64) -> Self {
+        SubscriberTx {
+            tx,
+            state: std::sync::Arc::new(SubscriberState {
+                queued: std::sync::atomic::AtomicUsize::new(0),
+                soft_since_ms: std::sync::atomic::AtomicU64::new(0),
+                closing: std::sync::atomic::AtomicBool::new(false),
+                port,
+                client_id,
+            }),
+        }
+    }
+
+    /// Queues a reply to the subscriber's own command (always; counted).
+    pub fn send(&self, data: Bytes) -> Result<(), flume::SendError<Bytes>> {
+        self.state
+            .queued
+            .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+        self.tx.send(data)
+    }
+
+    /// Queues a published message unless that takes the subscriber over its
+    /// output limit, in which case it is disconnected. Whether it was queued.
+    pub fn deliver(&self, frame: &Bytes, limit: &crate::connection::BufferLimit) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let st = &self.state;
+        if st.closing.load(Relaxed) {
+            return false;
+        }
+        let len = frame.len();
+        let queued = st.queued.fetch_add(len, Relaxed) + len;
+        let mut over = limit.hard_limit > 0 && queued as u64 >= limit.hard_limit;
+        if !over && limit.soft_limit > 0 && queued as u64 >= limit.soft_limit {
+            let now = now_ms();
+            match st.soft_since_ms.load(Relaxed) {
+                0 => st.soft_since_ms.store(now, Relaxed),
+                since => over = now.saturating_sub(since) >= limit.soft_seconds * 1000,
+            }
+        } else if st.soft_since_ms.load(Relaxed) != 0 {
+            st.soft_since_ms.store(0, Relaxed);
+        }
+        if over {
+            st.queued.fetch_sub(len, Relaxed);
+            if !st.closing.swap(true, Relaxed) {
+                crate::connection::close_client_over_output_limit(st.port, st.client_id, queued);
+            }
+            return false;
+        }
+        if self.tx.send(frame.clone()).is_err() {
+            st.queued.fetch_sub(len, Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// The writer sent `n` queued bytes to the socket.
+    pub fn written(&self, n: usize) {
+        let _ = self.state.queued.try_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |q| Some(q.saturating_sub(n)),
+        );
+    }
+
+    /// Bytes queued and not yet written.
+    pub fn queued(&self) -> usize {
+        self.state.queued.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A subscriber not registered with any server (tests).
+    #[cfg(test)]
+    pub fn unregistered(tx: flume::Sender<Bytes>) -> Self {
+        Self::new(tx, 0, 0)
+    }
+
+    /// The raw channel, for the transport split.
+    pub fn raw(&self) -> &flume::Sender<Bytes> {
+        &self.tx
+    }
+}
+
 #[derive(Default)]
 pub struct PubSubHub {
     pub channels: hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>,
     pub patterns: hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>,
     pub shard_channels: hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>,
-    pub clients: hashbrown::HashMap<u64, flume::Sender<Bytes>>,
+    pub clients: hashbrown::HashMap<u64, SubscriberTx>,
     pub client_channels: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
     pub client_patterns: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
     pub client_shard_channels: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
@@ -340,7 +459,7 @@ impl PubSubHub {
         &mut self,
         client_id: u64,
         channel: Bytes,
-        tx: flume::Sender<Bytes>,
+        tx: SubscriberTx,
         is_resp3: bool,
         presence_info: Option<(usize, &ShardedPresenceTable)>,
     ) -> usize {
@@ -375,7 +494,7 @@ impl PubSubHub {
         &mut self,
         client_id: u64,
         channel: Bytes,
-        tx: flume::Sender<Bytes>,
+        tx: SubscriberTx,
         is_resp3: bool,
     ) -> usize {
         self.subscribe_with_presence(client_id, channel, tx, is_resp3, None)
@@ -460,7 +579,7 @@ impl PubSubHub {
         &mut self,
         client_id: u64,
         pattern: Bytes,
-        tx: flume::Sender<Bytes>,
+        tx: SubscriberTx,
         is_resp3: bool,
         presence_info: Option<(usize, &ShardedPresenceTable)>,
     ) -> usize {
@@ -494,7 +613,7 @@ impl PubSubHub {
         &mut self,
         client_id: u64,
         pattern: Bytes,
-        tx: flume::Sender<Bytes>,
+        tx: SubscriberTx,
         is_resp3: bool,
     ) -> usize {
         self.psubscribe_with_presence(client_id, pattern, tx, is_resp3, None)
@@ -575,6 +694,7 @@ impl PubSubHub {
 
     pub fn publish(&self, channel: &[u8], message: &[u8]) -> usize {
         let mut count = 0;
+        let mut limit = None;
 
         // 1. Direct channel subscribers
         if let Some(subscribers) = self.channels.get(channel) {
@@ -597,7 +717,7 @@ impl PubSubHub {
                     DEFERRED_SELF_PUBSUB.with(|d| d.borrow_mut().push(frame.clone()));
                     count += 1;
                 } else if let Some(tx) = self.clients.get(client_id)
-                    && tx.try_send(frame.clone()).is_ok()
+                    && tx.deliver(frame, limit.get_or_insert_with(pubsub_limit))
                 {
                     count += 1;
                 }
@@ -626,7 +746,7 @@ impl PubSubHub {
                         DEFERRED_SELF_PUBSUB.with(|d| d.borrow_mut().push(frame.clone()));
                         count += 1;
                     } else if let Some(tx) = self.clients.get(client_id)
-                        && tx.try_send(frame.clone()).is_ok()
+                        && tx.deliver(frame, limit.get_or_insert_with(pubsub_limit))
                     {
                         count += 1;
                     }
@@ -641,7 +761,7 @@ impl PubSubHub {
         &mut self,
         client_id: u64,
         channel: Bytes,
-        tx: flume::Sender<Bytes>,
+        tx: SubscriberTx,
         is_resp3: bool,
     ) -> usize {
         self.clients.insert(client_id, tx);
@@ -705,6 +825,7 @@ impl PubSubHub {
 
     pub fn spublish(&self, channel: &[u8], message: &[u8]) -> usize {
         let mut count = 0;
+        let mut limit = None;
         if let Some(subscribers) = self.shard_channels.get(channel) {
             let mut frame_resp2: Option<Bytes> = None;
             let mut frame_resp3: Option<Bytes> = None;
@@ -725,7 +846,7 @@ impl PubSubHub {
                     DEFERRED_SELF_PUBSUB.with(|d| d.borrow_mut().push(frame.clone()));
                     count += 1;
                 } else if let Some(tx) = self.clients.get(client_id)
-                    && tx.try_send(frame.clone()).is_ok()
+                    && tx.deliver(frame, limit.get_or_insert_with(pubsub_limit))
                 {
                     count += 1;
                 }
@@ -807,13 +928,33 @@ mod tests {
         let (tx4, rx4) = flume::unbounded();
 
         // Client 1: RESP2 subscriber
-        hub.subscribe(1, Bytes::from_static(b"news"), tx1, false);
+        hub.subscribe(
+            1,
+            Bytes::from_static(b"news"),
+            SubscriberTx::unregistered(tx1),
+            false,
+        );
         // Client 2: RESP3 subscriber
-        hub.subscribe(2, Bytes::from_static(b"news"), tx2, true);
+        hub.subscribe(
+            2,
+            Bytes::from_static(b"news"),
+            SubscriberTx::unregistered(tx2),
+            true,
+        );
         // Client 3: RESP3 pattern subscriber
-        hub.psubscribe(3, Bytes::from_static(b"news*"), tx3, true);
+        hub.psubscribe(
+            3,
+            Bytes::from_static(b"news*"),
+            SubscriberTx::unregistered(tx3),
+            true,
+        );
         // Client 4: RESP2 pattern subscriber
-        hub.psubscribe(4, Bytes::from_static(b"news*"), tx4, false);
+        hub.psubscribe(
+            4,
+            Bytes::from_static(b"news*"),
+            SubscriberTx::unregistered(tx4),
+            false,
+        );
 
         let count = hub.publish(b"news", b"breaking");
         assert_eq!(count, 4);
@@ -842,45 +983,73 @@ mod tests {
     }
 
     #[test]
-    fn test_pubsub_slow_consumer_backpressure_and_zero_copy() {
+    fn test_pubsub_slow_subscriber_is_cut_off_by_bytes_not_dropped() {
+        // No per-message cap: a subscriber that has not read 10k messages
+        // still gets every one (well under the default 32 MB hard limit).
         let mut hub = PubSubHub::new();
-        let (tx1, rx1) = flume::bounded(2);
-        let (tx2, rx2) = flume::bounded(10);
-
-        hub.subscribe(1, Bytes::from_static(b"fast_lane"), tx1, false);
-        hub.subscribe(2, Bytes::from_static(b"fast_lane"), tx2, false);
-
-        // First 2 publishes fill client 1's queue
-        assert_eq!(hub.publish(b"fast_lane", b"msg1"), 2);
-        assert_eq!(hub.publish(b"fast_lane", b"msg2"), 2);
-
-        // Third publish: client 1 queue is full (backpressure), client 2 accepts
-        assert_eq!(hub.publish(b"fast_lane", b"msg3"), 1);
-
-        // Verify client 1 has msg1 and msg2, but msg3 was dropped due to backpressure
+        let (tx1, rx1) = flume::unbounded();
+        let (tx2, rx2) = flume::unbounded();
+        hub.subscribe(
+            1,
+            Bytes::from_static(b"lane"),
+            SubscriberTx::unregistered(tx1),
+            false,
+        );
+        hub.subscribe(
+            2,
+            Bytes::from_static(b"lane"),
+            SubscriberTx::unregistered(tx2),
+            false,
+        );
+        for _ in 0..10_000 {
+            assert_eq!(hub.publish(b"lane", b"msg"), 2);
+        }
+        assert_eq!(rx1.len(), 10_000);
+        assert_eq!(rx2.len(), 10_000);
         assert_eq!(
             rx1.try_recv().unwrap(),
-            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg1\r\n")
+            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$4\r\nlane\r\n$3\r\nmsg\r\n")
         );
-        assert_eq!(
-            rx1.try_recv().unwrap(),
-            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg2\r\n")
-        );
-        assert!(rx1.try_recv().is_err());
 
-        // Verify client 2 received all three messages
-        assert_eq!(
-            rx2.try_recv().unwrap(),
-            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg1\r\n")
+        // Hard limit by bytes queued: over it, the subscriber is cut off
+        // (closing) rather than skipping a message and carrying on.
+        let frame = Bytes::from(vec![b'x'; 40]);
+        let (tx, rx) = flume::unbounded();
+        let sub = SubscriberTx::unregistered(tx);
+        let hard = crate::connection::BufferLimit::new(100, 0, 0);
+        assert!(sub.deliver(&frame, &hard));
+        assert!(sub.deliver(&frame, &hard));
+        assert_eq!(sub.queued(), 80);
+        assert!(!sub.deliver(&frame, &hard));
+        assert_eq!(sub.queued(), 80);
+        // Draining afterwards does not resume delivery: it is disconnected.
+        sub.written(80);
+        assert_eq!(sub.queued(), 0);
+        assert!(!sub.deliver(&frame, &hard));
+        assert_eq!(rx.len(), 2);
+
+        // Soft limit: over it for `soft_seconds` (0 here: the next message).
+        let (tx, _rx) = flume::unbounded();
+        let sub = SubscriberTx::unregistered(tx);
+        let soft = crate::connection::BufferLimit::new(0, 50, 0);
+        assert!(sub.deliver(&frame, &soft));
+        assert!(
+            sub.deliver(&frame, &soft),
+            "first time over soft: timer starts"
         );
-        assert_eq!(
-            rx2.try_recv().unwrap(),
-            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg2\r\n")
-        );
-        assert_eq!(
-            rx2.try_recv().unwrap(),
-            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg3\r\n")
-        );
+        assert!(!sub.deliver(&frame, &soft));
+
+        // Dropping back under the soft limit resets its timer.
+        let (tx, _rx) = flume::unbounded();
+        let sub = SubscriberTx::unregistered(tx);
+        let soft = crate::connection::BufferLimit::new(0, 50, 3600);
+        assert!(sub.deliver(&frame, &soft));
+        assert!(sub.deliver(&frame, &soft));
+        sub.written(80);
+        for _ in 0..1000 {
+            assert!(sub.deliver(&frame, &soft));
+            sub.written(40);
+        }
     }
 
     #[test]
@@ -899,7 +1068,7 @@ mod tests {
         hub_shard0.subscribe_with_presence(
             1,
             Bytes::from_static(b"sports"),
-            tx0.clone(),
+            SubscriberTx::unregistered(tx0.clone()),
             false,
             Some((0, &presence)),
         );
@@ -911,7 +1080,7 @@ mod tests {
         hub_shard1.subscribe_with_presence(
             2,
             Bytes::from_static(b"sports"),
-            tx1,
+            SubscriberTx::unregistered(tx1),
             false,
             Some((1, &presence)),
         );
@@ -928,7 +1097,7 @@ mod tests {
         hub_shard0.psubscribe_with_presence(
             3,
             Bytes::from_static(b"news.*"),
-            tx0,
+            SubscriberTx::unregistered(tx0),
             false,
             Some((0, &presence)),
         );
@@ -950,15 +1119,30 @@ mod tests {
         let (tx_pat, rx_pat) = flume::unbounded();
 
         // Client 1: RESP2 subscriber to shard channel "orders:eu"
-        let count1 = hub.ssubscribe(1, Bytes::from_static(b"orders:eu"), tx1, false);
+        let count1 = hub.ssubscribe(
+            1,
+            Bytes::from_static(b"orders:eu"),
+            SubscriberTx::unregistered(tx1),
+            false,
+        );
         assert_eq!(count1, 1);
 
         // Client 2: RESP3 subscriber to shard channel "orders:eu"
-        let count2 = hub.ssubscribe(2, Bytes::from_static(b"orders:eu"), tx2, true);
+        let count2 = hub.ssubscribe(
+            2,
+            Bytes::from_static(b"orders:eu"),
+            SubscriberTx::unregistered(tx2),
+            true,
+        );
         assert_eq!(count2, 1);
 
         // Client 3: pattern subscriber to "orders:*"
-        hub.psubscribe(3, Bytes::from_static(b"orders:*"), tx_pat, false);
+        hub.psubscribe(
+            3,
+            Bytes::from_static(b"orders:*"),
+            SubscriberTx::unregistered(tx_pat),
+            false,
+        );
 
         // SPUBLISH to "orders:eu"
         let recv_count = hub.spublish(b"orders:eu", b"payload_123");
