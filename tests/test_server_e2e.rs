@@ -29827,3 +29827,70 @@ fn test_slow_subscriber_disconnected_at_pubsub_limit_not_dropped_e2e() {
     let _ = srv.kill();
     let _ = srv.wait();
 }
+
+/// With `client-output-buffer-limit normal` set, a client pipelining large
+/// replies it never reads is disconnected near the limit (and counted).
+/// Replies were checked only after a whole batch of up to 1024 commands, so
+/// a 4 MB limit let one ~50 KB write build ~200 MB of replies first.
+#[test]
+fn test_normal_output_limit_stops_batch_near_limit_e2e() {
+    let port = 18017u16;
+    let ps = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &ps, "--threads", "1", "--no-pin"], port);
+    let rss_kb = |pid: u32| -> u64 {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .unwrap()
+            .trim()
+            .trim_end_matches(" kB")
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut req = String::from("*102\r\n$5\r\nRPUSH\r\n$3\r\nlst\r\n");
+    let item = "y".repeat(1000);
+    for _ in 0..100 {
+        req.push_str(&format!("$1000\r\n{item}\r\n"));
+    }
+    assert_eq!(send_and_read_reply(&mut c, req.as_bytes()), ":100\r\n");
+    assert_eq!(
+        send_and_read_reply(
+            &mut c,
+            b"CONFIG SET client-output-buffer-limit \"normal 4mb 2mb 10\"\r\n"
+        ),
+        "+OK\r\n"
+    );
+    let base = rss_kb(srv.id());
+    let bad = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let sock = socket2::SockRef::from(&bad);
+    let _ = sock.set_recv_buffer_size(4096);
+    // 2000 LRANGEs (~200 MB of replies) in one write, never read.
+    let one = "*4\r\n$6\r\nLRANGE\r\n$3\r\nlst\r\n$1\r\n0\r\n$2\r\n-1\r\n";
+    (&bad).write_all(one.repeat(2000).as_bytes()).unwrap();
+    let mut peak = base;
+    for _ in 0..40 {
+        peak = peak.max(rss_kb(srv.id()));
+        thread::sleep(Duration::from_millis(50));
+    }
+    let list = send_and_read_reply(&mut c, b"CLIENT LIST\r\n");
+    assert!(
+        !list.contains("cmd=lrange"),
+        "client not disconnected: {list}"
+    );
+    let stats = send_and_read_reply(&mut c, b"INFO stats\r\n");
+    assert!(
+        stats.contains("client_output_buffer_limit_disconnections:1"),
+        "{stats}"
+    );
+    assert!(
+        peak - base < 40 * 1024,
+        "RSS grew {} MB for a 4 MB limit",
+        (peak - base) / 1024
+    );
+    let _ = srv.kill();
+    let _ = srv.wait();
+}

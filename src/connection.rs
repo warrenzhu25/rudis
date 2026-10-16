@@ -5718,29 +5718,56 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         }
                     } else {
                         let cmd_cnt = commands.len() as u64;
-                        let quit = execute_commands_squashed(
-                            &mut commands,
-                            has_special,
-                            &router,
-                            &responders,
-                            &mut remote_batches,
-                            &mut items_pool,
-                            &mut results_pool,
-                            &mut squashed_responses,
-                            client_id,
-                            &client_registry,
-                            &mut out_buf,
-                            &mut asking,
-                            &mut authenticated,
-                            &mut auth_user,
-                        )
-                        .await;
+                        // With a normal-client output limit set, run the batch
+                        // in chunks of 1, 2, 4, ... commands and stop once the
+                        // replies pass the hard limit: replies are only checked
+                        // after the batch, so up to 1024 of them (e.g. large
+                        // LRANGEs) were built first, several times the limit.
+                        // Doubling keeps the overshoot near the limit and the
+                        // squashing; with no limit (the default) it is one call.
+                        let hard =
+                            if HAS_CUSTOM_BUFFER_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+                                get_client_output_buffer_limit(ClientClass::Normal).hard_limit
+                            } else {
+                                0
+                            };
+                        let mut rest = if hard > 0 {
+                            std::mem::take(&mut commands)
+                        } else {
+                            Vec::new()
+                        };
+                        let mut chunk = 1usize;
+                        loop {
+                            if hard > 0 {
+                                commands = take_doubling_chunk(&mut rest, &mut chunk);
+                            }
+                            let quit = execute_commands_squashed(
+                                &mut commands,
+                                has_special,
+                                &router,
+                                &responders,
+                                &mut remote_batches,
+                                &mut items_pool,
+                                &mut results_pool,
+                                &mut squashed_responses,
+                                client_id,
+                                &client_registry,
+                                &mut out_buf,
+                                &mut asking,
+                                &mut authenticated,
+                                &mut auth_user,
+                            )
+                            .await;
+                            if quit {
+                                should_quit = true;
+                            }
+                            if quit || rest.is_empty() || out_buf.len() as u64 >= hard {
+                                break;
+                            }
+                        }
                         stats
                             .tot_cmds
                             .fetch_add(cmd_cnt, std::sync::atomic::Ordering::Relaxed);
-                        if quit {
-                            should_quit = true;
-                        }
                     }
                     commands.clear();
                 }
@@ -5770,6 +5797,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                     let norm_limits = get_client_output_buffer_limit(ClientClass::Normal);
                     if norm_limits.hard_limit > 0 && out_buf.len() as u64 >= norm_limits.hard_limit
                     {
+                        client_output_limit_reached(client_id, "N", out_buf.len());
                         break;
                     }
                     if norm_limits.soft_limit > 0 && out_buf.len() as u64 >= norm_limits.soft_limit
@@ -5777,6 +5805,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         let now = Instant::now();
                         if let Some(st) = soft_limit_start {
                             if now.duration_since(st).as_secs() >= norm_limits.soft_seconds {
+                                client_output_limit_reached(client_id, "N", out_buf.len());
                                 break;
                             }
                         } else {
@@ -6755,7 +6784,17 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
 
 /// Counts and logs a client dropped for breaking its output buffer limit
 /// (Redis's wording; rate-limited, as many clients may break it at once).
-fn client_output_limit_reached(client_id: u64, omem: usize) {
+/// Takes the next `*chunk` items off the front of `rest` (fewer at its end)
+/// and doubles `*chunk`: a batch run 1, 2, 4, ... commands at a time, so
+/// output checked between chunks overshoots a limit by at most about what
+/// was already built.
+fn take_doubling_chunk<T>(rest: &mut Vec<T>, chunk: &mut usize) -> Vec<T> {
+    let tail = rest.split_off((*chunk).min(rest.len()));
+    *chunk = chunk.saturating_mul(2);
+    std::mem::replace(rest, tail)
+}
+
+fn client_output_limit_reached(client_id: u64, flags: &str, omem: usize) {
     static LOG_LIMIT: crate::log::RateLimit = crate::log::RateLimit::new();
     crate::server_stats::add(
         crate::server_stats::Stat::ClientOutputBufferLimitDisconnections,
@@ -6763,8 +6802,9 @@ fn client_output_limit_reached(client_id: u64, omem: usize) {
     );
     if LOG_LIMIT.allow(std::time::Duration::from_secs(1)) {
         crate::log_warning!(
-            "Client id={} flags=P omem={} scheduled to be closed ASAP for overcoming of output buffer limits.",
+            "Client id={} flags={} omem={} scheduled to be closed ASAP for overcoming of output buffer limits.",
             client_id,
+            flags,
             omem
         );
     }
@@ -6775,7 +6815,7 @@ fn client_output_limit_reached(client_id: u64, omem: usize) {
 /// counts it like Redis, then shuts its socket down the way CLIENT KILL
 /// does, so its writer's pending write fails and the connection closes.
 pub fn close_client_over_output_limit(port: u16, client_id: u64, omem: usize) {
-    client_output_limit_reached(client_id, omem);
+    client_output_limit_reached(client_id, "P", omem);
     let map = GLOBAL_CLIENTS.read();
     if let Some(entry) = map.get(&(port, client_id)) {
         if entry
@@ -28288,6 +28328,21 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn take_doubling_chunk_runs_a_batch_1_2_4_in_order() {
+        let mut rest: Vec<u32> = (0..20).collect();
+        let mut chunk = 1;
+        let mut sizes = Vec::new();
+        let mut seen = Vec::new();
+        while !rest.is_empty() {
+            let part = super::take_doubling_chunk(&mut rest, &mut chunk);
+            sizes.push(part.len());
+            seen.extend(part);
+        }
+        assert_eq!(sizes, vec![1, 2, 4, 8, 5]);
+        assert_eq!(seen, (0..20).collect::<Vec<_>>());
+    }
+
     use super::*;
 
     #[test]
