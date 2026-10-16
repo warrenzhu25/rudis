@@ -29471,7 +29471,9 @@ fn test_cron_trims_entry_arenas_left_part_empty_by_deletes_e2e() {
 /// not maintain: a shard full of hashes looked nearly empty and kept all its
 /// keys while the shard holding strings was evicted down to ~13%). Strings
 /// on one shard and same-sized hashes on another, filled past `maxmemory`:
-/// both keep a similar share.
+/// both keep a similar share (within 1.6x), whichever shard the connection
+/// lands on (the fair share once counted the two empty shards, so the
+/// connection's own shard was evicted to a quarter of the target).
 #[test]
 fn test_eviction_splits_shards_fairly_across_value_types_e2e() {
     let port = 18012;
@@ -29546,7 +29548,7 @@ fn test_eviction_splits_shards_fairly_across_value_types_e2e() {
     );
     let (lo, hi) = (strings.min(hashes), strings.max(hashes));
     assert!(
-        hi < lo * 3,
+        hi * 5 < lo * 8,
         "eviction lopsided between shards: strings kept {strings}, hashes kept {hashes}"
     );
 }

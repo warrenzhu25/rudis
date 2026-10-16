@@ -258,6 +258,25 @@ fn eviction_target(max_mem: usize) -> usize {
     max_mem - (max_mem / 64).min(1 << 20)
 }
 
+/// The level `L` at which shards keeping `min(size, L)` hold `target` in
+/// total (water filling): each shard's fair share when evicting. Not
+/// `target / shards`, which counts empty shards too: with data on two of
+/// four shards the one running the writes evicted itself to a quarter of
+/// the target while the other kept three quarters. The largest size when
+/// everything already fits.
+pub fn water_level(sizes: &mut [usize], target: usize) -> usize {
+    sizes.sort_unstable();
+    let mut left = target;
+    for (i, &s) in sizes.iter().enumerate() {
+        let n = sizes.len() - i;
+        if s.saturating_mul(n) >= left {
+            return (left / n).max(1);
+        }
+        left -= s;
+    }
+    sizes.last().copied().unwrap_or(0).max(1)
+}
+
 /// The calling shard thread's memory by the allocator's count, as the pair
 /// (allocated minus freed by this thread, table arena space allocated but
 /// free for reuse). Call on the shard's own thread. Without
@@ -1095,9 +1114,12 @@ impl Router {
         // volatile-* with TTL keys on a few shards).
         let fair_share = || {
             let real_total = self.real_used_total().max(1);
-            let est_total = self.tier_stats.published_used_total(None);
+            let mut sizes: Vec<usize> = (0..self.num_shards.max(1))
+                .map(|s| self.tier_stats.published_shard_used(s))
+                .collect();
+            let est_total: usize = sizes.iter().sum();
             let est_target = (est_total as u128 * target as u128 / real_total as u128) as usize;
-            (est_target.min(target) / self.num_shards.max(1)).max(1)
+            water_level(&mut sizes, est_target.min(target))
         };
         const FAIR_ROUNDS: usize = 3;
         let rounds = if self.num_shards <= 1 {
@@ -5623,6 +5645,19 @@ mod tests {
     /// per-segment dataset estimate: corrupting the legacy `data_bytes`
     /// counter (as unmaintained write paths did) doesn't change it, and a
     /// shard of hashes is not "empty".
+    #[test]
+    fn test_water_level_ignores_empty_shards() {
+        // Two of four shards hold data: each may keep half, not a quarter.
+        assert_eq!(water_level(&mut [0, 600, 0, 600], 600), 300);
+        // A small shard keeps all it has; the rest split what is left.
+        assert_eq!(water_level(&mut [100, 1000, 1000, 0], 900), 400);
+        // Even data: the plain split.
+        assert_eq!(water_level(&mut [500; 4], 1000), 250);
+        // Everything fits: nobody needs to go below its size.
+        assert_eq!(water_level(&mut [10, 20, 30], 1000), 30);
+        assert_eq!(water_level(&mut [], 1000), 1);
+    }
+
     #[test]
     fn test_shard_size_for_eviction_uses_dataset_estimate() {
         let stats = crate::tiering::TieringStats::default();
