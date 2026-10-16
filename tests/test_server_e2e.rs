@@ -29465,3 +29465,88 @@ fn test_cron_trims_entry_arenas_left_part_empty_by_deletes_e2e() {
         ":2\r\n"
     );
 }
+
+/// Eviction splits the excess between shards by the per-segment dataset
+/// estimate, not the legacy `data_bytes` counter (which most write paths do
+/// not maintain: a shard full of hashes looked nearly empty and kept all its
+/// keys while the shard holding strings was evicted down to ~13%). Strings
+/// on one shard and same-sized hashes on another, filled past `maxmemory`:
+/// both keep a similar share.
+#[test]
+fn test_eviction_splits_shards_fairly_across_value_types_e2e() {
+    let port = 18012;
+    let shards = 4;
+    start_test_server(port, shards);
+    let mut c = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    // Two hash tags on different shards.
+    let shard = |k: &str| rudis::router::target_shard_and_hash(k.as_bytes(), shards).0;
+    let tags: Vec<String> = (0..100).map(|i| format!("t{i}")).collect();
+    let s_tag = &tags[0];
+    let h_tag = tags
+        .iter()
+        .find(|t| shard(&format!("{{{t}}}")) != shard(&format!("{{{s_tag}}}")))
+        .unwrap();
+    assert_eq!(
+        send_and_read(&mut c, b"CONFIG SET maxmemory-policy allkeys-lru\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c, b"CONFIG SET maxmemory 48mb\r\n"),
+        "+OK\r\n"
+    );
+    // ~100 bytes of payload per key either way; ~2x the limit in total.
+    let n = 300_000usize;
+    let val = "v".repeat(100);
+    let fval = "f".repeat(16);
+    for batch in 0..(n / 500) {
+        let mut req = String::new();
+        for i in 0..500 {
+            let k = batch * 500 + i;
+            req.push_str(&format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{{{s_tag}}}s:{k}\r\n$100\r\n{val}\r\n",
+                format!("{{{s_tag}}}s:{k}").len()
+            ));
+            let hk = format!("{{{h_tag}}}h:{k}");
+            req.push_str(&format!(
+                "*8\r\n$4\r\nHSET\r\n${}\r\n{hk}\r\n$2\r\nf1\r\n$16\r\n{fval}\r\n$2\r\nf2\r\n$16\r\n{fval}\r\n$2\r\nf3\r\n$16\r\n{fval}\r\n",
+                hk.len()
+            ));
+        }
+        c.write_all(req.as_bytes()).unwrap();
+        let mut got = 0;
+        let mut buf = vec![0u8; 1 << 16];
+        while got < 1000 {
+            let r = c.read(&mut buf).unwrap();
+            assert!(r > 0);
+            got += buf[..r].windows(2).filter(|w| w == b"\r\n").count();
+        }
+    }
+    thread::sleep(Duration::from_millis(500));
+    let count = |c: &mut TcpStream, pattern: &str| -> usize {
+        let mut cursor = "0".to_string();
+        let mut total = 0;
+        loop {
+            let cmd = format!("SCAN {cursor} MATCH {pattern} COUNT 10000\r\n");
+            let r = send_and_read_reply(c, cmd.as_bytes());
+            let parts: Vec<&str> = r.split("\r\n").collect();
+            cursor = parts[2].to_string();
+            total += parts.iter().skip(3).filter(|p| p.starts_with('{')).count();
+            if cursor == "0" {
+                break;
+            }
+        }
+        total
+    };
+    let strings = count(&mut c, &format!("{{{s_tag}}}s:*"));
+    let hashes = count(&mut c, &format!("{{{h_tag}}}h:*"));
+    assert!(
+        strings > 0 && hashes > 0,
+        "strings {strings} hashes {hashes}"
+    );
+    let (lo, hi) = (strings.min(hashes), strings.max(hashes));
+    assert!(
+        hi < lo * 3,
+        "eviction lopsided between shards: strings kept {strings}, hashes kept {hashes}"
+    );
+}

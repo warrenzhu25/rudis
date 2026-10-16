@@ -422,6 +422,9 @@ pub fn run_shard_worker(
                     // Compact arenas left part empty by deletes/eviction.
                     db.table.trim_arena_step(32);
                 }
+                // Recount part of the dataset estimate (values grown or shrunk
+                // in place); read-only, so safe during a snapshot.
+                active_db.borrow_mut().refresh_data_step(50_000);
                 // Deletes, flushes and CONFIG SET maxmemory don't go through
                 // the post-write check; publish this shard's usage here.
                 mem_router.publish_memory_state();
@@ -2007,7 +2010,10 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     ShardMessage::GetUsedMemory { responder } => {
                         // Also republishes this shard's allocator count.
                         cross_shard_router.publish_memory_state();
-                        let used = cross_shard_db.borrow().total_used_memory();
+                        let used = crate::router::shard_size_for_eviction(
+                            &cross_shard_router.tier_stats,
+                            &cross_shard_db.borrow(),
+                        );
                         let _ = responder.send(used);
                     }
                     ShardMessage::EvictUntilUnder {
@@ -2021,7 +2027,10 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let ((), track) = crate::connection::with_evict_capture(client_id, || {
                             cross_shard_router.evict_local_until_under(&policy, floor);
                         });
-                        let used = cross_shard_db.borrow().total_used_memory();
+                        let used = crate::router::shard_size_for_eviction(
+                            &cross_shard_router.tier_stats,
+                            &cross_shard_db.borrow(),
+                        );
                         let _ = responder.send((used, track));
                     }
                     ShardMessage::TryEvictOneKey { policy, responder } => {

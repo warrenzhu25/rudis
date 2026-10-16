@@ -106,7 +106,7 @@ impl MemoryReport {
 pub fn format_memory_stats(r: &MemoryReport, out: &mut Vec<u8>) {
     let b = &r.breakdown;
     let ratio = |a: usize, d: usize| if d == 0 { 0.0 } else { a as f64 / d as f64 };
-    let ints: [(&str, usize); 13] = [
+    let ints: [(&str, usize); 14] = [
         ("total.allocated", r.alloc.allocated),
         ("used_memory", r.used),
         ("maxmemory", r.maxmemory as usize),
@@ -115,17 +115,21 @@ pub fn format_memory_stats(r: &MemoryReport, out: &mut Vec<u8>) {
             "keys.bytes-per-key",
             r.used.checked_div(b.keys).unwrap_or(0),
         ),
-        ("dataset.bytes", b.dataset),
+        ("dataset.bytes", b.dataset_estimate),
         ("overhead.hashtable.main", b.table),
         ("allocator.allocated", r.alloc.allocated),
         ("allocator.active", r.alloc.active),
         ("allocator.resident", r.alloc.resident),
         ("rudis.dataset.exact.bytes", b.dataset_exact),
+        ("rudis.dataset.counter.bytes", b.dataset),
         ("rudis.hashtable.exact.bytes", b.table_exact),
         ("rudis.untracked.bytes", r.untracked()),
     ];
     let floats: [(&str, f64); 3] = [
-        ("dataset.percentage", 100.0 * ratio(b.dataset, r.used)),
+        (
+            "dataset.percentage",
+            100.0 * ratio(b.dataset_estimate, r.used),
+        ),
         (
             "allocator-fragmentation.ratio",
             ratio(r.alloc.active, r.alloc.allocated),
@@ -168,11 +172,10 @@ pub fn memory_doctor(r: &MemoryReport) -> String {
         ));
     }
     let drift = |inc: usize, exact: usize| inc.abs_diff(exact) > exact / 50 + MB;
-    if drift(b.dataset, b.dataset_exact) || drift(b.table, b.table_exact) {
+    if drift(b.dataset_estimate, b.dataset_exact) || drift(b.table, b.table_exact) {
         issues.push(format!(
-            "Memory accounting drift: dataset {} vs {} bytes recomputed, table {} vs {}. \
-             MEMORY PURGE recomputes it.",
-            b.dataset, b.dataset_exact, b.table, b.table_exact
+            "Memory accounting drift: dataset {} vs {} bytes recomputed, table {} vs {}.",
+            b.dataset_estimate, b.dataset_exact, b.table, b.table_exact
         ));
     }
     if r.untracked() > 64 * MB && r.untracked() > r.used / 10 {
@@ -408,6 +411,7 @@ mod tests {
         let b = crate::table::MemoryBreakdown {
             keys: 1000,
             dataset: 10 * MB,
+            dataset_estimate: 10 * MB,
             dataset_exact: 10 * MB,
             table: 5 * MB,
             table_exact: 5 * MB,
@@ -433,7 +437,7 @@ mod tests {
         let mut out = Vec::new();
         format_memory_stats(&report(200, 220, 210, 256), &mut out);
         let s = String::from_utf8(out).unwrap();
-        assert!(s.starts_with("*34\r\n"), "{s}");
+        assert!(s.starts_with("*36\r\n"), "{s}");
         for f in [
             "used_memory",
             "maxmemory",
@@ -462,6 +466,10 @@ mod tests {
         assert!(over.contains("exceeds maxmemory"), "{over}");
         let mut drift = report(200, 220, 205, 0);
         drift.breakdown.dataset_exact += 64 << 20;
+        // The legacy counter is known not to be maintained: never a finding.
+        let mut legacy = report(200, 220, 205, 0);
+        legacy.breakdown.dataset = 0;
+        assert!(memory_doctor(&legacy).contains("can't find any"));
         assert!(memory_doctor(&drift).contains("accounting drift"));
         let untracked = memory_doctor(&report(200, 290, 290, 0));
         assert!(

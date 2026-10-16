@@ -1442,6 +1442,18 @@ impl RudisValue {
         }
     }
 
+    /// Elements in a collection value (0 for strings and other scalars):
+    /// the work [`Self::mem_bytes`] does to size it.
+    pub fn collection_len(&self) -> usize {
+        match self {
+            RudisValue::SmallHash(h) => h.len(),
+            RudisValue::Hash(h) => h.len(),
+            RudisValue::List(l) => l.len(),
+            RudisValue::Cooled(cv) => cv.val.collection_len(),
+            _ => 0,
+        }
+    }
+
     pub fn approx_bytes(&self) -> usize {
         match self {
             RudisValue::String(b) => b.len(),
@@ -1862,6 +1874,17 @@ pub struct RawSegment {
     pub local_depth: u8,
     pub stash_ctrl: [u8; STASH_CAP],
     pub stash_count: u8,
+    /// Estimated bytes of this segment's entries (see [`entry_cost`]):
+    /// kept current on insert/remove, refreshed by
+    /// [`RudisFlatTable::refresh_data_step`] to pick up in-place growth.
+    data_est: usize,
+}
+
+/// Bytes an entry adds to the dataset estimate: its key's and value's heap
+/// bytes plus the per-entry overhead (as `RudisTable::recalculate_used_memory`).
+#[inline]
+fn entry_cost(e: &RudisEntry) -> usize {
+    e.key.heap_bytes() + e.val.mem_bytes() + ENTRY_OVERHEAD
 }
 
 impl RawSegment {
@@ -1884,6 +1907,7 @@ impl RawSegment {
             local_depth,
             stash_ctrl: [EMPTY; STASH_CAP],
             stash_count: 0,
+            data_est: 0,
         }
     }
 
@@ -2440,6 +2464,7 @@ impl RawSegment {
 
     pub fn rebuild(&mut self, new_cap: usize) {
         let mut next = RawSegment::new(new_cap, self.local_depth);
+        next.data_est = self.data_est;
         next.reserve_entries_exact(self.items);
         for (entry, access) in self.drain_entries() {
             let h = mix_hash(hash_key(&entry.key));
@@ -2495,6 +2520,10 @@ pub struct RudisFlatTable {
     seg_fixed_bytes: usize,
     /// Next segment [`Self::trim_step`] looks at.
     trim_cursor: usize,
+    /// Sum of every segment's `data_est`.
+    data_est_total: usize,
+    /// Next segment [`Self::refresh_data_step`] recounts.
+    data_cursor: usize,
 }
 
 impl RudisFlatTable {
@@ -2515,6 +2544,8 @@ impl RudisFlatTable {
             seg_heap_bytes,
             seg_fixed_bytes,
             trim_cursor: 0,
+            data_est_total: 0,
+            data_cursor: 0,
         }
     }
 
@@ -2556,6 +2587,46 @@ impl RudisFlatTable {
         freed
     }
 
+    /// Moves segment `seg_id`'s data estimate (and the total) by `add - sub`.
+    #[inline(always)]
+    fn adjust_data(&mut self, seg_id: usize, add: usize, sub: usize) {
+        let seg = &mut self.segments[seg_id];
+        seg.data_est = (seg.data_est + add).saturating_sub(sub);
+        self.data_est_total = (self.data_est_total + add).saturating_sub(sub);
+    }
+
+    /// Estimated bytes of every entry (keys, values, per-entry overhead):
+    /// exact for inserts and removes, refreshed for in-place changes by
+    /// [`Self::refresh_data_step`]. O(1).
+    #[inline]
+    pub fn dataset_estimate(&self) -> usize {
+        self.data_est_total
+    }
+
+    /// Recounts segments' data estimates round robin until about `budget`
+    /// units of work (an entry, plus a collection's length) are done, so
+    /// values that grew or shrank in place (HSET on an existing hash, APPEND,
+    /// LPUSH...) are reflected within a few cron ticks. Returns the number
+    /// of segments recounted.
+    pub fn refresh_data_step(&mut self, budget: usize) -> usize {
+        let n = self.segments.len();
+        let (mut work, mut done) = (0usize, 0usize);
+        while done < n && work < budget {
+            let i = self.data_cursor % n;
+            self.data_cursor = (i + 1) % n;
+            let seg = &mut self.segments[i];
+            let mut fresh = 0;
+            for e in seg.iter_entries() {
+                fresh += entry_cost(e);
+                work += 1 + e.val.collection_len();
+            }
+            self.data_est_total = (self.data_est_total + fresh).saturating_sub(seg.data_est);
+            seg.data_est = fresh;
+            done += 1;
+        }
+        done
+    }
+
     /// [`Self::struct_bytes`] recomputed from every segment instead of the
     /// incremental counter (O(segments)).
     pub fn struct_bytes_exact(&self) -> usize {
@@ -2581,6 +2652,7 @@ impl RudisFlatTable {
     }
 
     fn recompute_seg_heap_bytes(&mut self) {
+        self.data_est_total = self.segments.iter().map(|s| s.data_est).sum();
         self.seg_heap_bytes = self.segments.iter().map(RawSegment::heap_bytes).sum();
         self.seg_fixed_bytes = self.segments.iter().map(RawSegment::fixed_heap_bytes).sum();
     }
@@ -2655,13 +2727,20 @@ impl RudisFlatTable {
                 .count();
             seg_zero.reserve_entries_exact(moved.len() - ones);
             seg_one.reserve_entries_exact(ones);
+            let old_data = self.segments[seg_id].data_est;
             for (entry, acc, h) in moved {
+                let cost = entry_cost(&entry);
                 if ((h >> bit_shift) & 1) == 0 {
+                    seg_zero.data_est += cost;
                     seg_zero.insert_migrated(entry, h, acc);
                 } else {
+                    seg_one.data_est += cost;
                     seg_one.insert_migrated(entry, h, acc);
                 }
             }
+            // The halves are recounted exactly; the old figure may have lagged.
+            self.data_est_total =
+                self.data_est_total.saturating_sub(old_data) + seg_zero.data_est + seg_one.data_est;
 
             self.seg_heap_bytes =
                 self.seg_heap_bytes - old_heap + seg_zero.heap_bytes() + seg_one.heap_bytes();
@@ -2773,14 +2852,19 @@ impl RudisFlatTable {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
 
+        let cost = entry_cost(&entry);
         if existing.is_some() {
-            self.segments[seg_id].replace_at(local_idx, entry)
+            let old = self.segments[seg_id].replace_at(local_idx, entry);
+            let old_cost = old.as_ref().map_or(0, entry_cost);
+            self.adjust_data(seg_id, cost, old_cost);
+            old
         } else {
             if let Some(counts) = self.slot_counts.as_mut() {
                 let slot = crate::router::key_slot(&entry.key) as usize;
                 counts[slot] += 1;
             }
             self.seg_heap_bytes += self.segments[seg_id].insert_at(entry, mix_hash(h), local_idx);
+            self.adjust_data(seg_id, cost, 0);
             self.items += 1;
             None
         }
@@ -2794,7 +2878,9 @@ impl RudisFlatTable {
         }
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
+        let cost = entry_cost(&entry);
         self.seg_heap_bytes += self.segments[seg_id].insert_at(entry, mix_hash(hash), local_idx);
+        self.adjust_data(seg_id, cost, 0);
         self.items += 1;
     }
 
@@ -2813,6 +2899,7 @@ impl RudisFlatTable {
         let local_idx = global_idx & GLOBAL_IDX_MASK;
         let (entry, freed) = self.segments.get_mut(seg_id)?.remove(local_idx)?;
         self.seg_heap_bytes -= freed;
+        self.adjust_data(seg_id, 0, entry_cost(&entry));
         self.items -= 1;
         if let Some(counts) = self.slot_counts.as_mut() {
             let slot = crate::router::key_slot(&entry.key) as usize;
@@ -2827,6 +2914,7 @@ impl RudisFlatTable {
         let local_idx = global_idx & GLOBAL_IDX_MASK;
         let (entry, freed) = self.segments[seg_id].remove_present(local_idx);
         self.seg_heap_bytes -= freed;
+        self.adjust_data(seg_id, 0, entry_cost(&entry));
         self.items -= 1;
         if let Some(counts) = self.slot_counts.as_mut() {
             let slot = crate::router::key_slot(&entry.key) as usize;
@@ -3035,6 +3123,7 @@ impl RudisFlatTable {
         {
             let target_cap = optimal_cap.clamp(64, SEG_CAP);
             let mut single = RawSegment::new(target_cap, 0);
+            single.data_est = self.segments.iter().map(|s| s.data_est).sum();
             single.reserve_entries_exact(self.items);
             for seg in self.segments.iter_mut() {
                 for (entry, access) in seg.drain_entries() {
@@ -3134,6 +3223,7 @@ impl RudisFlatTable {
     fn merge_buddies(&mut self, a: usize, b: usize, d: u8, pattern: usize) {
         let (keep, hole) = if a > b { (a, b) } else { (b, a) };
         let mut merged = RawSegment::new(SEG_CAP, d - 1);
+        merged.data_est = self.segments[a].data_est + self.segments[b].data_est;
         merged.reserve_entries_exact(self.segments[a].items + self.segments[b].items);
         for id in [hole, keep] {
             for (entry, access) in self.segments[id].drain_entries() {
@@ -3258,8 +3348,12 @@ pub fn compute_digest(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryBreakdown {
     pub keys: usize,
-    /// Incremental `data_bytes` (keys, values, per-entry overhead).
+    /// Incremental `data_bytes` (keys, values, per-entry overhead). Not kept
+    /// current by every write path; see `dataset_estimate`.
     pub dataset: usize,
+    /// Per-segment estimate (exact on insert/remove, recounted by the cron):
+    /// what eviction splits shards by.
+    pub dataset_estimate: usize,
     /// `dataset` recomputed by walking every entry.
     pub dataset_exact: usize,
     /// Incremental table structure bytes (slot arrays, entry arenas).
@@ -3274,6 +3368,7 @@ impl std::ops::AddAssign for MemoryBreakdown {
     fn add_assign(&mut self, o: Self) {
         self.keys += o.keys;
         self.dataset += o.dataset;
+        self.dataset_estimate += o.dataset_estimate;
         self.dataset_exact += o.dataset_exact;
         self.table += o.table;
         self.table_exact += o.table_exact;
@@ -3734,6 +3829,7 @@ impl RudisTable {
         MemoryBreakdown {
             keys: self.len(),
             dataset: self.data_bytes,
+            dataset_estimate: self.table.dataset_estimate(),
             dataset_exact,
             table: self.table.struct_bytes(),
             table_exact: self.table.struct_bytes_exact(),
@@ -3753,6 +3849,18 @@ impl RudisTable {
     /// Gives back table structure left over from deleted keys, a bounded
     /// step at a time; see [`RudisFlatTable::shrink_step`]. Collapses to a
     /// single small segment once the keyspace fits in one.
+    /// Size of this table for splitting eviction between shards: structure
+    /// plus [`RudisFlatTable::dataset_estimate`].
+    #[inline]
+    pub fn eviction_size(&self) -> usize {
+        self.table.struct_bytes() + self.table.dataset_estimate()
+    }
+
+    /// See [`RudisFlatTable::refresh_data_step`].
+    pub fn refresh_data_step(&mut self, budget: usize) -> usize {
+        self.table.refresh_data_step(budget)
+    }
+
     /// See [`RudisFlatTable::trim_step`]; keeps `used_memory` in step.
     pub fn trim_arena_step(&mut self, budget: usize) -> usize {
         self.table.trim_step(budget)
@@ -17122,7 +17230,64 @@ mod tests {
         assert_eq!((b.dataset, b.table), (b.dataset_exact, b.table_exact));
     }
 
+    /// The dataset estimate is exact after inserts, removes, splits, merges
+    /// and defrag, and catches in-place growth once the refresh step has
+    /// visited every segment.
+    #[test]
+    fn test_dataset_estimate_tracks_inserts_removes_and_in_place_growth() {
+        let mut t = RudisTable::new();
+        let exact = |t: &RudisTable| t.memory_breakdown().dataset_exact;
+        for k in 0..50_000u64 {
+            t.set(
+                Bytes::from(format!("k:{k:08}")),
+                Bytes::from("v".repeat((k % 300) as usize)),
+                None,
+            );
+        }
+        for k in 0..2000u64 {
+            t.hset(
+                Bytes::from(format!("h:{k}")),
+                vec![(Bytes::from("f"), Bytes::from("x"))],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            t.table.dataset_estimate(),
+            exact(&t),
+            "after inserts/splits"
+        );
+        assert_seg_heap_bytes_consistent(&t.table);
+        for k in (0..50_000u64).filter(|k| k % 3 == 0) {
+            t.del(format!("k:{k:08}").as_bytes());
+        }
+        assert_eq!(t.table.dataset_estimate(), exact(&t), "after removes");
+        // In-place growth: not seen until the refresh step recounts.
+        for k in 0..2000u64 {
+            let fields: Vec<_> = (0..20)
+                .map(|i| (Bytes::from(format!("g{i}")), Bytes::from("y".repeat(30))))
+                .collect();
+            t.hset(Bytes::from(format!("h:{k}")), fields).unwrap();
+        }
+        assert!(t.table.dataset_estimate() < exact(&t));
+        let segs = t.table.segments.len();
+        while t.refresh_data_step(usize::MAX) < segs {}
+        assert_eq!(t.table.dataset_estimate(), exact(&t), "after refresh");
+        // Merges and defrag keep it.
+        for k in 0..50_000u64 {
+            t.del(format!("k:{k:08}").as_bytes());
+        }
+        while t.table.shrink_step(32) > 0 {}
+        assert_eq!(t.table.dataset_estimate(), exact(&t), "after merges");
+        t.table.defrag();
+        assert_eq!(t.table.dataset_estimate(), exact(&t), "after defrag");
+        assert_seg_heap_bytes_consistent(&t.table);
+        t.flushdb();
+        assert_eq!(t.table.dataset_estimate(), 0);
+    }
+
     fn assert_seg_heap_bytes_consistent(t: &RudisFlatTable) {
+        let data: usize = t.segments.iter().map(|s| s.data_est).sum();
+        assert_eq!(t.data_est_total, data, "data_est_total != sum of segments");
         let full: usize = t.segments.iter().map(RawSegment::heap_bytes).sum();
         assert_eq!(t.seg_heap_bytes, full, "incremental seg_heap_bytes drifted");
         let fixed: usize = t.segments.iter().map(RawSegment::fixed_heap_bytes).sum();

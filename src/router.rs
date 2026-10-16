@@ -286,6 +286,21 @@ pub fn local_real_used(stats: &crate::tiering::TieringStats, db: &crate::shard::
     net - slack as i64
 }
 
+/// This shard's size for splitting eviction between shards: table
+/// structure plus the per-segment dataset estimate (exact on insert and
+/// remove, recounted for in-place growth by the cron). Not the incremental
+/// `data_bytes` counter, which most write paths don't maintain (a shard of
+/// hashes looked nearly empty and was never evicted), nor the shard thread's
+/// allocator net, which memory freed on other threads skews (a shard could
+/// publish 0 and be skipped).
+#[inline]
+pub fn shard_size_for_eviction(
+    _stats: &crate::tiering::TieringStats,
+    db: &crate::shard::ShardDb,
+) -> usize {
+    db.eviction_size()
+}
+
 /// Clears `is_saving` and records a failed save or rewrite if the task
 /// doing it ends without finishing (its future dropped part-way, e.g. by a
 /// panic isolated with `catch_unwind`). Otherwise one such save refuses
@@ -892,7 +907,7 @@ impl Router {
         let (estimate, (net, slack)) = {
             let db = self.local_db.borrow();
             (
-                db.total_used_memory(),
+                shard_size_for_eviction(&self.tier_stats, &db),
                 local_real_parts(&self.tier_stats, &db),
             )
         };
@@ -953,7 +968,9 @@ impl Router {
             let mut db = self.local_db.borrow_mut();
             loop {
                 let local = local_real_used(&self.tier_stats, &db);
-                if others + local <= target || db.total_used_memory() <= floor {
+                if others + local <= target
+                    || shard_size_for_eviction(&self.tier_stats, &db) <= floor
+                {
                     break;
                 }
                 if db.try_evict_one_key(policy, self.aof.as_deref()).is_none() {
@@ -5600,6 +5617,27 @@ mod tests {
         });
         crate::tiering::set_max_memory(port, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shard's size for splitting eviction is its table structure plus the
+    /// per-segment dataset estimate: corrupting the legacy `data_bytes`
+    /// counter (as unmaintained write paths did) doesn't change it, and a
+    /// shard of hashes is not "empty".
+    #[test]
+    fn test_shard_size_for_eviction_uses_dataset_estimate() {
+        let stats = crate::tiering::TieringStats::default();
+        let mut db = crate::shard::ShardDb::new(6409);
+        let empty = shard_size_for_eviction(&stats, &db);
+        for i in 0..2000 {
+            let fields = vec![(Bytes::from("f1"), Bytes::from("x".repeat(40)))];
+            db.table.hset(Bytes::from(format!("h{i}")), fields).unwrap();
+        }
+        let full = shard_size_for_eviction(&stats, &db);
+        assert_eq!(full, db.table.eviction_size());
+        // 2000 hashes of ~44 payload bytes plus overhead: clearly not empty.
+        assert!(full > empty + 2000 * 40, "empty {empty} full {full}");
+        db.table.data_bytes = 0;
+        assert_eq!(shard_size_for_eviction(&stats, &db), full);
     }
 
     #[test]

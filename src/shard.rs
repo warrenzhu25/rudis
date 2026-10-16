@@ -876,6 +876,31 @@ impl ShardDb {
         total
     }
 
+    /// [`crate::table::RudisTable::eviction_size`] summed over every DB.
+    pub fn eviction_size(&self) -> usize {
+        let mut total = self.table.eviction_size();
+        for (idx, opt) in self.tables.iter().enumerate() {
+            if idx != self.current_db
+                && let Some(t) = opt
+            {
+                total += t.eviction_size();
+            }
+        }
+        total
+    }
+
+    /// See [`crate::table::RudisTable::refresh_data_step`]; every DB.
+    pub fn refresh_data_step(&mut self, budget: usize) {
+        self.table.refresh_data_step(budget);
+        for (idx, opt) in self.tables.iter_mut().enumerate() {
+            if idx != self.current_db
+                && let Some(t) = opt
+            {
+                t.refresh_data_step(budget);
+            }
+        }
+    }
+
     /// [`crate::table::RudisTable::memory_breakdown`] summed over every DB.
     pub fn memory_breakdown(&self) -> crate::table::MemoryBreakdown {
         let mut total = self.table.memory_breakdown();
