@@ -29550,3 +29550,39 @@ fn test_eviction_splits_shards_fairly_across_value_types_e2e() {
         "eviction lopsided between shards: strings kept {strings}, hashes kept {hashes}"
     );
 }
+
+/// `--maxmemory` sets the eviction limit itself (not only a tiering
+/// threshold, as its help once said) and other `--<directive> <value>`
+/// flags pass through as config directives, e.g. `--maxmemory-policy`.
+#[test]
+fn test_cli_maxmemory_and_passthrough_policy_take_effect_e2e() {
+    let port = 18013u16;
+    let ps = port.to_string();
+    let help = rudis_bin().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("enforced by eviction"), "{help}");
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &ps,
+            "--threads",
+            "1",
+            "--no-pin",
+            "--maxmemory",
+            "64mb",
+            "--maxmemory-policy",
+            "allkeys-lfu",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let r = send_and_read_reply(&mut c, b"CONFIG GET maxmemory\r\n");
+    assert!(r.contains("67108864"), "{r}");
+    let r = send_and_read_reply(&mut c, b"CONFIG GET maxmemory-policy\r\n");
+    assert!(r.contains("allkeys-lfu"), "{r}");
+    let r = send_and_read_reply(&mut c, b"INFO memory\r\n");
+    assert!(r.contains("maxmemory:67108864"), "{r}");
+    let _ = srv.kill();
+    let _ = srv.wait();
+}

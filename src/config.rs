@@ -1125,6 +1125,21 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The shipped rudis.conf (with its maxmemory headroom guidance) parses
+    /// to the documented limit and policy.
+    #[test]
+    fn test_shipped_rudis_conf_sets_maxmemory_and_policy() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("rudis.conf");
+        let cfg = RudisConfig::load_file(&path).expect("rudis.conf parses");
+        assert_eq!(cfg.maxmemory_bytes, Some(4 << 30));
+        assert_eq!(cfg.maxmemory_policy, "allkeys-lru");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("not the process RSS"),
+            "headroom guidance missing"
+        );
+    }
+
     #[test]
     fn test_parse_empty_and_comments() {
         let text = r#"

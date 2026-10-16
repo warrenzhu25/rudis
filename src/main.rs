@@ -42,7 +42,11 @@ struct Args {
     #[arg(long)]
     aof_dir: Option<std::path::PathBuf>,
 
-    /// Max memory limit for tiered storage auto-tiering (e.g. 512mb, 1gb)
+    /// Memory limit (e.g. 512mb, 1gb): `maxmemory`, enforced by eviction
+    /// under `--maxmemory-policy` (or by spilling to the NVMe tier when
+    /// tiering is enabled). Leave ~25% of RAM above it: it bounds
+    /// `used_memory`, not RSS. Any other `--<directive> <value>` is applied
+    /// as a config-file directive, e.g. `--maxmemory-policy allkeys-lru`.
     #[arg(long)]
     maxmemory: Option<String>,
 
