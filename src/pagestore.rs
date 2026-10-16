@@ -12,7 +12,8 @@
 //! go (read-only, so the owner can still look entries up to find what points
 //! at them), then [`PageStore::compact`] slides them down in place and
 //! shrinks the page to its live bytes (only the current page takes appends,
-//! so a compacted page is never refilled). Handles
+//! so a compacted page is never refilled; the current page is compacted the
+//! same way and keeps taking appends after its live bytes). Handles
 //! are never reused while live, and every moved entry lands below every
 //! not-yet-moved one, so repointing by handle equality is unambiguous.
 
@@ -298,7 +299,10 @@ impl<H: Handle> PageStore<H> {
             self.pages[page] = Page::default();
             self.free_pages.push(page as u32);
             None
-        } else if dead * 2 >= used && self.current != page as u32 {
+        } else if dead * 2 >= used {
+            // The current page too: a collection that fits one page appends
+            // and deletes there forever, so exempting it let dead entries
+            // fill it to a full page however few members were live.
             Some(page)
         } else {
             None
@@ -371,6 +375,38 @@ impl<H: Handle> PageStore<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A collection that fits one page churns on the current page: dead
+    /// entries there must be compacted too, not left to fill a full page.
+    #[test]
+    fn current_page_churn_is_compacted() {
+        let mut ps = PageStore::<u32>::default();
+        let mut live: Vec<(u32, u32)> = Vec::new();
+        let mut peak = 0;
+        for seq in 0..20_000u32 {
+            if live.len() >= 50 {
+                let (h, _) = live.remove((seq as usize * 7) % live.len());
+                if let Some(p) = ps.release(h) {
+                    let mv: Vec<(u32, u32)> = ps.moves(p).map(|(a, b, _)| (a, b)).collect();
+                    ps.compact(p);
+                    for (a, b) in mv {
+                        for e in live.iter_mut().filter(|e| e.0 == a) {
+                            e.0 = b;
+                        }
+                    }
+                }
+            }
+            let (h, retired) = ps.insert(&[&seq.to_le_bytes()]).unwrap();
+            assert!(retired.is_none());
+            live.push((h, seq));
+            peak = peak.max(ps.heap_bytes());
+        }
+        // 50 live 5-byte entries: 250 bytes, about 4x below a full page.
+        assert!(peak <= 1024, "peak heap {peak}");
+        for &(h, v) in &live {
+            assert_eq!(ps.get(h), &v.to_le_bytes());
+        }
+    }
 
     /// Remove + insert churn with a small live set must not pin memory:
     /// compacted pages hand back their freed tail.

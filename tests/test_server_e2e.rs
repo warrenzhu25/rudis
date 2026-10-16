@@ -29659,3 +29659,87 @@ fn test_zset_churn_keeps_memory_flat_e2e() {
     let _ = srv.kill();
     let _ = srv.wait();
 }
+
+/// SADD + SREM churn on a set that fits one page must not grow memory: the
+/// page taking appends was exempt from compaction, so dead members filled
+/// it to a full 4 KB page however few were live (~4x for 100 short members).
+#[test]
+fn test_set_churn_on_one_page_keeps_memory_flat_e2e() {
+    let port = 18015u16;
+    let ps = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &ps, "--threads", "1", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let used = |c: &mut TcpStream| -> i64 {
+        let r = send_and_read_reply(c, b"INFO memory\r\n");
+        r.lines()
+            .find_map(|l| l.strip_prefix("used_memory:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let (sets, live) = (1000usize, 100usize);
+    let send = |c: &mut TcpStream, cmds: &[(&str, String, String)]| {
+        let mut req = String::new();
+        for (op, k, m) in cmds {
+            req.push_str(&format!(
+                "*3\r\n${}\r\n{op}\r\n${}\r\n{k}\r\n${}\r\n{m}\r\n",
+                op.len(),
+                k.len(),
+                m.len()
+            ));
+        }
+        c.write_all(req.as_bytes()).unwrap();
+        let (mut got, mut buf) = (0, vec![0u8; 1 << 16]);
+        while got < cmds.len() {
+            let r = c.read(&mut buf).unwrap();
+            assert!(r > 0);
+            got += buf[..r].windows(2).filter(|w| w == b"\r\n").count();
+        }
+    };
+    // Set i holds members m{lo..lo+live}; a step drops the oldest and adds
+    // the next, so every SREM and SADD changes the set.
+    let step = |c: &mut TcpStream, lo: usize| {
+        let mut cmds = Vec::with_capacity(sets * 2);
+        for i in 0..sets {
+            let k = format!("s{i}");
+            cmds.push(("SREM", k.clone(), format!("m{lo}")));
+            cmds.push(("SADD", k, format!("m{}", lo + live)));
+        }
+        send(c, &cmds);
+    };
+    for j in 0..live {
+        let cmds: Vec<_> = (0..sets)
+            .map(|i| ("SADD", format!("s{i}"), format!("m{j}")))
+            .collect();
+        send(&mut c, &cmds);
+    }
+    for lo in 0..20 {
+        step(&mut c, lo);
+    }
+    let before = used(&mut c);
+    for lo in 20..470 {
+        step(&mut c, lo);
+    }
+    let after = used(&mut c);
+    assert_eq!(send_and_read_reply(&mut c, b"SCARD s7\r\n"), ":100\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut c, b"SISMEMBER s7 m569\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut c, b"SISMEMBER s7 m470\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut c, b"SISMEMBER s7 m469\r\n"),
+        ":0\r\n"
+    );
+    assert!(
+        after - before < 1 << 20,
+        "set churn grew used_memory from {before} to {after}"
+    );
+    let _ = srv.kill();
+    let _ = srv.wait();
+}
