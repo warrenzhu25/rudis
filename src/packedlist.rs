@@ -415,12 +415,15 @@ impl PackedList {
         }
         let need = entry_size(v.len());
         if !matches!(self.chunks.back(), Some(Chunk::Packed(p)) if p.fits(need)) {
-            // A list's first chunk grows gradually (small lists stay small);
-            // later ones are allocated full, so long lists never reallocate.
-            let p = if self.chunks.is_empty() {
-                Packed::new()
-            } else {
+            // A chunk is allocated full only after a full packed chunk, so a
+            // long run of short values never reallocates. Otherwise (the
+            // list's first chunk, or the end is a long value's own chunk) it
+            // grows gradually: allocating 4 KB there gave a list mixing short
+            // and long values a near-empty 4 KB chunk after every long one.
+            let p = if matches!(self.chunks.back(), Some(Chunk::Packed(_))) {
                 Packed::full_for_back()
+            } else {
+                Packed::new()
             };
             self.chunks.push_back(Chunk::Packed(p));
         }
@@ -438,10 +441,11 @@ impl PackedList {
         }
         let need = entry_size(v.len());
         if !matches!(self.chunks.front(), Some(Chunk::Packed(p)) if p.fits(need)) {
-            let p = if self.chunks.is_empty() {
-                Packed::new()
-            } else {
+            // As in `push_back_impl`: full only after a full packed chunk.
+            let p = if matches!(self.chunks.front(), Some(Chunk::Packed(_))) {
                 Packed::full_for_front()
+            } else {
+                Packed::new()
             };
             self.chunks.push_front(Chunk::Packed(p));
         }
@@ -933,6 +937,66 @@ mod tests {
         assert_eq!(all[4_999], b"l00000");
         assert_eq!(all[5_000], b"r00000");
         assert_eq!(all[9_999], format!("r{:05}", 4_999).into_bytes());
+    }
+
+    /// Short values pushed between long ones (which get chunks of their own)
+    /// start small growable chunks, not a 4 KB chunk each: a list mixing 6-,
+    /// 40- and 128-byte values held ~14x its data. A long run of short
+    /// values still fills full chunks.
+    #[test]
+    fn short_values_between_long_ones_do_not_get_full_chunks() {
+        let packed_capacity = |l: &PackedList| -> usize {
+            l.chunks
+                .iter()
+                .map(|c| match c {
+                    Chunk::Packed(p) => p.buf.capacity(),
+                    Chunk::Big(_) => 0,
+                })
+                .sum()
+        };
+        for front in [false, true] {
+            let mut l = PackedList::new();
+            let long = b(&[b'L'; 128]);
+            for i in 0..1000u32 {
+                let short = b(format!("s{i:04}").as_bytes());
+                if front {
+                    l.push_front(&long);
+                    l.push_front(&short);
+                } else {
+                    l.push_back(&long);
+                    l.push_back(&short);
+                }
+            }
+            assert_eq!(l.len(), 2000);
+            // 1000 short entries of 7 bytes: well under 100 KB of chunk
+            // capacity (each short value's chunk is a small one).
+            let cap = packed_capacity(&l);
+            assert!(
+                cap < 100 * 1024,
+                "front={front}: {cap} bytes of packed chunks"
+            );
+            let all: Vec<Vec<u8>> = l.iter().map(<[u8]>::to_vec).collect();
+            let want = |i: u32| format!("s{i:04}").into_bytes();
+            if front {
+                assert_eq!(all[0], want(999));
+                assert_eq!(all[1], vec![b'L'; 128]);
+            } else {
+                assert_eq!(all[0], vec![b'L'; 128]);
+                assert_eq!(all[1], want(0));
+            }
+        }
+        // A long run of short values: every chunk but the last is a full one.
+        let mut l = PackedList::new();
+        for i in 0..20_000u32 {
+            l.push_back(&b(format!("v{i:05}").as_bytes()));
+        }
+        let n = l.chunks.len();
+        assert!(n > 3);
+        for c in l.chunks.iter().skip(1).take(n - 2) {
+            if let Chunk::Packed(p) = c {
+                assert_eq!(p.buf.capacity(), HDR + CHUNK_MAX);
+            }
+        }
     }
 
     #[test]
