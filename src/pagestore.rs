@@ -10,7 +10,9 @@
 //! Removing an entry sets its dead bit. Once at least half a page is dead the
 //! owner compacts it: [`PageStore::moves`] lists where each live entry will
 //! go (read-only, so the owner can still look entries up to find what points
-//! at them), then [`PageStore::compact`] slides them down in place. Handles
+//! at them), then [`PageStore::compact`] slides them down in place and
+//! shrinks the page to its live bytes (only the current page takes appends,
+//! so a compacted page is never refilled). Handles
 //! are never reused while live, and every moved entry lands below every
 //! not-yet-moved one, so repointing by handle equality is unambiguous.
 
@@ -348,6 +350,86 @@ impl<H: Handle> PageStore<H> {
             off += size;
         }
         buf.truncate(dst);
+        // Give the freed tail back: new entries only append to the current
+        // page, so a compacted page is never refilled. Keeping its full
+        // capacity let churn (remove + insert) pin a near-empty 4 KB page
+        // per few survivors, growing without bound.
+        buf.shrink_to_fit();
         p.dead = 0;
+    }
+
+    /// Heap bytes held: page buffers (by capacity) plus the page table.
+    pub fn heap_bytes(&self) -> usize {
+        let bufs: usize = (0..self.pages.n)
+            .map(|i| self.pages[i].buf.capacity())
+            .sum();
+        bufs + self.pages.rest.capacity() * std::mem::size_of::<Page>()
+            + self.free_pages.capacity() * 4
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Remove + insert churn with a small live set must not pin memory:
+    /// compacted pages hand back their freed tail.
+    #[test]
+    fn churn_keeps_heap_bounded_by_live_bytes() {
+        let mut ps = PageStore::<u32>::default();
+        let mut live: std::collections::VecDeque<(u32, u32)> = Default::default();
+        let compact = |ps: &mut PageStore<u32>,
+                       live: &mut std::collections::VecDeque<(u32, u32)>,
+                       page: usize| {
+            let mv: Vec<(u32, u32)> = ps.moves(page).map(|(a, b, _)| (a, b)).collect();
+            ps.compact(page);
+            for (a, b) in mv {
+                for e in live.iter_mut() {
+                    if e.0 == a {
+                        e.0 = b;
+                    }
+                }
+            }
+        };
+        let mut peak = 0;
+        let mut rng = 0x9E37_79B9u32;
+        let prio: Vec<u32> = (0..200_000)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                rng
+            })
+            .collect();
+        for seq in 0..200_000u32 {
+            if live.len() >= 300 {
+                // ZPOPMIN-like: drop the lowest random priority, so a few
+                // high-priority entries outlive many pages of their peers.
+                let i = (0..live.len())
+                    .min_by_key(|&i| prio[live[i].1 as usize])
+                    .unwrap();
+                let (h, _) = live.remove(i).unwrap();
+                if let Some(p) = ps.release(h) {
+                    compact(&mut ps, &mut live, p);
+                }
+            }
+            let payload = seq.to_le_bytes();
+            let (h, retired) = ps.insert(&[&payload, &[7u8; 20]]).unwrap();
+            live.push_back((h, seq));
+            if let Some(p) = retired {
+                compact(&mut ps, &mut live, p);
+            }
+            if seq % 1000 == 0 {
+                peak = peak.max(ps.heap_bytes());
+            }
+        }
+        let live_bytes = live.len() * 25;
+        assert!(
+            peak <= 2 * live_bytes + 3 * PAGE_BYTES + 64 * 1024,
+            "peak heap {peak} for {live_bytes} live bytes"
+        );
+        for &(h, v) in &live {
+            assert_eq!(&ps.get(h)[..4], &v.to_le_bytes());
+        }
     }
 }

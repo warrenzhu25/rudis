@@ -29586,3 +29586,76 @@ fn test_cli_maxmemory_and_passthrough_policy_take_effect_e2e() {
     let _ = srv.kill();
     let _ = srv.wait();
 }
+
+/// ZADD + ZPOPMIN churn on sorted sets of constant size must not grow
+/// memory. Packed sorted sets store entries in pages; a compacted page kept
+/// its full 4 KB buffer while a few long-lived (high-score) members pinned
+/// it, so churn grew memory without bound (~5 bytes per pop per key).
+#[test]
+fn test_zset_churn_keeps_memory_flat_e2e() {
+    let port = 18014u16;
+    let ps = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &ps, "--threads", "1", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let used = |c: &mut TcpStream| -> i64 {
+        let r = send_and_read_reply(c, b"INFO memory\r\n");
+        r.lines()
+            .find_map(|l| l.strip_prefix("used_memory:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let keys = 20;
+    let mut rng = 0x9E37_79B9u32;
+    let mut seq = 0u64;
+    let mut batch = |c: &mut TcpStream, pairs: usize, pop: bool| {
+        let mut req = String::new();
+        for _ in 0..pairs {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            let k = format!("z{}", seq % keys);
+            let m = format!("member:{seq:032}");
+            let s = rng.to_string();
+            seq += 1;
+            req.push_str(&format!(
+                "*4\r\n$4\r\nZADD\r\n${}\r\n{k}\r\n${}\r\n{s}\r\n${}\r\n{m}\r\n",
+                k.len(),
+                s.len(),
+                m.len()
+            ));
+            if pop {
+                req.push_str(&format!("*2\r\n$7\r\nZPOPMIN\r\n${}\r\n{k}\r\n", k.len()));
+            }
+        }
+        c.write_all(req.as_bytes()).unwrap();
+        // ZADD: 1 line; ZPOPMIN: 5 lines.
+        let want = pairs * if pop { 6 } else { 1 };
+        let (mut got, mut buf) = (0, vec![0u8; 1 << 16]);
+        while got < want {
+            let r = c.read(&mut buf).unwrap();
+            assert!(r > 0);
+            got += buf[..r].windows(2).filter(|w| w == b"\r\n").count();
+        }
+    };
+    // Fill each key to 300 members, then churn to a steady state.
+    batch(&mut c, keys as usize * 300, false);
+    for _ in 0..100 {
+        batch(&mut c, 1000, true);
+    }
+    let before = used(&mut c);
+    for _ in 0..1000 {
+        batch(&mut c, 1000, true);
+    }
+    let after = used(&mut c);
+    let r = send_and_read_reply(&mut c, b"ZCARD z0\r\n");
+    assert_eq!(r, ":300\r\n");
+    assert!(
+        after - before < 1 << 20,
+        "zset churn grew used_memory from {before} to {after}"
+    );
+    let _ = srv.kill();
+    let _ = srv.wait();
+}
