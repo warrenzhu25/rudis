@@ -39,3 +39,6 @@ path = "fuzz_targets/load_rdb.rs"
 test = false
 doc = false
 bench = false
+
+[patch.crates-io]
+monoio = { path = "../vendor/monoio" }
