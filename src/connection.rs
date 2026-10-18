@@ -10404,6 +10404,13 @@ async fn execute_command_inner(
         return false;
     }
 
+    if let Some(err) = crate::aof::aof_write_misconf(router.port)
+        && (cmd.is_write_command() || crate::aof::command_to_resp(&cmd).is_some())
+    {
+        out.extend_from_slice(err.as_bytes());
+        return false;
+    }
+
     if crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
         && REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
         && crate::replication::get_replication_hub(router.port).is_slave()
@@ -11389,7 +11396,7 @@ async fn execute_command_inner(
             let persistence_str = format!(
                 // The fork/COW fields are always 0: snapshots are taken in
                 // place, without a child process.
-                "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:ok\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\naof_rewrites:{}\r\naof_rewrites_consecutive_failures:{}\r\n{}unpropagated_changes:{}\r\n",
+                "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:{}\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\naof_rewrites:{}\r\naof_rewrites_consecutive_failures:{}\r\n{}unpropagated_changes:{}\r\n",
                 u8::from(crate::replication::is_loading(router.port)),
                 snap.changes_since_last_save(),
                 u8::from(
@@ -11403,6 +11410,11 @@ async fn execute_command_inner(
                 u8::from(router.aof.is_some()),
                 u8::from(aof_rw.in_progress()),
                 if aof_rw.last_ok() { "ok" } else { "err" },
+                if crate::aof::aof_write_misconf(router.port).is_some() {
+                    "err"
+                } else {
+                    "ok"
+                },
                 aof_rw.rewrites(),
                 aof_rw.consecutive_failures(),
                 // Redis lists these only while the AOF is on.
@@ -26225,6 +26237,10 @@ async fn execute_commands_squashed_inner(
     let mut can_squash = *authenticated;
     // During a full-sync load, `execute_command` answers -LOADING.
     if can_squash && crate::replication::is_loading(router.port) {
+        can_squash = false;
+    }
+    // While AOF writes fail, `execute_command` answers writes -MISCONF.
+    if can_squash && crate::aof::aof_write_misconf(router.port).is_some() {
         can_squash = false;
     }
     // With keyspace notifications on, a pipeline is batched only if every

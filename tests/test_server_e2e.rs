@@ -30067,3 +30067,109 @@ fn test_shutdown_under_load_keeps_every_acknowledged_write_e2e() {
     let _ = srv.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// When AOF writes fail (here: a file size limit, as a full disk would),
+/// write commands get -MISCONF and INFO says aof_last_write_status:err, like
+/// Redis; once writes succeed again, so do commands. The server kept
+/// acknowledging writes it could not persist and reported "ok".
+#[test]
+fn test_aof_write_failure_refuses_writes_with_misconf_e2e() {
+    use std::os::unix::process::CommandExt;
+    let port = 18020u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-misconf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cmd = rudis_bin();
+    cmd.args([
+        "--port",
+        &ps,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    // SAFETY: only async-signal-safe calls between fork and exec. Files are
+    // capped at 256 KB; SIGXFSZ is ignored (kept across exec) so a write past
+    // the cap fails with EFBIG instead of killing the server.
+    unsafe {
+        cmd.pre_exec(|| {
+            let lim = libc::rlimit {
+                rlim_cur: 256 * 1024,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            libc::setrlimit(libc::RLIMIT_FSIZE, &lim);
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut srv = cmd.spawn().unwrap();
+    let mut c = None;
+    for _ in 0..200 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            c = Some(s);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut c = c.expect("server up");
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let val = "x".repeat(1000);
+    let mut first_err = None;
+    for i in 0..600 {
+        let r = send_and_read_reply(&mut c, format!("SET k{i} {val}\r\n").as_bytes());
+        if r != "+OK\r\n" {
+            first_err = Some((i, r));
+            break;
+        }
+    }
+    let (at, err) = first_err.expect("writes past the size cap still acknowledged");
+    assert!(at > 100, "refused too early, at write {at}");
+    assert!(
+        err.starts_with("-MISCONF Errors writing to the AOF file"),
+        "{err}"
+    );
+    let info = send_and_read_reply(&mut c, b"INFO persistence\r\n");
+    assert!(info.contains("aof_last_write_status:err"), "{info}");
+    // Reads still work.
+    assert_eq!(send_and_read_reply(&mut c, b"EXISTS k0\r\n"), ":1\r\n");
+    // Lift the cap: the flusher's retry succeeds and writes are accepted.
+    let unlimited = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    // SAFETY: plain syscall on our own child's pid with valid pointers.
+    let rc = unsafe {
+        libc::prlimit(
+            srv.id() as libc::pid_t,
+            libc::RLIMIT_FSIZE,
+            &unlimited,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let r = send_and_read_reply(&mut c, b"SET after ok\r\n");
+        if r == "+OK\r\n" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writes still refused: {r}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let info = send_and_read_reply(&mut c, b"INFO persistence\r\n");
+    assert!(info.contains("aof_last_write_status:ok"), "{info}");
+    let _ = srv.kill();
+    let _ = srv.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

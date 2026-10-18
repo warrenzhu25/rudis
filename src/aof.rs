@@ -40,9 +40,42 @@ impl Default for AofConfig {
 pub struct AofProgress {
     pub appended: std::sync::atomic::AtomicU64,
     pub written: std::sync::atomic::AtomicU64,
+    /// errno of this shard's last failed AOF write, 0 once a write succeeds.
+    pub write_error: std::sync::atomic::AtomicI32,
 }
 
+/// Shards (of any server) whose last AOF write failed: lets the write path
+/// skip the per-port check while there are none.
+static AOF_SHARDS_IN_ERROR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl AofProgress {
+    /// Records the outcome of an AOF write (`Err(errno)` or `Ok`), logging
+    /// the transitions like Redis.
+    fn record_write(&self, res: Result<(), i32>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        static LOG_LIMIT: crate::log::RateLimit = crate::log::RateLimit::new();
+        match res {
+            Err(errno) => {
+                let errno = errno.max(1);
+                if self.write_error.swap(errno, SeqCst) == 0 {
+                    AOF_SHARDS_IN_ERROR.fetch_add(1, SeqCst);
+                }
+                if LOG_LIMIT.allow(std::time::Duration::from_secs(1)) {
+                    crate::log_warning!(
+                        "Error writing to the AOF file: {}",
+                        std::io::Error::from_raw_os_error(errno)
+                    );
+                }
+            }
+            Ok(()) => {
+                if self.write_error.load(SeqCst) != 0 && self.write_error.swap(0, SeqCst) != 0 {
+                    AOF_SHARDS_IN_ERROR.fetch_sub(1, SeqCst);
+                    crate::log_warning!("AOF write error looks solved, Redis can write again.");
+                }
+            }
+        }
+    }
+
     /// Whether some appended bytes are not yet written to the kernel.
     #[inline]
     pub fn pending(&self) -> bool {
@@ -63,6 +96,26 @@ pub fn aof_progress(port: u16, shard: usize) -> std::sync::Arc<AofProgress> {
         .entry((port, shard))
         .or_default()
         .clone()
+}
+
+/// The `-MISCONF` reply for write commands while an AOF write of the server
+/// at `port` is failing (e.g. disk full), as Redis refuses writes then: it
+/// would otherwise keep acknowledging writes it cannot persist. `None` when
+/// writes are allowed.
+pub fn aof_write_misconf(port: u16) -> Option<String> {
+    if AOF_SHARDS_IN_ERROR.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let errno = AOF_PROGRESS
+        .lock()
+        .iter()
+        .filter(|((p, _), _)| *p == port)
+        .map(|(_, pr)| pr.write_error.load(std::sync::atomic::Ordering::Relaxed))
+        .find(|&e| e != 0)?;
+    Some(format!(
+        "-MISCONF Errors writing to the AOF file: {}\r\n",
+        std::io::Error::from_raw_os_error(errno)
+    ))
 }
 
 /// Every shard's progress on the server at `port`.
@@ -205,6 +258,9 @@ impl AofWriter {
         if let Some(c) = chunk {
             self.recycle_chunk(c);
             self.mark_written_if_idle();
+            self.progress.record_write(Ok(()));
+        } else {
+            self.progress.record_write(Err(libc::EIO));
         }
     }
 
@@ -355,9 +411,16 @@ impl AofWriter {
             let f = std::mem::ManuallyDrop::new(unsafe {
                 std::fs::File::from_raw_fd(file.as_raw_fd())
             });
-            f.write_all_at(&self.buffer, self.offset)?;
+            // On failure (e.g. ENOSPC part way) the buffer and offset stay,
+            // so the next attempt rewrites the same range.
+            if let Err(e) = f.write_all_at(&self.buffer, self.offset) {
+                self.progress
+                    .record_write(Err(e.raw_os_error().unwrap_or(libc::EIO)));
+                return Err(e);
+            }
             self.offset += self.buffer.len() as u64;
             self.buffer.clear();
+            self.progress.record_write(Ok(()));
         }
         self.mark_written_if_idle();
         Ok(true)
@@ -6545,6 +6608,31 @@ mod tests {
             "only this layout's shard files"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_aof_write_errors_refuse_writes_until_a_write_succeeds() {
+        // A port no server uses, so its shards' state is this test's alone.
+        let port = 65_001;
+        assert!(aof_write_misconf(port).is_none());
+        let p0 = aof_progress(port, 0);
+        let p1 = aof_progress(port, 1);
+        p1.record_write(Err(libc::ENOSPC));
+        let err = aof_write_misconf(port).expect("writes refused while a shard fails");
+        assert!(
+            err.starts_with("-MISCONF Errors writing to the AOF file: No space left"),
+            "{err}"
+        );
+        // Another shard succeeding does not clear it; that shard's does.
+        p0.record_write(Ok(()));
+        assert!(aof_write_misconf(port).is_some());
+        p1.record_write(Ok(()));
+        assert!(aof_write_misconf(port).is_none());
+        // Repeated failures count once (the global fast-path counter).
+        p1.record_write(Err(libc::EIO));
+        p1.record_write(Err(libc::EIO));
+        p1.record_write(Ok(()));
+        assert!(aof_write_misconf(port).is_none());
     }
 
     #[test]
