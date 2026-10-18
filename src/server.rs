@@ -2374,7 +2374,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         "Received {} scheduling shutdown...",
                         crate::shutdown::last_shutdown_signal_name()
                     );
-                    match r.save_before_shutdown(None).await {
+                    match r.save_before_shutdown(None, 0).await {
                         Ok(()) => crate::shutdown::request_shutdown(),
                         Err(e) => crate::log_warning!(
                             "Error trying to save the DB, can't exit: {}. Fix the problem and send the signal again, or use SHUTDOWN NOSAVE.",

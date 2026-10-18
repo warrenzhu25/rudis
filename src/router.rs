@@ -4592,11 +4592,29 @@ impl Router {
     /// The save step of `SHUTDOWN [SAVE|NOSAVE]` and SIGTERM. Returns an
     /// error if a snapshot was required and failed; callers must then keep
     /// running rather than exit and lose the data, as Redis does.
-    pub async fn save_before_shutdown(&self, save: Option<bool>) -> Result<(), String> {
+    ///
+    /// First quiesces the server (`own_batches`: command batches of the
+    /// caller's own still running, 1 from the SHUTDOWN command, 0 from a
+    /// signal), so the snapshot holds every acknowledged write and none is
+    /// acknowledged after it; a failed save lets commands run again.
+    pub async fn save_before_shutdown(
+        &self,
+        save: Option<bool>,
+        own_batches: usize,
+    ) -> Result<(), String> {
+        crate::shutdown::quiesce(own_batches, crate::shutdown::CLIENT_DRAIN_TIMEOUT).await;
         let has_points = !crate::config::save_points(self.base_port).is_empty();
         if !crate::config::should_save_on_shutdown(save, has_points) {
             return Ok(());
         }
+        let res = self.save_before_shutdown_inner().await;
+        if res.is_err() {
+            crate::shutdown::unquiesce();
+        }
+        res
+    }
+
+    async fn save_before_shutdown_inner(&self) -> Result<(), String> {
         // Let an in-flight BGSAVE finish rather than fail on "in progress".
         while self.is_saving.load(Ordering::SeqCst) {
             monoio::time::sleep(std::time::Duration::from_millis(10)).await;

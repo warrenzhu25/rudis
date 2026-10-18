@@ -29973,3 +29973,97 @@ fn test_everysec_kill9_loses_no_acknowledged_write_e2e() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// SHUTDOWN (and SIGTERM) under write load with RDB save points: every
+/// acknowledged write is in the final snapshot. The snapshot was taken while
+/// other clients' writes kept being executed and acknowledged until they were
+/// drained (~200 ms later), and those were lost on restart.
+#[test]
+fn test_shutdown_under_load_keeps_every_acknowledged_write_e2e() {
+    let port = 18019u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-quiesce-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "no",
+        "--save",
+        "3600 1",
+    ];
+    let mut srv = spawn_rudis_listening(&args, port);
+    // Four writers, each SET w<i>:<n> one batch of 50 at a time, counting
+    // fully acknowledged batches.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut acked = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut req = String::new();
+                    for n in acked..acked + 50 {
+                        let k = format!("w{w}:{n}");
+                        req.push_str(&format!(
+                            "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n$1\r\n1\r\n",
+                            k.len()
+                        ));
+                    }
+                    if c.write_all(req.as_bytes()).is_err() {
+                        break;
+                    }
+                    let (mut oks, mut buf) = (0, [0u8; 4096]);
+                    while oks < 50 {
+                        match c.read(&mut buf) {
+                            Ok(n) if n > 0 => {
+                                oks += buf[..n].windows(3).filter(|x| x == b"OK\r").count()
+                            }
+                            _ => return acked,
+                        }
+                    }
+                    acked += 50;
+                }
+                acked
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(400));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c.write_all(b"SHUTDOWN\r\n").unwrap();
+    let mut buf = [0u8; 64];
+    let _ = c.read(&mut buf);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while srv.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = srv.kill();
+            panic!("server did not exit within 20 s of SHUTDOWN");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let acked: Vec<usize> = writers.into_iter().map(|h| h.join().unwrap()).collect();
+    let mut srv = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for (w, &n) in acked.iter().enumerate() {
+        assert!(n > 0, "writer {w} got nothing acknowledged");
+        for i in [0, n / 2, n - 1] {
+            let r = send_and_read_reply(&mut c, format!("EXISTS w{w}:{i}\r\n").as_bytes());
+            assert_eq!(r, ":1\r\n", "writer {w}: acknowledged w{w}:{i} of {n} lost");
+        }
+    }
+    let _ = srv.kill();
+    let _ = srv.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

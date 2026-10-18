@@ -45,8 +45,82 @@ pub fn sd_notify_to(socket_path: &str, state: &str) -> bool {
     sock.send_to(state.as_bytes(), socket_path).is_ok()
 }
 
+/// Set from the moment a shutdown is decided until the process exits (or the
+/// shutdown is abandoned because the final save failed): no new command
+/// batch may start, so nothing is acknowledged after the final save.
+static QUIESCING: AtomicBool = AtomicBool::new(false);
+const INFLIGHT_SLOTS: usize = 256;
+/// Command batches executing, per shard thread (each slot written only by
+/// its own shard, so no contention on the hot path).
+static INFLIGHT: [crate::mailbox::CachePadded<AtomicUsize>; INFLIGHT_SLOTS] =
+    [const { crate::mailbox::CachePadded(AtomicUsize::new(0)) }; INFLIGHT_SLOTS];
+
+/// A command batch counted as executing on its shard; see [`enter_batch`].
+pub struct BatchGuard(usize);
+
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        INFLIGHT[self.0].fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Registers a command batch about to execute on `shard`, or `None` while a
+/// shutdown is quiescing the server (the caller must wait, and close once
+/// [`is_shutting_down`]). Counting before checking (both SeqCst) pairs with
+/// [`quiesce`] setting the flag before reading the counts: either the batch
+/// sees the flag or `quiesce` sees the batch.
+#[inline]
+pub fn enter_batch(shard: usize) -> Option<BatchGuard> {
+    let slot = shard % INFLIGHT_SLOTS;
+    INFLIGHT[slot].fetch_add(1, Ordering::SeqCst);
+    if QUIESCING.load(Ordering::SeqCst) {
+        INFLIGHT[slot].fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
+    Some(BatchGuard(slot))
+}
+
+/// Whether a shutdown is holding new command batches back.
+#[inline]
+pub fn is_quiescing() -> bool {
+    QUIESCING.load(Ordering::Relaxed)
+}
+
+/// Stops new command batches and waits (up to `timeout`) until at most
+/// `own` are still executing (the caller's own, e.g. the batch running
+/// SHUTDOWN). Then a final save sees every acknowledged write and nothing
+/// is acknowledged after it. (The save used to run while other clients'
+/// writes kept being executed and acknowledged until they were drained,
+/// ~200 ms later, and those writes were lost.) A batch blocked in, e.g.,
+/// BLPOP is not waited for past `timeout`.
+pub async fn quiesce(own: usize, timeout: std::time::Duration) {
+    QUIESCING.store(true, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let busy: usize = INFLIGHT.iter().map(|c| c.load(Ordering::SeqCst)).sum();
+        if busy <= own {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            crate::log_warning!(
+                "Shutdown: {} command batch(es) still running after {:?}; saving anyway.",
+                busy - own,
+                timeout
+            );
+            return;
+        }
+        monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+/// Lets command batches run again (the shutdown was abandoned).
+pub fn unquiesce() {
+    QUIESCING.store(false, Ordering::SeqCst);
+}
+
 /// Resets the shutdown state (primarily used in tests between test cases).
 pub fn reset_shutdown() {
+    QUIESCING.store(false, Ordering::SeqCst);
     SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
     SHARDS_DRAINED.store(0, Ordering::SeqCst);
 }
@@ -137,6 +211,39 @@ mod tests {
     use std::thread;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_quiesce_holds_new_batches_and_waits_for_running_ones() {
+        let _guard = TEST_LOCK.lock();
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // A batch running on shard 255 (a slot no test server uses).
+            let running = enter_batch(255).expect("not quiescing");
+            let t0 = std::time::Instant::now();
+            quiesce(0, std::time::Duration::from_millis(100)).await;
+            assert!(
+                t0.elapsed() >= std::time::Duration::from_millis(90),
+                "returned while a batch was still running"
+            );
+            assert!(is_quiescing());
+            assert!(
+                enter_batch(255).is_none(),
+                "a new batch started while quiescing"
+            );
+            // The caller's own running batch is not waited for.
+            let t0 = std::time::Instant::now();
+            quiesce(1, std::time::Duration::from_secs(5)).await;
+            assert!(t0.elapsed() < std::time::Duration::from_secs(4));
+            drop(running);
+            unquiesce();
+            assert!(!is_quiescing());
+            let again = enter_batch(255);
+            assert!(again.is_some(), "batches run again after unquiesce");
+        });
+    }
 
     #[test]
     fn test_shutdown_flag_state_transitions() {

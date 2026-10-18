@@ -5450,6 +5450,17 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                     break;
                 }
 
+                // Hold the batch while a shutdown quiesces the server (see
+                // `shutdown::quiesce`); close once the shutdown goes ahead.
+                let mut batch_guard = crate::shutdown::enter_batch(router.shard_id);
+                while batch_guard.is_none() && !crate::shutdown::is_shutting_down() {
+                    monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    batch_guard = crate::shutdown::enter_batch(router.shard_id);
+                }
+                if batch_guard.is_none() {
+                    commands.clear();
+                    break;
+                }
                 let batch_writes = aof_on
                     && commands.iter().any(|c| {
                         c.is_write_command()
@@ -18126,7 +18137,7 @@ async fn execute_command_inner(
         Command::MemcachedQuit => true,
         Command::Shutdown { save } => {
             crate::log_warning!("User requested shutdown...");
-            if let Err(e) = router.save_before_shutdown(save).await {
+            if let Err(e) = router.save_before_shutdown(save, 1).await {
                 crate::log_warning!("Error trying to save the DB, can't exit: {}", e);
                 crate::log_warning!(
                     "Errors trying to shut down the server. Check the logs for more information."
