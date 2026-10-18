@@ -30835,6 +30835,43 @@ fn test_memory_malloc_stats_reports_jemalloc_e2e() {
     drop(srv);
 }
 
+/// MEMORY USAGE sizes every type on whichever shard owns the key; on a
+/// remote shard it went through GET and answered nil for non-strings.
+#[test]
+fn test_memory_usage_of_non_strings_on_any_shard_e2e() {
+    let port = 18040u16;
+    let ps = port.to_string();
+    let srv = ServerGuard(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "4", "--no-pin"],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for i in 0..16 {
+        for (ty, write) in [
+            ("h", "HSET {k} f v"),
+            ("l", "RPUSH {k} a"),
+            ("s", "SADD {k} a"),
+            ("z", "ZADD {k} 1 a"),
+        ] {
+            let k = format!("{ty}{i}");
+            let w = write.replace("{k}", &k) + "\r\n";
+            assert_eq!(send_and_read_reply(&mut c, w.as_bytes()), ":1\r\n", "{w}");
+            let r = send_and_read_reply(&mut c, format!("MEMORY USAGE {k}\r\n").as_bytes());
+            let n: i64 = r
+                .strip_prefix(':')
+                .and_then(|r| r.trim_end().parse().ok())
+                .unwrap_or_else(|| panic!("MEMORY USAGE {k}: {r:?}"));
+            assert!(n > 0, "{k}: {n}");
+        }
+    }
+    assert_eq!(
+        send_and_read_reply(&mut c, b"MEMORY USAGE nokey\r\n"),
+        "$-1\r\n"
+    );
+    drop(srv);
+}
+
 /// (P|S)UNSUBSCRIBE replies carry the channel name byte for byte. A
 /// non-UTF-8 name was formatted lossily under its raw length, making the
 /// reply malformed and desyncing the client's protocol stream.

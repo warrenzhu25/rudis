@@ -10202,6 +10202,14 @@ async fn execute_command(
     .1
 }
 
+/// MEMORY USAGE, sized on the shard that owns `key`: a GET from another
+/// shard only saw strings, so hashes, lists... there answered nil.
+async fn memory_usage_reply(router: &Router, key: Bytes) -> Vec<u8> {
+    let target = router.target_shard(&key);
+    let usage = Command::Memory(crate::resp::MemorySubcommand::Usage { key });
+    router.execute_on_shard(target, usage).await
+}
+
 async fn execute_command_inner(
     cmd: Command,
     router: &Router,
@@ -18368,22 +18376,7 @@ async fn execute_command_inner(
         Command::Memory(sub) => {
             match sub {
                 MemorySubcommand::Usage { key } => {
-                    let target = router.target_shard(&key);
-                    if target == router.shard_id {
-                        if let Some((val, _)) = router.local_db.borrow_mut().get_entry(&key) {
-                            let size = 24 + key.len() + val.approx_bytes();
-                            write_resp_integer(out, size as i64);
-                        } else {
-                            out.extend_from_slice(b"$-1\r\n");
-                        }
-                    } else {
-                        if let Some(val) = router.get(key.clone()).await {
-                            let size = 24 + key.len() + val.len();
-                            write_resp_integer(out, size as i64);
-                        } else {
-                            out.extend_from_slice(b"$-1\r\n");
-                        }
-                    }
+                    out.extend_from_slice(&memory_usage_reply(router, key).await);
                 }
                 MemorySubcommand::Stats | MemorySubcommand::Doctor => {
                     let report = crate::allocator::MemoryReport {
@@ -29777,6 +29770,80 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out), ":100\r\n:102\r\n");
         assert!(scratch.remote_batches.iter().all(|b| b.is_empty()));
         recycle_conn_scratch(scratch);
+    }
+
+    #[monoio::test(timer_enabled = true)]
+    async fn test_memory_usage_sizes_non_strings_on_their_owner_shard() {
+        let dir = std::env::temp_dir().join(format!("rudis-memusage-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let router = Router::new(
+            0,
+            2,
+            6397,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::shard::ShardDb::new(6397))),
+            senders_mesh[0].clone(),
+            None,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::pubsub::PubSubHub::new())),
+            dir,
+        );
+        let key = (0..)
+            .map(|i| Bytes::from(format!("h{i}")))
+            .find(|k| router.target_shard(k) == 1)
+            .unwrap();
+        // Owner of shard 1 holds `key` as a hash and runs one Batch.
+        let rx1 = receivers.remove(1);
+        let owner_key = key.clone();
+        let owner = std::thread::spawn(move || {
+            let mut db = crate::shard::ShardDb::new(6397);
+            let hset = crate::resp::build_command(vec![
+                Bytes::from_static(b"HSET"),
+                owner_key,
+                Bytes::from_static(b"f"),
+                Bytes::from_static(b"v"),
+            ])
+            .unwrap()
+            .unwrap();
+            execute_local_command(&hset, &mut db, &mut Vec::new(), None);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if let Ok(ShardMessage::Batch {
+                    mut items,
+                    responder,
+                    ..
+                }) = rx1.try_recv()
+                {
+                    for (idx, _, cmd) in items.iter() {
+                        let mut out = Vec::new();
+                        execute_local_command(cmd, &mut db, &mut out, None);
+                        let n = std::str::from_utf8(&out[1..out.len() - 2])
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok());
+                        let reply = match n {
+                            Some(n) if out[0] == b':' => CompactResp::from_integer(n),
+                            _ => CompactResp::from_integer(-1),
+                        };
+                        responder.write_slot(*idx, reply);
+                    }
+                    items.clear();
+                    responder.finish(items);
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        });
+        let reply = monoio::time::timeout(
+            std::time::Duration::from_secs(5),
+            memory_usage_reply(&router, key),
+        )
+        .await
+        .expect("MEMORY USAGE of a remote hash: no reply from its owner shard");
+        owner.join().unwrap();
+        let reply = String::from_utf8_lossy(&reply).into_owned();
+        assert!(
+            reply.starts_with(':') && !reply.starts_with(":-"),
+            "MEMORY USAGE of a remote hash: {reply:?}"
+        );
     }
 
     #[monoio::test]
