@@ -30777,3 +30777,30 @@ fn test_memory_malloc_stats_reports_jemalloc_e2e() {
     assert!(send_and_read_reply(&mut c, b"INFO memory\r\n").contains("mem_allocator:jemalloc"));
     drop(srv);
 }
+
+/// (P|S)UNSUBSCRIBE replies carry the channel name byte for byte. A
+/// non-UTF-8 name was formatted lossily under its raw length, making the
+/// reply malformed and desyncing the client's protocol stream.
+#[test]
+fn test_unsubscribe_binary_channel_reply_is_well_formed_e2e() {
+    let port = 18036u16;
+    let ps = port.to_string();
+    let srv = ServerGuard(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "1", "--no-pin"],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(b"*2\r\n$11\r\nUNSUBSCRIBE\r\n$4\r\n\xe0\x85N\xff\r\n*1\r\n$4\r\nPING\r\n")
+        .unwrap();
+    let want: &[u8] = b"*3\r\n$11\r\nunsubscribe\r\n$4\r\n\xe0\x85N\xff\r\n:0\r\n+PONG\r\n";
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    while got.len() < want.len() {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0);
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&got));
+    drop(srv);
+}

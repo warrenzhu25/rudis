@@ -6318,7 +6318,11 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                                         );
                                     } else {
                                         for (ch, rem) in unsubs {
-                                            exec_results.push(format!("*3\r\n$11\r\nunsubscribe\r\n${}\r\n{}\r\n:{}\r\n", ch.len(), String::from_utf8_lossy(&ch), rem).into_bytes());
+                                            exec_results.push(unsubscribe_reply(
+                                                "unsubscribe",
+                                                &ch,
+                                                rem,
+                                            ));
                                         }
                                     }
                                 } else {
@@ -6381,7 +6385,11 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                                         );
                                     } else {
                                         for (pat, rem) in unsubs {
-                                            exec_results.push(format!("*3\r\n$12\r\npunsubscribe\r\n${}\r\n{}\r\n:{}\r\n", pat.len(), String::from_utf8_lossy(&pat), rem).into_bytes());
+                                            exec_results.push(unsubscribe_reply(
+                                                "punsubscribe",
+                                                &pat,
+                                                rem,
+                                            ));
                                         }
                                     }
                                 } else {
@@ -6908,6 +6916,20 @@ fn take_doubling_chunk<T>(rest: &mut Vec<T>, chunk: &mut usize) -> Vec<T> {
     let tail = rest.split_off((*chunk).min(rest.len()));
     *chunk = chunk.saturating_mul(2);
     std::mem::replace(rest, tail)
+}
+
+/// `[kind, name, count]`, the reply to (P|S)UNSUBSCRIBE for one channel or
+/// pattern, binary-safe. The name was formatted lossily as UTF-8 under its
+/// raw byte length, so a non-UTF-8 channel name made the reply malformed
+/// (the bulk body longer than its length) and desynced the client.
+fn unsubscribe_reply(kind: &str, name: &[u8], count: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + name.len());
+    out.extend_from_slice(
+        format!("*3\r\n${}\r\n{}\r\n${}\r\n", kind.len(), kind, name.len()).as_bytes(),
+    );
+    out.extend_from_slice(name);
+    out.extend_from_slice(format!("\r\n:{}\r\n", count).as_bytes());
+    out
 }
 
 fn client_output_limit_reached(client_id: u64, flags: &str, omem: usize) {
@@ -16965,14 +16987,7 @@ async fn execute_command_inner(
                 out.extend_from_slice(b"*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n");
             } else {
                 for ch in channels {
-                    out.extend_from_slice(
-                        format!(
-                            "*3\r\n$11\r\nunsubscribe\r\n${}\r\n{}\r\n:0\r\n",
-                            ch.len(),
-                            String::from_utf8_lossy(&ch)
-                        )
-                        .as_bytes(),
-                    );
+                    out.extend_from_slice(&unsubscribe_reply("unsubscribe", &ch, 0));
                 }
             }
             false
@@ -16982,14 +16997,7 @@ async fn execute_command_inner(
                 out.extend_from_slice(b"*3\r\n$12\r\nsunsubscribe\r\n$-1\r\n:0\r\n");
             } else {
                 for ch in channels {
-                    out.extend_from_slice(
-                        format!(
-                            "*3\r\n$12\r\nsunsubscribe\r\n${}\r\n{}\r\n:0\r\n",
-                            ch.len(),
-                            String::from_utf8_lossy(&ch)
-                        )
-                        .as_bytes(),
-                    );
+                    out.extend_from_slice(&unsubscribe_reply("sunsubscribe", &ch, 0));
                 }
             }
             false
@@ -16999,14 +17007,7 @@ async fn execute_command_inner(
                 out.extend_from_slice(b"*3\r\n$12\r\npunsubscribe\r\n$-1\r\n:0\r\n");
             } else {
                 for pat in patterns {
-                    out.extend_from_slice(
-                        format!(
-                            "*3\r\n$12\r\npunsubscribe\r\n${}\r\n{}\r\n:0\r\n",
-                            pat.len(),
-                            String::from_utf8_lossy(&pat)
-                        )
-                        .as_bytes(),
-                    );
+                    out.extend_from_slice(&unsubscribe_reply("punsubscribe", &pat, 0));
                 }
             }
             false
@@ -28538,6 +28539,15 @@ mod tests {
         }
         assert_eq!(sizes, vec![1, 2, 4, 8, 5]);
         assert_eq!(seen, (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unsubscribe_reply_is_binary_safe() {
+        let r = super::unsubscribe_reply("unsubscribe", b"\xe0\x85N\xff", 3);
+        assert_eq!(
+            &r[..],
+            &b"*3\r\n$11\r\nunsubscribe\r\n$4\r\n\xe0\x85N\xff\r\n:3\r\n"[..]
+        );
     }
 
     use super::*;
