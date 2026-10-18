@@ -1973,6 +1973,25 @@ pub fn log_expired_key(key: &[u8]) {
     });
 }
 
+/// Logs `HDEL key field...` (AOF and replicas) for hash fields this shard
+/// just expired (HEXPIRE), like Redis: replicas and replays never expire
+/// fields themselves, and otherwise kept fields the master had dropped.
+pub fn log_expired_fields(key: &[u8], fields: &[bytes::Bytes]) {
+    if crate::connection::REPLAYING_WRITES.get() || fields.is_empty() {
+        return;
+    }
+    SHARD_LOG.with(|l| {
+        if let Some((port, shard_id, aof)) = &*l.borrow() {
+            log_shard_mutation(*port, *shard_id, aof.as_deref(), || {
+                crate::resp::Command::Hdel {
+                    key: bytes::Bytes::copy_from_slice(key),
+                    fields: fields.iter().cloned().collect(),
+                }
+            });
+        }
+    });
+}
+
 /// Appends the mutation built by `make` to this shard's AOF and replicates
 /// it. Must run on the thread of the shard that owns the data (`shard_id`),
 /// right after applying the change, so that the AOF, the replication stream

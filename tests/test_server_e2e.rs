@@ -30804,3 +30804,91 @@ fn test_unsubscribe_binary_channel_reply_is_well_formed_e2e() {
     assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&got));
     drop(srv);
 }
+
+/// An expired hash field is logged as HDEL (AOF and replicas): the replica
+/// and a restart from the AOF hold the same hash as the master. Replicas
+/// and replays expired fields by their own clock instead.
+#[test]
+fn test_hash_field_expiry_is_logged_as_hdel_e2e() {
+    let (mp, rp) = (18037u16, 18038u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-hdel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let margs = [
+        "--port",
+        &mps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+    ];
+    let master = ServerGuard(spawn_rudis_listening(&margs, mp));
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !send_and_read_reply(&mut r, b"INFO replication\r\n").contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // The master keeps field f past its deadline (as if its expiry had not
+    // run yet) and HPERSISTs it; field e it lets expire.
+    for cmd in [
+        &b"DEBUG SET-ACTIVE-EXPIRE 0\r\n"[..],
+        b"DEBUG SET-ALLOW-ACCESS-EXPIRED 1\r\n",
+    ] {
+        assert_eq!(send_and_read_reply(&mut m, cmd), "+OK\r\n");
+    }
+    assert_eq!(send_and_read_reply(&mut m, b"HSET h f v e x\r\n"), ":2\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut m, b"HPEXPIRE h 100 FIELDS 2 f e\r\n"),
+        "*2\r\n:1\r\n:1\r\n"
+    );
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        send_and_read_reply(&mut m, b"HPERSIST h FIELDS 1 f\r\n"),
+        "*1\r\n:1\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut m, b"DEBUG SET-ALLOW-ACCESS-EXPIRED 0\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read_reply(&mut m, b"HLEN h\r\n"), ":1\r\n");
+    assert_eq!(send_and_read_reply(&mut m, b"WAIT 1 2000\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut r, b"HGETALL h\r\n"),
+        "*2\r\n$1\r\nf\r\n$1\r\nv\r\n"
+    );
+    drop(replica);
+    drop(master);
+    let master = ServerGuard(spawn_rudis_listening(&margs, mp));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        send_and_read_reply(&mut m, b"HGETALL h\r\n"),
+        "*2\r\n$1\r\nf\r\n$1\r\nv\r\n"
+    );
+    drop(master);
+    let _ = std::fs::remove_dir_all(&dir);
+}

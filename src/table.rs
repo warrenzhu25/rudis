@@ -6550,6 +6550,12 @@ impl RudisTable {
     }
 
     pub fn purge_expired_hash_fields(&mut self, key: &[u8]) {
+        // Nothing expires while writes are re-applied, and a read-only
+        // replica waits for its master's HDEL (like keys: see
+        // `connection::REPLAYING_WRITES`, `replication::hide_expired_keys`).
+        if crate::connection::access_expired_allowed() || crate::replication::hide_expired_keys() {
+            return;
+        }
         let now = Instant::now();
         let mut expired = Vec::new();
         let mut empty_map = false;
@@ -6568,6 +6574,7 @@ impl RudisTable {
             self.hash_field_expires.remove(key);
         }
         if !expired.is_empty() {
+            crate::replication::log_expired_fields(key, &expired);
             let _ = self.hdel(key, &expired);
         }
     }
@@ -6632,7 +6639,10 @@ impl RudisTable {
                 .get(key)
                 .and_then(|m| m.get(f).copied());
 
-            if delta_ms <= 0 {
+            // While re-applying writes nothing expires (Redis loading rules):
+            // a deadline already past is stored, not acted on, so a later
+            // HPERSIST in the stream still finds the field.
+            if delta_ms <= 0 && !crate::connection::access_expired_allowed() {
                 let cond_ok = match condition {
                     crate::resp::HexpireCondition::None => true,
                     crate::resp::HexpireCondition::Nx => cur_exp.is_none(),
@@ -6650,7 +6660,7 @@ impl RudisTable {
                     results.push(0);
                 }
             } else {
-                let new_exp = now + Duration::from_millis(delta_ms as u64);
+                let new_exp = now + Duration::from_millis(delta_ms.max(0) as u64);
                 let cond_ok = match condition {
                     crate::resp::HexpireCondition::None => true,
                     crate::resp::HexpireCondition::Nx => cur_exp.is_none(),
@@ -12239,7 +12249,11 @@ impl RudisTable {
     /// Samples up to `max_keys` entries from `hash_field_expires` starting at `sample_cursor`
     /// and reclaims expired fields (and parent hashes when empty).
     pub fn evict_expired_hash_fields_sample(&mut self, max_keys: usize) -> usize {
-        if self.hash_field_expires.is_empty() || max_keys == 0 {
+        if self.hash_field_expires.is_empty()
+            || max_keys == 0
+            || crate::connection::access_expired_allowed()
+            || crate::replication::hide_expired_keys()
+        {
             return 0;
         }
         let now = Instant::now();
@@ -12274,6 +12288,7 @@ impl RudisTable {
             }
             if !expired.is_empty() {
                 evicted_fields += expired.len();
+                crate::replication::log_expired_fields(&key, &expired);
                 let _ = self.hdel(&key, &expired);
             }
         }

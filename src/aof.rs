@@ -4768,6 +4768,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An expired hash field (HEXPIRE) is logged as HDEL when it is
+    /// dropped, before the command that dropped it, and a replay (where
+    /// nothing expires) gives the master's hash.
+    #[test]
+    fn test_hash_field_expiry_logs_hdel() {
+        let aof = std::rc::Rc::new(std::cell::RefCell::new(AofWriter::new_in_memory()));
+        crate::replication::set_shard_log_context(6379, 0, Some(aof.clone()));
+        let mut db = ShardDb::new(6379);
+        let mut out = Vec::new();
+        let mut run = |db: &mut ShardDb, args: &[&str]| {
+            out.clear();
+            let cmd = parse_resp(&resp_argv(args));
+            crate::connection::execute_local_command(&cmd, db, &mut out, Some(&*aof));
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        run(&mut db, &["HSET", "h", "f", "v", "g", "w"]);
+        run(&mut db, &["HPEXPIRE", "h", "1", "FIELDS", "1", "f"]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(run(&mut db, &["HLEN", "h"]), ":1\r\n");
+        crate::replication::set_shard_log_context(6379, 0, None);
+        let log = String::from_utf8_lossy(aof.borrow().buffer()).into_owned();
+        assert!(log.contains("HDEL\r\n$1\r\nh\r\n$1\r\nf"), "{log:?}");
+        let dir = std::env::temp_dir().join(format!("rudis-aof-hdel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("log.aof"), aof.borrow().buffer()).unwrap();
+        let mut replayed = ShardDb::new(6379);
+        replay_aof(&dir.join("log.aof"), &mut replayed).unwrap();
+        assert_eq!(
+            run(&mut replayed, &["HGETALL", "h"]),
+            "*2\r\n$1\r\ng\r\n$1\r\nw\r\n"
+        );
+        // A field deadline already past at replay time but HPERSISTed later
+        // in the log is kept: nothing expires while replaying.
+        let past = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            - 60_000)
+            .to_string();
+        let mut log = Vec::new();
+        for args in [
+            &["HSET", "p", "f", "v"][..],
+            &["HPEXPIREAT", "p", &past, "FIELDS", "1", "f"],
+            &["HPERSIST", "p", "FIELDS", "1", "f"],
+        ] {
+            log.extend_from_slice(&resp_argv(args));
+        }
+        std::fs::write(dir.join("log2.aof"), &log).unwrap();
+        let mut replayed = ShardDb::new(6379);
+        replay_aof(&dir.join("log2.aof"), &mut replayed).unwrap();
+        assert_eq!(run(&mut replayed, &["HGET", "p", "f"]), "$1\r\nv\r\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_probabilistic_state_survives_aof_replay_and_rewrite() {
         let dir = std::env::temp_dir().join(format!("rudis-aof-prob-{}", std::process::id()));
