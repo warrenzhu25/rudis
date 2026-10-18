@@ -15011,6 +15011,30 @@ fn test_startup_refuses_unloadable_rdb_and_aof_e2e() {
 }
 
 /// Starts the real binary and waits until it accepts connections.
+/// A spawned server killed when dropped, so a failing test does not leave it
+/// running (holding its port for the next run).
+struct ServerGuard(std::process::Child);
+
+impl std::ops::Deref for ServerGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ServerGuard {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn spawn_rudis_listening(args: &[&str], port: u16) -> std::process::Child {
     let mut child = rudis_bin()
         .args(args)
@@ -30093,6 +30117,8 @@ fn test_aof_write_failure_refuses_writes_with_misconf_e2e() {
         "yes",
         "--appendfsync",
         "everysec",
+        "--metrics-port",
+        "18120",
     ])
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::null());
@@ -30110,7 +30136,7 @@ fn test_aof_write_failure_refuses_writes_with_misconf_e2e() {
             Ok(())
         });
     }
-    let mut srv = cmd.spawn().unwrap();
+    let srv = ServerGuard(cmd.spawn().unwrap());
     let mut c = None;
     for _ in 0..200 {
         if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
@@ -30138,6 +30164,19 @@ fn test_aof_write_failure_refuses_writes_with_misconf_e2e() {
     );
     let info = send_and_read_reply(&mut c, b"INFO persistence\r\n");
     assert!(info.contains("aof_last_write_status:err"), "{info}");
+    let metrics = || -> String {
+        let mut m = TcpStream::connect(("127.0.0.1", 18120)).unwrap();
+        m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        m.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let mut body = String::new();
+        let _ = m.read_to_string(&mut body);
+        body
+    };
+    assert!(
+        metrics().contains("rudis_aof_last_write_ok 0"),
+        "operators can alert on it"
+    );
     // Reads still work.
     assert_eq!(send_and_read_reply(&mut c, b"EXISTS k0\r\n"), ":1\r\n");
     // Lift the cap: the flusher's retry succeeds and writes are accepted.
@@ -30169,8 +30208,8 @@ fn test_aof_write_failure_refuses_writes_with_misconf_e2e() {
     }
     let info = send_and_read_reply(&mut c, b"INFO persistence\r\n");
     assert!(info.contains("aof_last_write_status:ok"), "{info}");
-    let _ = srv.kill();
-    let _ = srv.wait();
+    assert!(metrics().contains("rudis_aof_last_write_ok 1"));
+    drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -30216,7 +30255,7 @@ fn test_failed_bgsave_stops_writes_with_misconf_e2e() {
             Ok(())
         });
     }
-    let mut srv = cmd.spawn().unwrap();
+    let srv = ServerGuard(cmd.spawn().unwrap());
     let mut c = None;
     for _ in 0..200 {
         if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
@@ -30284,7 +30323,6 @@ fn test_failed_bgsave_stops_writes_with_misconf_e2e() {
     send_and_read_reply(&mut c, b"BGSAVE\r\n");
     wait_status(&mut c, "rdb_last_bgsave_status:ok");
     assert_eq!(send_and_read_reply(&mut c, b"SET after 1\r\n"), "+OK\r\n");
-    let _ = srv.kill();
-    let _ = srv.wait();
+    drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }

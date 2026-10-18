@@ -113,6 +113,16 @@ fn format_server_stats() -> String {
             "Key lookups that did not find the key",
             Stat::KeyspaceMisses,
         ),
+        (
+            "client_output_buffer_limit_disconnections",
+            "Clients disconnected for exceeding their output buffer limit",
+            Stat::ClientOutputBufferLimitDisconnections,
+        ),
+        (
+            "client_query_buffer_limit_disconnections",
+            "Clients disconnected for exceeding client-query-buffer-limit",
+            Stat::ClientQueryBufferLimitDisconnections,
+        ),
     ];
     let mut out = String::new();
     for (name, help, stat) in counters {
@@ -252,6 +262,11 @@ pub fn format_server_state_metrics(router: &crate::router::Router) -> String {
             "aof_last_rewrite_ok",
             "1 if the last AOF rewrite succeeded",
             u64::from(aof_rw.last_ok()),
+        ),
+        (
+            "aof_last_write_ok",
+            "1 unless AOF writes are failing (e.g. disk full; writes then get -MISCONF)",
+            u64::from(crate::aof::aof_write_misconf(router.port).is_none()),
         ),
         (
             "loading",
@@ -413,6 +428,8 @@ mod tests {
         assert!(metrics.contains("rudis_isolated_panics_total"));
         assert!(metrics.contains("# TYPE rudis_commands_processed_total counter\n"));
         assert!(metrics.contains("rudis_keyspace_misses_total "));
+        assert!(metrics.contains("rudis_client_output_buffer_limit_disconnections_total "));
+        assert!(metrics.contains("rudis_client_query_buffer_limit_disconnections_total "));
     }
 
     #[test]
