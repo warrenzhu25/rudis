@@ -30173,3 +30173,118 @@ fn test_aof_write_failure_refuses_writes_with_misconf_e2e() {
     let _ = srv.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// With save points set and `stop-writes-on-bgsave-error yes` (the default),
+/// a failed RDB save makes write commands fail with -MISCONF until a save
+/// succeeds, like Redis; `no` lets them through. The option was accepted
+/// but ignored: writes kept being acknowledged with snapshots failing.
+#[test]
+fn test_failed_bgsave_stops_writes_with_misconf_e2e() {
+    use std::os::unix::process::CommandExt;
+    let port = 18021u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-rdbmisconf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cmd = rudis_bin();
+    cmd.args([
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--appendonly",
+        "no",
+        "--save",
+        "3600 1000000",
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    // SAFETY: only async-signal-safe calls between fork and exec. Files are
+    // capped at 64 KB (SIGXFSZ ignored), so the snapshot below cannot be
+    // written.
+    unsafe {
+        cmd.pre_exec(|| {
+            let lim = libc::rlimit {
+                rlim_cur: 64 * 1024,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            libc::setrlimit(libc::RLIMIT_FSIZE, &lim);
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut srv = cmd.spawn().unwrap();
+    let mut c = None;
+    for _ in 0..200 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            c = Some(s);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut c = c.expect("server up");
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let val = "x".repeat(1000);
+    for i in 0..300 {
+        assert_eq!(
+            send_and_read_reply(&mut c, format!("SET k{i} {val}\r\n").as_bytes()),
+            "+OK\r\n"
+        );
+    }
+    let wait_status = |c: &mut TcpStream, want: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let info = send_and_read_reply(c, b"INFO persistence\r\n");
+            if info.contains(want) && info.contains("rdb_bgsave_in_progress:0") {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "no {want}: {info}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    send_and_read_reply(&mut c, b"BGSAVE\r\n");
+    wait_status(&mut c, "rdb_last_bgsave_status:err");
+    let r = send_and_read_reply(&mut c, b"SET blocked 1\r\n");
+    assert!(
+        r.starts_with("-MISCONF Redis is configured to save RDB snapshots"),
+        "{r}"
+    );
+    // Pipelined writes are refused too; reads still work.
+    let r = send_and_read_reply(&mut c, b"SET a 1\r\nGET k1\r\n");
+    assert!(r.starts_with("-MISCONF"), "{r}");
+    assert_eq!(send_and_read_reply(&mut c, b"EXISTS k0\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut c, b"CONFIG SET stop-writes-on-bgsave-error no\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read_reply(&mut c, b"SET allowed 1\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut c, b"CONFIG SET stop-writes-on-bgsave-error yes\r\n"),
+        "+OK\r\n"
+    );
+    assert!(send_and_read_reply(&mut c, b"SET blocked 1\r\n").starts_with("-MISCONF"));
+    // Lift the cap: a successful save lets writes through again.
+    let unlimited = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    // SAFETY: plain syscall on our own child's pid with valid pointers.
+    let rc = unsafe {
+        libc::prlimit(
+            srv.id() as libc::pid_t,
+            libc::RLIMIT_FSIZE,
+            &unlimited,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    send_and_read_reply(&mut c, b"BGSAVE\r\n");
+    wait_status(&mut c, "rdb_last_bgsave_status:ok");
+    assert_eq!(send_and_read_reply(&mut c, b"SET after 1\r\n"), "+OK\r\n");
+    let _ = srv.kill();
+    let _ = srv.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

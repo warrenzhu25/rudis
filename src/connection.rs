@@ -1467,6 +1467,31 @@ pub static TCP_KEEPALIVE_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(300);
 
 /// `replica-read-only`: whether a replica rejects writes from its clients.
+/// `stop-writes-on-bgsave-error` (Redis default yes).
+pub static STOP_WRITES_ON_BGSAVE_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// The `-MISCONF` reply for write commands while the server at `router`
+/// cannot persist, as Redis refuses writes then: an AOF write is failing,
+/// or the last RDB save failed with save points set and
+/// `stop-writes-on-bgsave-error yes`. `None` when writes are allowed.
+pub(crate) fn persistence_misconf(router: &Router) -> Option<String> {
+    if let Some(e) = crate::aof::aof_write_misconf(router.port) {
+        return Some(e);
+    }
+    if crate::snapshot::any_save_failing()
+        && STOP_WRITES_ON_BGSAVE_ERROR.load(std::sync::atomic::Ordering::Relaxed)
+        && !crate::snapshot::state(router.base_port).last_save_ok()
+        && !crate::config::save_points(router.base_port).is_empty()
+    {
+        return Some(
+            "-MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to disk. Commands that may modify the data set are disabled, because this instance is configured to report errors during writes if RDB snapshotting fails (stop-writes-on-bgsave-error option). Please check the Redis logs for details about the RDB error.\r\n"
+                .to_string(),
+        );
+    }
+    None
+}
+
 pub static REPLICA_READ_ONLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -3252,6 +3277,9 @@ pub fn apply_config_value(
         "replica-read-only" | "slave-read-only" => {
             REPLICA_READ_ONLY.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
         }
+        "stop-writes-on-bgsave-error" => {
+            STOP_WRITES_ON_BGSAVE_ERROR.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
+        }
         "replica-ignore-maxmemory" | "slave-ignore-maxmemory" => {
             REPLICA_IGNORE_MAXMEMORY.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
         }
@@ -3528,7 +3556,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
-    let all_configs: [(&str, String); 93] = [
+    let all_configs: [(&str, String); 94] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
@@ -3693,6 +3721,15 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
             TCP_KEEPALIVE_SECS
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .to_string(),
+        ),
+        (
+            "stop-writes-on-bgsave-error",
+            if STOP_WRITES_ON_BGSAVE_ERROR.load(std::sync::atomic::Ordering::Relaxed) {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
         ),
         ("replica-read-only", ro.to_string()),
         ("slave-read-only", ro.to_string()),
@@ -3885,6 +3922,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 | "slave-read-only"
                 | "replica-ignore-maxmemory"
                 | "slave-ignore-maxmemory"
+                | "stop-writes-on-bgsave-error"
         ) {
             if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
                 out.extend_from_slice(
@@ -10404,7 +10442,7 @@ async fn execute_command_inner(
         return false;
     }
 
-    if let Some(err) = crate::aof::aof_write_misconf(router.port)
+    if let Some(err) = persistence_misconf(router)
         && (cmd.is_write_command() || crate::aof::command_to_resp(&cmd).is_some())
     {
         out.extend_from_slice(err.as_bytes());
@@ -26239,8 +26277,8 @@ async fn execute_commands_squashed_inner(
     if can_squash && crate::replication::is_loading(router.port) {
         can_squash = false;
     }
-    // While AOF writes fail, `execute_command` answers writes -MISCONF.
-    if can_squash && crate::aof::aof_write_misconf(router.port).is_some() {
+    // While persistence fails, `execute_command` answers writes -MISCONF.
+    if can_squash && persistence_misconf(router).is_some() {
         can_squash = false;
     }
     // With keyspace notifications on, a pipeline is batched only if every

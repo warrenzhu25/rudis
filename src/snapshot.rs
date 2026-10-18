@@ -60,6 +60,16 @@ pub fn note_changes(n: u64) {
     }
 }
 
+/// Servers whose last RDB save failed: lets the write path skip the
+/// per-port check (`stop-writes-on-bgsave-error`) while there are none.
+static SAVES_FAILING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether some server's last RDB save failed (cheap; then check its state).
+#[inline]
+pub fn any_save_failing() -> bool {
+    SAVES_FAILING.load(Ordering::Relaxed) != 0
+}
+
 fn dirty_now() -> u64 {
     WRITES.iter().map(|s| s.0.load(Ordering::Relaxed)).sum()
 }
@@ -103,7 +113,12 @@ impl SnapshotState {
                 .fetch_max(dirty_before, Ordering::Relaxed);
             self.last_save_unix.store(unix_now(), Ordering::Relaxed);
         }
-        self.last_save_ok.store(ok, Ordering::Relaxed);
+        let was_ok = self.last_save_ok.swap(ok, Ordering::SeqCst);
+        if was_ok && !ok {
+            SAVES_FAILING.fetch_add(1, Ordering::SeqCst);
+        } else if !was_ok && ok {
+            SAVES_FAILING.fetch_sub(1, Ordering::SeqCst);
+        }
         self.in_progress.store(false, Ordering::SeqCst);
     }
 
@@ -284,6 +299,27 @@ impl AofRewriteState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_failed_save_counts_once_until_a_save_succeeds() {
+        // A port no server uses; other tests may have saves failing too, so
+        // compare against the count before.
+        let st = state(65_002);
+        let base = SAVES_FAILING.load(Ordering::SeqCst);
+        st.finish(st.begin(), false);
+        assert!(!st.last_save_ok());
+        assert!(any_save_failing());
+        assert_eq!(SAVES_FAILING.load(Ordering::SeqCst), base + 1);
+        st.finish(st.begin(), false);
+        assert_eq!(
+            SAVES_FAILING.load(Ordering::SeqCst),
+            base + 1,
+            "counted once"
+        );
+        st.finish(st.begin(), true);
+        assert!(st.last_save_ok());
+        assert_eq!(SAVES_FAILING.load(Ordering::SeqCst), base);
+    }
 
     #[test]
     fn test_save_point_rule() {
