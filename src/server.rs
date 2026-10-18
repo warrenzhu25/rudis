@@ -378,6 +378,8 @@ pub fn run_shard_worker(
         } else {
             None
         };
+        // Expired keys are logged as DELs from wherever they expire.
+        crate::replication::set_shard_log_context(base_port, shard_id, aof_writer.clone());
 
         // 4. Background Cluster Bus & Gossip Engine (on Shard 0), cluster mode only.
         if shard_id == 0 && cluster_enabled {
@@ -434,7 +436,12 @@ pub fn run_shard_worker(
         monoio::spawn(async move {
             loop {
                 monoio::time::sleep(std::time::Duration::from_millis(100)).await;
-                active_db.borrow_mut().active_expire_cycle();
+                // Like Redis, a replica does not expire keys itself: it waits
+                // for its master's DEL (its own expiry could race a PERSIST
+                // or EXPIRE from the master and lose the key).
+                if !crate::replication::get_replication_hub(base_port).is_slave() {
+                    active_db.borrow_mut().active_expire_cycle();
+                }
                 // Give back table segments emptied by deletes and expiry.
                 // Not while a snapshot walks the segments: moving entries
                 // would make it restart as one blocking pass.

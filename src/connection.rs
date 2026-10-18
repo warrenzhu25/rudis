@@ -301,11 +301,15 @@ pub struct ClientTracker {
 thread_local! {
     pub static CURRENT_CLIENT_RESP3: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub static CURRENT_DB: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Set while this thread replays AOF files written by Redis (see
-    /// `aof::import_external_aof`): like Redis loading, nothing expires
-    /// during the load, so a past `PEXPIREAT` followed by more writes to the
-    /// key replays the way Redis applied it.
-    pub static LOADING_EXTERNAL_AOF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while this thread re-applies writes that already happened: an AOF
+    /// replay (`aof::replay_aof_with`) or commands from this replica's
+    /// master. Like Redis (nothing expires while loading; a replica waits
+    /// for its master's DEL), expired keys count as live meanwhile, so a
+    /// past `PEXPIREAT` followed by more writes to the key (APPEND, PERSIST,
+    /// ...) applies the way it did originally. Expiring mid-replay dropped
+    /// such keys, or recreated them from the later writes alone, without a
+    /// TTL. See [`ReplayingWrites`].
+    pub static REPLAYING_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub static CURRENT_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static EXECUTING_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static DEFER_BCAST_FLUSH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2941,11 +2945,34 @@ pub static ALLOW_ACCESS_EXPIRED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Whether expired keys must be treated as live: set process-wide by `DEBUG
-/// SET-ALLOW-ACCESS-EXPIRED`, or for this thread while it imports
-/// Redis-written AOF files.
+/// SET-ALLOW-ACCESS-EXPIRED`, or for this thread while it re-applies writes
+/// ([`REPLAYING_WRITES`]).
 #[inline]
 pub fn access_expired_allowed() -> bool {
-    ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed) || LOADING_EXTERNAL_AOF.get()
+    ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed) || REPLAYING_WRITES.get()
+}
+
+/// Sets [`REPLAYING_WRITES`] for this thread until dropped.
+pub struct ReplayingWrites(bool);
+
+impl ReplayingWrites {
+    #[inline]
+    pub fn new() -> Self {
+        ReplayingWrites(REPLAYING_WRITES.replace(true))
+    }
+}
+
+impl Default for ReplayingWrites {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ReplayingWrites {
+    #[inline]
+    fn drop(&mut self) {
+        REPLAYING_WRITES.set(self.0);
+    }
 }
 pub static PAUSE_CRON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static ACTIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -19090,7 +19117,10 @@ pub fn apply_replicated_command(
 ) {
     out.clear();
     let start = std::time::Instant::now();
-    execute_local_command(cmd, db, out, aof);
+    {
+        let _master_write = ReplayingWrites::new();
+        execute_local_command(cmd, db, out, aof);
+    }
     let name = get_cmd_name(cmd);
     record_cmd_stats(name, 1, start.elapsed().as_nanos() as u64);
     if out.first() == Some(&b'-') {

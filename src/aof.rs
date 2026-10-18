@@ -3031,6 +3031,8 @@ pub fn replay_aof_with(
     if data.is_empty() {
         return Ok(0);
     }
+    // Like Redis loading: nothing expires until the replay is done.
+    let _no_expiry = crate::connection::ReplayingWrites::new();
     let bad = |offset: usize, why: &str| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -3841,8 +3843,8 @@ fn unix_ms_now() -> u128 {
 /// writes it to `staging` as `appendonly-{i}.aof` files split by key owner.
 ///
 /// Replay follows Redis's loading rules (nothing expires mid-load; see
-/// [`crate::connection::LOADING_EXTERNAL_AOF`]); keys already expired at
-/// the end are left out of the rewrite.
+/// [`crate::connection::REPLAYING_WRITES`]); keys already expired at the
+/// end are left out of the rewrite.
 fn import_external_aof(
     ext_files: &[PathBuf],
     num_shards: usize,
@@ -3850,7 +3852,6 @@ fn import_external_aof(
     staging: &Path,
 ) -> std::io::Result<()> {
     let mut combined = ShardDb::new(port);
-    crate::connection::LOADING_EXTERNAL_AOF.set(true);
     let replayed = (|| {
         for (idx, ext_path) in ext_files.iter().enumerate() {
             // Only the newest file can end in a torn write.
@@ -3859,7 +3860,6 @@ fn import_external_aof(
         }
         Ok::<(), std::io::Error>(())
     })();
-    crate::connection::LOADING_EXTERNAL_AOF.set(false);
     replayed?;
     std::fs::create_dir_all(staging)?;
     rewrite_shard_aof(&mut combined, staging, 0)?;
@@ -4669,6 +4669,86 @@ mod tests {
 
     /// Replaying the logged BF/CF/CMS/TOPK writes, or a rewrite of the
     /// result, rebuilds exactly the same structures.
+    /// Nothing expires mid-replay (Redis loading rules): a key whose
+    /// PEXPIREAT is in the past by replay time but that later writes still
+    /// found live replays like the original run.
+    #[test]
+    fn test_replay_does_not_expire_keys_mid_load() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-noexp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let past = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            - 60_000)
+            .to_string();
+        let mut log = Vec::new();
+        for args in [
+            // Expired by replay time, but PERSISTed before it expired.
+            &["SET", "kept", "v"][..],
+            &["PEXPIREAT", "kept", &past],
+            &["PERSIST", "kept"],
+            // Expired by replay time after an APPEND: gone afterwards, not
+            // recreated as "tail" without a TTL.
+            &["SET", "gone", "v"],
+            &["PEXPIREAT", "gone", &past],
+            &["APPEND", "gone", "tail"],
+        ] {
+            log.extend_from_slice(&resp_argv(args));
+        }
+        let path = dir.join("log.aof");
+        std::fs::write(&path, &log).unwrap();
+        let mut db = ShardDb::new(6379);
+        replay_aof(&path, &mut db).unwrap();
+        assert!(!crate::connection::REPLAYING_WRITES.get());
+        let mut out = Vec::new();
+        let mut run = |db: &mut ShardDb, args: &[&str]| {
+            out.clear();
+            let cmd = parse_resp(&resp_argv(args));
+            crate::connection::execute_local_command(&cmd, db, &mut out, None);
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        assert_eq!(run(&mut db, &["GET", "kept"]), "$1\r\nv\r\n");
+        assert_eq!(run(&mut db, &["TTL", "kept"]), ":-1\r\n");
+        assert_eq!(run(&mut db, &["GET", "gone"]), "$-1\r\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key expiring on access is logged as DEL before the command that
+    /// found it expired, so replaying the AOF (where nothing expires)
+    /// rebuilds what the master had.
+    #[test]
+    fn test_lazy_expiry_logs_del_before_the_command() {
+        let aof = std::rc::Rc::new(std::cell::RefCell::new(AofWriter::new_in_memory()));
+        crate::replication::set_shard_log_context(6379, 0, Some(aof.clone()));
+        let mut db = ShardDb::new(6379);
+        let mut out = Vec::new();
+        let mut run = |db: &mut ShardDb, args: &[&str]| {
+            out.clear();
+            let cmd = parse_resp(&resp_argv(args));
+            crate::connection::execute_local_command(&cmd, db, &mut out, Some(&*aof));
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        run(&mut db, &["SET", "k", "v", "PX", "1"]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(run(&mut db, &["APPEND", "k", "tail"]), ":4\r\n");
+        crate::replication::set_shard_log_context(6379, 0, None);
+        let log = String::from_utf8_lossy(aof.borrow().buffer()).into_owned();
+        let del = log.find("DEL\r\n$1\r\nk").expect("expiry not logged");
+        let append = log.find("APPEND").expect("append not logged");
+        assert!(del < append, "DEL must precede the APPEND: {log:?}");
+        // Replaying it gives the master's value, not "v" + "tail".
+        let dir = std::env::temp_dir().join(format!("rudis-aof-expdel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("log.aof"), aof.borrow().buffer()).unwrap();
+        let mut replayed = ShardDb::new(6379);
+        replay_aof(&dir.join("log.aof"), &mut replayed).unwrap();
+        assert_eq!(run(&mut replayed, &["GET", "k"]), "$4\r\ntail\r\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_probabilistic_state_survives_aof_replay_and_rewrite() {
         let dir = std::env::temp_dir().join(format!("rudis-aof-prob-{}", std::process::id()));
@@ -5643,17 +5723,23 @@ mod tests {
         // "Downtime" longer than every TTL before replaying.
         std::thread::sleep(Duration::from_millis(120));
 
+        // Like Redis, nothing expires during the load itself: keys whose
+        // deadline passed are kept until right after it (lazy or active
+        // expiry), so count the keys still live, not the keys present.
+        let live = |db: &ShardDb| {
+            let now = std::time::Instant::now();
+            db.table
+                .entries()
+                .filter(|e| e.expire_at().is_none_or(|t| t > now))
+                .count()
+        };
         let mut db = ShardDb::new(0);
         replay_aof_with(&live_path, &mut db, true).unwrap();
-        assert_eq!(db.table.dbsize(), 1, "only the key without TTL may survive");
+        assert_eq!(live(&db), 1, "only the key without TTL may survive");
 
         let mut db = ShardDb::new(0);
         replay_aof_with(&dir.join("appendonly-0.aof"), &mut db, true).unwrap();
-        assert_eq!(
-            db.table.dbsize(),
-            0,
-            "rewritten keys must not outlive their TTL"
-        );
+        assert_eq!(live(&db), 0, "rewritten keys must not outlive their TTL");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6429,7 +6515,7 @@ mod tests {
         // The expired list was left out of the import, not kept until accessed.
         assert_eq!(loaded.table.dbsize(), 2);
         // The import flag is per-thread and was reset.
-        assert!(!crate::connection::LOADING_EXTERNAL_AOF.get());
+        assert!(!crate::connection::REPLAYING_WRITES.get());
 
         // A restart with unchanged Redis files keeps rudis's own writes.
         let shard0 = dir.join("appendonly-0.aof");

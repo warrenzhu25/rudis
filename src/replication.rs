@@ -1910,6 +1910,48 @@ pub fn propagate_shard_bytes(port: u16, shard_id: usize, bytes: &[u8]) {
     hub.propagate_shard(shard_id, bytes);
 }
 
+thread_local! {
+    /// This shard thread's server port, shard id and AOF, for logging the
+    /// DELs of keys that expire on it (see [`log_expired_key`]).
+    static SHARD_LOG: std::cell::RefCell<Option<ShardLog>> = const { std::cell::RefCell::new(None) };
+}
+
+type ShardLog = (
+    u16,
+    usize,
+    Option<std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>>,
+);
+
+/// Registers this shard thread's port, shard id and AOF writer (call once at
+/// shard startup).
+pub fn set_shard_log_context(
+    port: u16,
+    shard_id: usize,
+    aof: Option<std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>>,
+) {
+    SHARD_LOG.with(|l| *l.borrow_mut() = Some((port, shard_id, aof)));
+}
+
+/// Logs `DEL key` (AOF and replicas) for a key this shard just expired, at
+/// the moment it expires, as Redis does: before the command that found it
+/// expired, under that command's DB. Replicas and AOF replays never expire
+/// keys themselves (see `connection::REPLAYING_WRITES`), so without it they
+/// kept keys the master had expired, and applied later writes (APPEND,
+/// INCR, PERSIST...) to the old value instead of a fresh key. Nothing is
+/// logged while re-applying writes (they do not expire keys anyway).
+pub fn log_expired_key(key: &[u8]) {
+    if crate::connection::REPLAYING_WRITES.get() {
+        return;
+    }
+    SHARD_LOG.with(|l| {
+        if let Some((port, shard_id, aof)) = &*l.borrow() {
+            log_shard_mutation(*port, *shard_id, aof.as_deref(), || {
+                crate::resp::Command::Del(smallvec::smallvec![bytes::Bytes::copy_from_slice(key)])
+            });
+        }
+    });
+}
+
 /// Appends the mutation built by `make` to this shard's AOF and replicates
 /// it. Must run on the thread of the shard that owns the data (`shard_id`),
 /// right after applying the change, so that the AOF, the replication stream

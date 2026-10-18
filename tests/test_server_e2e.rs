@@ -30375,3 +30375,134 @@ fn test_wait_returns_promptly_with_getack_e2e() {
     drop(replica);
     drop(master);
 }
+
+/// A replica does not expire keys itself (no active expiry, and writes from
+/// its master see expired keys as live), like Redis: it waits for the
+/// master's DEL. Expiring on its own, it lost a key the master PERSISTed
+/// just after its TTL ran out, and the two diverged.
+#[test]
+fn test_replica_waits_for_master_to_expire_keys_e2e() {
+    let (mp, rp) = (18024u16, 18025u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let master = ServerGuard(spawn_rudis_listening(
+        &["--port", &mps, "--threads", "2", "--no-pin"],
+        mp,
+    ));
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !send_and_read_reply(&mut r, b"INFO replication\r\n").contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // The master keeps the key past its TTL (as if its expiry had not run
+    // yet) and then PERSISTs it.
+    assert_eq!(
+        send_and_read_reply(&mut m, b"DEBUG SET-ACTIVE-EXPIRE 0\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut m, b"DEBUG SET-ALLOW-ACCESS-EXPIRED 1\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut m, b"SET k v PX 300\r\n"),
+        "+OK\r\n"
+    );
+    thread::sleep(Duration::from_millis(800));
+    assert_eq!(send_and_read_reply(&mut m, b"PERSIST k\r\n"), ":1\r\n");
+    assert_eq!(send_and_read_reply(&mut m, b"WAIT 1 2000\r\n"), ":1\r\n");
+    assert_eq!(send_and_read_reply(&mut r, b"GET k\r\n"), "$1\r\nv\r\n");
+    assert_eq!(send_and_read_reply(&mut r, b"TTL k\r\n"), ":-1\r\n");
+    drop(replica);
+    drop(master);
+}
+
+/// A key that expires on the master is logged as DEL (AOF and replicas)
+/// before the command that found it expired: an APPEND to an expired key
+/// gives a fresh "tail" on the master, its replica and after a restart from
+/// the AOF. Expiries were not logged, so the replica and the replayed AOF
+/// (which do not expire keys themselves) appended to the old value.
+#[test]
+fn test_expiry_is_logged_as_del_for_replica_and_aof_e2e() {
+    let (mp, rp) = (18026u16, 18027u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-expdel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let margs = [
+        "--port",
+        &mps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+    ];
+    let master = ServerGuard(spawn_rudis_listening(&margs, mp));
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !send_and_read_reply(&mut r, b"INFO replication\r\n").contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Active expiry off, so the APPEND is what finds the key expired.
+    assert_eq!(
+        send_and_read_reply(&mut m, b"DEBUG SET-ACTIVE-EXPIRE 0\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut m, b"SET k v PX 100\r\n"),
+        "+OK\r\n"
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(send_and_read_reply(&mut m, b"APPEND k tail\r\n"), ":4\r\n");
+    assert_eq!(send_and_read_reply(&mut m, b"WAIT 1 2000\r\n"), ":1\r\n");
+    assert_eq!(send_and_read_reply(&mut r, b"GET k\r\n"), "$4\r\ntail\r\n");
+    drop(replica);
+    // Restart the master from its AOF (kill -9: the AOF is written before
+    // replies).
+    drop(master);
+    let master = ServerGuard(spawn_rudis_listening(&margs, mp));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(send_and_read_reply(&mut m, b"GET k\r\n"), "$4\r\ntail\r\n");
+    drop(master);
+    let _ = std::fs::remove_dir_all(&dir);
+}

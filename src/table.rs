@@ -3927,6 +3927,7 @@ impl RudisTable {
             let freed = removed.key.heap_bytes() + removed.val.mem_bytes() + ENTRY_OVERHEAD;
             self.data_bytes = self.data_bytes.saturating_sub(freed);
             inc_expired_keys();
+            crate::replication::log_expired_key(removed.key.as_ref());
             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::connection::touch_watched_key_any_port(removed.key.as_ref());
             }
