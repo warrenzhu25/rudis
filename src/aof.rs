@@ -4689,6 +4689,10 @@ mod tests {
             &["SET", "kept", "v"][..],
             &["PEXPIREAT", "kept", &past],
             &["PERSIST", "kept"],
+            // As a rewritten AOF stores a TTL: SET ... PXAT <past>, then
+            // PERSISTed before it expired.
+            &["SET", "rewritten", "v", "PXAT", &past],
+            &["PERSIST", "rewritten"],
             // Expired by replay time after an APPEND: gone afterwards, not
             // recreated as "tail" without a TTL.
             &["SET", "gone", "v"],
@@ -4711,6 +4715,8 @@ mod tests {
         };
         assert_eq!(run(&mut db, &["GET", "kept"]), "$1\r\nv\r\n");
         assert_eq!(run(&mut db, &["TTL", "kept"]), ":-1\r\n");
+        assert_eq!(run(&mut db, &["GET", "rewritten"]), "$1\r\nv\r\n");
+        assert_eq!(run(&mut db, &["TTL", "rewritten"]), ":-1\r\n");
         assert_eq!(run(&mut db, &["GET", "gone"]), "$-1\r\n");
         let _ = std::fs::remove_dir_all(&dir);
     }

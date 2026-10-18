@@ -30598,3 +30598,57 @@ fn test_full_sync_does_not_make_master_evict_e2e() {
     drop(replica);
     drop(master);
 }
+
+/// A rewritten AOF stores a TTL as SET ... PXAT <deadline>. Replayed after
+/// that deadline it keeps the key with its passed deadline (nothing expires
+/// while loading, as in Redis), so a later PERSIST in the AOF still saves
+/// it. The SET dropped it outright, and the PERSISTed key was lost.
+#[test]
+fn test_rewritten_ttl_then_persist_survives_restart_e2e() {
+    let port = 18030u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-pxat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+    ];
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        send_and_read_reply(&mut c, b"SET k v PX 1000\r\n"),
+        "+OK\r\n"
+    );
+    send_and_read_reply(&mut c, b"BGREWRITEAOF\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !send_and_read_reply(&mut c, b"INFO persistence\r\n")
+        .contains("aof_rewrite_in_progress:0")
+    {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(send_and_read_reply(&mut c, b"PERSIST k\r\n"), ":1\r\n");
+    // Past the deadline stored in the rewritten AOF, then kill -9 (the AOF
+    // is written before replies) and restart.
+    thread::sleep(Duration::from_millis(1200));
+    drop(srv);
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(send_and_read_reply(&mut c, b"GET k\r\n"), "$1\r\nv\r\n");
+    assert_eq!(send_and_read_reply(&mut c, b"TTL k\r\n"), ":-1\r\n");
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

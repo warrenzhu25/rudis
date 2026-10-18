@@ -19302,6 +19302,19 @@ pub fn execute_local_command(
                 keepttl,
                 past_expired,
             } => {
+                // While re-applying writes (AOF load, from the master) nothing
+                // expires, like Redis: a past EXAT/PXAT (as a rewritten AOF
+                // stores TTLs) keeps the key with its passed deadline instead
+                // of deleting it, so later writes to it (PERSIST, APPEND...)
+                // apply as they did originally.
+                let replay_past = *past_expired && access_expired_allowed();
+                let past_expired = &(*past_expired && !replay_past);
+                let passed_deadline = Some(std::time::Duration::ZERO);
+                let expire_in = if replay_past {
+                    &passed_deadline
+                } else {
+                    expire_in
+                };
                 let current_val = match db.table.get(key) {
                     Ok(val) => val,
                     Err(err) => {
