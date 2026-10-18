@@ -30713,3 +30713,45 @@ fn test_replica_hides_expired_keys_until_master_del_e2e() {
     drop(replica);
     drop(master);
 }
+
+/// Pipelined writes to a read-only replica are refused (-READONLY) like
+/// single ones. Batched, they bypassed the check and were applied, so the
+/// replica silently diverged from its master.
+#[test]
+fn test_replica_refuses_pipelined_writes_e2e() {
+    let (mp, rp) = (18033u16, 18034u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let master = ServerGuard(spawn_rudis_listening(
+        &["--port", &mps, "--threads", "2", "--no-pin"],
+        mp,
+    ));
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !send_and_read_reply(&mut r, b"INFO replication\r\n").contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let reply = send_and_read_reply(&mut r, b"SET a 1\r\nSET b 2\r\nGET a\r\n");
+    assert!(reply.starts_with("-READONLY"), "{reply}");
+    assert_eq!(reply.matches("-READONLY").count(), 2, "{reply}");
+    assert!(
+        reply.ends_with("$-1\r\n"),
+        "the write must not have applied: {reply}"
+    );
+    drop(replica);
+    drop(master);
+}

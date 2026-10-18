@@ -1475,6 +1475,14 @@ pub static TCP_KEEPALIVE_SECS: std::sync::atomic::AtomicU64 =
 pub static STOP_WRITES_ON_BGSAVE_ERROR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// Whether any command of a batch writes (by the same test as the
+/// -READONLY check of `execute_command`).
+pub(crate) fn batch_has_writes(commands: &[Command]) -> bool {
+    commands
+        .iter()
+        .any(|c| c.is_write_command() || crate::aof::command_to_resp(c).is_some())
+}
+
 /// The `-MISCONF` reply for write commands while the server at `router`
 /// cannot persist, as Redis refuses writes then: an AOF write is failing,
 /// or the last RDB save failed with save points set and
@@ -26326,6 +26334,16 @@ async fn execute_commands_squashed_inner(
     if can_squash && crate::replication::is_loading(router.port) {
         can_squash = false;
     }
+    // On a read-only replica `execute_command` answers writes -READONLY;
+    // batched, pipelined writes were applied (and the replica diverged).
+    if can_squash
+        && crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
+        && REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::replication::get_replication_hub(router.port).is_slave()
+        && batch_has_writes(commands)
+    {
+        can_squash = false;
+    }
     // While persistence fails, `execute_command` answers writes -MISCONF.
     if can_squash && persistence_misconf(router).is_some() {
         can_squash = false;
@@ -28489,6 +28507,20 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn batch_has_writes_spots_any_write() {
+        let parse = |line: &[u8]| {
+            let mut b = bytes::BytesMut::from(line);
+            crate::resp::parse_command(&mut b).unwrap().unwrap()
+        };
+        let get = parse(b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+        let set = parse(b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        let incr = parse(b"*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n");
+        assert!(!super::batch_has_writes(&[get.clone(), get.clone()]));
+        assert!(super::batch_has_writes(&[get.clone(), set]));
+        assert!(super::batch_has_writes(&[incr, get]));
+    }
+
     #[test]
     fn take_doubling_chunk_runs_a_batch_1_2_4_in_order() {
         let mut rest: Vec<u32> = (0..20).collect();
