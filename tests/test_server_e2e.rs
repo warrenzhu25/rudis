@@ -30326,3 +30326,52 @@ fn test_failed_bgsave_stops_writes_with_misconf_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// WAIT asks replicas for an ack (REPLCONF GETACK) instead of waiting for
+/// their once-a-second report: every WAIT took ~1 s, now a round trip.
+#[test]
+fn test_wait_returns_promptly_with_getack_e2e() {
+    let (mp, rp) = (18022u16, 18023u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let master = ServerGuard(spawn_rudis_listening(
+        &["--port", &mps, "--threads", "2", "--no-pin"],
+        mp,
+    ));
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !send_and_read_reply(&mut r, b"INFO replication\r\n").contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut worst = Duration::ZERO;
+    for i in 0..10 {
+        assert_eq!(
+            send_and_read_reply(&mut m, format!("SET w{i} v\r\n").as_bytes()),
+            "+OK\r\n"
+        );
+        let t = std::time::Instant::now();
+        assert_eq!(send_and_read_reply(&mut m, b"WAIT 1 5000\r\n"), ":1\r\n");
+        worst = worst.max(t.elapsed());
+    }
+    assert!(worst < Duration::from_millis(300), "WAIT took {worst:?}");
+    // The replica really has the write WAIT confirmed.
+    assert_eq!(send_and_read_reply(&mut r, b"GET w9\r\n"), "$1\r\nv\r\n");
+    drop(replica);
+    drop(master);
+}

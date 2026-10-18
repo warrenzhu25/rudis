@@ -1820,6 +1820,7 @@ pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> us
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms);
     let target_offset = hub.master_repl_offset.load(Ordering::SeqCst);
+    let mut asked = false;
     loop {
         let count = {
             let reps = hub.replicas.read();
@@ -1837,7 +1838,15 @@ pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> us
         if count >= numreplicas || timeout_ms == 0 || start.elapsed() >= timeout {
             return count;
         }
-        monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+        if !asked {
+            // Ask for acks now, like Redis: replicas otherwise report their
+            // offset once a second, so every WAIT took ~1 s. The request
+            // goes into the stream after the writes being waited for, and
+            // a replica acks only once it has applied up to it.
+            asked = true;
+            propagate_bytes(port, b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n");
+        }
+        monoio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 }
 
@@ -2890,6 +2899,43 @@ mod tests {
         )
         .await;
         assert_eq!(runs.get(), 1);
+    }
+
+    #[test]
+    fn test_wait_asks_replicas_for_an_ack() {
+        let port = 65_004;
+        let hub = get_replication_hub(port);
+        let (tx, rx) = flume::unbounded();
+        let rep = hub.register_replica(77, tx);
+        hub.propagate(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let waiter = monoio::spawn(wait_replicas(port, 1, 5000));
+            // WAIT must request an ack rather than sit out the replica's
+            // once-a-second report.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut stream = Vec::new();
+            while !stream.windows(6).any(|w| w == b"GETACK") {
+                assert!(std::time::Instant::now() < deadline, "no GETACK sent");
+                while let Ok(chunk) = rx.try_recv() {
+                    stream.extend_from_slice(&chunk);
+                }
+                stream.extend_from_slice(&rep.take_pending());
+                monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            // The replica acks everything up to the GETACK: WAIT returns.
+            let t = std::time::Instant::now();
+            rep.ack_offset.store(
+                hub.master_repl_offset.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            assert_eq!(waiter.await, 1);
+            assert!(t.elapsed() < std::time::Duration::from_millis(500));
+        });
+        hub.unregister_replica(rep.id);
     }
 
     #[test]
