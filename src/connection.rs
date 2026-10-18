@@ -5227,6 +5227,14 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
     let mut auth_user = "default".to_string();
     let mut soft_limit_start: Option<Instant> = None;
     let mut aof_appends_seen = crate::aof::AOF_APPENDS.load(std::sync::atomic::Ordering::Relaxed);
+    // AOF write-through before replies (see `aof_reply_barrier`): only with
+    // an AOF, and only for batches that write.
+    let aof_on = router.aof.is_some();
+    let aof_progress = if aof_on {
+        crate::aof::aof_progress_all(router.base_port, router.num_shards)
+    } else {
+        Vec::new()
+    };
 
     use crate::transport::MIN_READ_SPARE;
     // Set when the previous batch stopped at MAX_DRAIN_BATCH_CMDS with
@@ -5442,6 +5450,17 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                     break;
                 }
 
+                let batch_writes = aof_on
+                    && commands.iter().any(|c| {
+                        c.is_write_command()
+                            || matches!(
+                                c,
+                                Command::Exec
+                                    | Command::Eval { .. }
+                                    | Command::Evalsha { .. }
+                                    | Command::Fcall { .. }
+                            )
+                    });
                 if !commands.is_empty() {
                     stats
                         .pipeline_len_sum
@@ -5476,7 +5495,13 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         continue;
                     }
                     if !out_buf.is_empty() {
-                        aof_always_barrier(&router, &mut aof_appends_seen).await;
+                        aof_reply_barrier(
+                            &router,
+                            &mut aof_appends_seen,
+                            batch_writes,
+                            &aof_progress,
+                        )
+                        .await;
                         stats
                             .tot_net_out
                             .fetch_add(out_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -5653,7 +5678,13 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 ))
                                 && !out_buf.is_empty()
                             {
-                                aof_always_barrier(&router, &mut aof_appends_seen).await;
+                                aof_reply_barrier(
+                                    &router,
+                                    &mut aof_appends_seen,
+                                    batch_writes,
+                                    &aof_progress,
+                                )
+                                .await;
                                 stats.tot_net_out.fetch_add(
                                     out_buf.len() as u64,
                                     std::sync::atomic::Ordering::Relaxed,
@@ -5817,7 +5848,8 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                 }
 
                 if !out_buf.is_empty() {
-                    aof_always_barrier(&router, &mut aof_appends_seen).await;
+                    aof_reply_barrier(&router, &mut aof_appends_seen, batch_writes, &aof_progress)
+                        .await;
                     let len = out_buf.len();
                     stats
                         .tot_net_out
@@ -9837,6 +9869,21 @@ pub fn acl_channels_denied(user: &crate::acl::AclUser, cmd: &Command) -> bool {
 /// last checked, makes every shard's AOF durable before its replies go out.
 /// One relaxed load when no server in the process runs `always`.
 #[inline]
+/// Run before sending a batch's replies: under `appendfsync always` makes
+/// its writes durable ([`aof_always_barrier`]); otherwise, if the batch had
+/// writes and the AOF is on, gets them into the kernel first, as Redis does.
+async fn aof_reply_barrier(
+    router: &Router,
+    seen: &mut u64,
+    batch_writes: bool,
+    progress: &[std::sync::Arc<crate::aof::AofProgress>],
+) {
+    aof_always_barrier(router, seen).await;
+    if batch_writes && !crate::aof::appendfsync_is_always(router.base_port) {
+        router.write_aof_through(progress).await;
+    }
+}
+
 async fn aof_always_barrier(router: &Router, seen: &mut u64) {
     if !crate::aof::APPENDFSYNC_ALWAYS_ANY.load(std::sync::atomic::Ordering::Relaxed) {
         return;

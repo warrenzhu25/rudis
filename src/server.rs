@@ -320,7 +320,8 @@ pub fn run_shard_worker(
 
         let aof_writer = if aof_config.enabled {
             match crate::aof::AofWriter::open(aof_path).await {
-                Ok(w) => {
+                Ok(mut w) => {
+                    w.set_progress(crate::aof::aof_progress(base_port, shard_id));
                     let writer = Rc::new(RefCell::new(w));
                     let flush_writer = writer.clone();
                     let fsync_every_sec = crate::aof::fsync_every_sec_flag(base_port);
@@ -328,6 +329,27 @@ pub fn run_shard_worker(
                         let mut ticker = 0u64;
                         loop {
                             monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            // Not under appendfsync always (whose fsync path
+                            // writes chunks asynchronously): a plain write,
+                            // so replies' write-through never waits on an
+                            // in-flight chunk.
+                            if !crate::aof::appendfsync_is_always(base_port)
+                                && flush_writer
+                                    .borrow_mut()
+                                    .write_pending_sync()
+                                    .unwrap_or(false)
+                            {
+                                ticker += 1;
+                                if ticker.is_multiple_of(200)
+                                    && fsync_every_sec.load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    let file = flush_writer.borrow().get_file();
+                                    if let Some(file) = file {
+                                        let _ = file.sync_data().await;
+                                    }
+                                }
+                                continue;
+                            }
                             let flush_chunk = flush_writer.borrow_mut().take_flush_chunk();
                             if let Some((file, chunk, offset)) = flush_chunk {
                                 let (res, returned_chunk) = file.write_all_at(chunk, offset).await;
@@ -1655,6 +1677,17 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     ShardMessage::SlotBarrier { responder } => {
                         let _ = responder.send(());
                     }
+                    ShardMessage::WriteAof { responder } => {
+                        // Like SyncAof, in a task so the write does not hold
+                        // up this shard's mailbox.
+                        let aof = cross_shard_aof.clone();
+                        monoio::spawn(async move {
+                            if let Some(aof) = aof {
+                                let _ = crate::aof::AofWriter::write_through(&aof).await;
+                            }
+                            let _ = responder.send(());
+                        });
+                    }
                     ShardMessage::SyncAof { responder } => {
                         // In a task: the fsync must not hold up this shard's
                         // mailbox (appendfsync always sends one per batch).
@@ -2120,12 +2153,16 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     // without a yield a steady stream from other shards
                     // would keep this task running and starve the local
                     // connections on this thread.
+                    aof_write_after_mailbox(&cross_shard_aof, base_port);
                     crate::mailbox::yield_now().await;
                     break;
                 }
                 match rx.try_recv() {
                     Ok(next) => msg = next,
-                    Err(_) => break,
+                    Err(_) => {
+                        aof_write_after_mailbox(&cross_shard_aof, base_port);
+                        break;
+                    }
                 }
             }
         }
@@ -2584,6 +2621,23 @@ async fn accept_loop(
                 crate::log_warning!("[Shard {}] Accept error: {}", shard_id, e);
             }
         }
+    }
+}
+
+/// After a run of mailbox messages: writes the AOF bytes they appended to
+/// the kernel (not under `appendfsync always`, which syncs its own way), so
+/// connections waiting to reply to those writes (`Router::write_aof_through`)
+/// see them written without sending this shard a message.
+#[inline]
+fn aof_write_after_mailbox(
+    aof: &Option<std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>>,
+    base_port: u16,
+) {
+    if let Some(aof) = aof
+        && aof.borrow().has_pending()
+        && !crate::aof::appendfsync_is_always(base_port)
+    {
+        let _ = aof.borrow_mut().write_pending_sync();
     }
 }
 

@@ -537,6 +537,11 @@ pub enum ShardMessage {
     SyncAof {
         responder: flume::Sender<()>,
     },
+    /// Write this shard's pending AOF bytes to the kernel (no fsync), then
+    /// reply: see `AofWriter::write_through`.
+    WriteAof {
+        responder: flume::Sender<()>,
+    },
     FlushCommandStats {
         responder: flume::Sender<()>,
     },

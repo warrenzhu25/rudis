@@ -2790,6 +2790,64 @@ impl Router {
 
     /// Makes every shard's AOF durable: everything appended before the call
     /// is written and fsynced when it returns (see `AofWriter::sync_durable`).
+    /// Before replying to a write batch under `appendfsync everysec`/`no`:
+    /// waits until every shard's AOF bytes appended so far are in the kernel.
+    /// This shard's it writes itself; other shards write theirs when their
+    /// mailbox runs empty, right after the requests that appended them, so
+    /// usually a few yields suffice. A shard still behind after ~50 us (busy
+    /// with a long command, or bytes appended by its own cron) is asked
+    /// with a message. (`progress` is [`crate::aof::aof_progress_all`].)
+    pub async fn write_aof_through(&self, progress: &[std::sync::Arc<crate::aof::AofProgress>]) {
+        use std::sync::atomic::Ordering::Acquire;
+        let mut targets: smallvec::SmallVec<[(usize, u64); 8]> = smallvec::SmallVec::new();
+        for (sid, p) in progress.iter().enumerate() {
+            let appended = p.appended.load(Acquire);
+            if p.written.load(Acquire) < appended {
+                if sid == self.shard_id {
+                    if let Some(aof) = &self.aof {
+                        let _ = crate::aof::AofWriter::write_through(aof).await;
+                    }
+                } else {
+                    targets.push((sid, appended));
+                }
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        loop {
+            targets.retain(|&mut (sid, t)| progress[sid].written.load(Acquire) < t);
+            if targets.is_empty() {
+                return;
+            }
+            if start.elapsed() > std::time::Duration::from_micros(50) {
+                break;
+            }
+            crate::mailbox::yield_now().await;
+        }
+        let mut waits: smallvec::SmallVec<[_; 8]> = smallvec::SmallVec::new();
+        for &(sid, _) in &targets {
+            if let Some(sender) = self.senders.get(sid) {
+                let (tx, rx) = self.acquire_notify_channel();
+                if sender
+                    .send(ShardMessage::WriteAof {
+                        responder: tx.clone(),
+                    })
+                    .is_ok()
+                {
+                    waits.push((tx, rx));
+                } else {
+                    self.release_notify_channel(tx, rx);
+                }
+            }
+        }
+        for (tx, rx) in waits {
+            let _ = rx.recv_async().await;
+            self.release_notify_channel(tx, rx);
+        }
+    }
+
     pub async fn sync_aof(&self) {
         if self.aof.is_none() {
             return;

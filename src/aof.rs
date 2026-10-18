@@ -32,6 +32,44 @@ impl Default for AofConfig {
     }
 }
 
+/// One shard's AOF progress, readable from any thread: bytes appended so far
+/// and bytes handed to the kernel (both monotonic, unaffected by rewrites).
+/// A connection compares them before replying to a write batch (see
+/// [`AofWriter::write_through`]).
+#[derive(Debug, Default)]
+pub struct AofProgress {
+    pub appended: std::sync::atomic::AtomicU64,
+    pub written: std::sync::atomic::AtomicU64,
+}
+
+impl AofProgress {
+    /// Whether some appended bytes are not yet written to the kernel.
+    #[inline]
+    pub fn pending(&self) -> bool {
+        self.written.load(std::sync::atomic::Ordering::Acquire)
+            < self.appended.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+type ProgressMap = std::collections::HashMap<(u16, usize), std::sync::Arc<AofProgress>>;
+static AOF_PROGRESS: std::sync::LazyLock<parking_lot::Mutex<ProgressMap>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Shard `shard`'s progress on the server at `port` (created on first use,
+/// so the writer and the connections share it whichever comes first).
+pub fn aof_progress(port: u16, shard: usize) -> std::sync::Arc<AofProgress> {
+    AOF_PROGRESS
+        .lock()
+        .entry((port, shard))
+        .or_default()
+        .clone()
+}
+
+/// Every shard's progress on the server at `port`.
+pub fn aof_progress_all(port: u16, shards: usize) -> Vec<std::sync::Arc<AofProgress>> {
+    (0..shards).map(|s| aof_progress(port, s)).collect()
+}
+
 pub struct AofWriter {
     buffer: Vec<u8>,
     spare_buffer: Option<Vec<u8>>,
@@ -45,6 +83,9 @@ pub struct AofWriter {
     inflight: usize,
     /// Everything before this offset is on disk (see [`AofWriter::sync_durable`]).
     durable: u64,
+    /// Bytes ever appended (monotonic, unlike `offset`, which a rewrite resets).
+    appended_total: u64,
+    progress: std::sync::Arc<AofProgress>,
 }
 
 impl AofWriter {
@@ -67,6 +108,8 @@ impl AofWriter {
             current_db: 0,
             inflight: 0,
             durable: offset,
+            appended_total: 0,
+            progress: std::sync::Arc::new(AofProgress::default()),
         })
     }
 
@@ -80,6 +123,33 @@ impl AofWriter {
             current_db: 0,
             inflight: 0,
             durable: 0,
+            appended_total: 0,
+            progress: std::sync::Arc::new(AofProgress::default()),
+        }
+    }
+
+    /// Publishes this writer's progress in `progress` (shared with the
+    /// connections of its server). Call right after opening.
+    pub fn set_progress(&mut self, progress: std::sync::Arc<AofProgress>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let base = progress
+            .appended
+            .load(Relaxed)
+            .max(progress.written.load(Relaxed));
+        self.appended_total = base + self.buffer.len() as u64;
+        progress.written.store(base, Relaxed);
+        progress.appended.store(self.appended_total, Relaxed);
+        self.progress = progress;
+    }
+
+    /// With no chunk in flight, everything taken from the buffer is written.
+    #[inline]
+    fn mark_written_if_idle(&mut self) {
+        if self.inflight == 0 {
+            self.progress.written.store(
+                self.appended_total - self.buffer.len() as u64,
+                std::sync::atomic::Ordering::Release,
+            );
         }
     }
 
@@ -96,10 +166,15 @@ impl AofWriter {
     #[inline]
     pub fn append(&mut self, data: &[u8]) {
         let db = crate::connection::CURRENT_DB.get();
+        let before = self.buffer.len();
         if db != self.current_db {
             self.emit_select_db(db);
         }
         self.buffer.extend_from_slice(data);
+        self.appended_total += (self.buffer.len() - before) as u64;
+        self.progress
+            .appended
+            .store(self.appended_total, std::sync::atomic::Ordering::Release);
         if APPENDFSYNC_ALWAYS_ANY.load(std::sync::atomic::Ordering::Relaxed) {
             AOF_APPENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -129,6 +204,7 @@ impl AofWriter {
         self.inflight = self.inflight.saturating_sub(1);
         if let Some(c) = chunk {
             self.recycle_chunk(c);
+            self.mark_written_if_idle();
         }
     }
 
@@ -213,6 +289,80 @@ impl AofWriter {
         Ok(())
     }
 
+    /// Hands everything appended so far to the kernel (no fsync): writes the
+    /// pending buffer and waits for chunks other tasks are still writing.
+    /// Group commit: returns at once if another write already covered it.
+    ///
+    /// Under `appendfsync everysec`/`no`, replies to a write batch wait for
+    /// this, as Redis writes the AOF before replying: a crash of the process
+    /// alone then loses no acknowledged write (only an OS crash can lose up
+    /// to the last second). Buffered for the 5 ms flusher, acknowledged
+    /// writes were lost on kill -9, and each shard's file was cut at a
+    /// different point.
+    pub async fn write_through(aof: &std::rc::Rc<std::cell::RefCell<Self>>) -> std::io::Result<()> {
+        let (target, progress) = {
+            let w = aof.borrow();
+            (w.appended_total, w.progress.clone())
+        };
+        // Usual case: nothing in flight, so write the buffer right here with
+        // a plain pwrite (a few KB into the page cache, like Redis's write;
+        // an io_uring write per batch, waited for, halved write throughput).
+        if aof.borrow_mut().write_pending_sync()? {
+            return Ok(());
+        }
+        loop {
+            if progress.written.load(std::sync::atomic::Ordering::Acquire) >= target {
+                return Ok(());
+            }
+            let chunk = aof.borrow_mut().take_flush_chunk();
+            match chunk {
+                Some((file, chunk, offset)) => {
+                    let (res, buf) = file.write_all_at(chunk, offset).await;
+                    aof.borrow_mut().chunk_written(res.is_ok().then_some(buf));
+                    res?;
+                }
+                None if aof.borrow().inflight == 0 => {
+                    // Nothing pending and nothing in flight (e.g. the file
+                    // was swapped by a rewrite): all is written.
+                    aof.borrow_mut().mark_written_if_idle();
+                    return Ok(());
+                }
+                None => monoio::time::sleep(std::time::Duration::from_micros(20)).await,
+            }
+        }
+    }
+
+    /// Whether appended bytes are waiting in the buffer.
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
+    /// Writes the pending buffer with a blocking pwrite, if no chunk is in
+    /// flight (else returns false and writes nothing: the in-flight chunk,
+    /// at an earlier offset, must land first for `written` to advance).
+    pub fn write_pending_sync(&mut self) -> std::io::Result<bool> {
+        if self.inflight > 0 {
+            return Ok(false);
+        }
+        if !self.buffer.is_empty()
+            && let Some(file) = &self.file
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::fs::FileExt;
+            // SAFETY: borrows the writer's open fd for one call; ManuallyDrop
+            // keeps the std File from closing it.
+            let f = std::mem::ManuallyDrop::new(unsafe {
+                std::fs::File::from_raw_fd(file.as_raw_fd())
+            });
+            f.write_all_at(&self.buffer, self.offset)?;
+            self.offset += self.buffer.len() as u64;
+            self.buffer.clear();
+        }
+        self.mark_written_if_idle();
+        Ok(true)
+    }
+
     pub async fn sync(&mut self) -> std::io::Result<()> {
         self.flush().await?;
         if let Some(file) = &self.file {
@@ -241,6 +391,10 @@ impl AofWriter {
         // The rewrite fsynced the new file before renaming it in.
         self.durable = new_size;
         self.buffer.clear();
+        // What was pending is in the rewritten file.
+        self.progress
+            .written
+            .store(self.appended_total, std::sync::atomic::Ordering::Release);
         self.current_db = 0;
         Ok(new_size)
     }
@@ -6390,6 +6544,53 @@ mod tests {
             15,
             "only this layout's shard files"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_through_puts_appends_in_the_file_and_tracks_progress() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appendonly-0.aof");
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let progress = std::sync::Arc::new(AofProgress::default());
+            let mut w = AofWriter::open(path.clone()).await.unwrap();
+            w.set_progress(progress.clone());
+            let aof = std::rc::Rc::new(std::cell::RefCell::new(w));
+            assert!(!progress.pending());
+            aof.borrow_mut().append(b"first;");
+            assert!(progress.pending(), "an append is pending until written");
+            // Another task took a chunk and hasn't written it yet: write_through
+            // must wait for it, not just write its own part.
+            let (file, chunk, off) = aof.borrow_mut().take_flush_chunk().unwrap();
+            aof.borrow_mut().append(b"second;");
+            let done = std::rc::Rc::new(std::cell::Cell::new(false));
+            let (a, d) = (aof.clone(), done.clone());
+            let writer = monoio::spawn(async move {
+                AofWriter::write_through(&a).await.unwrap();
+                d.set(true);
+            });
+            monoio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(
+                !done.get(),
+                "returned before the in-flight chunk was written"
+            );
+            let (res, buf) = file.write_all_at(chunk, off).await;
+            res.unwrap();
+            aof.borrow_mut().chunk_written(Some(buf));
+            writer.await;
+            assert!(!progress.pending());
+            // No fsync needed: the bytes are in the file for any reader.
+            assert_eq!(std::fs::read(&path).unwrap(), b"first;second;");
+            // Nothing pending: returns at once, still nothing pending.
+            AofWriter::write_through(&aof).await.unwrap();
+            assert!(!progress.pending());
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

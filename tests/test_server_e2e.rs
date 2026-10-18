@@ -29894,3 +29894,82 @@ fn test_normal_output_limit_stops_batch_near_limit_e2e() {
     let _ = srv.kill();
     let _ = srv.wait();
 }
+
+/// Under `appendfsync everysec`, killing the process (not the OS) loses no
+/// acknowledged write: like Redis, replies wait until the AOF bytes are
+/// written to the kernel. They were buffered for a flusher running every
+/// 5 ms, so kill -9 right after a reply lost the last acknowledged writes.
+#[test]
+fn test_everysec_kill9_loses_no_acknowledged_write_e2e() {
+    let port = 18018u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-aofwt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+    ];
+    for round in 0..3 {
+        let mut srv = spawn_rudis_listening(&args, port);
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // Batches of 200 SETs over all shards; after each full reply the
+        // batch counts as acknowledged.
+        let mut acked = 0usize;
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(300 + 200 * round) {
+            let mut req = String::new();
+            for i in acked..acked + 200 {
+                let k = format!("r{round}:k{i}");
+                let v = i.to_string();
+                req.push_str(&format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n${}\r\n{v}\r\n",
+                    k.len(),
+                    v.len()
+                ));
+            }
+            c.write_all(req.as_bytes()).unwrap();
+            let (mut oks, mut buf) = (0, [0u8; 8192]);
+            while oks < 200 {
+                let n = c.read(&mut buf).unwrap();
+                assert!(n > 0);
+                oks += buf[..n].windows(3).filter(|w| w == b"OK\r").count();
+            }
+            acked += 200;
+        }
+        // kill -9 right after the last acknowledgement.
+        let _ = srv.kill();
+        let _ = srv.wait();
+        let mut srv = spawn_rudis_listening(&args, port);
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut missing = Vec::new();
+        for i in (0..acked).rev().take(400).chain([0, acked / 2]) {
+            let k = format!("r{round}:k{i}");
+            let r = send_and_read_reply(&mut c, format!("GET {k}\r\n").as_bytes());
+            if r != format!("${}\r\n{i}\r\n", i.to_string().len()) {
+                missing.push(i);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "round {round}: {} of {acked} acknowledged writes lost, e.g. {:?}",
+            missing.len(),
+            &missing[..missing.len().min(5)]
+        );
+        let _ = srv.kill();
+        let _ = srv.wait();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
