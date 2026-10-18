@@ -30755,3 +30755,25 @@ fn test_replica_refuses_pipelined_writes_e2e() {
     drop(replica);
     drop(master);
 }
+
+/// MEMORY MALLOC-STATS returns jemalloc's statistics report, as Redis does
+/// (INFO says mem_allocator:jemalloc; the Redis suite checks both).
+#[test]
+fn test_memory_malloc_stats_reports_jemalloc_e2e() {
+    let port = 18035u16;
+    let ps = port.to_string();
+    let srv = ServerGuard(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "1", "--no-pin"],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let r = send_and_read_reply(&mut c, b"MEMORY MALLOC-STATS\r\n");
+    assert!(
+        r.starts_with('$') && r.contains("jemalloc"),
+        "{}",
+        &r[..r.len().min(200)]
+    );
+    assert!(send_and_read_reply(&mut c, b"INFO memory\r\n").contains("mem_allocator:jemalloc"));
+    drop(srv);
+}

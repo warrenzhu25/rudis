@@ -383,8 +383,30 @@ impl SmallCollectionArena {
     }
 }
 
+/// `MEMORY MALLOC-STATS`: jemalloc's own statistics report, as Redis
+/// returns it (the Redis test suite checks it mentions jemalloc, since INFO
+/// says `mem_allocator:jemalloc`).
+pub fn malloc_stats() -> String {
+    let mut buf = Vec::new();
+    match tikv_jemalloc_ctl::stats_print::stats_print(&mut buf, Default::default()) {
+        Ok(()) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(e) => format!("jemalloc stats unavailable: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malloc_stats_is_jemallocs_report() {
+        let report = super::malloc_stats();
+        assert!(
+            report.contains("jemalloc"),
+            "{}",
+            &report[..report.len().min(200)]
+        );
+        assert!(report.len() > 1000);
+    }
+
     use super::*;
     use crate::table::{OrderedScore, RudisTable, ZAddFlags};
 

@@ -155,6 +155,7 @@ pub enum MemorySubcommand {
     Purge,
     Doctor,
     Defrag,
+    MallocStats,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -6222,6 +6223,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "PURGE" => Ok(Some(Command::Memory(MemorySubcommand::Purge))),
                 "DOCTOR" => Ok(Some(Command::Memory(MemorySubcommand::Doctor))),
                 "DEFRAG" => Ok(Some(Command::Memory(MemorySubcommand::Defrag))),
+                "MALLOC-STATS" => Ok(Some(Command::Memory(MemorySubcommand::MallocStats))),
                 "HELP" => Ok(Some(Command::Unknown("MEMORY HELP".to_string()))),
                 _ => Err(format!("unknown subcommand '{}' for 'memory'", sub)),
             }

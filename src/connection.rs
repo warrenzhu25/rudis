@@ -9051,6 +9051,7 @@ pub fn acl_cmd_name(cmd: &Command) -> &'static str {
             M::Purge => "memory|purge",
             M::Doctor => "memory|doctor",
             M::Defrag => "memory",
+            M::MallocStats => "memory|malloc-stats",
         },
         Command::Commandlog(args) => {
             match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
@@ -18399,6 +18400,9 @@ async fn execute_command_inner(
                 MemorySubcommand::Purge | MemorySubcommand::Defrag => {
                     let _ = router.active_defrag().await;
                     out.extend_from_slice(b"+OK\r\n");
+                }
+                MemorySubcommand::MallocStats => {
+                    write_resp_bulk(out, crate::allocator::malloc_stats().as_bytes());
                 }
             }
             false
