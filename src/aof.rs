@@ -4701,10 +4701,23 @@ mod tests {
         ] {
             log.extend_from_slice(&resp_argv(args));
         }
+        // Kept, but with a deadline that has really passed: not one rounded
+        // to the nearest stored millisecond, which can sit in the future.
+        for i in 0..200 {
+            let key = format!("late{i}");
+            log.extend_from_slice(&resp_argv(&["SET", &key, "v", "PXAT", &past]));
+        }
         let path = dir.join("log.aof");
         std::fs::write(&path, &log).unwrap();
         let mut db = ShardDb::new(6379);
         replay_aof(&path, &mut db).unwrap();
+        let after = std::time::Instant::now();
+        let not_passed = db
+            .table
+            .entries()
+            .filter(|e| e.key.starts_with(b"late") && e.expire_at().is_none_or(|t| t > after))
+            .count();
+        assert_eq!(not_passed, 0, "replayed past PXAT must stay passed");
         assert!(!crate::connection::REPLAYING_WRITES.get());
         let mut out = Vec::new();
         let mut run = |db: &mut ShardDb, args: &[&str]| {

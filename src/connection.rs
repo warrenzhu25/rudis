@@ -19430,6 +19430,12 @@ pub fn execute_local_command(
 
                 let prev_kind = db.type_of(key.as_ref());
                 db.set_extended(key.clone(), value.clone(), *expire_in, *keepttl);
+                if replay_past {
+                    // `now + 0` rounds to the nearest stored millisecond, so
+                    // it can sit just in the future; pin it clearly passed.
+                    db.table
+                        .expire(key.as_ref(), std::time::Duration::ZERO, Default::default());
+                }
                 record_change!(cmd);
                 notify_set_key_events_local(prev_kind, "string", key);
                 notify_keyspace_event(NOTIFY_STRING, "set", key);
