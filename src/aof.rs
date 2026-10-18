@@ -250,17 +250,31 @@ impl AofWriter {
         }
     }
 
-    /// Reports that a chunk from `take_flush_chunk` finished writing (with
-    /// its buffer back for reuse, if the write succeeded).
+    /// Reports that a chunk from `take_flush_chunk` (taken at `offset`)
+    /// finished writing: `res` is the write's outcome and `chunk` its buffer
+    /// back. A failed chunk is put back in front of the buffer (when no later
+    /// chunk was taken since), so the next write retries it, as Redis keeps
+    /// unwritten AOF data: dropped, nothing was left to retry and writes
+    /// stayed refused (-MISCONF) even after the disk had room again.
     #[inline]
-    pub fn chunk_written(&mut self, chunk: Option<Vec<u8>>) {
+    pub fn chunk_written(&mut self, res: &std::io::Result<()>, chunk: Vec<u8>, offset: u64) {
         self.inflight = self.inflight.saturating_sub(1);
-        if let Some(c) = chunk {
-            self.recycle_chunk(c);
-            self.mark_written_if_idle();
-            self.progress.record_write(Ok(()));
-        } else {
-            self.progress.record_write(Err(libc::EIO));
+        match res {
+            Ok(()) => {
+                self.recycle_chunk(chunk);
+                self.mark_written_if_idle();
+                self.progress.record_write(Ok(()));
+            }
+            Err(e) => {
+                if offset + chunk.len() as u64 == self.offset {
+                    let mut buf = chunk;
+                    buf.extend_from_slice(&self.buffer);
+                    self.buffer = buf;
+                    self.offset = offset;
+                }
+                self.progress
+                    .record_write(Err(e.raw_os_error().unwrap_or(libc::EIO)));
+            }
         }
     }
 
@@ -289,7 +303,7 @@ impl AofWriter {
     pub async fn flush(&mut self) -> std::io::Result<()> {
         if let Some((file, chunk, offset)) = self.take_flush_chunk() {
             let (res, buf) = file.write_all_at(chunk, offset).await;
-            self.chunk_written(res.is_ok().then_some(buf));
+            self.chunk_written(&res, buf, offset);
             res?;
         }
         Ok(())
@@ -299,7 +313,7 @@ impl AofWriter {
         let chunk_and_off = aof.borrow_mut().take_flush_chunk();
         if let Some((file, chunk, offset)) = chunk_and_off {
             let (res, buf) = file.write_all_at(chunk, offset).await;
-            aof.borrow_mut().chunk_written(res.is_ok().then_some(buf));
+            aof.borrow_mut().chunk_written(&res, buf, offset);
             res?;
         }
         Ok(())
@@ -317,7 +331,7 @@ impl AofWriter {
         };
         if let Some((file, chunk, offset)) = chunk {
             let (res, buf) = file.write_all_at(chunk, offset).await;
-            aof.borrow_mut().chunk_written(res.is_ok().then_some(buf));
+            aof.borrow_mut().chunk_written(&res, buf, offset);
             res?;
         }
         loop {
@@ -374,7 +388,7 @@ impl AofWriter {
             match chunk {
                 Some((file, chunk, offset)) => {
                     let (res, buf) = file.write_all_at(chunk, offset).await;
-                    aof.borrow_mut().chunk_written(res.is_ok().then_some(buf));
+                    aof.borrow_mut().chunk_written(&res, buf, offset);
                     res?;
                 }
                 None if aof.borrow().inflight == 0 => {
@@ -6636,6 +6650,37 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_chunk_is_retried_not_dropped() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-requeue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appendonly-0.aof");
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let progress = aof_progress(65_003, 0);
+            let mut w = AofWriter::open(path.clone()).await.unwrap();
+            w.set_progress(progress.clone());
+            w.append(b"first;");
+            let (_file, chunk, off) = w.take_flush_chunk().unwrap();
+            w.append(b"second;");
+            // The write of `first;` failed (e.g. disk full).
+            let failed: std::io::Result<()> = Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            w.chunk_written(&failed, chunk, off);
+            assert!(aof_write_misconf(65_003).is_some());
+            assert!(progress.pending());
+            // The next write retries it, in order, and clears the error.
+            assert!(w.write_pending_sync().unwrap());
+            assert_eq!(std::fs::read(&path).unwrap(), b"first;second;");
+            assert!(aof_write_misconf(65_003).is_none());
+            assert!(!progress.pending());
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_write_through_puts_appends_in_the_file_and_tracks_progress() {
         let dir = std::env::temp_dir().join(format!("rudis-aof-wt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6669,8 +6714,8 @@ mod tests {
                 "returned before the in-flight chunk was written"
             );
             let (res, buf) = file.write_all_at(chunk, off).await;
+            aof.borrow_mut().chunk_written(&res, buf, off);
             res.unwrap();
-            aof.borrow_mut().chunk_written(Some(buf));
             writer.await;
             assert!(!progress.pending());
             // No fsync needed: the bytes are in the file for any reader.
@@ -6712,8 +6757,8 @@ mod tests {
                 "returned before the in-flight chunk was written"
             );
             let (res, buf) = file.write_all_at(chunk, off).await;
+            aof.borrow_mut().chunk_written(&res, buf, off);
             res.unwrap();
-            aof.borrow_mut().chunk_written(Some(buf));
             syncer.await;
             assert!(done.get());
             assert_eq!(std::fs::read(&path).unwrap(), b"first;second;");

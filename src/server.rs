@@ -355,7 +355,7 @@ pub fn run_shard_worker(
                                 let (res, returned_chunk) = file.write_all_at(chunk, offset).await;
                                 flush_writer
                                     .borrow_mut()
-                                    .chunk_written(res.is_ok().then_some(returned_chunk));
+                                    .chunk_written(&res, returned_chunk, offset);
                             }
                             ticker += 1;
                             if ticker.is_multiple_of(200)
