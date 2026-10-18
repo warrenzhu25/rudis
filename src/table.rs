@@ -21237,4 +21237,22 @@ mod tests {
         // The clock keeps going, so later writes still win over old ones.
         assert!(db.crdt_store.clock.now() > ts);
     }
+
+    /// RDB inputs cargo-fuzz found overflowing (a panic with overflow checks
+    /// on, as in debug builds): a RESIZEDB size near u64::MAX, and a
+    /// semantic-cache eviction counter at u64::MAX. Either loads or errors.
+    #[test]
+    fn test_load_rdb_survives_overflowing_sizes_and_counters() {
+        for body in [
+            &include_bytes!("../tests/fixtures/fuzz/load_rdb_resizedb_overflow.bin")[..],
+            &include_bytes!("../tests/fixtures/fuzz/load_rdb_semantic_counter_overflow.bin")[..],
+        ] {
+            let mut file = b"REDIS0011".to_vec();
+            file.extend_from_slice(body);
+            let crc = crc64(&file);
+            file.extend_from_slice(&crc.to_le_bytes());
+            let mut db = crate::shard::ShardDb::new(0);
+            let _ = load_rdb_bytes(&file, &mut db, 0, 1);
+        }
+    }
 }

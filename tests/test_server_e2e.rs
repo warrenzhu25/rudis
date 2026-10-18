@@ -14954,6 +14954,63 @@ fn run_rudis_until_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
     (status, stderr)
 }
 
+/// A server starting from RDB files cargo-fuzz found overflowing a size or
+/// counter (a panic in builds with overflow checks) either serves or
+/// refuses the file cleanly; it never panics.
+#[test]
+fn test_startup_survives_overflowing_rdb_fields_e2e() {
+    let dir = std::env::temp_dir().join(format!("rudis-rdb-overflow-{}", std::process::id()));
+    for (i, body) in [
+        &include_bytes!("fixtures/fuzz/load_rdb_resizedb_overflow.bin")[..],
+        &include_bytes!("fixtures/fuzz/load_rdb_semantic_counter_overflow.bin")[..],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rdb = b"REDIS0011".to_vec();
+        rdb.extend_from_slice(body);
+        let crc = rudis::table::crc64(&rdb);
+        rdb.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(dir.join("dump.rdb"), &rdb).unwrap();
+        let mut child = rudis_bin()
+            .args(["--port", "18039", "--threads", "2", "--no-pin", "--aof-dir"])
+            .arg(&dir)
+            .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn rudis");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let served = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if let Ok(mut c) = TcpStream::connect("127.0.0.1:18039") {
+                assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n", "input {i}");
+                break true;
+            }
+            assert!(std::time::Instant::now() < deadline, "input {i}: no start");
+            thread::sleep(Duration::from_millis(50));
+        };
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(!stderr.contains("panicked"), "input {i}: {stderr}");
+        if !served {
+            assert_eq!(status.code(), Some(1), "input {i}: {stderr}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_startup_refuses_unloadable_rdb_and_aof_e2e() {
     let dir = std::env::temp_dir().join(format!("rudis-badload-{}", std::process::id()));

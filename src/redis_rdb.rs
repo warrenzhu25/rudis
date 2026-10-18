@@ -2010,12 +2010,18 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
                     let k_cap = if db_size == 0 {
                         0
                     } else {
-                        db_size.next_power_of_two().max(4)
+                        db_size
+                            .checked_next_power_of_two()
+                            .unwrap_or(u64::MAX)
+                            .max(4)
                     };
                     let e_cap = if expires_size == 0 {
                         0
                     } else {
-                        expires_size.next_power_of_two().max(4)
+                        expires_size
+                            .checked_next_power_of_two()
+                            .unwrap_or(u64::MAX)
+                            .max(4)
                     };
                     crate::log_verbose!("DB {} resized: {} keys ({} expires)", dbid, k_cap, e_cap);
                 }

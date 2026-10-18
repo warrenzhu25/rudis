@@ -3671,7 +3671,8 @@ impl ShardDb {
                         continue;
                     }
                     if exp_unix_ms != 0 && exp_unix_ms <= unix_now {
-                        evicted_expired += 1;
+                        // Saturating: the starting count comes from the file.
+                        evicted_expired = evicted_expired.saturating_add(1);
                         continue;
                     }
                     let ttl = if exp_unix_ms > unix_now {
