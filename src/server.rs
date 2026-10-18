@@ -439,7 +439,13 @@ pub fn run_shard_worker(
                 // Like Redis, a replica does not expire keys itself: it waits
                 // for its master's DEL (its own expiry could race a PERSIST
                 // or EXPIRE from the master and lose the key).
-                if !crate::replication::get_replication_hub(base_port).is_slave() {
+                let is_replica = crate::replication::get_replication_hub(base_port).is_slave();
+                crate::replication::set_readonly_replica(
+                    is_replica
+                        && crate::connection::REPLICA_READ_ONLY
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                if !is_replica {
                     active_db.borrow_mut().active_expire_cycle();
                 }
                 // Give back table segments emptied by deletes and expiry.

@@ -1922,6 +1922,27 @@ type ShardLog = (
     Option<std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>>,
 );
 
+thread_local! {
+    /// Whether this shard thread belongs to a read-only replica (refreshed
+    /// by the shard's cron): see [`hide_expired_keys`].
+    static READONLY_REPLICA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Records whether this shard thread's server is a read-only replica.
+pub fn set_readonly_replica(v: bool) {
+    READONLY_REPLICA.with(|c| c.set(v));
+}
+
+/// Whether expired keys are to be hidden rather than deleted: on a
+/// read-only replica, like Redis, a read finds an expired key gone but the
+/// key stays until its master's DEL arrives. Deleting it there could race
+/// a PERSIST or EXPIRE from the master sent just before the deadline, and
+/// lose the key the master kept.
+#[inline]
+pub fn hide_expired_keys() -> bool {
+    READONLY_REPLICA.with(|c| c.get())
+}
+
 /// Registers this shard thread's port, shard id and AOF writer (call once at
 /// shard startup).
 pub fn set_shard_log_context(

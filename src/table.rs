@@ -3915,6 +3915,11 @@ impl RudisTable {
         if crate::connection::is_client_paused().is_some() {
             return;
         }
+        // A read-only replica keeps the key (reads still see it as gone)
+        // until its master's DEL: see `replication::hide_expired_keys`.
+        if crate::replication::hide_expired_keys() {
+            return;
+        }
         if let Some(removed) = self.table.remove(slot_idx) {
             match &removed.val {
                 RudisValue::Tiered(ptr) => self.dropped_tier.push((**ptr, false)),
@@ -17182,6 +17187,23 @@ mod tests {
     /// `trim_step` compacts arenas left part empty by deletes (which only
     /// trim below half live), keeps the incremental byte counters exact and
     /// every surviving key readable.
+    #[test]
+    fn test_readonly_replica_hides_expired_keys_without_deleting() {
+        let mut t = RudisTable::new();
+        t.set(
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"v"),
+            Some(Duration::from_millis(1)),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        crate::replication::set_readonly_replica(true);
+        assert_eq!(t.get(b"k").unwrap(), None, "expired: hidden from reads");
+        assert_eq!(t.dbsize(), 1, "but kept until the master's DEL");
+        crate::replication::set_readonly_replica(false);
+        assert_eq!(t.get(b"k").unwrap(), None);
+        assert_eq!(t.dbsize(), 0, "a master deletes it on access");
+    }
+
     #[test]
     fn test_trim_step_compacts_arenas_left_part_empty_by_deletes() {
         let mut t = RudisTable::new();
