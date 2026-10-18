@@ -30986,3 +30986,110 @@ fn test_hash_field_expiry_is_logged_as_hdel_e2e() {
     drop(master);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// SETs logged with the in-place AOF encoding (binary keys and values,
+/// empty and large values, several DBs, mixed with other writes) reach a
+/// replica and a restart from the AOF byte for byte.
+#[test]
+fn test_set_log_encoding_round_trips_through_replica_and_aof_e2e() {
+    fn resp(args: &[&[u8]]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+    fn bulk(v: &[u8]) -> String {
+        let mut out = format!("${}\r\n", v.len()).into_bytes();
+        out.extend_from_slice(v);
+        out.extend_from_slice(b"\r\n");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    let (mp, rp) = (18041u16, 18042u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-setenc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let margs = [
+        "--port",
+        &mps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+    ];
+    let master = ServerGuard(spawn_rudis_listening(&margs, mp));
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !send_and_read_reply(&mut r, b"INFO replication\r\n").contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let big = vec![b'x'; 100_000];
+    let data: Vec<(&[u8], Vec<u8>, Vec<u8>)> = vec![
+        (b"0", b"plain".to_vec(), b"v".to_vec()),
+        (b"0", b"bin\r\n\0key".to_vec(), b"val\r\n\0ue".to_vec()),
+        (b"0", b"empty".to_vec(), Vec::new()),
+        (b"0", b"big".to_vec(), big.clone()),
+        (b"2", b"plain".to_vec(), b"db2".to_vec()),
+        (b"2", b"n".to_vec(), b"41".to_vec()),
+    ];
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for (db, k, v) in &data {
+        send_and_read_reply(&mut m, &resp(&[b"SELECT", db]));
+        assert_eq!(
+            send_and_read_reply(&mut m, &resp(&[b"SET", k, v])),
+            "+OK\r\n"
+        );
+    }
+    // Other writes between SETs, and a SET that does not apply.
+    assert_eq!(send_and_read_reply(&mut m, b"INCR n\r\n"), ":42\r\n");
+    assert_eq!(send_and_read_reply(&mut m, b"SET n 0 NX\r\n"), "$-1\r\n");
+    assert_eq!(send_and_read_reply(&mut m, b"WAIT 1 2000\r\n"), ":1\r\n");
+    let expect: Vec<(&[u8], Vec<u8>, String)> = data
+        .iter()
+        .map(|(db, k, v)| {
+            let v = if k == b"n" { b"42".to_vec() } else { v.clone() };
+            (*db, k.clone(), bulk(&v))
+        })
+        .collect();
+    let check = |c: &mut TcpStream, who: &str| {
+        for (db, k, want) in &expect {
+            send_and_read_reply(c, &resp(&[b"SELECT", db]));
+            let got = send_and_read_reply(c, &resp(&[b"GET", k]));
+            assert!(got == *want, "{who}: db {db:?} key {k:?}: {:.80}", got);
+        }
+    };
+    check(&mut r, "replica");
+    drop(replica);
+    drop(master);
+    let master = ServerGuard(spawn_rudis_listening(&margs, mp));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    check(&mut m, "restart from AOF");
+    drop(master);
+    let _ = std::fs::remove_dir_all(&dir);
+}

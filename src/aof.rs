@@ -224,6 +224,36 @@ impl AofWriter {
             self.emit_select_db(db);
         }
         self.buffer.extend_from_slice(data);
+        self.note_appended(before);
+    }
+
+    /// Appends `cmd` encoded as RESP (see [`command_to_resp`]) and returns
+    /// where it starts in [`Self::buffer`], or `None` (appending nothing)
+    /// if it has no encoding. Plain SETs are encoded in place: no temporary
+    /// buffer, its regrowth or the copy out of it.
+    #[inline]
+    pub fn append_command(&mut self, cmd: &Command) -> Option<usize> {
+        let encoded = if is_plain_set(cmd) {
+            None
+        } else {
+            Some(command_to_resp(cmd)?)
+        };
+        let db = crate::connection::CURRENT_DB.get();
+        let before = self.buffer.len();
+        if db != self.current_db {
+            self.emit_select_db(db);
+        }
+        let start = self.buffer.len();
+        match encoded {
+            Some(bytes) => self.buffer.extend_from_slice(&bytes),
+            None => encode_plain_set(cmd, &mut self.buffer),
+        }
+        self.note_appended(before);
+        Some(start)
+    }
+
+    #[inline]
+    fn note_appended(&mut self, before: usize) {
         self.appended_total += (self.buffer.len() - before) as u64;
         self.progress
             .appended
@@ -583,6 +613,51 @@ fn encode_hdel(buf: &mut Vec<u8>, key: &[u8], fields: &[bytes::Bytes]) {
     }
 }
 
+/// A SET without TTL or KEEPTTL: logged as `SET key value`.
+#[inline]
+fn is_plain_set(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Set {
+            expire_in: None,
+            keepttl: false,
+            ..
+        }
+    )
+}
+
+/// Appends `SET key value` for a plain SET ([`is_plain_set`]) to `buf`.
+#[inline]
+fn encode_plain_set(cmd: &Command, buf: &mut Vec<u8>) {
+    if let Command::Set { key, value, .. } = cmd {
+        buf.reserve(40 + key.len() + value.len());
+        buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n");
+        push_bulk(buf, key);
+        push_bulk(buf, value);
+    }
+}
+
+/// Appends `data` as a RESP bulk string, without `format!`.
+#[inline]
+fn push_bulk(buf: &mut Vec<u8>, data: &[u8]) {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut n = data.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf.push(b'$');
+    buf.extend_from_slice(&digits[i..]);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(data);
+    buf.extend_from_slice(b"\r\n");
+}
+
 pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     match cmd {
@@ -619,11 +694,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                     format!("\r\n$4\r\nPXAT\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
                 );
             } else {
-                buf.extend_from_slice(format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
-                buf.extend_from_slice(key);
-                buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
-                buf.extend_from_slice(value);
-                buf.extend_from_slice(b"\r\n");
+                encode_plain_set(cmd, &mut buf);
             }
             Some(buf)
         }
@@ -4732,6 +4803,63 @@ mod tests {
         assert_eq!(run(&mut db, &["TTL", "rewritten"]), ":-1\r\n");
         assert_eq!(run(&mut db, &["GET", "gone"]), "$-1\r\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `append_command` logs exactly what `command_to_resp` encodes (plain
+    /// SETs are encoded in place, everything else through it), behind a
+    /// SELECT when the DB changes, and appends nothing for commands with no
+    /// encoding.
+    #[test]
+    fn test_append_command_matches_command_to_resp() {
+        let mut w = AofWriter::new_in_memory();
+        let mut expected = Vec::new();
+        let big = "v".repeat(10_000);
+        for (db, line) in [
+            (0, "SET k v".to_string()),
+            (0, "SET k v NX".to_string()),
+            (0, format!("SET big {big}")),
+            (0, "SET k v KEEPTTL".to_string()),
+            (3, "SET k3 v".to_string()),
+            (3, "INCR n".to_string()),
+            (3, "HSET h f v".to_string()),
+            (0, "GET k".to_string()),
+            (0, "SET back v".to_string()),
+        ] {
+            crate::connection::CURRENT_DB.set(db);
+            let cmd = parse_line(&line);
+            let before = w.buffer().len();
+            let start = w.append_command(&cmd);
+            match command_to_resp(&cmd) {
+                Some(bytes) => {
+                    let start = start.unwrap_or_else(|| panic!("{line}: not appended"));
+                    assert_eq!(&w.buffer()[start..], &bytes[..], "{line}");
+                    if start != before {
+                        expected.extend_from_slice(&w.buffer()[before..start]);
+                    }
+                    expected.extend_from_slice(&bytes);
+                }
+                None => {
+                    assert_eq!(start, None, "{line}");
+                    assert_eq!(w.buffer().len(), before, "{line}: appended bytes");
+                }
+            }
+        }
+        crate::connection::CURRENT_DB.set(0);
+        assert_eq!(w.buffer(), &expected[..]);
+        // The shared plain-SET encoding itself, byte for byte.
+        assert_eq!(
+            command_to_resp(&parse_line("SET k v")).unwrap(),
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+        );
+        let mut long = b"*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n$10000\r\n".to_vec();
+        long.extend_from_slice(big.as_bytes());
+        long.extend_from_slice(b"\r\n");
+        assert_eq!(
+            command_to_resp(&parse_line(&format!("SET big {big}"))).unwrap(),
+            long
+        );
+        let log = String::from_utf8_lossy(w.buffer());
+        assert_eq!(log.matches("SELECT").count(), 2, "{log:.300}");
     }
 
     /// A key expiring on access is logged as DEL before the command that

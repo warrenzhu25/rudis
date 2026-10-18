@@ -19145,6 +19145,39 @@ pub fn apply_replicated_command(
     }
 }
 
+/// Appends a change to the AOF and replicates it (see `record_change!` in
+/// [`execute_local_command`]). Out of line: expanded at every write site,
+/// this grew that function's stack frame enough to overflow test threads.
+#[inline(never)]
+fn log_change(
+    changed: &Command,
+    aof: Option<&RefCell<crate::aof::AofWriter>>,
+    port: u16,
+    shard_id: usize,
+    warn: bool,
+) {
+    let need_rep = crate::replication::has_connected_replicas(port);
+    if let Some(aof_w) = aof {
+        // Encoded straight into the AOF buffer; replicas get the same bytes
+        // from there.
+        let mut w = aof_w.borrow_mut();
+        match w.append_command(changed) {
+            Some(start) if need_rep => {
+                crate::replication::propagate_shard_bytes(port, shard_id, &w.buffer()[start..])
+            }
+            Some(_) => {}
+            None if warn => crate::aof::note_unpropagated(changed),
+            None => {}
+        }
+    } else if need_rep {
+        if let Some(bytes) = crate::aof::command_to_resp(changed) {
+            crate::replication::propagate_shard_bytes(port, shard_id, &bytes);
+        } else if warn {
+            crate::aof::note_unpropagated(changed);
+        }
+    }
+}
+
 pub fn execute_local_command(
     cmd: &Command,
     db: &mut ShardDb,
@@ -19168,20 +19201,7 @@ pub fn execute_local_command(
                     notify_key_invalidation(db.port, k, cid);
                 });
             }
-            let need_aof = aof.is_some();
-            let need_rep = crate::replication::has_connected_replicas(db.port);
-            if need_aof || need_rep {
-                if let Some(bytes) = crate::aof::command_to_resp(changed) {
-                    if let Some(aof_w) = aof {
-                        aof_w.borrow_mut().append(&bytes);
-                    }
-                    if need_rep {
-                        crate::replication::propagate_shard_bytes(db.port, db.shard_id, &bytes);
-                    }
-                } else if $warn {
-                    crate::aof::note_unpropagated(changed);
-                }
-            }
+            log_change(changed, aof, db.port, db.shard_id, $warn);
         }};
         ($cmd_expr:expr) => {
             record_change!(@log $cmd_expr, true)
