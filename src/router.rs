@@ -975,7 +975,7 @@ impl Router {
             self.publish_memory_state();
             return true;
         }
-        if policy != "noeviction" {
+        if policy != "noeviction" && !self.tier_stats.eviction_paused() {
             // Once over the limit, evict a little below it so the next
             // writes don't each trigger another (possibly remote) round.
             // The limit is checked by the allocator's count, which drops as
@@ -1098,6 +1098,9 @@ impl Router {
         track_out: &mut Vec<u8>,
     ) -> bool {
         self.sync_backoff_epoch();
+        if self.tier_stats.eviction_paused() {
+            return true;
+        }
         if !self.over_maxmemory_checked().await {
             return true;
         }

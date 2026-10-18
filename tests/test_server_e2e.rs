@@ -30506,3 +30506,95 @@ fn test_expiry_is_logged_as_del_for_replica_and_aof_e2e() {
     drop(master);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A replica attaching to a master at `maxmemory` does not make it evict:
+/// the full-sync snapshot (built in-process, about the dataset's size held
+/// more than once) does not count toward the limit, as in Redis. It made
+/// the master evict essentially its whole dataset.
+#[test]
+fn test_full_sync_does_not_make_master_evict_e2e() {
+    let (mp, rp) = (18028u16, 18029u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let master = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &mps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--maxmemory",
+            "40mb",
+            "--maxmemory-policy",
+            "allkeys-lru",
+        ],
+        mp,
+    ));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let val = "v".repeat(1000);
+    for b in 0..34 {
+        let mut req = String::new();
+        for i in 0..1000 {
+            let k = format!("k{b}:{i}");
+            req.push_str(&format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n$1000\r\n{val}\r\n",
+                k.len()
+            ));
+        }
+        m.write_all(req.as_bytes()).unwrap();
+        let (mut oks, mut buf) = (0, [0u8; 8192]);
+        while oks < 1000 {
+            let n = m.read(&mut buf).unwrap();
+            assert!(n > 0);
+            oks += buf[..n].windows(3).filter(|w| w == b"OK\r").count();
+        }
+    }
+    let evicted = |m: &mut TcpStream| -> u64 {
+        send_and_read_reply(m, b"INFO stats\r\n")
+            .lines()
+            .find_map(|l| l.strip_prefix("evicted_keys:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let keys_before = send_and_read_reply(&mut m, b"DBSIZE\r\n");
+    let ev_before = evicted(&mut m);
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Writes keep coming while the replica syncs.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut j = 0;
+    while !send_and_read_reply(&mut r, b"INFO replication\r\n").contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+        for _ in 0..20 {
+            send_and_read_reply(&mut m, format!("SET w{j} x\r\n").as_bytes());
+            j += 1;
+        }
+    }
+    assert_eq!(evicted(&mut m), ev_before, "evicted during the full sync");
+    let keys_after: u64 = send_and_read_reply(&mut m, b"DBSIZE\r\n")[1..]
+        .trim()
+        .parse()
+        .unwrap();
+    let before: u64 = keys_before[1..].trim().parse().unwrap();
+    assert!(
+        keys_after >= before,
+        "{before} keys before, {keys_after} after"
+    );
+    drop(replica);
+    drop(master);
+}

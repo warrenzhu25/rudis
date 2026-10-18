@@ -7216,6 +7216,9 @@ async fn run_master_replica_stream(
             }
             // Register before any shard serializes, so each shard's changes
             // after its snapshot reach the replica (see FullSyncCut).
+            // No eviction until the snapshot is built and sent (dropped at
+            // the end of this block, after the buffers).
+            let _pause = crate::tiering::SnapshotEvictionPause::new(router.tier_stats.clone());
             let (rdb, replid, offset, after_snapshot, rep) =
                 match snapshot_for_replica(&hub, &router, client_id, &write_tx).await {
                     Ok(snapshot) => snapshot,
@@ -7244,6 +7247,9 @@ async fn run_master_replica_stream(
         }
     } else {
         crate::log_notice!("Full resync requested by replica {}", name);
+        // No eviction until the snapshot is built and sent (dropped at the
+        // end of this block, after the buffers).
+        let _pause = crate::tiering::SnapshotEvictionPause::new(router.tier_stats.clone());
         let (rdb, _, _, after_snapshot, rep) =
             match snapshot_for_replica(&hub, &router, client_id, &write_tx).await {
                 Ok(snapshot) => snapshot,

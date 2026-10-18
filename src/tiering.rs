@@ -61,6 +61,9 @@ pub struct TieringStats {
     /// process-wide `stats.allocated` while this is the only server in the
     /// process. Zero otherwise.
     pub unattributed: AtomicI64,
+    /// Full-sync snapshots being built or sent to replicas. Eviction
+    /// pauses meanwhile (see [`SnapshotEvictionPause`]).
+    pub snapshots_in_progress: std::sync::atomic::AtomicUsize,
     /// Whether shards publish allocator counts into `shard_real`. Set by a
     /// running server; routers built directly (unit tests) publish the
     /// table's estimate there instead, since their thread's allocator
@@ -117,6 +120,7 @@ impl Default for TieringStats {
                 .map(|_| crate::mailbox::CachePadded(ShardRealMem::default()))
                 .collect(),
             unattributed: AtomicI64::new(0),
+            snapshots_in_progress: std::sync::atomic::AtomicUsize::new(0),
             real_accounting: AtomicBool::new(false),
         }
     }
@@ -191,6 +195,12 @@ impl TieringStats {
             .map(|(_, m)| m.net.load(Ordering::Relaxed) - m.slack.load(Ordering::Relaxed))
             .sum::<i64>()
             + self.unattributed.load(Ordering::Relaxed)
+    }
+
+    /// Whether eviction is paused for a full-sync snapshot.
+    #[inline]
+    pub fn eviction_paused(&self) -> bool {
+        self.snapshots_in_progress.load(Ordering::Relaxed) != 0
     }
 
     /// Sets the unattributed remainder so the shard nets plus it equal
@@ -1230,9 +1240,55 @@ pub(crate) async fn run_during_first_wait<A: std::future::Future, B: std::future
     (a.await, b_out)
 }
 
+/// Pauses maxmemory eviction while a full-sync snapshot for a replica is
+/// built and sent, like Redis, where the snapshot (a forked child's
+/// copy-on-write pages) never counts toward `maxmemory`. Here it is built
+/// in-process: the shards' chunks and the whole snapshot (about the
+/// dataset's size, held more than once), with chunks allocated on one
+/// thread and freed on another until the 100 ms recalibration. Counting
+/// that, a replica attaching to a master at its limit made it evict all of
+/// its keys. Dropping recalibrates the count first, so eviction resumes on
+/// real numbers.
+pub struct SnapshotEvictionPause {
+    stats: std::sync::Arc<TieringStats>,
+}
+
+impl SnapshotEvictionPause {
+    pub fn new(stats: std::sync::Arc<TieringStats>) -> Self {
+        stats.snapshots_in_progress.fetch_add(1, Ordering::SeqCst);
+        SnapshotEvictionPause { stats }
+    }
+}
+
+impl Drop for SnapshotEvictionPause {
+    fn drop(&mut self) {
+        if sole_server_in_process()
+            && let Some(global) = crate::allocator::global_allocated()
+        {
+            self.stats.calibrate_unattributed(global);
+        }
+        self.stats
+            .snapshots_in_progress
+            .fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_snapshot_pause_stops_eviction_until_dropped() {
+        let stats = get_tier_stats(65_005);
+        assert!(!stats.eviction_paused());
+        let a = SnapshotEvictionPause::new(stats.clone());
+        let b = SnapshotEvictionPause::new(stats.clone());
+        assert!(stats.eviction_paused());
+        drop(a);
+        assert!(stats.eviction_paused(), "another snapshot is still running");
+        drop(b);
+        assert!(!stats.eviction_paused());
+    }
 
     #[test]
     fn test_encode_decode_record_integrity() {
