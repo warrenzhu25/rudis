@@ -31426,3 +31426,40 @@ fn test_bgrewriteaof_does_not_block_and_keeps_every_write_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A server starting on a directory with the temp file of a rewrite that
+/// a crash cut short removes it, and loads its AOF as usual.
+#[test]
+fn test_startup_removes_interrupted_rewrite_temp_e2e() {
+    let port = 18048u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-staletmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+    ];
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(send_and_read_reply(&mut c, b"SET k v\r\n"), "+OK\r\n");
+    drop(srv);
+    let stale = dir.join("appendonly-0.aof.tmp.999999_live7");
+    std::fs::write(&stale, vec![b'x'; 4096]).unwrap();
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(send_and_read_reply(&mut c, b"GET k\r\n"), "$1\r\nv\r\n");
+    assert!(!stale.exists(), "stale rewrite temp file removed");
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

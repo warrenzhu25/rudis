@@ -4051,6 +4051,7 @@ fn raw_resp_arg(raw: &[u8], idx: usize) -> Option<&[u8]> {
 ///
 /// Returns the old shard count if a reshard happened.
 pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Result<Option<usize>> {
+    remove_stale_rewrite_temps(dir);
     let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
     let marker = dir.join(AOF_RESHARD_MARKER);
     if marker.exists() {
@@ -5038,6 +5039,26 @@ fn write_canonical_aof(
     Ok(count)
 }
 
+/// Removes the temporary files of AOF rewrites a crash or kill -9 cut
+/// short (`appendonly-N.aof.tmp.*`); they are never read and, as rewrites
+/// now run for a while in the background, would pile up. Startup only: no
+/// rewrite is running yet.
+fn remove_stale_rewrite_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("appendonly-")
+            && name.contains(".aof.tmp.")
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            crate::log_notice!("Removed {} left by an interrupted AOF rewrite", name);
+        }
+    }
+}
+
 /// Flushes directory metadata so that recently renamed files are durable across sudden power loss
 pub fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -5758,6 +5779,29 @@ mod tests {
             crate::digest::shard_digest(&db.borrow()),
             "the rewritten AOF replays to the live dataset"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Startup removes the temp files of rewrites a crash cut short, and
+    /// nothing else.
+    #[test]
+    fn test_startup_removes_stale_rewrite_temps() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-stale-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("appendonly-0.aof"), SET_A).unwrap();
+        std::fs::write(dir.join("appendonly-0.aof.tmp.4242_live1"), b"REDIS0012").unwrap();
+        std::fs::write(dir.join("appendonly-1.aof.tmp.4242_3"), b"*1").unwrap();
+        std::fs::write(dir.join("dump.rdb.tmp"), b"x").unwrap();
+        reshard_aof_dir(&dir, 1, 0).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with(AOF_SHARDS_MANIFEST))
+            .collect();
+        names.sort();
+        assert_eq!(names, ["appendonly-0.aof", "dump.rdb.tmp"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
