@@ -31562,3 +31562,46 @@ fn test_bgrewriteaof_does_not_block_on_other_dbs_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Plain SETs count no keyspace hits or misses (INFO stats), as in Redis;
+/// with the AOF on they were counted as a GET's.
+#[test]
+fn test_plain_set_counts_no_keyspace_hits_or_misses_e2e() {
+    let port = 18050u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-sethits-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let srv = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &ps,
+            "--threads",
+            "1",
+            "--no-pin",
+            "--dir",
+            &ds,
+            "--appendonly",
+            "yes",
+        ],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        send_and_read_reply(&mut c, b"CONFIG RESETSTAT\r\n"),
+        "+OK\r\n"
+    );
+    for cmd in [&b"SET a 1\r\n"[..], b"SET a 2\r\n", b"SET b 3\r\n"] {
+        assert_eq!(send_and_read_reply(&mut c, cmd), "+OK\r\n");
+    }
+    let stats = send_and_read_reply(&mut c, b"INFO stats\r\n");
+    assert!(stats.contains("keyspace_hits:0\r\n"), "{stats}");
+    assert!(stats.contains("keyspace_misses:0\r\n"), "{stats}");
+    assert_eq!(send_and_read_reply(&mut c, b"GET a\r\n"), "$1\r\n2\r\n");
+    let stats = send_and_read_reply(&mut c, b"INFO stats\r\n");
+    assert!(stats.contains("keyspace_hits:1\r\n"), "{stats}");
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

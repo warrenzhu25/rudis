@@ -79,6 +79,13 @@ pub fn add(stat: Stat, n: u64) {
     });
 }
 
+/// `stat` in this thread's slot only (tests on parallel threads don't
+/// disturb it).
+#[cfg(test)]
+pub fn thread_count(stat: Stat) -> u64 {
+    LOCAL.with(|slot| slot.counters[stat as usize].load(Ordering::Relaxed))
+}
+
 /// Counts one key looked up by a read command: a hit if it exists, as
 /// Redis does in lookupKeyRead.
 #[inline]

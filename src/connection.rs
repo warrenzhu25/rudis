@@ -10730,23 +10730,26 @@ async fn execute_command_inner(
                     return false;
                 }
                 let mut db = router.local_db.borrow_mut();
-                let current_val = match db.table.get(&key) {
-                    Ok(val) => val,
-                    Err(err) => {
-                        if get
-                            || matches!(
-                                condition,
-                                crate::resp::SetCondition::Ifeq(_)
-                                    | crate::resp::SetCondition::Ifne(_)
-                                    | crate::resp::SetCondition::Ifdeq(_)
-                                    | crate::resp::SetCondition::Ifdne(_)
-                            )
-                        {
+                // The old value only for GET and the IF* conditions (see
+                // `execute_local_command`).
+                let needs_current = get
+                    || matches!(
+                        condition,
+                        crate::resp::SetCondition::Ifeq(_)
+                            | crate::resp::SetCondition::Ifne(_)
+                            | crate::resp::SetCondition::Ifdeq(_)
+                            | crate::resp::SetCondition::Ifdne(_)
+                    );
+                let current_val = if needs_current {
+                    match db.table.get(&key) {
+                        Ok(val) => val,
+                        Err(err) => {
                             write_resp_err(out, err);
                             return false;
                         }
-                        None
                     }
+                } else {
+                    None
                 };
 
                 let exists = db.exists(&key);
@@ -19384,23 +19387,27 @@ pub fn execute_local_command(
                 } else {
                     expire_in
                 };
-                let current_val = match db.table.get(key) {
-                    Ok(val) => val,
-                    Err(err) => {
-                        if *get
-                            || matches!(
-                                condition,
-                                crate::resp::SetCondition::Ifeq(_)
-                                    | crate::resp::SetCondition::Ifne(_)
-                                    | crate::resp::SetCondition::Ifdeq(_)
-                                    | crate::resp::SetCondition::Ifdne(_)
-                            )
-                        {
+                // The old value only for GET and the IF* conditions: a plain
+                // SET read it too (unpacking it, and counting a keyspace hit
+                // or miss as GET does).
+                let needs_current = *get
+                    || matches!(
+                        condition,
+                        crate::resp::SetCondition::Ifeq(_)
+                            | crate::resp::SetCondition::Ifne(_)
+                            | crate::resp::SetCondition::Ifdeq(_)
+                            | crate::resp::SetCondition::Ifdne(_)
+                    );
+                let current_val = if needs_current {
+                    match db.table.get(key) {
+                        Ok(val) => val,
+                        Err(err) => {
                             write_resp_err(out, err);
                             return false;
                         }
-                        None
                     }
+                } else {
+                    None
                 };
 
                 let exists = db.exists(key);
@@ -29717,6 +29724,33 @@ mod tests {
             (&["RPUSH", "t", "a"], &["rpush"]),
             (&["LTRIM", "t", "1", "0"], &["ltrim", "del"]),
         ]);
+    }
+
+    /// A plain SET does not look up the old value: no keyspace hit or miss
+    /// (as in Redis), unlike SET ... GET and the IF* conditions.
+    #[test]
+    fn test_plain_set_counts_no_keyspace_lookup() {
+        use crate::server_stats::{Stat, thread_count};
+        let mut db = crate::shard::ShardDb::new(6397);
+        let aof = RefCell::new(crate::aof::AofWriter::new_in_memory());
+        let mut out = Vec::new();
+        let mut run = |args: &[&str]| {
+            let cmd = crate::resp::build_command(
+                args.iter().map(|a| Bytes::from(a.to_string())).collect(),
+            )
+            .unwrap()
+            .unwrap();
+            execute_local_command(&cmd, &mut db, &mut out, Some(&aof));
+        };
+        let lookups = || thread_count(Stat::KeyspaceHits) + thread_count(Stat::KeyspaceMisses);
+        let before = lookups();
+        run(&["SET", "k", "v1"]);
+        run(&["SET", "k", "v2"]);
+        run(&["SET", "k", "v3", "NX"]);
+        assert_eq!(lookups(), before, "plain SETs looked keys up");
+        run(&["SET", "k", "v4", "GET"]);
+        assert_eq!(lookups(), before + 1);
+        assert_eq!(out, b"+OK\r\n+OK\r\n$-1\r\n$2\r\nv2\r\n");
     }
 
     #[test]
