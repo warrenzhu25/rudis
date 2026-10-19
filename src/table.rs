@@ -1667,6 +1667,30 @@ pub fn key_dir_bits(key: &[u8]) -> u64 {
     mix_hash(hash_key(key)) >> SEG_SHIFT
 }
 
+/// `at` as Unix milliseconds, given the same moment as `now` / `now_unix_ms`;
+/// a deadline already passed stays in the past (at least 1, 0 meaning none).
+pub fn instant_to_unix_ms(at: Instant, now: Instant, now_unix_ms: u64) -> u64 {
+    if at >= now {
+        now_unix_ms + at.duration_since(now).as_millis() as u64
+    } else {
+        now_unix_ms
+            .saturating_sub(now.duration_since(at).as_millis() as u64)
+            .max(1)
+    }
+}
+
+/// The inverse of [`instant_to_unix_ms`]: a past Unix time maps to a past
+/// instant (clamped where `Instant` cannot go back that far).
+pub fn unix_ms_to_instant(unix_ms: u64, now_unix_ms: u64) -> Instant {
+    let now = Instant::now();
+    match unix_ms.checked_sub(now_unix_ms) {
+        Some(ahead) => now + Duration::from_millis(ahead),
+        None => now
+            .checked_sub(Duration::from_millis(now_unix_ms - unix_ms))
+            .unwrap_or(now),
+    }
+}
+
 /// Mask of the low `depth` directory bits.
 pub fn dir_bits_mask(depth: u8) -> u64 {
     if depth >= 64 {
@@ -15227,16 +15251,10 @@ impl RudisTable {
         }
         if !self.hash_field_expires.is_empty() {
             for (key, fmap) in &self.hash_field_expires {
+                // Passed deadlines too (see `ShardDb::write_hash_field_expires_legacy`).
                 let active: Vec<(&Bytes, u64)> = fmap
                     .iter()
-                    .filter_map(|(f, &exp)| {
-                        if exp > now {
-                            let rem_ms = exp.duration_since(now).as_millis() as u64;
-                            Some((f, unix_now + rem_ms))
-                        } else {
-                            None
-                        }
-                    })
+                    .map(|(f, &exp)| (f, instant_to_unix_ms(exp, now, unix_now)))
                     .collect();
                 if !active.is_empty() {
                     buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -15316,12 +15334,11 @@ impl RudisTable {
                     let exp_unix_ms =
                         u64::from_le_bytes(data[f_len..f_len + 8].try_into().unwrap());
                     data = &data[f_len + 8..];
-                    if exp_unix_ms > unix_now {
-                        let rem_ms = exp_unix_ms - unix_now;
+                    if exp_unix_ms > unix_now || crate::connection::access_expired_allowed() {
                         self.hash_field_expires
                             .entry(key.clone())
                             .or_default()
-                            .insert(field, Instant::now() + Duration::from_millis(rem_ms));
+                            .insert(field, unix_ms_to_instant(exp_unix_ms, unix_now));
                     } else {
                         expired_on_disk.push(field);
                     }
@@ -17036,13 +17053,14 @@ fn load_legacy_records(
                 );
                 cursor += f_len + 8;
                 if is_owned {
-                    if exp_unix_ms > unix_now {
-                        let rem_ms = exp_unix_ms - unix_now;
+                    if exp_unix_ms > unix_now || crate::connection::access_expired_allowed() {
+                        // While an AOF replays nothing expires (its later
+                        // commands may still save the field).
                         db.table
                             .hash_field_expires
                             .entry(key.clone())
                             .or_default()
-                            .insert(field, Instant::now() + Duration::from_millis(rem_ms));
+                            .insert(field, unix_ms_to_instant(exp_unix_ms, unix_now));
                     } else {
                         expired_on_disk.push(field);
                     }
@@ -21254,5 +21272,37 @@ mod tests {
             let mut db = crate::shard::ShardDb::new(0);
             let _ = load_rdb_bytes(&file, &mut db, 0, 1);
         }
+    }
+
+    /// A hash field whose deadline passed but that was not purged yet is
+    /// saved with that deadline, so loading drops it; saved without one it
+    /// came back as a permanent field.
+    #[test]
+    fn test_snapshot_keeps_passed_hash_field_deadlines() {
+        let mut db = crate::shard::ShardDb::new(6385);
+        let mut out = Vec::new();
+        for line in ["HSET h f v g w", "HPEXPIRE h 50 FIELDS 1 f"] {
+            let mut buf = bytes::BytesMut::from(format!("{line}\r\n").as_str());
+            let cmd = crate::resp::parse_command(&mut buf).unwrap().unwrap();
+            crate::connection::execute_local_command(&cmd, &mut db, &mut out, None);
+        }
+        std::thread::sleep(Duration::from_millis(120));
+        let mut file = Vec::new();
+        crate::redis_rdb::write_file_header(&mut file, 0);
+        db.save_rdb_chunk(&mut file).unwrap();
+        file.push(crate::redis_rdb::OP_EOF);
+        let crc = crc64(&file);
+        file.extend_from_slice(&crc.to_le_bytes());
+        let mut loaded = crate::shard::ShardDb::new(6385);
+        load_rdb_bytes(&file, &mut loaded, 0, 1).unwrap();
+        assert_eq!(
+            loaded.table.hget(b"h", b"f").unwrap(),
+            None,
+            "expired field dropped"
+        );
+        assert_eq!(
+            loaded.table.hget(b"h", b"g").unwrap(),
+            Some(Bytes::from("w"))
+        );
     }
 }

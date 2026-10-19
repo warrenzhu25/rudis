@@ -31206,3 +31206,50 @@ fn test_mixed_writes_log_encoding_matches_replica_and_aof_e2e() {
     drop(master);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A hash field past its deadline but not purged yet when a snapshot is
+/// taken does not come back as a permanent field after a restart.
+#[test]
+fn test_expired_hash_field_stays_expired_across_rdb_restart_e2e() {
+    let port = 18047u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-hfesave-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--enable-debug-command",
+        "yes",
+    ];
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        send_and_read_reply(&mut c, b"DEBUG SET-ACTIVE-EXPIRE 0\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read_reply(&mut c, b"HSET h f v g w\r\n"), ":2\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut c, b"HPEXPIRE h 100 FIELDS 1 f\r\n"),
+        "*1\r\n:1\r\n"
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(send_and_read_reply(&mut c, b"SAVE\r\n"), "+OK\r\n");
+    drop(srv);
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        send_and_read_reply(&mut c, b"HGETALL h\r\n"),
+        "*2\r\n$1\r\ng\r\n$1\r\nw\r\n"
+    );
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

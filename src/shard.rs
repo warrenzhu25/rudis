@@ -3010,15 +3010,15 @@ impl ShardDb {
         buf: &mut Vec<u8>,
     ) {
         for (key, fmap) in hfe {
+            // Passed deadlines too: the field itself is saved until it is
+            // purged, and without its deadline it came back for good.
             let active: Vec<(&Bytes, u64)> = fmap
                 .iter()
-                .filter_map(|(f, &exp)| {
-                    if exp > clock.now {
-                        let rem_ms = exp.duration_since(clock.now).as_millis() as u64;
-                        Some((f, clock.unix_ms + rem_ms))
-                    } else {
-                        None
-                    }
+                .map(|(f, &exp)| {
+                    (
+                        f,
+                        crate::table::instant_to_unix_ms(exp, clock.now, clock.unix_ms),
+                    )
                 })
                 .collect();
             if !active.is_empty() {
