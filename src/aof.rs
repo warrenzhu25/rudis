@@ -227,26 +227,30 @@ impl AofWriter {
         self.note_appended(before);
     }
 
-    /// Appends `cmd` encoded as RESP (see [`command_to_resp`]) and returns
+    /// Appends `cmd` encoded as RESP (see [`encode_command`]) and returns
     /// where it starts in [`Self::buffer`], or `None` (appending nothing)
-    /// if it has no encoding. Plain SETs are encoded in place: no temporary
-    /// buffer, its regrowth or the copy out of it.
+    /// if it has no encoding. Encoded in place: no temporary buffer per
+    /// command, its regrowth or the copy out of it.
     #[inline]
     pub fn append_command(&mut self, cmd: &Command) -> Option<usize> {
-        let encoded = if is_plain_set(cmd) {
-            None
-        } else {
-            Some(command_to_resp(cmd)?)
-        };
         let db = crate::connection::CURRENT_DB.get();
-        let before = self.buffer.len();
+        let (before, prev_db) = (self.buffer.len(), self.current_db);
         if db != self.current_db {
             self.emit_select_db(db);
         }
         let start = self.buffer.len();
-        match encoded {
-            Some(bytes) => self.buffer.extend_from_slice(&bytes),
-            None => encode_plain_set(cmd, &mut self.buffer),
+        if let Command::Set {
+            expire_in: None,
+            keepttl: false,
+            ..
+        } = cmd
+        {
+            // The most common logged write: skip the generic encoder.
+            encode_plain_set(cmd, &mut self.buffer);
+        } else if !encode_command(cmd, &mut self.buffer) {
+            self.buffer.truncate(before);
+            self.current_db = prev_db;
+            return None;
         }
         self.note_appended(before);
         Some(start)
@@ -613,20 +617,7 @@ fn encode_hdel(buf: &mut Vec<u8>, key: &[u8], fields: &[bytes::Bytes]) {
     }
 }
 
-/// A SET without TTL or KEEPTTL: logged as `SET key value`.
-#[inline]
-fn is_plain_set(cmd: &Command) -> bool {
-    matches!(
-        cmd,
-        Command::Set {
-            expire_in: None,
-            keepttl: false,
-            ..
-        }
-    )
-}
-
-/// Appends `SET key value` for a plain SET ([`is_plain_set`]) to `buf`.
+/// Appends `SET key value` for a SET without TTL or KEEPTTL to `buf`.
 #[inline]
 fn encode_plain_set(cmd: &Command, buf: &mut Vec<u8>) {
     if let Command::Set { key, value, .. } = cmd {
@@ -640,9 +631,40 @@ fn encode_plain_set(cmd: &Command, buf: &mut Vec<u8>) {
 /// Appends `data` as a RESP bulk string, without `format!`.
 #[inline]
 fn push_bulk(buf: &mut Vec<u8>, data: &[u8]) {
+    push_len(buf, b"$", data.len());
+    buf.extend_from_slice(data);
+    buf.extend_from_slice(b"\r\n");
+}
+
+pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    encode_command(cmd, &mut buf).then_some(buf)
+}
+
+/// Appends `cmd` encoded as RESP (as [`command_to_resp`] returns it) to
+/// `buf`; returns false, appending nothing, if it has no encoding. Lets the
+/// AOF encode straight into its buffer, without a temporary one per command.
+pub fn encode_command(cmd: &Command, buf: &mut Vec<u8>) -> bool {
+    let start = buf.len();
+    match encode_command_inner(cmd, buf) {
+        Some(own) => {
+            buf.extend_from_slice(&own);
+            true
+        }
+        None => {
+            buf.truncate(start);
+            false
+        }
+    }
+}
+
+/// Appends `n` in decimal after `prefix`, then CRLF (RESP lengths), without
+/// `format!`.
+#[inline]
+fn push_len(buf: &mut Vec<u8>, prefix: &[u8], n: usize) {
     let mut digits = [0u8; 20];
     let mut i = digits.len();
-    let mut n = data.len();
+    let mut n = n;
     loop {
         i -= 1;
         digits[i] = b'0' + (n % 10) as u8;
@@ -651,15 +673,16 @@ fn push_bulk(buf: &mut Vec<u8>, data: &[u8]) {
             break;
         }
     }
-    buf.push(b'$');
+    buf.extend_from_slice(prefix);
     buf.extend_from_slice(&digits[i..]);
-    buf.extend_from_slice(b"\r\n");
-    buf.extend_from_slice(data);
     buf.extend_from_slice(b"\r\n");
 }
 
-pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
+/// Body of [`encode_command`]: either writes the encoding into `buf` and
+/// returns `Some` of an empty `Vec` (which does not allocate), or returns a
+/// separately built encoding for the caller to append, or `None`.
+fn encode_command_inner(cmd: &Command, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    use std::io::Write;
     match cmd {
         Command::Set {
             key,
@@ -669,9 +692,9 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             ..
         } => {
             if *keepttl {
-                buf.extend_from_slice(format!("*4\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
+                let _ = write!(buf, "*4\r\n$3\r\nSET\r\n${}\r\n", key.len());
                 buf.extend_from_slice(key);
-                buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
+                push_len(buf, b"\r\n$", value.len());
                 buf.extend_from_slice(value);
                 buf.extend_from_slice(b"\r\n$7\r\nKEEPTTL\r\n");
             } else if let Some(dur) = expire_in {
@@ -686,29 +709,27 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                     ms
                 };
                 let ms_str = abs_ms.to_string();
-                buf.extend_from_slice(format!("*5\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
+                let _ = write!(buf, "*5\r\n$3\r\nSET\r\n${}\r\n", key.len());
                 buf.extend_from_slice(key);
-                buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
+                push_len(buf, b"\r\n$", value.len());
                 buf.extend_from_slice(value);
-                buf.extend_from_slice(
-                    format!("\r\n$4\r\nPXAT\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                );
+                let _ = write!(buf, "\r\n$4\r\nPXAT\r\n${}\r\n{}\r\n", ms_str.len(), ms_str);
             } else {
-                encode_plain_set(cmd, &mut buf);
+                encode_plain_set(cmd, buf);
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Mset(pairs) => {
-            buf.extend_from_slice(format!("*{}\r\n$4\r\nMSET\r\n", 1 + pairs.len() * 2).as_bytes());
+            let _ = write!(buf, "*{}\r\n$4\r\nMSET\r\n", 1 + pairs.len() * 2);
             for (k, v) in pairs {
-                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                push_len(buf, b"$", k.len());
                 buf.extend_from_slice(k);
                 buf.extend_from_slice(b"\r\n");
-                buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                push_len(buf, b"$", v.len());
                 buf.extend_from_slice(v);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Msetex {
             pairs,
@@ -724,16 +745,14 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 crate::resp::MsetexExpiry::KeepTtl => num_args += 1,
                 crate::resp::MsetexExpiry::ExpireIn(_) => num_args += 2,
             }
-            buf.extend_from_slice(format!("*{}\r\n$6\r\nMSETEX\r\n", num_args).as_bytes());
+            let _ = write!(buf, "*{}\r\n$6\r\nMSETEX\r\n", num_args);
             let numkeys_str = pairs.len().to_string();
-            buf.extend_from_slice(
-                format!("${}\r\n{}\r\n", numkeys_str.len(), numkeys_str).as_bytes(),
-            );
+            let _ = write!(buf, "${}\r\n{}\r\n", numkeys_str.len(), numkeys_str);
             for (k, v) in pairs {
-                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                push_len(buf, b"$", k.len());
                 buf.extend_from_slice(k);
                 buf.extend_from_slice(b"\r\n");
-                buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                push_len(buf, b"$", v.len());
                 buf.extend_from_slice(v);
                 buf.extend_from_slice(b"\r\n");
             }
@@ -747,31 +766,29 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 crate::resp::MsetexExpiry::ExpireIn(d) => {
                     buf.extend_from_slice(b"$4\r\nPXAT\r\n");
                     let ms_str = unix_ms_after(*d).to_string();
-                    buf.extend_from_slice(
-                        format!("${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                    );
+                    let _ = write!(buf, "${}\r\n{}\r\n", ms_str.len(), ms_str);
                 }
                 crate::resp::MsetexExpiry::None => {}
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Del(keys) => {
-            buf.extend_from_slice(format!("*{}\r\n$3\r\nDEL\r\n", 1 + keys.len()).as_bytes());
+            let _ = write!(buf, "*{}\r\n$3\r\nDEL\r\n", 1 + keys.len());
             for k in keys {
-                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                push_len(buf, b"$", k.len());
                 buf.extend_from_slice(k);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Unlink(keys) => {
-            buf.extend_from_slice(format!("*{}\r\n$6\r\nUNLINK\r\n", 1 + keys.len()).as_bytes());
+            let _ = write!(buf, "*{}\r\n$6\r\nUNLINK\r\n", 1 + keys.len());
             for k in keys {
-                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                push_len(buf, b"$", k.len());
                 buf.extend_from_slice(k);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::IncrBy(key, delta, name) => {
             // Like Redis, the command as sent: INCR / DECR / INCRBY / DECRBY.
@@ -781,170 +798,176 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 crate::resp::IncrName::DecrBy if *delta != i64::MIN => ("DECRBY", Some(-*delta)),
                 _ => ("INCRBY", Some(*delta)),
             };
-            buf.extend_from_slice(
-                format!(
-                    "*{}\r\n${}\r\n{}\r\n${}\r\n",
-                    if arg.is_some() { 3 } else { 2 },
-                    verb.len(),
-                    verb,
-                    key.len()
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n${}\r\n{}\r\n${}\r\n",
+                if arg.is_some() { 3 } else { 2 },
+                verb.len(),
+                verb,
+                key.len()
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             if let Some(d) = arg {
                 let d_str = d.to_string();
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", d_str.len(), d_str).as_bytes());
+                let _ = write!(buf, "${}\r\n{}\r\n", d_str.len(), d_str);
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Expire { key, duration, .. } => {
             let ms_str = unix_ms_after(*duration).to_string();
-            buf.extend_from_slice(
-                format!("*3\r\n$9\r\nPEXPIREAT\r\n${}\r\n", key.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*3\r\n$9\r\nPEXPIREAT\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes());
-            Some(buf)
+            let _ = write!(buf, "\r\n${}\r\n{}\r\n", ms_str.len(), ms_str);
+            Some(Vec::new())
         }
         Command::Persist(key) => {
-            buf.extend_from_slice(format!("*2\r\n$7\r\nPERSIST\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*2\r\n$7\r\nPERSIST\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Hset { key, fields } | Command::Hmset { key, fields } => {
-            buf.extend_from_slice(
-                format!(
-                    "*{}\r\n$4\r\nHSET\r\n${}\r\n",
-                    2 + fields.len() * 2,
-                    key.len()
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$4\r\nHSET\r\n${}\r\n",
+                2 + fields.len() * 2,
+                key.len()
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             for (f, v) in fields {
-                buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                push_len(buf, b"$", f.len());
                 buf.extend_from_slice(f);
                 buf.extend_from_slice(b"\r\n");
-                buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                push_len(buf, b"$", v.len());
                 buf.extend_from_slice(v);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Hsetnx { key, field, value } => {
-            buf.extend_from_slice(format!("*4\r\n$6\r\nHSETNX\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*4\r\n$6\r\nHSETNX\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
-            buf.extend_from_slice(format!("${}\r\n", field.len()).as_bytes());
+            push_len(buf, b"$", field.len());
             buf.extend_from_slice(field);
             buf.extend_from_slice(b"\r\n");
-            buf.extend_from_slice(format!("${}\r\n", value.len()).as_bytes());
+            push_len(buf, b"$", value.len());
             buf.extend_from_slice(value);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Hdel { key, fields } => {
-            encode_hdel(&mut buf, key, fields);
-            Some(buf)
+            encode_hdel(buf, key, fields);
+            Some(Vec::new())
         }
         Command::Hgetdel { key, fields } => {
-            encode_hdel(&mut buf, key, fields);
-            Some(buf)
+            encode_hdel(buf, key, fields);
+            Some(Vec::new())
         }
         Command::Lpush { key, values } => {
-            buf.extend_from_slice(
-                format!("*{}\r\n$5\r\nLPUSH\r\n${}\r\n", 2 + values.len(), key.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$5\r\nLPUSH\r\n${}\r\n",
+                2 + values.len(),
+                key.len()
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             for v in values {
-                buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                push_len(buf, b"$", v.len());
                 buf.extend_from_slice(v);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Rpush { key, values } => {
-            buf.extend_from_slice(
-                format!("*{}\r\n$5\r\nRPUSH\r\n${}\r\n", 2 + values.len(), key.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$5\r\nRPUSH\r\n${}\r\n",
+                2 + values.len(),
+                key.len()
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             for v in values {
-                buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                push_len(buf, b"$", v.len());
                 buf.extend_from_slice(v);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Lpop { key, count } => {
             if let Some(c) = count {
                 let c_str = c.to_string();
-                buf.extend_from_slice(format!("*3\r\n$4\r\nLPOP\r\n${}\r\n", key.len()).as_bytes());
+                let _ = write!(buf, "*3\r\n$4\r\nLPOP\r\n${}\r\n", key.len());
                 buf.extend_from_slice(key);
-                buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", c_str.len(), c_str).as_bytes());
+                let _ = write!(buf, "\r\n${}\r\n{}\r\n", c_str.len(), c_str);
             } else {
-                buf.extend_from_slice(format!("*2\r\n$4\r\nLPOP\r\n${}\r\n", key.len()).as_bytes());
+                let _ = write!(buf, "*2\r\n$4\r\nLPOP\r\n${}\r\n", key.len());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Rpop { key, count } => {
             if let Some(c) = count {
                 let c_str = c.to_string();
-                buf.extend_from_slice(format!("*3\r\n$4\r\nRPOP\r\n${}\r\n", key.len()).as_bytes());
+                let _ = write!(buf, "*3\r\n$4\r\nRPOP\r\n${}\r\n", key.len());
                 buf.extend_from_slice(key);
-                buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", c_str.len(), c_str).as_bytes());
+                let _ = write!(buf, "\r\n${}\r\n{}\r\n", c_str.len(), c_str);
             } else {
-                buf.extend_from_slice(format!("*2\r\n$4\r\nRPOP\r\n${}\r\n", key.len()).as_bytes());
+                let _ = write!(buf, "*2\r\n$4\r\nRPOP\r\n${}\r\n", key.len());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Sadd { key, members } => {
-            buf.extend_from_slice(
-                format!("*{}\r\n$4\r\nSADD\r\n${}\r\n", 2 + members.len(), key.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$4\r\nSADD\r\n${}\r\n",
+                2 + members.len(),
+                key.len()
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             for m in members {
-                buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                push_len(buf, b"$", m.len());
                 buf.extend_from_slice(m);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Srem { key, members } => {
-            buf.extend_from_slice(
-                format!("*{}\r\n$4\r\nSREM\r\n${}\r\n", 2 + members.len(), key.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$4\r\nSREM\r\n${}\r\n",
+                2 + members.len(),
+                key.len()
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             for m in members {
-                buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                push_len(buf, b"$", m.len());
                 buf.extend_from_slice(m);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Spop { key, count } => {
             if let Some(c) = count {
                 let c_str = c.to_string();
-                buf.extend_from_slice(format!("*3\r\n$4\r\nSPOP\r\n${}\r\n", key.len()).as_bytes());
+                let _ = write!(buf, "*3\r\n$4\r\nSPOP\r\n${}\r\n", key.len());
                 buf.extend_from_slice(key);
-                buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", c_str.len(), c_str).as_bytes());
+                let _ = write!(buf, "\r\n${}\r\n{}\r\n", c_str.len(), c_str);
             } else {
-                buf.extend_from_slice(format!("*2\r\n$4\r\nSPOP\r\n${}\r\n", key.len()).as_bytes());
+                let _ = write!(buf, "*2\r\n$4\r\nSPOP\r\n${}\r\n", key.len());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Zadd {
             key,
@@ -970,9 +993,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             if flags.incr {
                 num_args += 1;
             }
-            buf.extend_from_slice(
-                format!("*{}\r\n$4\r\nZADD\r\n${}\r\n", num_args, key.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*{}\r\n$4\r\nZADD\r\n${}\r\n", num_args, key.len());
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             if flags.nx {
@@ -995,73 +1016,76 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             for (s, m) in elements {
                 let s_str = s.to_string();
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes());
-                buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                let _ = write!(buf, "${}\r\n{}\r\n", s_str.len(), s_str);
+                push_len(buf, b"$", m.len());
                 buf.extend_from_slice(m);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Zrem { key, members } => {
-            buf.extend_from_slice(
-                format!("*{}\r\n$4\r\nZREM\r\n${}\r\n", 2 + members.len(), key.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$4\r\nZREM\r\n${}\r\n",
+                2 + members.len(),
+                key.len()
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             for m in members {
-                buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                push_len(buf, b"$", m.len());
                 buf.extend_from_slice(m);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Zincrby { key, delta, member } => {
             let d_str = delta.to_string();
-            buf.extend_from_slice(format!("*4\r\n$7\r\nZINCRBY\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*4\r\n$7\r\nZINCRBY\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", d_str.len(), d_str).as_bytes());
-            buf.extend_from_slice(format!("${}\r\n", member.len()).as_bytes());
+            let _ = write!(buf, "\r\n${}\r\n{}\r\n", d_str.len(), d_str);
+            push_len(buf, b"$", member.len());
             buf.extend_from_slice(member);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Setnx { key, value } => {
-            buf.extend_from_slice(format!("*3\r\n$5\r\nSETNX\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*3\r\n$5\r\nSETNX\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
+            push_len(buf, b"\r\n$", value.len());
             buf.extend_from_slice(value);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Getset { key, value } => {
-            buf.extend_from_slice(format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*3\r\n$3\r\nSET\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
+            push_len(buf, b"\r\n$", value.len());
             buf.extend_from_slice(value);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Getdel(key) => {
-            buf.extend_from_slice(format!("*2\r\n$3\r\nDEL\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*2\r\n$3\r\nDEL\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Append { key, value } => {
-            buf.extend_from_slice(format!("*3\r\n$6\r\nAPPEND\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*3\r\n$6\r\nAPPEND\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
+            push_len(buf, b"\r\n$", value.len());
             buf.extend_from_slice(value);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Rename { key, newkey, .. } => {
-            buf.extend_from_slice(format!("*3\r\n$6\r\nRENAME\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*3\r\n$6\r\nRENAME\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", newkey.len()).as_bytes());
+            push_len(buf, b"\r\n$", newkey.len());
             buf.extend_from_slice(newkey);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Copy {
             source,
@@ -1076,73 +1100,72 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             if *replace {
                 count += 1;
             }
-            buf.extend_from_slice(
-                format!("*{}\r\n$4\r\nCOPY\r\n${}\r\n", count, source.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*{}\r\n$4\r\nCOPY\r\n${}\r\n", count, source.len());
             buf.extend_from_slice(source);
-            buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
+            push_len(buf, b"\r\n$", destination.len());
             buf.extend_from_slice(destination);
             if let Some(db_id) = destination_db {
-                buf.extend_from_slice(
-                    format!("\r\n$2\r\nDB\r\n${}\r\n{}", db_id.to_string().len(), db_id).as_bytes(),
+                let _ = write!(
+                    buf,
+                    "\r\n$2\r\nDB\r\n${}\r\n{}",
+                    db_id.to_string().len(),
+                    db_id
                 );
             }
             if *replace {
                 buf.extend_from_slice(b"\r\n$7\r\nREPLACE");
             }
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Flushdb => {
             buf.extend_from_slice(b"*1\r\n$7\r\nFLUSHDB\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Flushall => {
             buf.extend_from_slice(b"*1\r\n$8\r\nFLUSHALL\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Move { key, db } => {
             let s = db.to_string();
-            buf.extend_from_slice(format!("*3\r\n$4\r\nMOVE\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*3\r\n$4\r\nMOVE\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
-            Some(buf)
+            let _ = write!(buf, "\r\n${}\r\n{}\r\n", s.len(), s);
+            Some(Vec::new())
         }
         Command::Swapdb { db1, db2 } => {
             let s1 = db1.to_string();
             let s2 = db2.to_string();
-            buf.extend_from_slice(
-                format!(
-                    "*3\r\n$6\r\nSWAPDB\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    s1.len(),
-                    s1,
-                    s2.len(),
-                    s2
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "*3\r\n$6\r\nSWAPDB\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                s1.len(),
+                s1,
+                s2.len(),
+                s2
             );
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Msetnx(pairs) => {
-            buf.extend_from_slice(format!("*{}\r\n$4\r\nMSET\r\n", 1 + pairs.len() * 2).as_bytes());
+            let _ = write!(buf, "*{}\r\n$4\r\nMSET\r\n", 1 + pairs.len() * 2);
             for (k, v) in pairs {
-                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                push_len(buf, b"$", k.len());
                 buf.extend_from_slice(k);
                 buf.extend_from_slice(b"\r\n");
-                buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                push_len(buf, b"$", v.len());
                 buf.extend_from_slice(v);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Setbit { key, offset, value } => {
             let off_str = offset.to_string();
             let val_str = value.to_string();
-            buf.extend_from_slice(format!("*4\r\n$6\r\nSETBIT\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*4\r\n$6\r\nSETBIT\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", off_str.len(), off_str).as_bytes());
-            buf.extend_from_slice(format!("${}\r\n{}\r\n", val_str.len(), val_str).as_bytes());
-            Some(buf)
+            let _ = write!(buf, "\r\n${}\r\n{}\r\n", off_str.len(), off_str);
+            let _ = write!(buf, "${}\r\n{}\r\n", val_str.len(), val_str);
+            Some(Vec::new())
         }
         Command::Bitfield { key, ops, readonly } => {
             if *readonly {
@@ -1184,73 +1207,67 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                     }
                 }
             }
-            buf.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+            push_len(buf, b"*", parts.len());
             for p in parts {
-                buf.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+                push_len(buf, b"$", p.len());
                 buf.extend_from_slice(&p);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Bitop {
             op,
             destkey,
             srckeys,
         } => {
-            buf.extend_from_slice(
-                format!(
-                    "*{}\r\n$5\r\nBITOP\r\n${}\r\n{}\r\n${}\r\n",
-                    3 + srckeys.len(),
-                    op.len(),
-                    op,
-                    destkey.len()
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$5\r\nBITOP\r\n${}\r\n{}\r\n${}\r\n",
+                3 + srckeys.len(),
+                op.len(),
+                op,
+                destkey.len()
             );
             buf.extend_from_slice(destkey);
             buf.extend_from_slice(b"\r\n");
             for k in srckeys {
-                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                push_len(buf, b"$", k.len());
                 buf.extend_from_slice(k);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Pfadd { key, elements } => {
-            buf.extend_from_slice(
-                format!(
-                    "*{}\r\n$5\r\nPFADD\r\n${}\r\n",
-                    2 + elements.len(),
-                    key.len()
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$5\r\nPFADD\r\n${}\r\n",
+                2 + elements.len(),
+                key.len()
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             for e in elements {
-                buf.extend_from_slice(format!("${}\r\n", e.len()).as_bytes());
+                push_len(buf, b"$", e.len());
                 buf.extend_from_slice(e);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Pfmerge { destkey, srckeys } => {
-            buf.extend_from_slice(
-                format!(
-                    "*{}\r\n$7\r\nPFMERGE\r\n${}\r\n",
-                    2 + srckeys.len(),
-                    destkey.len()
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$7\r\nPFMERGE\r\n${}\r\n",
+                2 + srckeys.len(),
+                destkey.len()
             );
             buf.extend_from_slice(destkey);
             buf.extend_from_slice(b"\r\n");
             for k in srckeys {
-                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                push_len(buf, b"$", k.len());
                 buf.extend_from_slice(k);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Restore {
             key,
@@ -1268,18 +1285,14 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 num_args += 1;
             }
             let ttl_str = ttl_ms.to_string();
-            buf.extend_from_slice(
-                format!("*{}\r\n$7\r\nRESTORE\r\n${}\r\n", num_args, key.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*{}\r\n$7\r\nRESTORE\r\n${}\r\n", num_args, key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(
-                format!(
-                    "\r\n${}\r\n{}\r\n${}\r\n",
-                    ttl_str.len(),
-                    ttl_str,
-                    serialized.len()
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "\r\n${}\r\n{}\r\n${}\r\n",
+                ttl_str.len(),
+                ttl_str,
+                serialized.len()
             );
             buf.extend_from_slice(serialized);
             buf.extend_from_slice(b"\r\n");
@@ -1289,7 +1302,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             if *absttl {
                 buf.extend_from_slice(b"$6\r\nABSTTL\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         // XADD and XTRIM log their trim as given, which their handlers
         // first make exact (see `stream_exact_trim_args`), and XADD logs the
@@ -1326,16 +1339,19 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             Some(resp_argv(&args))
         }
         Command::Xdel { key, ids } => {
-            buf.extend_from_slice(
-                format!("*{}\r\n$4\r\nXDEL\r\n${}\r\n", 2 + ids.len(), key.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$4\r\nXDEL\r\n${}\r\n",
+                2 + ids.len(),
+                key.len()
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             for id in ids {
                 let s = id.to_string();
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                let _ = write!(buf, "${}\r\n{}\r\n", s.len(), s);
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Xidmprecord {
             key,
@@ -1343,18 +1359,16 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             iid,
             id_raw,
         } => {
-            buf.extend_from_slice(
-                format!("*5\r\n$11\r\nXIDMPRECORD\r\n${}\r\n", key.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*5\r\n$11\r\nXIDMPRECORD\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", pid.len()).as_bytes());
+            push_len(buf, b"\r\n$", pid.len());
             buf.extend_from_slice(pid);
-            buf.extend_from_slice(format!("\r\n${}\r\n", iid.len()).as_bytes());
+            push_len(buf, b"\r\n$", iid.len());
             buf.extend_from_slice(iid);
-            buf.extend_from_slice(format!("\r\n${}\r\n", id_raw.len()).as_bytes());
+            push_len(buf, b"\r\n$", id_raw.len());
             buf.extend_from_slice(id_raw);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Xtrim {
             key,
@@ -1418,37 +1432,37 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             if entries_read.is_some() {
                 num_args += 2;
             }
-            buf.extend_from_slice(
-                format!(
-                    "*{}\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n",
-                    num_args,
-                    key.len()
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n",
+                num_args,
+                key.len()
             );
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
+            push_len(buf, b"\r\n$", group.len());
             buf.extend_from_slice(group);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes());
+            let _ = write!(buf, "\r\n${}\r\n{}\r\n", id_str.len(), id_str);
             if *mkstream {
                 buf.extend_from_slice(b"$8\r\nMKSTREAM\r\n");
             }
             if let Some(er) = entries_read {
                 let er_str = er.to_string();
                 buf.extend_from_slice(b"$11\r\nENTRIESREAD\r\n");
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", er_str.len(), er_str).as_bytes());
+                let _ = write!(buf, "${}\r\n{}\r\n", er_str.len(), er_str);
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::XgroupDestroy { key, group } => {
-            buf.extend_from_slice(
-                format!("*4\r\n$6\r\nXGROUP\r\n$7\r\nDESTROY\r\n${}\r\n", key.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "*4\r\n$6\r\nXGROUP\r\n$7\r\nDESTROY\r\n${}\r\n",
+                key.len()
             );
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
+            push_len(buf, b"\r\n$", group.len());
             buf.extend_from_slice(group);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::XgroupSetId {
             key,
@@ -1460,39 +1474,43 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             if entries_read.is_some() {
                 num_args += 2;
             }
-            buf.extend_from_slice(
-                format!(
-                    "*{}\r\n$6\r\nXGROUP\r\n$5\r\nSETID\r\n${}\r\n",
-                    num_args,
-                    key.len()
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$6\r\nXGROUP\r\n$5\r\nSETID\r\n${}\r\n",
+                num_args,
+                key.len()
             );
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
+            push_len(buf, b"\r\n$", group.len());
             buf.extend_from_slice(group);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", id.len(), id).as_bytes());
+            let _ = write!(buf, "\r\n${}\r\n{}\r\n", id.len(), id);
             if let Some(er) = entries_read {
                 let er_str = er.to_string();
-                buf.extend_from_slice(
-                    format!("$11\r\nENTRIESREAD\r\n${}\r\n{}\r\n", er_str.len(), er_str).as_bytes(),
+                let _ = write!(
+                    buf,
+                    "$11\r\nENTRIESREAD\r\n${}\r\n{}\r\n",
+                    er_str.len(),
+                    er_str
                 );
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Xack { key, group, ids } => {
-            buf.extend_from_slice(
-                format!("*{}\r\n$4\r\nXACK\r\n${}\r\n", 3 + ids.len(), key.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "*{}\r\n$4\r\nXACK\r\n${}\r\n",
+                3 + ids.len(),
+                key.len()
             );
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
+            push_len(buf, b"\r\n$", group.len());
             buf.extend_from_slice(group);
             buf.extend_from_slice(b"\r\n");
             for id in ids {
                 let s = id.to_string();
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                let _ = write!(buf, "${}\r\n{}\r\n", s.len(), s);
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Xnack {
             key,
@@ -1509,11 +1527,9 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             if *force {
                 num_args += 1;
             }
-            buf.extend_from_slice(
-                format!("*{}\r\n$5\r\nXNACK\r\n${}\r\n", num_args, key.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*{}\r\n$5\r\nXNACK\r\n${}\r\n", num_args, key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
+            push_len(buf, b"\r\n$", group.len());
             buf.extend_from_slice(group);
             buf.extend_from_slice(b"\r\n");
             let mode_str = match mode {
@@ -1521,23 +1537,23 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 crate::resp::XnackMode::Fail => "FAIL",
                 crate::resp::XnackMode::Fatal => "FATAL",
             };
-            buf.extend_from_slice(format!("${}\r\n{}\r\n", mode_str.len(), mode_str).as_bytes());
+            let _ = write!(buf, "${}\r\n{}\r\n", mode_str.len(), mode_str);
             buf.extend_from_slice(b"$3\r\nIDS\r\n");
             let numids_s = ids.len().to_string();
-            buf.extend_from_slice(format!("${}\r\n{}\r\n", numids_s.len(), numids_s).as_bytes());
+            let _ = write!(buf, "${}\r\n{}\r\n", numids_s.len(), numids_s);
             for id in ids {
                 let id_s = id.to_string();
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", id_s.len(), id_s).as_bytes());
+                let _ = write!(buf, "${}\r\n{}\r\n", id_s.len(), id_s);
             }
             if let Some(rc) = retrycount {
                 let rc_s = rc.to_string();
                 buf.extend_from_slice(b"$10\r\nRETRYCOUNT\r\n");
-                buf.extend_from_slice(format!("${}\r\n{}\r\n", rc_s.len(), rc_s).as_bytes());
+                let _ = write!(buf, "${}\r\n{}\r\n", rc_s.len(), rc_s);
             }
             if *force {
                 buf.extend_from_slice(b"$5\r\nFORCE\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Hincrby {
             key,
@@ -1545,12 +1561,12 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             increment,
         } => {
             let s = increment.to_string();
-            buf.extend_from_slice(format!("*4\r\n$7\r\nHINCRBY\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*4\r\n$7\r\nHINCRBY\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", field.len()).as_bytes());
+            push_len(buf, b"\r\n$", field.len());
             buf.extend_from_slice(field);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
-            Some(buf)
+            let _ = write!(buf, "\r\n${}\r\n{}\r\n", s.len(), s);
+            Some(Vec::new())
         }
         Command::Hincrbyfloat {
             key,
@@ -1558,40 +1574,41 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             increment,
         } => {
             let s = increment.to_string();
-            buf.extend_from_slice(
-                format!("*4\r\n$12\r\nHINCRBYFLOAT\r\n${}\r\n", key.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*4\r\n$12\r\nHINCRBYFLOAT\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", field.len()).as_bytes());
+            push_len(buf, b"\r\n$", field.len());
             buf.extend_from_slice(field);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
-            Some(buf)
+            let _ = write!(buf, "\r\n${}\r\n{}\r\n", s.len(), s);
+            Some(Vec::new())
         }
         Command::Smove {
             source,
             destination,
             member,
         } => {
-            buf.extend_from_slice(format!("*4\r\n$5\r\nSMOVE\r\n${}\r\n", source.len()).as_bytes());
+            let _ = write!(buf, "*4\r\n$5\r\nSMOVE\r\n${}\r\n", source.len());
             buf.extend_from_slice(source);
-            buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
+            push_len(buf, b"\r\n$", destination.len());
             buf.extend_from_slice(destination);
-            buf.extend_from_slice(format!("\r\n${}\r\n", member.len()).as_bytes());
+            push_len(buf, b"\r\n$", member.len());
             buf.extend_from_slice(member);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Zremrangebyrank { key, start, stop } => {
             let st = start.to_string();
             let sp = stop.to_string();
-            buf.extend_from_slice(
-                format!("*4\r\n$16\r\nZREMRANGEBYRANK\r\n${}\r\n", key.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*4\r\n$16\r\nZREMRANGEBYRANK\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(
-                format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", st.len(), st, sp.len(), sp).as_bytes(),
+            let _ = write!(
+                buf,
+                "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                st.len(),
+                st,
+                sp.len(),
+                sp
             );
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Zremrangebyscore {
             key,
@@ -1610,21 +1627,17 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             } else {
                 format!("({}", max_score)
             };
-            buf.extend_from_slice(
-                format!("*4\r\n$17\r\nZREMRANGEBYSCORE\r\n${}\r\n", key.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*4\r\n$17\r\nZREMRANGEBYSCORE\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(
-                format!(
-                    "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    min_s.len(),
-                    min_s,
-                    max_s.len(),
-                    max_s
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                min_s.len(),
+                min_s,
+                max_s.len(),
+                max_s
             );
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Zremrangebylex { key, min, max } => {
             let min_s = match min {
@@ -1639,31 +1652,32 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 crate::table::LexBound::Inclusive(b) => format!("[{}", String::from_utf8_lossy(b)),
                 crate::table::LexBound::Exclusive(b) => format!("({}", String::from_utf8_lossy(b)),
             };
-            buf.extend_from_slice(
-                format!("*4\r\n$15\r\nZREMRANGEBYLEX\r\n${}\r\n", key.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*4\r\n$15\r\nZREMRANGEBYLEX\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(
-                format!(
-                    "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    min_s.len(),
-                    min_s,
-                    max_s.len(),
-                    max_s
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                min_s.len(),
+                min_s,
+                max_s.len(),
+                max_s
             );
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Ltrim { key, start, stop } => {
             let st = start.to_string();
             let sp = stop.to_string();
-            buf.extend_from_slice(format!("*4\r\n$5\r\nLTRIM\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*4\r\n$5\r\nLTRIM\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(
-                format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", st.len(), st, sp.len(), sp).as_bytes(),
+            let _ = write!(
+                buf,
+                "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                st.len(),
+                st,
+                sp.len(),
+                sp
             );
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Lset {
             key,
@@ -1671,20 +1685,18 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             element,
         } => {
             let idx_s = index.to_string();
-            buf.extend_from_slice(format!("*4\r\n$4\r\nLSET\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*4\r\n$4\r\nLSET\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(
-                format!(
-                    "\r\n${}\r\n{}\r\n${}\r\n",
-                    idx_s.len(),
-                    idx_s,
-                    element.len()
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "\r\n${}\r\n{}\r\n${}\r\n",
+                idx_s.len(),
+                idx_s,
+                element.len()
             );
             buf.extend_from_slice(element);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Lrem {
             key,
@@ -1692,20 +1704,18 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             element,
         } => {
             let cnt_s = count.to_string();
-            buf.extend_from_slice(format!("*4\r\n$4\r\nLREM\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*4\r\n$4\r\nLREM\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(
-                format!(
-                    "\r\n${}\r\n{}\r\n${}\r\n",
-                    cnt_s.len(),
-                    cnt_s,
-                    element.len()
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "\r\n${}\r\n{}\r\n${}\r\n",
+                cnt_s.len(),
+                cnt_s,
+                element.len()
             );
             buf.extend_from_slice(element);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Linsert {
             key,
@@ -1714,16 +1724,14 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             element,
         } => {
             let dir = if *before { "BEFORE" } else { "AFTER" };
-            buf.extend_from_slice(format!("*5\r\n$7\r\nLINSERT\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*5\r\n$7\r\nLINSERT\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(
-                format!("\r\n${}\r\n{}\r\n${}\r\n", dir.len(), dir, pivot.len()).as_bytes(),
-            );
+            let _ = write!(buf, "\r\n${}\r\n{}\r\n${}\r\n", dir.len(), dir, pivot.len());
             buf.extend_from_slice(pivot);
-            buf.extend_from_slice(format!("\r\n${}\r\n", element.len()).as_bytes());
+            push_len(buf, b"\r\n$", element.len());
             buf.extend_from_slice(element);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Lmove {
             source,
@@ -1733,14 +1741,12 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             is_rpoplpush,
         } => {
             if *is_rpoplpush {
-                buf.extend_from_slice(
-                    format!("*3\r\n$9\r\nRPOPLPUSH\r\n${}\r\n", source.len()).as_bytes(),
-                );
+                let _ = write!(buf, "*3\r\n$9\r\nRPOPLPUSH\r\n${}\r\n", source.len());
                 buf.extend_from_slice(source);
-                buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
+                push_len(buf, b"\r\n$", destination.len());
                 buf.extend_from_slice(destination);
                 buf.extend_from_slice(b"\r\n");
-                return Some(buf);
+                return Some(Vec::new());
             }
             let from_s = match where_from {
                 crate::table::ListDirection::Left => "LEFT",
@@ -1750,21 +1756,19 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 crate::table::ListDirection::Left => "LEFT",
                 crate::table::ListDirection::Right => "RIGHT",
             };
-            buf.extend_from_slice(format!("*5\r\n$5\r\nLMOVE\r\n${}\r\n", source.len()).as_bytes());
+            let _ = write!(buf, "*5\r\n$5\r\nLMOVE\r\n${}\r\n", source.len());
             buf.extend_from_slice(source);
-            buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
+            push_len(buf, b"\r\n$", destination.len());
             buf.extend_from_slice(destination);
-            buf.extend_from_slice(
-                format!(
-                    "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    from_s.len(),
-                    from_s,
-                    to_s.len(),
-                    to_s
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                from_s.len(),
+                from_s,
+                to_s.len(),
+                to_s
             );
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Lmovem {
             source,
@@ -1803,50 +1807,48 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 (from_s, to_s, mode_s, order_s)
             };
             let count_s = count.to_string();
-            buf.extend_from_slice(
-                format!("*8\r\n$6\r\nLMOVEM\r\n${}\r\n", source.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*8\r\n$6\r\nLMOVEM\r\n${}\r\n", source.len());
             buf.extend_from_slice(source);
-            buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
+            push_len(buf, b"\r\n$", destination.len());
             buf.extend_from_slice(destination);
-            buf.extend_from_slice(format!("\r\n${}\r\n", from_s.len(),).as_bytes());
+            push_len(buf, b"\r\n$", from_s.len());
             buf.extend_from_slice(from_s);
-            buf.extend_from_slice(format!("\r\n${}\r\n", to_s.len(),).as_bytes());
+            push_len(buf, b"\r\n$", to_s.len());
             buf.extend_from_slice(to_s);
-            buf.extend_from_slice(format!("\r\n${}\r\n", mode_s.len(),).as_bytes());
+            push_len(buf, b"\r\n$", mode_s.len());
             buf.extend_from_slice(mode_s);
-            buf.extend_from_slice(
-                format!(
-                    "\r\n${}\r\n{}\r\n${}\r\n",
-                    count_s.len(),
-                    count_s,
-                    order_s.len(),
-                )
-                .as_bytes(),
+            let _ = write!(
+                buf,
+                "\r\n${}\r\n{}\r\n${}\r\n",
+                count_s.len(),
+                count_s,
+                order_s.len()
             );
             buf.extend_from_slice(order_s);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Incrbyfloat { key, increment } => {
             let s = increment.to_string();
-            buf.extend_from_slice(
-                format!("*3\r\n$11\r\nINCRBYFLOAT\r\n${}\r\n", key.len()).as_bytes(),
-            );
+            let _ = write!(buf, "*3\r\n$11\r\nINCRBYFLOAT\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
-            Some(buf)
+            let _ = write!(buf, "\r\n${}\r\n{}\r\n", s.len(), s);
+            Some(Vec::new())
         }
         Command::Setrange { key, offset, value } => {
             let off_s = offset.to_string();
-            buf.extend_from_slice(format!("*4\r\n$8\r\nSETRANGE\r\n${}\r\n", key.len()).as_bytes());
+            let _ = write!(buf, "*4\r\n$8\r\nSETRANGE\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(
-                format!("\r\n${}\r\n{}\r\n${}\r\n", off_s.len(), off_s, value.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "\r\n${}\r\n{}\r\n${}\r\n",
+                off_s.len(),
+                off_s,
+                value.len()
             );
             buf.extend_from_slice(value);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Sort {
             key,
@@ -1880,13 +1882,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             args.push(b"STORE".to_vec());
             args.push(dest.to_vec());
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Hexpire {
             key,
@@ -1917,13 +1919,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             for f in fields {
                 args.push(f.as_ref());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Hpersist { key, fields } => {
             let numfields_s = fields.len().to_string();
@@ -1932,13 +1934,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             for f in fields {
                 args.push(f.as_ref());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Hgetex {
             key,
@@ -1976,13 +1978,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             for f in fields {
                 args.push(f.as_ref());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Hsetex {
             key,
@@ -2019,13 +2021,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 args.push(f.as_ref());
                 args.push(v.as_ref());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Xclaim {
             key,
@@ -2072,13 +2074,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 args.push(b"LASTID".to_vec());
                 args.push(l.to_string().into_bytes());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Xautoclaim {
             key,
@@ -2102,13 +2104,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             if *justid {
                 args.push(b"JUSTID".to_vec());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Zrangestore { dst, src, opts } => {
             let (start_s, stop_s) = if opts.by_score {
@@ -2149,13 +2151,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 args.push(opts.offset.to_string().into_bytes());
                 args.push(count.to_string().into_bytes());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         // JSON.* writes are logged as issued; replaying them in order
         // rebuilds the same document.
@@ -2407,35 +2409,35 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 args.push(b"TOKENS".to_vec());
                 args.push(t.to_string().into_bytes());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::SemanticDel { namespace, ids } => {
-            buf.extend_from_slice(
-                format!("*{}\r\n$12\r\nSEMANTIC.DEL\r\n", 2 + ids.len()).as_bytes(),
-            );
-            buf.extend_from_slice(format!("${}\r\n", namespace.len()).as_bytes());
+            let _ = write!(buf, "*{}\r\n$12\r\nSEMANTIC.DEL\r\n", 2 + ids.len());
+            push_len(buf, b"$", namespace.len());
             buf.extend_from_slice(namespace);
             buf.extend_from_slice(b"\r\n");
             for id in ids {
-                buf.extend_from_slice(format!("${}\r\n", id.len()).as_bytes());
+                push_len(buf, b"$", id.len());
                 buf.extend_from_slice(id);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::SemanticFlush(namespace) => {
-            buf.extend_from_slice(
-                format!("*2\r\n$14\r\nSEMANTIC.FLUSH\r\n${}\r\n", namespace.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "*2\r\n$14\r\nSEMANTIC.FLUSH\r\n${}\r\n",
+                namespace.len()
             );
             buf.extend_from_slice(namespace);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::AgentMemAdd {
             session,
@@ -2466,13 +2468,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 args.push(b"META".to_vec());
                 args.push(m.to_vec());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::AgentMemCompact {
             session,
@@ -2500,21 +2502,23 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                     args.push(f.to_string().into_bytes());
                 }
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::AgentMemClear(session) => {
-            buf.extend_from_slice(
-                format!("*2\r\n$15\r\nAGENT.MEM.CLEAR\r\n${}\r\n", session.len()).as_bytes(),
+            let _ = write!(
+                buf,
+                "*2\r\n$15\r\nAGENT.MEM.CLEAR\r\n${}\r\n",
+                session.len()
             );
             buf.extend_from_slice(session);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::AgentCheckpointPut {
             key,
@@ -2538,13 +2542,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 args.push(b"META".to_vec());
                 args.push(m.to_vec());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::AgentToolClaim {
             key,
@@ -2563,13 +2567,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 args.push(b"INPUT".to_vec());
                 args.push(inp.to_vec());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::AgentToolComplete {
             key,
@@ -2588,13 +2592,13 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 args.push(b"TTL".to_vec());
                 args.push(ttl.to_string().into_bytes());
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Vadd {
             key,
@@ -2667,33 +2671,33 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                     args.push(b"TIERED".to_vec());
                 }
             }
-            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            push_len(buf, b"*", args.len());
             for a in args {
-                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                push_len(buf, b"$", a.len());
                 buf.extend_from_slice(&a);
                 buf.extend_from_slice(b"\r\n");
             }
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Vdel { key, element } => {
             buf.extend_from_slice(b"*3\r\n$4\r\nVREM\r\n");
-            buf.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
+            push_len(buf, b"$", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", element.len()).as_bytes());
+            push_len(buf, b"\r\n$", element.len());
             buf.extend_from_slice(element);
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Vsetattr { key, element, attr } => {
             buf.extend_from_slice(b"*4\r\n$8\r\nVSETATTR\r\n");
-            buf.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
+            push_len(buf, b"$", key.len());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n", element.len()).as_bytes());
+            push_len(buf, b"\r\n$", element.len());
             buf.extend_from_slice(element);
-            buf.extend_from_slice(format!("\r\n${}\r\n", attr.len()).as_bytes());
+            push_len(buf, b"\r\n$", attr.len());
             buf.extend_from_slice(attr.as_bytes());
             buf.extend_from_slice(b"\r\n");
-            Some(buf)
+            Some(Vec::new())
         }
         Command::Lpushx { key, values } | Command::Rpushx { key, values } => {
             let name: &[u8] = if matches!(cmd, Command::Lpushx { .. }) {
@@ -4860,6 +4864,38 @@ mod tests {
         );
         let log = String::from_utf8_lossy(w.buffer());
         assert_eq!(log.matches("SELECT").count(), 2, "{log:.300}");
+    }
+
+    /// `encode_command` appends after what `buf` holds, exactly the bytes
+    /// `command_to_resp` returns, and leaves `buf` untouched for a command
+    /// without an encoding.
+    #[test]
+    fn test_encode_command_appends_in_place() {
+        let mut buf = b"prefix".to_vec();
+        for line in [
+            "HSET hash field value field2 value2",
+            "INCR counter",
+            "DECRBY counter 1234567",
+            "LPUSH list alpha beta",
+            "SADD set member",
+            "ZADD zset NX 1.5 alpha",
+            "DEL key1 key22",
+            "XADD stream 1-1 field value",
+        ] {
+            let cmd = parse_line(line);
+            let before = buf.len();
+            assert!(encode_command(&cmd, &mut buf), "{line}");
+            assert_eq!(
+                &buf[before..],
+                &command_to_resp(&cmd).unwrap()[..],
+                "{line}"
+            );
+            assert_eq!(parse_resp(&buf[before..]), parse_line(line), "{line}");
+        }
+        let len = buf.len();
+        assert!(!encode_command(&parse_line("GET key"), &mut buf));
+        assert_eq!(buf.len(), len);
+        assert!(buf.starts_with(b"prefix*6\r\n$4\r\nHSET\r\n"));
     }
 
     /// A key expiring on access is logged as DEL before the command that

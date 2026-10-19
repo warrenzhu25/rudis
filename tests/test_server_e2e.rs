@@ -31093,3 +31093,116 @@ fn test_set_log_encoding_round_trips_through_replica_and_aof_e2e() {
     drop(master);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Writes of many types logged through the in-place AOF encoder (binary
+/// keys, members and values) leave a replica and a restart from the AOF
+/// with the master's exact dataset (DEBUG DIGEST).
+#[test]
+fn test_mixed_writes_log_encoding_matches_replica_and_aof_e2e() {
+    fn resp(args: &[&[u8]]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+    let (mp, rp) = (18043u16, 18044u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-mixenc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let margs = [
+        "--port",
+        &mps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+        "--enable-debug-command",
+        "yes",
+    ];
+    let master = ServerGuard(spawn_rudis_listening(&margs, mp));
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+            "--enable-debug-command",
+            "yes",
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !send_and_read_reply(&mut r, b"INFO replication\r\n").contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let bin: &[u8] = b"b\r\n\0in";
+    for i in 0..50u32 {
+        let k = format!("k{i}");
+        let k = k.as_bytes();
+        let n = i.to_string();
+        let n = n.as_bytes();
+        for cmd in [
+            resp(&[b"HSET", k, b"f", bin, bin, n]),
+            resp(&[b"HINCRBY", k, b"cnt", n]),
+            resp(&[b"INCRBY", &[k, b"n"].concat(), n]),
+            resp(&[b"DECR", &[k, b"n"].concat()]),
+            resp(&[b"LPUSH", &[k, b"l"].concat(), bin, n]),
+            resp(&[b"RPUSH", &[k, b"l"].concat(), b""]),
+            resp(&[b"SADD", &[k, b"s"].concat(), bin, n]),
+            resp(&[b"ZADD", &[k, b"z"].concat(), n, bin, b"2.5", n]),
+            resp(&[b"APPEND", &[k, b"a"].concat(), bin]),
+            resp(&[b"SETRANGE", &[k, b"a"].concat(), b"2", n]),
+            resp(&[b"PEXPIRE", &[k, b"a"].concat(), b"100000"]),
+            resp(&[b"XADD", &[k, b"x"].concat(), b"*", b"f", bin]),
+            resp(&[b"SREM", &[k, b"s"].concat(), n]),
+            resp(&[b"LPOP", &[k, b"l"].concat()]),
+            resp(&[b"ZINCRBY", &[k, b"z"].concat(), b"1.25", bin]),
+            resp(&[b"HDEL", k, b"f"]),
+        ] {
+            let reply = send_and_read_reply(&mut m, &cmd);
+            assert!(!reply.starts_with('-'), "{reply}");
+        }
+    }
+    assert_eq!(send_and_read_reply(&mut m, b"WAIT 1 2000\r\n"), ":1\r\n");
+    let digest = send_and_read_reply(&mut m, b"DEBUG DIGEST\r\n");
+    assert!(
+        digest.len() > 10 && !digest.contains("0000000000000000000000000000000000000000"),
+        "{digest}"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut r, b"DEBUG DIGEST\r\n"),
+        digest,
+        "replica"
+    );
+    drop(replica);
+    drop(master);
+    let master = ServerGuard(spawn_rudis_listening(&margs, mp));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        send_and_read_reply(&mut m, b"DEBUG DIGEST\r\n"),
+        digest,
+        "restart from AOF"
+    );
+    drop(master);
+    let _ = std::fs::remove_dir_all(&dir);
+}
