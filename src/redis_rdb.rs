@@ -1931,6 +1931,11 @@ struct LoadCtx<'a> {
     load_functions: bool,
     now_ms: u64,
     count: usize,
+    /// Keep keys and hash fields whose deadline already passed, with that
+    /// deadline: an AOF's RDB preamble, where (as in Redis) nothing expires
+    /// during the load, so later commands in the AOF (a PERSIST...) still
+    /// find them.
+    keep_expired: bool,
 }
 
 impl LoadCtx<'_> {
@@ -1943,8 +1948,17 @@ impl LoadCtx<'_> {
 
     fn insert(&mut self, key: &[u8], decoded: Decoded, expire_ms: Option<i64>) {
         let now = Instant::now();
-        let expire_at = expire_ms
-            .map(|ms| now + Duration::from_millis((ms as u64).saturating_sub(self.now_ms)));
+        let now_ms = self.now_ms;
+        // A deadline already passed stays passed (not `now`, which the
+        // stored millisecond rounding can put just ahead).
+        let at = |ms: u64| match ms.checked_sub(now_ms) {
+            Some(ahead) => now + Duration::from_millis(ahead),
+            None => now
+                .checked_sub(Duration::from_millis(now_ms - ms))
+                .unwrap_or(now),
+        };
+        let expire_at = expire_ms.map(|ms| at(ms.max(0) as u64));
+        let at_field = at;
         self.db.table.insert_entry(crate::table::RudisEntry::new(
             crate::compact::CompactKey::new(key),
             decoded.value,
@@ -1954,10 +1968,7 @@ impl LoadCtx<'_> {
             let key = Bytes::copy_from_slice(key);
             let map = self.db.table.hash_field_expires.entry(key).or_default();
             for (f, at) in decoded.field_expires {
-                map.insert(
-                    f,
-                    now + Duration::from_millis(at.saturating_sub(self.now_ms)),
-                );
+                map.insert(f, at_field(at));
             }
         }
         self.count += 1;
@@ -2092,7 +2103,7 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
                     return corrupt("empty key name");
                 }
                 let exp = expire_ms.take();
-                let expired = exp.is_some_and(|ms| ms <= ctx.now_ms as i64);
+                let expired = !ctx.keep_expired && exp.is_some_and(|ms| ms <= ctx.now_ms as i64);
                 if expired && ctx.owns(&key) {
                     note_expired_on_load(&key);
                 }
@@ -2100,7 +2111,8 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
                     skip_value(t, r)?;
                     continue;
                 }
-                match decode_value(t, r, ctx.now_ms)? {
+                let decode_now = if ctx.keep_expired { 0 } else { ctx.now_ms };
+                match decode_value(t, r, decode_now)? {
                     Some(d) if !expired => {
                         ctx.insert(&key, d, exp);
                         if key_load_delay > 0 {
@@ -2155,6 +2167,7 @@ pub fn load_file(
         load_functions: shard_id == 0,
         now_ms: unix_ms_now(),
         count: 0,
+        keep_expired: false,
     };
     let res = load_records(&mut r, &mut ctx, false).map_err(|e| {
         RdbError::new(format!(
@@ -2184,6 +2197,7 @@ pub fn load_chunk(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResult<usiz
         load_functions: false,
         now_ms: unix_ms_now(),
         count: 0,
+        keep_expired: false,
     };
     let res = load_records(&mut r, &mut ctx, true);
     ctx.db.select_db(0);
@@ -2217,6 +2231,7 @@ pub fn load_rdb_preamble(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResu
         load_functions: true,
         now_ms: unix_ms_now(),
         count: 0,
+        keep_expired: true,
     };
     let res = load_records(&mut r, &mut ctx, false);
     ctx.db.select_db(0);

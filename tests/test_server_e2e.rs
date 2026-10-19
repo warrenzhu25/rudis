@@ -31253,3 +31253,71 @@ fn test_expired_hash_field_stays_expired_across_rdb_restart_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Function libraries survive BGREWRITEAOF and a restart from the AOF
+/// (the rewritten AOF is an RDB image that holds them); before, FUNCTION
+/// LIST came back empty and FCALL failed.
+#[test]
+fn test_functions_survive_aof_rewrite_and_restart_e2e() {
+    let port = 18045u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-fnrw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+    ];
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let code =
+        "#!lua name=rwlib\nredis.register_function('rwfn', function(keys, args) return 42 end)";
+    let load = format!(
+        "*3\r\n$8\r\nFUNCTION\r\n$4\r\nLOAD\r\n${}\r\n{}\r\n",
+        code.len(),
+        code
+    );
+    assert_eq!(
+        send_and_read_reply(&mut c, load.as_bytes()),
+        "$5\r\nrwlib\r\n"
+    );
+    for i in 0..20 {
+        let cmd = format!("SET key{i} v{i}\r\n");
+        assert_eq!(send_and_read_reply(&mut c, cmd.as_bytes()), "+OK\r\n");
+    }
+    assert!(send_and_read_reply(&mut c, b"BGREWRITEAOF\r\n").starts_with('+'));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while send_and_read_reply(&mut c, b"INFO persistence\r\n").contains("aof_rewrite_in_progress:1")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rewrite never finished"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        send_and_read_reply(&mut c, b"SET after rewrite\r\n"),
+        "+OK\r\n"
+    );
+    drop(srv);
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(send_and_read_reply(&mut c, b"FCALL rwfn 0\r\n"), ":42\r\n");
+    assert_eq!(send_and_read_reply(&mut c, b"DBSIZE\r\n"), ":21\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut c, b"GET after\r\n"),
+        "$7\r\nrewrite\r\n"
+    );
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

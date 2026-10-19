@@ -3080,7 +3080,16 @@ impl ShardDb {
             },
             _ => None,
         };
-        let val = hydrated.as_ref().unwrap_or(&entry.val);
+        Self::write_rdb_value(entry, hydrated.as_ref().unwrap_or(&entry.val), clock, buf);
+        Ok(())
+    }
+
+    fn write_rdb_value(
+        entry: &crate::table::RudisEntry,
+        val: &crate::table::RudisValue,
+        clock: &RdbClock,
+        buf: &mut Vec<u8>,
+    ) {
         let expire_unix_ms = entry
             .expire_at()
             .map(|exp| clock.unix_ms + exp.duration_since(clock.now).as_millis() as u64);
@@ -3096,7 +3105,6 @@ impl ShardDb {
             crate::redis_rdb::encode_stream_extras(&entry.key, s, &mut ext);
             crate::redis_rdb::write_ext_aux(buf, &ext);
         }
-        Ok(())
     }
 
     /// Reads a tiered record's value payload, already in
@@ -4706,6 +4714,11 @@ struct RdbSaveCursor {
     epoch: u64,
     seg: usize,
     written: WrittenPatterns,
+    /// The extended state and the other DBs were written up front (an AOF
+    /// rewrite image takes them at its start), not after DB 0.
+    extras_done: bool,
+    /// DB 0 keys already written out of order (see [`AofImage`]): skipped.
+    skip: std::collections::HashSet<bytes::Bytes>,
 }
 
 impl RdbSaveCursor {
@@ -4714,6 +4727,8 @@ impl RdbSaveCursor {
             epoch: db.table_for_db(0).map_or(0, |t| t.layout_epoch()),
             seg: 0,
             written: WrittenPatterns::default(),
+            extras_done: false,
+            skip: Default::default(),
         }
     }
 
@@ -4730,8 +4745,7 @@ impl RdbSaveCursor {
     ) -> Result<bool, TieredReadError> {
         let clock = RdbClock::now(db.port);
         let Some(t0) = db.table_for_db(0) else {
-            db.save_extended_rdb_chunk(buf);
-            db.save_other_dbs_rdb_chunk(&clock, buf)?;
+            self.write_extras(db, &clock, buf)?;
             return Ok(true);
         };
         if t0.layout_epoch() != self.epoch {
@@ -4739,12 +4753,11 @@ impl RdbSaveCursor {
             // small; write the keys no written segment covered.
             for entry in t0.entries() {
                 let bits = crate::table::key_dir_bits(&entry.key);
-                if !self.written.covers(u8::MAX, bits) {
+                if !self.written.covers(u8::MAX, bits) && !self.skip.contains(&entry.key[..]) {
                     db.save_rdb_entry(entry, &clock, buf)?;
                 }
             }
-            db.save_extended_rdb_chunk(buf);
-            db.save_other_dbs_rdb_chunk(&clock, buf)?;
+            self.write_extras(db, &clock, buf)?;
             return Ok(true);
         }
         let segments = t0.segment_count();
@@ -4756,18 +4769,103 @@ impl RdbSaveCursor {
             let pattern = t0.segment_pattern(self.seg);
             if let Some((depth, bits)) = pattern {
                 if !self.written.covers(depth, bits) {
-                    db.save_rdb_segment_db0(self.seg, &clock, buf)?;
+                    if self.skip.is_empty() {
+                        db.save_rdb_segment_db0(self.seg, &clock, buf)?;
+                    } else {
+                        for entry in t0.segment_entries(self.seg) {
+                            if !self.skip.contains(&entry.key[..]) {
+                                db.save_rdb_entry(entry, &clock, buf)?;
+                            }
+                        }
+                    }
                 }
                 self.written.insert(depth, bits);
             }
             self.seg += 1;
         }
         if self.seg >= segments {
-            db.save_extended_rdb_chunk(buf);
-            db.save_other_dbs_rdb_chunk(&clock, buf)?;
+            self.write_extras(db, &clock, buf)?;
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn write_extras(
+        &self,
+        db: &ShardDb,
+        clock: &RdbClock,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), TieredReadError> {
+        if !self.extras_done {
+            db.save_extended_rdb_chunk(buf);
+            db.save_other_dbs_rdb_chunk(clock, buf)?;
+        }
+        Ok(())
+    }
+}
+
+/// An RDB image of a shard, written a few DB 0 segments at a time: the
+/// base of a rewritten AOF (an RDB preamble, like Redis's
+/// `aof-use-rdb-preamble`). The function libraries, the extended state
+/// and DBs other than 0 are taken whole when it starts (the latter two
+/// written after DB 0).
+pub struct AofImage {
+    cursor: RdbSaveCursor,
+    buf: Vec<u8>,
+    /// The extended state and the other DBs as of the start, written after
+    /// DB 0 as a snapshot writes them: loading a hash after its field
+    /// deadlines (in the extended state) would drop them.
+    deferred: Vec<u8>,
+    db0_done: bool,
+}
+
+impl AofImage {
+    /// Starts an image of `db` as of now: the RDB header (with the function
+    /// libraries), the extended state and the other DBs.
+    pub fn start(db: &ShardDb) -> Result<Self, TieredReadError> {
+        let mut buf = Vec::with_capacity(RDB_FLUSH_BYTES * 2);
+        crate::redis_rdb::write_file_header(&mut buf, db.total_used_memory() as u64);
+        let clock = RdbClock::now(db.port);
+        let mut deferred = Vec::new();
+        db.save_extended_rdb_chunk(&mut deferred);
+        db.save_other_dbs_rdb_chunk(&clock, &mut deferred)?;
+        let mut cursor = RdbSaveCursor::new(db);
+        cursor.extras_done = true;
+        Ok(AofImage {
+            cursor,
+            buf,
+            deferred,
+            db0_done: false,
+        })
+    }
+
+    /// Writes more of DB 0 (at least one segment, then until `budget` has
+    /// passed or `flush_bytes` are buffered). Returns the bytes to write out
+    /// once that many are buffered, and whether DB 0 is complete.
+    pub fn step(
+        &mut self,
+        db: &ShardDb,
+        budget: Duration,
+        flush_bytes: usize,
+    ) -> Result<(Option<Vec<u8>>, bool), String> {
+        if !self.db0_done {
+            self.db0_done = self
+                .cursor
+                .step(db, &mut self.buf, budget, flush_bytes)
+                .map_err(|e| e.to_string())?;
+        }
+        let piece = (self.buf.len() >= flush_bytes)
+            .then(|| std::mem::replace(&mut self.buf, Vec::with_capacity(RDB_FLUSH_BYTES * 2)));
+        Ok((piece, self.db0_done))
+    }
+
+    /// The rest of the image once [`Self::step`] reported DB 0 complete:
+    /// what is still buffered, then `OP_EOF` (the writer adds the CRC64).
+    pub fn finish(mut self) -> Vec<u8> {
+        debug_assert!(self.db0_done);
+        self.buf.append(&mut self.deferred);
+        self.buf.push(crate::redis_rdb::OP_EOF);
+        self.buf
     }
 }
 

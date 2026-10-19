@@ -3133,8 +3133,12 @@ pub fn replay_aof_with(
         )
     };
     let (rdb_preamble_len, mut count) = if data.starts_with(b"REDIS") {
-        crate::redis_rdb::load_rdb_preamble(&data, db)
-            .map_err(|e| bad(0, &format!("invalid RDB preamble: {}", e)))?
+        let loaded = crate::redis_rdb::load_rdb_preamble(&data, db)
+            .map_err(|e| bad(0, &format!("invalid RDB preamble: {}", e)))?;
+        // Its keys bypassed the indexing hooks (as an RDB load's do): index
+        // them before the commands after it, which index as they apply.
+        db.rebuild_search_indices();
+        loaded
     } else {
         (0, 0)
     };
@@ -3875,7 +3879,7 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
 
     // 2. Rewrite to canonical per-key commands and split them by owner.
     std::fs::create_dir_all(&staging)?;
-    rewrite_shard_aof(&mut combined, &staging, 0)?;
+    rewrite_shard_aof_canonical(&mut combined, &staging, 0)?;
     // Replaying registered the indexes globally; the shards register them
     // again when they replay their new files.
     for name in combined.search_indices.keys() {
@@ -3937,7 +3941,7 @@ fn import_external_aof(
     })();
     replayed?;
     std::fs::create_dir_all(staging)?;
-    rewrite_shard_aof(&mut combined, staging, 0)?;
+    rewrite_shard_aof_canonical(&mut combined, staging, 0)?;
     // Replaying registered the indexes globally; the shards register them
     // again when they replay their new files.
     for name in combined.search_indices.keys() {
@@ -4009,8 +4013,107 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
     res
 }
 
-/// Writes `db` as an AOF to `tmp_path`, fsyncs it and renames it to `target_path`.
+/// Like [`rewrite_shard_aof`], but as canonical commands, which resharding
+/// can split by key owner.
+pub fn rewrite_shard_aof_canonical(
+    db: &mut ShardDb,
+    dir: &Path,
+    shard_id: usize,
+) -> std::io::Result<usize> {
+    static TMP_REWRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let tmp_id = TMP_REWRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = dir.join(format!(
+        "appendonly-{}.aof.tmp.{}_{}",
+        shard_id,
+        std::process::id(),
+        tmp_id
+    ));
+    let target_path = dir.join(format!("appendonly-{}.aof", shard_id));
+    let orig_db = db.current_db;
+    let res = write_canonical_aof(db, &tmp_path, &target_path);
+    if res.is_err() {
+        // Don't leave a partial rewrite behind; the live AOF is untouched.
+        let _ = std::fs::remove_file(&tmp_path);
+        // A failure mid-way can leave another DB selected.
+        db.select_db(orig_db);
+    }
+    res
+}
+
+/// Writes `db` as an AOF to `tmp_path`, fsyncs it and renames it to
+/// `target_path`. The AOF is an RDB image of the shard (an RDB preamble,
+/// like Redis's default `aof-use-rdb-preamble yes`): it holds everything
+/// a snapshot does, function libraries included. Returns the number of
+/// keys written.
 fn write_rewritten_aof(
+    db: &mut ShardDb,
+    tmp_path: &Path,
+    target_path: &Path,
+) -> std::io::Result<usize> {
+    let keys = db
+        .keyspace_stats_by_db()
+        .iter()
+        .map(|&(_, k, _, _)| k)
+        .sum();
+    let mut image =
+        crate::shard::AofImage::start(db).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut writer = ImageFileWriter::create(tmp_path)?;
+    loop {
+        let (piece, done) = image
+            .step(db, std::time::Duration::MAX, IMAGE_FLUSH_BYTES)
+            .map_err(std::io::Error::other)?;
+        if let Some(piece) = piece {
+            writer.write(&piece)?;
+        }
+        if done {
+            break;
+        }
+    }
+    writer.write(&image.finish())?;
+    drop(writer.finish()?);
+    std::fs::rename(tmp_path, target_path)?;
+    let _ = sync_parent_dir(target_path);
+    Ok(keys)
+}
+
+/// Bytes of an AOF rewrite image buffered before they are written out.
+const IMAGE_FLUSH_BYTES: usize = 4 << 20;
+
+/// Writes an RDB image to a file, computing the CRC64 the RDB format ends
+/// with as it goes.
+struct ImageFileWriter {
+    file: std::io::BufWriter<std::fs::File>,
+    crc: u64,
+}
+
+impl ImageFileWriter {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        Ok(ImageFileWriter {
+            file: std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?),
+            crc: 0,
+        })
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.crc = crate::table::crc64_update(self.crc, bytes);
+        self.file.write_all(bytes)
+    }
+
+    /// Appends the CRC64 and fsyncs; returns the file, positioned at its end.
+    fn finish(mut self) -> std::io::Result<std::fs::File> {
+        use std::io::Write;
+        self.file.write_all(&self.crc.to_le_bytes())?;
+        let file = self.file.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        Ok(file)
+    }
+}
+
+/// Writes `db` as canonical commands (one write per key or structure) to
+/// `tmp_path`, fsyncs it and renames it to `target_path`. Resharding splits
+/// such a file by key owner (see [`split_rewritten_aof_to_shards`]).
+fn write_canonical_aof(
     db: &mut ShardDb,
     tmp_path: &Path,
     target_path: &Path,
@@ -5174,14 +5277,100 @@ mod tests {
         replay_aof(&log, &mut replayed).unwrap();
         same_state(&replayed, &db);
 
+        // Both rewrite forms: the RDB image of a live rewrite, and the
+        // canonical commands of a reshard (one CRDT.MERGE per register,
+        // counter and set).
+        rewrite_shard_aof(&mut db, &dir, 0).unwrap();
+        let mut rewritten = ShardDb::new(6380);
+        replay_aof(&dir.join("appendonly-0.aof"), &mut rewritten).unwrap();
+        same_state(&rewritten, &db);
         let entries =
             db.crdt_store.registers.len() + db.crdt_store.counters.len() + db.crdt_store.sets.len();
-        let n = rewrite_shard_aof(&mut db, &dir, 0).unwrap();
+        let n = rewrite_shard_aof_canonical(&mut db, &dir, 0).unwrap();
         assert_eq!(n, entries, "one CRDT.MERGE per register, counter and set");
         let mut rewritten = ShardDb::new(6380);
         let applied = replay_aof(&dir.join("appendonly-0.aof"), &mut rewritten).unwrap();
         assert_eq!(applied, entries);
         same_state(&rewritten, &db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rewritten AOF is an RDB image (preamble) of the shard, and keeps
+    /// the function libraries, which the old command form dropped: after a
+    /// rewrite and a restart, FCALL failed with "Function not found".
+    #[test]
+    fn test_rewritten_aof_is_an_rdb_image_keeping_functions() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-img-fn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = "aofimgfnlib";
+        let code = format!(
+            "#!lua name={lib}\nredis.register_function('aofimgfn', function(keys, args) return 7 end)"
+        );
+        crate::scripting::load_function(&code, true).unwrap();
+        let mut db = ShardDb::new(6381);
+        db.set(Bytes::from("k"), Bytes::from("v"), None);
+        db.rpush(Bytes::from("l"), vec![Bytes::from("a"), Bytes::from("b")])
+            .unwrap();
+        assert_eq!(rewrite_shard_aof(&mut db, &dir, 0).unwrap(), 2);
+        let file = std::fs::read(dir.join("appendonly-0.aof")).unwrap();
+        assert!(file.starts_with(b"REDIS"), "an RDB preamble");
+        assert!(crate::scripting::delete_function(lib));
+        let mut restored = ShardDb::new(6381);
+        replay_aof(&dir.join("appendonly-0.aof"), &mut restored).unwrap();
+        assert!(
+            crate::scripting::list_functions()
+                .iter()
+                .any(|l| l.name == lib),
+            "function library restored"
+        );
+        assert_eq!(restored.get(b"k"), Some(Bytes::from("v")));
+        assert_eq!(restored.llen(b"l").unwrap(), 2);
+        crate::scripting::delete_function(lib);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing expires while an AOF's RDB preamble loads (as in Redis): a
+    /// key or hash field whose deadline passed is kept, with that deadline,
+    /// so a later PERSIST / HPERSIST in the AOF still finds it.
+    #[test]
+    fn test_rdb_preamble_keeps_passed_deadlines_for_later_commands() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-img-ttl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = ShardDb::new(6384);
+        let mut out = Vec::new();
+        for line in [
+            "SET k v PX 150",
+            "SET gone v PX 150",
+            "HSET h f v g w",
+            "HPEXPIRE h 150 FIELDS 2 f g",
+        ] {
+            crate::connection::execute_local_command(&parse_line(line), &mut db, &mut out, None);
+        }
+        rewrite_shard_aof(&mut db, &dir, 0).unwrap();
+        let path = dir.join("appendonly-0.aof");
+        let mut file = std::fs::read(&path).unwrap();
+        file.extend_from_slice(&resp_argv(&["PERSIST", "k"]));
+        file.extend_from_slice(&resp_argv(&["HPERSIST", "h", "FIELDS", "1", "f"]));
+        std::fs::write(&path, &file).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut restored = ShardDb::new(6384);
+        replay_aof(&path, &mut restored).unwrap();
+        let mut run = |line: &str| {
+            out.clear();
+            crate::connection::execute_local_command(
+                &parse_line(line),
+                &mut restored,
+                &mut out,
+                None,
+            );
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        assert_eq!(run("GET k"), "$1\r\nv\r\n");
+        assert_eq!(run("TTL k"), ":-1\r\n");
+        assert_eq!(run("GET gone"), "$-1\r\n");
+        assert_eq!(run("HGETALL h"), "*2\r\n$1\r\nf\r\n$1\r\nv\r\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
