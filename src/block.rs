@@ -450,6 +450,9 @@ impl BlockHub {
             return;
         }
         let db = crate::connection::CURRENT_DB.get();
+        // Serving pops `key` and may push to a move's destination: keep an
+        // AOF rewrite's image as of its start (see `shard::AofImage`).
+        crate::shard::before_write_table(table, db, key);
         let db_key = (db, key.clone());
         let mut dest_to_notify: Option<Bytes> = None;
         let mut satisfied_clients = Vec::new();
@@ -516,6 +519,7 @@ impl BlockHub {
                         ref destination,
                         is_rpoplpush,
                     } => {
+                        crate::shard::before_write_table(table, db, destination);
                         let dst_type = table.type_of(destination.as_ref());
                         if dst_type != "none" && dst_type != "list" {
                             let _ = waiter
@@ -576,6 +580,7 @@ impl BlockHub {
                         count,
                         ordering,
                     } => {
+                        crate::shard::before_write_table(table, db, destination);
                         let dst_type = table.type_of(destination.as_ref());
                         if dst_type != "none" && dst_type != "list" {
                             let _ = waiter
@@ -683,6 +688,7 @@ impl BlockHub {
             return;
         }
         let db = crate::connection::CURRENT_DB.get();
+        crate::shard::before_write_table(table, db, key);
         let db_key = (db, key.clone());
         let mut satisfied_clients = Vec::new();
         if let Some(waiters) = self.zset_waiters.get_mut(&db_key) {
@@ -765,6 +771,9 @@ impl BlockHub {
     pub fn notify_stream(&mut self, db: &mut crate::shard::ShardDb, key: &Bytes) {
         let cur_db = crate::connection::CURRENT_DB.get();
         let db_key = (cur_db, key.clone());
+        if self.stream_waiters.contains_key(&db_key) {
+            crate::shard::before_write(db, key);
+        }
         if let Some(waiters) = self.stream_waiters.get_mut(&db_key) {
             let aof = crate::connection::CURRENT_ROUTER
                 .with(|cr| cr.borrow().as_ref().and_then(|r| r.aof.clone()));

@@ -4698,16 +4698,14 @@ impl Router {
 
     async fn rewrite_all_shard_aofs(&self) -> Result<usize, String> {
         self.sync_aof().await;
-        let mut total_rewritten = {
-            let mut db = self.local_db.borrow_mut();
-            crate::aof::rewrite_and_swap_shard_aof(
-                &mut db,
-                &self.db_dir,
-                self.shard_id,
-                self.aof.as_ref(),
-            )
-            .map_err(|e| format!("shard {}: {}", self.shard_id, e))?
-        };
+        let mut total_rewritten = crate::aof::rewrite_shard_aof_live(
+            &self.local_db,
+            &self.db_dir,
+            self.shard_id,
+            self.aof.as_ref(),
+        )
+        .await
+        .map_err(|e| format!("shard {}: {}", self.shard_id, e))?;
 
         // Remote shards rewritten sequentially one-by-one to eliminate concurrent 15-shard I/O and memory spikes
         let mut errors = Vec::new();

@@ -2221,6 +2221,7 @@ impl ShardDb {
         if db1 == db2 {
             return;
         }
+        poison_aof_image("SWAPDB ran during the rewrite");
         let saved = self.current_db;
         self.select_db(0);
         let max_idx = db1.max(db2);
@@ -2424,6 +2425,7 @@ impl ShardDb {
             &std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>,
         )>,
     ) -> Result<(), String> {
+        poison_aof_image("a full resync replaced the dataset during the rewrite");
         self.select_db(0);
         self.flushall();
         // The file's index definitions replace ours (a FLUSHALL keeps them).
@@ -3082,6 +3084,22 @@ impl ShardDb {
         };
         Self::write_rdb_value(entry, hydrated.as_ref().unwrap_or(&entry.val), clock, buf);
         Ok(())
+    }
+
+    /// [`Self::save_rdb_entry`] for an entry whose value is in memory (not
+    /// [`crate::table::RudisValue::Tiered`]).
+    fn save_rdb_entry_untiered(
+        entry: &crate::table::RudisEntry,
+        clock: &RdbClock,
+        buf: &mut Vec<u8>,
+    ) {
+        if let Some(exp) = entry.expire_at()
+            && exp <= clock.now
+            && !clock.keep_expired
+        {
+            return;
+        }
+        Self::write_rdb_value(entry, &entry.val, clock, buf);
     }
 
     fn write_rdb_value(
@@ -4614,7 +4632,7 @@ impl RdbClock {
 }
 
 /// How long one step of [`save_rdb_chunk_yielding`] may hold the shard.
-const RDB_SAVE_STEP: std::time::Duration = std::time::Duration::from_millis(1);
+pub(crate) const RDB_SAVE_STEP: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// [`ShardDb::save_rdb_chunk`] for SAVE/BGSAVE: serializes a few table
 /// segments at a time and yields to the shard's other tasks in between, so
@@ -4804,11 +4822,18 @@ impl RdbSaveCursor {
     }
 }
 
-/// An RDB image of a shard, written a few DB 0 segments at a time: the
-/// base of a rewritten AOF (an RDB preamble, like Redis's
-/// `aof-use-rdb-preamble`). The function libraries, the extended state
-/// and DBs other than 0 are taken whole when it starts (the latter two
-/// written after DB 0).
+/// A point-in-time RDB image of a shard, built a few DB 0 segments at a
+/// time between commands: the base of an AOF rewrite (the AOF tail written
+/// since its start follows it), like the image Redis's forked child writes.
+///
+/// The extended state, the function libraries and DBs other than 0 are
+/// taken whole when it starts (the extended state and the other DBs are
+/// written after DB 0); DB 0 is walked segment by segment. To keep
+/// the image as of the start, the first write to a DB 0 key not written yet
+/// first writes that key's current, unchanged state ([`before_write`]), and
+/// the walk skips it later. Writes that are idempotent (SET, DEL,
+/// PEXPIREAT...) need no hook: the image then holds their result, which
+/// the AOF tail repeats harmlessly.
 pub struct AofImage {
     cursor: RdbSaveCursor,
     buf: Vec<u8>,
@@ -4817,6 +4842,10 @@ pub struct AofImage {
     /// deadlines (in the extended state) would drop them.
     deferred: Vec<u8>,
     db0_done: bool,
+    /// Why the image can no longer be trusted (e.g. SWAPDB, a tiered value
+    /// written outside a command): the rewrite then falls back to a
+    /// blocking pass.
+    poisoned: Option<String>,
 }
 
 impl AofImage {
@@ -4836,6 +4865,7 @@ impl AofImage {
             buf,
             deferred,
             db0_done: false,
+            poisoned: None,
         })
     }
 
@@ -4848,6 +4878,9 @@ impl AofImage {
         budget: Duration,
         flush_bytes: usize,
     ) -> Result<(Option<Vec<u8>>, bool), String> {
+        if let Some(why) = &self.poisoned {
+            return Err(why.clone());
+        }
         if !self.db0_done {
             self.db0_done = self
                 .cursor
@@ -4861,12 +4894,128 @@ impl AofImage {
 
     /// The rest of the image once [`Self::step`] reported DB 0 complete:
     /// what is still buffered, then `OP_EOF` (the writer adds the CRC64).
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(mut self) -> Result<Vec<u8>, String> {
+        if let Some(why) = self.poisoned {
+            return Err(why);
+        }
         debug_assert!(self.db0_done);
         self.buf.append(&mut self.deferred);
         self.buf.push(crate::redis_rdb::OP_EOF);
-        self.buf
+        Ok(self.buf)
     }
+
+    /// Before `key` (in DB 0) changes: writes its current state if the
+    /// image does not hold it yet, and makes the walk skip it.
+    fn cover_key(
+        &mut self,
+        table: &crate::table::RudisTable,
+        key: &[u8],
+        save: impl FnOnce(&crate::table::RudisEntry, &mut Vec<u8>) -> Result<(), TieredReadError>,
+    ) {
+        if self.db0_done || self.poisoned.is_some() || table.layout_epoch() != self.cursor.epoch {
+            // A renumbered table (FLUSHALL) is finished by the walk; the
+            // AOF tail holds the flush.
+            return;
+        }
+        if self
+            .cursor
+            .written
+            .covers(u8::MAX, crate::table::key_dir_bits(key))
+            || self.cursor.skip.contains(key)
+        {
+            return;
+        }
+        if let Some(entry) = table.peek_entry(key)
+            && let Err(e) = save(entry, &mut self.buf)
+        {
+            self.poisoned = Some(e.to_string());
+            return;
+        }
+        // Also when absent: a key created from now on is not in the image.
+        self.cursor.skip.insert(bytes::Bytes::copy_from_slice(key));
+    }
+}
+
+thread_local! {
+    /// The AOF rewrite image this shard thread is building, if any.
+    static AOF_IMAGE: std::cell::RefCell<Option<AofImage>> = const { std::cell::RefCell::new(None) };
+    static AOF_IMAGE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Installs `image` as this shard thread's live AOF rewrite image, which
+/// [`before_write`] keeps point-in-time.
+pub fn install_aof_image(image: AofImage) {
+    AOF_IMAGE.with(|i| *i.borrow_mut() = Some(image));
+    AOF_IMAGE_ACTIVE.set(true);
+}
+
+/// Removes this thread's live AOF rewrite image (when done or abandoned).
+pub fn take_aof_image() -> Option<AofImage> {
+    AOF_IMAGE_ACTIVE.set(false);
+    AOF_IMAGE.with(|i| i.borrow_mut().take())
+}
+
+/// Runs `f` on this thread's live AOF rewrite image.
+pub fn with_aof_image<R>(f: impl FnOnce(&mut AofImage) -> R) -> Option<R> {
+    AOF_IMAGE.with(|i| i.borrow_mut().as_mut().map(f))
+}
+
+/// Whether an AOF rewrite image is being built on this thread.
+#[inline(always)]
+pub fn aof_image_active() -> bool {
+    AOF_IMAGE_ACTIVE.get()
+}
+
+/// Makes the live AOF rewrite image (if any) unusable: the rewrite falls
+/// back to a blocking pass. For changes the image cannot follow (SWAPDB, a
+/// full resync replacing the dataset).
+pub fn poison_aof_image(why: &str) {
+    if aof_image_active() {
+        with_aof_image(|img| {
+            img.poisoned.get_or_insert_with(|| why.to_string());
+        });
+    }
+}
+
+/// Call before a command may change `key` in the current DB (see
+/// [`AofImage`]). A single flag test when no AOF rewrite is running.
+#[inline(always)]
+pub fn before_write(db: &ShardDb, key: &[u8]) {
+    if aof_image_active() && crate::connection::CURRENT_DB.get() == 0 {
+        before_write_slow(db, key);
+    }
+}
+
+#[cold]
+fn before_write_slow(db: &ShardDb, key: &[u8]) {
+    let Some(t0) = db.table_for_db(0) else {
+        return;
+    };
+    with_aof_image(|img| {
+        let clock = RdbClock::now(db.port);
+        img.cover_key(t0, key, |entry, buf| db.save_rdb_entry(entry, &clock, buf));
+    });
+}
+
+/// [`before_write`] where only DB `db_idx`'s table is at hand (serving a
+/// blocked client). A tiered value can't be read back from here: the image
+/// is poisoned instead.
+pub fn before_write_table(table: &crate::table::RudisTable, db_idx: usize, key: &[u8]) {
+    if !aof_image_active() || db_idx != 0 {
+        return;
+    }
+    with_aof_image(|img| {
+        let clock = RdbClock::now(0);
+        img.cover_key(table, key, |entry, buf| {
+            if matches!(entry.val, crate::table::RudisValue::Tiered(_)) {
+                return Err(TieredReadError {
+                    key: bytes::Bytes::copy_from_slice(&entry.key),
+                });
+            }
+            ShardDb::save_rdb_entry_untiered(entry, &clock, buf);
+            Ok(())
+        });
+    });
 }
 
 /// Piece size [`save_rdb_chunk_yielding`] streams to its sink.

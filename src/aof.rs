@@ -482,6 +482,32 @@ impl AofWriter {
         Ok(())
     }
 
+    /// Where an incremental rewrite starts: what is appended from now on
+    /// is the new AOF's tail ([`rewrite_shard_aof_live`]).
+    fn rewrite_mark(&self) -> RewriteMark {
+        RewriteMark {
+            file_pos: self.offset + self.buffer.len() as u64,
+            logical: self.appended_total,
+            db: self.current_db,
+        }
+    }
+
+    /// Points the writer at the new AOF `rewrite_shard_aof_live` just
+    /// renamed into place, `new_size` bytes long, holding everything
+    /// appended so far (its tail ends in the DB this writer last selected,
+    /// so that is kept). Synchronous, with nothing pending or in flight.
+    fn swap_after_live_rewrite(&mut self, new_size: u64) -> std::io::Result<()> {
+        debug_assert!(self.buffer.is_empty() && self.inflight == 0);
+        let std_file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
+        self.file = Some(std::rc::Rc::new(monoio::fs::File::from_std(std_file)?));
+        self.offset = new_size;
+        self.durable = new_size;
+        self.progress
+            .written
+            .store(self.appended_total, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// Points the writer at the freshly rewritten AOF at `self.path`.
     ///
     /// Must run synchronously right after the rewrite, with no `.await` in
@@ -524,6 +550,264 @@ pub fn rewrite_and_swap_shard_aof(
         aof.borrow_mut().swap_after_rewrite()?;
     }
     Ok(count)
+}
+
+/// Where an incremental rewrite started in the live AOF (see
+/// [`AofWriter::rewrite_mark`]).
+#[derive(Clone, Copy)]
+struct RewriteMark {
+    /// Offset in the old file of the first byte appended after the start.
+    file_pos: u64,
+    /// `appended_total` at the start.
+    logical: u64,
+    /// The DB the old file's tail starts in.
+    db: usize,
+}
+
+enum LiveRewriteError {
+    Io(std::io::Error),
+    /// The image could not stay point-in-time (see
+    /// [`crate::shard::poison_aof_image`]): rewrite in one blocking pass.
+    Fallback(String),
+}
+
+impl From<std::io::Error> for LiveRewriteError {
+    fn from(e: std::io::Error) -> Self {
+        LiveRewriteError::Io(e)
+    }
+}
+
+/// Live rewrites that fell back to a blocking pass.
+pub static LIVE_REWRITE_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes of the old AOF's tail copied per step while catching up.
+const TAIL_COPY_BYTES: u64 = 4 << 20;
+/// Tail left for the final, synchronous copy.
+const TAIL_SYNC_BYTES: u64 = 1 << 20;
+
+/// Rewrites shard `shard_id`'s AOF without blocking it: an RDB image of
+/// the shard as of the start ([`crate::shard::AofImage`]) is built a few
+/// segments at a time between commands and written by another thread;
+/// then what the live AOF received since the start is copied after it,
+/// the last bit (and the switch to the new file) in one synchronous step.
+/// A shard used to stop for the whole rewrite (~0.75 s per GB). Falls back
+/// to that blocking pass if the image cannot stay point-in-time.
+pub async fn rewrite_shard_aof_live(
+    db: &std::rc::Rc<std::cell::RefCell<ShardDb>>,
+    dir: &Path,
+    shard_id: usize,
+    aof: Option<&std::rc::Rc<std::cell::RefCell<AofWriter>>>,
+) -> std::io::Result<usize> {
+    let (tmp_path, target_path) = rewrite_paths(dir, shard_id);
+    let res = rewrite_live_inner(db, &tmp_path, &target_path, aof).await;
+    if res.is_err() {
+        crate::shard::take_aof_image();
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    match res {
+        Ok(n) => Ok(n),
+        Err(LiveRewriteError::Io(e)) => Err(e),
+        Err(LiveRewriteError::Fallback(why)) => {
+            LIVE_REWRITE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::log_warning!(
+                "[Shard {}] AOF rewrite: {}; rewriting in one blocking pass",
+                shard_id,
+                why
+            );
+            rewrite_and_swap_shard_aof(&mut db.borrow_mut(), dir, shard_id, aof)
+        }
+    }
+}
+
+fn rewrite_paths(dir: &Path, shard_id: usize) -> (std::path::PathBuf, std::path::PathBuf) {
+    static TMP_LIVE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let tmp_id = TMP_LIVE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (
+        dir.join(format!(
+            "appendonly-{}.aof.tmp.{}_live{}",
+            shard_id,
+            std::process::id(),
+            tmp_id
+        )),
+        dir.join(format!("appendonly-{}.aof", shard_id)),
+    )
+}
+
+async fn rewrite_live_inner(
+    db: &std::rc::Rc<std::cell::RefCell<ShardDb>>,
+    tmp_path: &Path,
+    target_path: &Path,
+    aof: Option<&std::rc::Rc<std::cell::RefCell<AofWriter>>>,
+) -> Result<usize, LiveRewriteError> {
+    // Start: the image and the AOF mark in one synchronous step, so the
+    // image is the state right before the first byte of the tail.
+    let (keys, mark) = {
+        let d = db.borrow();
+        let image =
+            crate::shard::AofImage::start(&d).map_err(|e| std::io::Error::other(e.to_string()))?;
+        crate::shard::install_aof_image(image);
+        let keys: usize = d.keyspace_stats_by_db().iter().map(|&(_, k, _, _)| k).sum();
+        (keys, aof.map(|w| w.borrow().rewrite_mark()))
+    };
+    let (tx, done_rx) = spawn_image_writer(tmp_path.to_path_buf())?;
+    let gone = || std::io::Error::other("AOF rewrite writer thread failed");
+    loop {
+        let step = crate::shard::with_aof_image(|img| {
+            img.step(&db.borrow(), crate::shard::RDB_SAVE_STEP, IMAGE_FLUSH_BYTES)
+        })
+        .expect("the AOF image stays installed during its rewrite");
+        let (piece, done) = step.map_err(LiveRewriteError::Fallback)?;
+        if let Some(piece) = piece {
+            tx.send_async(piece).await.map_err(|_| gone())?;
+        }
+        if done {
+            break;
+        }
+        let delay_us =
+            crate::connection::RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed);
+        if delay_us > 0 {
+            monoio::time::sleep(std::time::Duration::from_micros(delay_us.clamp(1, 50_000))).await;
+        }
+        crate::mailbox::yield_now().await;
+    }
+    let image = crate::shard::take_aof_image().expect("installed above");
+    let rest = image.finish().map_err(LiveRewriteError::Fallback)?;
+    tx.send_async(rest).await.map_err(|_| gone())?;
+    drop(tx);
+    let file = done_rx.recv_async().await.map_err(|_| gone())??;
+    match (aof, mark) {
+        (Some(aof), Some(mark)) => {
+            catch_up_and_swap(aof, file, mark, tmp_path, target_path).await?;
+        }
+        _ => {
+            drop(file);
+            std::fs::rename(tmp_path, target_path)?;
+            let _ = sync_parent_dir(target_path);
+        }
+    }
+    Ok(keys)
+}
+
+/// Writes an image's pieces (as they come) to `tmp`, then its CRC64, and
+/// fsyncs: the CRC and the disk writes stay off the shard thread. Hands the
+/// file back once the sender is dropped.
+fn spawn_image_writer(
+    tmp: std::path::PathBuf,
+) -> std::io::Result<(
+    flume::Sender<Vec<u8>>,
+    flume::Receiver<std::io::Result<std::fs::File>>,
+)> {
+    let (tx, rx) = flume::bounded::<Vec<u8>>(2);
+    let (done_tx, done_rx) = flume::bounded(1);
+    std::thread::Builder::new()
+        .name("aof-rewrite".into())
+        .spawn(move || {
+            let res = (|| {
+                let mut w = ImageFileWriter::create(&tmp)?;
+                for piece in rx.iter() {
+                    w.write(&piece)?;
+                }
+                w.finish()
+            })();
+            let _ = done_tx.send(res);
+        })?;
+    Ok((tx, done_rx))
+}
+
+/// The live AOF, opened for reading through the writer's own descriptor
+/// (it is write-only), so even a file unlinked or replaced under it reads
+/// what the writer wrote. Falls back to the path.
+fn open_for_reading(
+    aof: &std::rc::Rc<std::cell::RefCell<AofWriter>>,
+    path: &Path,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    if let Some(file) = aof.borrow().get_file()
+        && let Ok(f) = std::fs::File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    {
+        return Ok(f);
+    }
+    std::fs::File::open(path)
+}
+
+/// Appends to `file` (the new AOF, holding the image) what the live AOF
+/// received since `mark`, then renames it into place and switches the
+/// writer to it. All but the last `TAIL_SYNC_BYTES` are copied between
+/// commands; the rest, with the rename and the switch, in one synchronous
+/// step after the writer's pending bytes are written, so no write is lost
+/// or doubled.
+async fn catch_up_and_swap(
+    aof: &std::rc::Rc<std::cell::RefCell<AofWriter>>,
+    file: std::fs::File,
+    mark: RewriteMark,
+    tmp_path: &Path,
+    target_path: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let old = open_for_reading(aof, target_path)?;
+    let mut out_pos = file.metadata()?.len();
+    if mark.db != 0 {
+        let db = mark.db.to_string();
+        let select = format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{}\r\n", db.len(), db);
+        file.write_all_at(select.as_bytes(), out_pos)?;
+        out_pos += select.len() as u64;
+    }
+    let mut copied = mark.file_pos;
+    let mut chunk = vec![0u8; TAIL_COPY_BYTES as usize];
+    let mut copy =
+        |from: u64, to: u64, copied: &mut u64, out_pos: &mut u64| -> std::io::Result<()> {
+            let mut at = from;
+            while at < to {
+                let n = (to - at).min(TAIL_COPY_BYTES) as usize;
+                old.read_exact_at(&mut chunk[..n], at)?;
+                file.write_all_at(&chunk[..n], *out_pos)?;
+                at += n as u64;
+                *out_pos += n as u64;
+            }
+            *copied = to;
+            Ok(())
+        };
+    // Catch up between commands while the tail keeps growing.
+    loop {
+        let (written_end, appended_end) = {
+            let w = aof.borrow();
+            let written = w
+                .progress
+                .written
+                .load(std::sync::atomic::Ordering::Acquire);
+            (
+                mark.file_pos + written.saturating_sub(mark.logical),
+                mark.file_pos + w.appended_total.saturating_sub(mark.logical),
+            )
+        };
+        if appended_end.saturating_sub(copied) <= TAIL_SYNC_BYTES {
+            break;
+        }
+        if written_end > copied {
+            let to = written_end.min(copied + TAIL_COPY_BYTES);
+            copy(copied, to, &mut copied, &mut out_pos)?;
+            crate::mailbox::yield_now().await;
+        } else {
+            monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+    // The last bit and the switch, with no command in between.
+    loop {
+        {
+            let mut w = aof.borrow_mut();
+            if w.inflight == 0 {
+                w.write_pending_sync()?;
+                let end = w.offset;
+                copy(copied, end, &mut copied, &mut out_pos)?;
+                file.sync_data()?;
+                std::fs::rename(tmp_path, target_path)?;
+                let _ = sync_parent_dir(target_path);
+                return w.swap_after_live_rewrite(out_pos);
+            }
+        }
+        monoio::time::sleep(std::time::Duration::from_micros(20)).await;
+    }
 }
 
 static UNPROPAGATED_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4069,7 +4353,7 @@ fn write_rewritten_aof(
             break;
         }
     }
-    writer.write(&image.finish())?;
+    writer.write(&image.finish().map_err(std::io::Error::other)?)?;
     drop(writer.finish()?);
     std::fs::rename(tmp_path, target_path)?;
     let _ = sync_parent_dir(target_path);
@@ -5371,6 +5655,109 @@ mod tests {
         assert_eq!(run("TTL k"), ":-1\r\n");
         assert_eq!(run("GET gone"), "$-1\r\n");
         assert_eq!(run("HGETALL h"), "*2\r\n$1\r\nf\r\n$1\r\nv\r\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A live rewrite runs between writes (here: random INCR, LPUSH,
+    /// APPEND, RENAME, DEL, MOVE... in two DBs, many while its image is
+    /// being built), yet the new AOF replays to exactly the live dataset:
+    /// the image holds each key as of the start, and the tail everything
+    /// after. Without the before-write hook, a key changed before the walk
+    /// reached it was in the image with the change and in the tail again.
+    #[monoio::test(timer_enabled = true)]
+    async fn test_live_rewrite_replays_to_the_live_dataset() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        let dir = std::env::temp_dir().join(format!("rudis-aof-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Rc::new(RefCell::new(ShardDb::new(6383)));
+        let aof = Rc::new(RefCell::new(
+            AofWriter::open(dir.join("appendonly-0.aof")).await.unwrap(),
+        ));
+        let mut out = Vec::new();
+        let mut run = |dbi: usize, line: String| {
+            crate::connection::CURRENT_DB.set(dbi);
+            out.clear();
+            let cmd = parse_line(&line);
+            crate::connection::execute_local_command(
+                &cmd,
+                &mut db.borrow_mut(),
+                &mut out,
+                Some(&aof),
+            );
+        };
+        for i in 0..20_000 {
+            run(0, format!("SET s{i} v{i}"));
+            run(0, format!("INCR c{}", i % 3000));
+            run(0, format!("RPUSH l{} x{i}", i % 700));
+            if i % 10 == 0 {
+                run(1, format!("INCR d{}", i % 500));
+            }
+        }
+        AofWriter::write_through(&aof).await.unwrap();
+        let fallbacks = LIVE_REWRITE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
+        let done = Rc::new(Cell::new(false));
+        let task = {
+            let (db, aof, dir, done) = (db.clone(), aof.clone(), dir.clone(), done.clone());
+            monoio::spawn(async move {
+                let res = rewrite_shard_aof_live(&db, &dir, 0, Some(&aof)).await;
+                done.set(true);
+                res
+            })
+        };
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let mut during_image = 0;
+        while !done.get() {
+            for _ in 0..40 {
+                if crate::shard::aof_image_active() {
+                    during_image += 1;
+                }
+                let (a, b) = (next(20_000), next(20_000));
+                match next(9) {
+                    0 => run(0, format!("INCR c{}", next(3000))),
+                    1 => run(0, format!("LPUSH l{} y{a}", next(700))),
+                    2 => run(0, format!("APPEND s{a} z")),
+                    3 => run(0, format!("RENAME s{a} s{b}")),
+                    4 => run(0, format!("DEL s{a}")),
+                    5 => run(0, format!("SET n{a} {b}")),
+                    6 => run(0, format!("MOVE c{} 1", next(3000))),
+                    7 => run(1, format!("INCR d{}", next(500))),
+                    _ => run(0, format!("LPOP l{}", next(700))),
+                }
+            }
+            crate::mailbox::yield_now().await;
+        }
+        task.await.unwrap();
+        assert!(
+            during_image > 100,
+            "writes while the image was built: {during_image}"
+        );
+        assert_eq!(
+            LIVE_REWRITE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
+            fallbacks,
+            "no blocking fallback"
+        );
+        // Writes after the switch go to the new file.
+        run(0, "INCR after".to_string());
+        run(1, "SET after1 x".to_string());
+        AofWriter::write_through(&aof).await.unwrap();
+        crate::connection::CURRENT_DB.set(0);
+        let file = std::fs::read(dir.join("appendonly-0.aof")).unwrap();
+        assert!(file.starts_with(b"REDIS"));
+        let mut replayed = ShardDb::new(6383);
+        replay_aof(&dir.join("appendonly-0.aof"), &mut replayed).unwrap();
+        assert_eq!(
+            crate::digest::shard_digest(&replayed),
+            crate::digest::shard_digest(&db.borrow()),
+            "the rewritten AOF replays to the live dataset"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

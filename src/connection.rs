@@ -10202,6 +10202,25 @@ async fn execute_command(
     .1
 }
 
+/// While an AOF rewrite builds its image of this shard (see
+/// [`crate::shard::AofImage`]), keeps it as of the rewrite's start: the
+/// keys `cmd` may change (those `local` accepts) are written to it first.
+#[cold]
+fn aof_image_before_command(db: &ShardDb, cmd: &Command, local: impl Fn(&[u8]) -> bool) {
+    if !cmd.is_write_command() {
+        return;
+    }
+    if matches!(cmd, Command::Swapdb { .. }) {
+        crate::shard::poison_aof_image("SWAPDB ran during the rewrite");
+        return;
+    }
+    for_each_cmd_key(cmd, |k| {
+        if local(k) {
+            crate::shard::before_write(db, k);
+        }
+    });
+}
+
 /// MEMORY USAGE, sized on the shard that owns `key`: a GET from another
 /// shard only saw strings, so hashes, lists... there answered nil.
 async fn memory_usage_reply(router: &Router, key: Bytes) -> Vec<u8> {
@@ -10227,6 +10246,12 @@ async fn execute_command_inner(
         CURRENT_DB.set(client.db);
         initial_reply_mode = client.reply_mode;
         client_stats = Some(client.stats.clone());
+    }
+    if crate::shard::aof_image_active() {
+        // The router's fast paths change this shard's keys directly.
+        aof_image_before_command(&router.local_db.borrow(), &cmd, |k| {
+            router.target_shard(k) == router.shard_id
+        });
     }
     router.local_db.borrow_mut().select_db(CURRENT_DB.get());
     struct ExecutingClientGuard {
@@ -19186,6 +19211,9 @@ pub fn execute_local_command(
 ) -> bool {
     db.select_db(CURRENT_DB.get());
     db.hydrate_cmd_keys(cmd);
+    if crate::shard::aof_image_active() {
+        aof_image_before_command(db, cmd, |_| true);
+    }
     // The client this command runs for, 0 for internal work (replication,
     // expiry, eviction); the connection path and shard batches set it.
     let cid = CURRENT_CLIENT_ID.get();
@@ -28204,6 +28232,11 @@ pub fn record_replica_cmd_stats(cmd: &Command, elapsed_ns: u64) {
 }
 
 pub async fn execute_cross_shard_replica_command(router: &Router, cmd: Command) {
+    if crate::shard::aof_image_active() {
+        aof_image_before_command(&router.local_db.borrow(), &cmd, |k| {
+            router.target_shard(k) == router.shard_id
+        });
+    }
     let start = std::time::Instant::now();
     let name = get_cmd_name(&cmd);
     let out = match cmd {

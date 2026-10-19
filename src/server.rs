@@ -728,6 +728,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         crate::connection::CURRENT_DB.set(db);
                         let mut sdb = cross_shard_db.borrow_mut();
                         sdb.select_db(db);
+                        crate::shard::before_write(&sdb, &key);
                         let res = sdb.incr_by(key.clone(), delta);
                         if res.is_ok() {
                             crate::replication::log_shard_mutation(
@@ -1659,15 +1660,21 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         shard_id,
                         responder,
                     } => {
-                        let mut db = cross_shard_db.borrow_mut();
-                        let res = crate::aof::rewrite_and_swap_shard_aof(
-                            &mut db,
-                            &dir,
-                            shard_id,
-                            cross_shard_aof.as_ref(),
-                        )
-                        .map_err(|e| e.to_string());
-                        let _ = responder.send(res);
+                        // Built between this shard's other work (see
+                        // `aof::rewrite_shard_aof_live`).
+                        let db = cross_shard_db.clone();
+                        let aof = cross_shard_aof.clone();
+                        monoio::spawn(async move {
+                            let res = crate::aof::rewrite_shard_aof_live(
+                                &db,
+                                &dir,
+                                shard_id,
+                                aof.as_ref(),
+                            )
+                            .await
+                            .map_err(|e| e.to_string());
+                            let _ = responder.send(res);
+                        });
                     }
                     ShardMessage::SetSlotState { slot, state } => {
                         if state == crate::shard::SlotState::Stable {

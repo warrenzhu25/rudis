@@ -31321,3 +31321,108 @@ fn test_functions_survive_aof_rewrite_and_restart_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// BGREWRITEAOF no longer stops the shards: while it rewrites ~1M keys,
+/// PING keeps answering quickly, and writes of every kind (INCR, LPUSH,
+/// MULTI/EXEC, EVAL, a served BLMOVE, RENAME, another DB) keep going; the
+/// rewritten AOF then restarts into exactly the live dataset.
+#[test]
+fn test_bgrewriteaof_does_not_block_and_keeps_every_write_e2e() {
+    let port = 18046u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-liverw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--enable-debug-command",
+        "yes",
+    ];
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        c
+    };
+    let mut c = connect();
+    assert_eq!(
+        send_and_read_reply(&mut c, b"DEBUG POPULATE 1000000 key 64\r\n"),
+        "+OK\r\n"
+    );
+    for i in 0..200 {
+        let cmd = format!("RPUSH list{i} a b c\r\nSET cnt{i} 0\r\n");
+        send_and_read_reply(&mut c, cmd.as_bytes());
+    }
+    // A client blocked on BLMOVE, served by an LPUSH during the rewrite.
+    let mut blocked = connect();
+    blocked
+        .write_all(b"BLMOVE src dst LEFT RIGHT 0\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert!(send_and_read_reply(&mut c, b"BGREWRITEAOF\r\n").starts_with('+'));
+    let start = std::time::Instant::now();
+    let mut worst = Duration::ZERO;
+    let mut i = 0u64;
+    let mut ping = connect();
+    loop {
+        let t = std::time::Instant::now();
+        assert_eq!(send_and_read_reply(&mut ping, b"PING\r\n"), "+PONG\r\n");
+        worst = worst.max(t.elapsed());
+        let k = i % 200;
+        let cmds = format!(
+            "INCR cnt{k}\r\nLPUSH list{k} x{i}\r\nRENAME key:{i} renamed:{i}\r\nSELECT 1\r\nINCR db1:{k}\r\nSELECT 0\r\nMULTI\r\nINCR cnt{k}\r\nRPOP list{k}\r\nEXEC\r\nEVAL \"return redis.call('INCRBY', KEYS[1], 2)\" 1 cnt{k}\r\n"
+        );
+        for line in cmds.split_inclusive("\r\n") {
+            send_and_read_reply(&mut c, line.as_bytes());
+        }
+        if i == 50 {
+            assert_eq!(
+                send_and_read_reply(&mut c, b"LPUSH src moved\r\n"),
+                ":1\r\n"
+            );
+        }
+        i += 1;
+        if i.is_multiple_of(20)
+            && !send_and_read_reply(&mut c, b"INFO persistence\r\n")
+                .contains("aof_rewrite_in_progress:1")
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "rewrite never finished"
+        );
+    }
+    eprintln!("live rewrite: {i} write rounds, worst PING {worst:?}");
+    assert!(i > 50, "writes during the rewrite: {i}");
+    assert!(
+        worst < Duration::from_millis(500),
+        "PING took {worst:?} during the rewrite"
+    );
+    let mut reply = [0u8; 64];
+    let n = blocked.read(&mut reply).unwrap();
+    assert!(String::from_utf8_lossy(&reply[..n]).contains("moved"));
+    assert_eq!(send_and_read_reply(&mut c, b"INCR after\r\n"), ":1\r\n");
+    let digest = send_and_read_reply(&mut c, b"DEBUG DIGEST\r\n");
+    drop(srv);
+    let aof0 = std::fs::read(dir.join("appendonly-0.aof")).unwrap();
+    assert!(aof0.starts_with(b"REDIS"), "rewritten as an RDB image");
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = connect();
+    assert_eq!(
+        send_and_read_reply(&mut c, b"DEBUG DIGEST\r\n"),
+        digest,
+        "restart from AOF"
+    );
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
