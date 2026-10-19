@@ -576,28 +576,35 @@ fn pack7_heap_bmi2(s: &[u8]) -> Box<[u8]> {
 #[inline(always)]
 fn pack7_heap_with(s: &[u8], pack: impl Fn(u64) -> u64) -> Box<[u8]> {
     let plen = packed_len(s.len());
-    let mut out = vec![0u8; plen].into_boxed_slice();
-    let mut at = 0;
+    // Written once, not zeroed first (a memset per SET of a packed value).
+    let mut out: Vec<u8> = Vec::with_capacity(plen);
     let (groups, tail) = s.as_chunks::<8>();
-    for g in groups {
-        let p = pack(u64::from_le_bytes(*g)).to_le_bytes();
-        // Fixed-size stores: all 8 bytes while they fit (the 8th is
-        // overwritten by the next group), else the 7 that matter.
-        if at + 8 <= plen {
-            out[at..at + 8].copy_from_slice(&p);
-        } else {
-            out[at..at + 7].copy_from_slice(&p[..7]);
+    let dst = out.as_mut_ptr();
+    let mut at = 0;
+    // SAFETY: `out` has room for `plen` bytes. Each group's 7 packed bytes
+    // land at `at..at + 7` with `at + 7 <= plen`; an 8-byte store is used
+    // only while `at + 8 <= plen` (its 8th byte is overwritten by the next
+    // group or is the first tail byte, rewritten below). The tail fills
+    // `at..plen`. So all `plen` bytes are written before `set_len`.
+    unsafe {
+        for g in groups {
+            let p = pack(u64::from_le_bytes(*g)).to_le();
+            if at + 8 <= plen {
+                dst.add(at).cast::<u64>().write_unaligned(p);
+            } else {
+                std::ptr::copy_nonoverlapping(p.to_ne_bytes().as_ptr(), dst.add(at), 7);
+            }
+            at += 7;
         }
-        at += 7;
+        if !tail.is_empty() {
+            let mut w = [0u8; 8];
+            w[..tail.len()].copy_from_slice(tail);
+            let p = pack(u64::from_le_bytes(w)).to_le_bytes();
+            std::ptr::copy_nonoverlapping(p.as_ptr(), dst.add(at), plen - at);
+        }
+        out.set_len(plen);
     }
-    if !tail.is_empty() {
-        let mut w = [0u8; 8];
-        w[..tail.len()].copy_from_slice(tail);
-        let p = pack(u64::from_le_bytes(w)).to_le_bytes();
-        let n = plen - at;
-        out[at..].copy_from_slice(&p[..n]);
-    }
-    out
+    out.into_boxed_slice()
 }
 
 /// Appends the `len` bytes packed by [`pack7_heap`] to `out`.
@@ -1355,6 +1362,36 @@ mod tests {
             let packed = pack7(&s);
             assert_eq!(&packed[..], &v.to_le_bytes()[..STR_INLINE_SHORT_CAP]);
             assert_eq!(&unpack7(&packed)[..len], &s[..]);
+        }
+    }
+
+    /// The heap packer writes every byte of its (not zeroed) output: each
+    /// packed value equals a bit-by-bit reference, for every packable
+    /// length, with freed 0xff-filled memory around to expose a byte left
+    /// unwritten.
+    #[test]
+    fn test_pack7_heap_writes_every_byte() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for n in HEAP_PACK_MIN..=HEAP_PACK_MAX {
+            drop(vec![0xffu8; packed_len(n)].into_boxed_slice());
+            let s: Vec<u8> = (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed & 0x7f) as u8
+                })
+                .collect();
+            let mut want = vec![0u8; packed_len(n)];
+            for (i, &b) in s.iter().enumerate() {
+                for bit in 0..7 {
+                    if b >> bit & 1 == 1 {
+                        let at = 7 * i + bit;
+                        want[at / 8] |= 1 << (at % 8);
+                    }
+                }
+            }
+            assert_eq!(&pack7_heap(&s)[..], &want[..], "len {n}");
         }
     }
 

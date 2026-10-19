@@ -31605,3 +31605,37 @@ fn test_plain_set_counts_no_keyspace_hits_or_misses_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// ASCII values of every length the server stores 7-bit packed come back
+/// byte for byte (GET, GETRANGE, STRLEN).
+#[test]
+fn test_packed_string_values_of_every_length_round_trip_e2e() {
+    let port = 18051u16;
+    let ps = port.to_string();
+    let srv = ServerGuard(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "2", "--no-pin"],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for n in 20..=300usize {
+        let v: String = (0..n)
+            .map(|i| (b'!' + ((i * 7 + n) % 94) as u8) as char)
+            .collect();
+        let set = format!("*3\r\n$3\r\nSET\r\n$4\r\nk{n:03}\r\n${n}\r\n{v}\r\n");
+        assert_eq!(send_and_read_reply(&mut c, set.as_bytes()), "+OK\r\n");
+        let get = format!("GET k{n:03}\r\n");
+        assert_eq!(
+            send_and_read_reply(&mut c, get.as_bytes()),
+            format!("${n}\r\n{v}\r\n"),
+            "len {n}"
+        );
+        let tail = format!("GETRANGE k{n:03} -9 -1\r\n");
+        assert_eq!(
+            send_and_read_reply(&mut c, tail.as_bytes()),
+            format!("$9\r\n{}\r\n", &v[n - 9..]),
+            "len {n}"
+        );
+    }
+    drop(srv);
+}
