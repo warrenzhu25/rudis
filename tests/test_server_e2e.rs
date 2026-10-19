@@ -31463,3 +31463,102 @@ fn test_startup_removes_interrupted_rewrite_temp_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// BGREWRITEAOF does not block on DBs other than 0 or on probabilistic
+/// structures either (they were serialized in one step at its start): with
+/// 1M keys in DB 1, PING stays fast while writes to DB 1 (INCR, MOVE),
+/// CMS.INCRBY and CF.ADD keep going, and the restart matches.
+#[test]
+fn test_bgrewriteaof_does_not_block_on_other_dbs_e2e() {
+    let port = 18049u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-liverw-db1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--enable-debug-command",
+        "yes",
+    ];
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        c
+    };
+    let mut c = connect();
+    assert_eq!(send_and_read_reply(&mut c, b"SELECT 1\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut c, b"DEBUG POPULATE 1000000 k1 64\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read_reply(&mut c, b"SELECT 0\r\n"), "+OK\r\n");
+    for i in 0..100 {
+        let cmds =
+            format!("CMS.INITBYDIM cms{i} 1000 5\r\nCF.RESERVE cf{i} 10000\r\nSET cnt{i} 0\r\n");
+        for line in cmds.split_inclusive("\r\n") {
+            send_and_read_reply(&mut c, line.as_bytes());
+        }
+    }
+    assert!(send_and_read_reply(&mut c, b"BGREWRITEAOF\r\n").starts_with('+'));
+    let start = std::time::Instant::now();
+    let mut worst = Duration::ZERO;
+    let mut ping = connect();
+    let mut i = 0u64;
+    loop {
+        let t = std::time::Instant::now();
+        assert_eq!(send_and_read_reply(&mut ping, b"PING\r\n"), "+PONG\r\n");
+        worst = worst.max(t.elapsed());
+        let k = i % 100;
+        let cmds = format!(
+            "SELECT 1\r\nINCR k1:{i}\r\nSELECT 0\r\nMOVE cnt{k} 1\r\nSET cnt{k} {i}\r\nCMS.INCRBY cms{k} x 1\r\nCF.ADD cf{k} x{i}\r\n"
+        );
+        // Every command is timed: a client on the shard a blocking rewrite
+        // stops waits in whichever command it sent.
+        for line in cmds.split_inclusive("\r\n") {
+            let t = std::time::Instant::now();
+            send_and_read_reply(&mut c, line.as_bytes());
+            worst = worst.max(t.elapsed());
+        }
+        i += 1;
+        if i.is_multiple_of(20)
+            && !send_and_read_reply(&mut c, b"INFO persistence\r\n")
+                .contains("aof_rewrite_in_progress:1")
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "rewrite never finished"
+        );
+    }
+    eprintln!("live rewrite (DB 1): {i} write rounds, worst command {worst:?}");
+    assert!(i > 40, "writes during the rewrite: {i}");
+    assert!(
+        worst < Duration::from_millis(100),
+        "a command took {worst:?} during the rewrite"
+    );
+    let digest = send_and_read_reply(&mut c, b"DEBUG DIGEST\r\n");
+    let probe = b"CMS.QUERY cms7 x\r\n";
+    let cms = send_and_read_reply(&mut c, probe);
+    drop(srv);
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = connect();
+    assert_eq!(
+        send_and_read_reply(&mut c, b"DEBUG DIGEST\r\n"),
+        digest,
+        "restart from AOF"
+    );
+    assert_eq!(send_and_read_reply(&mut c, probe), cms);
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

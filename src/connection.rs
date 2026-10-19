@@ -10219,6 +10219,21 @@ fn aof_image_before_command(db: &ShardDb, cmd: &Command, local: impl Fn(&[u8]) -
             crate::shard::before_write(db, k);
         }
     });
+    // Writes to another DB than the current one.
+    let target = match cmd {
+        Command::Move { key, db: to } => Some((key, *to as usize)),
+        Command::Copy {
+            destination,
+            destination_db: Some(to),
+            ..
+        } => Some((destination, *to as usize)),
+        _ => None,
+    };
+    if let Some((key, to)) = target
+        && local(key)
+    {
+        crate::shard::before_write_in(db, to, key);
+    }
 }
 
 /// MEMORY USAGE, sized on the shard that owns `key`: a GET from another

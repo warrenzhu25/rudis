@@ -5712,10 +5712,16 @@ mod tests {
             run(0, format!("SET s{i} v{i}"));
             run(0, format!("INCR c{}", i % 3000));
             run(0, format!("RPUSH l{} x{i}", i % 700));
-            if i % 10 == 0 {
-                run(1, format!("INCR d{}", i % 500));
+            // DB 1 large enough to be walked a segment at a time.
+            run(1, format!("INCR d{}", i % 5000));
+            if i % 20 == 0 {
+                run(1, format!("HSET h{} f v g w", i % 300));
+                run(1, format!("HPEXPIRE h{} 3600000 FIELDS 1 g", i % 300));
+                run(0, format!("JSON.SET j{} $ '{{\"n\":{i}}}'", i % 400));
             }
         }
+        run(0, "CMS.INITBYDIM cms 100 4".to_string());
+        run(0, "CF.RESERVE cf 10000".to_string());
         AofWriter::write_through(&aof).await.unwrap();
         let fallbacks = LIVE_REWRITE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
         let done = Rc::new(Cell::new(false));
@@ -5741,7 +5747,7 @@ mod tests {
                     during_image += 1;
                 }
                 let (a, b) = (next(20_000), next(20_000));
-                match next(9) {
+                match next(14) {
                     0 => run(0, format!("INCR c{}", next(3000))),
                     1 => run(0, format!("LPUSH l{} y{a}", next(700))),
                     2 => run(0, format!("APPEND s{a} z")),
@@ -5749,7 +5755,12 @@ mod tests {
                     4 => run(0, format!("DEL s{a}")),
                     5 => run(0, format!("SET n{a} {b}")),
                     6 => run(0, format!("MOVE c{} 1", next(3000))),
-                    7 => run(1, format!("INCR d{}", next(500))),
+                    7 => run(1, format!("INCR d{}", next(5000))),
+                    8 => run(1, format!("HINCRBY h{} f2 1", next(300))),
+                    9 => run(0, format!("JSON.NUMINCRBY j{} $.n 1", next(400))),
+                    10 => run(0, format!("CMS.INCRBY cms i{} 1", next(50))),
+                    11 => run(0, format!("CF.ADD cf i{}", next(50))),
+                    12 => run(1, format!("RENAME d{} d{}", next(5000), next(5000))),
                     _ => run(0, format!("LPOP l{}", next(700))),
                 }
             }
@@ -5779,6 +5790,36 @@ mod tests {
             crate::digest::shard_digest(&db.borrow()),
             "the rewritten AOF replays to the live dataset"
         );
+        // The extended structures and DB 1's hash field deadlines too.
+        let live = db.borrow();
+        let items = live.ext_item_keys();
+        assert!(
+            items.iter().any(|(k, _)| *k == crate::shard::ExtKind::Cms)
+                && items
+                    .iter()
+                    .any(|(k, _)| *k == crate::shard::ExtKind::Cuckoo),
+            "{items:?}"
+        );
+        for (kind, key) in items {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            live.save_ext_item(kind, &key, &mut a);
+            replayed.save_ext_item(kind, &key, &mut b);
+            assert!(a == b, "{kind:?} {key:?} differs after replay");
+        }
+        let fields = |d: &ShardDb| {
+            let mut v: Vec<(Bytes, Bytes)> = d
+                .table_for_db(1)
+                .unwrap()
+                .hash_field_expires
+                .iter()
+                .flat_map(|(k, m)| m.keys().map(move |f| (k.clone(), f.clone())))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(fields(&replayed), fields(&live));
+        assert!(!fields(&live).is_empty());
+        drop(live);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

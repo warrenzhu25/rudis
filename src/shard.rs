@@ -3241,97 +3241,140 @@ impl ShardDb {
 
     /// The legacy-format records behind [`Self::save_extended_rdb_chunk`].
     fn save_extended_legacy_records(&self, buf: &mut Vec<u8>) {
-        // 1. JSON documents
-        for (key, val) in self.json_store.iter() {
+        // 1-6. JSON documents, Bloom filters, vector indexes, Cuckoo
+        // filters, Count-Min Sketches and Top-K trackers, one item each.
+        for (kind, key) in self.ext_item_keys() {
+            self.save_ext_item(kind, &key, buf);
+        }
+        self.save_extended_small_records(buf);
+    }
+
+    /// The extended structures written one at a time (JSON documents,
+    /// probabilistic structures, vector indexes): each with its key, in the
+    /// order [`Self::save_extended_legacy_records`] writes them.
+    pub(crate) fn ext_item_keys(&self) -> Vec<(ExtKind, Bytes)> {
+        let mut keys: Vec<(ExtKind, Bytes)> = Vec::new();
+        keys.extend(
+            self.json_store
+                .iter()
+                .map(|(k, _)| (ExtKind::Json, k.clone())),
+        );
+        let ps = &self.probabilistic_store;
+        keys.extend(ps.bloom_filters.keys().map(|k| (ExtKind::Bloom, k.clone())));
+        keys.extend(
+            self.vector_indexes
+                .keys()
+                .map(|n| (ExtKind::Vector, Bytes::copy_from_slice(n.as_bytes()))),
+        );
+        keys.extend(
+            ps.cuckoo_filters
+                .keys()
+                .map(|k| (ExtKind::Cuckoo, k.clone())),
+        );
+        keys.extend(ps.cms_sketches.keys().map(|k| (ExtKind::Cms, k.clone())));
+        keys.extend(ps.topk_trackers.keys().map(|k| (ExtKind::Topk, k.clone())));
+        keys
+    }
+
+    /// Writes the legacy record(s) of extended structure `key` of `kind`,
+    /// if it exists.
+    pub(crate) fn save_ext_item(&self, kind: ExtKind, key: &[u8], buf: &mut Vec<u8>) {
+        let ps = &self.probabilistic_store;
+        let mut put = |tag: u8, encode: &dyn Fn(&mut Vec<u8>)| {
             buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
             buf.extend_from_slice(key);
-            buf.push(7u8);
-            let json_str = val.to_string();
-            buf.extend_from_slice(&(json_str.len() as u32).to_le_bytes());
-            buf.extend_from_slice(json_str.as_bytes());
-        }
-
-        // 2. Bloom filters
-        for (key, bf) in &self.probabilistic_store.bloom_filters {
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key);
-            buf.push(8u8);
-            bf.encode(buf);
-        }
-
-        // 3. Vector indexes
-        for (name, index) in &self.vector_indexes {
-            for (key, &node_id) in &index.key_to_id {
-                if let Some(Some(node)) = index.nodes.get(node_id) {
-                    let full_key = format!("vec:{}:{}", name, String::from_utf8_lossy(key));
-                    buf.extend_from_slice(&(full_key.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(full_key.as_bytes());
-                    buf.push(9u8);
-                    buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(name.as_bytes());
-                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(key);
-                    buf.push((index.metric as u8) | 0x80);
-                    let full_v = index.node_vector_cow(node);
-                    buf.extend_from_slice(&(full_v.len() as u32).to_le_bytes());
-                    for &coord in full_v.iter() {
-                        buf.extend_from_slice(&coord.to_bits().to_le_bytes());
-                    }
-                    let mut vset_flags = 0u8;
-                    if index.is_redis_vset {
-                        vset_flags |= 0x01;
-                    }
-                    if node.quantized.is_some() {
-                        vset_flags |= 0x02;
-                    }
-                    if node.pq.is_some() {
-                        vset_flags |= 0x04;
-                    }
-                    if node.is_tiered {
-                        vset_flags |= 0x08;
-                    }
-                    buf.push(vset_flags);
-                    let quant_byte = match index.quant {
-                        crate::vector::VQuant::NoQuant => 0u8,
-                        crate::vector::VQuant::Q8 => 1u8,
-                        crate::vector::VQuant::Bin => 2u8,
-                    };
-                    buf.push(quant_byte);
-                    buf.extend_from_slice(&(index.m as u32).to_le_bytes());
-                    if let Some(attr) = index.attributes.get(key) {
-                        buf.extend_from_slice(&(attr.len() as u32).to_le_bytes());
-                        buf.extend_from_slice(attr.as_bytes());
-                    } else {
-                        buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.push(tag);
+            encode(buf);
+        };
+        match kind {
+            ExtKind::Json => {
+                if let Some(val) = self.json_store.get(key) {
+                    put(7, &|buf| {
+                        let json_str = val.to_string();
+                        buf.extend_from_slice(&(json_str.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(json_str.as_bytes());
+                    });
+                }
+            }
+            ExtKind::Bloom => {
+                if let Some(bf) = ps.bloom_filters.get(key) {
+                    put(8, &|buf| bf.encode(buf));
+                }
+            }
+            ExtKind::Cuckoo => {
+                if let Some(cf) = ps.cuckoo_filters.get(key) {
+                    put(10, &|buf| cf.encode(buf));
+                }
+            }
+            ExtKind::Cms => {
+                if let Some(cms) = ps.cms_sketches.get(key) {
+                    put(11, &|buf| cms.encode(buf));
+                }
+            }
+            ExtKind::Topk => {
+                if let Some(topk) = ps.topk_trackers.get(key) {
+                    put(12, &|buf| topk.encode(buf));
+                }
+            }
+            ExtKind::Vector => {
+                let Ok(name_str) = std::str::from_utf8(key) else {
+                    return;
+                };
+                if let Some((name, index)) = self.vector_indexes.get_key_value(name_str) {
+                    for (key, &node_id) in &index.key_to_id {
+                        if let Some(Some(node)) = index.nodes.get(node_id) {
+                            let full_key = format!("vec:{}:{}", name, String::from_utf8_lossy(key));
+                            buf.extend_from_slice(&(full_key.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(full_key.as_bytes());
+                            buf.push(9u8);
+                            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(name.as_bytes());
+                            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(key);
+                            buf.push((index.metric as u8) | 0x80);
+                            let full_v = index.node_vector_cow(node);
+                            buf.extend_from_slice(&(full_v.len() as u32).to_le_bytes());
+                            for &coord in full_v.iter() {
+                                buf.extend_from_slice(&coord.to_bits().to_le_bytes());
+                            }
+                            let mut vset_flags = 0u8;
+                            if index.is_redis_vset {
+                                vset_flags |= 0x01;
+                            }
+                            if node.quantized.is_some() {
+                                vset_flags |= 0x02;
+                            }
+                            if node.pq.is_some() {
+                                vset_flags |= 0x04;
+                            }
+                            if node.is_tiered {
+                                vset_flags |= 0x08;
+                            }
+                            buf.push(vset_flags);
+                            let quant_byte = match index.quant {
+                                crate::vector::VQuant::NoQuant => 0u8,
+                                crate::vector::VQuant::Q8 => 1u8,
+                                crate::vector::VQuant::Bin => 2u8,
+                            };
+                            buf.push(quant_byte);
+                            buf.extend_from_slice(&(index.m as u32).to_le_bytes());
+                            if let Some(attr) = index.attributes.get(key) {
+                                buf.extend_from_slice(&(attr.len() as u32).to_le_bytes());
+                                buf.extend_from_slice(attr.as_bytes());
+                            } else {
+                                buf.extend_from_slice(&0u32.to_le_bytes());
+                            }
+                        }
                     }
                 }
             }
         }
+    }
 
-        // 4. Cuckoo filters
-        for (key, cf) in &self.probabilistic_store.cuckoo_filters {
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key);
-            buf.push(10u8);
-            cf.encode(buf);
-        }
-
-        // 5. Count-Min Sketches
-        for (key, cms) in &self.probabilistic_store.cms_sketches {
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key);
-            buf.push(11u8);
-            cms.encode(buf);
-        }
-
-        // 6. Top-K trackers
-        for (key, topk) in &self.probabilistic_store.topk_trackers {
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key);
-            buf.push(12u8);
-            topk.encode(buf);
-        }
-
+    /// The extended state other than [`Self::ext_item_keys`]: CRDT state,
+    /// DB 0's hash field deadlines, semantic caches, agent state, search
+    /// index definitions, LLM quotas.
+    fn save_extended_small_records(&self, buf: &mut Vec<u8>) {
         // 7. CRDT sync state
         let crdt_payload = self.crdt_store.export_sync_payload();
         if !crdt_payload.is_empty() {
@@ -4732,11 +4775,6 @@ struct RdbSaveCursor {
     epoch: u64,
     seg: usize,
     written: WrittenPatterns,
-    /// The extended state and the other DBs were written up front (an AOF
-    /// rewrite image takes them at its start), not after DB 0.
-    extras_done: bool,
-    /// DB 0 keys already written out of order (see [`AofImage`]): skipped.
-    skip: std::collections::HashSet<bytes::Bytes>,
 }
 
 impl RdbSaveCursor {
@@ -4745,8 +4783,6 @@ impl RdbSaveCursor {
             epoch: db.table_for_db(0).map_or(0, |t| t.layout_epoch()),
             seg: 0,
             written: WrittenPatterns::default(),
-            extras_done: false,
-            skip: Default::default(),
         }
     }
 
@@ -4763,7 +4799,8 @@ impl RdbSaveCursor {
     ) -> Result<bool, TieredReadError> {
         let clock = RdbClock::now(db.port);
         let Some(t0) = db.table_for_db(0) else {
-            self.write_extras(db, &clock, buf)?;
+            db.save_extended_rdb_chunk(buf);
+            db.save_other_dbs_rdb_chunk(&clock, buf)?;
             return Ok(true);
         };
         if t0.layout_epoch() != self.epoch {
@@ -4771,11 +4808,12 @@ impl RdbSaveCursor {
             // small; write the keys no written segment covered.
             for entry in t0.entries() {
                 let bits = crate::table::key_dir_bits(&entry.key);
-                if !self.written.covers(u8::MAX, bits) && !self.skip.contains(&entry.key[..]) {
+                if !self.written.covers(u8::MAX, bits) {
                     db.save_rdb_entry(entry, &clock, buf)?;
                 }
             }
-            self.write_extras(db, &clock, buf)?;
+            db.save_extended_rdb_chunk(buf);
+            db.save_other_dbs_rdb_chunk(&clock, buf)?;
             return Ok(true);
         }
         let segments = t0.segment_count();
@@ -4787,91 +4825,149 @@ impl RdbSaveCursor {
             let pattern = t0.segment_pattern(self.seg);
             if let Some((depth, bits)) = pattern {
                 if !self.written.covers(depth, bits) {
-                    if self.skip.is_empty() {
-                        db.save_rdb_segment_db0(self.seg, &clock, buf)?;
-                    } else {
-                        for entry in t0.segment_entries(self.seg) {
-                            if !self.skip.contains(&entry.key[..]) {
-                                db.save_rdb_entry(entry, &clock, buf)?;
-                            }
-                        }
-                    }
+                    db.save_rdb_segment_db0(self.seg, &clock, buf)?;
                 }
                 self.written.insert(depth, bits);
             }
             self.seg += 1;
         }
         if self.seg >= segments {
-            self.write_extras(db, &clock, buf)?;
+            db.save_extended_rdb_chunk(buf);
+            db.save_other_dbs_rdb_chunk(&clock, buf)?;
             return Ok(true);
         }
         Ok(false)
     }
-
-    fn write_extras(
-        &self,
-        db: &ShardDb,
-        clock: &RdbClock,
-        buf: &mut Vec<u8>,
-    ) -> Result<(), TieredReadError> {
-        if !self.extras_done {
-            db.save_extended_rdb_chunk(buf);
-            db.save_other_dbs_rdb_chunk(clock, buf)?;
-        }
-        Ok(())
-    }
 }
 
-/// A point-in-time RDB image of a shard, built a few DB 0 segments at a
+/// An extended structure an AOF image writes on its own (see
+/// [`ShardDb::ext_item_keys`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ExtKind {
+    Json,
+    Bloom,
+    Vector,
+    Cuckoo,
+    Cms,
+    Topk,
+}
+
+/// A point-in-time RDB image of a shard, built a few table segments at a
 /// time between commands: the base of an AOF rewrite (the AOF tail written
 /// since its start follows it), like the image Redis's forked child writes.
 ///
-/// The extended state, the function libraries and DBs other than 0 are
-/// taken whole when it starts (the extended state and the other DBs are
-/// written after DB 0); DB 0 is walked segment by segment. To keep
-/// the image as of the start, the first write to a DB 0 key not written yet
-/// first writes that key's current, unchanged state ([`before_write`]), and
-/// the walk skips it later. Writes that are idempotent (SET, DEL,
-/// PEXPIREAT...) need no hook: the image then holds their result, which
-/// the AOF tail repeats harmlessly.
+/// Every DB is walked segment by segment, then the larger extended
+/// structures (JSON documents, probabilistic structures, vector indexes,
+/// [`ExtKind`]) one at a time; the function libraries and the rest of the
+/// extended state are taken when it starts. To keep the image as of the
+/// start, the first write to a key not written yet first writes the key's
+/// unchanged state ([`before_write`]), and the walk skips it later. Writes
+/// that are idempotent (SET, DEL, PEXPIREAT...) need no hook: the image
+/// then holds their result, which the AOF tail repeats harmlessly.
 pub struct AofImage {
-    cursor: RdbSaveCursor,
+    /// One walk per DB that had keys at the start, in DB order.
+    walks: Vec<DbWalk>,
+    /// The walk in progress.
+    cur: usize,
+    /// Extended structures not written yet, in order.
+    ext_pending: std::collections::VecDeque<(ExtKind, bytes::Bytes)>,
+    /// Their keys, for [`before_write`].
+    ext_keys: std::collections::HashSet<bytes::Bytes>,
+    /// Extended structures written early (by [`before_write`]).
+    ext_done: std::collections::HashSet<(ExtKind, bytes::Bytes)>,
     buf: Vec<u8>,
-    /// The extended state and the other DBs as of the start, written after
-    /// DB 0 as a snapshot writes them: loading a hash after its field
-    /// deadlines (in the extended state) would drop them.
-    deferred: Vec<u8>,
-    db0_done: bool,
+    /// The DB the last `SELECTDB` in the image selected.
+    selected_db: usize,
+    /// Hash field deadlines of DBs other than 0 (each after its
+    /// `SELECTDB`), then the rest of the extended state, as of the start:
+    /// written last, as a snapshot writes them (loading a hash after its
+    /// field deadlines would drop them).
+    deferred_dbs: Vec<u8>,
+    deferred_ext: Vec<u8>,
+    done: bool,
     /// Why the image can no longer be trusted (e.g. SWAPDB, a tiered value
     /// written outside a command): the rewrite then falls back to a
     /// blocking pass.
     poisoned: Option<String>,
 }
 
+/// An [`AofImage`]'s walk over one DB's table (see [`RdbSaveCursor`]).
+struct DbWalk {
+    db_idx: usize,
+    epoch: u64,
+    seg: usize,
+    written: WrittenPatterns,
+    /// Keys written out of order (by [`before_write`]): skipped.
+    skip: std::collections::HashSet<bytes::Bytes>,
+    done: bool,
+}
+
 impl AofImage {
     /// Starts an image of `db` as of now: the RDB header (with the function
-    /// libraries), the extended state and the other DBs.
+    /// libraries) and what is written last (see [`Self::finish`]).
     pub fn start(db: &ShardDb) -> Result<Self, TieredReadError> {
         let mut buf = Vec::with_capacity(RDB_FLUSH_BYTES * 2);
         crate::redis_rdb::write_file_header(&mut buf, db.total_used_memory() as u64);
         let clock = RdbClock::now(db.port);
-        let mut deferred = Vec::new();
-        db.save_extended_rdb_chunk(&mut deferred);
-        db.save_other_dbs_rdb_chunk(&clock, &mut deferred)?;
-        let mut cursor = RdbSaveCursor::new(db);
-        cursor.extras_done = true;
+        let mut walks = Vec::new();
+        let mut deferred_dbs = Vec::new();
+        for db_idx in 0..db.max_db_len() {
+            let Some(table) = db.table_for_db(db_idx) else {
+                continue;
+            };
+            if !table.is_empty() {
+                walks.push(DbWalk {
+                    db_idx,
+                    epoch: table.layout_epoch(),
+                    seg: 0,
+                    written: WrittenPatterns::default(),
+                    skip: Default::default(),
+                    done: false,
+                });
+            }
+            if db_idx != 0 && !table.hash_field_expires.is_empty() {
+                crate::redis_rdb::write_selectdb(&mut deferred_dbs, db_idx);
+                let mut records = Vec::new();
+                ShardDb::write_hash_field_expires_legacy(
+                    &table.hash_field_expires,
+                    &clock,
+                    &mut records,
+                );
+                crate::redis_rdb::write_ext_aux(&mut deferred_dbs, &records);
+            }
+        }
+        let mut records = Vec::new();
+        db.save_extended_small_records(&mut records);
+        let mut deferred_ext = Vec::new();
+        crate::redis_rdb::write_ext_aux(&mut deferred_ext, &records);
+        let ext_pending: std::collections::VecDeque<_> = db.ext_item_keys().into();
+        let ext_keys = ext_pending.iter().map(|(_, k)| k.clone()).collect();
         Ok(AofImage {
-            cursor,
+            walks,
+            cur: 0,
+            ext_pending,
+            ext_keys,
+            ext_done: Default::default(),
             buf,
-            deferred,
-            db0_done: false,
+            selected_db: 0,
+            deferred_dbs,
+            deferred_ext,
+            done: false,
             poisoned: None,
         })
     }
 
-    /// Writes more of DB 0 (at least one segment, then until `budget` has
-    /// passed or `flush_bytes` are buffered). Returns the bytes to write out
-    /// once that many are buffered, and whether DB 0 is complete.
+    fn select(&mut self, db_idx: usize) {
+        if self.selected_db != db_idx {
+            crate::redis_rdb::write_selectdb(&mut self.buf, db_idx);
+            self.selected_db = db_idx;
+        }
+    }
+
+    /// Writes more of the image (at least one segment or structure, then
+    /// until `budget` has passed or `flush_bytes` are buffered). Returns the
+    /// bytes to write out once that many are buffered, and whether all but
+    /// [`Self::finish`]'s part is written.
     pub fn step(
         &mut self,
         db: &ShardDb,
@@ -4881,58 +4977,145 @@ impl AofImage {
         if let Some(why) = &self.poisoned {
             return Err(why.clone());
         }
-        if !self.db0_done {
-            self.db0_done = self
-                .cursor
-                .step(db, &mut self.buf, budget, flush_bytes)
-                .map_err(|e| e.to_string())?;
+        let clock = RdbClock::now(db.port);
+        let mut first = true;
+        while !self.done
+            && (first || (clock.now.elapsed() < budget && self.buf.len() < flush_bytes))
+        {
+            first = false;
+            if self.cur < self.walks.len() {
+                self.step_walk(db, &clock).map_err(|e| e.to_string())?;
+            } else if let Some((kind, key)) = self.ext_pending.pop_front() {
+                if !self.ext_done.remove(&(kind, key.clone())) {
+                    let mut records = Vec::new();
+                    db.save_ext_item(kind, &key, &mut records);
+                    if !records.is_empty() {
+                        crate::redis_rdb::write_ext_aux(&mut self.buf, &records);
+                    }
+                }
+            } else {
+                self.done = true;
+            }
         }
         let piece = (self.buf.len() >= flush_bytes)
             .then(|| std::mem::replace(&mut self.buf, Vec::with_capacity(RDB_FLUSH_BYTES * 2)));
-        Ok((piece, self.db0_done))
+        Ok((piece, self.done))
     }
 
-    /// The rest of the image once [`Self::step`] reported DB 0 complete:
-    /// what is still buffered, then `OP_EOF` (the writer adds the CRC64).
+    /// Writes one segment of the current DB walk (or, if its table was
+    /// renumbered, all its keys not written yet).
+    fn step_walk(&mut self, db: &ShardDb, clock: &RdbClock) -> Result<(), TieredReadError> {
+        let w = &self.walks[self.cur];
+        let db_idx = w.db_idx;
+        let Some(table) = db.table_for_db(db_idx) else {
+            self.walks[self.cur].done = true;
+            self.cur += 1;
+            return Ok(());
+        };
+        self.select(db_idx);
+        let w = &mut self.walks[self.cur];
+        if table.layout_epoch() != w.epoch {
+            // Renumbered (FLUSHDB / FLUSHALL, collapsing defrag): what is
+            // left is small; write the keys no written segment covered.
+            for entry in table.entries() {
+                let bits = crate::table::key_dir_bits(&entry.key);
+                if !w.written.covers(u8::MAX, bits) && !w.skip.contains(&entry.key[..]) {
+                    db.save_rdb_entry(entry, clock, &mut self.buf)?;
+                }
+            }
+            w.done = true;
+        } else if w.seg < table.segment_count() {
+            if let Some((depth, bits)) = table.segment_pattern(w.seg) {
+                if !w.written.covers(depth, bits) {
+                    for entry in table.segment_entries(w.seg) {
+                        if !w.skip.contains(&entry.key[..]) {
+                            db.save_rdb_entry(entry, clock, &mut self.buf)?;
+                        }
+                    }
+                }
+                w.written.insert(depth, bits);
+            }
+            w.seg += 1;
+        } else {
+            w.done = true;
+        }
+        if w.done {
+            self.cur += 1;
+        }
+        Ok(())
+    }
+
+    /// The rest of the image once [`Self::step`] reported it done: what is
+    /// still buffered, the deferred part, then `OP_EOF` (the writer adds
+    /// the CRC64).
     pub fn finish(mut self) -> Result<Vec<u8>, String> {
         if let Some(why) = self.poisoned {
             return Err(why);
         }
-        debug_assert!(self.db0_done);
-        self.buf.append(&mut self.deferred);
+        debug_assert!(self.done);
+        if !self.deferred_dbs.is_empty() {
+            self.buf.append(&mut self.deferred_dbs);
+            self.selected_db = usize::MAX;
+        }
+        self.select(0);
+        self.buf.append(&mut self.deferred_ext);
         self.buf.push(crate::redis_rdb::OP_EOF);
         Ok(self.buf)
     }
 
-    /// Before `key` (in DB 0) changes: writes its current state if the
-    /// image does not hold it yet, and makes the walk skip it.
+    /// Before `key` in DB `db_idx` changes: writes its current state if
+    /// the image does not hold it yet, and makes the walk skip it.
     fn cover_key(
         &mut self,
+        db_idx: usize,
         table: &crate::table::RudisTable,
         key: &[u8],
         save: impl FnOnce(&crate::table::RudisEntry, &mut Vec<u8>) -> Result<(), TieredReadError>,
     ) {
-        if self.db0_done || self.poisoned.is_some() || table.layout_epoch() != self.cursor.epoch {
-            // A renumbered table (FLUSHALL) is finished by the walk; the
-            // AOF tail holds the flush.
+        if self.poisoned.is_some() {
             return;
         }
-        if self
-            .cursor
-            .written
-            .covers(u8::MAX, crate::table::key_dir_bits(key))
-            || self.cursor.skip.contains(key)
-        {
+        let Some(wi) = self.walks.iter().position(|w| w.db_idx == db_idx) else {
+            // The DB was empty at the start: its keys are all newer.
+            return;
+        };
+        let w = &self.walks[wi];
+        if w.done || table.layout_epoch() != w.epoch {
+            // A renumbered table (FLUSHDB) is finished by the walk; the AOF
+            // tail holds the flush.
             return;
         }
-        if let Some(entry) = table.peek_entry(key)
-            && let Err(e) = save(entry, &mut self.buf)
-        {
-            self.poisoned = Some(e.to_string());
+        if w.written.covers(u8::MAX, crate::table::key_dir_bits(key)) || w.skip.contains(key) {
             return;
+        }
+        if let Some(entry) = table.peek_entry(key) {
+            self.select(db_idx);
+            if let Err(e) = save(entry, &mut self.buf) {
+                self.poisoned = Some(e.to_string());
+                return;
+            }
         }
         // Also when absent: a key created from now on is not in the image.
-        self.cursor.skip.insert(bytes::Bytes::copy_from_slice(key));
+        self.walks[wi]
+            .skip
+            .insert(bytes::Bytes::copy_from_slice(key));
+    }
+
+    /// Before extended structures named `key` change: writes those not
+    /// written yet.
+    fn cover_ext(&mut self, db: &ShardDb, key: &[u8]) {
+        if !self.ext_keys.remove(key) {
+            return;
+        }
+        let mut records = Vec::new();
+        for (kind, k) in &self.ext_pending {
+            if k.as_ref() == key && self.ext_done.insert((*kind, k.clone())) {
+                db.save_ext_item(*kind, key, &mut records);
+            }
+        }
+        if !records.is_empty() {
+            crate::redis_rdb::write_ext_aux(&mut self.buf, &records);
+        }
     }
 }
 
@@ -4981,19 +5164,30 @@ pub fn poison_aof_image(why: &str) {
 /// [`AofImage`]). A single flag test when no AOF rewrite is running.
 #[inline(always)]
 pub fn before_write(db: &ShardDb, key: &[u8]) {
-    if aof_image_active() && crate::connection::CURRENT_DB.get() == 0 {
+    if aof_image_active() {
         before_write_slow(db, key);
     }
 }
 
 #[cold]
 fn before_write_slow(db: &ShardDb, key: &[u8]) {
-    let Some(t0) = db.table_for_db(0) else {
+    before_write_in(db, crate::connection::CURRENT_DB.get(), key);
+}
+
+/// [`before_write`] for `key` in DB `db_idx` (MOVE and COPY ... DB write
+/// to another DB than the current one).
+pub fn before_write_in(db: &ShardDb, db_idx: usize, key: &[u8]) {
+    if !aof_image_active() {
         return;
-    };
+    }
     with_aof_image(|img| {
-        let clock = RdbClock::now(db.port);
-        img.cover_key(t0, key, |entry, buf| db.save_rdb_entry(entry, &clock, buf));
+        if let Some(table) = db.table_for_db(db_idx) {
+            let clock = RdbClock::now(db.port);
+            img.cover_key(db_idx, table, key, |entry, buf| {
+                db.save_rdb_entry(entry, &clock, buf)
+            });
+        }
+        img.cover_ext(db, key);
     });
 }
 
@@ -5001,12 +5195,12 @@ fn before_write_slow(db: &ShardDb, key: &[u8]) {
 /// blocked client). A tiered value can't be read back from here: the image
 /// is poisoned instead.
 pub fn before_write_table(table: &crate::table::RudisTable, db_idx: usize, key: &[u8]) {
-    if !aof_image_active() || db_idx != 0 {
+    if !aof_image_active() {
         return;
     }
     with_aof_image(|img| {
         let clock = RdbClock::now(0);
-        img.cover_key(table, key, |entry, buf| {
+        img.cover_key(db_idx, table, key, |entry, buf| {
             if matches!(entry.val, crate::table::RudisValue::Tiered(_)) {
                 return Err(TieredReadError {
                     key: bytes::Bytes::copy_from_slice(&entry.key),
