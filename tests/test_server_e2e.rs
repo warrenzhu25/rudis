@@ -15093,10 +15093,16 @@ impl Drop for ServerGuard {
 }
 
 fn spawn_rudis_listening(args: &[&str], port: u16) -> std::process::Child {
+    spawn_rudis_listening_driver(args, port, &legacy_driver_env())
+}
+
+/// [`spawn_rudis_listening`] with `MONOIO_FORCE_LEGACY_DRIVER` set to
+/// `legacy` (`"0"` runs the io_uring driver production uses).
+fn spawn_rudis_listening_driver(args: &[&str], port: u16, legacy: &str) -> std::process::Child {
     let mut child = rudis_bin()
         .args(args)
         .args(DEBUG_ON)
-        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -32062,4 +32068,65 @@ fn test_timers_fire_during_live_rewrite_e2e() {
     assert!(worst < Duration::from_millis(80), "an LPUSH took {worst:?}");
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A full sync of a snapshot over 2 GiB reaches the replica. The master
+/// sent the snapshot in one write, which failed (EINVAL) past 2 GiB: it
+/// dropped the connection without a word and the replica retried forever.
+#[test]
+fn test_full_sync_over_2gib_e2e() {
+    let mp = 18058u16;
+    let mps = mp.to_string();
+    // On io_uring, as in production: the legacy driver's send() takes a
+    // partial write instead of failing.
+    let master = ServerGuard(spawn_rudis_listening_driver(
+        &[
+            "--port",
+            &mps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--enable-debug-command",
+            "yes",
+        ],
+        mp,
+        "0",
+    ));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+    // 1100 x 2 MB values: a ~2.2 GB snapshot.
+    assert_eq!(
+        send_and_read_reply(&mut m, b"DEBUG POPULATE 1100 big 2000000\r\n"),
+        "+OK\r\n"
+    );
+    // A replica's handshake, as a Redis replica (or redis-cli --rdb) sends it.
+    let mut r = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+    r.write_all(b"PSYNC ? -1\r\n").unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    // "+FULLRESYNC <id> <offset>\r\n$<len>\r\n"
+    while head.iter().filter(|&&b| b == b'\n').count() < 2 {
+        assert_eq!(
+            r.read(&mut byte).unwrap(),
+            1,
+            "the master closed the connection"
+        );
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    assert!(head.starts_with("+FULLRESYNC "), "{head}");
+    let len: u64 = head.lines().nth(1).unwrap()[1..].parse().unwrap();
+    assert!(len > 1 << 31, "snapshot of {len} bytes is not over 2 GiB");
+    let mut left = len;
+    let mut buf = vec![0u8; 1 << 20];
+    while left > 0 {
+        let n = r.read(&mut buf[..left.min(1 << 20) as usize]).unwrap();
+        assert!(
+            n > 0,
+            "the master closed the connection with {left} bytes to go"
+        );
+        left -= n as u64;
+    }
+    drop(master);
 }

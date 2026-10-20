@@ -26,10 +26,15 @@ where
     A: AsyncWriteRent + ?Sized,
 {
     async fn write_all<T: IoBuf + 'static>(&mut self, mut buf: T) -> BufResult<usize, T> {
+        // Rudis patch: at most 1 GiB per write. One io_uring send of more
+        // than 2 GiB fails with EINVAL (rather than writing part of it), so
+        // a full-sync snapshot that size never reached the replica.
+        const MAX_WRITE: usize = 1 << 30;
         let len = buf.bytes_init();
         let mut written = 0;
         while written < len {
-            let buf_slice = unsafe { Slice::new_unchecked(buf, written, len) };
+            let end = len.min(written + MAX_WRITE);
+            let buf_slice = unsafe { Slice::new_unchecked(buf, written, end) };
             let (result, buf_slice) = self.write(buf_slice).await;
             buf = buf_slice.into_inner();
             match result {

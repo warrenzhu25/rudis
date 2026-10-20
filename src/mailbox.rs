@@ -1196,6 +1196,41 @@ mod tests {
         });
     }
 
+    /// `write_all` of more than 2 GiB to a socket completes. One send of
+    /// that size failed, so a full sync whose snapshot was over 2 GiB never
+    /// reached the replica, which retried forever.
+    #[test]
+    fn test_write_all_over_2gib_to_a_socket() {
+        use monoio::io::AsyncWriteRentExt;
+        use std::io::Read;
+        let len = (1usize << 31) + (1 << 20);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Reads until it has all `len` bytes (not until EOF: the runtime,
+        // still alive, may not have closed the socket yet).
+        let reader = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 1 << 20];
+            let mut n = 0u64;
+            while n < len as u64 {
+                let r = s.read(&mut buf).unwrap();
+                assert!(r > 0, "closed after {n} bytes");
+                n += r as u64;
+            }
+            n
+        });
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let mut s = monoio::net::TcpStream::connect(addr).await.unwrap();
+            let (res, _) = s.write_all(vec![7u8; len]).await;
+            assert_eq!(res.unwrap(), len);
+        });
+        assert_eq!(reader.join().unwrap(), len as u64);
+    }
+
     /// A timer fires on time while another task keeps yielding. The
     /// runtime only processed timers when it parked, which a thread with a
     /// task always ready (a live AOF rewrite's step loop) never did: every

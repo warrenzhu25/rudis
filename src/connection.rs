@@ -7270,7 +7270,8 @@ async fn run_master_replica_stream(
                 format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
             initial_msg.extend_from_slice(&rdb);
             initial_msg.extend_from_slice(&after_snapshot);
-            if writer.write_all(initial_msg).await.0.is_err() {
+            if let Err(e) = writer.write_all(initial_msg).await.0 {
+                crate::log_warning!("Sending the full sync to replica {} failed: {}", name, e);
                 hub.unregister_replica(client_id);
                 return;
             }
@@ -7299,7 +7300,8 @@ async fn run_master_replica_stream(
         let mut initial_msg = format!("${}\r\n", rdb.len()).into_bytes();
         initial_msg.extend_from_slice(&rdb);
         initial_msg.extend_from_slice(&after_snapshot);
-        if writer.write_all(initial_msg).await.0.is_err() {
+        if let Err(e) = writer.write_all(initial_msg).await.0 {
+            crate::log_warning!("Sending the full sync to replica {} failed: {}", name, e);
             hub.unregister_replica(client_id);
             return;
         }
