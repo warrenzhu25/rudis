@@ -3383,6 +3383,14 @@ pub fn replay_aof_with(
     db: &mut ShardDb,
     load_truncated: bool,
 ) -> std::io::Result<usize> {
+    let replayed = replay_aof_inner(path, db, load_truncated);
+    // The replay's freed buffers would otherwise sit in this thread's
+    // allocator cache, counted against maxmemory.
+    crate::allocator::flush_thread_cache();
+    replayed
+}
+
+fn replay_aof_inner(path: &Path, db: &mut ShardDb, load_truncated: bool) -> std::io::Result<usize> {
     if !path.exists() {
         return Ok(0);
     }
@@ -5077,6 +5085,38 @@ pub fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An AOF replay leaves this thread's allocator cache empty: buffers
+    /// freed by it (or before it) go back to the arena instead of staying
+    /// counted as allocated, against maxmemory.
+    #[test]
+    fn test_replay_aof_flushes_thread_cache() {
+        std::thread::spawn(|| {
+            crate::allocator::bind_thread_to_new_arena();
+            let dir = std::env::temp_dir().join(format!("rudis-aof-tcache-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("log.aof");
+            std::fs::write(&path, resp_argv(&["SET", "k", "v"])).unwrap();
+            let mut db = ShardDb::new(6379);
+            // Fill the cache's large bins with freed 24 KB buffers.
+            let bufs: Vec<Vec<u8>> = (0..16)
+                .map(|_| std::hint::black_box(vec![1u8; 24 << 10]))
+                .collect();
+            drop(bufs);
+            let before = crate::allocator::thread_cache_bytes();
+            assert!(before >= 8 * (24 << 10), "cache holds {before} bytes");
+            assert_eq!(replay_aof(&path, &mut db).unwrap(), 1);
+            let after = crate::allocator::thread_cache_bytes();
+            assert!(
+                after < 16 << 10,
+                "cache still holds {after} bytes after the replay"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+        .join()
+        .unwrap();
+    }
     use bytes::Bytes;
     use std::time::Duration;
 

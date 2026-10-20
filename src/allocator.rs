@@ -83,6 +83,53 @@ pub fn global_allocated() -> Option<usize> {
     tikv_jemalloc_ctl::stats::allocated::read().ok()
 }
 
+/// Hands the objects parked in this thread's jemalloc cache back to their
+/// arena. jemalloc counts cached objects as allocated, and a bulk load
+/// (RDB, AOF replay, replica sync) frees enough buffers of up to 32 KB to
+/// fill every cache bin: ~1.5 MB per shard thread that `used_memory`, and
+/// so `maxmemory` eviction, would otherwise see until normal traffic
+/// cycled them out. A restart near the limit then evicted keys that fit
+/// before it.
+pub fn flush_thread_cache() {
+    // `thread.tcache.flush` takes no value, which the ctl crate's raw API
+    // cannot pass; turning the cache off flushes it the same way, and it
+    // is rebuilt on the next allocation once turned back on.
+    const ENABLED: &[u8] = b"thread.tcache.enabled\0";
+    // SAFETY: `thread.tcache.enabled` is a bool ctl.
+    unsafe {
+        if tikv_jemalloc_ctl::raw::read::<bool>(ENABLED).unwrap_or(false) {
+            let _ = tikv_jemalloc_ctl::raw::write(ENABLED, false);
+            let _ = tikv_jemalloc_ctl::raw::write(ENABLED, true);
+        }
+    }
+}
+
+/// Test support: moves this thread onto a fresh jemalloc arena of its own,
+/// so [`thread_cache_bytes`] sees only this thread's cache.
+#[cfg(test)]
+pub fn bind_thread_to_new_arena() {
+    // SAFETY: `arenas.create` returns an unsigned arena index, which
+    // `thread.arena` takes.
+    unsafe {
+        let arena: u32 = tikv_jemalloc_ctl::raw::read(b"arenas.create\0").unwrap();
+        tikv_jemalloc_ctl::raw::write(b"thread.arena\0", arena).unwrap();
+    }
+}
+
+/// Test support: bytes held in the jemalloc caches of threads on this
+/// thread's arena (see [`bind_thread_to_new_arena`]).
+#[cfg(test)]
+pub fn thread_cache_bytes() -> usize {
+    tikv_jemalloc_ctl::epoch::advance().unwrap();
+    // SAFETY: `thread.arena` is an unsigned arena index and
+    // `stats.arenas.<i>.tcache_bytes` a size_t.
+    unsafe {
+        let arena: u32 = tikv_jemalloc_ctl::raw::read(b"thread.arena\0").unwrap();
+        let name = format!("stats.arenas.{arena}.tcache_bytes\0");
+        tikv_jemalloc_ctl::raw::read::<usize>(name.as_bytes()).unwrap()
+    }
+}
+
 /// Inputs of [`format_memory_stats`] and [`memory_doctor`]: the server's
 /// accounting summed over shards, plus `used_memory` and `maxmemory`.
 pub struct MemoryReport {

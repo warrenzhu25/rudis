@@ -31820,3 +31820,67 @@ fn test_live_rewrite_over_spilled_values_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A restart doesn't push a dataset that fit under maxmemory over it: the
+/// buffers each shard's AOF replay freed used to stay in its allocator
+/// cache (~1.5 MB a thread), counted in used_memory, so a restart near the
+/// limit evicted keys.
+#[test]
+fn test_restart_near_maxmemory_keeps_keys_e2e() {
+    let port = 18054u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-maxmem-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let base = [
+        "--port",
+        &ps,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+    ];
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        c
+    };
+    let keys = 120_000usize;
+    let srv = ServerGuard(spawn_rudis_listening(&base, port));
+    let mut c = connect();
+    let value = "v".repeat(200);
+    for chunk in (0..keys).collect::<Vec<_>>().chunks(10_000) {
+        let mut pipe = String::new();
+        for i in chunk {
+            pipe.push_str(&format!("SET key:{i} {value}\r\n"));
+        }
+        c.write_all(pipe.as_bytes()).unwrap();
+        let mut replies = vec![0u8; chunk.len() * 5];
+        c.read_exact(&mut replies).unwrap();
+    }
+    thread::sleep(Duration::from_millis(500));
+    let live_used = info_field_u64(&mut c, "memory", "used_memory");
+    drop(c);
+    drop(srv);
+
+    // A limit 2.5 MB above what the data used when written live.
+    let limit = (live_used + (5 << 19)).to_string();
+    let mut args = base.to_vec();
+    args.extend(["--maxmemory", &limit, "--maxmemory-policy", "allkeys-lru"]);
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = connect();
+    thread::sleep(Duration::from_millis(1500));
+    let loaded_used = info_field_u64(&mut c, "memory", "used_memory");
+    eprintln!("used_memory live {live_used}, after restart {loaded_used}, limit {limit}");
+    assert_eq!(info_field_u64(&mut c, "stats", "evicted_keys"), 0);
+    assert_eq!(
+        send_and_read_reply(&mut c, b"DBSIZE\r\n"),
+        format!(":{keys}\r\n")
+    );
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

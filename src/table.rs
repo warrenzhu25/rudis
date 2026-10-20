@@ -16569,6 +16569,19 @@ pub fn load_rdb_bytes(
     shard_id: usize,
     num_shards: usize,
 ) -> std::io::Result<usize> {
+    let loaded = load_rdb_bytes_inner(data, db, shard_id, num_shards);
+    // The load's freed buffers would otherwise sit in this thread's
+    // allocator cache, counted against maxmemory.
+    crate::allocator::flush_thread_cache();
+    loaded
+}
+
+fn load_rdb_bytes_inner(
+    data: &[u8],
+    db: &mut crate::shard::ShardDb,
+    shard_id: usize,
+    num_shards: usize,
+) -> std::io::Result<usize> {
     use crate::redis_rdb::{FileKind, classify, header_version, load_file};
     if data.is_empty() {
         return Ok(0);
@@ -17173,6 +17186,33 @@ mod tests {
         let crc = crc64(&v);
         v.extend_from_slice(&crc.to_le_bytes());
         v
+    }
+
+    /// An RDB load leaves this thread's allocator cache empty: buffers
+    /// freed by it (or before it) go back to the arena instead of staying
+    /// counted as allocated, against maxmemory.
+    #[test]
+    fn test_load_rdb_bytes_flushes_thread_cache() {
+        std::thread::spawn(|| {
+            crate::allocator::bind_thread_to_new_arena();
+            let rdb = rdb_with_body(&[0xFE, 0x00, 0xFF]);
+            let mut db = crate::shard::ShardDb::new(0);
+            // Fill the cache's large bins with freed 24 KB buffers.
+            let bufs: Vec<Vec<u8>> = (0..16)
+                .map(|_| std::hint::black_box(vec![1u8; 24 << 10]))
+                .collect();
+            drop(bufs);
+            let before = crate::allocator::thread_cache_bytes();
+            assert!(before >= 8 * (24 << 10), "cache holds {before} bytes");
+            assert_eq!(load_rdb_bytes(&rdb, &mut db, 0, 1).unwrap(), 0);
+            let after = crate::allocator::thread_cache_bytes();
+            assert!(
+                after < 16 << 10,
+                "cache still holds {after} bytes after the load"
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
