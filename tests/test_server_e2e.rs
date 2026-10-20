@@ -32267,3 +32267,122 @@ fn test_replica_takes_eof_mark_full_sync_e2e() {
     );
     drop(replica);
 }
+
+/// A full sync to a replica that takes `$EOF:` transfers is streamed: the
+/// master keeps serving (each shard writes its part in short steps) and
+/// the replica ends up identical, writes made during the sync included.
+/// The snapshot used to be built in one blocking step per shard (~110 ms
+/// per GB) and held whole in memory.
+#[test]
+fn test_streamed_full_sync_e2e() {
+    let (mp, rp) = (18062u16, 18063u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let master = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &mps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--enable-debug-command",
+            "yes",
+        ],
+        mp,
+    ));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    // ~600 MB: ~300 MB a shard, which the buffered path serialized in one go.
+    assert_eq!(
+        send_and_read_reply(&mut m, b"DEBUG POPULATE 3000000 key 200\r\n"),
+        "+OK\r\n"
+    );
+    for i in 0..100 {
+        send_and_read_reply(&mut m, format!("RPUSH list{i} a b\r\n").as_bytes());
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worst = std::sync::Arc::new(std::sync::Mutex::new(Duration::ZERO));
+    let (stop2, worst2) = (stop.clone(), worst.clone());
+    // Writes (non-idempotent ones too) and latency probes during the sync.
+    let writer = thread::spawn(move || {
+        let mut w = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+        w.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        // Several connections, so both shards' threads are probed.
+        let mut probes: Vec<TcpStream> = (0..8)
+            .map(|_| {
+                let p = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+                p.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                p
+            })
+            .collect();
+        let mut i = 0u64;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            for p in probes.iter_mut() {
+                let t = std::time::Instant::now();
+                assert_eq!(send_and_read_reply(p, b"PING\r\n"), "+PONG\r\n");
+                let dt = t.elapsed();
+                let mut wst = worst2.lock().unwrap();
+                *wst = (*wst).max(dt);
+            }
+            let k = i % 100;
+            send_and_read_reply(&mut w, format!("INCR cnt{k}\r\n").as_bytes());
+            send_and_read_reply(&mut w, format!("LPUSH list{k} x{i}\r\n").as_bytes());
+            send_and_read_reply(
+                &mut w,
+                format!("SET key:{} changed{i}\r\n", i * 7919 % 3_000_000).as_bytes(),
+            );
+            i += 1;
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--enable-debug-command",
+            "yes",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let info = send_and_read_reply(&mut r, b"INFO replication\r\n");
+        if info.contains("master_link_status:up") && info.contains("master_sync_in_progress:0") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "no sync: {info}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Keep writing a little past the sync, then let the replica catch up.
+    thread::sleep(Duration::from_millis(300));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    let worst = *worst.lock().unwrap();
+    eprintln!("worst master PING during the full sync: {worst:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let md = send_and_read_reply(&mut m, b"DEBUG DIGEST\r\n");
+        let rd = send_and_read_reply(&mut r, b"DEBUG DIGEST\r\n");
+        if md == rd {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica differs: {md} vs {rd}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        worst < Duration::from_millis(200),
+        "a PING took {worst:?} during the full sync"
+    );
+    drop(replica);
+    drop(master);
+}

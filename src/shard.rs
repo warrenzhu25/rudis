@@ -588,6 +588,22 @@ pub enum ShardMessage {
         sink: flume::Sender<Option<Vec<u8>>>,
         done: flume::Sender<Result<bool, TieredReadError>>,
     },
+    /// Streamed full sync to replica `replica`: start this shard's
+    /// point-in-time image and arm the replica's stream cut, in one step
+    /// (see [`start_sync_image`]).
+    StartSyncImage {
+        replica: u64,
+        responder: flume::Sender<Result<(), TieredReadError>>,
+    },
+    /// The next piece of that image (see [`sync_image_step`]).
+    SyncImageStep {
+        replica: u64,
+        responder: flume::Sender<Result<(Vec<u8>, bool), String>>,
+    },
+    /// Abandons that image: the full sync failed.
+    DropSyncImage {
+        replica: u64,
+    },
     Publish {
         channel: Bytes,
         message: Bytes,
@@ -4930,6 +4946,9 @@ pub struct AofImage {
     /// that can't be read back): the rewrite then falls back to a blocking
     /// pass.
     poisoned: Option<String>,
+    /// A shard's part of a multi-shard RDB (a full sync): no file header
+    /// and no `OP_EOF`, like [`ShardDb::save_rdb_chunk`]'s output.
+    chunk: bool,
 }
 
 /// An [`AofImage`]'s walk over one DB's table (see [`RdbSaveCursor`]).
@@ -4947,8 +4966,21 @@ impl AofImage {
     /// Starts an image of `db` as of now: the RDB header (with the function
     /// libraries) and what is written last (see [`Self::finish`]).
     pub fn start(db: &ShardDb) -> Result<Self, TieredReadError> {
+        Self::start_inner(db, false)
+    }
+
+    /// [`Self::start`] for one shard's part of a multi-shard RDB: it starts
+    /// and ends with DB 0 selected, and the caller writes the file header,
+    /// `OP_EOF` and checksum around the parts.
+    pub fn start_chunk(db: &ShardDb) -> Result<Self, TieredReadError> {
+        Self::start_inner(db, true)
+    }
+
+    fn start_inner(db: &ShardDb, chunk: bool) -> Result<Self, TieredReadError> {
         let mut buf = Vec::with_capacity(RDB_FLUSH_BYTES * 2);
-        crate::redis_rdb::write_file_header(&mut buf, db.total_used_memory() as u64);
+        if !chunk {
+            crate::redis_rdb::write_file_header(&mut buf, db.total_used_memory() as u64);
+        }
         let clock = RdbClock::now(db.port);
         let mut walks = Vec::new();
         let mut deferred_dbs = Vec::new();
@@ -4997,6 +5029,7 @@ impl AofImage {
             port: db.port,
             tier: db.tier_manager.clone(),
             poisoned: None,
+            chunk,
         })
     }
 
@@ -5137,7 +5170,9 @@ impl AofImage {
         }
         self.select(0);
         self.buf.append(&mut self.deferred_ext);
-        self.buf.push(crate::redis_rdb::OP_EOF);
+        if !self.chunk {
+            self.buf.push(crate::redis_rdb::OP_EOF);
+        }
         Ok(self.buf)
     }
 
@@ -5197,45 +5232,139 @@ impl AofImage {
     }
 }
 
-thread_local! {
-    /// The AOF rewrite image this shard thread is building, if any.
-    static AOF_IMAGE: std::cell::RefCell<Option<AofImage>> = const { std::cell::RefCell::new(None) };
-    static AOF_IMAGE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// What a shard's point-in-time [`AofImage`] is for. A shard can build
+/// several at once (an AOF rewrite and full syncs to replicas); the write
+/// hooks keep every one of them point-in-time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageOwner {
+    /// The live AOF rewrite.
+    AofRewrite,
+    /// The full sync to the replica with this client id.
+    FullSync(u64),
 }
 
-/// Installs `image` as this shard thread's live AOF rewrite image, which
+thread_local! {
+    /// The images this shard thread is building.
+    static IMAGES: std::cell::RefCell<Vec<(ImageOwner, AofImage)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static IMAGES_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Installs `image` for `owner` (replacing any it had), which
 /// [`before_write`] keeps point-in-time.
+pub fn install_image(owner: ImageOwner, image: AofImage) {
+    IMAGES.with(|i| {
+        let mut images = i.borrow_mut();
+        images.retain(|(o, _)| *o != owner);
+        images.push((owner, image));
+    });
+    IMAGES_ACTIVE.set(true);
+}
+
+/// Removes `owner`'s image (when done or abandoned).
+pub fn take_image(owner: ImageOwner) -> Option<AofImage> {
+    IMAGES.with(|i| {
+        let mut images = i.borrow_mut();
+        let pos = images.iter().position(|(o, _)| *o == owner)?;
+        let (_, image) = images.remove(pos);
+        IMAGES_ACTIVE.set(!images.is_empty());
+        Some(image)
+    })
+}
+
+/// Runs `f` on `owner`'s image.
+pub fn with_image<R>(owner: ImageOwner, f: impl FnOnce(&mut AofImage) -> R) -> Option<R> {
+    IMAGES.with(|i| {
+        i.borrow_mut()
+            .iter_mut()
+            .find(|(o, _)| *o == owner)
+            .map(|(_, img)| f(img))
+    })
+}
+
+/// Runs `f` on every image this thread is building.
+fn for_each_image(mut f: impl FnMut(&mut AofImage)) {
+    IMAGES.with(|i| {
+        for (_, img) in i.borrow_mut().iter_mut() {
+            f(img);
+        }
+    });
+}
+
+/// Installs `image` as this shard thread's live AOF rewrite image.
 pub fn install_aof_image(image: AofImage) {
-    AOF_IMAGE.with(|i| *i.borrow_mut() = Some(image));
-    AOF_IMAGE_ACTIVE.set(true);
+    install_image(ImageOwner::AofRewrite, image);
 }
 
 /// Removes this thread's live AOF rewrite image (when done or abandoned).
 pub fn take_aof_image() -> Option<AofImage> {
-    AOF_IMAGE_ACTIVE.set(false);
-    AOF_IMAGE.with(|i| i.borrow_mut().take())
+    take_image(ImageOwner::AofRewrite)
 }
 
 /// Runs `f` on this thread's live AOF rewrite image.
 pub fn with_aof_image<R>(f: impl FnOnce(&mut AofImage) -> R) -> Option<R> {
-    AOF_IMAGE.with(|i| i.borrow_mut().as_mut().map(f))
+    with_image(ImageOwner::AofRewrite, f)
 }
 
-/// Whether an AOF rewrite image is being built on this thread.
+/// Whether any image (an AOF rewrite's or a full sync's) is being built on
+/// this thread: the write hooks are a single flag test otherwise.
 #[inline(always)]
 pub fn aof_image_active() -> bool {
-    AOF_IMAGE_ACTIVE.get()
+    IMAGES_ACTIVE.get()
 }
 
-/// Makes the live AOF rewrite image (if any) unusable: the rewrite falls
-/// back to a blocking pass. For changes the image cannot follow (SWAPDB, a
+/// Makes every image being built unusable: its rewrite or full sync falls
+/// back to a blocking pass. For changes an image cannot follow (SWAPDB, a
 /// full resync replacing the dataset).
 pub fn poison_aof_image(why: &str) {
     if aof_image_active() {
-        with_aof_image(|img| {
+        for_each_image(|img| {
             img.poisoned.get_or_insert_with(|| why.to_string());
         });
     }
+}
+
+/// Starts this shard's part of a streamed full sync to replica `replica`:
+/// a point-in-time chunk image (see [`AofImage::start_chunk`]), and the
+/// replica's stream cut armed right then, so the stream it gets after the
+/// snapshot starts exactly where the image stands.
+pub fn start_sync_image(
+    db: &ShardDb,
+    shard_id: usize,
+    replica: u64,
+) -> Result<(), TieredReadError> {
+    install_image(ImageOwner::FullSync(replica), AofImage::start_chunk(db)?);
+    crate::replication::get_replication_hub(db.port).arm_full_sync(replica, shard_id);
+    Ok(())
+}
+
+/// Bytes a full-sync image step hands out at most (it may hand out less,
+/// or nothing, when its time budget runs out first).
+const SYNC_IMAGE_PIECE_BYTES: usize = 1 << 20;
+
+/// Writes about [`RDB_SAVE_STEP`] more of replica `replica`'s image.
+/// Returns the bytes to send and whether this shard's part is complete (the
+/// image is then removed). An error (the image was poisoned, or a spilled
+/// value could not be read) removes it too: the sync must start over.
+pub fn sync_image_step(db: &ShardDb, replica: u64) -> Result<(Vec<u8>, bool), String> {
+    let owner = ImageOwner::FullSync(replica);
+    let step = with_image(owner, |img| {
+        img.step(db, RDB_SAVE_STEP, SYNC_IMAGE_PIECE_BYTES)
+    })
+    .ok_or_else(|| "the full-sync image is gone".to_string())?;
+    let (piece, done) = match step {
+        Ok(step) => step,
+        Err(e) => {
+            take_image(owner);
+            return Err(e);
+        }
+    };
+    let mut out = piece.unwrap_or_default();
+    if done {
+        let image = take_image(owner).expect("present above");
+        out.extend(image.finish()?);
+    }
+    Ok((out, done))
 }
 
 /// Call before a command may change `key` in the current DB (see
@@ -5258,9 +5387,9 @@ pub fn before_write_in(db: &ShardDb, db_idx: usize, key: &[u8]) {
     if !aof_image_active() {
         return;
     }
-    with_aof_image(|img| {
+    let clock = RdbClock::now(db.port);
+    for_each_image(|img| {
         if let Some(table) = db.table_for_db(db_idx) {
-            let clock = RdbClock::now(db.port);
             img.cover_key(db_idx, table, key, |entry, buf| {
                 db.save_rdb_entry(entry, &clock, buf)
             });
@@ -5276,7 +5405,7 @@ pub fn before_write_table(table: &crate::table::RudisTable, db_idx: usize, key: 
     if !aof_image_active() {
         return;
     }
-    with_aof_image(|img| {
+    for_each_image(|img| {
         let clock = RdbClock::now(img.port);
         let tier = img.tier.clone();
         img.cover_key(db_idx, table, key, |entry, buf| {
@@ -5389,6 +5518,87 @@ mod tests {
             }
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An AOF rewrite image and a full sync's chunk image are built at
+    /// once on one shard, with writes in between: each stays as of its own
+    /// start (the write hooks cover both), and the chunk wrapped in a file
+    /// header and `OP_EOF` loads. One image per thread was all the hooks
+    /// kept before, so a streamed full sync could not run.
+    #[test]
+    fn test_concurrent_images_each_stay_point_in_time() {
+        let mut db = ShardDb::new(0);
+        let key = |i: usize| Bytes::from(format!("l{i}"));
+        let n = 2000;
+        for i in 0..n {
+            db.rpush(key(i), vec![Bytes::from_static(b"a")]).unwrap();
+        }
+        install_aof_image(AofImage::start(&db).unwrap());
+        // Pushed after the rewrite image started, before the sync's.
+        before_write(&db, b"l1");
+        db.rpush(key(1), vec![Bytes::from_static(b"b")]).unwrap();
+        start_sync_image(&db, 0, 99).unwrap();
+        // After both started: in neither image.
+        for i in [1, 5, n - 1] {
+            before_write(&db, format!("l{i}").as_bytes());
+            db.rpush(key(i), vec![Bytes::from_static(b"c")]).unwrap();
+        }
+        let mut chunk = Vec::new();
+        let mut rewrite = Vec::new();
+        let (mut sync_done, mut rewrite_done) = (false, false);
+        let mut round = 0;
+        while !(sync_done && rewrite_done) {
+            if !sync_done {
+                let (piece, done) = sync_image_step(&db, 99).unwrap();
+                chunk.extend(piece);
+                sync_done = done;
+            }
+            if !rewrite_done {
+                let (piece, done) = with_aof_image(|img| img.step(&db, Duration::ZERO, 1 << 30))
+                    .unwrap()
+                    .unwrap();
+                rewrite.extend(piece.unwrap_or_default());
+                rewrite_done = done;
+            }
+            // More writes mid-walk.
+            round += 1;
+            let i = (round * 37) % n;
+            before_write(&db, format!("l{i}").as_bytes());
+            db.rpush(key(i), vec![Bytes::from_static(b"d")]).unwrap();
+        }
+        rewrite.extend(take_aof_image().unwrap().finish().unwrap());
+        assert!(!aof_image_active(), "the sync image is removed when done");
+        let mut full = Vec::new();
+        crate::redis_rdb::write_file_header(&mut full, 0);
+        full.extend(chunk);
+        full.push(crate::redis_rdb::OP_EOF);
+        let load = |mut image: Vec<u8>| {
+            let crc = crate::table::crc64(&image);
+            image.extend_from_slice(&crc.to_le_bytes());
+            let mut loaded = ShardDb::new(0);
+            crate::table::load_rdb_bytes(&image, &mut loaded, 0, 1).unwrap();
+            assert_eq!(loaded.table.len(), n);
+            loaded
+        };
+        let (from_sync, from_rewrite) = (load(full), load(rewrite));
+        let list =
+            |db: &mut ShardDb, i: usize| db.lrange(format!("l{i}").as_bytes(), 0, -1).unwrap();
+        let (a, b) = (Bytes::from_static(b"a"), Bytes::from_static(b"b"));
+        let (mut from_sync, mut from_rewrite) = (from_sync, from_rewrite);
+        for i in (0..n).step_by(97).chain([1, 5, n - 1]) {
+            let want_rewrite = vec![a.clone()];
+            let want_sync = if i == 1 {
+                vec![a.clone(), b.clone()]
+            } else {
+                vec![a.clone()]
+            };
+            assert_eq!(
+                list(&mut from_rewrite, i),
+                want_rewrite,
+                "rewrite image, l{i}"
+            );
+            assert_eq!(list(&mut from_sync, i), want_sync, "sync image, l{i}");
+        }
     }
 
     #[test]

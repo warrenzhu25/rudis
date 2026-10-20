@@ -7149,6 +7149,194 @@ async fn snapshot_for_replica(
     Ok((rdb, replid, offset, after_snapshot, rep))
 }
 
+/// Removes a streamed full sync's images from every shard when the sync
+/// ends early (an image left installed would keep taking pre-images).
+struct SyncImagesGuard<'a> {
+    router: &'a Router,
+    replica: u64,
+    armed: bool,
+}
+
+impl Drop for SyncImagesGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        crate::shard::take_image(crate::shard::ImageOwner::FullSync(self.replica));
+        for (sid, sender) in self.router.senders.iter().enumerate() {
+            if sid != self.router.shard_id {
+                let _ = sender.send(crate::shard::ShardMessage::DropSyncImage {
+                    replica: self.replica,
+                });
+            }
+        }
+    }
+}
+
+/// Streamed full sync to replica `client_id`, which takes `$EOF:`
+/// transfers. Every shard starts a point-in-time image at once (arming the
+/// replica's stream cut), so the replication offset is known before the
+/// snapshot and goes out in +FULLRESYNC first; then each shard writes its
+/// part in ~1 ms steps between commands, sent as it is produced. The
+/// snapshot is never held whole in memory and no shard stops serving for
+/// longer than a step (the buffered path serialized each shard in one go:
+/// ~110 ms per GB of data, and ~3x the data in memory).
+///
+/// An error with a reason comes before anything was sent (the caller
+/// reports it); `Err(None)` means the transfer broke off after it began
+/// (already logged).
+async fn stream_full_sync(
+    hub: &std::sync::Arc<crate::replication::ReplicationHub>,
+    router: &Rc<Router>,
+    client_id: u64,
+    write_tx: &flume::Sender<Vec<u8>>,
+    writer: &mut monoio::net::tcp::TcpOwnedWriteHalf,
+    name: &str,
+) -> Result<std::sync::Arc<crate::replication::ConnectedReplica>, Option<ReplicaSnapshotError>> {
+    let apply = if hub.is_slave() {
+        Some(hub.lock_apply().await)
+    } else {
+        None
+    };
+    hub.reset_stream_db();
+    let rep = hub
+        .register_full_sync_replica(client_id, write_tx.clone(), router.num_shards)
+        .ok_or(Some(ReplicaSnapshotError::NoMasterLink))?;
+    crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
+    crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
+    let mut guard = SyncImagesGuard {
+        router,
+        replica: client_id,
+        armed: true,
+    };
+    let fail = |e: String| {
+        hub.unregister_replica(client_id);
+        crate::log_warning!("BGSAVE for replication failed: {}", e);
+        Some(ReplicaSnapshotError::Failed(e))
+    };
+    // 1. Start every shard's image (each arms its cut in the same step).
+    let mut first_err =
+        crate::shard::start_sync_image(&router.local_db.borrow(), router.shard_id, client_id)
+            .err()
+            .map(|e| format!("shard {}: {}", router.shard_id, e));
+    let mut responders = Vec::new();
+    for (sid, sender) in router.senders.iter().enumerate() {
+        if sid == router.shard_id {
+            continue;
+        }
+        let (tx, rx) = flume::bounded(1);
+        if sender
+            .send(crate::shard::ShardMessage::StartSyncImage {
+                replica: client_id,
+                responder: tx,
+            })
+            .is_ok()
+        {
+            responders.push((sid, rx));
+        } else {
+            first_err.get_or_insert(format!("shard {sid} is not reachable"));
+        }
+    }
+    for (sid, rx) in responders {
+        match rx.recv_async().await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                first_err.get_or_insert(format!("shard {sid}: {e}"));
+            }
+            Err(_) => {
+                first_err.get_or_insert(format!("shard {sid} did not start its image"));
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(fail(e));
+    }
+    let (replid, offset, after_snapshot) = hub.finish_full_sync(client_id);
+    drop(apply);
+    let gone =
+        |rep: &crate::replication::ConnectedReplica| rep.is_overflowed() || rep.is_disconnected();
+    let broke_off = |why: String| {
+        hub.unregister_replica(client_id);
+        crate::log_warning!(
+            "Streaming the full sync to replica {} failed: {}",
+            name,
+            why
+        );
+        None
+    };
+    // 2. +FULLRESYNC, the `$EOF:` header and the RDB file header.
+    let mark = crate::replication::new_replid();
+    let mut out = format!("+FULLRESYNC {replid} {offset}\r\n$EOF:{mark}\r\n").into_bytes();
+    let mut rdb_head = Vec::new();
+    let used_mem = router.local_db.borrow().total_used_memory() as u64;
+    crate::redis_rdb::write_file_header(&mut rdb_head, used_mem);
+    let mut crc = crate::table::crc64_update(0, &rdb_head);
+    out.extend_from_slice(&rdb_head);
+    if let Err(e) = writer.write_all(out).await.0 {
+        return Err(broke_off(e.to_string()));
+    }
+    // 3. Each shard's part, a step at a time.
+    for sid in 0..router.num_shards {
+        loop {
+            let step = if sid == router.shard_id {
+                let step = crate::shard::sync_image_step(&router.local_db.borrow(), client_id);
+                crate::mailbox::yield_now().await;
+                step
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                if router.senders[sid]
+                    .send(crate::shard::ShardMessage::SyncImageStep {
+                        replica: client_id,
+                        responder: tx,
+                    })
+                    .is_err()
+                {
+                    return Err(broke_off(format!("shard {sid} is not reachable")));
+                }
+                rx.recv_async()
+                    .await
+                    .unwrap_or_else(|_| Err(format!("shard {sid} did not return its data")))
+            };
+            let (piece, done) = match step {
+                Ok(step) => step,
+                Err(e) => return Err(broke_off(format!("shard {sid}: {e}"))),
+            };
+            if !piece.is_empty() {
+                crc = crate::table::crc64_update(crc, &piece);
+                if let Err(e) = writer.write_all(piece).await.0 {
+                    return Err(broke_off(e.to_string()));
+                }
+            }
+            if gone(&rep) {
+                if rep.is_overflowed() {
+                    replica_output_limit_reached(client_id, name);
+                }
+                hub.unregister_replica(client_id);
+                return Err(None);
+            }
+            if done {
+                break;
+            }
+        }
+    }
+    guard.armed = false;
+    drop(guard);
+    // 4. The RDB's end, the mark, then the stream written meanwhile.
+    let mut tail = Vec::new();
+    if let Some((replid, offset, stream_db)) = hub.saved_history() {
+        crate::redis_rdb::write_repl_aux(&mut tail, &replid, offset, stream_db);
+    }
+    tail.push(crate::redis_rdb::OP_EOF);
+    crc = crate::table::crc64_update(crc, &tail);
+    tail.extend_from_slice(&crc.to_le_bytes());
+    tail.extend_from_slice(mark.as_bytes());
+    tail.extend_from_slice(&after_snapshot);
+    if let Err(e) = writer.write_all(tail).await.0 {
+        return Err(broke_off(e.to_string()));
+    }
+    Ok(rep)
+}
+
 /// Ends a (P)SYNC whose snapshot [`snapshot_for_replica`] could not make.
 async fn replica_snapshot_failed(
     writer: &mut monoio::net::tcp::TcpOwnedWriteHalf,
@@ -7244,36 +7432,54 @@ async fn run_master_replica_stream(
             } else {
                 crate::log_notice!("Full resync requested by replica {}", name);
             }
-            // Register before any shard serializes, so each shard's changes
-            // after its snapshot reach the replica (see FullSyncCut).
-            // No eviction until the snapshot is built and sent (dropped at
-            // the end of this block, after the buffers).
-            let _pause = crate::tiering::SnapshotEvictionPause::new(router.tier_stats.clone());
-            let (rdb, replid, offset, after_snapshot, rep) =
-                match snapshot_for_replica(&hub, &router, client_id, &write_tx).await {
-                    Ok(snapshot) => snapshot,
-                    Err(e) => {
+            if hub.replica_takes_eof(client_id) {
+                // Eviction stays paused while it streams too: its pieces are
+                // allocated on each shard's thread and freed on this one,
+                // which the per-thread counts only see at the next
+                // recalibration (the shards looked far over the limit).
+                let _pause = crate::tiering::SnapshotEvictionPause::new(router.tier_stats.clone());
+                match stream_full_sync(&hub, &router, client_id, &write_tx, &mut writer, &name)
+                    .await
+                {
+                    Ok(rep) => repl = rep,
+                    Err(Some(e)) => {
                         replica_snapshot_failed(&mut writer, &name, e).await;
                         return;
                     }
-                };
-            repl = rep;
-            if repl.is_overflowed() || repl.is_disconnected() {
-                if repl.is_overflowed() {
-                    replica_output_limit_reached(client_id, &name);
+                    Err(None) => return,
                 }
-                hub.unregister_replica(client_id);
-                return;
-            }
+            } else {
+                // Register before any shard serializes, so each shard's changes
+                // after its snapshot reach the replica (see FullSyncCut).
+                // No eviction until the snapshot is built and sent (dropped at
+                // the end of this block, after the buffers).
+                let _pause = crate::tiering::SnapshotEvictionPause::new(router.tier_stats.clone());
+                let (rdb, replid, offset, after_snapshot, rep) =
+                    match snapshot_for_replica(&hub, &router, client_id, &write_tx).await {
+                        Ok(snapshot) => snapshot,
+                        Err(e) => {
+                            replica_snapshot_failed(&mut writer, &name, e).await;
+                            return;
+                        }
+                    };
+                repl = rep;
+                if repl.is_overflowed() || repl.is_disconnected() {
+                    if repl.is_overflowed() {
+                        replica_output_limit_reached(client_id, &name);
+                    }
+                    hub.unregister_replica(client_id);
+                    return;
+                }
 
-            let mut initial_msg =
-                format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
-            initial_msg.extend_from_slice(&rdb);
-            initial_msg.extend_from_slice(&after_snapshot);
-            if let Err(e) = writer.write_all(initial_msg).await.0 {
-                crate::log_warning!("Sending the full sync to replica {} failed: {}", name, e);
-                hub.unregister_replica(client_id);
-                return;
+                let mut initial_msg =
+                    format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
+                initial_msg.extend_from_slice(&rdb);
+                initial_msg.extend_from_slice(&after_snapshot);
+                if let Err(e) = writer.write_all(initial_msg).await.0 {
+                    crate::log_warning!("Sending the full sync to replica {} failed: {}", name, e);
+                    hub.unregister_replica(client_id);
+                    return;
+                }
             }
         }
     } else {
@@ -11825,6 +12031,9 @@ async fn execute_command_inner(
                 }
                 out.extend_from_slice(b"+OK\r\n");
             } else if args[0].eq_ignore_ascii_case(b"capa") {
+                if args.iter().any(|a| a.eq_ignore_ascii_case(b"eof")) {
+                    crate::replication::get_replication_hub(router.port).note_replica_capa_eof(client_id);
+                }
                 if args.iter().any(|a| a.eq_ignore_ascii_case(b"dragonfly")) {
                     let hub = crate::replication::get_replication_hub(router.port);
                     let replid = &hub.replid();

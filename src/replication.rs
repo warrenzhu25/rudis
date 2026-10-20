@@ -37,7 +37,7 @@ pub struct ReplIds {
 }
 
 /// A fresh random 40-character replication id.
-fn new_replid() -> String {
+pub(crate) fn new_replid() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -567,6 +567,8 @@ struct PendingPeer {
     port: u16,
     ip: Option<std::net::IpAddr>,
     announced_ip: Option<String>,
+    /// It sent `REPLCONF capa eof`: it takes streamed (`$EOF:`) full syncs.
+    capa_eof: bool,
 }
 
 /// Bound on `pending_peers`, which only clients that never send PSYNC
@@ -1206,6 +1208,21 @@ impl ReplicationHub {
     /// as a replica.
     pub fn note_replica_ip(&self, id: u64, ip: std::net::IpAddr) {
         self.note_pending_peer(id, |p| p.ip = Some(ip));
+    }
+
+    /// Records that replica `id` (before its PSYNC) sent `REPLCONF capa
+    /// eof`.
+    pub fn note_replica_capa_eof(&self, id: u64) {
+        self.note_pending_peer(id, |p| p.capa_eof = true);
+    }
+
+    /// Whether replica `id`, about to register with its PSYNC, takes
+    /// streamed (`$EOF:`) full syncs.
+    pub fn replica_takes_eof(&self, id: u64) -> bool {
+        self.pending_peers
+            .lock()
+            .get(&id)
+            .is_some_and(|p| p.capa_eof)
     }
 
     fn note_pending_peer(&self, id: u64, f: impl FnOnce(&mut PendingPeer)) {
