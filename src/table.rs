@@ -6591,7 +6591,17 @@ impl RudisTable {
     /// until the master's HDEL arrives. Redis replicas answer reads the
     /// same way. Empty on a master, and while the master's stream applies.
     fn replica_hidden_fields(&self, key: &[u8]) -> HiddenFields {
-        if !crate::replication::hide_expired_keys() || crate::connection::access_expired_allowed() {
+        if !crate::replication::hide_expired_keys() {
+            return HiddenFields::default();
+        }
+        self.expired_fields_view(key)
+    }
+
+    /// Fields of `key` past their deadline but not yet deleted, for reads
+    /// that skip them without purging (HRANDFIELD, HSCAN). Empty while
+    /// writes are re-applied, which see every stored field.
+    fn expired_fields_view(&self, key: &[u8]) -> HiddenFields {
+        if self.hash_field_expires.is_empty() || crate::connection::access_expired_allowed() {
             return HiddenFields::default();
         }
         let Some(fmap) = self.hash_field_expires.get(key) else {
@@ -6756,8 +6766,10 @@ impl RudisTable {
         is_expiretime: bool,
         fields: &[Bytes],
     ) -> Result<Vec<i64>, &'static str> {
+        let mut hidden = HiddenFields::default();
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            hidden = self.replica_hidden_fields(key);
         }
         let h = hash_key(key);
         let Some(idx) = self.table.find(key, h) else {
@@ -6787,7 +6799,7 @@ impl RudisTable {
                 RudisValue::Hash(map) => map.contains_key(f),
                 _ => false,
             };
-            if !exists {
+            if !exists || hidden.hides(f) {
                 results.push(-2);
                 continue;
             }
@@ -8135,8 +8147,9 @@ impl RudisTable {
         count: Option<i64>,
         with_values: bool,
     ) -> Result<Vec<Bytes>, &'static str> {
+        let hidden = self.expired_fields_view(key);
         let h = hash_key(key);
-        let pairs: Vec<(Bytes, Bytes)> = if let Some(idx) = self.table.find(key, h) {
+        let mut pairs: Vec<(Bytes, Bytes)> = if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
                 return Ok(Vec::new());
             }
@@ -8159,6 +8172,7 @@ impl RudisTable {
         } else {
             return Ok(Vec::new());
         };
+        pairs.retain(|(f, _)| !hidden.hides(f));
 
         if pairs.is_empty() {
             return Ok(Vec::new());
@@ -8209,6 +8223,7 @@ impl RudisTable {
         count: usize,
         no_values: bool,
     ) -> Result<(usize, Vec<Bytes>), &'static str> {
+        let hidden = self.expired_fields_view(key);
         let h = hash_key(key);
         let pairs: Vec<(Bytes, Bytes)> = if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -8247,10 +8262,13 @@ impl RudisTable {
         };
         while idx < pairs.len() && res.len() < limit {
             let (f, v) = &pairs[idx];
-            let matches = match pattern {
-                Some(pat) => crate::pubsub::glob_match(pat, f),
-                None => true,
-            };
+            // Skipped, not removed: cursors index `pairs`, so dropping a
+            // field would shift later ones past a client's cursor.
+            let matches = !hidden.hides(f)
+                && match pattern {
+                    Some(pat) => crate::pubsub::glob_match(pat, f),
+                    None => true,
+                };
             if matches {
                 res.push(f.clone());
                 if !no_values {
@@ -17271,6 +17289,47 @@ mod tests {
         v
     }
 
+    /// HRANDFIELD and HSCAN (which don't purge) skip a field past its
+    /// deadline that active expiry hasn't deleted yet; they used to return
+    /// it. HSCAN keeps its cursor positions.
+    #[test]
+    fn test_hrandfield_and_hscan_skip_expired_fields() {
+        let mut t = RudisTable::new();
+        let h = Bytes::from_static(b"h");
+        let fields: Vec<Bytes> = (0..6).map(|i| Bytes::from(format!("f{i}"))).collect();
+        t.hset(
+            h.clone(),
+            fields
+                .iter()
+                .map(|f| (f.clone(), Bytes::from_static(b"v")))
+                .collect(),
+        )
+        .unwrap();
+        let (_, first) = t.hscan(&h, 0, None, 3, true).unwrap();
+        let gone = first[0].clone();
+        t.hash_field_expires
+            .entry(h.clone())
+            .or_default()
+            .insert(gone.clone(), Instant::now() - Duration::from_millis(5));
+        let picks = t.hrandfield(&h, Some(-200), false).unwrap();
+        assert_eq!(picks.len(), 200);
+        assert!(!picks.contains(&gone));
+        assert_eq!(t.hrandfield(&h, Some(10), false).unwrap().len(), 5);
+        // A scan from the start skips it; one resumed past it still sees
+        // every later field.
+        let (cursor, page1) = t.hscan(&h, 0, None, 3, true).unwrap();
+        assert_eq!(page1[..2], first[1..]);
+        let (_, page2) = t.hscan(&h, cursor, None, 10, true).unwrap();
+        let mut seen: Vec<Bytes> = page1.into_iter().chain(page2).collect();
+        seen.sort();
+        let mut want: Vec<Bytes> = fields.iter().filter(|f| **f != gone).cloned().collect();
+        want.sort();
+        assert_eq!(seen, want);
+        // These reads skip it without deleting it; a purging read deletes it.
+        assert!(t.hash_field_expires[&h].contains_key(&gone));
+        assert_eq!(t.hlen(&h).unwrap(), 5);
+    }
+
     /// On a read-only replica, a hash field past its deadline is kept until
     /// the master's HDEL arrives, but reads treat it as gone (as Redis
     /// replicas do); they used to return it.
@@ -17319,6 +17378,15 @@ mod tests {
         );
         assert_eq!(t.hkeys(&h).unwrap(), vec![f2.clone()]);
         assert_eq!(t.hvals(&h).unwrap(), vec![v2.clone().unwrap()]);
+        assert_eq!(
+            t.httl(&h, true, false, &[f1.clone(), f2.clone()]).unwrap(),
+            vec![-2, -1]
+        );
+        assert_eq!(
+            t.hrandfield(&h, Some(-8), false).unwrap(),
+            vec![f2.clone(); 8]
+        );
+        assert_eq!(t.hscan(&h, 0, None, 10, true).unwrap().1, vec![f2.clone()]);
         // Still stored, for the master's later commands on it.
         assert_eq!(t.hlen(&h).unwrap(), 2);
         {

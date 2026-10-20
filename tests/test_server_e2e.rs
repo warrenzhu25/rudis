@@ -31955,6 +31955,18 @@ fn test_replica_hides_expired_hash_fields_e2e() {
         send_and_read_reply(&mut r, b"HGETALL h\r\n"),
         "*2\r\n$2\r\nf2\r\n$2\r\nv2\r\n"
     );
+    assert_eq!(
+        send_and_read_reply(&mut r, b"HTTL h FIELDS 2 f1 f2\r\n"),
+        "*2\r\n:-2\r\n:-1\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut r, b"HSCAN h 0\r\n"),
+        "*2\r\n$1\r\n0\r\n*2\r\n$2\r\nf2\r\n$2\r\nv2\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut r, b"HRANDFIELD h -3\r\n"),
+        "*3\r\n$2\r\nf2\r\n$2\r\nf2\r\n$2\r\nf2\r\n"
+    );
     // ...but kept, so the master's HPERSIST still applies.
     assert_eq!(
         send_and_read_reply(&mut m, b"HPERSIST h FIELDS 1 f1\r\n"),
