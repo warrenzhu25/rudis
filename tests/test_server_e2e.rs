@@ -31703,3 +31703,120 @@ fn test_pipelined_gets_of_packed_values_across_shards_e2e() {
     assert!(got == want.as_bytes(), "pipelined replies differ");
     drop(srv);
 }
+
+/// A live AOF rewrite over spilled (tiered) values keeps the shard
+/// responsive (each spilled value is read back from disk; a step stops at
+/// its budget, also inside a segment), serves a blocked BLMOVE onto a
+/// spilled list without falling back to a blocking pass (INFO
+/// aof_rewrite_fallbacks stays 0), and loses nothing: the restart from the
+/// AOF matches DEBUG DIGEST.
+#[test]
+fn test_live_rewrite_over_spilled_values_e2e() {
+    let port = 18053u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-tierrw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--enable-debug-command",
+        "yes",
+    ];
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        c
+    };
+    let mut c = connect();
+    let mut pipe = String::new();
+    for i in 0..20000 {
+        pipe.push_str(&format!(
+            "RPUSH l{i} {}{i}\r\nSET s{i} {}{i}\r\n",
+            "x".repeat(100),
+            "v".repeat(200)
+        ));
+    }
+    c.write_all(pipe.as_bytes()).unwrap();
+    let mut replies = vec![0u8; 20000 * (4 + 5)];
+    c.read_exact(&mut replies).unwrap();
+    assert!(send_and_read_reply(&mut c, b"TIER SPILLALL\r\n").starts_with(':'));
+    // Slow the walk so the rewrite is still building its image below.
+    assert_eq!(
+        send_and_read_reply(&mut c, b"CONFIG SET rdb-key-save-delay 2000\r\n"),
+        "+OK\r\n"
+    );
+    let mut blocked = connect();
+    blocked
+        .write_all(b"BLMOVE src l19999 LEFT RIGHT 0\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert!(send_and_read_reply(&mut c, b"BGREWRITEAOF\r\n").starts_with('+'));
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        send_and_read_reply(&mut c, b"INFO persistence\r\n").contains("aof_rewrite_in_progress:1")
+    );
+    assert_eq!(
+        send_and_read_reply(&mut c, b"LPUSH src moved\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(read_full_reply(&mut blocked), "$5\r\nmoved\r\n");
+    let mut worst = Duration::ZERO;
+    for i in 0..200 {
+        let cmd = format!(
+            "LPUSH l{} new{i}\r\nAPPEND s{} z\r\n",
+            i * 13 % 20000,
+            i * 7 % 20000
+        );
+        for line in cmd.split_inclusive("\r\n") {
+            let t = std::time::Instant::now();
+            send_and_read_reply(&mut c, line.as_bytes());
+            worst = worst.max(t.elapsed());
+        }
+    }
+    eprintln!("worst command during the rewrite: {worst:?}");
+    // A whole segment of spilled values read back in one step took ~50 ms
+    // here (debug build); now a step stops at its budget.
+    assert!(
+        worst < Duration::from_millis(25),
+        "a command took {worst:?} during the rewrite"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut c, b"CONFIG SET rdb-key-save-delay 0\r\n"),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let info = send_and_read_reply(&mut c, b"INFO persistence\r\n");
+        if info.contains("aof_rewrite_in_progress:0") {
+            assert!(info.contains("aof_last_bgrewrite_status:ok"), "{info}");
+            assert!(info.contains("aof_rewrite_fallbacks:0\r\n"), "{info}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rewrite never finished"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let digest = send_and_read_reply(&mut c, b"DEBUG DIGEST\r\n");
+    drop(srv);
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = connect();
+    assert_eq!(
+        send_and_read_reply(&mut c, b"DEBUG DIGEST\r\n"),
+        digest,
+        "restart from AOF"
+    );
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

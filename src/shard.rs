@@ -3082,6 +3082,16 @@ impl ShardDb {
         clock: &RdbClock,
         buf: &mut Vec<u8>,
     ) -> Result<(), TieredReadError> {
+        Self::save_rdb_entry_with(entry, clock, buf, |ptr| self.hydrate_tiered(ptr))
+    }
+
+    /// [`Self::save_rdb_entry`] reading tiered values with `hydrate`.
+    fn save_rdb_entry_with(
+        entry: &crate::table::RudisEntry,
+        clock: &RdbClock,
+        buf: &mut Vec<u8>,
+        hydrate: impl FnOnce(crate::table::TieredPointer) -> Option<crate::table::RudisValue>,
+    ) -> Result<(), TieredReadError> {
         if let Some(exp) = entry.expire_at()
             && exp <= clock.now
             && !clock.keep_expired
@@ -3094,7 +3104,7 @@ impl ShardDb {
         // snapshot: like Redis, a save that cannot write every key must not
         // produce (and rename into place) a file missing that key.
         let hydrated = match &entry.val {
-            crate::table::RudisValue::Tiered(ptr) => match self.hydrate_tiered(**ptr) {
+            crate::table::RudisValue::Tiered(ptr) => match hydrate(**ptr) {
                 Some(val) => Some(val),
                 None => {
                     let err = TieredReadError {
@@ -3108,22 +3118,6 @@ impl ShardDb {
         };
         Self::write_rdb_value(entry, hydrated.as_ref().unwrap_or(&entry.val), clock, buf);
         Ok(())
-    }
-
-    /// [`Self::save_rdb_entry`] for an entry whose value is in memory (not
-    /// [`crate::table::RudisValue::Tiered`]).
-    fn save_rdb_entry_untiered(
-        entry: &crate::table::RudisEntry,
-        clock: &RdbClock,
-        buf: &mut Vec<u8>,
-    ) {
-        if let Some(exp) = entry.expire_at()
-            && exp <= clock.now
-            && !clock.keep_expired
-        {
-            return;
-        }
-        Self::write_rdb_value(entry, &entry.val, clock, buf);
     }
 
     fn write_rdb_value(
@@ -3153,9 +3147,7 @@ impl ShardDb {
     /// `serialize_val_payload` form. The record's CRC and header type are
     /// checked by the tier manager; the payload's own type tag must agree.
     fn read_tiered_payload(&self, ptr: crate::table::TieredPointer) -> Option<Vec<u8>> {
-        let tm = self.tier_manager.as_ref()?;
-        let (_, raw) = tm.read_ptr_sync(ptr).ok()?;
-        (raw.first() == Some(&ptr.value_type)).then_some(raw)
+        read_tiered_payload_from(self.tier_manager.as_deref()?, ptr)
     }
 
     /// Reads and decodes a tiered value, for paths that need the value itself
@@ -4864,6 +4856,27 @@ impl RdbSaveCursor {
     }
 }
 
+/// A tiered record's value payload read from `tm` (see
+/// [`ShardDb::read_tiered_payload`]).
+fn read_tiered_payload_from(
+    tm: &crate::tiering::ShardTierManager,
+    ptr: crate::table::TieredPointer,
+) -> Option<Vec<u8>> {
+    let (_, raw) = tm.read_ptr_sync(ptr).ok()?;
+    (raw.first() == Some(&ptr.value_type)).then_some(raw)
+}
+
+/// A tiered value read back from `tm` and decoded (see
+/// [`ShardDb::hydrate_tiered`]).
+fn hydrate_tiered_from(
+    tm: &crate::tiering::ShardTierManager,
+    ptr: crate::table::TieredPointer,
+) -> Option<crate::table::RudisValue> {
+    let raw = read_tiered_payload_from(tm, ptr)?;
+    let (val, used) = crate::table::RudisTable::deserialize_val_payload(&raw).ok()?;
+    (used == raw.len()).then_some(val)
+}
+
 /// An extended structure an AOF image writes on its own (see
 /// [`ShardDb::ext_item_keys`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -4909,9 +4922,13 @@ pub struct AofImage {
     deferred_dbs: Vec<u8>,
     deferred_ext: Vec<u8>,
     done: bool,
-    /// Why the image can no longer be trusted (e.g. SWAPDB, a tiered value
-    /// written outside a command): the rewrite then falls back to a
-    /// blocking pass.
+    /// The shard's port (for its snapshot clock) and tier, to read spilled
+    /// values back where only a table is at hand ([`before_write_table`]).
+    port: u16,
+    tier: Option<std::rc::Rc<crate::tiering::ShardTierManager>>,
+    /// Why the image can no longer be trusted (e.g. SWAPDB, a spilled value
+    /// that can't be read back): the rewrite then falls back to a blocking
+    /// pass.
     poisoned: Option<String>,
 }
 
@@ -4977,6 +4994,8 @@ impl AofImage {
             deferred_dbs,
             deferred_ext,
             done: false,
+            port: db.port,
+            tier: db.tier_manager.clone(),
             poisoned: None,
         })
     }
@@ -5008,7 +5027,10 @@ impl AofImage {
         {
             first = false;
             if self.cur < self.walks.len() {
-                self.step_walk(db, &clock).map_err(|e| e.to_string())?;
+                // No deadline for an unbounded budget (a one-pass rewrite).
+                let deadline = clock.now.checked_add(budget);
+                self.step_walk(db, &clock, deadline)
+                    .map_err(|e| e.to_string())?;
             } else if let Some((kind, key)) = self.ext_pending.pop_front() {
                 if !self.ext_done.remove(&(kind, key.clone())) {
                     let mut records = Vec::new();
@@ -5028,7 +5050,12 @@ impl AofImage {
 
     /// Writes one segment of the current DB walk (or, if its table was
     /// renumbered, all its keys not written yet).
-    fn step_walk(&mut self, db: &ShardDb, clock: &RdbClock) -> Result<(), TieredReadError> {
+    fn step_walk(
+        &mut self,
+        db: &ShardDb,
+        clock: &RdbClock,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), TieredReadError> {
         let w = &self.walks[self.cur];
         let db_idx = w.db_idx;
         let Some(table) = db.table_for_db(db_idx) else {
@@ -5050,12 +5077,39 @@ impl AofImage {
             w.done = true;
         } else if w.seg < table.segment_count() {
             if let Some((depth, bits)) = table.segment_pattern(w.seg) {
+                let mut written = 0usize;
+                let mut paused = false;
                 if !w.written.covers(depth, bits) {
                     for entry in table.segment_entries(w.seg) {
-                        if !w.skip.contains(&entry.key[..]) {
-                            db.save_rdb_entry(entry, clock, &mut self.buf)?;
+                        if w.skip.contains(&entry.key[..]) {
+                            continue;
                         }
+                        // A spilled value is read back from disk, on this
+                        // thread: past the step's budget, stop at one and
+                        // finish the segment in a later step.
+                        if written > 0
+                            && matches!(entry.val, crate::table::RudisValue::Tiered(_))
+                            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+                        {
+                            paused = true;
+                            break;
+                        }
+                        db.save_rdb_entry(entry, clock, &mut self.buf)?;
+                        written += 1;
                     }
+                }
+                if paused {
+                    // What this step wrote counts as written out of order
+                    // (the segment is not covered yet). Nothing changed
+                    // since, so the same iteration yields the same keys.
+                    let done: Vec<bytes::Bytes> = table
+                        .segment_entries(w.seg)
+                        .filter(|e| !w.skip.contains(&e.key[..]))
+                        .take(written)
+                        .map(|e| bytes::Bytes::copy_from_slice(&e.key))
+                        .collect();
+                    w.skip.extend(done);
+                    return Ok(());
                 }
                 w.written.insert(depth, bits);
             }
@@ -5216,22 +5270,19 @@ pub fn before_write_in(db: &ShardDb, db_idx: usize, key: &[u8]) {
 }
 
 /// [`before_write`] where only DB `db_idx`'s table is at hand (serving a
-/// blocked client). A tiered value can't be read back from here: the image
-/// is poisoned instead.
+/// blocked client); spilled values are read back through the image's own
+/// handle on the shard's tier.
 pub fn before_write_table(table: &crate::table::RudisTable, db_idx: usize, key: &[u8]) {
     if !aof_image_active() {
         return;
     }
     with_aof_image(|img| {
-        let clock = RdbClock::now(0);
+        let clock = RdbClock::now(img.port);
+        let tier = img.tier.clone();
         img.cover_key(db_idx, table, key, |entry, buf| {
-            if matches!(entry.val, crate::table::RudisValue::Tiered(_)) {
-                return Err(TieredReadError {
-                    key: bytes::Bytes::copy_from_slice(&entry.key),
-                });
-            }
-            ShardDb::save_rdb_entry_untiered(entry, &clock, buf);
-            Ok(())
+            ShardDb::save_rdb_entry_with(entry, &clock, buf, |ptr| {
+                hydrate_tiered_from(tier.as_deref()?, ptr)
+            })
         });
     });
 }
@@ -5271,6 +5322,73 @@ mod tests {
             assert_eq!(out, *w);
         }
         assert_eq!(replies[17].clone().into_vec(), want[17]);
+    }
+
+    /// With spilled values, an AOF image's walk pauses inside a segment once
+    /// its step's budget is spent (each spilled value is a disk read on the
+    /// shard thread; a whole segment of them stalled the shard), and the
+    /// blocked-client hook reads a spilled value back itself instead of
+    /// giving up on the image. The image still holds every key once.
+    #[test]
+    fn test_aof_image_with_spilled_values() {
+        let dir = std::env::temp_dir().join(format!("rudis-img-tier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut db = ShardDb::new(0);
+            let tm = std::rc::Rc::new(
+                crate::tiering::ShardTierManager::open(0, 55561, &dir.join("tier"))
+                    .await
+                    .unwrap(),
+            );
+            db.tier_manager = Some(tm.clone());
+            let n = 3000;
+            for i in 0..n {
+                let key = Bytes::from(format!("l{i}"));
+                db.rpush(key.clone(), vec![Bytes::from(format!("v{i}"))])
+                    .unwrap();
+                let (payload, val_type) = db.table.get_value_for_spill(&key).unwrap();
+                let ptr = tm.stash_record(&key, &payload, val_type).await.unwrap();
+                assert!(db.table.set_tiered_pointer(&key, ptr));
+            }
+            let segments = db.table.segment_count();
+            install_aof_image(AofImage::start(&db).unwrap());
+            // A blocked client is served on a spilled key: written as is.
+            before_write_table(&db.table, 0, b"l7");
+            let mut image = Vec::new();
+            let mut steps = 0;
+            loop {
+                let (piece, done) = with_aof_image(|img| img.step(&db, Duration::ZERO, 1 << 30))
+                    .unwrap()
+                    .unwrap();
+                image.extend(piece.unwrap_or_default());
+                steps += 1;
+                if done {
+                    break;
+                }
+            }
+            assert!(
+                steps > segments * 2,
+                "{steps} steps for {segments} segments: no pause inside a segment"
+            );
+            image.extend(take_aof_image().unwrap().finish().unwrap());
+            let crc = crate::table::crc64(&image);
+            image.extend_from_slice(&crc.to_le_bytes());
+            let mut loaded = ShardDb::new(0);
+            crate::table::load_rdb_bytes(&image, &mut loaded, 0, 1).unwrap();
+            assert_eq!(loaded.table.len(), n);
+            for i in [0, 7, 1234, n - 1] {
+                assert_eq!(
+                    loaded.lrange(format!("l{i}").as_bytes(), 0, -1).unwrap(),
+                    vec![Bytes::from(format!("v{i}"))]
+                );
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -11549,7 +11549,7 @@ async fn execute_command_inner(
             let persistence_str = format!(
                 // The fork/COW fields are always 0: snapshots are taken in
                 // place, without a child process.
-                "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:{}\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\naof_rewrites:{}\r\naof_rewrites_consecutive_failures:{}\r\n{}unpropagated_changes:{}\r\n",
+                "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:{}\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\naof_rewrites:{}\r\naof_rewrites_consecutive_failures:{}\r\naof_rewrite_fallbacks:{}\r\n{}unpropagated_changes:{}\r\n",
                 u8::from(crate::replication::is_loading(router.port)),
                 snap.changes_since_last_save(),
                 u8::from(
@@ -11570,6 +11570,8 @@ async fn execute_command_inner(
                 },
                 aof_rw.rewrites(),
                 aof_rw.consecutive_failures(),
+                // Live rewrites that had to fall back to a blocking pass.
+                crate::aof::LIVE_REWRITE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
                 // Redis lists these only while the AOF is on.
                 if router.aof.is_some() {
                     format!(
