@@ -31639,3 +31639,67 @@ fn test_packed_string_values_of_every_length_round_trip_e2e() {
     }
     drop(srv);
 }
+
+/// Pipelined GETs and MGETs of packed (25-255 byte ASCII) values across
+/// shards, many more than one reply slab holds, all come back intact.
+#[test]
+fn test_pipelined_gets_of_packed_values_across_shards_e2e() {
+    let port = 18052u16;
+    let ps = port.to_string();
+    let srv = ServerGuard(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "4", "--no-pin"],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let value = |i: usize| -> String {
+        let n = 30 + i % 200;
+        (0..n)
+            .map(|j| (b'A' + ((i * 7 + j) % 26) as u8) as char)
+            .collect()
+    };
+    let keys = 3000usize;
+    let mut set = Vec::new();
+    for i in 0..keys {
+        let v = value(i);
+        set.extend_from_slice(
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\npk:{i}\r\n${}\r\n{v}\r\n",
+                format!("pk:{i}").len(),
+                v.len()
+            )
+            .as_bytes(),
+        );
+    }
+    c.write_all(&set).unwrap();
+    let mut want = String::new();
+    for _ in 0..keys {
+        want.push_str("+OK\r\n");
+    }
+    let mut got = vec![0u8; want.len()];
+    c.read_exact(&mut got).unwrap();
+    assert_eq!(String::from_utf8_lossy(&got), want);
+    // GETs, then MGETs of 5 keys, all in one pipeline.
+    let mut req = String::new();
+    let mut want = String::new();
+    for i in 0..keys {
+        req.push_str(&format!("GET pk:{i}\r\n"));
+        let v = value(i);
+        want.push_str(&format!("${}\r\n{v}\r\n", v.len()));
+    }
+    for i in (0..keys).step_by(5) {
+        req.push_str("MGET");
+        want.push_str("*5\r\n");
+        for k in i..i + 5 {
+            req.push_str(&format!(" pk:{k}"));
+            let v = value(k);
+            want.push_str(&format!("${}\r\n{v}\r\n", v.len()));
+        }
+        req.push_str("\r\n");
+    }
+    c.write_all(req.as_bytes()).unwrap();
+    let mut got = vec![0u8; want.len()];
+    c.read_exact(&mut got).unwrap();
+    assert!(got == want.as_bytes(), "pipelined replies differ");
+    drop(srv);
+}

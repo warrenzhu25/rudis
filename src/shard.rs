@@ -31,6 +31,33 @@ fn prefetch_bytes(b: &[u8]) {
     let _ = b;
 }
 
+/// The RESP bulk reply of a 7-bit packed value, unpacked into this
+/// thread's reply slab (see [`REPLY_SLAB`]): a slice of a shared
+/// allocation instead of a `Vec` of its own.
+fn packed_reply_from_slab(s: &crate::compact::CompactStr) -> Bytes {
+    REPLY_SLAB.with(|cell| {
+        let (slab, scratch) = &mut *cell.borrow_mut();
+        scratch.clear();
+        s.write_resp_bulk(scratch);
+        if slab.capacity() - slab.len() < scratch.len() {
+            *slab = bytes::BytesMut::with_capacity(REPLY_SLAB_BYTES.max(scratch.len()));
+        }
+        slab.extend_from_slice(scratch);
+        slab.split().freeze()
+    })
+}
+
+/// Bytes of each reply slab.
+const REPLY_SLAB_BYTES: usize = 256 << 10;
+
+thread_local! {
+    /// Replies of packed values (unpacked, encoded) for other shards' batches:
+    /// carved from one allocation per slab instead of one `Vec` per reply,
+    /// which the batch's owner freed on its core. Plus a scratch buffer.
+    static REPLY_SLAB: std::cell::RefCell<(bytes::BytesMut, Vec<u8>)> =
+        std::cell::RefCell::new((bytes::BytesMut::new(), Vec::new()));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactResp {
     Small { len: u8, data: [u8; 30] },
@@ -134,10 +161,7 @@ impl CompactResp {
     #[inline(always)]
     pub fn from_compact_str(s: &crate::compact::CompactStr) -> Self {
         if s.is_heap_packed() {
-            // Unpack once, straight into the encoded reply.
-            let mut v = Vec::with_capacity(s.len() + 8);
-            s.write_resp_bulk(&mut v);
-            return CompactResp::Big(v);
+            return CompactResp::RawBytes(packed_reply_from_slab(s));
         }
         Self::from_bulk_with(&s.view(), || s.to_bytes())
     }
@@ -5218,6 +5242,36 @@ const RDB_FLUSH_BYTES: usize = 4 << 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replies of packed values come from a shared slab, but each is its
+    /// own, unchanged by later replies (also across a slab refill), and
+    /// equals the value's RESP encoding.
+    #[test]
+    fn test_packed_value_replies_from_the_slab_stay_intact() {
+        let mut replies = Vec::new();
+        let mut want = Vec::new();
+        // ~1.3 MB of replies: several slabs.
+        for i in 0..6000usize {
+            let n = crate::compact::HEAP_PACK_MIN + i % 200;
+            let v: Vec<u8> = (0..n).map(|j| b'a' + ((i + j) % 26) as u8).collect();
+            let s = crate::compact::CompactStr::new(&v);
+            if !s.is_heap_packed() {
+                continue;
+            }
+            let mut enc = Vec::new();
+            s.write_resp_bulk(&mut enc);
+            replies.push(CompactResp::from_compact_str(&s));
+            want.push(enc);
+        }
+        assert!(replies.len() > 2000, "{} packed", replies.len());
+        for (r, w) in replies.iter().zip(&want) {
+            assert_eq!(r.as_slice(), &w[..]);
+            let mut out = Vec::new();
+            r.write_to(&mut out);
+            assert_eq!(out, *w);
+        }
+        assert_eq!(replies[17].clone().into_vec(), want[17]);
+    }
 
     #[test]
     fn test_compact_resp_prefetch_leaves_replies_unchanged() {
