@@ -32130,3 +32130,140 @@ fn test_full_sync_over_2gib_e2e() {
     }
     drop(master);
 }
+
+/// Reads one RESP array command (as a replica sends during its handshake)
+/// from `s`, returning its arguments.
+fn read_resp_command(s: &mut TcpStream) -> Vec<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    let mut read_line = |s: &mut TcpStream, line: &mut Vec<u8>| {
+        line.clear();
+        while !line.ends_with(b"\r\n") {
+            assert_eq!(
+                s.read(&mut byte).unwrap(),
+                1,
+                "replica closed the connection"
+            );
+            line.push(byte[0]);
+        }
+    };
+    read_line(s, &mut line);
+    assert_eq!(line[0], b'*', "{:?}", String::from_utf8_lossy(&line));
+    let n: usize = std::str::from_utf8(&line[1..line.len() - 2])
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut args = Vec::new();
+    for _ in 0..n {
+        read_line(s, &mut line);
+        let len: usize = std::str::from_utf8(&line[1..line.len() - 2])
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut arg = vec![0u8; len + 2];
+        s.read_exact(&mut arg).unwrap();
+        arg.truncate(len);
+        args.push(String::from_utf8(arg).unwrap());
+    }
+    args
+}
+
+/// A replica takes a diskless full sync (`$EOF:<mark>` instead of a length,
+/// as masters stream it) and advertises that it can (`REPLCONF capa eof`).
+/// The stream that follows the mark in the same write applies too. Such a
+/// transfer used to be refused, so the replica could not sync.
+#[test]
+fn test_replica_takes_eof_mark_full_sync_e2e() {
+    // A real snapshot to send: fetched from a server with a raw PSYNC.
+    let sp = 18060u16;
+    let sps = sp.to_string();
+    let source = ServerGuard(spawn_rudis_listening(
+        &["--port", &sps, "--threads", "2", "--no-pin"],
+        sp,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", sp)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(send_and_read_reply(&mut c, b"SET k v\r\n"), "+OK\r\n");
+    c.write_all(b"PSYNC ? -1\r\n").unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while head.iter().filter(|&&b| b == b'\n').count() < 2 {
+        assert_eq!(c.read(&mut byte).unwrap(), 1);
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let len: usize = head.lines().nth(1).unwrap()[1..].parse().unwrap();
+    let mut rdb = vec![0u8; len];
+    c.read_exact(&mut rdb).unwrap();
+    drop(c);
+    drop(source);
+
+    // A fake master serving it as a diskless transfer.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mport = listener.local_addr().unwrap().port().to_string();
+    let master = thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut capas = Vec::new();
+        loop {
+            let args = read_resp_command(&mut s);
+            match args[0].to_ascii_uppercase().as_str() {
+                "PING" => s.write_all(b"+PONG\r\n").unwrap(),
+                "REPLCONF" => {
+                    if args[1].eq_ignore_ascii_case("capa") {
+                        capas.extend(
+                            args[2..]
+                                .iter()
+                                .filter(|a| !a.eq_ignore_ascii_case("capa"))
+                                .cloned(),
+                        );
+                    }
+                    s.write_all(b"+OK\r\n").unwrap();
+                }
+                "PSYNC" => break,
+                other => panic!("unexpected handshake command {other}"),
+            }
+        }
+        let mark = "0123456789abcdefghij0123456789ABCDEFGHIJ";
+        let mut out = format!("+FULLRESYNC {} 0\r\n$EOF:{mark}\r\n", "f".repeat(40)).into_bytes();
+        out.extend_from_slice(&rdb);
+        out.extend_from_slice(mark.as_bytes());
+        out.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$2\r\nv2\r\n");
+        s.write_all(&out).unwrap();
+        thread::sleep(Duration::from_secs(5));
+        capas
+    });
+
+    let rp = 18061u16;
+    let rps = rp.to_string();
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mport,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while send_and_read_reply(&mut r, b"GET k2\r\n") != "$2\r\nv2\r\n" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replica never applied the sync"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(send_and_read_reply(&mut r, b"GET k\r\n"), "$1\r\nv\r\n");
+    let capas = master.join().unwrap();
+    assert!(
+        capas.iter().any(|c| c.eq_ignore_ascii_case("eof")),
+        "capas: {capas:?}"
+    );
+    drop(replica);
+}

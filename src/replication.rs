@@ -2282,11 +2282,23 @@ fn take_repl_line(buf: &mut bytes::BytesMut) -> Result<Option<bytes::BytesMut>, 
     }
 }
 
-/// Takes the `$<len>` line that precedes a full-sync RDB, skipping the bare
-/// `\n` keepalives Redis masters send while producing it. A length that is
-/// not a plain number (including diskless `$EOF:` transfers, which are not
-/// supported) is an error.
-fn take_rdb_header(buf: &mut bytes::BytesMut) -> Result<Option<usize>, ()> {
+/// How a full-sync RDB is delimited.
+#[derive(Debug, PartialEq, Eq)]
+enum RdbLen {
+    /// `$<len>`: exactly this many bytes.
+    Bytes(usize),
+    /// `$EOF:<mark>` (diskless, streamed): the RDB ends where these 40
+    /// bytes come next.
+    Mark([u8; RDB_EOF_MARK_LEN]),
+}
+
+/// Length of the random delimiter of a `$EOF:` transfer.
+const RDB_EOF_MARK_LEN: usize = 40;
+
+/// Takes the `$<len>` or `$EOF:<mark>` line that precedes a full-sync RDB,
+/// skipping the bare `\n` keepalives Redis masters send while producing
+/// it. Anything else is an error.
+fn take_rdb_header(buf: &mut bytes::BytesMut) -> Result<Option<RdbLen>, ()> {
     loop {
         let keepalives = buf.iter().take_while(|&&b| b == b'\n').count();
         bytes::Buf::advance(buf, keepalives);
@@ -2294,11 +2306,28 @@ fn take_rdb_header(buf: &mut bytes::BytesMut) -> Result<Option<usize>, ()> {
             return Ok(None);
         };
         if let Some(len) = line.strip_prefix(b"$") {
-            return crate::resp::parse_decimal_bytes(&len[..len.len() - 2])
-                .map(Some)
+            let len = &len[..len.len() - 2];
+            if let Some(mark) = len.strip_prefix(b"EOF:") {
+                return <[u8; RDB_EOF_MARK_LEN]>::try_from(mark)
+                    .map(|m| Some(RdbLen::Mark(m)))
+                    .map_err(|_| ());
+            }
+            return crate::resp::parse_decimal_bytes(len)
+                .map(|n| Some(RdbLen::Bytes(n)))
                 .ok_or(());
         }
     }
+}
+
+/// Where an `$EOF:` transfer's RDB ends in `buf`, if its mark has arrived.
+/// `from` is how much of `buf` was searched before (the mark may straddle
+/// two reads, so the search restarts up to 39 bytes back).
+fn find_rdb_eof_mark(buf: &[u8], mark: &[u8; RDB_EOF_MARK_LEN], from: usize) -> Option<usize> {
+    let start = from.saturating_sub(RDB_EOF_MARK_LEN - 1);
+    buf.get(start..)?
+        .windows(RDB_EOF_MARK_LEN)
+        .position(|w| w == mark)
+        .map(|p| start + p)
 }
 
 /// A replication id as masters send it: 40 alphanumeric characters.
@@ -2558,8 +2587,11 @@ async fn run_replica_worker(
             }
         }
 
-        // 3. REPLCONF capa psync2
-        let line = send_and_expect_line!(b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n");
+        // 3. REPLCONF capa eof capa psync2 (eof: we take diskless `$EOF:`
+        // transfers)
+        let line = send_and_expect_line!(
+            b"*5\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$3\r\neof\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
+        );
         if !line.starts_with(b"+OK") {
             if log_attempt {
                 crate::log_warning!(
@@ -2648,7 +2680,7 @@ async fn run_replica_worker(
             // next attempt is a full one too.
             hub.cached_master.store(false, Ordering::Relaxed);
             // 5. Read RDB header: $<len>\r\n
-            let rdb_len = loop {
+            let rdb_header = loop {
                 match take_rdb_header(&mut buf) {
                     Ok(Some(len)) => break Some(len),
                     Ok(None) => {}
@@ -2666,7 +2698,7 @@ async fn run_replica_worker(
                 }
             };
 
-            let rdb_len = match rdb_len {
+            let rdb_header = match rdb_header {
                 Some(l) => l,
                 None => {
                     crate::log_warning!(
@@ -2687,19 +2719,26 @@ async fn run_replica_worker(
                 }
             };
 
-            crate::log_notice!(
-                "MASTER <-> REPLICA sync: receiving {} bytes from master to memory",
-                rdb_len
-            );
-            // 6. Read rdb_len bytes
+            // 6. Read the RDB: `rdb_len` bytes, or up to the EOF mark.
             let mut read_failed = false;
-            while buf.len() < rdb_len {
+            let mut searched = 0;
+            let rdb_len = loop {
+                match &rdb_header {
+                    RdbLen::Bytes(n) if buf.len() >= *n => break *n,
+                    RdbLen::Bytes(_) => {}
+                    RdbLen::Mark(mark) => {
+                        if let Some(end) = find_rdb_eof_mark(&buf, mark, searched) {
+                            break end;
+                        }
+                        searched = buf.len();
+                    }
+                }
                 let (res, returned) = stream.read(read_buf).await;
                 read_buf = returned;
                 match res {
                     Ok(0) | Err(_) => {
                         read_failed = true;
-                        break;
+                        break 0;
                     }
                     Ok(n) => {
                         hub.last_master_io_secs
@@ -2707,7 +2746,7 @@ async fn run_replica_worker(
                         buf.extend_from_slice(&read_buf[..n]);
                     }
                 }
-            }
+            };
             if read_failed {
                 crate::log_warning!("I/O error trying to sync with MASTER: connection lost");
                 if let ReplicationRole::Slave {
@@ -2725,6 +2764,13 @@ async fn run_replica_worker(
             }
 
             let rdb_bytes = buf.split_to(rdb_len).freeze();
+            if matches!(rdb_header, RdbLen::Mark(_)) {
+                bytes::Buf::advance(&mut buf, RDB_EOF_MARK_LEN);
+            }
+            crate::log_notice!(
+                "MASTER <-> REPLICA sync: received {} bytes from master to memory",
+                rdb_len
+            );
 
             // 7. Restore RDB into router. A failed load leaves the dataset
             // empty; forget the master's history too, so the next attempt
@@ -3662,10 +3708,40 @@ mod tests {
         );
     }
 
+    /// A diskless `$EOF:<mark>` transfer: the RDB ends where the 40-byte
+    /// mark comes, even when the mark arrives split across reads and the
+    /// stream follows it in the same read. Such transfers were refused, so
+    /// a replica could not take a streamed full sync.
+    #[test]
+    fn test_rdb_eof_mark_transfer() {
+        let mark = *b"0123456789abcdefghij0123456789ABCDEFGHIJ";
+        let mut buf =
+            BytesMut::from(&b"\n$EOF:0123456789abcdefghij0123456789ABCDEFGHIJ\r\nREDIS"[..]);
+        assert_eq!(take_rdb_header(&mut buf), Ok(Some(RdbLen::Mark(mark))));
+        assert_eq!(&buf[..], b"REDIS");
+        let mut data = b"REDIS0011-payload-".to_vec();
+        let rdb_len = data.len();
+        data.extend_from_slice(&mark);
+        data.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        // Fed in reads that cut the mark at every position.
+        for cut in 0..data.len() {
+            let (mut seen, mut searched, mut found) = (Vec::new(), 0, None);
+            for part in [&data[..cut], &data[cut..]] {
+                seen.extend_from_slice(part);
+                if found.is_none() {
+                    found = find_rdb_eof_mark(&seen, &mark, searched);
+                    searched = seen.len();
+                }
+            }
+            assert_eq!(found, Some(rdb_len), "cut at {cut}");
+        }
+        assert_eq!(find_rdb_eof_mark(b"REDIS no mark here", &mark, 0), None);
+    }
+
     #[test]
     fn test_take_rdb_header_rejects_bad_lengths() {
         let mut buf = BytesMut::from(&b"\n\n\n$5\r\nREDIS"[..]);
-        assert_eq!(take_rdb_header(&mut buf), Ok(Some(5)));
+        assert_eq!(take_rdb_header(&mut buf), Ok(Some(RdbLen::Bytes(5))));
         assert_eq!(&buf[..], b"REDIS");
         let mut buf = BytesMut::from(&b"\n\n$12"[..]);
         assert_eq!(take_rdb_header(&mut buf), Ok(None));
@@ -3675,7 +3751,8 @@ mod tests {
             b"$-1\r\n",
             b"$+5\r\n",
             b"$ 5\r\n",
-            b"$EOF:0123456789012345678901234567890123456789\r\n",
+            b"$EOF:012345678901234567890123456789012345678\r\n",
+            b"$EOF:01234567890123456789012345678901234567890\r\n",
             b"$99999999999999999999999\r\n",
         ] {
             assert_eq!(
