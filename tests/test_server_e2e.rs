@@ -31884,3 +31884,87 @@ fn test_restart_near_maxmemory_keeps_keys_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// On a replica, a hash field past its deadline reads as gone even before
+/// the master's HDEL arrives (as Redis replicas answer), but stays stored
+/// so the master's later commands on it still apply. Reads used to return
+/// it until the master expired it.
+#[test]
+fn test_replica_hides_expired_hash_fields_e2e() {
+    let (mp, rp) = (18055u16, 18056u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let master = ServerGuard(spawn_rudis_listening(
+        &["--port", &mps, "--threads", "2", "--no-pin"],
+        mp,
+    ));
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !send_and_read_reply(&mut r, b"INFO replication\r\n").contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Let the replica's cron see its role.
+    thread::sleep(Duration::from_millis(300));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Keep the master from deleting the field, so no HDEL reaches the replica.
+    assert_eq!(
+        send_and_read_reply(&mut m, b"DEBUG SET-ACTIVE-EXPIRE 0\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut m, b"DEBUG SET-ALLOW-ACCESS-EXPIRED 1\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut m, b"HSET h f1 v1 f2 v2\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut m, b"HPEXPIRE h 300 FIELDS 1 f1\r\n"),
+        "*1\r\n:1\r\n"
+    );
+    assert_eq!(send_and_read_reply(&mut m, b"WAIT 1 2000\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut r, b"HGET h f1\r\n"),
+        "$2\r\nv1\r\n"
+    );
+    thread::sleep(Duration::from_millis(500));
+    // Expired: hidden from reads on the replica...
+    assert_eq!(send_and_read_reply(&mut r, b"HGET h f1\r\n"), "$-1\r\n");
+    assert_eq!(send_and_read_reply(&mut r, b"HEXISTS h f1\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut r, b"HMGET h f1 f2\r\n"),
+        "*2\r\n$-1\r\n$2\r\nv2\r\n"
+    );
+    assert_eq!(
+        send_and_read_reply(&mut r, b"HGETALL h\r\n"),
+        "*2\r\n$2\r\nf2\r\n$2\r\nv2\r\n"
+    );
+    // ...but kept, so the master's HPERSIST still applies.
+    assert_eq!(
+        send_and_read_reply(&mut m, b"HPERSIST h FIELDS 1 f1\r\n"),
+        "*1\r\n:1\r\n"
+    );
+    assert_eq!(send_and_read_reply(&mut m, b"WAIT 1 2000\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut r, b"HGET h f1\r\n"),
+        "$2\r\nv1\r\n"
+    );
+    drop(replica);
+    drop(master);
+}

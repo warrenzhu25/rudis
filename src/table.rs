@@ -3400,6 +3400,19 @@ impl std::ops::AddAssign for MemoryBreakdown {
     }
 }
 
+/// Hash fields a read must skip (see `RudisTable::replica_hidden_fields`).
+/// Almost always empty: only a read-only replica holding expired fields
+/// that its master hasn't deleted yet fills it.
+#[derive(Default)]
+struct HiddenFields(smallvec::SmallVec<[Bytes; 2]>);
+
+impl HiddenFields {
+    #[inline]
+    fn hides(&self, field: &[u8]) -> bool {
+        !self.0.is_empty() && self.0.iter().any(|f| f.as_ref() == field)
+    }
+}
+
 /// The complete thread-local Rudis storage engine unifying:
 /// 1. Flat SIMD-accelerated hash table (`RudisFlatTable`)
 /// 2. Inlined TTL expiration
@@ -6573,6 +6586,26 @@ impl RudisTable {
         Ok(1)
     }
 
+    /// Fields of `key` a read-only replica's clients must not see: past
+    /// their deadline, but kept (see [`Self::purge_expired_hash_fields`])
+    /// until the master's HDEL arrives. Redis replicas answer reads the
+    /// same way. Empty on a master, and while the master's stream applies.
+    fn replica_hidden_fields(&self, key: &[u8]) -> HiddenFields {
+        if !crate::replication::hide_expired_keys() || crate::connection::access_expired_allowed() {
+            return HiddenFields::default();
+        }
+        let Some(fmap) = self.hash_field_expires.get(key) else {
+            return HiddenFields::default();
+        };
+        let now = Instant::now();
+        HiddenFields(
+            fmap.iter()
+                .filter(|(_, exp)| now >= **exp)
+                .map(|(f, _)| f.clone())
+                .collect(),
+        )
+    }
+
     pub fn purge_expired_hash_fields(&mut self, key: &[u8]) {
         // Nothing expires while writes are re-applied, and a read-only
         // replica waits for its master's HDEL (like keys: see
@@ -7354,6 +7387,9 @@ impl RudisTable {
     pub fn hget(&mut self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>, &'static str> {
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            if self.replica_hidden_fields(key).hides(field) {
+                return Ok(None);
+            }
         }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h)
@@ -7395,6 +7431,9 @@ impl RudisTable {
     ) -> Result<crate::shard::CompactResp, &'static str> {
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            if self.replica_hidden_fields(key).hides(field) {
+                return Ok(crate::shard::CompactResp::NULL);
+            }
         }
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
@@ -7435,6 +7474,10 @@ impl RudisTable {
     ) -> Result<(), &'static str> {
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            if self.replica_hidden_fields(key).hides(field) {
+                crate::connection::write_resp_null(out);
+                return Ok(());
+            }
         }
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
@@ -7476,8 +7519,10 @@ impl RudisTable {
         key: &[u8],
         fields: &[Bytes],
     ) -> Result<Vec<Option<Bytes>>, &'static str> {
+        let mut hidden = HiddenFields::default();
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            hidden = self.replica_hidden_fields(key);
         }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -7488,11 +7533,20 @@ impl RudisTable {
                 match &entry.val {
                     RudisValue::SmallHash(pairs) => Ok(fields
                         .iter()
-                        .map(|f| pairs.get(f).map(Bytes::copy_from_slice))
+                        .map(|f| {
+                            pairs
+                                .get(f)
+                                .filter(|_| !hidden.hides(f))
+                                .map(Bytes::copy_from_slice)
+                        })
                         .collect()),
                     RudisValue::Hash(map) => Ok(fields
                         .iter()
-                        .map(|f| map.get(f).map(Bytes::copy_from_slice))
+                        .map(|f| {
+                            map.get(f)
+                                .filter(|_| !hidden.hides(f))
+                                .map(Bytes::copy_from_slice)
+                        })
                         .collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
@@ -7512,8 +7566,10 @@ impl RudisTable {
         fields: &[Bytes],
         out: &mut Vec<u8>,
     ) -> Result<crate::shard::CompactResp, &'static str> {
+        let mut hidden = HiddenFields::default();
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            hidden = self.replica_hidden_fields(key);
         }
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
@@ -7538,7 +7594,7 @@ impl RudisTable {
                     out.reserve(16 + fields.len() * 24);
                     crate::connection::write_resp_array_header(out, fields.len());
                     for f in fields {
-                        if let Some(v) = pairs.get(f.as_ref()) {
+                        if let Some(v) = pairs.get(f.as_ref()).filter(|_| !hidden.hides(f)) {
                             crate::connection::write_resp_bulk(out, v);
                         } else {
                             crate::connection::write_resp_null(out);
@@ -7551,7 +7607,7 @@ impl RudisTable {
                     out.reserve(16 + fields.len() * 24);
                     crate::connection::write_resp_array_header(out, fields.len());
                     for f in fields {
-                        if let Some(v) = map.get(f.as_ref()) {
+                        if let Some(v) = map.get(f.as_ref()).filter(|_| !hidden.hides(f)) {
                             crate::connection::write_resp_bulk(out, v);
                         } else {
                             crate::connection::write_resp_null(out);
@@ -7646,6 +7702,9 @@ impl RudisTable {
     pub fn hexists(&mut self, key: &[u8], field: &[u8]) -> Result<bool, &'static str> {
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            if self.replica_hidden_fields(key).hides(field) {
+                return Ok(false);
+            }
         }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -7690,8 +7749,10 @@ impl RudisTable {
     }
 
     pub fn hgetall(&mut self, key: &[u8]) -> Result<Vec<(Bytes, Bytes)>, &'static str> {
+        let mut hidden = HiddenFields::default();
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            hidden = self.replica_hidden_fields(key);
         }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -7700,9 +7761,14 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(pairs) => Ok(pairs.to_vec()),
+                    RudisValue::SmallHash(pairs) => Ok(pairs
+                        .iter()
+                        .filter(|(k, _)| !hidden.hides(k))
+                        .map(|(k, v)| (Bytes::copy_from_slice(k), Bytes::copy_from_slice(v)))
+                        .collect()),
                     RudisValue::Hash(map) => Ok(map
                         .iter()
+                        .filter(|(k, _)| !hidden.hides(k))
                         .map(|(k, v)| (Bytes::copy_from_slice(k), Bytes::copy_from_slice(v)))
                         .collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -7716,8 +7782,10 @@ impl RudisTable {
     }
 
     pub fn hkeys(&mut self, key: &[u8]) -> Result<Vec<Bytes>, &'static str> {
+        let mut hidden = HiddenFields::default();
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            hidden = self.replica_hidden_fields(key);
         }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -7728,9 +7796,14 @@ impl RudisTable {
                 match &entry.val {
                     RudisValue::SmallHash(pairs) => Ok(pairs
                         .iter()
+                        .filter(|(k, _)| !hidden.hides(k))
                         .map(|(k, _)| Bytes::copy_from_slice(k))
                         .collect()),
-                    RudisValue::Hash(map) => Ok(map.keys().map(Bytes::copy_from_slice).collect()),
+                    RudisValue::Hash(map) => Ok(map
+                        .keys()
+                        .filter(|k| !hidden.hides(k))
+                        .map(Bytes::copy_from_slice)
+                        .collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -7742,8 +7815,10 @@ impl RudisTable {
     }
 
     pub fn hvals(&mut self, key: &[u8]) -> Result<Vec<Bytes>, &'static str> {
+        let mut hidden = HiddenFields::default();
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            hidden = self.replica_hidden_fields(key);
         }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -7754,9 +7829,14 @@ impl RudisTable {
                 match &entry.val {
                     RudisValue::SmallHash(pairs) => Ok(pairs
                         .iter()
+                        .filter(|(k, _)| !hidden.hides(k))
                         .map(|(_, v)| Bytes::copy_from_slice(v))
                         .collect()),
-                    RudisValue::Hash(map) => Ok(map.values().map(Bytes::copy_from_slice).collect()),
+                    RudisValue::Hash(map) => Ok(map
+                        .iter()
+                        .filter(|(k, _)| !hidden.hides(k))
+                        .map(|(_, v)| Bytes::copy_from_slice(v))
+                        .collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -7770,6 +7850,9 @@ impl RudisTable {
     pub fn hstrlen(&mut self, key: &[u8], field: &[u8]) -> Result<usize, &'static str> {
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
+            if self.replica_hidden_fields(key).hides(field) {
+                return Ok(0);
+            }
         }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -17186,6 +17269,66 @@ mod tests {
         let crc = crc64(&v);
         v.extend_from_slice(&crc.to_le_bytes());
         v
+    }
+
+    /// On a read-only replica, a hash field past its deadline is kept until
+    /// the master's HDEL arrives, but reads treat it as gone (as Redis
+    /// replicas do); they used to return it.
+    #[test]
+    fn test_replica_hides_expired_hash_fields_from_reads() {
+        let mut t = RudisTable::new();
+        let (h, f1, f2) = (
+            Bytes::from_static(b"h"),
+            Bytes::from_static(b"f1"),
+            Bytes::from_static(b"f2"),
+        );
+        t.hset(
+            h.clone(),
+            vec![
+                (f1.clone(), Bytes::from_static(b"v1")),
+                (f2.clone(), Bytes::from_static(b"v2")),
+            ],
+        )
+        .unwrap();
+        t.hash_field_expires
+            .entry(h.clone())
+            .or_default()
+            .insert(f1.clone(), Instant::now() - Duration::from_millis(5));
+        crate::replication::set_readonly_replica(true);
+        let v2 = Some(Bytes::from_static(b"v2"));
+        assert_eq!(t.hget(&h, &f1).unwrap(), None);
+        assert_eq!(t.hget(&h, &f2).unwrap(), v2);
+        assert_eq!(t.hget_compact(&h, &f1).unwrap().as_slice(), b"$-1\r\n");
+        let mut out = Vec::new();
+        t.write_hget_resp(&h, &f1, &mut out).unwrap();
+        assert_eq!(out, b"$-1\r\n");
+        assert!(!t.hexists(&h, &f1).unwrap());
+        assert_eq!(t.hstrlen(&h, &f1).unwrap(), 0);
+        assert_eq!(
+            t.hmget(&h, &[f1.clone(), f2.clone()]).unwrap(),
+            vec![None, v2.clone()]
+        );
+        let mut out = Vec::new();
+        let resp = t
+            .hmget_compact_with_hash(&h, hash_key(&h), &[f1.clone(), f2.clone()], &mut out)
+            .unwrap();
+        assert_eq!(resp.as_slice(), b"*2\r\n$-1\r\n$2\r\nv2\r\n");
+        assert_eq!(
+            t.hgetall(&h).unwrap(),
+            vec![(f2.clone(), v2.clone().unwrap())]
+        );
+        assert_eq!(t.hkeys(&h).unwrap(), vec![f2.clone()]);
+        assert_eq!(t.hvals(&h).unwrap(), vec![v2.clone().unwrap()]);
+        // Still stored, for the master's later commands on it.
+        assert_eq!(t.hlen(&h).unwrap(), 2);
+        {
+            let _replaying = crate::connection::ReplayingWrites::new();
+            assert_eq!(t.hget(&h, &f1).unwrap(), Some(Bytes::from_static(b"v1")));
+        }
+        // A master deletes it on read.
+        crate::replication::set_readonly_replica(false);
+        assert_eq!(t.hget(&h, &f1).unwrap(), None);
+        assert_eq!(t.hlen(&h).unwrap(), 1);
     }
 
     /// An RDB load leaves this thread's allocator cache empty: buffers
