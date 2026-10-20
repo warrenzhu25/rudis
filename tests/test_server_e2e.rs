@@ -31980,3 +31980,86 @@ fn test_replica_hides_expired_hash_fields_e2e() {
     drop(replica);
     drop(master);
 }
+
+/// Commands stay fast while a live AOF rewrite walks spilled values with
+/// clients blocked. The rewrite's step loop always had itself ready to
+/// run, and the runtime only processed timers when it parked, so every
+/// timer on a rewriting shard waited for its whole rewrite. A write's reply
+/// waits on one (the AOF write-through fallback): the first write to each
+/// shard took ~200 ms.
+#[test]
+fn test_timers_fire_during_live_rewrite_e2e() {
+    let port = 18057u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-rwtimer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--enable-debug-command",
+        "yes",
+    ];
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        c
+    };
+    let mut c = connect();
+    let mut pipe = String::new();
+    for i in 0..30000 {
+        pipe.push_str(&format!("SET s{i} {}{i}\r\n", "v".repeat(200)));
+        if i % 3 == 0 {
+            pipe.push_str(&format!("RPUSH l{} {}{i}\r\n", i % 500, "x".repeat(120)));
+            pipe.push_str(&format!("HSET h{} f{i} {}\r\n", i % 300, "y".repeat(150)));
+        }
+    }
+    // Drain the replies up to a trailing PING's.
+    pipe.push_str("PING\r\n");
+    c.write_all(pipe.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !got.ends_with(b"+PONG\r\n") {
+        let r = c.read(&mut buf).unwrap();
+        assert!(r > 0, "connection closed");
+        got.extend_from_slice(&buf[..r]);
+    }
+    assert!(!got.windows(4).any(|w| w == b"\r\n-E"), "an error reply");
+    assert!(send_and_read_reply(&mut c, b"TIER SPILLALL\r\n").starts_with(':'));
+    let mut blocked: Vec<TcpStream> = (0..20)
+        .map(|k| {
+            let mut b = connect();
+            b.write_all(format!("BLMOVE src{k} l{k} LEFT RIGHT 0\r\n").as_bytes())
+                .unwrap();
+            b
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(200));
+    assert!(send_and_read_reply(&mut c, b"BGREWRITEAOF\r\n").starts_with('+'));
+    let mut worst = Duration::ZERO;
+    for i in 0..100 {
+        let t = std::time::Instant::now();
+        send_and_read_reply(&mut c, format!("LPUSH l{} new{i}\r\n", i % 500).as_bytes());
+        worst = worst.max(t.elapsed());
+    }
+    eprintln!("worst LPUSH during the rewrite: {worst:?}");
+    for (k, b) in blocked.iter_mut().enumerate() {
+        send_and_read_reply(&mut c, format!("LPUSH src{k} m{k}\r\n").as_bytes());
+        assert_eq!(
+            read_full_reply(b),
+            format!("${}\r\nm{k}\r\n", 1 + k.to_string().len())
+        );
+    }
+    assert!(worst < Duration::from_millis(80), "an LPUSH took {worst:?}");
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

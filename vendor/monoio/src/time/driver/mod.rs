@@ -316,7 +316,22 @@ where
     }
 
     fn submit(&self) -> io::Result<()> {
-        self.park.submit()
+        self.park.submit()?;
+        // Rudis patch: fire the timers that are due here too. The runtime
+        // only parks (where timers are processed) once its task queue is
+        // empty, so a task that keeps yielding starved every timer on the
+        // thread until it finished.
+        let due = {
+            let state = self.handle.get().state.borrow();
+            state
+                .wheel
+                .next_expiration_time()
+                .is_some_and(|when| when <= self.time_source.now())
+        };
+        if due {
+            self.handle.process();
+        }
+        Ok(())
     }
 
     fn park(&self) -> io::Result<()> {

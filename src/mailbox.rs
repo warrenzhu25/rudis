@@ -1196,6 +1196,41 @@ mod tests {
         });
     }
 
+    /// A timer fires on time while another task keeps yielding. The
+    /// runtime only processed timers when it parked, which a thread with a
+    /// task always ready (a live AOF rewrite's step loop) never did: every
+    /// timer on the shard (BLPOP timeouts, the AOF write-through fallback)
+    /// waited for that task to finish.
+    #[test]
+    fn test_timers_fire_while_a_task_keeps_yielding() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            monoio::spawn(async {
+                let stop = std::rc::Rc::new(std::cell::Cell::new(false));
+                let stop2 = stop.clone();
+                let spinner = monoio::spawn(async move {
+                    let t = std::time::Instant::now();
+                    while !stop2.get() && t.elapsed() < Duration::from_secs(1) {
+                        yield_now().await;
+                    }
+                });
+                let t = std::time::Instant::now();
+                monoio::time::sleep(Duration::from_millis(5)).await;
+                let took = t.elapsed();
+                stop.set(true);
+                spinner.await;
+                assert!(
+                    took < Duration::from_millis(200),
+                    "a 5 ms sleep took {took:?}"
+                );
+            })
+            .await;
+        });
+    }
+
     #[test]
     fn test_fast_get_descriptor() {
         let desc = Arc::new(FastGetDescriptor::new(Bytes::from("key1")));
