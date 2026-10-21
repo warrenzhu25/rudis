@@ -3378,6 +3378,73 @@ pub fn replay_aof(path: &Path, db: &mut ShardDb) -> std::io::Result<usize> {
     replay_aof_with(path, db, aof_load_truncated())
 }
 
+/// A file mapped read-only for loading. Reading an AOF or RDB file whole
+/// into memory doubled the memory a restart needed (the dataset plus the
+/// file, ~5.6 GB for a 2.9 GB dataset), until jemalloc returned the freed
+/// buffer; a mapping is page cache the kernel can reclaim, and it is not
+/// counted against maxmemory.
+pub(crate) struct MappedFile {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl MappedFile {
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::File::open(path)?;
+        let len = usize::try_from(file.metadata()?.len())
+            .map_err(|_| std::io::Error::other("file too large to map"))?;
+        if len == 0 {
+            return Ok(MappedFile {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            });
+        }
+        // SAFETY: a fresh read-only private mapping of `len` bytes of an open
+        // file; the fd may be closed once mapped. Load files are not
+        // truncated while mapped (the AOF writer only appends to them, and
+        // only after loading), which would otherwise SIGBUS on access.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: advice on the mapping just made; failure is harmless.
+        unsafe { libc::madvise(ptr, len, libc::MADV_SEQUENTIAL) };
+        Ok(MappedFile { ptr, len })
+    }
+}
+
+impl std::ops::Deref for MappedFile {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        // SAFETY: `ptr` maps `len` readable bytes for as long as `self`
+        // lives (unmapped in Drop).
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for MappedFile {
+    fn drop(&mut self) {
+        if self.len != 0 {
+            // SAFETY: unmaps exactly the mapping made in `open`; no slice of
+            // it outlives `self`.
+            unsafe { libc::munmap(self.ptr, self.len) };
+        }
+    }
+}
+
 pub fn replay_aof_with(
     path: &Path,
     db: &mut ShardDb,
@@ -3394,7 +3461,7 @@ fn replay_aof_inner(path: &Path, db: &mut ShardDb, load_truncated: bool) -> std:
     if !path.exists() {
         return Ok(0);
     }
-    let data = std::fs::read(path)?;
+    let data = MappedFile::open(path)?;
     if data.is_empty() {
         return Ok(0);
     }
@@ -5085,6 +5152,72 @@ pub fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replaying an AOF maps its file rather than reading it into memory:
+    /// loading a 64 MB value allocates about the value, not the value plus
+    /// the file (which doubled the memory a restart needed).
+    #[test]
+    fn test_replay_maps_the_aof_file() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-mmap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = 64usize << 20;
+        let mut src = ShardDb::new(6379);
+        // Incompressible, so the file is as big as the value.
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let value: Vec<u8> = (0..big)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let mut out = Vec::new();
+        crate::connection::execute_local_command(
+            &Command::Set {
+                key: Bytes::from_static(b"big"),
+                value: Bytes::from(value),
+                expire_in: None,
+                condition: crate::resp::SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
+            },
+            &mut src,
+            &mut out,
+            None,
+        );
+        // An RDB-preamble AOF, as a rewrite writes it.
+        let mut image = crate::shard::AofImage::start(&src).unwrap();
+        let mut file = Vec::new();
+        loop {
+            let (piece, done) = image.step(&src, Duration::ZERO, 1 << 30).unwrap();
+            file.extend(piece.unwrap_or_default());
+            if done {
+                break;
+            }
+        }
+        file.extend(image.finish().unwrap());
+        let crc = crate::table::crc64(&file);
+        file.extend_from_slice(&crc.to_le_bytes());
+        let path = dir.join("appendonly-0.aof");
+        std::fs::write(&path, &file).unwrap();
+        drop((src, file));
+        let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+        let mut db = ShardDb::new(6379);
+        let before = allocated.get();
+        replay_aof(&path, &mut db).unwrap();
+        let used = allocated.get() - before;
+        assert_eq!(db.table.len(), 1);
+        assert!(
+            used < big as u64 + big as u64 / 2,
+            "replaying a {} MB value allocated {} MB",
+            big >> 20,
+            used >> 20
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// An AOF replay leaves this thread's allocator cache empty: buffers
     /// freed by it (or before it) go back to the arena instead of staying

@@ -16652,7 +16652,7 @@ pub fn load_rdb(
     if !path.exists() {
         return Ok(0);
     }
-    let data = std::fs::read(path)?;
+    let data = crate::aof::MappedFile::open(path)?;
     load_rdb_bytes(&data, db, shard_id, num_shards)
 }
 

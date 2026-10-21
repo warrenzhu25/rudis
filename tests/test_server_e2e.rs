@@ -32386,3 +32386,84 @@ fn test_streamed_full_sync_e2e() {
     drop(replica);
     drop(master);
 }
+
+/// A restart maps the AOF instead of reading it into memory: right after
+/// loading ~200 MB, the server's anonymous memory is about the dataset, not
+/// the dataset plus the files (freed read buffers lingered for ~10 s, so a
+/// restart needed about twice the dataset's memory).
+#[test]
+fn test_restart_maps_the_aof_e2e() {
+    let port = 18064u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-mmap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+    ];
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    // 200 incompressible 1 MB values (as the RDB preamble stores them).
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for i in 0..200 {
+        let value: Vec<u8> = (0..1 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b'a' + (x % 26) as u8
+            })
+            .collect();
+        let mut cmd = format!(
+            "*3\r\n$3\r\nSET\r\n${}\r\nbig{i}\r\n${}\r\n",
+            format!("big{i}").len(),
+            value.len()
+        )
+        .into_bytes();
+        cmd.extend_from_slice(&value);
+        cmd.extend_from_slice(b"\r\n");
+        assert_eq!(send_and_read_reply(&mut c, &cmd), "+OK\r\n");
+    }
+    // A rewrite (the RDB preamble restarts load from); 200 MB of writes
+    // may already have started one on their own.
+    let rewriting = |c: &mut TcpStream| {
+        send_and_read_reply(c, b"INFO persistence\r\n").contains("aof_rewrite_in_progress:1")
+    };
+    while rewriting(&mut c) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(send_and_read_reply(&mut c, b"BGREWRITEAOF\r\n").starts_with('+'));
+    while rewriting(&mut c) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    drop(c);
+    drop(srv);
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let status = std::fs::read_to_string(format!("/proc/{}/status", srv.0.id())).unwrap();
+    let anon_mb: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("RssAnon:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        .unwrap()
+        / 1024;
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(send_and_read_reply(&mut c, b"DBSIZE\r\n"), ":200\r\n");
+    eprintln!("anonymous memory right after loading 200 MB: {anon_mb} MB");
+    assert!(
+        anon_mb < 320,
+        "{anon_mb} MB anonymous memory after loading 200 MB"
+    );
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
