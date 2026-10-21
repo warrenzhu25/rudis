@@ -99,8 +99,11 @@ Every commit to `main` must strictly adhere to the following four rules:
   # 4. Run cross-thread integration tests
   cargo test --test test_cross_thread
 
-  # 5. Run end-to-end integration tests (serial)
+  # 5. Run end-to-end integration tests (serial), then again on the io_uring
+  #    driver production uses (the first pass runs servers on monoio's legacy
+  #    epoll driver)
   cargo test --test test_server_e2e -- --test-threads=1
+  MONOIO_FORCE_LEGACY_DRIVER=0 cargo test --test test_server_e2e -- --test-threads=1
 
   # 6. Live throughput regression check on this host: this build vs HEAD (the
   #    baseline commit is built once and cached), measured back to back in
