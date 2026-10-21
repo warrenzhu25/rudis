@@ -32569,3 +32569,94 @@ fn test_streamed_full_sync_waits_for_ack_e2e() {
     );
     drop(master);
 }
+
+/// A replica receives a full sync's RDB into a file it then maps, as Redis
+/// replicas do by default: right after syncing ~200 MB, its anonymous memory
+/// is about the dataset. It held the whole RDB in memory before loading it,
+/// so a full sync needed about twice the dataset's memory on the replica.
+#[test]
+fn test_replica_spools_full_sync_to_disk_e2e() {
+    let (mp, rp) = (18065u16, 18066u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-spool-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let master = ServerGuard(spawn_rudis_listening(
+        &["--port", &mps, "--threads", "2", "--no-pin"],
+        mp,
+    ));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    // 200 incompressible 1 MB values.
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for i in 0..200 {
+        let value: Vec<u8> = (0..1 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b'a' + (x % 26) as u8
+            })
+            .collect();
+        let key = format!("big{i}");
+        let mut cmd = format!(
+            "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n${}\r\n",
+            key.len(),
+            value.len()
+        )
+        .into_bytes();
+        cmd.extend_from_slice(&value);
+        cmd.extend_from_slice(b"\r\n");
+        assert_eq!(send_and_read_reply(&mut m, &cmd), "+OK\r\n");
+    }
+    let replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--dir",
+            &ds,
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let info = send_and_read_reply(&mut r, b"INFO replication\r\n");
+        if info.contains("master_link_status:up") && info.contains("master_sync_in_progress:0") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "no sync: {info}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let status = std::fs::read_to_string(format!("/proc/{}/status", replica.0.id())).unwrap();
+    let anon_mb: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("RssAnon:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        .unwrap()
+        / 1024;
+    assert_eq!(send_and_read_reply(&mut r, b"DBSIZE\r\n"), ":200\r\n");
+    eprintln!("replica anonymous memory right after syncing 200 MB: {anon_mb} MB");
+    // The spool file is gone once loaded.
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("temp-repl-"))
+        .collect();
+    assert!(left.is_empty(), "spool file left behind: {left:?}");
+    assert!(
+        anon_mb < 320,
+        "{anon_mb} MB anonymous memory on the replica after syncing 200 MB"
+    );
+    drop(replica);
+    drop(master);
+    let _ = std::fs::remove_dir_all(&dir);
+}

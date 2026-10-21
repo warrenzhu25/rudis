@@ -2347,6 +2347,98 @@ fn find_rdb_eof_mark(buf: &[u8], mark: &[u8; RDB_EOF_MARK_LEN], from: usize) -> 
         .map(|p| start + p)
 }
 
+/// Receives a full sync's RDB into a file in the data dir, then maps it
+/// for loading, as Redis replicas do by default (`repl-diskless-load
+/// disabled`). Holding it in memory meant a replica needed the dataset
+/// twice over during a full sync (the RDB, then what it loads into).
+struct RdbSpool {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    header: RdbLen,
+    written: usize,
+    /// For `$EOF:` transfers: the last bytes seen, held back in case they
+    /// start the mark.
+    carry: Vec<u8>,
+}
+
+impl RdbSpool {
+    /// A new spool file in `dir` for the server on `port`, removing any a
+    /// previous attempt left behind.
+    fn create(dir: &std::path::Path, port: u16, header: RdbLen) -> std::io::Result<Self> {
+        let prefix = format!("temp-repl-{port}-");
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && name.ends_with(".rdb") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        let path = dir.join(format!("{prefix}{}.rdb", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        Ok(RdbSpool {
+            file,
+            path,
+            header,
+            written: 0,
+            carry: Vec::new(),
+        })
+    }
+
+    /// Moves the RDB's bytes from `buf` to the file, leaving whatever follows
+    /// the RDB (the replication stream) in `buf`. True once the RDB is all
+    /// written.
+    fn feed(&mut self, buf: &mut bytes::BytesMut) -> std::io::Result<bool> {
+        use std::io::Write;
+        match &self.header {
+            RdbLen::Bytes(n) => {
+                let take = (n - self.written).min(buf.len());
+                self.file.write_all(&buf.split_to(take))?;
+                self.written += take;
+                Ok(self.written == *n)
+            }
+            RdbLen::Mark(mark) => {
+                let mut seen = std::mem::take(&mut self.carry);
+                seen.extend_from_slice(&buf.split());
+                if let Some(end) = find_rdb_eof_mark(&seen, mark, 0) {
+                    self.file.write_all(&seen[..end])?;
+                    self.written += end;
+                    buf.extend_from_slice(&seen[end + RDB_EOF_MARK_LEN..]);
+                    return Ok(true);
+                }
+                let keep = seen.len().min(RDB_EOF_MARK_LEN - 1);
+                let cut = seen.len() - keep;
+                self.file.write_all(&seen[..cut])?;
+                self.written += cut;
+                self.carry = seen[cut..].to_vec();
+                Ok(false)
+            }
+        }
+    }
+
+    /// The received RDB, mapped. The file is unlinked right away: the
+    /// mapping keeps it until the load is done.
+    fn finish(self) -> std::io::Result<bytes::Bytes> {
+        let map = crate::aof::MappedFile::open(&self.path);
+        let _ = std::fs::remove_file(&self.path);
+        Ok(bytes::Bytes::from_owner(map?))
+    }
+}
+
+impl Drop for RdbSpool {
+    fn drop(&mut self) {
+        // A failed transfer: nothing left on disk (finish already unlinked
+        // a complete one).
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// A replication id as masters send it: 40 alphanumeric characters.
 fn valid_replid(id: &str) -> bool {
     id.len() == 40 && id.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -2736,27 +2828,32 @@ async fn run_replica_worker(
                 }
             };
 
-            // 6. Read the RDB: `rdb_len` bytes, or up to the EOF mark.
-            let mut read_failed = false;
-            let mut searched = 0;
-            let rdb_len = loop {
-                match &rdb_header {
-                    RdbLen::Bytes(n) if buf.len() >= *n => break *n,
-                    RdbLen::Bytes(_) => {}
-                    RdbLen::Mark(mark) => {
-                        if let Some(end) = find_rdb_eof_mark(&buf, mark, searched) {
-                            break end;
-                        }
-                        searched = buf.len();
+            // 6. Receive the RDB (`rdb_len` bytes, or up to the EOF mark)
+            // into a spool file.
+            let mut spool = match RdbSpool::create(&router.db_dir, router.port, rdb_header) {
+                Ok(spool) => spool,
+                Err(e) => {
+                    crate::log_warning!(
+                        "Opening the temp file for the RDB from MASTER failed: {}",
+                        e
+                    );
+                    if is_sync_cancelled(&cancel_rx) {
+                        break 'reconnect_loop;
                     }
+                    monoio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    continue 'reconnect_loop;
+                }
+            };
+            let received = loop {
+                match spool.feed(&mut buf) {
+                    Ok(true) => break Ok(()),
+                    Ok(false) => {}
+                    Err(e) => break Err(format!("writing the temp file: {e}")),
                 }
                 let (res, returned) = stream.read(read_buf).await;
                 read_buf = returned;
                 match res {
-                    Ok(0) | Err(_) => {
-                        read_failed = true;
-                        break 0;
-                    }
+                    Ok(0) | Err(_) => break Err("connection lost".to_string()),
                     Ok(n) => {
                         hub.last_master_io_secs
                             .store(unix_secs(), Ordering::Relaxed);
@@ -2764,28 +2861,32 @@ async fn run_replica_worker(
                     }
                 }
             };
-            if read_failed {
-                crate::log_warning!("I/O error trying to sync with MASTER: connection lost");
-                if let ReplicationRole::Slave {
-                    ref mut link_status,
-                    ..
-                } = *hub.role.write()
-                {
-                    *link_status = "down".to_string();
+            let rdb_len = spool.written;
+            let rdb_bytes = received.and_then(|()| {
+                spool
+                    .finish()
+                    .map_err(|e| format!("mapping the temp file: {e}"))
+            });
+            let rdb_bytes = match rdb_bytes {
+                Ok(b) => b,
+                Err(e) => {
+                    crate::log_warning!("I/O error trying to sync with MASTER: {}", e);
+                    if let ReplicationRole::Slave {
+                        ref mut link_status,
+                        ..
+                    } = *hub.role.write()
+                    {
+                        *link_status = "down".to_string();
+                    }
+                    if is_sync_cancelled(&cancel_rx) {
+                        break 'reconnect_loop;
+                    }
+                    monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue 'reconnect_loop;
                 }
-                if is_sync_cancelled(&cancel_rx) {
-                    break 'reconnect_loop;
-                }
-                monoio::time::sleep(std::time::Duration::from_millis(50)).await;
-                continue 'reconnect_loop;
-            }
-
-            let rdb_bytes = buf.split_to(rdb_len).freeze();
-            if matches!(rdb_header, RdbLen::Mark(_)) {
-                bytes::Buf::advance(&mut buf, RDB_EOF_MARK_LEN);
-            }
+            };
             crate::log_notice!(
-                "MASTER <-> REPLICA sync: received {} bytes from master to memory",
+                "MASTER <-> REPLICA sync: received {} bytes from master to disk",
                 rdb_len
             );
 
@@ -3763,6 +3864,60 @@ mod tests {
             assert_eq!(found, Some(rdb_len), "cut at {cut}");
         }
         assert_eq!(find_rdb_eof_mark(b"REDIS no mark here", &mark, 0), None);
+    }
+
+    /// A full sync's RDB goes to a spool file, not memory: fed in reads
+    /// split at every point, the file holds exactly the RDB (for both
+    /// `$<len>` and `$EOF:` transfers), the stream after it stays in the
+    /// buffer, and the mapped result equals the RDB with the file already
+    /// gone from the directory.
+    #[test]
+    fn test_rdb_spool_writes_the_rdb_to_a_file() {
+        let dir = std::env::temp_dir().join(format!("rudis-spool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mark = *b"0123456789abcdefghij0123456789ABCDEFGHIJ";
+        let rdb: Vec<u8> = (0..5000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let stream = b"*1\r\n$4\r\nPING\r\n";
+        for with_mark in [false, true] {
+            let mut wire = rdb.clone();
+            if with_mark {
+                wire.extend_from_slice(&mark);
+            }
+            wire.extend_from_slice(stream);
+            let around_end = rdb.len() - 40..(rdb.len() + 41).min(wire.len() + 1);
+            for cut in (0..wire.len()).step_by(7).chain(around_end) {
+                let header = if with_mark {
+                    RdbLen::Mark(mark)
+                } else {
+                    RdbLen::Bytes(rdb.len())
+                };
+                let mut spool = RdbSpool::create(&dir, 1, header).unwrap();
+                let mut buf = BytesMut::new();
+                let mut done = false;
+                for part in [&wire[..cut], &wire[cut..]] {
+                    buf.extend_from_slice(part);
+                    if !done {
+                        done = spool.feed(&mut buf).unwrap();
+                    }
+                }
+                assert!(done, "mark={with_mark} cut={cut}");
+                assert_eq!(&buf[..], stream, "mark={with_mark} cut={cut}");
+                assert_eq!(
+                    std::fs::read(&spool.path).unwrap(),
+                    rdb,
+                    "mark={with_mark} cut={cut}"
+                );
+                let loaded = spool.finish().unwrap();
+                assert_eq!(&loaded[..], &rdb[..]);
+                assert_eq!(
+                    std::fs::read_dir(&dir).unwrap().count(),
+                    0,
+                    "file left behind"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

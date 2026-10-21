@@ -3423,6 +3423,20 @@ impl MappedFile {
     }
 }
 
+// SAFETY: a read-only mapping, never written through, owned by this value
+// alone: moving it to another thread (a replica's shards load from one
+// mapped RDB) is as safe as moving a `Box<[u8]>`.
+unsafe impl Send for MappedFile {}
+// SAFETY: only ever read, so shared references from several threads are as
+// safe as sharing a `&[u8]`.
+unsafe impl Sync for MappedFile {}
+
+impl AsRef<[u8]> for MappedFile {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
 impl std::ops::Deref for MappedFile {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
