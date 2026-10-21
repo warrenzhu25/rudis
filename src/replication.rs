@@ -2857,13 +2857,23 @@ async fn run_replica_worker(
         let (ack_tx, ack_rx) = flume::unbounded::<()>();
         let applied_w = applied.clone();
         monoio::spawn(async move {
+            // The first ack goes out at once, as Redis replicas send theirs:
+            // after a streamed full sync the master holds the stream until
+            // it (see `run_master_replica_stream`).
+            let mut first = true;
             loop {
-                match monoio::time::timeout(std::time::Duration::from_secs(1), ack_rx.recv_async())
+                if !first {
+                    match monoio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        ack_rx.recv_async(),
+                    )
                     .await
-                {
-                    Ok(Ok(())) | Err(_) => {}
-                    Ok(Err(_)) => break,
+                    {
+                        Ok(Ok(())) | Err(_) => {}
+                        Ok(Err(_)) => break,
+                    }
                 }
+                first = false;
                 while ack_rx.try_recv().is_ok() {}
                 let off = applied_w.get().to_string();
                 let ack = format!(

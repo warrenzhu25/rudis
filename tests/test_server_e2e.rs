@@ -21155,8 +21155,9 @@ fn test_replica_replies_loading_while_it_loads_a_full_sync_e2e() {
         let mut reply = format!("+FULLRESYNC {replid} 0\r\n${}\r\n", rdb.len()).into_bytes();
         reply.extend_from_slice(&rdb);
         let _ = conn.write_all(&reply);
-        // Hold the link open until the test is done.
-        let _ = conn.read(&mut buf);
+        // Hold the link open until the test is done (the replica's acks
+        // arrive meanwhile).
+        while matches!(conn.read(&mut buf), Ok(n) if n > 0) {}
     });
 
     // Clients PING (not allowed while loading, like in Redis) rather than
@@ -32466,4 +32467,105 @@ fn test_restart_maps_the_aof_e2e() {
     );
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After a streamed (`$EOF:`) full sync, nothing follows the mark until the
+/// replica acks: Redis replicas find the end of such a transfer by the mark
+/// being the last bytes of a read, so the stream written meanwhile is held
+/// until their first `REPLCONF ACK` (as Redis masters do), then sent. It
+/// followed the mark at once, and real Redis replicas waited forever.
+#[test]
+fn test_streamed_full_sync_waits_for_ack_e2e() {
+    let mp = 18067u16;
+    let mps = mp.to_string();
+    let master = ServerGuard(spawn_rudis_listening(
+        &["--port", &mps, "--threads", "2", "--no-pin"],
+        mp,
+    ));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for i in 0..2000 {
+        send_and_read_reply(
+            &mut m,
+            format!("SET key:{i} {}\r\n", "x".repeat(300)).as_bytes(),
+        );
+    }
+    // Writes during the sync, so there is stream to hold back.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let writer = thread::spawn(move || {
+        let mut w = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+        w.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            send_and_read_reply(&mut w, b"INCR counter\r\n");
+        }
+    });
+    thread::sleep(Duration::from_millis(50));
+    // A replica's handshake, as Redis replicas send it.
+    let mut r = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for cmd in [
+        &b"PING\r\n"[..],
+        b"REPLCONF listening-port 6399\r\n",
+        b"REPLCONF capa eof capa psync2\r\n",
+    ] {
+        r.write_all(cmd).unwrap();
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while !line.ends_with(b"\r\n") {
+            assert_eq!(r.read(&mut byte).unwrap(), 1);
+            line.push(byte[0]);
+        }
+        assert!(line[0] == b'+', "{}", String::from_utf8_lossy(&line));
+    }
+    r.write_all(b"PSYNC ? -1\r\n").unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while head.iter().filter(|&&b| b == b'\n').count() < 2 {
+        assert_eq!(r.read(&mut byte).unwrap(), 1);
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let mark = head
+        .lines()
+        .nth(1)
+        .and_then(|l| l.strip_prefix("$EOF:"))
+        .unwrap_or_else(|| panic!("not a streamed sync: {head}"))
+        .to_string();
+    // Read up to the mark.
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    let end = loop {
+        if let Some(p) = got.windows(40).position(|w| w == mark.as_bytes()) {
+            break p + 40;
+        }
+        let n = r.read(&mut buf).unwrap();
+        assert!(n > 0, "the master closed the connection");
+        got.extend_from_slice(&buf[..n]);
+    };
+    // Nothing after the mark until we ack, though the master takes writes.
+    let early = got.len() - end;
+    r.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let more = r.read(&mut buf).unwrap_or_default();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert_eq!(
+        early + more,
+        0,
+        "{} bytes followed the mark before the ack",
+        early + more
+    );
+    // After the ack, the held-back stream arrives.
+    r.write_all(b"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n")
+        .unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let n = r.read(&mut buf).unwrap();
+    assert!(n > 0);
+    let stream = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+    assert!(
+        stream.contains("incr") || stream.contains("counter"),
+        "no stream after the ack: {stream:?}"
+    );
+    drop(master);
 }

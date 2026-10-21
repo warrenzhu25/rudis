@@ -7149,6 +7149,26 @@ async fn snapshot_for_replica(
     Ok((rdb, replid, offset, after_snapshot, rep))
 }
 
+/// The end of a streamed full sync: the saved replication history (if
+/// any), `OP_EOF`, the checksum (`crc` covers everything sent before), then
+/// the `$EOF:` mark, which must be the last bytes on the wire until the
+/// replica acks.
+fn streamed_sync_tail(
+    saved_history: Option<(String, u64, usize)>,
+    crc: u64,
+    mark: &str,
+) -> Vec<u8> {
+    let mut tail = Vec::new();
+    if let Some((replid, offset, stream_db)) = saved_history {
+        crate::redis_rdb::write_repl_aux(&mut tail, &replid, offset, stream_db);
+    }
+    tail.push(crate::redis_rdb::OP_EOF);
+    let crc = crate::table::crc64_update(crc, &tail);
+    tail.extend_from_slice(&crc.to_le_bytes());
+    tail.extend_from_slice(mark.as_bytes());
+    tail
+}
+
 /// Removes a streamed full sync's images from every shard when the sync
 /// ends early (an image left installed would keep taking pre-images).
 struct SyncImagesGuard<'a> {
@@ -7182,9 +7202,11 @@ impl Drop for SyncImagesGuard<'_> {
 /// longer than a step (the buffered path serialized each shard in one go:
 /// ~110 ms per GB of data, and ~3x the data in memory).
 ///
-/// An error with a reason comes before anything was sent (the caller
-/// reports it); `Err(None)` means the transfer broke off after it began
-/// (already logged).
+/// Returns the replica and the stream bytes written during the transfer,
+/// which go out only after the replica's first `REPLCONF ACK`. An error
+/// with a reason comes before anything was sent (the caller reports it);
+/// `Err(None)` means the transfer broke off after it began (already
+/// logged).
 async fn stream_full_sync(
     hub: &std::sync::Arc<crate::replication::ReplicationHub>,
     router: &Rc<Router>,
@@ -7192,7 +7214,13 @@ async fn stream_full_sync(
     write_tx: &flume::Sender<Vec<u8>>,
     writer: &mut monoio::net::tcp::TcpOwnedWriteHalf,
     name: &str,
-) -> Result<std::sync::Arc<crate::replication::ConnectedReplica>, Option<ReplicaSnapshotError>> {
+) -> Result<
+    (
+        std::sync::Arc<crate::replication::ConnectedReplica>,
+        Vec<u8>,
+    ),
+    Option<ReplicaSnapshotError>,
+> {
     let apply = if hub.is_slave() {
         Some(hub.lock_apply().await)
     } else {
@@ -7321,20 +7349,14 @@ async fn stream_full_sync(
     }
     guard.armed = false;
     drop(guard);
-    // 4. The RDB's end, the mark, then the stream written meanwhile.
-    let mut tail = Vec::new();
-    if let Some((replid, offset, stream_db)) = hub.saved_history() {
-        crate::redis_rdb::write_repl_aux(&mut tail, &replid, offset, stream_db);
-    }
-    tail.push(crate::redis_rdb::OP_EOF);
-    crc = crate::table::crc64_update(crc, &tail);
-    tail.extend_from_slice(&crc.to_le_bytes());
-    tail.extend_from_slice(mark.as_bytes());
-    tail.extend_from_slice(&after_snapshot);
+    // 4. The RDB's end and the mark. The stream written meanwhile is
+    // returned, not sent: it may only follow once the replica acks (see
+    // the caller).
+    let tail = streamed_sync_tail(hub.saved_history(), crc, &mark);
     if let Err(e) = writer.write_all(tail).await.0 {
         return Err(broke_off(e.to_string()));
     }
-    Ok(rep)
+    Ok((rep, after_snapshot))
 }
 
 /// Ends a (P)SYNC whose snapshot [`snapshot_for_replica`] could not make.
@@ -7393,6 +7415,9 @@ async fn run_master_replica_stream(
     hub.ensure_pinger();
 
     let repl;
+    // After a streamed (`$EOF:`) full sync: the stream written during the
+    // transfer, held back until the replica's first ack (see below).
+    let mut after_ack: Option<Vec<u8>> = None;
     if !is_sync {
         let (req_replid, req_offset) = match &psync_cmd {
             Command::Psync { replid, offset } => {
@@ -7441,7 +7466,10 @@ async fn run_master_replica_stream(
                 match stream_full_sync(&hub, &router, client_id, &write_tx, &mut writer, &name)
                     .await
                 {
-                    Ok(rep) => repl = rep,
+                    Ok((rep, after_snapshot)) => {
+                        repl = rep;
+                        after_ack = Some(after_snapshot);
+                    }
                     Err(Some(e)) => {
                         replica_snapshot_failed(&mut writer, &name, e).await;
                         return;
@@ -7519,7 +7547,29 @@ async fn run_master_replica_stream(
     repl.attach_fd(raw_fd);
     link.repl = Some(repl.clone());
     let writer_hub = hub.clone();
+    // A replica that took a `$EOF:` transfer finds its end by the mark being
+    // the last bytes of a read (Redis replicas do), so nothing may follow
+    // the mark until it has loaded and acked, as Redis masters do it. The
+    // stream meanwhile waits in the replica's buffer. Sending it right after
+    // the mark left Redis replicas waiting for the end forever.
+    let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+    let mut ack_tx = Some(ack_tx);
     monoio::spawn(async move {
+        if let Some(after) = after_ack {
+            if ack_rx.recv_async().await.is_err() {
+                // The link ended before the replica acked.
+                repl.detach_fd();
+                writer_hub.unregister_replica(client_id);
+                return;
+            }
+            if !after.is_empty() && writer.write_all(after).await.0.is_err() {
+                repl.detach_fd();
+                writer_hub.unregister_replica(client_id);
+                return;
+            }
+            // Wakeups for what was queued while waiting are still in the
+            // channel: the loop below sends it.
+        }
         // Each wakeup carries no data: everything queued since the last one
         // is in the replica's pending buffer and goes out in one write.
         while write_rx.recv_async().await.is_ok() {
@@ -7546,7 +7596,13 @@ async fn run_master_replica_stream(
         writer_hub.unregister_replica(client_id);
     });
 
-    read_replica_acks(&mut reader, |off| hub.update_replica_ack(client_id, off)).await;
+    read_replica_acks(&mut reader, |off| {
+        if let Some(tx) = ack_tx.take() {
+            let _ = tx.send(());
+        }
+        hub.update_replica_ack(client_id, off)
+    })
+    .await;
     drop(link);
 }
 
@@ -28838,6 +28894,25 @@ mod tests {
     }
 
     use super::*;
+
+    /// A streamed full sync ends with a valid RDB end and checksum, then
+    /// the mark as the very last bytes: Redis replicas detect the end by the
+    /// mark ending a read, so the stream must not share the write.
+    #[test]
+    fn test_streamed_sync_tail_ends_with_the_mark() {
+        let mut rdb = Vec::new();
+        crate::redis_rdb::write_file_header(&mut rdb, 0);
+        let crc = crate::table::crc64_update(0, &rdb);
+        let mark = "0123456789abcdefghij0123456789ABCDEFGHIJ";
+        for history in [None, Some(("f".repeat(40), 7, 0))] {
+            let tail = streamed_sync_tail(history, crc, mark);
+            assert!(tail.ends_with(mark.as_bytes()));
+            let mut file = rdb.clone();
+            file.extend_from_slice(&tail[..tail.len() - mark.len()]);
+            let mut db = ShardDb::new(0);
+            crate::table::load_rdb_bytes(&file, &mut db, 0, 1).unwrap();
+        }
+    }
 
     #[test]
     fn integral_scores_format_like_printf_g17() {
