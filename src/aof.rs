@@ -3515,7 +3515,26 @@ fn replay_aof_inner(path: &Path, db: &mut ShardDb, load_truncated: bool) -> std:
     } else {
         (0, 0)
     };
-    let mut buf = BytesMut::from(&data[rdb_preamble_len..]);
+    // The commands after the preamble are parsed a chunk at a time: copying
+    // them whole into the parse buffer put the whole tail in memory on top
+    // of the dataset (a restart with a long tail peaked at ~3x the data).
+    const TAIL_CHUNK: usize = 8 << 20;
+    let tail = &data[rdb_preamble_len..];
+    // How much of the tail has been copied into `buf`.
+    let next = std::cell::Cell::new(0usize);
+    let mut buf = BytesMut::new();
+    // Appends the next chunk of the tail; false once it is all in `buf`.
+    let refill = |buf: &mut BytesMut| -> bool {
+        let from = next.get();
+        if from == tail.len() {
+            return false;
+        }
+        let end = (from + TAIL_CHUNK).min(tail.len());
+        buf.extend_from_slice(&tail[from..end]);
+        next.set(end);
+        true
+    };
+    refill(&mut buf);
     let mut dummy_out = Vec::new();
     let saved_db = crate::connection::CURRENT_DB.get();
     crate::connection::CURRENT_DB.set(0);
@@ -3525,20 +3544,26 @@ fn replay_aof_inner(path: &Path, db: &mut ShardDb, load_truncated: bool) -> std:
     // block cut off at the end of the file is dropped as a whole.
     let mut in_multi: Option<(usize, Vec<Command>)> = None;
     let res = (|| -> std::io::Result<usize> {
-        while !buf.is_empty() {
+        loop {
+            if buf.len() < TAIL_CHUNK / 2 {
+                refill(&mut buf);
+            }
             // Skip Redis 7+ `#TS:<unix_ts>\r\n` timestamp annotations.
             while buf.starts_with(b"#") {
                 if let Some(nl_pos) = buf.iter().position(|&b| b == b'\n') {
                     let _ = buf.split_to(nl_pos + 1);
-                } else {
+                } else if !refill(&mut buf) {
                     buf.clear();
                     break;
                 }
             }
-            if buf.is_empty() {
+            if buf.is_empty() && !refill(&mut buf) {
                 break;
             }
-            let offset = data.len() - buf.len();
+            if buf.starts_with(b"#") {
+                continue;
+            }
+            let offset = rdb_preamble_len + next.get() - buf.len();
             // rudis and Redis only ever append RESP arrays (after #TS comments);
             // anything else is corruption.
             if buf[0] != b'*' {
@@ -3581,6 +3606,8 @@ fn replay_aof_inner(path: &Path, db: &mut ShardDb, load_truncated: bool) -> std:
                         }
                     }
                 },
+                // A command that continues in the next chunk.
+                Ok(None) if refill(&mut buf) => {}
                 Ok(None) if buf.is_empty() => break,
                 Ok(None) => {
                     // An open MULTI block is cut off along with the command.
@@ -5166,6 +5193,62 @@ pub fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The commands after an AOF's preamble are parsed a chunk at a time:
+    /// replaying a 64 MB tail that keeps overwriting one key stays far below
+    /// the tail's size in memory (it was copied whole first), and commands,
+    /// `#TS` annotations and a MULTI block that straddle chunk boundaries
+    /// still apply.
+    #[test]
+    fn test_replay_parses_the_tail_in_chunks() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-chunks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appendonly-0.aof");
+        let mut log = Vec::new();
+        let value = "v".repeat(1 << 20);
+        let mut i = 0;
+        while log.len() < 64 << 20 {
+            log.extend_from_slice(&resp_argv(&["SET", "big", &value]));
+            log.extend_from_slice(format!("#TS:{i}\r\n").as_bytes());
+            log.extend_from_slice(&resp_argv(&["MULTI"]));
+            log.extend_from_slice(&resp_argv(&["INCR", "n"]));
+            log.extend_from_slice(&resp_argv(&["SET", &format!("k{i}"), "x"]));
+            log.extend_from_slice(&resp_argv(&["EXEC"]));
+            i += 1;
+        }
+        std::fs::write(&path, &log).unwrap();
+        drop(log);
+        let peak_mb = std::thread::spawn(move || {
+            let mut db = ShardDb::new(6379);
+            replay_aof(&path, &mut db).unwrap();
+            let mut out = Vec::new();
+            for (cmd, want) in [
+                (
+                    Command::Get(Bytes::from_static(b"n")),
+                    format!("${}\r\n{i}\r\n", i.to_string().len()),
+                ),
+                (
+                    Command::Strlen(Bytes::from_static(b"big")),
+                    format!(":{}\r\n", 1 << 20),
+                ),
+            ] {
+                out.clear();
+                crate::connection::execute_local_command(&cmd, &mut db, &mut out, None);
+                assert_eq!(String::from_utf8_lossy(&out), want);
+            }
+            assert_eq!(db.table.len(), i + 2);
+            // SAFETY: `thread.peak.read` is a u64 ctl.
+            unsafe { tikv_jemalloc_ctl::raw::read::<u64>(b"thread.peak.read\0").unwrap() >> 20 }
+        })
+        .join()
+        .unwrap();
+        assert!(
+            peak_mb < 32,
+            "replaying a 64 MB tail peaked at {peak_mb} MB"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Replaying an AOF maps its file rather than reading it into memory:
     /// loading a 64 MB value allocates about the value, not the value plus

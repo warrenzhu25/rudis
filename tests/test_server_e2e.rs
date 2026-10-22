@@ -32660,3 +32660,66 @@ fn test_replica_spools_full_sync_to_disk_e2e() {
     drop(master);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A restart parses the commands after the AOF's base a chunk at a time:
+/// with ~300 MB of commands that keep overwriting one key (and no rewrite
+/// to compact them), the server's anonymous memory right after loading is
+/// small. The whole tail was copied into memory first.
+#[test]
+fn test_restart_parses_the_aof_tail_in_chunks_e2e() {
+    let port = 18068u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-aoftail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+    ];
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    assert_eq!(
+        send_and_read_reply(&mut c, b"CONFIG SET auto-aof-rewrite-percentage 0\r\n"),
+        "+OK\r\n"
+    );
+    let value = "v".repeat(1 << 20);
+    let cmd = format!(
+        "*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${}\r\n{value}\r\n",
+        value.len()
+    );
+    for _ in 0..300 {
+        assert_eq!(send_and_read_reply(&mut c, cmd.as_bytes()), "+OK\r\n");
+    }
+    drop(c);
+    drop(srv);
+    let srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let status = std::fs::read_to_string(format!("/proc/{}/status", srv.0.id())).unwrap();
+    let anon_mb: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("RssAnon:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        .unwrap()
+        / 1024;
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(
+        send_and_read_reply(&mut c, b"STRLEN big\r\n"),
+        format!(":{}\r\n", 1 << 20)
+    );
+    eprintln!("anonymous memory right after replaying a 300 MB AOF tail: {anon_mb} MB");
+    assert!(
+        anon_mb < 120,
+        "{anon_mb} MB anonymous memory after replaying a 300 MB tail"
+    );
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
