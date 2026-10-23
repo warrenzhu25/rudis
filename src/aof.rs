@@ -5994,6 +5994,18 @@ mod tests {
         run(0, "CF.RESERVE cf 10000".to_string());
         AofWriter::write_through(&aof).await.unwrap();
         let fallbacks = LIVE_REWRITE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
+        // A short pause between image steps, so plenty of writes land while
+        // the image is built however fast this build walks it (a release
+        // build finished the walk within ~40 writes).
+        struct SaveDelay;
+        impl Drop for SaveDelay {
+            fn drop(&mut self) {
+                crate::connection::RDB_KEY_SAVE_DELAY
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        crate::connection::RDB_KEY_SAVE_DELAY.store(200, std::sync::atomic::Ordering::Relaxed);
+        let _save_delay = SaveDelay;
         let done = Rc::new(Cell::new(false));
         let task = {
             let (db, aof, dir, done) = (db.clone(), aof.clone(), dir.clone(), done.clone());
