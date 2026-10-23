@@ -195,6 +195,9 @@ impl TieringStats {
             .map(|(_, m)| m.net.load(Ordering::Relaxed) - m.slack.load(Ordering::Relaxed))
             .sum::<i64>()
             + self.unattributed.load(Ordering::Relaxed)
+            // Full-sync images' buffers don't count, like Redis's
+            // replication buffers.
+            - crate::shard::SYNC_IMAGE_BYTES.load(Ordering::Relaxed).max(0)
     }
 
     /// Whether eviction is paused for a full-sync snapshot.

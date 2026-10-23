@@ -7304,17 +7304,30 @@ async fn stream_full_sync(
         return Err(broke_off(e.to_string()));
     }
     // 3. Each shard's part, a step at a time.
+    // The buffer of the last piece sent, handed back with the next step
+    // (see `AofImage::give_buffer`); a shard's last one goes to the next
+    // shard, so no piece is freed on this thread mid-transfer. Counted
+    // apart from maxmemory while here, like the images' own buffers.
+    let mut recycle: Option<Vec<u8>> = None;
+    let mut in_flight = crate::shard::SyncImageHeld::default();
     for sid in 0..router.num_shards {
         loop {
             let step = if sid == router.shard_id {
-                let step = crate::shard::sync_image_step(&router.local_db.borrow(), client_id);
+                in_flight.set(0);
+                let step = crate::shard::sync_image_step(
+                    &router.local_db.borrow(),
+                    client_id,
+                    recycle.take(),
+                );
                 crate::mailbox::yield_now().await;
                 step
             } else {
                 let (tx, rx) = flume::bounded(1);
+                in_flight.set(0);
                 if router.senders[sid]
                     .send(crate::shard::ShardMessage::SyncImageStep {
                         replica: client_id,
+                        recycle: recycle.take(),
                         responder: tx,
                     })
                     .is_err()
@@ -7330,10 +7343,13 @@ async fn stream_full_sync(
                 Err(e) => return Err(broke_off(format!("shard {sid}: {e}"))),
             };
             if !piece.is_empty() {
+                in_flight.set(piece.capacity() as i64);
                 crc = crate::table::crc64_update(crc, &piece);
-                if let Err(e) = writer.write_all(piece).await.0 {
+                let (res, sent) = writer.write_all(piece).await;
+                if let Err(e) = res {
                     return Err(broke_off(e.to_string()));
                 }
+                recycle = Some(sent);
             }
             if gone(&rep) {
                 if rep.is_overflowed() {
@@ -7349,6 +7365,15 @@ async fn stream_full_sync(
     }
     guard.armed = false;
     drop(guard);
+    // The last buffer is freed here, on this thread: recalibrate, so the
+    // per-thread memory counts eviction reads are right again at once.
+    drop(recycle);
+    in_flight.set(0);
+    if crate::tiering::sole_server_in_process()
+        && let Some(global) = crate::allocator::global_allocated()
+    {
+        router.tier_stats.calibrate_unattributed(global);
+    }
     // 4. The RDB's end and the mark. The stream written meanwhile is
     // returned, not sent: it may only follow once the replica acks (see
     // the caller).
@@ -7458,11 +7483,9 @@ async fn run_master_replica_stream(
                 crate::log_notice!("Full resync requested by replica {}", name);
             }
             if hub.replica_takes_eof(client_id) {
-                // Eviction stays paused while it streams too: its pieces are
-                // allocated on each shard's thread and freed on this one,
-                // which the per-thread counts only see at the next
-                // recalibration (the shards looked far over the limit).
-                let _pause = crate::tiering::SnapshotEvictionPause::new(router.tier_stats.clone());
+                // No eviction pause: the images' buffers don't count toward
+                // maxmemory (SYNC_IMAGE_BYTES), and sent pieces go back to
+                // their shard rather than being freed on this thread.
                 match stream_full_sync(&hub, &router, client_id, &write_tx, &mut writer, &name)
                     .await
                 {

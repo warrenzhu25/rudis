@@ -1735,8 +1735,12 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let res = crate::shard::start_sync_image(&cross_shard_db.borrow(), shard_id, replica);
                         let _ = responder.send(res);
                     }
-                    ShardMessage::SyncImageStep { replica, responder } => {
-                        let res = crate::shard::sync_image_step(&cross_shard_db.borrow(), replica);
+                    ShardMessage::SyncImageStep {
+                        replica,
+                        recycle,
+                        responder,
+                    } => {
+                        let res = crate::shard::sync_image_step(&cross_shard_db.borrow(), replica, recycle);
                         let _ = responder.send(res);
                     }
                     ShardMessage::DropSyncImage { replica } => {

@@ -598,6 +598,9 @@ pub enum ShardMessage {
     /// The next piece of that image (see [`sync_image_step`]).
     SyncImageStep {
         replica: u64,
+        /// The buffer of this shard's previous piece, once sent (see
+        /// [`AofImage::give_buffer`]).
+        recycle: Option<Vec<u8>>,
         responder: flume::Sender<Result<(Vec<u8>, bool), String>>,
     },
     /// Abandons that image: the full sync failed.
@@ -4949,7 +4952,47 @@ pub struct AofImage {
     /// A shard's part of a multi-shard RDB (a full sync): no file header
     /// and no `OP_EOF`, like [`ShardDb::save_rdb_chunk`]'s output.
     chunk: bool,
+    /// A buffer handed back once its piece was sent (see
+    /// [`Self::give_buffer`]), reused for the next piece.
+    spare: Option<Vec<u8>>,
+    /// This full-sync image's share of [`SYNC_IMAGE_BYTES`].
+    held: SyncImageHeld,
 }
+
+/// Bytes of replication buffers: the shards' full-sync images (their
+/// buffers, pre-images included), pieces in flight to a replica, and
+/// replicas' output buffers. Like Redis's replication buffers, they don't
+/// count toward maxmemory: [`crate::tiering::TieringStats::real_used_total`] leaves them
+/// out, so a replica attaching to a master at its limit doesn't make it
+/// evict.
+pub static SYNC_IMAGE_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// A share of [`SYNC_IMAGE_BYTES`] (an image's buffers, or a piece in
+/// flight to the replica), given back when dropped.
+#[derive(Default)]
+pub(crate) struct SyncImageHeld(i64);
+
+impl SyncImageHeld {
+    pub(crate) fn set(&mut self, bytes: i64) {
+        // Usually unchanged (a replica's buffer between growths): skip the
+        // write to the counter every shard shares.
+        if bytes != self.0 {
+            SYNC_IMAGE_BYTES.fetch_add(bytes - self.0, std::sync::atomic::Ordering::Relaxed);
+            self.0 = bytes;
+        }
+    }
+}
+
+impl Drop for SyncImageHeld {
+    fn drop(&mut self) {
+        self.set(0);
+    }
+}
+
+/// Initial buffer of a full-sync image: about one piece
+/// (`SYNC_IMAGE_PIECE_BYTES`) rather than the 8 MB a rewrite image starts
+/// with, since a master holds one per shard while a sync runs.
+const SYNC_IMAGE_BUF: usize = (1 << 20) + (256 << 10);
 
 /// An [`AofImage`]'s walk over one DB's table (see [`RdbSaveCursor`]).
 struct DbWalk {
@@ -4977,7 +5020,11 @@ impl AofImage {
     }
 
     fn start_inner(db: &ShardDb, chunk: bool) -> Result<Self, TieredReadError> {
-        let mut buf = Vec::with_capacity(RDB_FLUSH_BYTES * 2);
+        let mut buf = Vec::with_capacity(if chunk {
+            SYNC_IMAGE_BUF
+        } else {
+            RDB_FLUSH_BYTES * 2
+        });
         if !chunk {
             crate::redis_rdb::write_file_header(&mut buf, db.total_used_memory() as u64);
         }
@@ -5030,7 +5077,32 @@ impl AofImage {
             tier: db.tier_manager.clone(),
             poisoned: None,
             chunk,
+            spare: None,
+            held: SyncImageHeld::default(),
         })
+        .map(|mut img| {
+            img.report_held();
+            img
+        })
+    }
+
+    /// Updates a full-sync image's share of [`SYNC_IMAGE_BYTES`].
+    fn report_held(&mut self) {
+        if self.chunk {
+            let bytes = self.buf.capacity() + self.spare.as_ref().map_or(0, Vec::capacity);
+            self.held.set(bytes as i64);
+        }
+    }
+
+    /// Hands back the buffer of a piece [`Self::step`] returned, once sent,
+    /// to hold the next piece: a full sync's pieces are sent from another
+    /// thread, and freeing them there skews the per-thread memory counts
+    /// eviction reads.
+    pub fn give_buffer(&mut self, buf: Vec<u8>) {
+        if buf.capacity() > 0 {
+            self.spare = Some(buf);
+            self.report_held();
+        }
     }
 
     fn select(&mut self, db_idx: usize) {
@@ -5076,8 +5148,18 @@ impl AofImage {
                 self.done = true;
             }
         }
-        let piece = (self.buf.len() >= flush_bytes)
-            .then(|| std::mem::replace(&mut self.buf, Vec::with_capacity(RDB_FLUSH_BYTES * 2)));
+        let piece = (self.buf.len() >= flush_bytes).then(|| {
+            let next = match self.spare.take() {
+                Some(mut b) => {
+                    b.clear();
+                    b
+                }
+                None if self.chunk => Vec::with_capacity(SYNC_IMAGE_BUF),
+                None => Vec::with_capacity(RDB_FLUSH_BYTES * 2),
+            };
+            std::mem::replace(&mut self.buf, next)
+        });
+        self.report_held();
         Ok((piece, self.done))
     }
 
@@ -5346,9 +5428,16 @@ const SYNC_IMAGE_PIECE_BYTES: usize = 1 << 20;
 /// Returns the bytes to send and whether this shard's part is complete (the
 /// image is then removed). An error (the image was poisoned, or a spilled
 /// value could not be read) removes it too: the sync must start over.
-pub fn sync_image_step(db: &ShardDb, replica: u64) -> Result<(Vec<u8>, bool), String> {
+pub fn sync_image_step(
+    db: &ShardDb,
+    replica: u64,
+    recycle: Option<Vec<u8>>,
+) -> Result<(Vec<u8>, bool), String> {
     let owner = ImageOwner::FullSync(replica);
     let step = with_image(owner, |img| {
+        if let Some(buf) = recycle {
+            img.give_buffer(buf);
+        }
         img.step(db, RDB_SAVE_STEP, SYNC_IMAGE_PIECE_BYTES)
     })
     .ok_or_else(|| "the full-sync image is gone".to_string())?;
@@ -5395,6 +5484,7 @@ pub fn before_write_in(db: &ShardDb, db_idx: usize, key: &[u8]) {
             });
         }
         img.cover_ext(db, key);
+        img.report_held();
     });
 }
 
@@ -5413,6 +5503,7 @@ pub fn before_write_table(table: &crate::table::RudisTable, db_idx: usize, key: 
                 hydrate_tiered_from(tier.as_deref()?, ptr)
             })
         });
+        img.report_held();
     });
 }
 
@@ -5520,6 +5611,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A full-sync image's buffers are counted in `SYNC_IMAGE_BYTES` (which
+    /// eviction leaves out) while it exists, are about one piece rather than
+    /// the 8 MB a rewrite image starts with, are reused once handed back,
+    /// and stop counting when the image is done. They counted toward
+    /// maxmemory before, so a replica attaching to a master at its limit
+    /// made it evict.
+    #[test]
+    fn test_sync_image_bytes_are_counted_apart() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut db = ShardDb::new(0);
+        for i in 0..20_000 {
+            db.rpush(
+                Bytes::from(format!("l{i}")),
+                vec![Bytes::from(vec![b'x'; 300])],
+            )
+            .unwrap();
+        }
+        let base = SYNC_IMAGE_BYTES.load(Relaxed);
+        start_sync_image(&db, 0, 78).unwrap();
+        let held = SYNC_IMAGE_BYTES.load(Relaxed) - base;
+        assert!(
+            held > 0 && held < 2 << 20,
+            "a new sync image holds {held} bytes"
+        );
+        let mut recycle: Option<Vec<u8>> = None;
+        let mut handed_back = Vec::new();
+        let (mut pieces, mut in_reused) = (0, 0);
+        loop {
+            if let Some(b) = &recycle {
+                handed_back.push(b.as_ptr() as usize);
+            }
+            let (piece, done) = sync_image_step(&db, 78, recycle.take()).unwrap();
+            if done {
+                break;
+            }
+            assert!(SYNC_IMAGE_BYTES.load(Relaxed) - base < 4 << 20);
+            if piece.is_empty() {
+                continue;
+            }
+            pieces += 1;
+            if handed_back.contains(&(piece.as_ptr() as usize)) {
+                in_reused += 1;
+            }
+            recycle = Some(piece);
+        }
+        assert!(pieces >= 4, "only {pieces} pieces");
+        // The first two pieces use the image's own buffers; every later one
+        // is built in a buffer handed back.
+        assert_eq!(
+            in_reused,
+            pieces - 2,
+            "{in_reused} of {pieces} pieces reused a buffer"
+        );
+        assert_eq!(
+            SYNC_IMAGE_BYTES.load(Relaxed),
+            base,
+            "a finished image still counts"
+        );
+    }
+
     /// An AOF rewrite image and a full sync's chunk image are built at
     /// once on one shard, with writes in between: each stays as of its own
     /// start (the write hooks cover both), and the chunk wrapped in a file
@@ -5549,7 +5700,7 @@ mod tests {
         let mut round = 0;
         while !(sync_done && rewrite_done) {
             if !sync_done {
-                let (piece, done) = sync_image_step(&db, 99).unwrap();
+                let (piece, done) = sync_image_step(&db, 99, None).unwrap();
                 chunk.extend(piece);
                 sync_done = done;
             }

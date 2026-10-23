@@ -71,6 +71,10 @@ pub struct ConnectedReplica {
     wake_queued: AtomicBool,
     /// Bytes the writer took from `pending` and is still writing.
     inflight: std::sync::atomic::AtomicUsize,
+    /// This replica's output buffers (`pending` and `inflight`) in
+    /// [`crate::shard::SYNC_IMAGE_BYTES`]: like Redis's replica output
+    /// buffers, they don't count toward maxmemory.
+    buffers_held: Mutex<crate::shard::SyncImageHeld>,
     /// Set once the buffered stream broke `client-output-buffer-limit
     /// replica`; nothing more is buffered and the writer drops the link.
     overflowed: AtomicBool,
@@ -164,13 +168,22 @@ impl ConnectedReplica {
         let buffered = pending.len() + self.inflight.load(Ordering::Relaxed);
         if self.over_output_limit(buffered) {
             *pending = Vec::new();
+            self.note_buffers(0);
             drop(pending);
             // Always wake, so the writer notices and drops the link.
             self.wake_queued.store(true, Ordering::Release);
             return true;
         }
+        self.note_buffers(pending.capacity());
         drop(pending);
         !self.wake_queued.swap(true, Ordering::AcqRel)
+    }
+
+    /// Updates this replica's share of the bytes maxmemory leaves out
+    /// (`pending_capacity` plus what the writer is still writing).
+    fn note_buffers(&self, pending_capacity: usize) {
+        let bytes = pending_capacity + self.inflight.load(Ordering::Relaxed);
+        self.buffers_held.lock().set(bytes as i64);
     }
 
     /// Buffers bytes that must follow the full-sync snapshot; returns true
@@ -289,12 +302,15 @@ impl ConnectedReplica {
         let mut pending = self.pending.lock();
         let data = std::mem::take(&mut *pending);
         self.inflight.store(data.len(), Ordering::Relaxed);
+        self.note_buffers(0);
         data
     }
 
     /// The writer finished writing the batch from `take_pending`.
     pub fn finish_write(&self) {
+        let pending = self.pending.lock();
         self.inflight.store(0, Ordering::Relaxed);
+        self.note_buffers(pending.capacity());
     }
 }
 
@@ -1039,6 +1055,7 @@ impl ReplicationHub {
             pending: Mutex::new(Vec::new()),
             wake_queued: AtomicBool::new(false),
             inflight: std::sync::atomic::AtomicUsize::new(0),
+            buffers_held: Mutex::new(crate::shard::SyncImageHeld::default()),
             overflowed: AtomicBool::new(false),
             soft_since_ms: AtomicU64::new(0),
             conn_fd: Mutex::new(None),
