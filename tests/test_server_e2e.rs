@@ -33235,3 +33235,130 @@ fn test_cluster_restart_does_not_resurrect_pseudo_shard_nodes_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&peer_dir);
 }
+
+/// 3 masters with a replica each. Heartbeats must stay timely with six
+/// nodes: no live node is ever judged failing, and killing a master gets
+/// its replica promoted. (Accepting bus connections used to wait behind
+/// sequential pings: PINGs were read seconds late, so live nodes looked
+/// silent and a dead one kept "talking" for a minute.)
+#[test]
+fn test_cluster_six_node_heartbeats_stay_timely_e2e() {
+    let ports = [18129u16, 18135, 18141, 18147, 18153, 18159];
+    let ranges = [(0, 5460), (5461, 10922), (10923, 16383)];
+    let dirs: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            let d = std::env::temp_dir().join(format!("rudis_six_{}_{}", p, std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d.to_str().unwrap().to_string()
+        })
+        .collect();
+    let mut servers: Vec<Option<ServerGuard>> = ports
+        .iter()
+        .zip(&dirs)
+        .map(|(p, d)| {
+            Some(ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    d,
+                    "--cluster-enabled",
+                    "yes",
+                    "--threads",
+                    "2",
+                    "--no-pin",
+                ],
+                *p,
+            )))
+        })
+        .collect();
+    let cmd = |p: u16, args: &[&str]| {
+        let mut c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd(&mut c, args)
+    };
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    let wait_until = |what: &str, ok: &mut dyn FnMut() -> Option<String>| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match ok() {
+                None => return,
+                Some(state) => assert!(std::time::Instant::now() < deadline, "{what}: {state}"),
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    for p in ports {
+        assert_eq!(
+            cmd(p, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+            "+OK\r\n"
+        );
+    }
+    for (p, (s, e)) in ports.iter().zip(ranges) {
+        let (s, e) = (s.to_string(), e.to_string());
+        assert_eq!(cmd(*p, &["CLUSTER", "ADDSLOTSRANGE", &s, &e]), "+OK\r\n");
+    }
+    for p in &ports[1..] {
+        assert_eq!(
+            cmd(ports[0], &["CLUSTER", "MEET", "127.0.0.1", &p.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    let ids: Vec<String> = ports
+        .iter()
+        .map(|p| bulk(cmd(*p, &["CLUSTER", "MYID"])))
+        .collect();
+    wait_until("everyone knows everyone", &mut || {
+        let views: Vec<String> = ports
+            .iter()
+            .map(|p| cmd(*p, &["CLUSTER", "NODES"]))
+            .collect();
+        (!views
+            .iter()
+            .all(|v| ids.iter().all(|id| v.contains(id.as_str()))))
+        .then(|| views.join("\n"))
+    });
+    for i in 0..3 {
+        assert_eq!(
+            cmd(ports[3 + i], &["CLUSTER", "REPLICATE", &ids[i]]),
+            "+OK\r\n"
+        );
+    }
+
+    // Ten seconds (twice the node timeout) of a healthy cluster: no node
+    // may see a live one as failing.
+    let healthy_until = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < healthy_until {
+        for p in ports {
+            let nodes = cmd(p, &["CLUSTER", "NODES"]);
+            assert!(
+                !nodes.contains("fail"),
+                "node {p} sees a live node failing:\n{nodes}"
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    servers[0] = None; // SIGKILL the master of 0-5460
+    let started = std::time::Instant::now();
+    wait_until("its replica takes over", &mut || {
+        let nodes = cmd(ports[3], &["CLUSTER", "NODES"]);
+        let me = nodes
+            .lines()
+            .find(|l| l.contains("myself"))
+            .unwrap_or_default();
+        (!(me.contains("master") && me.ends_with(" 0-5460"))).then_some(nodes)
+    });
+    eprintln!("promoted after {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(servers);
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

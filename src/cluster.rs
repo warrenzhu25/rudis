@@ -2130,14 +2130,32 @@ pub fn start_cluster_bus(port: u16) {
                     }
                 };
 
-            let mut last_tick = std::time::Instant::now();
+            // Heartbeats on a thread of their own: a tick waits on peers, and
+            // accepting must never wait behind it. Queued PINGs used to be
+            // read seconds late, so a dead node kept "talking" and live ones
+            // looked silent.
+            let tick_hub = hub_clone.clone();
+            let tick_cancel = cancel_rx.clone();
+            std::thread::Builder::new()
+                .name(format!("cluster-tick-{}", cport))
+                .spawn(move || {
+                    while tick_cancel.is_empty() {
+                        let started = std::time::Instant::now();
+                        cluster_bus_tick(&tick_hub);
+                        std::thread::sleep(
+                            Duration::from_millis(500).saturating_sub(started.elapsed()),
+                        );
+                    }
+                })
+                .expect("Failed to spawn cluster tick thread");
+
             let open_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             while cancel_rx.is_empty() {
-                // 1. Accept new cluster bus connections
+                // Accept every pending cluster bus connection.
                 let mut accepted_any = false;
                 for listener in &listeners {
-                    if let Ok((stream, _)) = listener.accept() {
+                    while let Ok((stream, _)) = listener.accept() {
                         accepted_any = true;
                         if open_conns.fetch_add(1, Ordering::AcqRel) >= MAX_BUS_CONNS {
                             open_conns.fetch_sub(1, Ordering::AcqRel);
@@ -2155,13 +2173,7 @@ pub fn start_cluster_bus(port: u16) {
                     }
                 }
                 if !accepted_any {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-
-                // 2. Heartbeat tick every 500ms
-                if last_tick.elapsed() >= Duration::from_millis(500) {
-                    last_tick = std::time::Instant::now();
-                    cluster_bus_tick(&hub_clone);
+                    std::thread::sleep(Duration::from_millis(5));
                 }
             }
         })
@@ -2560,45 +2572,55 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         gossip_payload.pop();
     }
 
-    for (id, ip, _port, cport) in peers {
-        let addr = format!("{}:{}", ip, cport);
-        let parsed_addr = match addr.parse::<SocketAddr>() {
-            Ok(a) => a,
-            Err(_) => continue,
+    // Every peer at once (a bounded batch at a time): one slow or dead
+    // peer must not delay the others' heartbeats.
+    let exchange = |id: &str, ip: &str, cport: u16| -> bool {
+        let Ok(addr) = format!("{}:{}", ip, cport).parse::<SocketAddr>() else {
+            return false;
         };
-
-        // Record ping_sent
-        if let Some(node) = hub.nodes.write().get_mut(&id) {
-            node.ping_sent = now;
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(1000)));
+        // Built per peer, so it carries this node's slots as of sending.
+        let ping_msg = hub.ping_frame(&gossip_payload);
+        let mut buf = [0u8; 4096];
+        // apply_pong records the peer's slots and epoch, ignoring stale ones.
+        stream.write_all(ping_msg.as_bytes()).is_ok()
+            && stream
+                .read(&mut buf)
+                .is_ok_and(|n| hub.apply_pong(id, &String::from_utf8_lossy(&buf[..n])))
+    };
+    for batch in peers.chunks(64) {
+        for (id, ..) in batch {
+            if let Some(node) = hub.nodes.write().get_mut(id) {
+                node.ping_sent = now;
+            }
         }
-
-        if let Ok(mut stream) = TcpStream::connect_timeout(&parsed_addr, Duration::from_millis(200))
-        {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-            // Built per peer, so it carries this node's slots as of sending.
-            let ping_msg = hub.ping_frame(&gossip_payload);
-            let mut buf = [0u8; 512];
-            // apply_pong records the peer's slots and epoch, ignoring stale ones.
-            let success = stream.write_all(ping_msg.as_bytes()).is_ok()
-                && stream
-                    .read(&mut buf)
-                    .is_ok_and(|n| hub.apply_pong(&id, &String::from_utf8_lossy(&buf[..n])));
-
+        let results: Vec<bool> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|(id, ip, _port, cport)| scope.spawn(|| exchange(id, ip, *cport)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or(false))
+                .collect()
+        });
+        for ((id, ..), success) in batch.iter().zip(results) {
             if success {
-                if let Some(node) = hub.nodes.write().get_mut(&id) {
+                if let Some(node) = hub.nodes.write().get_mut(id) {
                     node.pong_recv = now;
                     node.link_state = "connected".to_string();
                     node.fail = FailState::Ok;
                 }
-                if let Some(reports) = hub.pfail_reports.write().get_mut(&id) {
+                if let Some(reports) = hub.pfail_reports.write().get_mut(id) {
                     reports.remove(&hub.my_id());
                 }
             } else {
-                note_unreachable(hub, &id, now, quorum);
+                note_unreachable(hub, id, now, quorum);
             }
-        } else {
-            note_unreachable(hub, &id, now, quorum);
         }
     }
 
@@ -2708,6 +2730,64 @@ mod tests {
         hub.claim_slots(&other, Some(1), vec![(10923, 16383)]);
         assert!(hub.nodes.read()[&other].slots.is_empty());
         assert_eq!(hub.nodes.read()[&new].slots, vec![(10923, 16383)]);
+    }
+
+    #[test]
+    fn test_bus_tick_pings_peers_in_parallel() {
+        // 16 peers that accept but never answer, and one that answers.
+        // Pinged one after another, the tick took one timeout per silent
+        // peer (3.2 s here), delaying everyone's heartbeats (and inbound
+        // PINGs queued behind it); in parallel it takes about one timeout.
+        let hub = Arc::new(ClusterHub::new(7500));
+        let mut silent = Vec::new();
+        let add = |hub: &ClusterHub, id: String, listener: &TcpListener| {
+            let port = listener.local_addr().unwrap().port();
+            hub.nodes.write().insert(
+                id.clone(),
+                ClusterNodeInfo {
+                    id,
+                    ip: "127.0.0.1".to_string(),
+                    port: port - 10000,
+                    cport: port,
+                    flags: "master".to_string(),
+                    fail: FailState::Ok,
+                    master_id: "-".to_string(),
+                    ping_sent: 0,
+                    pong_recv: 0,
+                    config_epoch: 0,
+                    link_state: "connected".to_string(),
+                    slots: Vec::new(),
+                },
+            );
+        };
+        let bind = || {
+            (0..200)
+                .find_map(|i| TcpListener::bind(("127.0.0.1", 47600 + i)).ok())
+                .unwrap()
+        };
+        for i in 0..16 {
+            let l = bind();
+            add(&hub, format!("{:0>40}", format!("s{i}")), &l);
+            silent.push(l); // accepted by the kernel, never answered
+        }
+        let answering = bind();
+        let fast_id = "f".repeat(40);
+        add(&hub, fast_id.clone(), &answering);
+        let reply = format!("+PONG {fast_id} 0 master\r\n");
+        std::thread::spawn(move || {
+            for mut c in answering.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+
+        let started = std::time::Instant::now();
+        cluster_bus_tick(&hub);
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(2000), "tick took {took:?}");
+        assert!(hub.nodes.read()[&fast_id].pong_recv > 0);
+        drop(silent);
     }
 
     #[test]
