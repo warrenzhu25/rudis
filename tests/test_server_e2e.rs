@@ -14992,9 +14992,18 @@ fn test_startup_survives_overflowing_rdb_fields_e2e() {
             if child.try_wait().unwrap().is_some() {
                 break false;
             }
+            // A connection the previous input's SIGKILLed server still held
+            // may be reset: only a reply means this server is up.
             if let Ok(mut c) = TcpStream::connect("127.0.0.1:18039") {
-                assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n", "input {i}");
-                break true;
+                let _ = c.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buf = [0u8; 64];
+                if c.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok()
+                    && let Ok(n) = c.read(&mut buf)
+                    && n > 0
+                {
+                    assert_eq!(&buf[..n], b"+PONG\r\n", "input {i}");
+                    break true;
+                }
             }
             assert!(std::time::Instant::now() < deadline, "input {i}: no start");
             thread::sleep(Duration::from_millis(50));
