@@ -32802,11 +32802,7 @@ fn test_cluster_shard_port_writes_reach_the_replica_e2e() {
     let (mdir, rdir) = (mk_dir(mport), mk_dir(rport));
     let _m = spawn(mport, &mdir);
     let _r = spawn(rport, &rdir);
-    let conn = |p: u16| {
-        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        c
-    };
+    let conn = connect_ready;
     let mut m0 = conn(mport);
     let mut m1 = conn(mport + 1);
     assert_eq!(
@@ -32890,11 +32886,7 @@ fn test_cluster_replicate_copies_the_masters_data_e2e() {
             p,
         ))
     };
-    let conn = |p: u16| {
-        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        c
-    };
+    let conn = connect_ready;
     let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
     let wait_until = |what: &str, mut ok: Box<dyn FnMut() -> Option<String> + '_>| {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -33002,6 +32994,25 @@ fn test_cluster_replicate_copies_the_masters_data_e2e() {
     drop(r_srv);
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&rdir);
+}
+
+/// Connects to `port`, retrying while it refuses: `spawn_rudis_listening`
+/// waits for the base port, and the other shards of a cluster-mode node
+/// may start listening on theirs a moment later.
+fn connect_ready(port: u16) -> TcpStream {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(c) => {
+                c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                return c;
+            }
+            Err(e) => {
+                assert!(std::time::Instant::now() < deadline, "port {port}: {e}");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 /// Waits until every node's CLUSTER SLOTS shows all three ranges of a
@@ -33844,11 +33855,7 @@ fn test_cluster_shard_ports_share_maxmemory_e2e() {
         ],
         port,
     ));
-    let conn = |p: u16| {
-        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        c
-    };
+    let conn = connect_ready;
     let (mut c0, mut c1) = (conn(port), conn(port + 1));
     assert_eq!(
         resp_cmd(&mut c1, &["CONFIG", "GET", "maxmemory"]),
@@ -33897,11 +33904,7 @@ fn test_cluster_publish_reaches_every_shard_port_e2e() {
         ],
         port,
     ));
-    let conn = |p: u16| {
-        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        c
-    };
+    let conn = connect_ready;
     for (sub_port, pub_port) in [(port + 1, port), (port, port + 1)] {
         let mut sub = conn(sub_port);
         let ch = format!("ch{sub_port}");
@@ -33924,7 +33927,7 @@ fn test_cluster_publish_reaches_every_shard_port_e2e() {
 /// port, not just its own.
 #[test]
 fn test_cluster_monitor_sees_every_shard_port_e2e() {
-    let port = 18231u16;
+    let port = 18297u16;
     let dir = std::env::temp_dir().join(format!("rudis_cl_monitor_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -33942,11 +33945,7 @@ fn test_cluster_monitor_sees_every_shard_port_e2e() {
         ],
         port,
     ));
-    let conn = |p: u16| {
-        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        c
-    };
+    let conn = connect_ready;
     let mut mon = conn(port);
     assert_eq!(resp_cmd(&mut mon, &["MONITOR"]), "+OK\r\n");
     let mut other = conn(port + 1);
@@ -34278,11 +34277,7 @@ fn test_cluster_watch_sees_flushall_from_another_port_e2e() {
         ],
         port,
     ));
-    let conn = |p: u16| {
-        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        c
-    };
+    let conn = connect_ready;
     let k = (0..1000)
         .map(|i| format!("w{i}"))
         .find(|k| rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2) == 1)
