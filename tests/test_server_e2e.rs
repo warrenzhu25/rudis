@@ -32723,3 +32723,92 @@ fn test_restart_parses_the_aof_tail_in_chunks_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// In cluster mode each shard has its own client port, and clients write to
+/// it directly (MOVED points there). The node still has one identity and one
+/// replication stream: writes taken on any shard's port must reach the
+/// replica, and `CLUSTER MYID` must not depend on the port asked.
+#[test]
+fn test_cluster_shard_port_writes_reach_the_replica_e2e() {
+    let (mport, rport) = (18069u16, 18075u16);
+    let mk_dir = |p: u16| {
+        let d =
+            std::env::temp_dir().join(format!("rudis_shardport_repl_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "2",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (mdir, rdir) = (mk_dir(mport), mk_dir(rport));
+    let _m = spawn(mport, &mdir);
+    let _r = spawn(rport, &rdir);
+    let conn = |p: u16| {
+        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let mut m0 = conn(mport);
+    let mut m1 = conn(mport + 1);
+    assert_eq!(
+        resp_cmd(&mut m0, &["CLUSTER", "MYID"]),
+        resp_cmd(&mut m1, &["CLUSTER", "MYID"]),
+        "both shard ports are the same node"
+    );
+    let mut r0 = conn(rport);
+    assert_eq!(
+        resp_cmd(&mut r0, &["REPLICAOF", "127.0.0.1", &mport.to_string()]),
+        "+OK\r\n"
+    );
+    let wait_for = |c: &mut TcpStream, want: &str, what: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let info = resp_cmd(c, &["INFO", "replication"]);
+            if info.contains(want) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}: {info}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    wait_for(&mut r0, "master_link_status:up", "replica link");
+
+    // Each key is written on the port of the shard that owns it.
+    let n = 400;
+    for i in 0..n {
+        let k = format!("sp_{i}");
+        let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2);
+        let c = if shard == 0 { &mut m0 } else { &mut m1 };
+        assert_eq!(resp_cmd(c, &["SET", &k, "v"]), "+OK\r\n", "{k}");
+    }
+    let dbsize = |c: &mut TcpStream| resp_cmd(c, &["DBSIZE"]);
+    assert_eq!(dbsize(&mut m0), format!(":{n}\r\n"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = dbsize(&mut r0);
+        if got == format!(":{n}\r\n") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica holds {got:?} of {n} keys"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}

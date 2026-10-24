@@ -7409,7 +7409,7 @@ async fn run_master_replica_stream(
     router: Rc<Router>,
     psync_cmd: Command,
 ) {
-    let hub = crate::replication::get_replication_hub(router.port);
+    let hub = crate::replication::get_replication_hub(router.base_port);
     let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
     if let Ok(peer) = stream.peer_addr() {
         hub.note_replica_ip(client_id, peer.ip());
@@ -7636,7 +7636,7 @@ async fn run_shard_replication_flow(
     shard_id: usize,
     _lsn: Option<u64>,
 ) {
-    let hub = crate::replication::get_replication_hub(router.port);
+    let hub = crate::replication::get_replication_hub(router.base_port);
     let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
     let (mut reader, mut writer) = stream.into_split();
     let _unregister = UnregisterFdOnDrop {
@@ -9577,9 +9577,9 @@ async fn handle_bzpop(
                             if let Some(aof_w) = &router.aof {
                                 aof_w.borrow_mut().append(&bytes);
                             }
-                            if crate::replication::has_connected_replicas(router.port) {
+                            if crate::replication::has_connected_replicas(router.base_port) {
                                 crate::replication::propagate_shard_bytes(
-                                    router.port,
+                                    router.base_port,
                                     router.shard_id,
                                     &bytes,
                                 );
@@ -10729,7 +10729,7 @@ async fn execute_command_inner(
 
     if MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0
         && cmd.is_write_command()
-        && not_enough_good_replicas(router.port)
+        && not_enough_good_replicas(router.base_port)
     {
         out.extend_from_slice(b"-NOREPLICAS Not enough good replicas to write.\r\n");
         return false;
@@ -10798,8 +10798,8 @@ async fn execute_command_inner(
                 }
             }
             crate::shard::SlotState::Stable => {
-                if router.cluster_enabled || crate::cluster::has_active_cluster(router.port) {
-                    let hub = crate::cluster::get_cluster_hub(router.port);
+                if router.cluster_enabled || crate::cluster::has_active_cluster(router.base_port) {
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
                     let my_slots = hub.my_slots.read();
                     let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
                     if owns_slot {
@@ -10836,7 +10836,7 @@ async fn execute_command_inner(
         }
     }
 
-    if crate::replication::is_loading(router.port) && !allowed_while_loading(&cmd) {
+    if crate::replication::is_loading(router.base_port) && !allowed_while_loading(&cmd) {
         out.extend_from_slice(b"-LOADING Redis is loading the dataset in memory\r\n");
         return false;
     }
@@ -10850,7 +10850,7 @@ async fn execute_command_inner(
 
     if crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
         && REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && crate::replication::get_replication_hub(router.port).is_slave()
+        && crate::replication::get_replication_hub(router.base_port).is_slave()
         && (cmd.is_write_command() || crate::aof::command_to_resp(&cmd).is_some())
     {
         out.extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");
@@ -10864,7 +10864,7 @@ async fn execute_command_inner(
         .tier_stats
         .max_memory
         .load(std::sync::atomic::Ordering::Relaxed);
-    if max_mem > 0 && !maxmemory_ignored_as_replica(router.port) {
+    if max_mem > 0 && !maxmemory_ignored_as_replica(router.base_port) {
         let policy = get_max_memory_policy();
         if policy != "noeviction" {
             if !matches!(
@@ -10997,7 +10997,7 @@ async fn execute_command_inner(
                     && !keepttl
                     && !past_expired
                     && router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
+                    && !crate::replication::has_connected_replicas(router.base_port)
                     && crate::connection::NOTIFY_KEYSPACE_FLAGS
                         .load(std::sync::atomic::Ordering::Relaxed)
                         == 0
@@ -11156,7 +11156,7 @@ async fn execute_command_inner(
                     && !keepttl
                     && !past_expired
                     && router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
+                    && !crate::replication::has_connected_replicas(router.base_port)
                     && crate::connection::NOTIFY_KEYSPACE_FLAGS
                         .load(std::sync::atomic::Ordering::Relaxed)
                         == 0
@@ -11698,7 +11698,7 @@ async fn execute_command_inner(
             false
         }
         Command::Info(section) => {
-            let hub = crate::replication::get_replication_hub(router.port);
+            let hub = crate::replication::get_replication_hub(router.base_port);
             let stats = crate::tiering::get_tier_stats(router.port);
             let max_mem = crate::tiering::get_max_memory(router.port);
             let used_mem = router.get_total_used_memory().await;
@@ -11837,7 +11837,7 @@ async fn execute_command_inner(
                 // The fork/COW fields are always 0: snapshots are taken in
                 // place, without a child process.
                 "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:{}\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\naof_rewrites:{}\r\naof_rewrites_consecutive_failures:{}\r\naof_rewrite_fallbacks:{}\r\n{}unpropagated_changes:{}\r\n",
-                u8::from(crate::replication::is_loading(router.port)),
+                u8::from(crate::replication::is_loading(router.base_port)),
                 snap.changes_since_last_save(),
                 u8::from(
                     RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
@@ -12085,7 +12085,7 @@ async fn execute_command_inner(
             false
         }
         Command::Role => {
-            let hub = crate::replication::get_replication_hub(router.port);
+            let hub = crate::replication::get_replication_hub(router.base_port);
             out.extend_from_slice(&hub.format_role_resp());
             false
         }
@@ -12097,7 +12097,7 @@ async fn execute_command_inner(
                     && let Ok(s) = std::str::from_utf8(&args[1])
                     && let Ok(rport) = s.parse::<u16>()
                 {
-                    let hub = crate::replication::get_replication_hub(router.port);
+                    let hub = crate::replication::get_replication_hub(router.base_port);
                     hub.set_replica_port(client_id, rport);
                 }
                 out.extend_from_slice(b"+OK\r\n");
@@ -12105,16 +12105,16 @@ async fn execute_command_inner(
                 if args.len() >= 2
                     && let Ok(s) = std::str::from_utf8(&args[1])
                 {
-                    let hub = crate::replication::get_replication_hub(router.port);
+                    let hub = crate::replication::get_replication_hub(router.base_port);
                     hub.set_replica_announced_ip(client_id, s);
                 }
                 out.extend_from_slice(b"+OK\r\n");
             } else if args[0].eq_ignore_ascii_case(b"capa") {
                 if args.iter().any(|a| a.eq_ignore_ascii_case(b"eof")) {
-                    crate::replication::get_replication_hub(router.port).note_replica_capa_eof(client_id);
+                    crate::replication::get_replication_hub(router.base_port).note_replica_capa_eof(client_id);
                 }
                 if args.iter().any(|a| a.eq_ignore_ascii_case(b"dragonfly")) {
-                    let hub = crate::replication::get_replication_hub(router.port);
+                    let hub = crate::replication::get_replication_hub(router.base_port);
                     let replid = &hub.replid();
                     let num_shards = router.num_shards;
                     out.extend_from_slice(
@@ -12134,11 +12134,11 @@ async fn execute_command_inner(
                     && let Ok(s) = std::str::from_utf8(&args[1])
                     && let Ok(off) = s.parse::<u64>()
                 {
-                    let hub = crate::replication::get_replication_hub(router.port);
+                    let hub = crate::replication::get_replication_hub(router.base_port);
                     hub.update_replica_ack(client_id, off);
                 }
             } else if args[0].eq_ignore_ascii_case(b"getack") {
-                let hub = crate::replication::get_replication_hub(router.port);
+                let hub = crate::replication::get_replication_hub(router.base_port);
                 let off = hub
                     .master_repl_offset
                     .load(std::sync::atomic::Ordering::SeqCst)
@@ -12157,7 +12157,7 @@ async fn execute_command_inner(
             false
         }
         Command::Replicaof { host, port } => {
-            let hub = crate::replication::get_replication_hub(router.port);
+            let hub = crate::replication::get_replication_hub(router.base_port);
             if host.eq_ignore_ascii_case(b"no") && port.eq_ignore_ascii_case(b"one") {
                 if hub.is_slave() {
                     hub.stop_sync_and_wait().await;
@@ -12185,7 +12185,7 @@ async fn execute_command_inner(
                             client_id
                         );
                         crate::replication::start_replica_sync(
-                            router.port,
+                            router.base_port,
                             host_str,
                             mport,
                             router.clone(),
@@ -12443,7 +12443,7 @@ async fn execute_command_inner(
                         let target_addr = if node.contains(':') {
                             node.clone()
                         } else {
-                            let hub = crate::cluster::get_cluster_hub(router.port);
+                            let hub = crate::cluster::get_cluster_hub(router.base_port);
                             let nodes = hub.nodes.read();
                             if let Some(n) = nodes.get(&node) {
                                 format!("{}:{}", n.ip, n.port)
@@ -12453,7 +12453,7 @@ async fn execute_command_inner(
                         };
                         router
                             .set_slot_state(slot, crate::shard::SlotState::Migrating(target_addr));
-                        let hub = crate::cluster::get_cluster_hub(router.port);
+                        let hub = crate::cluster::get_cluster_hub(router.base_port);
                         hub.slot_states
                             .write()
                             .insert(slot, ("migrating".to_string(), node));
@@ -12464,7 +12464,7 @@ async fn execute_command_inner(
                         let source_addr = if node.contains(':') {
                             node.clone()
                         } else {
-                            let hub = crate::cluster::get_cluster_hub(router.port);
+                            let hub = crate::cluster::get_cluster_hub(router.base_port);
                             let nodes = hub.nodes.read();
                             if let Some(n) = nodes.get(&node) {
                                 format!("{}:{}", n.ip, n.port)
@@ -12474,7 +12474,7 @@ async fn execute_command_inner(
                         };
                         router
                             .set_slot_state(slot, crate::shard::SlotState::Importing(source_addr));
-                        let hub = crate::cluster::get_cluster_hub(router.port);
+                        let hub = crate::cluster::get_cluster_hub(router.base_port);
                         hub.slot_states
                             .write()
                             .insert(slot, ("importing".to_string(), node));
@@ -12483,7 +12483,7 @@ async fn execute_command_inner(
                     }
                     SetSlotSubcommand::Stable => {
                         router.set_slot_state(slot, crate::shard::SlotState::Stable);
-                        let hub = crate::cluster::get_cluster_hub(router.port);
+                        let hub = crate::cluster::get_cluster_hub(router.base_port);
                         hub.slot_states.write().remove(&slot);
                         router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
@@ -12493,7 +12493,7 @@ async fn execute_command_inner(
                         let is_myself = node == "myself"
                             || node == my_id
                             || (0..router.num_shards).any(|s| node == format!("{:040x}", s + 1));
-                        let hub = crate::cluster::get_cluster_hub(router.port);
+                        let hub = crate::cluster::get_cluster_hub(router.base_port);
                         hub.slot_states.write().remove(&slot);
                         if is_myself {
                             let shard = (0..router.num_shards)
@@ -12656,7 +12656,7 @@ async fn execute_command_inner(
                     threshold,
                     pipeline,
                 } => {
-                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
                     let target_hp = match (host, port) {
                         (Some(h), Some(p)) => Some((h, p, slots)),
                         _ => None,
@@ -12707,7 +12707,7 @@ async fn execute_command_inner(
                     }
                 }
                 ClusterSubcommand::Check => {
-                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
                     let report = hub.cluster_check();
                     let desc = report.format_report();
                     write_resp_bulk(out, desc.as_bytes());
@@ -12717,7 +12717,7 @@ async fn execute_command_inner(
                     source_node_id,
                     slots,
                 } => {
-                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
                     match hub.compute_reshard_plan(&target_node_id, &source_node_id, slots) {
                         Ok(plans) => {
                             let moved = execute_rebalance_plans(router, &hub, &plans, 100).await;
@@ -12764,19 +12764,19 @@ async fn execute_command_inner(
                     }
                 }
                 ClusterSubcommand::BumpEpoch => {
-                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
                     let new_epoch = hub.bump_config_epoch();
                     out.extend_from_slice(format!("+BUMPED {}\r\n", new_epoch).as_bytes());
                 }
                 ClusterSubcommand::SetConfigEpoch(epoch) => {
-                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
                     match hub.set_config_epoch(epoch) {
                         Ok(()) => out.extend_from_slice(b"+OK\r\n"),
                         Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
                     }
                 }
                 ClusterSubcommand::FlushSlots => {
-                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
                     hub.my_slots.write().clear();
                     hub.slot_states.write().clear();
                     let _ = hub.save_config();
@@ -12992,7 +12992,7 @@ async fn execute_command_inner(
                         if killed_cids.is_empty() {
                             // A replica's link to its master is a client in
                             // Redis, listed under the master's address.
-                            let hub = crate::replication::get_replication_hub(router.port);
+                            let hub = crate::replication::get_replication_hub(router.base_port);
                             if hub.drop_master_link_to(&target_addr) {
                                 out.extend_from_slice(b"+OK\r\n");
                             } else {
@@ -13198,7 +13198,7 @@ async fn execute_command_inner(
                                 && filter_user.is_none()
                                 && filter_laddr.is_none()
                             {
-                                let hub = crate::replication::get_replication_hub(router.port);
+                                let hub = crate::replication::get_replication_hub(router.base_port);
                                 let addr = match &*hub.role.read() {
                                     crate::replication::ReplicationRole::Slave {
                                         master_host,
@@ -13537,7 +13537,7 @@ async fn execute_command_inner(
                                 });
                             }
                             let need_aof = router.aof.is_some();
-                            let need_rep = crate::replication::has_connected_replicas(router.port);
+                            let need_rep = crate::replication::has_connected_replicas(router.base_port);
                             if (need_aof || need_rep)
                                 && let Some(bytes) = crate::aof::command_to_resp(&rep)
                             {
@@ -13546,7 +13546,7 @@ async fn execute_command_inner(
                                 }
                                 if need_rep {
                                     crate::replication::propagate_shard_bytes(
-                                        router.port,
+                                        router.base_port,
                                         router.shard_id,
                                         &bytes,
                                     );
@@ -14391,9 +14391,9 @@ async fn execute_command_inner(
                         if let Some(aof_w) = &router.aof {
                             aof_w.borrow_mut().append(&bytes);
                         }
-                        if crate::replication::has_connected_replicas(router.port) {
+                        if crate::replication::has_connected_replicas(router.base_port) {
                             crate::replication::propagate_shard_bytes(
-                                router.port,
+                                router.base_port,
                                 router.shard_id,
                                 &bytes,
                             );
@@ -14535,9 +14535,9 @@ async fn execute_command_inner(
                         if let Some(aof_w) = &router.aof {
                             aof_w.borrow_mut().append(&bytes);
                         }
-                        if crate::replication::has_connected_replicas(router.port) {
+                        if crate::replication::has_connected_replicas(router.base_port) {
                             crate::replication::propagate_shard_bytes(
-                                router.port,
+                                router.base_port,
                                 router.shard_id,
                                 &bytes,
                             );
@@ -15319,9 +15319,9 @@ async fn execute_command_inner(
                                     if let Some(aof_w) = &router.aof {
                                         aof_w.borrow_mut().append(&bytes);
                                     }
-                                    if crate::replication::has_connected_replicas(router.port) {
+                                    if crate::replication::has_connected_replicas(router.base_port) {
                                         crate::replication::propagate_shard_bytes(
-                                            router.port,
+                                            router.base_port,
                                             router.shard_id,
                                             &bytes,
                                         );
@@ -15419,9 +15419,9 @@ async fn execute_command_inner(
                                     if let Some(aof_w) = &router.aof {
                                         aof_w.borrow_mut().append(&bytes);
                                     }
-                                    if crate::replication::has_connected_replicas(router.port) {
+                                    if crate::replication::has_connected_replicas(router.base_port) {
                                         crate::replication::propagate_shard_bytes(
-                                            router.port,
+                                            router.base_port,
                                             router.shard_id,
                                             &bytes,
                                         );
@@ -15594,9 +15594,9 @@ async fn execute_command_inner(
                                     if let Some(aof_w) = &router.aof {
                                         aof_w.borrow_mut().append(&bytes);
                                     }
-                                    if crate::replication::has_connected_replicas(router.port) {
+                                    if crate::replication::has_connected_replicas(router.base_port) {
                                         crate::replication::propagate_shard_bytes(
-                                            router.port,
+                                            router.base_port,
                                             router.shard_id,
                                             &bytes,
                                         );
@@ -15681,9 +15681,9 @@ async fn execute_command_inner(
                                     if let Some(aof_w) = &router.aof {
                                         aof_w.borrow_mut().append(&bytes);
                                     }
-                                    if crate::replication::has_connected_replicas(router.port) {
+                                    if crate::replication::has_connected_replicas(router.base_port) {
                                         crate::replication::propagate_shard_bytes(
-                                            router.port,
+                                            router.base_port,
                                             router.shard_id,
                                             &bytes,
                                         );
@@ -15866,7 +15866,7 @@ async fn execute_command_inner(
             out.extend_from_slice(format!("$2\r\nid\r\n:{}\r\n", client_id).as_bytes());
 
             let is_cluster = router.cluster_enabled
-                || crate::cluster::get_cluster_hub(router.port)
+                || crate::cluster::get_cluster_hub(router.base_port)
                     .cluster_enabled
                     .load(std::sync::atomic::Ordering::Relaxed);
             if is_cluster {
@@ -15877,7 +15877,7 @@ async fn execute_command_inner(
 
             let is_replica = crate::replication::HAS_SLAVE_INSTANCE
                 .load(std::sync::atomic::Ordering::Relaxed)
-                && crate::replication::get_replication_hub(router.port).is_slave();
+                && crate::replication::get_replication_hub(router.base_port).is_slave();
             if is_replica {
                 out.extend_from_slice(b"$4\r\nrole\r\n$7\r\nreplica\r\n");
             } else {
@@ -16714,7 +16714,7 @@ async fn execute_command_inner(
         }
         Command::Select(idx) => {
             let is_cluster = router.cluster_enabled
-                || crate::cluster::get_cluster_hub(router.port)
+                || crate::cluster::get_cluster_hub(router.base_port)
                     .cluster_enabled
                     .load(std::sync::atomic::Ordering::Relaxed);
             if is_cluster && idx != 0 {
@@ -16851,7 +16851,7 @@ async fn execute_command_inner(
         }
         Command::Swapdb { db1, db2 } => {
             let is_cluster = router.cluster_enabled
-                || crate::cluster::get_cluster_hub(router.port)
+                || crate::cluster::get_cluster_hub(router.base_port)
                     .cluster_enabled
                     .load(std::sync::atomic::Ordering::Relaxed);
             let max_db = crate::config::databases_count();
@@ -16870,7 +16870,7 @@ async fn execute_command_inner(
         }
         Command::Move { ref key, .. } => {
             let is_cluster = router.cluster_enabled
-                || crate::cluster::get_cluster_hub(router.port)
+                || crate::cluster::get_cluster_hub(router.base_port)
                     .cluster_enabled
                     .load(std::sync::atomic::Ordering::Relaxed);
             if is_cluster {
@@ -16958,7 +16958,7 @@ async fn execute_command_inner(
             replace,
         } => {
             let is_cluster = router.cluster_enabled
-                || crate::cluster::get_cluster_hub(router.port)
+                || crate::cluster::get_cluster_hub(router.base_port)
                     .cluster_enabled
                     .load(std::sync::atomic::Ordering::Relaxed);
             if is_cluster
@@ -18352,12 +18352,12 @@ async fn execute_command_inner(
         Command::DflyCluster(sub) => {
             match sub {
                 crate::resp::DflyClusterSubcommand::MyId => {
-                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
                     let id = hub.my_id();
                     write_resp_bulk(out, id.as_bytes());
                 }
                 crate::resp::DflyClusterSubcommand::Config(json) => {
-                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
                     match hub.dfly_cluster_config(&json) {
                         Ok(()) => out.extend_from_slice(b"+OK\r\n"),
                         Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
@@ -18379,14 +18379,14 @@ async fn execute_command_inner(
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 crate::resp::DflyClusterSubcommand::SlotMigrationStatus => {
-                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
                     hub.dfly_slot_migration_status(out);
                 }
             }
             false
         }
         Command::DflyMigrate(sub) => {
-            let hub = crate::cluster::get_cluster_hub(router.port);
+            let hub = crate::cluster::get_cluster_hub(router.base_port);
             match sub {
                 crate::resp::DflyMigrateSubcommand::Init {
                     source_id,
@@ -18594,7 +18594,7 @@ async fn execute_command_inner(
             numreplicas,
             timeout,
         } => {
-            let count = crate::replication::wait_replicas(router.port, numreplicas, timeout).await;
+            let count = crate::replication::wait_replicas(router.base_port, numreplicas, timeout).await;
             write_resp_integer(out, count as i64);
             false
         }
@@ -18603,7 +18603,7 @@ async fn execute_command_inner(
             numreplicas,
             timeout,
         } => {
-            let count = crate::replication::wait_replicas(router.port, numreplicas, timeout).await;
+            let count = crate::replication::wait_replicas(router.base_port, numreplicas, timeout).await;
             out.extend_from_slice(format!("*2\r\n:1\r\n:{}\r\n", count).as_bytes());
             false
         }
@@ -18773,7 +18773,7 @@ async fn execute_command_inner(
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
                 } else if sub.eq_ignore_ascii_case(b"change-repl-id") {
-                    crate::replication::get_replication_hub(router.port).change_replid();
+                    crate::replication::get_replication_hub(router.base_port).change_replid();
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
                 } else if sub.eq_ignore_ascii_case(b"set-active-expire") {
@@ -18856,7 +18856,7 @@ async fn execute_command_inner(
                     // to the AOF (Redis uses it to test replica error
                     // handling and data divergence).
                     let bytes = crate::debug_cmd::encode_resp_array(&args[1..]);
-                    crate::replication::propagate_shard_bytes(router.port, router.shard_id, &bytes);
+                    crate::replication::propagate_shard_bytes(router.base_port, router.shard_id, &bytes);
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
                 } else if (sub.eq_ignore_ascii_case(b"stringmatch-len")
@@ -26697,7 +26697,7 @@ async fn execute_commands_squashed_inner(
     }
     let mut can_squash = *authenticated;
     // During a full-sync load, `execute_command` answers -LOADING.
-    if can_squash && crate::replication::is_loading(router.port) {
+    if can_squash && crate::replication::is_loading(router.base_port) {
         can_squash = false;
     }
     // On a read-only replica `execute_command` answers writes -READONLY;
@@ -26705,7 +26705,7 @@ async fn execute_commands_squashed_inner(
     if can_squash
         && crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
         && REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && crate::replication::get_replication_hub(router.port).is_slave()
+        && crate::replication::get_replication_hub(router.base_port).is_slave()
         && batch_has_writes(commands)
     {
         can_squash = false;
@@ -26730,8 +26730,8 @@ async fn execute_commands_squashed_inner(
         let acl_guard = acl.as_ref().map(|a| a.read());
         let user = acl_guard.as_ref().and_then(|g| g.users.get(auth_user));
 
-        let hub = if crate::cluster::has_active_cluster(router.port) {
-            let h = crate::cluster::get_cluster_hub(router.port);
+        let hub = if crate::cluster::has_active_cluster(router.base_port) {
+            let h = crate::cluster::get_cluster_hub(router.base_port);
             if !h.nodes.read().is_empty() {
                 Some(h)
             } else {
@@ -26881,7 +26881,7 @@ async fn execute_commands_squashed_inner(
     // Write fast paths skip AOF, replication and keyspace notifications; when
     // any of those is needed, writes go through `execute_local_command`.
     let write_fast_path = router.aof.is_none()
-        && !crate::replication::has_connected_replicas(router.port)
+        && !crate::replication::has_connected_replicas(router.base_port)
         && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0;
     let mut local_db = router.local_db.borrow_mut();
     local_db.select_db(CURRENT_DB.get());
@@ -28323,7 +28323,7 @@ async fn move_element_across_shards(
             return WRONGTYPE.to_vec();
         }
         let suppress =
-            crate::replication::get_replication_hub(router.port).suppress_hub_propagation();
+            crate::replication::get_replication_hub(router.base_port).suppress_hub_propagation();
         match op {
             CrossShardElementMove::List {
                 from,
@@ -28357,7 +28357,7 @@ async fn move_element_across_shards(
                 };
                 let _ = exec_on_shard(router, d, push).await;
                 drop(suppress);
-                if crate::replication::has_connected_replicas(router.port)
+                if crate::replication::has_connected_replicas(router.base_port)
                     && let Some(bytes) = crate::aof::command_to_resp(&Command::Lmove {
                         source: src.clone(),
                         destination: dst.clone(),
@@ -28366,7 +28366,7 @@ async fn move_element_across_shards(
                         is_rpoplpush,
                     })
                 {
-                    crate::replication::propagate_bytes(router.port, &bytes);
+                    crate::replication::propagate_bytes(router.base_port, &bytes);
                 }
                 let mut out = Vec::new();
                 write_resp_bulk(&mut out, &elem);
@@ -28395,14 +28395,14 @@ async fn move_element_across_shards(
                 )
                 .await;
                 drop(suppress);
-                if crate::replication::has_connected_replicas(router.port)
+                if crate::replication::has_connected_replicas(router.base_port)
                     && let Some(bytes) = crate::aof::command_to_resp(&Command::Smove {
                         source: src.clone(),
                         destination: dst.clone(),
                         member,
                     })
                 {
-                    crate::replication::propagate_bytes(router.port, &bytes);
+                    crate::replication::propagate_bytes(router.base_port, &bytes);
                 }
                 b":1\r\n".to_vec()
             }
@@ -28492,8 +28492,8 @@ async fn blmove_across_shards(
                 router.target_shard(source),
                 router.target_shard(destination),
             );
-            let suppress =
-                crate::replication::get_replication_hub(router.port).suppress_hub_propagation();
+            let suppress = crate::replication::get_replication_hub(router.base_port)
+                .suppress_hub_propagation();
             let dst_type = exec_on_shard(router, d, Command::Type(destination.clone())).await;
             if dst_type != b"+none\r\n" && dst_type != b"+list\r\n" {
                 let _ = exec_on_shard(router, s, push(source, where_from, elem)).await;
@@ -28505,7 +28505,7 @@ async fn blmove_across_shards(
             }
             let _ = exec_on_shard(router, d, push(destination, where_to, elem.clone())).await;
             drop(suppress);
-            if crate::replication::has_connected_replicas(router.port)
+            if crate::replication::has_connected_replicas(router.base_port)
                 && let Some(bytes) = crate::aof::command_to_resp(&Command::Lmove {
                     source: source.clone(),
                     destination: destination.clone(),
@@ -28514,7 +28514,7 @@ async fn blmove_across_shards(
                     is_rpoplpush,
                 })
             {
-                crate::replication::propagate_bytes(router.port, &bytes);
+                crate::replication::propagate_bytes(router.base_port, &bytes);
             }
             if client_disconnected {
                 return true;

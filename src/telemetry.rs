@@ -271,7 +271,7 @@ pub fn format_server_state_metrics(router: &crate::router::Router) -> String {
         (
             "loading",
             "1 while loading data at startup or from a master",
-            u64::from(crate::replication::is_loading(router.port)),
+            u64::from(crate::replication::is_loading(router.base_port)),
         ),
     ] {
         out +=
@@ -280,7 +280,7 @@ pub fn format_server_state_metrics(router: &crate::router::Router) -> String {
 
     // INFO replication fields that are plain numbers become gauges; the
     // role becomes a labelled 1.
-    let repl = crate::replication::get_replication_hub(router.port).format_info_replication();
+    let repl = crate::replication::get_replication_hub(router.base_port).format_info_replication();
     for line in repl.lines() {
         let Some((k, v)) = line.trim_end().split_once(':') else {
             continue;

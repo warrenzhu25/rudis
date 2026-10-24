@@ -379,7 +379,12 @@ impl Router {
     /// Logs a mutation applied to this shard's data to the AOF and the
     /// replication stream (see `replication::log_shard_mutation`).
     pub fn log_mutation(&self, make: impl FnOnce() -> Command) {
-        crate::replication::log_shard_mutation(self.port, self.shard_id, self.aof.as_deref(), make);
+        crate::replication::log_shard_mutation(
+            self.base_port,
+            self.shard_id,
+            self.aof.as_deref(),
+            make,
+        );
     }
 
     pub fn new(
@@ -463,7 +468,7 @@ impl Router {
     pub fn target_shard(&self, key: &[u8]) -> usize {
         if self.cluster_enabled
             || !self.slot_owners.borrow().is_empty()
-            || crate::cluster::has_active_cluster(self.port)
+            || crate::cluster::has_active_cluster(self.base_port)
         {
             let slot = key_slot(key);
             self.target_shard_for_slot(slot)
@@ -476,7 +481,7 @@ impl Router {
     pub fn target_shard_and_hash(&self, key: &[u8]) -> (usize, u64) {
         if self.cluster_enabled
             || !self.slot_owners.borrow().is_empty()
-            || crate::cluster::has_active_cluster(self.port)
+            || crate::cluster::has_active_cluster(self.base_port)
         {
             let slot = key_slot(key);
             (
@@ -2902,7 +2907,7 @@ impl Router {
     }
 
     pub async fn count_keys_in_slot(&self, slot: u16) -> usize {
-        if self.cluster_enabled || crate::cluster::has_active_cluster(self.port) {
+        if self.cluster_enabled || crate::cluster::has_active_cluster(self.base_port) {
             let target = self.target_shard_for_slot(slot);
             if target == self.shard_id {
                 self.local_db.borrow_mut().count_keys_in_slot(slot)
@@ -2941,7 +2946,7 @@ impl Router {
     }
 
     pub async fn get_keys_in_slot(&self, slot: u16, count: usize) -> Vec<Bytes> {
-        if self.cluster_enabled || crate::cluster::has_active_cluster(self.port) {
+        if self.cluster_enabled || crate::cluster::has_active_cluster(self.base_port) {
             let target = self.target_shard_for_slot(slot);
             if target == self.shard_id {
                 self.local_db.borrow_mut().get_keys_in_slot(slot, count)
@@ -4753,7 +4758,8 @@ impl Router {
         if let Some(id) = arm_replica
             && first_err.is_none()
         {
-            crate::replication::get_replication_hub(self.port).arm_full_sync(id, self.shard_id);
+            crate::replication::get_replication_hub(self.base_port)
+                .arm_full_sync(id, self.shard_id);
         }
 
         // Remote shard chunks. Every shard is waited for even after a
@@ -4791,7 +4797,7 @@ impl Router {
         }
 
         if let Some((replid, offset, stream_db)) =
-            crate::replication::get_replication_hub(self.port).saved_history()
+            crate::replication::get_replication_hub(self.base_port).saved_history()
         {
             crate::redis_rdb::write_repl_aux(&mut full_rdb, &replid, offset, stream_db);
         }
@@ -5139,7 +5145,7 @@ impl Router {
     /// `ReplicationHub::saved_history`), read between batches of a
     /// replica's master stream.
     async fn repl_history_for_save(&self) -> Option<(String, u64, usize)> {
-        let hub = crate::replication::get_replication_hub(self.port);
+        let hub = crate::replication::get_replication_hub(self.base_port);
         let _apply = if hub.is_slave() {
             Some(hub.lock_apply().await)
         } else {
@@ -5259,51 +5265,51 @@ impl Router {
     }
 
     pub fn my_id(&self) -> String {
-        crate::cluster::get_cluster_hub(self.port).my_id()
+        crate::cluster::get_cluster_hub(self.base_port).my_id()
     }
 
     pub fn cluster_meet(&self, ip: String, port: u16) -> Result<(), String> {
-        crate::cluster::get_cluster_hub(self.port).cluster_meet(&ip, port)
+        crate::cluster::get_cluster_hub(self.base_port).cluster_meet(&ip, port)
     }
 
     pub fn cluster_nodes(&self) -> String {
-        crate::cluster::get_cluster_hub(self.port).cluster_nodes()
+        crate::cluster::get_cluster_hub(self.base_port).cluster_nodes()
     }
 
     pub fn cluster_info(&self) -> String {
-        crate::cluster::get_cluster_hub(self.port).cluster_info()
+        crate::cluster::get_cluster_hub(self.base_port).cluster_info()
     }
 
     pub fn cluster_failover(&self, force: bool) -> Result<(), String> {
-        crate::cluster::get_cluster_hub(self.port).cluster_failover(force)
+        crate::cluster::get_cluster_hub(self.base_port).cluster_failover(force)
     }
 
     pub fn cluster_reset(&self, hard: bool) -> Result<(), String> {
-        crate::cluster::get_cluster_hub(self.port).cluster_reset(hard)
+        crate::cluster::get_cluster_hub(self.base_port).cluster_reset(hard)
     }
 
     pub fn cluster_forget(&self, node_id: &str) -> Result<(), String> {
-        crate::cluster::get_cluster_hub(self.port).cluster_forget(node_id)
+        crate::cluster::get_cluster_hub(self.base_port).cluster_forget(node_id)
     }
 
     pub fn cluster_replicate(&self, node_id: &str) -> Result<(), String> {
-        crate::cluster::get_cluster_hub(self.port).cluster_replicate(node_id)
+        crate::cluster::get_cluster_hub(self.base_port).cluster_replicate(node_id)
     }
 
     pub fn cluster_slots(&self, out: &mut Vec<u8>) {
-        crate::cluster::get_cluster_hub(self.port).cluster_slots(out, self.num_shards);
+        crate::cluster::get_cluster_hub(self.base_port).cluster_slots(out, self.num_shards);
     }
 
     pub fn cluster_shards(&self, out: &mut Vec<u8>) {
-        crate::cluster::get_cluster_hub(self.port).cluster_shards(out);
+        crate::cluster::get_cluster_hub(self.base_port).cluster_shards(out);
     }
 
     pub fn cluster_links(&self, out: &mut Vec<u8>) {
-        crate::cluster::get_cluster_hub(self.port).cluster_links(out);
+        crate::cluster::get_cluster_hub(self.base_port).cluster_links(out);
     }
 
     pub fn cluster_addslots(&self, slots: &[u16]) -> Result<(), String> {
-        let res = crate::cluster::get_cluster_hub(self.port).cluster_addslots(slots);
+        let res = crate::cluster::get_cluster_hub(self.base_port).cluster_addslots(slots);
         if res.is_ok() {
             for &s in slots {
                 self.set_slot_state(s, crate::shard::SlotState::Stable);
@@ -5314,11 +5320,11 @@ impl Router {
     }
 
     pub fn cluster_delslots(&self, slots: &[u16]) -> Result<(), String> {
-        crate::cluster::get_cluster_hub(self.port).cluster_delslots(slots)
+        crate::cluster::get_cluster_hub(self.base_port).cluster_delslots(slots)
     }
 
     pub fn cluster_addslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
-        let res = crate::cluster::get_cluster_hub(self.port).cluster_addslotsrange(ranges);
+        let res = crate::cluster::get_cluster_hub(self.base_port).cluster_addslotsrange(ranges);
         if res.is_ok() {
             for &(start, end) in ranges {
                 for s in start..=end {
@@ -5331,7 +5337,7 @@ impl Router {
     }
 
     pub fn cluster_delslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
-        crate::cluster::get_cluster_hub(self.port).cluster_delslotsrange(ranges)
+        crate::cluster::get_cluster_hub(self.base_port).cluster_delslotsrange(ranges)
     }
 }
 
@@ -7418,5 +7424,27 @@ mod tests {
         });
         drop(router);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn test_shard_port_router_uses_the_nodes_cluster_and_replication_state() {
+        // In cluster mode each shard listens on its own port, but the node
+        // has one cluster identity and one replication stream, kept under
+        // the base port. A router on another shard's port must use them,
+        // not a fresh hub of its own (which claimed every slot and had no
+        // replicas, so writes there skipped the replicas).
+        let base = 41870;
+        let (mut router, _db) = single_shard_router(base + 1);
+        router.set_base_port(base);
+        let node = crate::cluster::get_cluster_hub(base);
+        assert_eq!(router.my_id(), node.my_id());
+        assert!(
+            router
+                .cluster_nodes()
+                .lines()
+                .any(|l| l.contains("myself") && l.starts_with(&node.my_id())),
+            "{}",
+            router.cluster_nodes()
+        );
     }
 }

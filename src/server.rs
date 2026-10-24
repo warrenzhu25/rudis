@@ -2335,7 +2335,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
         if shard_id == 0
             && let Some((host, mport)) = crate::replication::take_startup_replicaof(base_port)
         {
-            crate::replication::start_replica_sync(router.port, host, mport, (*router).clone());
+            crate::replication::start_replica_sync(router.base_port, host, mport, (*router).clone());
         }
 
         // 4.8 `save <secs> <changes>` schedule (Redis serverCron).
