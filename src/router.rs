@@ -7447,4 +7447,49 @@ mod tests {
             router.cluster_nodes()
         );
     }
+
+    #[test]
+    fn test_sync_image_steps_publish_the_shards_memory() {
+        // Eviction sums the shards' published allocator counts minus
+        // SYNC_IMAGE_BYTES, which an image's buffers leave at once when it
+        // finishes (or move in and out of as pieces are handed back). Each
+        // step must publish the shard's count with it, or the total reads
+        // the freed buffers as data until the next publish: ~1.25 MB per
+        // shard, enough to evict near maxmemory.
+        let port = 41890;
+        let (router, db) = single_shard_router(port);
+        router
+            .tier_stats
+            .real_accounting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..20_000 {
+            db.borrow_mut()
+                .rpush(
+                    Bytes::from(format!("l{i}")),
+                    vec![Bytes::from(vec![b'x'; 300])],
+                )
+                .unwrap();
+        }
+        router.publish_memory_state();
+        crate::shard::start_sync_image(&db.borrow(), 0, 91).unwrap();
+        router.publish_memory_state();
+        let mut recycle = None;
+        loop {
+            let (piece, done) =
+                crate::shard::sync_image_step_published(&router, 91, recycle.take()).unwrap();
+            let published = router.tier_stats.real_used_total(None);
+            router.publish_memory_state();
+            let fresh = router.tier_stats.real_used_total(None);
+            assert!(
+                (published - fresh).abs() < 256 << 10,
+                "published {published}, actual {fresh} (done: {done})"
+            );
+            if done {
+                break;
+            }
+            if !piece.is_empty() {
+                recycle = Some(piece);
+            }
+        }
+    }
 }

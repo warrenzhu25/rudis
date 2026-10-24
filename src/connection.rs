@@ -7183,6 +7183,7 @@ impl Drop for SyncImagesGuard<'_> {
             return;
         }
         crate::shard::take_image(crate::shard::ImageOwner::FullSync(self.replica));
+        crate::shard::publish_after_image_change(self.router);
         for (sid, sender) in self.router.senders.iter().enumerate() {
             if sid != self.router.shard_id {
                 let _ = sender.send(crate::shard::ShardMessage::DropSyncImage {
@@ -7312,18 +7313,17 @@ async fn stream_full_sync(
     let mut in_flight = crate::shard::SyncImageHeld::default();
     for sid in 0..router.num_shards {
         loop {
+            // `in_flight` keeps counting the piece handed back until the
+            // step returns, by when its shard counts it as its spare: zeroed
+            // first, the buffer counted as data in between (~1.25 MB too
+            // much, enough to evict near maxmemory).
             let step = if sid == router.shard_id {
-                in_flight.set(0);
-                let step = crate::shard::sync_image_step(
-                    &router.local_db.borrow(),
-                    client_id,
-                    recycle.take(),
-                );
+                let step =
+                    crate::shard::sync_image_step_published(router, client_id, recycle.take());
                 crate::mailbox::yield_now().await;
                 step
             } else {
                 let (tx, rx) = flume::bounded(1);
-                in_flight.set(0);
                 if router.senders[sid]
                     .send(crate::shard::ShardMessage::SyncImageStep {
                         replica: client_id,
@@ -7342,8 +7342,8 @@ async fn stream_full_sync(
                 Ok(step) => step,
                 Err(e) => return Err(broke_off(format!("shard {sid}: {e}"))),
             };
+            in_flight.set(piece.capacity() as i64);
             if !piece.is_empty() {
-                in_flight.set(piece.capacity() as i64);
                 crc = crate::table::crc64_update(crc, &piece);
                 let (res, sent) = writer.write_all(piece).await;
                 if let Err(e) = res {

@@ -30673,17 +30673,28 @@ fn test_full_sync_does_not_make_master_evict_e2e() {
     ));
     let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
     r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    // Writes keep coming while the replica syncs.
+    // Writes keep coming while the replica syncs. They overwrite the same
+    // 100 keys: new keys grew the dataset itself past maxmemory when the
+    // sync was slow (a busy host), and those evictions were legitimate.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut j = 0;
     while !send_and_read_reply(&mut r, b"INFO replication\r\n").contains("master_link_status:up") {
         assert!(std::time::Instant::now() < deadline, "replica never linked");
         for _ in 0..20 {
-            send_and_read_reply(&mut m, format!("SET w{j} x\r\n").as_bytes());
+            send_and_read_reply(&mut m, format!("SET w{} x\r\n", j % 100).as_bytes());
             j += 1;
         }
     }
-    assert_eq!(evicted(&mut m), ev_before, "evicted during the full sync");
+    let diag = format!(
+        "writes during sync: {j}\n{}\n{}",
+        send_and_read_reply(&mut m, b"INFO replication\r\n"),
+        send_and_read_reply(&mut m, b"INFO memory\r\n")
+    );
+    assert_eq!(
+        evicted(&mut m),
+        ev_before,
+        "evicted during the full sync\n{diag}"
+    );
     let keys_after: u64 = send_and_read_reply(&mut m, b"DBSIZE\r\n")[1..]
         .trim()
         .parse()

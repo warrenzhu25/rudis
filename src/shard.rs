@@ -5456,6 +5456,29 @@ pub fn sync_image_step(
     Ok((out, done))
 }
 
+/// After a full-sync image grew, shrank or went away on this shard:
+/// eviction sums the shards' published allocator counts and subtracts
+/// `SYNC_IMAGE_BYTES`, which changes at once. Until this shard published
+/// again, freed image buffers left `SYNC_IMAGE_BYTES` but still sat in its
+/// published count (and new ones the other way round), so the total read
+/// up to ~1.25 MB per shard high and writes evicted (on a busy host, where
+/// the next publish came later).
+pub fn publish_after_image_change(router: &crate::router::Router) {
+    router.publish_memory_state();
+}
+
+/// [`sync_image_step`] on `router`'s shard, publishing its memory state
+/// with the change (see [`publish_after_image_change`]).
+pub fn sync_image_step_published(
+    router: &crate::router::Router,
+    replica: u64,
+    recycle: Option<Vec<u8>>,
+) -> Result<(Vec<u8>, bool), String> {
+    let step = sync_image_step(&router.local_db.borrow(), replica, recycle);
+    publish_after_image_change(router);
+    step
+}
+
 /// Call before a command may change `key` in the current DB (see
 /// [`AofImage`]). A single flag test when no AOF rewrite is running.
 #[inline(always)]
