@@ -837,21 +837,55 @@ impl ClusterHub {
         Ok(())
     }
 
-    pub fn cluster_replicate(&self, master_id: &str) -> Result<(), String> {
-        {
+    /// Makes this node a replica of `master_id` and returns the master's
+    /// client address, which the caller starts replicating from. Like
+    /// Redis, a master that still serves slots refuses: its keys would be
+    /// replaced by the master's dataset.
+    pub fn cluster_replicate(&self, master_id: &str) -> Result<(String, u16), String> {
+        if master_id == self.my_id() {
+            return Err("Can't replicate myself".to_string());
+        }
+        let addr = {
             let nodes = self.nodes.read();
-            if !nodes.contains_key(master_id) {
-                return Err("ERR Unknown node".to_string());
+            let Some(master) = nodes.get(master_id) else {
+                return Err(format!("Unknown node {}", master_id));
+            };
+            if master.flags.contains("slave") {
+                return Err("I can only replicate a master, not a replica.".to_string());
             }
+            (master.ip.clone(), master.port)
+        };
+        if *self.role.read() == "master" && !self.my_slots.read().is_empty() {
+            return Err(
+                "To set a master the node must be empty and without assigned slots.".to_string(),
+            );
         }
         *self.role.write() = "slave".to_string();
         *self.master_id.write() = master_id.to_string();
         self.my_slots.write().clear();
         let _ = self.save_config();
-        Ok(())
+        Ok(addr)
     }
 
+    /// Client address of the master this node replicates in the cluster
+    /// (from `CLUSTER REPLICATE` or a `nodes.conf` loaded at startup).
+    pub fn replication_master_addr(&self) -> Option<(String, u16)> {
+        if *self.role.read() != "slave" {
+            return None;
+        }
+        let master_id = self.master_id.read().clone();
+        self.nodes
+            .read()
+            .get(&master_id)
+            .map(|m| (m.ip.clone(), m.port))
+    }
+
+    /// Promotes this replica in place of its master. The caller stops the
+    /// replication link first (see the CLUSTER FAILOVER handler).
     pub fn cluster_failover(&self, _force: bool) -> Result<(), String> {
+        if *self.role.read() != "slave" {
+            return Err("You should send CLUSTER FAILOVER to a replica".to_string());
+        }
         let new_epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.config_epoch.store(new_epoch, Ordering::SeqCst);
         let old_master_id = self.master_id.write().clone();
@@ -1715,7 +1749,11 @@ impl ClusterHub {
                 *self.my_slots.write() = inherited.clone();
             }
 
-            crate::replication::get_replication_hub(self.port).make_master();
+            // The master is gone: end the link to it before taking over,
+            // so nothing it sent lands after the promotion.
+            let repl = crate::replication::get_replication_hub(self.port);
+            repl.stop_sync_and_wait_blocking(Duration::from_secs(5));
+            repl.make_master();
 
             // Announce failover to all peers
             let mut slots_repr = String::new();
@@ -2436,6 +2474,86 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cluster_replicate_returns_the_master_to_sync_from() {
+        let peer = |id: &str, port: u16, flags: &str| ClusterNodeInfo {
+            id: id.to_string(),
+            ip: "127.0.0.1".to_string(),
+            port,
+            cport: port + 10000,
+            flags: flags.to_string(),
+            master_id: "-".to_string(),
+            ping_sent: 0,
+            pong_recv: 0,
+            config_epoch: 1,
+            link_state: "connected".to_string(),
+            slots: Vec::new(),
+        };
+        let hub = ClusterHub::new(7100);
+        let master = "m".repeat(40);
+        let replica = "r".repeat(40);
+        hub.nodes
+            .write()
+            .insert(master.clone(), peer(&master, 7101, "master"));
+        hub.nodes
+            .write()
+            .insert(replica.clone(), peer(&replica, 7102, "slave"));
+
+        // A master serving slots would lose its keys to the sync.
+        assert!(!hub.my_slots.read().is_empty());
+        assert!(
+            hub.cluster_replicate(&master)
+                .unwrap_err()
+                .contains("without assigned slots")
+        );
+        hub.my_slots.write().clear();
+        assert_eq!(
+            hub.cluster_replicate(&hub.my_id()).unwrap_err(),
+            "Can't replicate myself"
+        );
+        assert!(
+            hub.cluster_replicate(&replica)
+                .unwrap_err()
+                .contains("not a replica")
+        );
+        assert!(
+            hub.cluster_replicate(&"x".repeat(40))
+                .unwrap_err()
+                .starts_with("Unknown node")
+        );
+        assert_eq!(hub.replication_master_addr(), None);
+
+        assert_eq!(
+            hub.cluster_replicate(&master),
+            Ok(("127.0.0.1".to_string(), 7101))
+        );
+        assert_eq!(
+            hub.replication_master_addr(),
+            Some(("127.0.0.1".to_string(), 7101))
+        );
+
+        // A restart (nodes.conf) knows which master to resume replicating.
+        let path = std::env::temp_dir().join(format!("nodes-repl-{}.conf", std::process::id()));
+        hub.set_config_file(path.clone());
+        hub.save_config().unwrap();
+        let restarted = ClusterHub::new(7100);
+        assert!(restarted.load_config(&path).unwrap());
+        assert_eq!(
+            restarted.replication_master_addr(),
+            Some(("127.0.0.1".to_string(), 7101))
+        );
+        let _ = std::fs::remove_file(&path);
+
+        assert!(restarted.cluster_failover(false).is_ok());
+        assert_eq!(restarted.replication_master_addr(), None);
+        assert!(
+            restarted
+                .cluster_failover(false)
+                .unwrap_err()
+                .contains("to a replica")
+        );
+    }
 
     #[test]
     fn test_cluster_quorum_pfail_to_fail_escalation() {

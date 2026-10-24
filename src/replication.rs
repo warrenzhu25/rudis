@@ -990,6 +990,17 @@ impl ReplicationHub {
         }
     }
 
+    /// `stop_sync_and_wait` for threads outside the shards' runtimes (the
+    /// cluster bus): blocks up to `timeout` for the worker to exit. Never
+    /// call it on a shard thread, which may be the one running the worker.
+    pub fn stop_sync_and_wait_blocking(&self, timeout: std::time::Duration) {
+        self.stop_sync();
+        let exit = self.worker_exit.lock().clone();
+        if let Some(exit) = exit {
+            let _ = exit.recv_timeout(timeout);
+        }
+    }
+
     /// CLIENT KILL of a replica's master link (`addr` is `host:port` of
     /// the configured master): breaks the link without stopping
     /// replication, so the worker reconnects and tries a partial resync.

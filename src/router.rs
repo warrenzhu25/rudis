@@ -5292,7 +5292,7 @@ impl Router {
         crate::cluster::get_cluster_hub(self.base_port).cluster_forget(node_id)
     }
 
-    pub fn cluster_replicate(&self, node_id: &str) -> Result<(), String> {
+    pub fn cluster_replicate(&self, node_id: &str) -> Result<(String, u16), String> {
         crate::cluster::get_cluster_hub(self.base_port).cluster_replicate(node_id)
     }
 

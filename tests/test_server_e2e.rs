@@ -3696,7 +3696,12 @@ fn test_cluster_bus_gossip_failover_e2e() {
         nodes1
     );
 
-    // 4. Test CLUSTER REPLICATE
+    // 4. Test CLUSTER REPLICATE (like Redis, only a node without slots may
+    // become a replica: its keys would be replaced by the master's)
+    assert_eq!(
+        send_and_read(&mut c2, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"),
+        "+OK\r\n"
+    );
     let rep_resp = send_and_read(
         &mut c2,
         format!("CLUSTER REPLICATE {}\r\n", myid1).as_bytes(),
@@ -32809,6 +32814,130 @@ fn test_cluster_shard_port_writes_reach_the_replica_e2e() {
         );
         thread::sleep(Duration::from_millis(50));
     }
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}
+
+/// `CLUSTER REPLICATE` makes the node an actual replica: it receives the
+/// master's dataset and writes, resumes after a restart (from nodes.conf),
+/// and CLUSTER FAILOVER ends the link before the promotion.
+#[test]
+fn test_cluster_replicate_copies_the_masters_data_e2e() {
+    let (mport, rport) = (18081u16, 18087u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!(
+            "rudis_cluster_replicate_{}_{}",
+            p,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "2",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let conn = |p: u16| {
+        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    let wait_until = |what: &str, mut ok: Box<dyn FnMut() -> Option<String> + '_>| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match ok() {
+                None => return,
+                Some(state) => assert!(std::time::Instant::now() < deadline, "{what}: {state}"),
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let (mdir, rdir) = (mk_dir(mport), mk_dir(rport));
+    let _m = spawn(mport, &mdir);
+    let mut r_srv = spawn(rport, &rdir);
+    let mut m0 = conn(mport);
+    let mut m1 = conn(mport + 1);
+    let mut r0 = conn(rport);
+    let master_id = bulk(resp_cmd(&mut m0, &["CLUSTER", "MYID"]));
+
+    // Writes each key on the port of the master shard that owns it.
+    let mut write = |from: usize, to: usize| {
+        for i in from..to {
+            let k = format!("cr_{i}");
+            let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2);
+            let c = if shard == 0 { &mut m0 } else { &mut m1 };
+            assert_eq!(resp_cmd(c, &["SET", &k, "v"]), "+OK\r\n", "{k}");
+        }
+    };
+    write(0, 300);
+
+    // The replica serves no slots (CLUSTER REPLICATE refuses otherwise).
+    assert_eq!(
+        resp_cmd(&mut r0, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut r0,
+            &["CLUSTER", "MEET", "127.0.0.1", &mport.to_string()]
+        ),
+        "+OK\r\n"
+    );
+    wait_until(
+        "replica learns the master",
+        Box::new(|| {
+            let nodes = resp_cmd(&mut r0, &["CLUSTER", "NODES"]);
+            (!nodes.contains(&master_id)).then_some(nodes)
+        }),
+    );
+    assert_eq!(
+        resp_cmd(&mut r0, &["CLUSTER", "REPLICATE", &master_id]),
+        "+OK\r\n"
+    );
+    let dbsize_is = |c: &mut TcpStream, n: usize| {
+        let got = resp_cmd(c, &["DBSIZE"]);
+        (got != format!(":{n}\r\n")).then_some(got)
+    };
+    wait_until("initial sync", Box::new(|| dbsize_is(&mut r0, 300)));
+    write(300, 400);
+    wait_until("streamed writes", Box::new(|| dbsize_is(&mut r0, 400)));
+
+    // A restarted replica resumes replicating its master.
+    drop(r0);
+    let _ = r_srv.0.kill();
+    let _ = r_srv.0.wait();
+    r_srv = spawn(rport, &rdir);
+    let mut r0 = conn(rport);
+    let info = resp_cmd(&mut r0, &["INFO", "replication"]);
+    assert!(info.contains("role:slave"), "{info}");
+    write(400, 500);
+    wait_until(
+        "writes after the restart",
+        Box::new(|| dbsize_is(&mut r0, 500)),
+    );
+
+    // Failover: the promoted node stops following the old master.
+    assert_eq!(resp_cmd(&mut r0, &["CLUSTER", "FAILOVER"]), "+OK\r\n");
+    let info = resp_cmd(&mut r0, &["INFO", "replication"]);
+    assert!(info.contains("role:master"), "{info}");
+    write(500, 600);
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(resp_cmd(&mut r0, &["DBSIZE"]), ":500\r\n");
+    drop(r_srv);
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&rdir);
 }

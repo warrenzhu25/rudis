@@ -12728,13 +12728,25 @@ async fn execute_command_inner(
                         }
                     }
                 }
-                ClusterSubcommand::Failover { force } => match router.cluster_failover(force) {
-                    Ok(_) => out.extend_from_slice(b"+OK\r\n"),
-                    Err(e) => {
-                        let resp = format!("-ERR {}\r\n", e);
-                        out.extend_from_slice(resp.as_bytes());
+                ClusterSubcommand::Failover { force } => {
+                    // End the link to the old master before taking over, so
+                    // nothing it sends lands after the promotion.
+                    if crate::cluster::get_cluster_hub(router.base_port)
+                        .replication_master_addr()
+                        .is_some()
+                    {
+                        crate::replication::get_replication_hub(router.base_port)
+                            .stop_sync_and_wait()
+                            .await;
                     }
-                },
+                    match router.cluster_failover(force) {
+                        Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => {
+                            let resp = format!("-ERR {}\r\n", e);
+                            out.extend_from_slice(resp.as_bytes());
+                        }
+                    }
+                }
                 ClusterSubcommand::Reset { hard } => match router.cluster_reset(hard) {
                     Ok(_) => out.extend_from_slice(b"+OK\r\n"),
                     Err(e) => {
@@ -12750,7 +12762,26 @@ async fn execute_command_inner(
                     }
                 },
                 ClusterSubcommand::Replicate(node_id) => match router.cluster_replicate(&node_id) {
-                    Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                    Ok((host, mport)) => {
+                        // The cluster role alone moves no data: replicate the
+                        // master like REPLICAOF does.
+                        let hub = crate::replication::get_replication_hub(router.base_port);
+                        if !hub.is_replicating_from(&host, mport) {
+                            crate::log_notice!(
+                                "CLUSTER REPLICATE {}: replicating {}:{}",
+                                node_id,
+                                host,
+                                mport
+                            );
+                            crate::replication::start_replica_sync(
+                                router.base_port,
+                                host,
+                                mport,
+                                router.clone(),
+                            );
+                        }
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
                     Err(e) => {
                         let resp = format!("-ERR {}\r\n", e);
                         out.extend_from_slice(resp.as_bytes());

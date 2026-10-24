@@ -328,7 +328,15 @@ fn main() {
             hub.num_shards
                 .store(num_shards, std::sync::atomic::Ordering::Release);
             match hub.load_config(&cfg_path) {
-                Ok(true) => {}
+                Ok(true) => {
+                    // A cluster replica resumes replicating its master.
+                    if let Some((host, mport)) = hub.replication_master_addr() {
+                        let _ = rudis::replication::set_startup_replicaof(
+                            port,
+                            &format!("{} {}", host, mport),
+                        );
+                    }
+                }
                 Ok(false) => {
                     let _ = hub.save_config();
                 }
