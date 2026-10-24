@@ -457,6 +457,10 @@ impl Router {
         self.tier_stats
             .num_shards
             .fetch_max(num_shards.max(1), Ordering::Relaxed);
+        // PUBLISH asks the node's presence table which shards have
+        // subscribers: one table for all shard ports, or a message
+        // published on one port never reached subscribers on another.
+        self.presence_table = crate::pubsub::get_presence_table(base_port);
     }
 
     #[inline(always)]
@@ -7453,6 +7457,17 @@ mod tests {
         assert!(Arc::ptr_eq(
             &router.tier_stats,
             &crate::tiering::get_tier_stats(base)
+        ));
+    }
+
+    #[test]
+    fn test_shard_port_router_shares_the_nodes_subscriber_presence() {
+        let base = 41884;
+        let (mut router, _db) = single_shard_router(base + 1);
+        router.set_base_port(base);
+        assert!(Arc::ptr_eq(
+            &router.presence_table,
+            &crate::pubsub::get_presence_table(base)
         ));
     }
 

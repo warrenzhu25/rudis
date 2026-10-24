@@ -33873,3 +33873,49 @@ fn test_cluster_shard_ports_share_maxmemory_e2e() {
     assert!(used < 22 << 20, "used_memory {used} over a 20 MB limit");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Pub/sub within one cluster-mode node: a message published on one
+/// shard's port reaches subscribers connected to another shard's port
+/// (PUBLISH used to return 0 and drop it).
+#[test]
+fn test_cluster_publish_reaches_every_shard_port_e2e() {
+    let port = 18225u16;
+    let dir = std::env::temp_dir().join(format!("rudis_cl_pubsub_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _srv = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &port.to_string(),
+            "--dir",
+            dir.to_str().unwrap(),
+            "--cluster-enabled",
+            "yes",
+            "--threads",
+            "2",
+            "--no-pin",
+        ],
+        port,
+    ));
+    let conn = |p: u16| {
+        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    for (sub_port, pub_port) in [(port + 1, port), (port, port + 1)] {
+        let mut sub = conn(sub_port);
+        let ch = format!("ch{sub_port}");
+        let r = resp_cmd(&mut sub, &["SUBSCRIBE", &ch]);
+        assert!(r.contains("subscribe"), "{r}");
+        let mut publisher = conn(pub_port);
+        assert_eq!(
+            resp_cmd(&mut publisher, &["PUBLISH", &ch, "hello"]),
+            ":1\r\n"
+        );
+        let mut buf = [0u8; 256];
+        let n = sub.read(&mut buf).unwrap();
+        let got = String::from_utf8_lossy(&buf[..n]);
+        assert!(got.contains("message") && got.contains("hello"), "{got}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
