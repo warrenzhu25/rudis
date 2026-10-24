@@ -3596,6 +3596,24 @@ fn test_lua_scripting_engine_e2e() {
     );
 }
 
+/// CLUSTER REPLICATE starts a real sync: wait until it is done (link up,
+/// dataset loaded) before acting on the replica, which answers -LOADING
+/// meanwhile.
+fn wait_for_master_link(c: &mut TcpStream) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let info = send_and_read(c, b"INFO replication\r\n");
+        if info.contains("master_link_status:up") && !info.contains("master_sync_in_progress:1") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica never synced: {info}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn test_cluster_bus_gossip_failover_e2e() {
     let port1 = 16440;
@@ -3726,6 +3744,7 @@ fn test_cluster_bus_gossip_failover_e2e() {
     );
 
     // 5. Test CLUSTER FAILOVER
+    wait_for_master_link(&mut c2);
     let failover_resp = send_and_read(&mut c2, b"CLUSTER FAILOVER\r\n");
     assert_eq!(failover_resp, "+OK\r\n");
 
@@ -5129,6 +5148,7 @@ fn test_cluster_bus_shards_and_automated_failover_e2e() {
     );
 
     // Trigger failover on Node 3
+    wait_for_master_link(&mut c3);
     assert_eq!(send_and_read(&mut c3, b"CLUSTER FAILOVER\r\n"), "+OK\r\n");
     let mut nodes3 = String::new();
     for _ in 0..30 {
