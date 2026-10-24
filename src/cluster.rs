@@ -289,6 +289,18 @@ impl ClusterHub {
             .any(|&(s, e)| slot >= s && slot <= e)
     }
 
+    /// Whether this node is a replica of the master serving `slot`.
+    pub fn replicates_slot(&self, slot: u16) -> bool {
+        if *self.role.read() != "slave" {
+            return false;
+        }
+        let master_id = self.master_id.read().clone();
+        self.nodes
+            .read()
+            .get(&master_id)
+            .is_some_and(|m| m.slots.iter().any(|&(s, e)| slot >= s && slot <= e))
+    }
+
     /// The master this node was demoted to replicate, once (see `follow`).
     pub fn take_follow(&self) -> Option<(String, u16)> {
         self.follow.lock().take()
@@ -2996,6 +3008,19 @@ mod tests {
             nodes_free,
             "the tick held `nodes` while waiting for `my_slots`"
         );
+    }
+
+    #[test]
+    fn test_replicates_slot_only_for_its_masters_slots() {
+        let hub = ClusterHub::new(7900);
+        hub.my_slots.write().clear();
+        let m = "m".repeat(40);
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7901 {m} 0"), &hub);
+        handle_cluster_bus_line(&format!("PING {m} 0 master 0-5460"), &hub);
+        assert!(!hub.replicates_slot(100), "a master replicates nothing");
+        hub.cluster_replicate(&m).unwrap();
+        assert!(hub.replicates_slot(100));
+        assert!(!hub.replicates_slot(5461));
     }
 
     #[test]

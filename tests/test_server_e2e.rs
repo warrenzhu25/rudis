@@ -33962,3 +33962,81 @@ fn test_cluster_monitor_sees_every_shard_port_e2e() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// READONLY on a cluster replica: reads for its master's slots are served
+/// there; writes, and reads after READWRITE, are still redirected.
+#[test]
+fn test_cluster_replica_serves_readonly_reads_e2e() {
+    let (mport, rport) = (18237u16, 18243u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_ro_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "2",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (md, rd) = (mk_dir(mport), mk_dir(rport));
+    let _m = spawn(mport, &md);
+    let _r = spawn(rport, &rd);
+    let cmd = |p: u16, args: &[&str]| {
+        let mut c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd(&mut c, args)
+    };
+    let master_id = cmd(mport, &["CLUSTER", "MYID"])
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        cmd(rport, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(rport, &["CLUSTER", "MEET", "127.0.0.1", &mport.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(rport, &["CLUSTER", "NODES"]).contains(&master_id) {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Slots known on the replica's side before acting on them.
+    while !cmd(rport, &["CLUSTER", "SLOTS"]).contains(&format!(":{mport}")) {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(cmd(rport, &["CLUSTER", "REPLICATE", &master_id]), "+OK\r\n");
+    let k = "ro_key";
+    let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2) as u16;
+    assert_eq!(cmd(mport + shard, &["SET", k, "v"]), "+OK\r\n");
+    while cmd(rport, &["DBSIZE"]) != ":1\r\n" {
+        assert!(std::time::Instant::now() < deadline, "replica never synced");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut c = TcpStream::connect(("127.0.0.1", rport + shard)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert!(resp_cmd(&mut c, &["GET", k]).starts_with("-MOVED"));
+    assert_eq!(resp_cmd(&mut c, &["READONLY"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", k]), "$1\r\nv\r\n");
+    assert!(resp_cmd(&mut c, &["SET", k, "w"]).starts_with("-MOVED"));
+    assert_eq!(resp_cmd(&mut c, &["READWRITE"]), "+OK\r\n");
+    assert!(resp_cmd(&mut c, &["GET", k]).starts_with("-MOVED"));
+    let _ = std::fs::remove_dir_all(&md);
+    let _ = std::fs::remove_dir_all(&rd);
+}

@@ -89,6 +89,9 @@ pub struct ClientInfo {
     pub qbuf_cap: usize,
     pub reply_mode: crate::resp::ClientReplyMode,
     pub is_monitor: bool,
+    /// READONLY: reads for its master's slots are served on this cluster
+    /// replica instead of redirected (until READWRITE).
+    pub readonly: bool,
     pub stats: std::sync::Arc<ClientStats>,
     /// How other threads deliver MONITOR output to this client.
     pub push: crate::transport::PushTarget,
@@ -5246,6 +5249,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
             qbuf_cap: 0,
             reply_mode: crate::resp::ClientReplyMode::On,
             is_monitor: false,
+            readonly: false,
             stats: stats.clone(),
             push,
         },
@@ -10824,7 +10828,15 @@ async fn execute_command_inner(
                     let hub = crate::cluster::get_cluster_hub(router.base_port);
                     // Never hold `my_slots` while taking `nodes` below: the
                     // cluster bus takes them the other way round.
-                    let owns_slot = hub.owns_slot(slot);
+                    // Like Redis, a READONLY client of a cluster replica gets
+                    // reads for its master's slots served here.
+                    let owns_slot = hub.owns_slot(slot)
+                        || (!cmd.is_write_command()
+                            && client_registry
+                                .borrow()
+                                .get(&client_id)
+                                .is_some_and(|c| c.readonly)
+                            && hub.replicates_slot(slot));
                     if owns_slot {
                         if router.cluster_enabled {
                             let target_shard = router.target_shard_for_slot(slot);
@@ -18640,7 +18652,17 @@ async fn execute_command_inner(
                 true
             }
         }
-        Command::Readonly | Command::Readwrite => {
+        Command::Readonly => {
+            if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                c.readonly = true;
+            }
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Readwrite => {
+            if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                c.readonly = false;
+            }
             out.extend_from_slice(b"+OK\r\n");
             false
         }
