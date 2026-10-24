@@ -33094,3 +33094,64 @@ fn test_cluster_master_failure_promotes_its_replica_e2e() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// A fresh cluster-mode node shows its shards as pseudo nodes, but must
+/// not persist them: after a restart they came back as peers that never
+/// answer (and claimed slots), visible once the node meets a real peer.
+#[test]
+fn test_cluster_restart_does_not_resurrect_pseudo_shard_nodes_e2e() {
+    let (port, peer) = (18117u16, 18123u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_pseudo_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "2",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let cmd = |p: u16, args: &[&str]| {
+        let mut c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd(&mut c, args)
+    };
+    let (dir, peer_dir) = (mk_dir(port), mk_dir(peer));
+    let pseudo = format!("{:040x}", 2);
+    let first = spawn(port, &dir);
+    assert!(cmd(port, &["CLUSTER", "NODES"]).contains(&pseudo));
+    assert_eq!(cmd(port, &["CLUSTER", "SAVECONFIG"]), "+OK\r\n");
+    drop(first);
+    let _node = spawn(port, &dir);
+    let _peer = spawn(peer, &peer_dir);
+    assert_eq!(
+        cmd(peer, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(port, &["CLUSTER", "MEET", "127.0.0.1", &peer.to_string()]),
+        "+OK\r\n"
+    );
+    let nodes = cmd(port, &["CLUSTER", "NODES"]);
+    assert!(
+        !nodes.contains(&pseudo),
+        "pseudo node came back as a peer:\n{nodes}"
+    );
+    assert!(nodes.contains(&format!("127.0.0.1:{peer}@")), "{nodes}");
+    let mine = nodes.lines().find(|l| l.contains("myself")).unwrap();
+    assert!(mine.ends_with(" 0-16383"), "{mine}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&peer_dir);
+}

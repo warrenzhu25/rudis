@@ -299,7 +299,7 @@ impl ClusterHub {
         {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut content = self.cluster_nodes();
+        let mut content = self.render_nodes(false);
         content.push_str(&format!(
             "vars currentEpoch {} lastVoteEpoch {}\n",
             self.current_epoch.load(Ordering::Relaxed),
@@ -413,6 +413,10 @@ impl ClusterHub {
                 self.config_epoch.store(config_epoch, Ordering::SeqCst);
                 self.current_epoch.fetch_max(config_epoch, Ordering::SeqCst);
                 parsed_my_slots = node_slots;
+            } else if is_own_shard_pseudo_node(self.port, &id, port) {
+                // Written by older versions (see `render_nodes`): one of our
+                // own shards, not a peer.
+                continue;
             } else {
                 let clean_flags = flags
                     .split(',')
@@ -602,6 +606,15 @@ impl ClusterHub {
     }
 
     pub fn cluster_nodes(&self) -> String {
+        self.render_nodes(true)
+    }
+
+    /// CLUSTER NODES. With `single_node_view`, a cluster-mode node that
+    /// knows no peers shows each of its shards as a node of its own (each
+    /// listens on its own port), as clients see it. That view is never
+    /// saved to nodes.conf: read back, the pseudo nodes became peers that
+    /// never answer, and their slot claims outlived any real owner's.
+    fn render_nodes(&self, single_node_view: bool) -> String {
         let mut out = String::new();
 
         // 1. Myself entry
@@ -614,7 +627,11 @@ impl ClusterHub {
         let my_slots_snapshot = self.my_slots.read().clone();
         let has_default_all_slots =
             my_slots_snapshot.len() == 1 && my_slots_snapshot[0] == (0, 16383);
-        let my_slots_str = if is_cluster && self.nodes.read().is_empty() && has_default_all_slots {
+        let my_slots_str = if single_node_view
+            && is_cluster
+            && self.nodes.read().is_empty()
+            && has_default_all_slots
+        {
             let end_slot = 16384 / num_shards - 1;
             format!(" 0-{}", end_slot)
         } else {
@@ -661,7 +678,7 @@ impl ClusterHub {
 
         // 2. Peer entries
         let nodes = self.nodes.read();
-        if is_cluster && nodes.is_empty() {
+        if single_node_view && is_cluster && nodes.is_empty() {
             for s in 1..num_shards {
                 let peer_port = self.port + s as u16;
                 let peer_cport = peer_port + 10000;
@@ -1934,6 +1951,12 @@ impl ClusterHub {
 }
 
 /// Encodes slot ranges as the bus does: `0-100,200-300`.
+/// Whether a nodes.conf entry is the single-node view of one of our own
+/// shards: `{:040x}` of the shard number + 1, at our port + shard.
+fn is_own_shard_pseudo_node(my_port: u16, id: &str, port: u16) -> bool {
+    port > my_port && port - my_port < 1024 && id == format!("{:040x}", port - my_port + 1)
+}
+
 fn slots_repr(slots: &[(u16, u16)]) -> String {
     slots
         .iter()
@@ -2529,6 +2552,38 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_nodes_conf_holds_no_pseudo_shard_nodes() {
+        // A cluster-mode node with 2 shards and no peers shows each shard
+        // as a node, but saves only itself.
+        let hub = ClusterHub::new(7400);
+        hub.cluster_enabled.store(true, Ordering::Relaxed);
+        hub.num_shards.store(2, Ordering::Relaxed);
+        let pseudo = format!("{:040x}", 2);
+        assert!(hub.cluster_nodes().contains(&pseudo));
+        let path = std::env::temp_dir().join(format!("nodes-pseudo-{}.conf", std::process::id()));
+        hub.set_config_file(path.clone());
+        hub.save_config().unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains(&pseudo), "{saved}");
+        assert!(
+            saved.contains("myself,master - 0 0 0 connected 0-16383"),
+            "{saved}"
+        );
+
+        // A file an older version wrote with the pseudo node loads without it.
+        std::fs::write(
+            &path,
+            format!("{saved}{pseudo} 127.0.0.1:7401@17401 master - 0 0 2 connected 8192-16383\n"),
+        )
+        .unwrap();
+        let restarted = ClusterHub::new(7400);
+        assert!(restarted.load_config(&path).unwrap());
+        assert!(restarted.nodes.read().is_empty());
+        assert_eq!(*restarted.my_slots.read(), vec![(0, 16383)]);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn test_gossiped_node_takes_its_slots_from_its_pongs() {
