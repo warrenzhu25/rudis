@@ -1990,6 +1990,17 @@ static GLOBAL_CLIENTS: std::sync::LazyLock<
     parking_lot::RwLock<hashbrown::HashMap<(u16, u64), GlobalClientEntry>>,
 > = std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
 
+/// The registry entry of client `cid`, whichever of the node's ports it
+/// connected on (client ids are unique in the process). CLIENT KILL looked
+/// it up under the killer's own port, so on a cluster-mode node a client on
+/// another shard port was reported killed but stayed connected.
+fn global_client_entry(
+    map: &hashbrown::HashMap<(u16, u64), GlobalClientEntry>,
+    cid: u64,
+) -> Option<&GlobalClientEntry> {
+    map.iter().find_map(|((_, c), e)| (*c == cid).then_some(e))
+}
+
 /// Counts a command a script ran towards its calling client's `tot_cmds`.
 pub fn inc_active_client_tot_cmds(port: u16) {
     let cid = requesting_client_id();
@@ -13123,7 +13134,7 @@ async fn execute_command_inner(
                             for cid in killed_cids {
                                 if cid == client_id {
                                     close_conn = true;
-                                } else if let Some(entry) = map.get(&(router.port, cid)) {
+                                } else if let Some(entry) = global_client_entry(&map, cid) {
                                     if entry
                                         .stats
                                         .killed
@@ -13282,7 +13293,7 @@ async fn execute_command_inner(
                                 {
                                     continue;
                                 }
-                                let entry_opt = map.get(&(router.port, cid));
+                                let entry_opt = global_client_entry(&map, cid);
                                 if let Some(ref f_user) = filter_user {
                                     let u = entry_opt
                                         .map(|e| e.auth_user.as_str())
@@ -13337,7 +13348,7 @@ async fn execute_command_inner(
                             for cid in killed_cids {
                                 if cid == client_id {
                                     close_conn = true;
-                                } else if let Some(entry) = map.get(&(router.port, cid)) {
+                                } else if let Some(entry) = global_client_entry(&map, cid) {
                                     if entry
                                         .stats
                                         .killed

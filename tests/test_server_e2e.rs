@@ -34296,3 +34296,51 @@ fn test_cluster_watch_sees_flushall_from_another_port_e2e() {
     assert_eq!(resp_cmd(&mut w, &["EXEC"]), "*-1\r\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// CLIENT KILL on a cluster-mode node closes a client connected on another
+/// shard's port (it used to report the kill and leave it connected).
+#[test]
+fn test_cluster_client_kill_reaches_every_shard_port_e2e() {
+    let port = 18291u16;
+    let dir = std::env::temp_dir().join(format!("rudis_cl_kill_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _srv = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &port.to_string(),
+            "--dir",
+            dir.to_str().unwrap(),
+            "--cluster-enabled",
+            "yes",
+            "--threads",
+            "2",
+            "--no-pin",
+        ],
+        port,
+    ));
+    let mut victim = TcpStream::connect(("127.0.0.1", port + 1)).unwrap();
+    victim
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let id = resp_cmd(&mut victim, &["CLIENT", "ID"]);
+    let id = id.trim().trim_start_matches(':').to_string();
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(
+        resp_cmd(&mut admin, &["CLIENT", "KILL", "ID", &id]),
+        ":1\r\n"
+    );
+    victim.write_all(b"*1\r\n$4\r\nPING\r\n").ok();
+    let mut buf = [0u8; 64];
+    let n = victim.read(&mut buf).unwrap_or(0);
+    assert_eq!(
+        n,
+        0,
+        "killed client still answered: {:?}",
+        String::from_utf8_lossy(&buf[..n])
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
