@@ -230,6 +230,7 @@ pub fn run_shard_worker(
         };
         // Users/requirepass are server-wide: every shard port uses one ACL table.
         crate::acl::share_acl_with_port(shard_port, base_port);
+        crate::connection::set_node_port(shard_port, base_port);
 
         // 1. One SO_REUSEPORT listener per configured `bind` address.
         let bind_addrs = crate::netsec::bind_addrs(base_port);

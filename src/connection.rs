@@ -2003,7 +2003,27 @@ pub fn has_monitor_clients() -> bool {
     HAS_MONITOR_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Shard port -> the node's base port, for registries that are the node's
+/// (MONITOR): in cluster mode every shard listens on its own port.
+static NODE_PORTS: std::sync::LazyLock<parking_lot::RwLock<hashbrown::HashMap<u16, u16>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(hashbrown::HashMap::new()));
+
+/// Records that `shard_port` is a port of the node on `base_port`.
+pub fn set_node_port(shard_port: u16, base_port: u16) {
+    if shard_port != base_port {
+        NODE_PORTS.write().insert(shard_port, base_port);
+    }
+}
+
+/// The base port of the node `port` belongs to.
+fn node_port(port: u16) -> u16 {
+    NODE_PORTS.read().get(&port).copied().unwrap_or(port)
+}
+
 pub fn register_monitor_client(port: u16, client_id: u64, push: crate::transport::PushTarget) {
+    // One node, one MONITOR feed: commands on every shard port reach every
+    // monitor (keyed by the shard port, a monitor saw only its own port's).
+    let port = node_port(port);
     let mut list = MONITOR_CLIENTS.write();
     if !list.iter().any(|(p, id, _)| *p == port && *id == client_id) {
         list.push((port, client_id, push));
@@ -2015,6 +2035,7 @@ pub fn unregister_monitor_client(port: u16, client_id: u64) {
     if !has_monitor_clients() {
         return;
     }
+    let port = node_port(port);
     let mut list = MONITOR_CLIENTS.write();
     let prev_len = list.len();
     list.retain(|(p, id, _)| !(*p == port && *id == client_id));
@@ -2054,6 +2075,7 @@ pub fn broadcast_monitor(port: u16, source_addr: &str, argv: &[Bytes]) {
     }
     line.push_str("\r\n");
     let bytes = line.as_bytes();
+    let port = node_port(port);
     let list = MONITOR_CLIENTS.read();
     for (p, _, target) in list.iter() {
         if *p == port {
@@ -28910,6 +28932,30 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_monitor_feed_is_the_nodes_on_every_shard_port() {
+        // A monitor on the base port gets commands broadcast from a shard
+        // port of the same node, and a monitor on a shard port gets the
+        // base port's.
+        let (base, shard) = (41895u16, 41896u16);
+        set_node_port(shard, base);
+        let (tx, rx) = flume::unbounded();
+        register_monitor_client(base, 9_000_001, crate::transport::PushTarget::Queue(tx));
+        broadcast_monitor(
+            shard,
+            "127.0.0.1:1",
+            &[Bytes::from_static(b"echo-from-shard")],
+        );
+        let got = rx.try_recv().expect("the base port's monitor got nothing");
+        assert!(String::from_utf8_lossy(&got).contains("echo-from-shard"));
+        unregister_monitor_client(shard, 9_000_001);
+        broadcast_monitor(base, "127.0.0.1:1", &[Bytes::from_static(b"after")]);
+        assert!(
+            rx.try_recv().is_err(),
+            "unregistering by the shard port left it"
+        );
+    }
+
     #[test]
     fn batch_has_writes_spots_any_write() {
         let parse = |line: &[u8]| {

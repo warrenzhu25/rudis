@@ -33919,3 +33919,46 @@ fn test_cluster_publish_reaches_every_shard_port_e2e() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// MONITOR on a cluster-mode node shows the commands sent to every shard's
+/// port, not just its own.
+#[test]
+fn test_cluster_monitor_sees_every_shard_port_e2e() {
+    let port = 18231u16;
+    let dir = std::env::temp_dir().join(format!("rudis_cl_monitor_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _srv = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &port.to_string(),
+            "--dir",
+            dir.to_str().unwrap(),
+            "--cluster-enabled",
+            "yes",
+            "--threads",
+            "2",
+            "--no-pin",
+        ],
+        port,
+    ));
+    let conn = |p: u16| {
+        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let mut mon = conn(port);
+    assert_eq!(resp_cmd(&mut mon, &["MONITOR"]), "+OK\r\n");
+    let mut other = conn(port + 1);
+    let _ = resp_cmd(&mut other, &["ECHO", "from-shard-1"]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut seen = String::new();
+    while !seen.contains("from-shard-1") {
+        assert!(std::time::Instant::now() < deadline, "monitor saw: {seen}");
+        let mut buf = [0u8; 1024];
+        if let Ok(n) = mon.read(&mut buf) {
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
