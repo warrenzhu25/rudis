@@ -446,6 +446,17 @@ impl Router {
     pub fn set_base_port(&mut self, base_port: u16) {
         self.base_port = base_port;
         self.is_saving = crate::snapshot::is_saving(base_port);
+        // One node, one memory budget: in cluster mode every shard listens
+        // on its own port, but maxmemory, its policy inputs and the shards'
+        // published usage are the node's. Keyed by the shard port, shard 1+
+        // ran with maxmemory 0 and published usage shard 0 never saw: the
+        // node overshot its limit and refused writes (OOM) under an evicting
+        // policy.
+        let num_shards = self.tier_stats.num_shards.load(Ordering::Relaxed);
+        self.tier_stats = crate::tiering::get_tier_stats(base_port);
+        self.tier_stats
+            .num_shards
+            .fetch_max(num_shards.max(1), Ordering::Relaxed);
     }
 
     #[inline(always)]
@@ -7424,6 +7435,25 @@ mod tests {
         });
         drop(router);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn test_shard_port_router_shares_the_nodes_memory_budget() {
+        // maxmemory and the shards' published usage are the node's: a
+        // router on another shard's port must see the limit set for the
+        // node and publish where the other shards read.
+        let base = 41880;
+        crate::tiering::set_max_memory(base, 20 << 20);
+        let (mut router, _db) = single_shard_router(base + 1);
+        router.set_base_port(base);
+        assert_eq!(
+            router.tier_stats.max_memory.load(Ordering::Relaxed),
+            20 << 20
+        );
+        assert!(Arc::ptr_eq(
+            &router.tier_stats,
+            &crate::tiering::get_tier_stats(base)
+        ));
     }
 
     #[test]

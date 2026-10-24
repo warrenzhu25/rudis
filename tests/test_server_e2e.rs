@@ -33814,3 +33814,62 @@ fn test_proto_max_bulk_len_spares_aof_and_master_stream_e2e() {
     assert!(cmd(rport, &["INFO", "replication"]).contains("master_link_status:up"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A cluster-mode node with 2 shards (a port each) at its maxmemory under
+/// allkeys-lru: writes on either shard's port evict rather than fail, the
+/// node stays near its limit, and every shard port reports the limit.
+/// (Shard 1 used to run with maxmemory 0 and its own usage table: the node
+/// overshot the limit, then refused writes with OOM.)
+#[test]
+fn test_cluster_shard_ports_share_maxmemory_e2e() {
+    let port = 18219u16;
+    let dir = std::env::temp_dir().join(format!("rudis_cl_maxmem_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _srv = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &port.to_string(),
+            "--dir",
+            dir.to_str().unwrap(),
+            "--cluster-enabled",
+            "yes",
+            "--threads",
+            "2",
+            "--no-pin",
+            "--maxmemory",
+            "20mb",
+            "--maxmemory-policy",
+            "allkeys-lru",
+        ],
+        port,
+    ));
+    let conn = |p: u16| {
+        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    };
+    let (mut c0, mut c1) = (conn(port), conn(port + 1));
+    assert_eq!(
+        resp_cmd(&mut c1, &["CONFIG", "GET", "maxmemory"]),
+        "*2\r\n$9\r\nmaxmemory\r\n$8\r\n20971520\r\n"
+    );
+    let val = "x".repeat(1000);
+    for i in 0..50_000 {
+        let k = format!("mm{i}");
+        let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2);
+        let c = if shard == 0 { &mut c0 } else { &mut c1 };
+        let r = resp_cmd(c, &["SET", &k, &val]);
+        assert_eq!(r, "+OK\r\n", "write {i} on shard {shard}");
+    }
+    let info = resp_cmd(&mut c0, &["INFO", "memory"]);
+    let used: u64 = info
+        .lines()
+        .find_map(|l| l.strip_prefix("used_memory:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(used < 22 << 20, "used_memory {used} over a 20 MB limit");
+    let _ = std::fs::remove_dir_all(&dir);
+}

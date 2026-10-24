@@ -3434,9 +3434,9 @@ pub fn apply_config_value(
 
 #[inline(never)]
 fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>) {
-    let max_mem = crate::tiering::get_max_memory(router.port).to_string();
-    let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
-    let upload = crate::tiering::get_upload_threshold_pct(router.port).to_string();
+    let max_mem = crate::tiering::get_max_memory(router.base_port).to_string();
+    let offload = crate::tiering::get_offload_threshold_pct(router.base_port).to_string();
+    let upload = crate::tiering::get_upload_threshold_pct(router.base_port).to_string();
     let hash_entries = HASH_MAX_ENTRIES
         .load(std::sync::atomic::Ordering::Relaxed)
         .to_string();
@@ -11700,8 +11700,8 @@ async fn execute_command_inner(
         }
         Command::Info(section) => {
             let hub = crate::replication::get_replication_hub(router.base_port);
-            let stats = crate::tiering::get_tier_stats(router.port);
-            let max_mem = crate::tiering::get_max_memory(router.port);
+            let stats = crate::tiering::get_tier_stats(router.base_port);
+            let max_mem = crate::tiering::get_max_memory(router.base_port);
             let used_mem = router.get_total_used_memory().await;
             let memory_str = crate::allocator::format_memory_info(
                 used_mem,
@@ -11989,7 +11989,7 @@ async fn execute_command_inner(
             };
             let info_str =
                 if tokens.len() == 1 && matches!(tokens[0].as_str(), "metrics" | "prometheus") {
-                    crate::telemetry::format_prometheus_metrics(router.port, used_mem)
+                    crate::telemetry::format_prometheus_metrics(router.base_port, used_mem)
                 } else {
                     let mut expanded: Vec<&str> = Vec::new();
                     let mut push_unique = |name: &'static str| {
@@ -12262,8 +12262,8 @@ async fn execute_command_inner(
                 }
 
                 crate::resp::TierSubcommand::Info => {
-                    let stats = crate::tiering::get_tier_stats(router.port);
-                    let max_mem = crate::tiering::get_max_memory(router.port);
+                    let stats = crate::tiering::get_tier_stats(router.base_port);
+                    let max_mem = crate::tiering::get_max_memory(router.base_port);
                     let used_mem = router.get_total_used_memory().await;
                     let info = format!(
                         "# Tiered Storage (io_uring NVMe)\r\ntier_enabled:1\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\nused_memory:{}\r\nused_memory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\ngc_reclaimed_bytes:{}\r\ngc_cycles:{}\r\ndecommit_count:{}\r\ncoalesced_reads:{}\r\nbin_pages:{}\r\ntotal_stashes:{}\r\ntotal_fetches:{}\r\ntotal_deletes:{}\r\nram_hits:{}\r\nram_misses:{}\r\nstreaming_reads:{}\r\noffload_threshold_pct:{}\r\nupload_threshold_pct:{}\r\n",
@@ -18749,7 +18749,7 @@ async fn execute_command_inner(
                     let report = crate::allocator::MemoryReport {
                         breakdown: router.memory_breakdown().await,
                         used: router.get_total_used_memory().await,
-                        maxmemory: crate::tiering::get_max_memory(router.port),
+                        maxmemory: crate::tiering::get_max_memory(router.base_port),
                         alloc: crate::allocator::get_allocator_stats(),
                     };
                     if matches!(sub, MemorySubcommand::Stats) {

@@ -402,7 +402,7 @@ async fn serve_metrics_conn(router: &crate::router::Router, mut stream: monoio::
         0
     };
     let response = metrics_http_response(&request, || {
-        format_prometheus_metrics(router.port, used) + &format_server_state_metrics(router)
+        format_prometheus_metrics(router.base_port, used) + &format_server_state_metrics(router)
     });
     let _ = stream.write_all(response).await;
 }
