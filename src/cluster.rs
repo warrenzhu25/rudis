@@ -1133,6 +1133,9 @@ impl ClusterHub {
         if *self.role.read() != "slave" {
             return Err("You should send CLUSTER FAILOVER to a replica".to_string());
         }
+        // A replication master first (the caller ended the link), so whoever
+        // sees us serving the slots also finds us a master.
+        crate::replication::get_replication_hub(self.port).make_master();
         let new_epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.config_epoch.store(new_epoch, Ordering::SeqCst);
         let old_master_id = self.master_id.write().clone();
@@ -1153,9 +1156,6 @@ impl ClusterHub {
         if !inherited_slots.is_empty() {
             *self.my_slots.write() = inherited_slots.clone();
         }
-
-        // Notify replication hub if active
-        crate::replication::get_replication_hub(self.port).make_master();
 
         // Broadcast FAILOVER to all peers
         {
@@ -2009,7 +2009,12 @@ impl ClusterHub {
 
         let majority = (total_masters / 2) + 1;
         if votes >= majority {
-            // Won the election!
+            // Won the election! End the link to the dead master and become
+            // a replication master first, so whoever sees us serving the
+            // slots (CLUSTER NODES/SLOTS) also finds us a master.
+            let repl = crate::replication::get_replication_hub(self.port);
+            repl.stop_sync_and_wait_blocking(Duration::from_secs(5));
+            repl.make_master();
             let my_id = self.my_id();
             *self.role.write() = "master".to_string();
             *self.master_id.write() = "-".to_string();
@@ -2029,12 +2034,6 @@ impl ClusterHub {
             if !inherited.is_empty() {
                 *self.my_slots.write() = inherited.clone();
             }
-
-            // The master is gone: end the link to it before taking over,
-            // so nothing it sent lands after the promotion.
-            let repl = crate::replication::get_replication_hub(self.port);
-            repl.stop_sync_and_wait_blocking(Duration::from_secs(5));
-            repl.make_master();
 
             // Announce failover to all peers
             let mut slots_repr = String::new();
