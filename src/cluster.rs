@@ -2233,6 +2233,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                         let gport: u16 = fields[2].parse().unwrap_or(0);
                         let gcport: u16 = fields[3].parse().unwrap_or(0);
                         let (grole, gfail) = parse_flags(fields[4]);
+                        let gepoch: u64 = fields.get(5).and_then(|e| e.parse().ok()).unwrap_or(0);
                         if gid != hub.my_id() {
                             let mut nodes = hub.nodes.write();
                             // Failure reports only count for nodes we know.
@@ -2267,7 +2268,9 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                                         master_id: "-".to_string(),
                                         ping_sent: now,
                                         pong_recv: now,
-                                        config_epoch: 1,
+                                        // As the sender knows it: a fresh node runs at epoch 0, and a
+                                        // guess above that made its PONGs (and slots) look stale.
+                                        config_epoch: gepoch,
                                         link_state: "connected".to_string(),
                                         slots: Vec::new(),
                                     },
@@ -2526,6 +2529,23 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gossiped_node_takes_its_slots_from_its_pongs() {
+        // A node first heard of through gossip must accept its own PONGs,
+        // even at epoch 0 (a fresh node), or its slots stay unknown here.
+        let hub = ClusterHub::new(7200);
+        let sender = "s".repeat(40);
+        let fresh = "f".repeat(40);
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7201 {sender} 1 0-5460"), &hub);
+        handle_cluster_bus_line(
+            &format!("PING {sender} 1 master 0-5460 GOSSIP {fresh},127.0.0.1,7202,17202,master,0"),
+            &hub,
+        );
+        assert_eq!(hub.nodes.read()[&fresh].config_epoch, 0);
+        assert!(hub.apply_pong(&fresh, &format!("+PONG {fresh} 0 master 10923-16383")));
+        assert_eq!(hub.nodes.read()[&fresh].slots, vec![(10923, 16383)]);
+    }
 
     #[test]
     fn test_cluster_replicate_returns_the_master_to_sync_from() {

@@ -32943,9 +32943,10 @@ fn test_cluster_replicate_copies_the_masters_data_e2e() {
 }
 
 /// Killing a master of a 3-master cluster: the survivors agree it failed
-/// (FAIL, keeping its role and slots) and stay responsive throughout.
+/// (FAIL, keeping its role and slots) and stay responsive throughout, and
+/// its replica takes over its slots with the data it replicated.
 #[test]
-fn test_cluster_master_failure_is_agreed_on_e2e() {
+fn test_cluster_master_failure_promotes_its_replica_e2e() {
     let ports = [18093u16, 18099, 18105, 18111];
     let ranges = [(0, 5460), (5461, 10922), (10923, 16383)];
     let dirs: Vec<String> = ports
@@ -33062,6 +33063,31 @@ fn test_cluster_master_failure_is_agreed_on_e2e() {
     for p in [ports[0], ports[1]] {
         assert_eq!(cmd(p, &["PING"]), "+PONG\r\n", "master {p} stuck");
     }
+    wait_until("replica promoted with the victim's slots", &mut || {
+        let nodes = cmd(replica, &["CLUSTER", "NODES"]);
+        let me = nodes
+            .lines()
+            .find(|l| l.contains("myself"))
+            .unwrap_or_default();
+        (!(me.contains("master") && me.ends_with("10923-16383"))).then_some(nodes)
+    });
+    eprintln!("promoted after {:?}", started.elapsed());
+    let info = cmd(replica, &["INFO", "replication"]);
+    assert!(info.contains("role:master"), "{info}");
+    assert_eq!(cmd(replica, &["DBSIZE"]), format!(":{}\r\n", keys.len()));
+    // The other masters route the victim's slots to the promoted replica.
+    let slot_owner_is_replica = |p: u16| {
+        let slots = cmd(p, &["CLUSTER", "SLOTS"]);
+        slots.contains(&format!(
+            ":10923\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:{replica}\r\n"
+        ))
+    };
+    wait_until("masters route the slots to the replica", &mut || {
+        (![ports[0], ports[1]]
+            .iter()
+            .all(|p| slot_owner_is_replica(*p)))
+        .then(|| cmd(ports[0], &["CLUSTER", "SLOTS"]))
+    });
 
     drop(servers);
     for d in &dirs {
