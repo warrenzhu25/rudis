@@ -337,9 +337,30 @@ impl ClusterHub {
                 .flat_map(|&(s, e)| s..=e)
                 .filter(|&slot| !newer[slot as usize])
                 .collect();
+            let my_master = self.master_id.read().clone();
+            let master_had_slots = nodes.get(&my_master).is_some_and(|m| !m.slots.is_empty());
             for (other, n) in nodes.iter_mut() {
                 if other != id && n.config_epoch < epoch {
                     remove_slots(&mut n.slots, &accepted);
+                }
+            }
+            // Our master's slots all went to `id` (it was failed over, maybe
+            // to another of its replicas): like Redis, follow the new owner.
+            if *self.role.read() == "slave"
+                && my_master != id
+                && master_had_slots
+                && nodes.get(&my_master).is_some_and(|m| m.slots.is_empty())
+                && !accepted.is_empty()
+            {
+                let new_master = nodes.get(id).map(|n| (n.ip.clone(), n.port));
+                if let Some(addr) = new_master {
+                    crate::log_warning!(
+                        "Cluster: my master {} was failed over to {}: following it",
+                        my_master,
+                        id
+                    );
+                    *self.master_id.write() = id.to_string();
+                    *self.follow.lock() = Some(addr);
                 }
             }
             if my_epoch < epoch {
@@ -1847,28 +1868,60 @@ impl ClusterHub {
             return;
         }
 
+        // A replica that never got its master's data must not take over:
+        // it would serve the slots empty.
+        if !crate::replication::get_replication_hub(self.port).holds_master_data() {
+            crate::log_warning!(
+                "Cluster: master {} failed but I hold none of its data: not taking over",
+                master_id
+            );
+            self.election_in_progress.store(false, Ordering::SeqCst);
+            return;
+        }
+        // Like Redis, wait a little (500 ms plus up to 500 ms of jitter), so
+        // the FAIL verdict spreads and replicas of the same master don't
+        // split the votes of one epoch.
+        std::thread::sleep(Duration::from_millis(500 + random_below(500)));
+        let still_failed = self
+            .nodes
+            .read()
+            .get(&master_id)
+            .is_some_and(|m| m.fail == FailState::Fail);
+        if !still_failed || *self.master_id.read() != master_id {
+            self.election_in_progress.store(false, Ordering::SeqCst);
+            return;
+        }
+
         let req_epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
-        let masters: Vec<(String, u16)> = {
+        // The masters serving slots vote, the failed one included in the
+        // count: winning takes a majority of them. A replica gets no vote
+        // of its own (it used to count itself, so with 3 masters one ACK
+        // was enough).
+        let (masters, total_masters): (Vec<(String, u16)>, usize) = {
             let nodes = self.nodes.read();
-            nodes
-                .values()
-                .filter(|n| n.is_master() && n.fail != FailState::Fail)
+            let serving = || {
+                nodes
+                    .values()
+                    .filter(|n| n.is_master() && (!n.slots.is_empty() || n.id == master_id))
+            };
+            let alive = serving()
+                .filter(|n| n.fail != FailState::Fail && n.id != master_id)
                 .map(|n| (n.ip.clone(), n.cport))
-                .collect()
+                .collect();
+            (alive, serving().count())
         };
 
-        let mut votes = 1; // self vote
-        let total_masters = masters.len() + 1; // plus the failed master
+        let mut votes = 0;
 
         for (ip, cport) in &masters {
             let addr = format!("{}:{}", ip, cport);
             if let Ok(parsed) = addr.parse::<SocketAddr>()
                 && let Ok(mut stream) =
-                    TcpStream::connect_timeout(&parsed, Duration::from_millis(200))
+                    TcpStream::connect_timeout(&parsed, Duration::from_millis(500))
             {
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(1000)));
                 let req = format!(
                     "FAILOVER_AUTH_REQUEST {} {} {}\r\n",
                     self.my_id(),
@@ -1929,6 +1982,11 @@ impl ClusterHub {
                 my_id, req_epoch, slots_repr
             );
             self.broadcast_to_peers(&announce);
+        } else {
+            // Lost (another replica of the same master got the votes of
+            // this epoch): back off a random while before running again,
+            // so two replicas don't keep splitting every epoch.
+            std::thread::sleep(Duration::from_millis(1000 + random_below(1000)));
         }
 
         self.election_in_progress.store(false, Ordering::SeqCst);
@@ -2457,12 +2515,13 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             let claimed_master = parts[3];
             let is_master = *hub.role.read() == "master";
             let last_vote = hub.last_vote_epoch.load(Ordering::Relaxed);
+            // Down, and not failed over yet: once another node took its
+            // slots, a later election (another replica) must not take them.
             let master_is_down = {
                 let nodes = hub.nodes.read();
                 nodes
                     .get(claimed_master)
-                    .map(|n| n.fail == FailState::Fail)
-                    .unwrap_or(false)
+                    .is_some_and(|n| n.fail == FailState::Fail && !n.slots.is_empty())
             };
 
             if is_master && req_epoch > last_vote && master_is_down {
@@ -2495,6 +2554,21 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
         }
         _ => Some("-ERR unknown clusterbus command\r\n".to_string()),
     }
+}
+
+/// A random number below `n`, different in every process and call. (The
+/// wall clock is no source: replicas reacting to the same FAIL broadcast
+/// read nearly the same time, so their "random" delays matched.)
+fn random_below(n: u64) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    h.finish() % n.max(1)
 }
 
 /// Masters that must agree before a node is FAIL: a majority of the
@@ -2637,8 +2711,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
             let nodes = hub.nodes.read();
             nodes
                 .get(&master_id)
-                .map(|n| n.fail == FailState::Fail)
-                .unwrap_or(false)
+                .is_some_and(|n| n.fail == FailState::Fail && !n.slots.is_empty())
         } else {
             false
         }
@@ -2809,6 +2882,85 @@ mod tests {
         hub.cluster_replicate(&owner).unwrap();
         hub.cluster_failover(false).unwrap();
         assert!(hub.config_epoch.load(Ordering::SeqCst) > 5);
+        assert_eq!(*hub.my_slots.read(), vec![(0, 5460)]);
+    }
+
+    #[test]
+    fn test_election_needs_data_and_a_majority_of_masters() {
+        // We replicate M (0-5460), which failed; A and B serve the other
+        // slots and vote. A always grants; B grants only when told to.
+        let hub = ClusterHub::new(7700);
+        hub.my_slots.write().clear();
+        let m = "m".repeat(40);
+        let b_grants = Arc::new(AtomicBool::new(false));
+        let voter = |grants: Option<Arc<AtomicBool>>| {
+            let l = (0..200)
+                .find_map(|i| TcpListener::bind(("127.0.0.1", 47900 + i)).ok())
+                .unwrap();
+            let cport = l.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for mut c in l.incoming().flatten() {
+                    let mut buf = [0u8; 512];
+                    let _ = c.read(&mut buf);
+                    let yes = grants.as_ref().is_none_or(|g| g.load(Ordering::SeqCst));
+                    let reply: &[u8] = if yes {
+                        b"+FAILOVER_AUTH_ACK x 1\r\n"
+                    } else {
+                        b"-ERR vote rejected\r\n"
+                    };
+                    let _ = c.write_all(reply);
+                }
+            });
+            cport
+        };
+        let node =
+            |id: &str, cport: u16, slots: Vec<(u16, u16)>, fail: FailState| ClusterNodeInfo {
+                id: id.to_string(),
+                ip: "127.0.0.1".to_string(),
+                port: cport - 10000,
+                cport,
+                flags: "master".to_string(),
+                fail,
+                master_id: "-".to_string(),
+                ping_sent: 0,
+                pong_recv: 0,
+                config_epoch: 0,
+                link_state: "connected".to_string(),
+                slots,
+            };
+        let (a_port, b_port) = (voter(None), voter(Some(b_grants.clone())));
+        hub.nodes
+            .write()
+            .insert(m.clone(), node(&m, 17701, vec![(0, 5460)], FailState::Fail));
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        hub.nodes.write().insert(
+            a.clone(),
+            node(&a, a_port, vec![(5461, 10922)], FailState::Ok),
+        );
+        hub.nodes.write().insert(
+            b.clone(),
+            node(&b, b_port, vec![(10923, 16383)], FailState::Ok),
+        );
+        *hub.role.write() = "slave".to_string();
+        *hub.master_id.write() = m.clone();
+        let won = |hub: &ClusterHub| *hub.role.read() == "master";
+
+        // 1. Without the master's data, no election even if all would vote.
+        b_grants.store(true, Ordering::SeqCst);
+        hub.start_election();
+        assert!(!won(&hub), "an empty replica took over");
+
+        // 2. With data, one vote of three masters is not a majority (the
+        // replica used to count a vote of its own).
+        crate::replication::get_replication_hub(7700).pretend_synced();
+        b_grants.store(false, Ordering::SeqCst);
+        hub.start_election();
+        assert!(!won(&hub), "promoted on one vote of three");
+
+        // 3. Two of three: promoted with M's slots.
+        b_grants.store(true, Ordering::SeqCst);
+        hub.start_election();
+        assert!(won(&hub));
         assert_eq!(*hub.my_slots.read(), vec![(0, 5460)]);
     }
 

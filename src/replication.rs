@@ -990,6 +990,25 @@ impl ReplicationHub {
         }
     }
 
+    /// Whether this replica holds a dataset from its master: a sync with
+    /// it completed (full or partial) and wasn't discarded since.
+    pub fn holds_master_data(&self) -> bool {
+        self.is_slave() && self.cached_master.load(Ordering::Relaxed)
+    }
+
+    /// Tests: act as a replica that completed a sync with its master.
+    #[cfg(test)]
+    pub(crate) fn pretend_synced(&self) {
+        *self.role.write() = ReplicationRole::Slave {
+            master_host: "127.0.0.1".to_string(),
+            master_port: 1,
+            link_status: "down".to_string(),
+            sync_in_progress: false,
+        };
+        self.is_slave_atomic.store(true, Ordering::Release);
+        self.cached_master.store(true, Ordering::Relaxed);
+    }
+
     /// `stop_sync_and_wait` for threads outside the shards' runtimes (the
     /// cluster bus): blocks up to `timeout` for the worker to exit. Never
     /// call it on a shard thread, which may be the one running the worker.

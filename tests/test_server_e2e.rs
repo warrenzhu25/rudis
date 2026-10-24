@@ -32973,6 +32973,41 @@ fn test_cluster_replicate_copies_the_masters_data_e2e() {
     let _ = std::fs::remove_dir_all(&rdir);
 }
 
+/// Waits until every node's CLUSTER SLOTS shows all three ranges of a
+/// 3-master test cluster: a master's slots are only learned from its own
+/// PINGs/PONGs, so killing one before that leaves the others (its replicas
+/// included) without its slots to fail over.
+fn wait_for_slot_views(ports: &[u16]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let views: Vec<String> = ports
+            .iter()
+            .map(|p| {
+                let mut c = TcpStream::connect(("127.0.0.1", *p)).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                resp_cmd(&mut c, &["CLUSTER", "SLOTS"])
+            })
+            .collect();
+        let full = |v: &String| {
+            [
+                ":0\r\n:5460\r\n",
+                ":5461\r\n:10922\r\n",
+                ":10923\r\n:16383\r\n",
+            ]
+            .iter()
+            .all(|r| v.contains(r))
+        };
+        if views.iter().all(full) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "slot views: {views:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Killing a master of a 3-master cluster: the survivors agree it failed
 /// (FAIL, keeping its role and slots) and stay responsive throughout, and
 /// its replica takes over its slots with the data it replicated. When the
@@ -33059,6 +33094,7 @@ fn test_cluster_master_failure_promotes_its_replica_e2e() {
         cmd(replica, &["CLUSTER", "REPLICATE", &victim_id]),
         "+OK\r\n"
     );
+    wait_for_slot_views(&ports);
 
     // Keys in the victim's slots, written on the victim's shard ports.
     let keys: Vec<String> = (0..2000)
@@ -33348,6 +33384,7 @@ fn test_cluster_six_node_heartbeats_stay_timely_e2e() {
             "+OK\r\n"
         );
     }
+    wait_for_slot_views(&ports);
 
     // Ten seconds (twice the node timeout) of a healthy cluster: no node
     // may see a live one as failing.
@@ -33379,6 +33416,184 @@ fn test_cluster_six_node_heartbeats_stay_timely_e2e() {
         "{:?}",
         started.elapsed()
     );
+    drop(servers);
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// A master with two replicas fails: one replica takes over, and the
+/// other follows the winner (replicating it) instead of staying attached
+/// to the dead master or taking the slots in a later election.
+#[test]
+fn test_cluster_second_replica_follows_the_promoted_one_e2e() {
+    let ports = [18165u16, 18171, 18177, 18183, 18189];
+    let ranges = [(0, 5460), (5461, 10922), (10923, 16383)];
+    let dirs: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            let d =
+                std::env::temp_dir().join(format!("rudis_two_rep_{}_{}", p, std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d.to_str().unwrap().to_string()
+        })
+        .collect();
+    let mut servers: Vec<Option<ServerGuard>> = ports
+        .iter()
+        .zip(&dirs)
+        .map(|(p, d)| {
+            Some(ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    d,
+                    "--cluster-enabled",
+                    "yes",
+                    "--threads",
+                    "2",
+                    "--no-pin",
+                ],
+                *p,
+            )))
+        })
+        .collect();
+    let cmd = |p: u16, args: &[&str]| {
+        let mut c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd(&mut c, args)
+    };
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    let wait_until = |what: &str, ok: &mut dyn FnMut() -> Option<String>| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match ok() {
+                None => return,
+                Some(state) => assert!(std::time::Instant::now() < deadline, "{what}: {state}"),
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    for p in ports {
+        assert_eq!(
+            cmd(p, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+            "+OK\r\n"
+        );
+    }
+    for (p, (s, e)) in ports.iter().zip(ranges) {
+        let (s, e) = (s.to_string(), e.to_string());
+        assert_eq!(cmd(*p, &["CLUSTER", "ADDSLOTSRANGE", &s, &e]), "+OK\r\n");
+    }
+    for p in &ports[1..] {
+        assert_eq!(
+            cmd(ports[0], &["CLUSTER", "MEET", "127.0.0.1", &p.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    let ids: Vec<String> = ports
+        .iter()
+        .map(|p| bulk(cmd(*p, &["CLUSTER", "MYID"])))
+        .collect();
+    wait_until("everyone knows everyone", &mut || {
+        let views: Vec<String> = ports
+            .iter()
+            .map(|p| cmd(*p, &["CLUSTER", "NODES"]))
+            .collect();
+        (!views
+            .iter()
+            .all(|v| ids.iter().all(|id| v.contains(id.as_str()))))
+        .then(|| views.join("\n"))
+    });
+    // Both replicate the master of 10923-16383.
+    for r in [ports[3], ports[4]] {
+        assert_eq!(cmd(r, &["CLUSTER", "REPLICATE", &ids[2]]), "+OK\r\n");
+    }
+    wait_for_slot_views(&ports);
+    let keys: Vec<String> = (0..2000)
+        .map(|i| format!("tr_{i}"))
+        .filter(|k| rudis::router::key_slot(k.as_bytes()) >= 10923)
+        .take(50)
+        .collect();
+    for k in &keys {
+        let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2);
+        assert_eq!(cmd(ports[2] + shard as u16, &["SET", k, "v"]), "+OK\r\n");
+    }
+    for r in [ports[3], ports[4]] {
+        wait_until("replica synced", &mut || {
+            let n = cmd(r, &["DBSIZE"]);
+            (n != format!(":{}\r\n", keys.len())).then_some(n)
+        });
+    }
+
+    servers[2] = None; // SIGKILL
+    let me_line = |p: u16| {
+        let nodes = cmd(p, &["CLUSTER", "NODES"]);
+        nodes
+            .lines()
+            .find(|l| l.contains("myself"))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut winner = 0;
+    wait_until("one replica takes over", &mut || {
+        winner = [ports[3], ports[4]]
+            .into_iter()
+            .find(|p| me_line(*p).ends_with(" 10923-16383"))
+            .unwrap_or(0);
+        (winner == 0).then(|| {
+            [ports[0], ports[1], ports[3], ports[4]]
+                .iter()
+                .map(|p| {
+                    format!(
+                        "--- {p}:\n{}{}",
+                        cmd(*p, &["CLUSTER", "NODES"]),
+                        cmd(*p, &["INFO", "replication"])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    });
+    let loser = if winner == ports[3] {
+        ports[4]
+    } else {
+        ports[3]
+    };
+    let winner_id = bulk(cmd(winner, &["CLUSTER", "MYID"]));
+    wait_until("the other follows the winner", &mut || {
+        let me = me_line(loser);
+        let info = cmd(loser, &["INFO", "replication"]);
+        (!(me.contains("myself,slave")
+            && me.contains(&winner_id)
+            && info.contains(&format!("master_port:{winner}"))
+            && info.contains("master_link_status:up")))
+        .then(|| format!("{me}\n{info}"))
+    });
+    // It stays a replica (no later election takes the slots back).
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        me_line(loser).contains("myself,slave"),
+        "{}",
+        me_line(loser)
+    );
+    assert!(
+        me_line(winner).ends_with(" 10923-16383"),
+        "{}",
+        me_line(winner)
+    );
+    // A new key on the winner reaches the follower.
+    let k = format!("{}_new", keys[0]);
+    let k = (0..100)
+        .map(|i| format!("{k}{i}"))
+        .find(|k| rudis::router::key_slot(k.as_bytes()) >= 10923)
+        .unwrap();
+    let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2);
+    assert_eq!(cmd(winner + shard as u16, &["SET", &k, "new"]), "+OK\r\n");
+    wait_until("the follower gets the winner's writes", &mut || {
+        let n = cmd(loser, &["DBSIZE"]);
+        (n != format!(":{}\r\n", keys.len() + 1)).then_some(n)
+    });
     drop(servers);
     for d in &dirs {
         let _ = std::fs::remove_dir_all(d);
