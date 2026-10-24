@@ -10818,8 +10818,8 @@ async fn execute_command_inner(
                         let nodes = hub.nodes.read();
                         if !nodes.is_empty()
                             && let Some(peer) = nodes.values().find(|n| {
-                                n.flags.contains("master")
-                                    && !n.flags.contains("fail")
+                                n.is_master()
+                                    && n.fail != crate::cluster::FailState::Fail
                                     && n.slots.iter().any(|&(s, e)| slot >= s && slot <= e)
                             })
                         {

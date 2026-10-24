@@ -6,19 +6,69 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+/// What this node believes about a peer's health (Redis's PFAIL/FAIL).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FailState {
+    #[default]
+    Ok,
+    /// This node got no PONG from the peer within the node timeout.
+    PFail,
+    /// A majority of masters agree the peer is unreachable: its replicas
+    /// may take over.
+    Fail,
+}
+
+/// Node timeout: a peer silent this long is PFAIL.
+pub const NODE_TIMEOUT_MS: u64 = 5000;
+
 #[derive(Clone, Debug)]
 pub struct ClusterNodeInfo {
     pub id: String,
     pub ip: String,
     pub port: u16,
     pub cport: u16,
-    pub flags: String, // "myself,master", "master", "slave", "fail?", "fail"
+    /// The peer's role, "master" or "slave". Health is kept apart in
+    /// `fail`, so a failing node keeps its role (and its slots stay known).
+    pub flags: String,
+    pub fail: FailState,
     pub master_id: String,
     pub ping_sent: u64,
     pub pong_recv: u64,
     pub config_epoch: u64,
     pub link_state: String, // "connected", "disconnected"
     pub slots: Vec<(u16, u16)>,
+}
+
+impl ClusterNodeInfo {
+    pub fn is_master(&self) -> bool {
+        self.flags != "slave"
+    }
+
+    /// Flags as CLUSTER NODES shows them, e.g. `master,fail?`.
+    pub fn flags_repr(&self) -> String {
+        match self.fail {
+            FailState::Ok => self.flags.clone(),
+            FailState::PFail => format!("{},fail?", self.flags),
+            FailState::Fail => format!("{},fail", self.flags),
+        }
+    }
+}
+
+/// Splits CLUSTER NODES style flags (`myself,slave,fail?`, or `|`
+/// separated as gossip carries them) into the role and the health they
+/// carry.
+pub fn parse_flags(flags: &str) -> (String, FailState) {
+    let mut role = "master";
+    let mut fail = FailState::Ok;
+    for f in flags.split([',', '|']) {
+        match f {
+            "slave" | "replica" => role = "slave",
+            "fail" => fail = FailState::Fail,
+            "fail?" if fail == FailState::Ok => fail = FailState::PFail,
+            _ => {}
+        }
+    }
+    (role.to_string(), fail)
 }
 
 #[derive(Clone, Debug)]
@@ -376,11 +426,8 @@ impl ClusterHub {
                         ip,
                         port,
                         cport,
-                        flags: if clean_flags.is_empty() {
-                            "master".to_string()
-                        } else {
-                            clean_flags
-                        },
+                        flags: parse_flags(&clean_flags).0,
+                        fail: parse_flags(&clean_flags).1,
                         master_id,
                         ping_sent,
                         pong_recv,
@@ -555,10 +602,6 @@ impl ClusterHub {
     }
 
     pub fn cluster_nodes(&self) -> String {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         let mut out = String::new();
 
         // 1. Myself entry
@@ -617,7 +660,7 @@ impl ClusterHub {
         ));
 
         // 2. Peer entries
-        let mut nodes = self.nodes.write();
+        let nodes = self.nodes.read();
         if is_cluster && nodes.is_empty() {
             for s in 1..num_shards {
                 let peer_port = self.port + s as u16;
@@ -641,36 +684,16 @@ impl ClusterHub {
             }
             return out;
         }
-        let pfail_reports = self.pfail_reports.read();
+        // Health is judged by the bus tick (`cluster_bus_tick`); this only
+        // reports it.
         let mut keys: Vec<String> = nodes.keys().cloned().collect();
         keys.sort();
-
-        let total_masters = nodes
-            .values()
-            .filter(|n| n.master_id == "-" || (!n.flags.contains("slave") && !n.flags.is_empty()))
-            .count()
-            + if *self.role.read() == "master" { 1 } else { 0 };
-        let quorum = (total_masters / 2) + 1;
 
         for id in keys {
             if id == my_id {
                 continue;
             }
-            if let Some(node) = nodes.get_mut(&id) {
-                let silence = now.saturating_sub(node.pong_recv);
-                let pfail_count = pfail_reports.get(&id).map(|s| s.len()).unwrap_or(0);
-                let total_pfail_votes = pfail_count + if silence > 5000 { 1 } else { 0 };
-
-                if node.flags == "fail" || total_pfail_votes >= quorum {
-                    node.flags = "fail".to_string();
-                    node.link_state = "disconnected".to_string();
-                } else if silence > 5000 {
-                    node.flags = "fail?".to_string();
-                } else if node.flags == "fail?" {
-                    node.flags = "master".to_string();
-                    node.link_state = "connected".to_string();
-                }
-
+            if let Some(node) = nodes.get(&id) {
                 let mut peer_slots_str = String::new();
                 for (s, e) in &node.slots {
                     if s == e {
@@ -686,7 +709,7 @@ impl ClusterHub {
                     node.ip,
                     node.port,
                     node.cport,
-                    node.flags,
+                    node.flags_repr(),
                     node.master_id,
                     node.ping_sent,
                     node.pong_recv,
@@ -703,9 +726,17 @@ impl ClusterHub {
     pub fn cluster_info(&self) -> String {
         let nodes = self.nodes.read();
         let total_nodes = nodes.len() + 1; // peers + self
-        let pfail_count = nodes.values().filter(|n| n.flags.contains("fail?")).count();
-        let fail_count = nodes.values().filter(|n| n.flags == "fail").count();
-        let state = if fail_count > 0 { "fail" } else { "ok" };
+        let pfail_count = nodes
+            .values()
+            .filter(|n| n.fail == FailState::PFail)
+            .count();
+        let fail_count = nodes.values().filter(|n| n.fail == FailState::Fail).count();
+        // Down while a failed master still serves slots (no replica took
+        // them over yet).
+        let uncovered = nodes
+            .values()
+            .any(|n| n.fail == FailState::Fail && n.is_master() && !n.slots.is_empty());
+        let state = if uncovered { "fail" } else { "ok" };
         let cur_epoch = self.current_epoch.load(Ordering::Relaxed);
         let cfg_epoch = self.config_epoch.load(Ordering::Relaxed);
         format!(
@@ -741,6 +772,7 @@ impl ClusterHub {
                         port,
                         cport,
                         flags: "master".to_string(),
+                        fail: FailState::Ok,
                         master_id: "-".to_string(),
                         ping_sent: now,
                         pong_recv: now,
@@ -802,7 +834,8 @@ impl ClusterHub {
                                     ip: ip.to_string(),
                                     port,
                                     cport,
-                                    flags: remote_role,
+                                    flags: parse_flags(&remote_role).0,
+                                    fail: FailState::Ok,
                                     master_id: "-".to_string(),
                                     ping_sent: now,
                                     pong_recv: now,
@@ -850,7 +883,7 @@ impl ClusterHub {
             let Some(master) = nodes.get(master_id) else {
                 return Err(format!("Unknown node {}", master_id));
             };
-            if master.flags.contains("slave") {
+            if !master.is_master() {
                 return Err("I can only replicate a master, not a replica.".to_string());
             }
             (master.ip.clone(), master.port)
@@ -1005,7 +1038,7 @@ impl ClusterHub {
 
         // 2. Peer masters
         for peer in nodes.values() {
-            if peer.flags.contains("master") {
+            if peer.is_master() {
                 let peer_replicas: Vec<(String, u16, String)> = nodes
                     .values()
                     .filter(|n| n.master_id == peer.id)
@@ -1085,7 +1118,7 @@ impl ClusterHub {
             ));
             for n in nodes.values() {
                 if n.master_id == my_id {
-                    let health = if n.flags.contains("fail") {
+                    let health = if n.fail == FailState::Fail {
                         "fail"
                     } else {
                         "online"
@@ -1107,9 +1140,9 @@ impl ClusterHub {
 
         // 2. Shards for peer masters
         for peer in nodes.values() {
-            if peer.flags.contains("master") {
+            if peer.is_master() {
                 let mut shard_nodes = Vec::new();
-                let master_health = if peer.flags.contains("fail") {
+                let master_health = if peer.fail == FailState::Fail {
                     "fail"
                 } else {
                     "online"
@@ -1123,7 +1156,7 @@ impl ClusterHub {
                 ));
                 for n in nodes.values() {
                     if n.master_id == peer.id {
-                        let health = if n.flags.contains("fail") {
+                        let health = if n.fail == FailState::Fail {
                             "fail"
                         } else {
                             "online"
@@ -1367,7 +1400,7 @@ impl ClusterHub {
             }
         } else {
             for node in nodes.values() {
-                if node.flags.contains("master") {
+                if node.is_master() {
                     masters_count += 1;
                     for &(s, e) in &node.slots {
                         for slot in s..=e {
@@ -1460,7 +1493,7 @@ impl ClusterHub {
         {
             let nodes = self.nodes.read();
             for n in nodes.values() {
-                if n.flags.contains("master") && n.id != my_id {
+                if n.is_master() && n.id != my_id {
                     let mut s = Vec::new();
                     for &(start, end) in &n.slots {
                         for slot in start..=end {
@@ -1694,7 +1727,7 @@ impl ClusterHub {
             let nodes = self.nodes.read();
             nodes
                 .values()
-                .filter(|n| n.flags.contains("master") && !n.flags.contains("fail"))
+                .filter(|n| n.is_master() && n.fail != FailState::Fail)
                 .map(|n| (n.ip.clone(), n.cport))
                 .collect()
         };
@@ -1742,7 +1775,9 @@ impl ClusterHub {
                 let mut nodes = self.nodes.write();
                 if let Some(m) = nodes.get_mut(&master_id) {
                     inherited = std::mem::take(&mut m.slots);
-                    m.flags = "fail".to_string();
+                    // The old master is down; when it returns it is our replica.
+                    m.flags = "slave".to_string();
+                    m.master_id = my_id.clone();
                 }
             }
             if !inherited.is_empty() {
@@ -2146,6 +2181,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                         port: peer_port,
                         cport: peer_cport,
                         flags: "master".to_string(),
+                        fail: FailState::Ok,
                         master_id: "-".to_string(),
                         ping_sent: now,
                         pong_recv: now,
@@ -2172,8 +2208,10 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                 if let Some(node) = nodes.get_mut(&peer_id) {
                     node.pong_recv = now;
                     node.link_state = "connected".to_string();
+                    // It is talking to us: reachable, whatever we thought.
+                    node.fail = FailState::Ok;
                     if parts.len() >= 4 {
-                        node.flags = parts[3].to_string();
+                        node.flags = parse_flags(parts[3]).0;
                     }
                     if parts.len() >= 5 {
                         let epoch = parts[2].parse::<u64>().ok();
@@ -2194,12 +2232,12 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                         let gip = fields[1].to_string();
                         let gport: u16 = fields[2].parse().unwrap_or(0);
                         let gcport: u16 = fields[3].parse().unwrap_or(0);
-                        let gflags = fields[4].to_string();
+                        let (grole, gfail) = parse_flags(fields[4]);
                         if gid != hub.my_id() {
                             let mut nodes = hub.nodes.write();
                             // Failure reports only count for nodes we know.
                             if nodes.contains_key(&gid) {
-                                if gflags.contains("fail") {
+                                if gfail != FailState::Ok {
                                     hub.pfail_reports
                                         .write()
                                         .entry(gid.clone())
@@ -2213,8 +2251,8 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                             }
 
                             if let Some(n) = nodes.get_mut(&gid) {
-                                if gflags == "fail" {
-                                    n.flags = "fail".to_string();
+                                if gfail == FailState::Fail {
+                                    n.fail = FailState::Fail;
                                 }
                             } else if gport > 0 && nodes.len() < MAX_CLUSTER_NODES {
                                 nodes.insert(
@@ -2224,7 +2262,8 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                                         ip: gip,
                                         port: gport,
                                         cport: gcport,
-                                        flags: gflags,
+                                        flags: grole,
+                                        fail: gfail,
                                         master_id: "-".to_string(),
                                         ping_sent: now,
                                         pong_recv: now,
@@ -2249,7 +2288,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             let failed_id = parts[1];
             let mut nodes = hub.nodes.write();
             if let Some(node) = nodes.get_mut(failed_id) {
-                node.flags = "fail".to_string();
+                node.fail = FailState::Fail;
                 node.link_state = "disconnected".to_string();
             }
             Some("+OK\r\n".to_string())
@@ -2265,6 +2304,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             let mut nodes = hub.nodes.write();
             if let Some(node) = nodes.get_mut(&master_id) {
                 node.flags = "master".to_string();
+                node.fail = FailState::Ok;
                 node.master_id = "-".to_string();
                 node.config_epoch = epoch;
                 if !peer_slots.is_empty() {
@@ -2286,7 +2326,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                 let nodes = hub.nodes.read();
                 nodes
                     .get(claimed_master)
-                    .map(|n| n.flags.contains("fail"))
+                    .map(|n| n.fail == FailState::Fail)
                     .unwrap_or(false)
             };
 
@@ -2312,6 +2352,7 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             let mut nodes = hub.nodes.write();
             if let Some(node) = nodes.get_mut(&new_master_id) {
                 node.flags = "master".to_string();
+                node.fail = FailState::Ok;
                 node.master_id = "-".to_string();
                 node.config_epoch = epoch;
                 if !peer_slots.is_empty() {
@@ -2337,6 +2378,50 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
     }
 }
 
+/// Masters that must agree before a node is FAIL: a majority of the
+/// masters serving slots (this node included when it is one).
+fn failure_quorum(hub: &ClusterHub, nodes: &HashMap<String, ClusterNodeInfo>) -> usize {
+    let me = usize::from(*hub.role.read() == "master" && !hub.my_slots.read().is_empty());
+    let masters = nodes
+        .values()
+        .filter(|n| n.is_master() && !n.slots.is_empty())
+        .count()
+        + me;
+    masters / 2 + 1
+}
+
+/// A PING to `id` got no PONG. Past the node timeout the peer is PFAIL;
+/// once a quorum of masters reports it (our own view counts if we are a
+/// master), it is FAIL and the verdict is broadcast.
+fn note_unreachable(hub: &ClusterHub, id: &str, now: u64, quorum: usize) {
+    let reports = {
+        let nodes = hub.nodes.read();
+        let reporters = hub.pfail_reports.read();
+        reporters.get(id).map_or(0, |r| {
+            r.iter()
+                .filter(|from| nodes.get(*from).is_some_and(|n| n.is_master()))
+                .count()
+        })
+    };
+    let me = usize::from(*hub.role.read() == "master");
+    let mut broadcast = false;
+    if let Some(node) = hub.nodes.write().get_mut(id) {
+        if now.saturating_sub(node.pong_recv) <= NODE_TIMEOUT_MS || node.fail == FailState::Fail {
+            return;
+        }
+        if reports + me >= quorum {
+            node.fail = FailState::Fail;
+            node.link_state = "disconnected".to_string();
+            broadcast = true;
+        } else {
+            node.fail = FailState::PFail;
+        }
+    }
+    if broadcast {
+        hub.broadcast_to_peers(&format!("FAIL {}\r\n", id));
+    }
+}
+
 fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2349,12 +2434,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
             .values()
             .map(|n| (n.id.clone(), n.ip.clone(), n.port, n.cport))
             .collect();
-        let total_masters = nodes
-            .values()
-            .filter(|n| n.master_id == "-" || (!n.flags.contains("slave") && !n.flags.is_empty()))
-            .count()
-            + if *hub.role.read() == "master" { 1 } else { 0 };
-        (p, (total_masters / 2) + 1)
+        (p, failure_quorum(hub, &nodes))
     };
 
     // Prepare gossip payload of all known nodes
@@ -2364,7 +2444,13 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         for n in nodes.values() {
             gossip_payload.push_str(&format!(
                 "{},{},{},{},{},{};",
-                n.id, n.ip, n.port, n.cport, n.flags, n.config_epoch
+                n.id,
+                n.ip,
+                n.port,
+                n.cport,
+                // Fields are comma-separated: flags travel as `master|fail?`.
+                n.flags_repr().replace(',', "|"),
+                n.config_epoch
             ));
         }
     }
@@ -2397,54 +2483,20 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
                     .read(&mut buf)
                     .is_ok_and(|n| hub.apply_pong(&id, &String::from_utf8_lossy(&buf[..n])));
 
-            if let Some(node) = hub.nodes.write().get_mut(&id) {
-                if success {
+            if success {
+                if let Some(node) = hub.nodes.write().get_mut(&id) {
                     node.pong_recv = now;
                     node.link_state = "connected".to_string();
-                    if node.flags == "fail?" || node.flags == "fail" {
-                        node.flags = "master".to_string();
-                    }
-                    if let Some(reports) = hub.pfail_reports.write().get_mut(&id) {
-                        reports.remove(&hub.my_id());
-                    }
-                } else {
-                    let elapsed = now.saturating_sub(node.pong_recv);
-                    if elapsed > 5000 {
-                        let pfail_count = hub
-                            .pfail_reports
-                            .read()
-                            .get(&id)
-                            .map(|s| s.len())
-                            .unwrap_or(0);
-                        let total_votes = pfail_count + 1;
-                        if total_votes >= quorum {
-                            node.flags = "fail".to_string();
-                            node.link_state = "disconnected".to_string();
-                            hub.broadcast_to_peers(&format!("FAIL {}\r\n", node.id));
-                        } else {
-                            node.flags = "fail?".to_string();
-                        }
-                    }
+                    node.fail = FailState::Ok;
                 }
-            }
-        } else if let Some(node) = hub.nodes.write().get_mut(&id) {
-            let elapsed = now.saturating_sub(node.pong_recv);
-            if elapsed > 5000 {
-                let pfail_count = hub
-                    .pfail_reports
-                    .read()
-                    .get(&id)
-                    .map(|s| s.len())
-                    .unwrap_or(0);
-                let total_votes = pfail_count + 1;
-                if total_votes >= quorum {
-                    node.flags = "fail".to_string();
-                    node.link_state = "disconnected".to_string();
-                    hub.broadcast_to_peers(&format!("FAIL {}\r\n", node.id));
-                } else {
-                    node.flags = "fail?".to_string();
+                if let Some(reports) = hub.pfail_reports.write().get_mut(&id) {
+                    reports.remove(&hub.my_id());
                 }
+            } else {
+                note_unreachable(hub, &id, now, quorum);
             }
+        } else {
+            note_unreachable(hub, &id, now, quorum);
         }
     }
 
@@ -2456,7 +2508,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
             let nodes = hub.nodes.read();
             nodes
                 .get(&master_id)
-                .map(|n| n.flags.contains("fail"))
+                .map(|n| n.fail == FailState::Fail)
                 .unwrap_or(false)
         } else {
             false
@@ -2483,6 +2535,7 @@ mod tests {
             port,
             cport: port + 10000,
             flags: flags.to_string(),
+            fail: FailState::Ok,
             master_id: "-".to_string(),
             ping_sent: 0,
             pong_recv: 0,
@@ -2577,6 +2630,7 @@ mod tests {
                     port: 7001,
                     cport: 17001,
                     flags: "master".to_string(),
+                    fail: FailState::Ok,
                     master_id: "-".to_string(),
                     ping_sent: now,
                     pong_recv: now.saturating_sub(6000), // silent for 6s (>5s PFAIL threshold)
@@ -2593,6 +2647,7 @@ mod tests {
                     port: 7002,
                     cport: 17002,
                     flags: "master".to_string(),
+                    fail: FailState::Ok,
                     master_id: "-".to_string(),
                     ping_sent: now,
                     pong_recv: now,
@@ -2603,45 +2658,79 @@ mod tests {
             );
         }
 
-        // Total masters: hub(7000) + node2 + node3 = 3. Quorum = (3/2) + 1 = 2.
-        // 1. Without peer corroboration, Node 2 is marked fail? (PFAIL), NOT fail
-        let nodes_output = hub.cluster_nodes();
-        assert!(nodes_output.contains(&format!("{} 127.0.0.1:7001@17001 fail?", node2_id)));
-        assert!(!nodes_output.contains(&format!("{} 127.0.0.1:7001@17001 fail ", node2_id)));
+        // Masters serving slots: hub(7000) + node2 + node3 = 3, quorum 2.
+        let quorum = failure_quorum(&hub, &hub.nodes.read());
+        assert_eq!(quorum, 2);
+        let node2_line = |hub: &ClusterHub| {
+            hub.cluster_nodes()
+                .lines()
+                .find(|l| l.starts_with(&node2_id))
+                .unwrap()
+                .to_string()
+        };
 
-        // 2. Node 3 reports Node 2 as failing
+        // 1. Silent past the node timeout, our view alone: PFAIL, and it
+        // keeps its role (and slots).
+        note_unreachable(&hub, &node2_id, now, quorum);
+        assert!(
+            node2_line(&hub).contains(" master,fail? "),
+            "{}",
+            node2_line(&hub)
+        );
+        assert!(
+            node2_line(&hub).ends_with(" 0-5460"),
+            "{}",
+            node2_line(&hub)
+        );
+
+        // 2. A replica's report does not count toward the quorum.
+        let replica_id = "node4_abcdef0123456789abcdef0123456789abcd".to_string();
+        let replica = ClusterNodeInfo {
+            flags: "slave".to_string(),
+            id: replica_id.clone(),
+            port: 7003,
+            cport: 17003,
+            slots: Vec::new(),
+            ..hub.nodes.read()[&node3_id].clone()
+        };
+        hub.nodes.write().insert(replica_id.clone(), replica);
         hub.pfail_reports
             .write()
             .entry(node2_id.clone())
             .or_default()
-            .insert(node3_id.clone());
+            .insert(replica_id.clone());
+        note_unreachable(&hub, &node2_id, now, quorum);
+        assert_eq!(hub.nodes.read()[&node2_id].fail, FailState::PFail);
 
-        // Now total votes = 1 (local) + 1 (node 3) = 2 >= quorum(2).
-        // Node 2 must be promoted to fail!
-        let nodes_output_escalated = hub.cluster_nodes();
+        // 3. Node 3 (a master) gossips that it can't reach node 2 either:
+        // FAIL.
+        handle_cluster_bus_line(
+            &format!(
+                "PING {node3_id} 1 master 5461-10922 GOSSIP {node2_id},127.0.0.1,7001,17001,master|fail?,1"
+            ),
+            &hub,
+        );
+        assert!(hub.pfail_reports.read()[&node2_id].contains(&node3_id));
+        note_unreachable(&hub, &node2_id, now, quorum);
         assert!(
-            nodes_output_escalated.contains(&format!("{} 127.0.0.1:7001@17001 fail", node2_id))
+            node2_line(&hub).contains(" master,fail "),
+            "{}",
+            node2_line(&hub)
         );
 
-        // 3. Node 3 retracts report
-        hub.pfail_reports
-            .write()
-            .get_mut(&node2_id)
-            .unwrap()
-            .remove(&node3_id);
-        {
-            let mut nodes = hub.nodes.write();
-            nodes.get_mut(&node2_id).unwrap().flags = "master".to_string();
-        }
-        let nodes_output_retracted = hub.cluster_nodes();
+        // 4. Reading CLUSTER NODES changes nothing; hearing from the node
+        // again clears it.
+        let _ = hub.cluster_nodes();
+        assert_eq!(hub.nodes.read()[&node2_id].fail, FailState::Fail);
+        handle_cluster_bus_line(&format!("PING {} 1 master 0-5460", node2_id), &hub);
+        assert_eq!(hub.nodes.read()[&node2_id].fail, FailState::Ok);
         assert!(
-            nodes_output_retracted.contains(&format!("{} 127.0.0.1:7001@17001 fail?", node2_id))
-        );
-        assert!(
-            !nodes_output_retracted.contains(&format!("{} 127.0.0.1:7001@17001 fail ", node2_id))
+            node2_line(&hub).contains(" master - "),
+            "{}",
+            node2_line(&hub)
         );
 
-        // 4. Test cluster_forget cleans up pfail_reports
+        // 5. Test cluster_forget cleans up pfail_reports
         hub.pfail_reports
             .write()
             .entry(node2_id.clone())
@@ -2712,6 +2801,7 @@ mod tests {
                 port: 7201,
                 cport: 17201,
                 flags: "master".to_string(),
+                fail: FailState::Ok,
                 master_id: "-".to_string(),
                 ping_sent: 0,
                 pong_recv: 0,
@@ -2977,6 +3067,7 @@ mod tests {
                 port: 7601,
                 cport: 17601,
                 flags: "master".to_string(),
+                fail: FailState::Ok,
                 master_id: "-".to_string(),
                 ping_sent: 0,
                 pong_recv: 0,

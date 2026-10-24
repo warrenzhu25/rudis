@@ -8015,7 +8015,7 @@ fn test_cluster_quorum_failure_detection_and_gossip_e2e() {
     let nodes_after_fail = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
     assert!(
         nodes_after_fail.contains(&format!(
-            "{} 127.0.0.1:{}@{} fail",
+            "{} 127.0.0.1:{}@{} master,fail ",
             myid3,
             port3,
             port3 + 10000
@@ -32940,4 +32940,131 @@ fn test_cluster_replicate_copies_the_masters_data_e2e() {
     drop(r_srv);
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&rdir);
+}
+
+/// Killing a master of a 3-master cluster: the survivors agree it failed
+/// (FAIL, keeping its role and slots) and stay responsive throughout.
+#[test]
+fn test_cluster_master_failure_is_agreed_on_e2e() {
+    let ports = [18093u16, 18099, 18105, 18111];
+    let ranges = [(0, 5460), (5461, 10922), (10923, 16383)];
+    let dirs: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            let d = std::env::temp_dir().join(format!(
+                "rudis_cluster_failover_{}_{}",
+                p,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d.to_str().unwrap().to_string()
+        })
+        .collect();
+    let mut servers: Vec<Option<ServerGuard>> = ports
+        .iter()
+        .zip(&dirs)
+        .map(|(p, d)| {
+            Some(ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    d,
+                    "--cluster-enabled",
+                    "yes",
+                    "--threads",
+                    "2",
+                    "--no-pin",
+                ],
+                *p,
+            )))
+        })
+        .collect();
+    let conn = |p: u16| {
+        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut conn(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    let wait_until = |what: &str, ok: &mut dyn FnMut() -> Option<String>| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match ok() {
+                None => return,
+                Some(state) => assert!(std::time::Instant::now() < deadline, "{what}: {state}"),
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    for p in ports {
+        assert_eq!(
+            cmd(p, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+            "+OK\r\n"
+        );
+    }
+    for (p, (s, e)) in ports.iter().zip(ranges) {
+        let (s, e) = (s.to_string(), e.to_string());
+        assert_eq!(cmd(*p, &["CLUSTER", "ADDSLOTSRANGE", &s, &e]), "+OK\r\n");
+    }
+    for p in &ports[1..] {
+        assert_eq!(
+            cmd(ports[0], &["CLUSTER", "MEET", "127.0.0.1", &p.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    let victim_id = bulk(cmd(ports[2], &["CLUSTER", "MYID"]));
+    let replica = ports[3];
+    wait_until("replica learns the victim", &mut || {
+        let nodes = cmd(replica, &["CLUSTER", "NODES"]);
+        (!nodes.contains(&victim_id)).then_some(nodes)
+    });
+    assert_eq!(
+        cmd(replica, &["CLUSTER", "REPLICATE", &victim_id]),
+        "+OK\r\n"
+    );
+
+    // Keys in the victim's slots, written on the victim's shard ports.
+    let keys: Vec<String> = (0..2000)
+        .map(|i| format!("fo_{i}"))
+        .filter(|k| rudis::router::key_slot(k.as_bytes()) >= 10923)
+        .take(100)
+        .collect();
+    for k in &keys {
+        let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2);
+        assert_eq!(cmd(ports[2] + shard as u16, &["SET", k, "v"]), "+OK\r\n");
+    }
+    wait_until("replica has the victim's keys", &mut || {
+        let n = cmd(replica, &["DBSIZE"]);
+        (n != format!(":{}\r\n", keys.len())).then_some(n)
+    });
+
+    servers[2] = None; // SIGKILL
+    let started = std::time::Instant::now();
+    wait_until("both masters see the victim FAIL", &mut || {
+        // The survivors keep answering while they judge the failure.
+        let views: Vec<String> = [ports[0], ports[1]]
+            .iter()
+            .map(|p| {
+                assert_eq!(cmd(*p, &["PING"]), "+PONG\r\n", "master {p} stuck");
+                cmd(*p, &["CLUSTER", "NODES"])
+            })
+            .collect();
+        let failed = |v: &String| {
+            v.lines()
+                .any(|l| l.starts_with(&victim_id) && l.contains(" master,fail "))
+        };
+        (!views.iter().all(failed)).then(|| views.join("\n"))
+    });
+    eprintln!("FAIL agreed after {:?}", started.elapsed());
+    for p in [ports[0], ports[1]] {
+        assert_eq!(cmd(p, &["PING"]), "+PONG\r\n", "master {p} stuck");
+    }
+
+    drop(servers);
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
 }
