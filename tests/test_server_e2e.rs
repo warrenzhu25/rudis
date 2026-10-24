@@ -33599,3 +33599,101 @@ fn test_cluster_second_replica_follows_the_promoted_one_e2e() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Client commands redirected (MOVED) by a node, while its own slots keep
+/// changing (DELSLOTS/ADDSLOTS) and its cluster bus judges and claims slots:
+/// the node must stay responsive (no lock-order cycle between the slot
+/// check, slot writers and the bus).
+#[test]
+fn test_cluster_moved_checks_race_slot_changes_e2e() {
+    let (a, b) = (18195u16, 18201u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_lockorder_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "2",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (da, db) = (mk_dir(a), mk_dir(b));
+    let _na = spawn(a, &da);
+    let _nb = spawn(b, &db);
+    let cmd = |p: u16, args: &[&str]| {
+        let mut c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd(&mut c, args)
+    };
+    assert_eq!(
+        cmd(a, &["CLUSTER", "DELSLOTSRANGE", "8192", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["CLUSTER", "DELSLOTSRANGE", "0", "8191"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let foreign: Vec<String> = (0..5000)
+        .map(|i| format!("lo_{i}"))
+        .filter(|k| rudis::router::key_slot(k.as_bytes()) >= 8192)
+        .take(64)
+        .collect();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut workers = Vec::new();
+    for shard in 0..2u16 {
+        let (stop, foreign) = (stop.clone(), foreign.clone());
+        workers.push(thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", a + shard)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for k in &foreign {
+                    let r = resp_cmd(&mut c, &["GET", k]);
+                    assert!(
+                        r.starts_with("-MOVED") || r.starts_with("-CLUSTERDOWN"),
+                        "{r}"
+                    );
+                }
+            }
+        }));
+    }
+    let flipper = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", a)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                assert_eq!(resp_cmd(&mut c, &["CLUSTER", "DELSLOTS", "100"]), "+OK\r\n");
+                assert_eq!(resp_cmd(&mut c, &["CLUSTER", "ADDSLOTS", "100"]), "+OK\r\n");
+            }
+        })
+    };
+    let until = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < until {
+        assert_eq!(cmd(a, &["PING"]), "+PONG\r\n");
+        assert!(cmd(a, &["CLUSTER", "NODES"]).contains("myself"));
+        thread::sleep(Duration::from_millis(100));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in workers {
+        w.join().unwrap();
+    }
+    flipper.join().unwrap();
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}

@@ -10800,8 +10800,9 @@ async fn execute_command_inner(
             crate::shard::SlotState::Stable => {
                 if router.cluster_enabled || crate::cluster::has_active_cluster(router.base_port) {
                     let hub = crate::cluster::get_cluster_hub(router.base_port);
-                    let my_slots = hub.my_slots.read();
-                    let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
+                    // Never hold `my_slots` while taking `nodes` below: the
+                    // cluster bus takes them the other way round.
+                    let owns_slot = hub.owns_slot(slot);
                     if owns_slot {
                         if router.cluster_enabled {
                             let target_shard = router.target_shard_for_slot(slot);

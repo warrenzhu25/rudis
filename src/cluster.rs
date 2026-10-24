@@ -281,6 +281,14 @@ impl ClusterHub {
         }
     }
 
+    /// Whether this node serves `slot`.
+    pub fn owns_slot(&self, slot: u16) -> bool {
+        self.my_slots
+            .read()
+            .iter()
+            .any(|&(s, e)| slot >= s && slot <= e)
+    }
+
     /// The master this node was demoted to replicate, once (see `follow`).
     pub fn take_follow(&self) -> Option<(String, u16)> {
         self.follow.lock().take()
@@ -2572,9 +2580,10 @@ fn random_below(n: u64) -> u64 {
 }
 
 /// Masters that must agree before a node is FAIL: a majority of the
-/// masters serving slots (this node included when it is one).
-fn failure_quorum(hub: &ClusterHub, nodes: &HashMap<String, ClusterNodeInfo>) -> usize {
-    let me = usize::from(*hub.role.read() == "master" && !hub.my_slots.read().is_empty());
+/// masters serving slots, `me` included when this node is one. (Read
+/// before taking `nodes`: never take `my_slots` under it.)
+fn failure_quorum(me_serves: bool, nodes: &HashMap<String, ClusterNodeInfo>) -> usize {
+    let me = usize::from(me_serves);
     let masters = nodes
         .values()
         .filter(|n| n.is_master() && !n.slots.is_empty())
@@ -2621,13 +2630,14 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         .unwrap_or_default()
         .as_millis() as u64;
 
+    let me_serves = *hub.role.read() == "master" && !hub.my_slots.read().is_empty();
     let (peers, quorum): (Vec<(String, String, u16, u16)>, usize) = {
         let nodes = hub.nodes.read();
         let p = nodes
             .values()
             .map(|n| (n.id.clone(), n.ip.clone(), n.port, n.cport))
             .collect();
-        (p, failure_quorum(hub, &nodes))
+        (p, failure_quorum(me_serves, &nodes))
     };
 
     // Prepare gossip payload of all known nodes
@@ -2965,6 +2975,30 @@ mod tests {
     }
 
     #[test]
+    fn test_bus_tick_never_waits_on_my_slots_holding_nodes() {
+        // Client commands check `my_slots`, then read `nodes` (MOVED). If
+        // the tick held `nodes` while waiting for `my_slots`, a writer on
+        // each (ADDSLOTS, a slot claim) could close a cycle and hang the
+        // node. Hold `my_slots` for writing: a tick must block on it
+        // without holding `nodes`.
+        let hub = Arc::new(ClusterHub::new(7800));
+        let guard = hub.my_slots.write();
+        let ticking = hub.clone();
+        let tick = std::thread::spawn(move || cluster_bus_tick(&ticking));
+        std::thread::sleep(Duration::from_millis(100));
+        let nodes_free = hub
+            .nodes
+            .try_write_for(Duration::from_millis(500))
+            .is_some();
+        drop(guard);
+        tick.join().unwrap();
+        assert!(
+            nodes_free,
+            "the tick held `nodes` while waiting for `my_slots`"
+        );
+    }
+
+    #[test]
     fn test_gossiped_node_takes_its_slots_from_its_pongs() {
         // A node first heard of through gossip must accept its own PONGs,
         // even at epoch 0 (a fresh node), or its slots stay unknown here.
@@ -3114,7 +3148,7 @@ mod tests {
         }
 
         // Masters serving slots: hub(7000) + node2 + node3 = 3, quorum 2.
-        let quorum = failure_quorum(&hub, &hub.nodes.read());
+        let quorum = failure_quorum(true, &hub.nodes.read());
         assert_eq!(quorum, 2);
         let node2_line = |hub: &ClusterHub| {
             hub.cluster_nodes()
