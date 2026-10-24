@@ -294,6 +294,11 @@ impl ClusterHub {
     /// slots this way (it was failed over while down or cut off) becomes a
     /// replica of the claimant, so two nodes never serve the same slots.
     pub fn claim_slots(&self, id: &str, epoch: Option<u64>, slots: Vec<(u16, u16)>) {
+        // Like Redis's currentEpoch: the highest epoch seen anywhere, so an
+        // epoch we pick next (failover, election) outranks every claim.
+        if let Some(e) = epoch {
+            self.current_epoch.fetch_max(e, Ordering::SeqCst);
+        }
         // Our own state first: never take `my_slots` under `nodes`.
         let my_epoch = self.config_epoch.load(Ordering::SeqCst);
         let my_slots = self.my_slots.read().clone();
@@ -2788,6 +2793,23 @@ mod tests {
         assert!(took < Duration::from_millis(2000), "tick took {took:?}");
         assert!(hub.nodes.read()[&fast_id].pong_recv > 0);
         drop(silent);
+    }
+
+    #[test]
+    fn test_failover_epoch_outranks_every_epoch_seen() {
+        // A replica of a master promoted at epoch 5 elsewhere: its manual
+        // failover must pick an epoch above 5, or the tie leaves the slots
+        // with the current owner and the replica a master of nothing.
+        let hub = ClusterHub::new(7600);
+        hub.my_slots.write().clear();
+        let owner = "o".repeat(40);
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7601 {owner} 0"), &hub);
+        handle_cluster_bus_line(&format!("PING {owner} 5 master 0-5460"), &hub);
+        assert!(hub.current_epoch.load(Ordering::SeqCst) >= 5);
+        hub.cluster_replicate(&owner).unwrap();
+        hub.cluster_failover(false).unwrap();
+        assert!(hub.config_epoch.load(Ordering::SeqCst) > 5);
+        assert_eq!(*hub.my_slots.read(), vec![(0, 5460)]);
     }
 
     #[test]

@@ -33169,6 +33169,28 @@ fn test_cluster_master_failure_promotes_its_replica_e2e() {
     });
     assert_eq!(cmd(replica + shard as u16, &["GET", k]), "$1\r\nv\r\n");
 
+    // A manual failover back: the old master takes its slots over again
+    // (at an epoch above the one it lost them at), and the node promoted
+    // in its place becomes its replica.
+    assert_eq!(cmd(ports[2], &["CLUSTER", "FAILOVER"]), "+OK\r\n");
+    wait_until("manual failover back", &mut || {
+        let back = cmd(ports[2], &["CLUSTER", "NODES"]);
+        let me = back
+            .lines()
+            .find(|l| l.contains("myself"))
+            .unwrap_or_default();
+        let other = cmd(replica, &["CLUSTER", "NODES"]);
+        let them = other
+            .lines()
+            .find(|l| l.contains("myself"))
+            .unwrap_or_default();
+        (!(me.contains("myself,master")
+            && me.ends_with(" 10923-16383")
+            && them.contains("myself,slave")))
+        .then(|| format!("{back}\n{other}"))
+    });
+    assert_eq!(cmd(ports[2] + shard as u16, &["SET", k, "back"]), "+OK\r\n");
+
     drop(servers);
     for d in &dirs {
         let _ = std::fs::remove_dir_all(d);
