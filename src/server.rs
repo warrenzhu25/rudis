@@ -2338,6 +2338,26 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             crate::replication::start_replica_sync(router.base_port, host, mport, (*router).clone());
         }
 
+        // 4.76 A cluster master that lost all its slots to a newer master
+        // (failed over while it was down) replicates that master.
+        if shard_id == 0 && cluster_enabled {
+            let r = router.clone();
+            monoio::spawn(async move {
+                let hub = crate::cluster::get_cluster_hub(r.base_port);
+                while !crate::shutdown::is_shutting_down() {
+                    monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let Some((host, mport)) = hub.take_follow() else {
+                        continue;
+                    };
+                    let repl = crate::replication::get_replication_hub(r.base_port);
+                    if !repl.is_replicating_from(&host, mport) {
+                        crate::log_notice!("Cluster: replicating my new master {}:{}", host, mport);
+                        crate::replication::start_replica_sync(r.base_port, host, mport, (*r).clone());
+                    }
+                }
+            });
+        }
+
         // 4.8 `save <secs> <changes>` schedule (Redis serverCron).
         if shard_id == 0 {
             let r = router.clone();

@@ -32930,13 +32930,35 @@ fn test_cluster_replicate_copies_the_masters_data_e2e() {
         Box::new(|| dbsize_is(&mut r0, 500)),
     );
 
-    // Failover: the promoted node stops following the old master.
+    // Failover: the promoted node stops following the old master and takes
+    // its slots; like Redis, the old master then replicates it.
     assert_eq!(resp_cmd(&mut r0, &["CLUSTER", "FAILOVER"]), "+OK\r\n");
     let info = resp_cmd(&mut r0, &["INFO", "replication"]);
     assert!(info.contains("role:master"), "{info}");
-    write(500, 600);
-    thread::sleep(Duration::from_millis(500));
-    assert_eq!(resp_cmd(&mut r0, &["DBSIZE"]), ":500\r\n");
+    let new_id = bulk(resp_cmd(&mut r0, &["CLUSTER", "MYID"]));
+    wait_until(
+        "old master follows the promoted node",
+        Box::new(|| {
+            let nodes = resp_cmd(&mut conn(mport), &["CLUSTER", "NODES"]);
+            let me = nodes
+                .lines()
+                .find(|l| l.contains("myself"))
+                .unwrap_or_default();
+            (!(me.contains("myself,slave") && me.contains(&new_id))).then_some(nodes)
+        }),
+    );
+    let k = "cr_after_failover";
+    let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2);
+    let moved = resp_cmd(&mut conn(mport + shard as u16), &["SET", k, "v"]);
+    assert!(moved.starts_with("-MOVED"), "{moved}");
+    assert_eq!(
+        resp_cmd(&mut conn(rport + shard as u16), &["SET", k, "v"]),
+        "+OK\r\n"
+    );
+    wait_until(
+        "old master replicates the promoted node",
+        Box::new(|| dbsize_is(&mut conn(mport), 501)),
+    );
     drop(r_srv);
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&rdir);
@@ -32944,7 +32966,9 @@ fn test_cluster_replicate_copies_the_masters_data_e2e() {
 
 /// Killing a master of a 3-master cluster: the survivors agree it failed
 /// (FAIL, keeping its role and slots) and stay responsive throughout, and
-/// its replica takes over its slots with the data it replicated.
+/// its replica takes over its slots with the data it replicated. When the
+/// old master comes back it yields the slots to the newer owner and
+/// replicates it, instead of serving them too.
 #[test]
 fn test_cluster_master_failure_promotes_its_replica_e2e() {
     let ports = [18093u16, 18099, 18105, 18111];
@@ -33088,6 +33112,53 @@ fn test_cluster_master_failure_promotes_its_replica_e2e() {
             .all(|p| slot_owner_is_replica(*p)))
         .then(|| cmd(ports[0], &["CLUSTER", "SLOTS"]))
     });
+
+    // The old master returns: nodes.conf still says it serves
+    // 10923-16383, at an older epoch.
+    servers[2] = Some(ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &ports[2].to_string(),
+            "--dir",
+            &dirs[2],
+            "--cluster-enabled",
+            "yes",
+            "--threads",
+            "2",
+            "--no-pin",
+        ],
+        ports[2],
+    )));
+    let new_master_id = bulk(cmd(replica, &["CLUSTER", "MYID"]));
+    wait_until(
+        "old master rejoins as a replica of the new one",
+        &mut || {
+            let nodes = cmd(ports[2], &["CLUSTER", "NODES"]);
+            let me = nodes
+                .lines()
+                .find(|l| l.contains("myself"))
+                .unwrap_or_default();
+            (!(me.contains("myself,slave") && me.contains(&new_master_id))).then_some(nodes)
+        },
+    );
+    let k = &keys[1];
+    let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2);
+    let moved = cmd(ports[2] + shard as u16, &["SET", k, "split"]);
+    assert!(
+        moved.starts_with("-MOVED"),
+        "old master still serves: {moved}"
+    );
+    wait_until("old master replicates the new master", &mut || {
+        let info = cmd(ports[2], &["INFO", "replication"]);
+        let want = format!("master_port:{replica}");
+        (!(info.contains(&want) && info.contains("master_link_status:up"))).then_some(info)
+    });
+    let n = cmd(replica, &["DBSIZE"]);
+    wait_until("old master holds the new master's dataset", &mut || {
+        let got = cmd(ports[2], &["DBSIZE"]);
+        (got != n).then_some(got)
+    });
+    assert_eq!(cmd(replica + shard as u16, &["GET", k]), "$1\r\nv\r\n");
 
     drop(servers);
     for d in &dirs {

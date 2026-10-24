@@ -181,6 +181,10 @@ pub struct ClusterHub {
     pub cluster_enabled: AtomicBool,
     pub num_shards: std::sync::atomic::AtomicUsize,
     pub config_file: RwLock<Option<std::path::PathBuf>>,
+    /// Master this node must start replicating, set when it lost all its
+    /// slots to a newer claimant; the shards' runtime picks it up (see
+    /// `take_follow`).
+    pub follow: parking_lot::Mutex<Option<(String, u16)>>,
 }
 
 pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
@@ -273,7 +277,102 @@ impl ClusterHub {
             cluster_enabled: AtomicBool::new(false),
             num_shards: std::sync::atomic::AtomicUsize::new(1),
             config_file: RwLock::new(None),
+            follow: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// The master this node was demoted to replicate, once (see `follow`).
+    pub fn take_follow(&self) -> Option<(String, u16)> {
+        self.follow.lock().take()
+    }
+
+    /// Records that `id` serves `slots` at config `epoch`, as its PING or
+    /// PONG says. Each slot belongs to the claimant with the highest config
+    /// epoch (Redis's `clusterUpdateSlotsConfigWith`): older claims by
+    /// other nodes give way, as do ours, and a claim older than a slot's
+    /// current owner is ignored for that slot. A master that loses all its
+    /// slots this way (it was failed over while down or cut off) becomes a
+    /// replica of the claimant, so two nodes never serve the same slots.
+    pub fn claim_slots(&self, id: &str, epoch: Option<u64>, slots: Vec<(u16, u16)>) {
+        // Our own state first: never take `my_slots` under `nodes`.
+        let my_epoch = self.config_epoch.load(Ordering::SeqCst);
+        let my_slots = self.my_slots.read().clone();
+        let owns =
+            |ranges: &[(u16, u16)], slot: u16| ranges.iter().any(|&(s, e)| slot >= s && slot <= e);
+        let mut lost: Vec<u16> = Vec::new();
+        let master_addr = {
+            let mut nodes = self.nodes.write();
+            let Some(node) = nodes.get(id) else {
+                return;
+            };
+            let epoch = match epoch {
+                Some(e) if e < node.config_epoch => return,
+                Some(e) => e,
+                None => node.config_epoch,
+            };
+            // Slots someone else holds at this claim's epoch or newer: on
+            // a tie the current holder keeps them, so a slot never has two
+            // owners.
+            let mut newer = vec![false; 16384];
+            let mut mark = |ranges: &[(u16, u16)]| {
+                for &(s, e) in ranges {
+                    newer[s as usize..=e as usize].fill(true);
+                }
+            };
+            for (other, n) in nodes.iter() {
+                if other != id && n.config_epoch >= epoch {
+                    mark(&n.slots);
+                }
+            }
+            if my_epoch >= epoch {
+                mark(&my_slots);
+            }
+            let accepted: Vec<u16> = slots
+                .iter()
+                .flat_map(|&(s, e)| s..=e)
+                .filter(|&slot| !newer[slot as usize])
+                .collect();
+            for (other, n) in nodes.iter_mut() {
+                if other != id && n.config_epoch < epoch {
+                    remove_slots(&mut n.slots, &accepted);
+                }
+            }
+            if my_epoch < epoch {
+                lost = accepted
+                    .iter()
+                    .copied()
+                    .filter(|&s| owns(&my_slots, s))
+                    .collect();
+            }
+            let node = nodes.get_mut(id).expect("checked above");
+            node.config_epoch = epoch;
+            let mut ranges: Vec<(u16, u16)> = accepted.iter().map(|&s| (s, s)).collect();
+            compact_slots(&mut ranges);
+            node.slots = ranges;
+            (node.ip.clone(), node.port)
+        };
+        if lost.is_empty() {
+            return;
+        }
+        let emptied = {
+            let mut mine = self.my_slots.write();
+            remove_slots(&mut mine, &lost);
+            mine.is_empty()
+        };
+        crate::log_warning!(
+            "Cluster: {} slots now belong to {} (config epoch {:?} > ours {})",
+            lost.len(),
+            id,
+            epoch,
+            my_epoch
+        );
+        if emptied && *self.role.read() == "master" {
+            crate::log_warning!("Cluster: lost all my slots to {}: becoming its replica", id);
+            *self.role.write() = "slave".to_string();
+            *self.master_id.write() = id.to_string();
+            *self.follow.lock() = Some(master_addr);
+        }
+        let _ = self.save_config();
     }
 
     pub fn set_config_file(&self, path: std::path::PathBuf) {
@@ -560,24 +659,29 @@ impl ClusterHub {
         let parts: Vec<&str> = resp.split_whitespace().collect();
         let epoch = parts.get(2).and_then(|v| v.parse::<u64>().ok());
         let slots = parts.get(4).map_or_else(Vec::new, |r| parse_slot_ranges(r));
-        let mut nodes = self.nodes.write();
         let mut key = node_id;
-        // A MEET whose handshake reply was lost leaves the peer under a
-        // placeholder id; its PONG names it, so move the entry to the real id.
-        if let Some(&real_id) = parts.get(1)
-            && real_id != node_id
         {
-            if let Some(mut node) = nodes.remove(node_id)
-                && !nodes.contains_key(real_id)
+            let mut nodes = self.nodes.write();
+            // A MEET whose handshake reply was lost leaves the peer under a
+            // placeholder id; its PONG names it, so move the entry to the real id.
+            if let Some(&real_id) = parts.get(1)
+                && real_id != node_id
             {
-                node.id = real_id.to_string();
-                nodes.insert(real_id.to_string(), node);
+                if let Some(mut node) = nodes.remove(node_id)
+                    && !nodes.contains_key(real_id)
+                {
+                    node.id = real_id.to_string();
+                    nodes.insert(real_id.to_string(), node);
+                }
+                key = real_id;
             }
-            key = real_id;
+            if let Some(node) = nodes.get_mut(key)
+                && let Some(role) = parts.get(3)
+            {
+                node.flags = parse_flags(role).0;
+            }
         }
-        if let Some(node) = nodes.get_mut(key) {
-            apply_peer_slots(node, epoch, slots);
-        }
+        self.claim_slots(key, epoch, slots);
         true
     }
 
@@ -1965,23 +2069,6 @@ fn slots_repr(slots: &[(u16, u16)]) -> String {
         .join(",")
 }
 
-/// Applies a peer's own announcement of its slots and config epoch.
-///
-/// An announcement older than the last one applied (lower epoch) is stale:
-/// it was built before a migration the peer has since taken part in, so it
-/// must not undo the newer assignment.
-fn apply_peer_slots(node: &mut ClusterNodeInfo, epoch: Option<u64>, slots: Vec<(u16, u16)>) {
-    if let Some(epoch) = epoch {
-        if epoch < node.config_epoch {
-            return;
-        }
-        node.config_epoch = epoch;
-    }
-    if !slots.is_empty() {
-        node.slots = slots;
-    }
-}
-
 pub fn compact_slots(slots: &mut Vec<(u16, u16)>) {
     if slots.is_empty() {
         return;
@@ -2196,10 +2283,14 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                 if !nodes.contains_key(&peer_id) && nodes.len() >= MAX_CLUSTER_NODES {
                     return Some("-ERR too many cluster nodes\r\n".to_string());
                 }
+                // What we knew of it stays until its claim is weighed below.
+                let (known_epoch, known_slots) = nodes
+                    .get(&peer_id)
+                    .map_or((0, Vec::new()), |n| (n.config_epoch, n.slots.clone()));
                 nodes.insert(
                     peer_id.clone(),
                     ClusterNodeInfo {
-                        id: peer_id,
+                        id: peer_id.clone(),
                         ip: peer_ip,
                         port: peer_port,
                         cport: peer_cport,
@@ -2208,12 +2299,13 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                         master_id: "-".to_string(),
                         ping_sent: now,
                         pong_recv: now,
-                        config_epoch: peer_epoch,
+                        config_epoch: known_epoch,
                         link_state: "connected".to_string(),
-                        slots: peer_slots,
+                        slots: known_slots,
                     },
                 );
             }
+            hub.claim_slots(&peer_id, Some(peer_epoch), peer_slots);
 
             // Respond PONG
             Some(pong_reply(hub))
@@ -2236,11 +2328,15 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                     if parts.len() >= 4 {
                         node.flags = parse_flags(parts[3]).0;
                     }
-                    if parts.len() >= 5 {
-                        let epoch = parts[2].parse::<u64>().ok();
-                        apply_peer_slots(node, epoch, parse_slot_ranges(parts[4]));
-                    }
                 }
+            }
+            if parts.len() >= 4 {
+                // No slot list (the next field is GOSSIP or nothing): none.
+                let slots = parts
+                    .get(4)
+                    .filter(|f| **f != "GOSSIP")
+                    .map_or_else(Vec::new, |r| parse_slot_ranges(r));
+                hub.claim_slots(&peer_id, parts[2].parse::<u64>().ok(), slots);
             }
 
             // Parse gossip section if present
@@ -2327,16 +2423,12 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             let master_id = parts[1].to_string();
             let epoch: u64 = parts[2].parse().unwrap_or(1);
             let peer_slots = parts.get(3).map_or_else(Vec::new, |r| parse_slot_ranges(r));
-            let mut nodes = hub.nodes.write();
-            if let Some(node) = nodes.get_mut(&master_id) {
+            if let Some(node) = hub.nodes.write().get_mut(&master_id) {
                 node.flags = "master".to_string();
                 node.fail = FailState::Ok;
                 node.master_id = "-".to_string();
-                node.config_epoch = epoch;
-                if !peer_slots.is_empty() {
-                    node.slots = peer_slots;
-                }
             }
+            hub.claim_slots(&master_id, Some(epoch), peer_slots);
             Some("+OK\r\n".to_string())
         }
         "FAILOVER_AUTH_REQUEST" => {
@@ -2375,29 +2467,13 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             let new_master_id = parts[1].to_string();
             let epoch: u64 = parts[2].parse().unwrap_or(1);
             let peer_slots = parts.get(3).map_or_else(Vec::new, |r| parse_slot_ranges(r));
-            let mut nodes = hub.nodes.write();
-            if let Some(node) = nodes.get_mut(&new_master_id) {
+            if let Some(node) = hub.nodes.write().get_mut(&new_master_id) {
                 node.flags = "master".to_string();
                 node.fail = FailState::Ok;
                 node.master_id = "-".to_string();
-                node.config_epoch = epoch;
-                if !peer_slots.is_empty() {
-                    node.slots = peer_slots.clone();
-                }
             }
-            if !peer_slots.is_empty() {
-                let mut to_remove = Vec::new();
-                for &(s, e) in &peer_slots {
-                    for slot in s..=e {
-                        to_remove.push(slot);
-                    }
-                }
-                for (other_id, other_node) in nodes.iter_mut() {
-                    if other_id != &new_master_id {
-                        remove_slots(&mut other_node.slots, &to_remove);
-                    }
-                }
-            }
+            // Older claims (the failed master's, everywhere) give way.
+            hub.claim_slots(&new_master_id, Some(epoch), peer_slots);
             Some("+OK\r\n".to_string())
         }
         _ => Some("-ERR unknown clusterbus command\r\n".to_string()),
@@ -2586,10 +2662,60 @@ mod tests {
     }
 
     #[test]
+    fn test_newer_claim_takes_slots_and_demotes_an_emptied_master() {
+        let peer = |id: &str, port: u16, epoch: u64| ClusterNodeInfo {
+            id: id.to_string(),
+            ip: "127.0.0.1".to_string(),
+            port,
+            cport: port + 10000,
+            flags: "master".to_string(),
+            fail: FailState::Ok,
+            master_id: "-".to_string(),
+            ping_sent: 0,
+            pong_recv: 0,
+            config_epoch: epoch,
+            link_state: "connected".to_string(),
+            slots: Vec::new(),
+        };
+        // We are the old master of 10923-16383 at epoch 0, back after a
+        // failover promoted `new` at epoch 2.
+        let hub = ClusterHub::new(7300);
+        *hub.my_slots.write() = vec![(10923, 16383)];
+        let new = "n".repeat(40);
+        let other = "o".repeat(40);
+        hub.nodes.write().insert(new.clone(), peer(&new, 7301, 0));
+        hub.nodes
+            .write()
+            .insert(other.clone(), peer(&other, 7302, 0));
+
+        // A claim no newer than ours takes nothing from us.
+        hub.claim_slots(&other, Some(0), vec![(10923, 16383)]);
+        assert_eq!(*hub.my_slots.read(), vec![(10923, 16383)]);
+        assert!(hub.nodes.read()[&other].slots.is_empty());
+
+        // The promoted replica's newer claim wins: we lose the slots and
+        // follow it, so the slots are never served twice.
+        hub.claim_slots(&new, Some(2), vec![(10923, 16383)]);
+        assert!(hub.my_slots.read().is_empty());
+        assert_eq!(hub.nodes.read()[&new].slots, vec![(10923, 16383)]);
+        assert_eq!(*hub.role.read(), "slave");
+        assert_eq!(*hub.master_id.read(), new);
+        assert_eq!(hub.take_follow(), Some(("127.0.0.1".to_string(), 7301)));
+        assert_eq!(hub.take_follow(), None);
+
+        // A stale claim (another node still announcing the old epoch)
+        // doesn't take the slots back from the newer owner.
+        hub.claim_slots(&other, Some(1), vec![(10923, 16383)]);
+        assert!(hub.nodes.read()[&other].slots.is_empty());
+        assert_eq!(hub.nodes.read()[&new].slots, vec![(10923, 16383)]);
+    }
+
+    #[test]
     fn test_gossiped_node_takes_its_slots_from_its_pongs() {
         // A node first heard of through gossip must accept its own PONGs,
         // even at epoch 0 (a fresh node), or its slots stay unknown here.
         let hub = ClusterHub::new(7200);
+        hub.my_slots.write().clear();
         let sender = "s".repeat(40);
         let fresh = "f".repeat(40);
         handle_cluster_bus_line(&format!("MEET 127.0.0.1 7201 {sender} 1 0-5460"), &hub);
