@@ -3361,6 +3361,15 @@ pub fn apply_config_value(
                 .announce_port
                 .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
         }
+        "cluster-node-timeout" => {
+            let ms: u64 = parse_config_num(name, val_str)?;
+            if ms == 0 {
+                return Err("cluster-node-timeout must be positive".to_string());
+            }
+            crate::cluster::get_cluster_hub(base_port)
+                .node_timeout_ms
+                .store(ms, Ordering::Relaxed);
+        }
         "cluster-config-file" => {
             if val_str.is_empty() {
                 return Err("Invalid cluster-config-file".to_string());
@@ -3616,7 +3625,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
-    let all_configs: [(&str, String); 94] = [
+    let all_configs: [(&str, String); 95] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
@@ -3625,6 +3634,13 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         (
             "cluster-config-file",
             crate::cluster::get_cluster_hub(router.base_port).config_file_name(),
+        ),
+        (
+            "cluster-node-timeout",
+            crate::cluster::get_cluster_hub(router.base_port)
+                .node_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
         ),
         ("acllog-max-len", acllog_max_len),
         ("acl-pubsub-default", acl_pubsub_default),

@@ -34040,3 +34040,111 @@ fn test_cluster_replica_serves_readonly_reads_e2e() {
     let _ = std::fs::remove_dir_all(&md);
     let _ = std::fs::remove_dir_all(&rd);
 }
+
+/// `cluster-node-timeout` sets how fast a dead master is failed over: at
+/// 1 s its replica takes over in well under the default's 5 s.
+#[test]
+fn test_cluster_node_timeout_is_configurable_e2e() {
+    let ports = [18249u16, 18255, 18261, 18267];
+    let ranges = [(0, 5460), (5461, 10922), (10923, 16383)];
+    let dirs: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            let d = std::env::temp_dir().join(format!("rudis_nto_{}_{}", p, std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d.to_str().unwrap().to_string()
+        })
+        .collect();
+    let mut servers: Vec<Option<ServerGuard>> = ports
+        .iter()
+        .zip(&dirs)
+        .map(|(p, d)| {
+            Some(ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    d,
+                    "--cluster-enabled",
+                    "yes",
+                    "--cluster-node-timeout",
+                    "1000",
+                    "--threads",
+                    "2",
+                    "--no-pin",
+                ],
+                *p,
+            )))
+        })
+        .collect();
+    let cmd = |p: u16, args: &[&str]| {
+        let mut c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd(&mut c, args)
+    };
+    assert_eq!(
+        cmd(ports[0], &["CONFIG", "GET", "cluster-node-timeout"]),
+        "*2\r\n$20\r\ncluster-node-timeout\r\n$4\r\n1000\r\n"
+    );
+    for p in ports {
+        assert_eq!(
+            cmd(p, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+            "+OK\r\n"
+        );
+    }
+    for (p, (s, e)) in ports.iter().zip(ranges) {
+        let (s, e) = (s.to_string(), e.to_string());
+        assert_eq!(cmd(*p, &["CLUSTER", "ADDSLOTSRANGE", &s, &e]), "+OK\r\n");
+    }
+    for p in &ports[1..] {
+        assert_eq!(
+            cmd(ports[0], &["CLUSTER", "MEET", "127.0.0.1", &p.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    let victim_id = cmd(ports[2], &["CLUSTER", "MYID"])
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(ports[3], &["CLUSTER", "NODES"]).contains(&victim_id) {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        cmd(ports[3], &["CLUSTER", "REPLICATE", &victim_id]),
+        "+OK\r\n"
+    );
+    wait_for_slot_views(&ports);
+    while !cmd(ports[3], &["INFO", "replication"]).contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(50));
+    }
+    servers[2] = None; // SIGKILL
+    let started = std::time::Instant::now();
+    loop {
+        let nodes = cmd(ports[3], &["CLUSTER", "NODES"]);
+        let me = nodes
+            .lines()
+            .find(|l| l.contains("myself"))
+            .unwrap_or_default()
+            .to_string();
+        if me.contains("master") && me.ends_with(" 10923-16383") {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(15), "{nodes}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("promoted after {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(servers);
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

@@ -18,7 +18,7 @@ pub enum FailState {
     Fail,
 }
 
-/// Node timeout: a peer silent this long is PFAIL.
+/// Default `cluster-node-timeout`: a peer silent this long is PFAIL.
 pub const NODE_TIMEOUT_MS: u64 = 5000;
 
 #[derive(Clone, Debug)]
@@ -185,6 +185,9 @@ pub struct ClusterHub {
     /// slots to a newer claimant; the shards' runtime picks it up (see
     /// `take_follow`).
     pub follow: parking_lot::Mutex<Option<(String, u16)>>,
+    /// `cluster-node-timeout` (ms): a peer silent this long is PFAIL, and
+    /// failover starts about this long after a master dies.
+    pub node_timeout_ms: AtomicU64,
 }
 
 pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
@@ -278,6 +281,7 @@ impl ClusterHub {
             num_shards: std::sync::atomic::AtomicUsize::new(1),
             config_file: RwLock::new(None),
             follow: parking_lot::Mutex::new(None),
+            node_timeout_ms: AtomicU64::new(NODE_TIMEOUT_MS),
         }
     }
 
@@ -2620,7 +2624,8 @@ fn note_unreachable(hub: &ClusterHub, id: &str, now: u64, quorum: usize) {
     let me = usize::from(*hub.role.read() == "master");
     let mut broadcast = false;
     if let Some(node) = hub.nodes.write().get_mut(id) {
-        if now.saturating_sub(node.pong_recv) <= NODE_TIMEOUT_MS || node.fail == FailState::Fail {
+        let timeout = hub.node_timeout_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(node.pong_recv) <= timeout || node.fail == FailState::Fail {
             return;
         }
         if reports + me >= quorum {
@@ -3021,6 +3026,21 @@ mod tests {
         hub.cluster_replicate(&m).unwrap();
         assert!(hub.replicates_slot(100));
         assert!(!hub.replicates_slot(5461));
+    }
+
+    #[test]
+    fn test_pfail_follows_the_configured_node_timeout() {
+        let hub = ClusterHub::new(7950);
+        hub.node_timeout_ms.store(1000, Ordering::Relaxed);
+        let now = now_ms();
+        for (id, silent) in [("a", 1200u64), ("b", 800)] {
+            let id = id.repeat(40);
+            handle_cluster_bus_line(&format!("MEET 127.0.0.1 7951 {id} 0"), &hub);
+            hub.nodes.write().get_mut(&id).unwrap().pong_recv = now - silent;
+            note_unreachable(&hub, &id, now, 99);
+        }
+        assert_eq!(hub.nodes.read()[&"a".repeat(40)].fail, FailState::PFail);
+        assert_eq!(hub.nodes.read()[&"b".repeat(40)].fail, FailState::Ok);
     }
 
     #[test]
