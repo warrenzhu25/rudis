@@ -34254,3 +34254,45 @@ fn test_cluster_manual_failover_loses_no_acknowledged_write_e2e() {
     let _ = std::fs::remove_dir_all(&md);
     let _ = std::fs::remove_dir_all(&rd);
 }
+
+/// WATCH on a cluster-mode node holds across its shard ports: a FLUSHALL
+/// sent to the base port aborts the EXEC of a client watching on another
+/// shard's port (the EXEC used to go through).
+#[test]
+fn test_cluster_watch_sees_flushall_from_another_port_e2e() {
+    let port = 18285u16;
+    let dir = std::env::temp_dir().join(format!("rudis_cl_watch_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _srv = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &port.to_string(),
+            "--dir",
+            dir.to_str().unwrap(),
+            "--cluster-enabled",
+            "yes",
+            "--threads",
+            "2",
+            "--no-pin",
+        ],
+        port,
+    ));
+    let conn = |p: u16| {
+        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let k = (0..1000)
+        .map(|i| format!("w{i}"))
+        .find(|k| rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2) == 1)
+        .unwrap();
+    let mut w = conn(port + 1);
+    assert_eq!(resp_cmd(&mut w, &["SET", &k, "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut w, &["WATCH", &k]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut conn(port), &["FLUSHALL"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut w, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut w, &["SET", &k, "2"]), "+QUEUED\r\n");
+    assert_eq!(resp_cmd(&mut w, &["EXEC"]), "*-1\r\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}

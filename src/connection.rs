@@ -1831,6 +1831,9 @@ pub fn watch_keys(port: u16, client_id: u64, keys: &[Bytes]) {
     if keys.is_empty() {
         return;
     }
+    // The node's keyspace is watched, whichever shard port a client (or a
+    // FLUSHALL) came in on.
+    let port = node_port(port);
     let db = CURRENT_DB.get();
     let mut map = WATCHED_KEYS.write();
     let port_map = map.entry(port).or_default();
@@ -1855,6 +1858,7 @@ pub fn unwatch_keys(port: u16, client_id: u64) {
     if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let port = node_port(port);
     let mut map = WATCHED_KEYS.write();
     if let Some(port_map) = map.get_mut(&port) {
         // Drop keys nobody watches any more; they used to stay forever.
@@ -1876,6 +1880,7 @@ pub fn is_watch_tainted(port: u16, client_id: u64) -> bool {
     if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
+    let port = node_port(port);
     CLIENT_WATCH_TAINTED
         .read()
         .get(&(port, client_id))
@@ -1895,6 +1900,7 @@ pub fn touch_watched_key_in_db(port: u16, db: usize, key: &[u8]) {
     if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let port = node_port(port);
     let map = WATCHED_KEYS.read();
     if let Some(port_map) = map.get(&port) {
         let mut tainted = None;
@@ -1913,6 +1919,7 @@ pub fn touch_watched_keys_on_swapdb(port: u16, db1: usize, db2: usize) {
     if db1 == db2 || !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let port = node_port(port);
     let map = WATCHED_KEYS.read();
     if let Some(port_map) = map.get(&port) {
         let mut tainted = CLIENT_WATCH_TAINTED.write();
@@ -1930,6 +1937,7 @@ pub fn touch_watched_keys_on_flushdb(port: u16, db: usize) {
     if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let port = node_port(port);
     let map = WATCHED_KEYS.read();
     if let Some(port_map) = map.get(&port) {
         let mut tainted = CLIENT_WATCH_TAINTED.write();
@@ -1947,6 +1955,7 @@ pub fn touch_watched_keys_on_flushall(port: u16) {
     if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let port = node_port(port);
     let map = WATCHED_KEYS.read();
     if let Some(port_map) = map.get(&port) {
         let mut tainted = CLIENT_WATCH_TAINTED.write();
@@ -28999,6 +29008,23 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_watch_is_the_nodes_on_every_shard_port() {
+        // WATCH on a shard port, FLUSHALL (or a write) arriving on the base
+        // port: the watcher's EXEC must fail.
+        let (base, shard) = (41897u16, 41898u16);
+        set_node_port(shard, base);
+        watch_keys(shard, 9_000_002, &[Bytes::from_static(b"wk")]);
+        assert!(!is_watch_tainted(shard, 9_000_002));
+        touch_watched_keys_on_flushall(base);
+        assert!(is_watch_tainted(shard, 9_000_002));
+        unwatch_keys(shard, 9_000_002);
+        watch_keys(shard, 9_000_003, &[Bytes::from_static(b"wk2")]);
+        touch_watched_key_in_db(base, CURRENT_DB.get(), b"wk2");
+        assert!(is_watch_tainted(shard, 9_000_003));
+        unwatch_keys(shard, 9_000_003);
+    }
+
     #[test]
     fn test_monitor_feed_is_the_nodes_on_every_shard_port() {
         // A monitor on the base port gets commands broadcast from a shard
