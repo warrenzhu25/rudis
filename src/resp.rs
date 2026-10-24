@@ -2319,6 +2319,28 @@ pub static PROTO_MAX_BULK_LEN: std::sync::atomic::AtomicUsize =
 /// mostly the value itself.
 pub const DETACH_FRAME_MAX: usize = 64 * 1024;
 
+thread_local! {
+    /// Set while parsing the server's own data (see `parse_command_trusted`).
+    static TRUSTED_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline]
+fn trusted_input() -> bool {
+    TRUSTED_INPUT.with(std::cell::Cell::get)
+}
+
+/// [`parse_command`] for the server's own data: the AOF it replays and the
+/// stream from its master. Like Redis, `proto-max-bulk-len` limits what
+/// clients send, not these: they only hold what was accepted earlier, maybe
+/// under a higher limit, and refusing them left a server unable to load its
+/// own AOF (or follow its master) after the limit was lowered.
+pub fn parse_command_trusted(buf: &mut BytesMut) -> Result<Option<Command>, String> {
+    TRUSTED_INPUT.with(|t| t.set(true));
+    let parsed = parse_command(buf);
+    TRUSTED_INPUT.with(|t| t.set(false));
+    parsed
+}
+
 #[inline(always)]
 pub fn get_proto_max_bulk_len() -> usize {
     PROTO_MAX_BULK_LEN.load(std::sync::atomic::Ordering::Relaxed)
@@ -2397,7 +2419,7 @@ fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Com
             None => return Err("Protocol error: invalid bulk length".to_string()),
         };
 
-        if arg_len > get_proto_max_bulk_len() {
+        if arg_len > get_proto_max_bulk_len() && !trusted_input() {
             return Err("Protocol error: invalid bulk length".to_string());
         }
 
@@ -15760,6 +15782,12 @@ mod tests {
         let mut buf = BytesMut::from("*2\r\n$4\r\nECHO\r\n$6\r\n123456\r\n");
         let err = parse_command(&mut buf).unwrap_err();
         assert!(err.contains("invalid bulk length"));
+        // The server's own data (AOF, master stream) isn't bound by it.
+        let mut buf = BytesMut::from("*2\r\n$4\r\nECHO\r\n$6\r\n123456\r\n");
+        assert!(parse_command_trusted(&mut buf).unwrap().is_some());
+        // ...and the next client parse on this thread is again.
+        let mut buf = BytesMut::from("*2\r\n$4\r\nECHO\r\n$6\r\n123456\r\n");
+        assert!(parse_command(&mut buf).is_err());
         set_proto_max_bulk_len(old);
 
         // XINFO STREAM

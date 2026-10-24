@@ -3569,7 +3569,7 @@ fn replay_aof_inner(path: &Path, db: &mut ShardDb, load_truncated: bool) -> std:
             if buf[0] != b'*' {
                 return Err(bad(offset, "expected a RESP array"));
             }
-            match crate::resp::parse_command(&mut buf) {
+            match crate::resp::parse_command_trusted(&mut buf) {
                 Ok(Some(cmd)) => match cmd {
                     Command::Unknown(ref name) => {
                         return Err(std::io::Error::new(
@@ -3978,7 +3978,7 @@ fn split_rewritten_aof_to_shards(
     let mut buf = BytesMut::from(rewritten);
     while !buf.is_empty() {
         let start = rewritten.len() - buf.len();
-        let cmd = match crate::resp::parse_command(&mut buf) {
+        let cmd = match crate::resp::parse_command_trusted(&mut buf) {
             Ok(Some(cmd)) => cmd,
             _ => return Err(invalid(format!("bad rewritten AOF at offset {}", start))),
         };

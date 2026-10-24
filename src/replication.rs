@@ -3052,7 +3052,7 @@ async fn run_replica_worker(
                 let start_len = buf.len();
                 while !buf.is_empty() {
                     let initial_buf_len = buf.len();
-                    match crate::resp::parse_command(&mut buf) {
+                    match crate::resp::parse_command_trusted(&mut buf) {
                         Ok(Some(cmd)) => {
                             let consumed = initial_buf_len - buf.len();
                             current_offset += consumed as u64;

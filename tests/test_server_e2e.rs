@@ -33728,3 +33728,89 @@ fn test_cluster_moved_checks_race_slot_changes_e2e() {
     let _ = std::fs::remove_dir_all(&da);
     let _ = std::fs::remove_dir_all(&db);
 }
+
+/// `proto-max-bulk-len` limits what clients send, not the server's own
+/// data: a server restarted with a lower limit than values already in its
+/// AOF loads them, and a replica with a low limit follows a master whose
+/// writes exceed it (both used to fail on "invalid bulk length").
+#[test]
+fn test_proto_max_bulk_len_spares_aof_and_master_stream_e2e() {
+    let (port, rport) = (18207u16, 18213u16);
+    let dir = std::env::temp_dir().join(format!("rudis_bulklen_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap().to_string();
+    let ps = port.to_string();
+    let cmd = |p: u16, args: &[&str]| {
+        let mut c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd_full(&mut c, args)
+    };
+    let big = "b".repeat(4096);
+    let base = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &dir_s,
+        "--appendonly",
+        "yes",
+    ];
+    let first = ServerGuard(spawn_rudis_listening(&base, port));
+    assert_eq!(cmd(port, &["SET", "big", &big]), "+OK\r\n");
+    drop(first);
+
+    // Restarted with a limit below the value it holds in its AOF.
+    let mut low = base.to_vec();
+    low.extend(["--proto-max-bulk-len", "1kb"]);
+    let _master = ServerGuard(spawn_rudis_listening(&low, port));
+    assert_eq!(cmd(port, &["STRLEN", "big"]), ":4096\r\n");
+    assert_eq!(
+        cmd(port, &["CONFIG", "SET", "proto-max-bulk-len", "536870912"]),
+        "+OK\r\n"
+    );
+
+    // A replica with a 1kb limit gets the master's 4 KB writes.
+    let rdir = dir.join("replica");
+    std::fs::create_dir_all(&rdir).unwrap();
+    let rps = rport.to_string();
+    let _replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--dir",
+            rdir.to_str().unwrap(),
+            "--proto-max-bulk-len",
+            "1kb",
+            "--replicaof",
+            "127.0.0.1",
+            &ps,
+        ],
+        rport,
+    ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(rport, &["INFO", "replication"]).contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(cmd(port, &["SET", "streamed", &big]), "+OK\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = cmd(rport, &["STRLEN", "streamed"]);
+        if got == ":4096\r\n" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica holds {got:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(cmd(rport, &["INFO", "replication"]).contains("master_link_status:up"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
