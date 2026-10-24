@@ -18,6 +18,10 @@ pub enum FailState {
     Fail,
 }
 
+/// How long a master pauses its writers for a replica's manual failover
+/// (Redis's `cluster-manual-failover-timeout` default).
+pub const MANUAL_FAILOVER_TIMEOUT_MS: u64 = 5000;
+
 /// Default `cluster-node-timeout`: a peer silent this long is PFAIL.
 pub const NODE_TIMEOUT_MS: u64 = 5000;
 
@@ -188,6 +192,9 @@ pub struct ClusterHub {
     /// `cluster-node-timeout` (ms): a peer silent this long is PFAIL, and
     /// failover starts about this long after a master dies.
     pub node_timeout_ms: AtomicU64,
+    /// This master paused its writers for a replica's manual failover
+    /// (until it steps down, or the pause times out).
+    pub mf_paused: AtomicBool,
 }
 
 pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
@@ -282,6 +289,7 @@ impl ClusterHub {
             config_file: RwLock::new(None),
             follow: parking_lot::Mutex::new(None),
             node_timeout_ms: AtomicU64::new(NODE_TIMEOUT_MS),
+            mf_paused: AtomicBool::new(false),
         }
     }
 
@@ -291,6 +299,36 @@ impl ClusterHub {
             .read()
             .iter()
             .any(|&(s, e)| slot >= s && slot <= e)
+    }
+
+    /// The first half of a manual failover (Redis's MFSTART): asks our
+    /// master to pause its writers and returns its replication offset,
+    /// which we must reach before taking over so no acknowledged write is
+    /// lost.
+    pub async fn manual_failover_start(&self) -> Result<u64, String> {
+        use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+        let master_id = self.master_id.read().clone();
+        let addr = match self.nodes.read().get(&master_id) {
+            Some(m) => format!("{}:{}", m.ip, m.cport),
+            None => return Err("my master is unknown".to_string()),
+        };
+        let addr: SocketAddr = addr.parse().map_err(|e| format!("{e}"))?;
+        let frame = format!("MFSTART {}\r\n", self.my_id());
+        let exchange = async {
+            let mut stream = monoio::net::TcpStream::connect(addr).await.ok()?;
+            let (res, _) = stream.write_all(frame.into_bytes()).await;
+            res.ok()?;
+            let (res, buf) = stream.read(Vec::with_capacity(128)).await;
+            res.ok()?;
+            Some(String::from_utf8_lossy(&buf).into_owned())
+        };
+        match monoio::time::timeout(Duration::from_secs(2), exchange).await {
+            Ok(Some(reply)) => reply
+                .strip_prefix("+MFOFFSET ")
+                .and_then(|o| o.trim().parse().ok())
+                .ok_or_else(|| format!("master refused the manual failover: {}", reply.trim())),
+            _ => Err("master did not answer the manual failover (use FORCE)".to_string()),
+        }
     }
 
     /// Whether this node is a replica of the master serving `slot`.
@@ -421,6 +459,11 @@ impl ClusterHub {
             *self.role.write() = "slave".to_string();
             *self.master_id.write() = id.to_string();
             *self.follow.lock() = Some(master_addr);
+            // A manual failover paused our writers: they resume now, and
+            // get MOVED to the new master.
+            if self.mf_paused.swap(false, Ordering::SeqCst) {
+                crate::connection::unpause_clients();
+            }
         }
         let _ = self.save_config();
     }
@@ -2530,6 +2573,20 @@ fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             hub.claim_slots(&master_id, Some(epoch), peer_slots);
             Some("+OK\r\n".to_string())
         }
+        "MFSTART" => {
+            // MFSTART <replica_id>: a replica of ours starts a manual
+            // failover. Pause writers (they get MOVED once the replica took
+            // our slots) and tell it the offset to reach.
+            if *hub.role.read() != "master" {
+                return Some("-ERR not a master\r\n".to_string());
+            }
+            crate::connection::set_client_pause(MANUAL_FAILOVER_TIMEOUT_MS, true);
+            hub.mf_paused.store(true, Ordering::SeqCst);
+            let offset = crate::replication::get_replication_hub(hub.port)
+                .master_repl_offset
+                .load(Ordering::SeqCst);
+            Some(format!("+MFOFFSET {offset}\r\n"))
+        }
         "FAILOVER_AUTH_REQUEST" => {
             // FAILOVER_AUTH_REQUEST <replica_id> <epoch> <master_id>
             if parts.len() < 4 {
@@ -3041,6 +3098,24 @@ mod tests {
         }
         assert_eq!(hub.nodes.read()[&"a".repeat(40)].fail, FailState::PFail);
         assert_eq!(hub.nodes.read()[&"b".repeat(40)].fail, FailState::Ok);
+    }
+
+    #[test]
+    fn test_mfstart_pauses_a_masters_writers_until_it_steps_down() {
+        let hub = ClusterHub::new(7960);
+        let reply = handle_cluster_bus_line(&format!("MFSTART {}", "r".repeat(40)), &hub).unwrap();
+        assert!(reply.starts_with("+MFOFFSET "), "{reply}");
+        assert!(crate::connection::is_client_paused().is_some());
+        // Stepping down (a newer claim takes all its slots) lifts the pause.
+        let new = "n".repeat(40);
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7961 {new} 0"), &hub);
+        hub.claim_slots(&new, Some(5), vec![(0, 16383)]);
+        assert_eq!(*hub.role.read(), "slave");
+        assert!(crate::connection::is_client_paused().is_none());
+        // A replica can't be asked.
+        let reply = handle_cluster_bus_line(&format!("MFSTART {}", "r".repeat(40)), &hub).unwrap();
+        assert!(reply.starts_with("-ERR"), "{reply}");
+        crate::connection::unpause_clients();
     }
 
     #[test]

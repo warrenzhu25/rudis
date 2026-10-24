@@ -4266,7 +4266,11 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     })))
                 }
                 "FAILOVER" => {
-                    let force = args.len() > 2 && args[2].eq_ignore_ascii_case(b"force");
+                    // TAKEOVER skips the master's agreement like FORCE (a manual
+                    // failover holds no election here anyway).
+                    let force = args.len() > 2
+                        && (args[2].eq_ignore_ascii_case(b"force")
+                            || args[2].eq_ignore_ascii_case(b"takeover"));
                     Ok(Some(Command::Cluster(ClusterSubcommand::Failover {
                         force,
                     })))

@@ -34148,3 +34148,109 @@ fn test_cluster_node_timeout_is_configurable_e2e() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// A manual CLUSTER FAILOVER while a client keeps writing to the master:
+/// the master pauses its writers, the replica catches up and takes over,
+/// and no acknowledged write is lost (the counter on the new master equals
+/// the last INCR the old one acknowledged); writers then get MOVED.
+#[test]
+fn test_cluster_manual_failover_loses_no_acknowledged_write_e2e() {
+    let (mport, rport) = (18273u16, 18279u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_mf_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "2",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (md, rd) = (mk_dir(mport), mk_dir(rport));
+    let _m = spawn(mport, &md);
+    let _r = spawn(rport, &rd);
+    let cmd = |p: u16, args: &[&str]| {
+        let mut c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        resp_cmd(&mut c, args)
+    };
+    let master_id = cmd(mport, &["CLUSTER", "MYID"])
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        cmd(rport, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(rport, &["CLUSTER", "MEET", "127.0.0.1", &mport.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(rport, &["CLUSTER", "SLOTS"]).contains(&format!(":{mport}")) {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(cmd(rport, &["CLUSTER", "REPLICATE", &master_id]), "+OK\r\n");
+    while !cmd(rport, &["INFO", "replication"]).contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(50));
+    }
+    let k = "mf_counter";
+    let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2) as u16;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", mport + shard)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut last_acked = 0i64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let r = resp_cmd(&mut c, &["INCR", k]);
+                match r.strip_prefix(':') {
+                    Some(n) => last_acked = n.trim().parse().unwrap(),
+                    None => {
+                        assert!(r.starts_with("-MOVED"), "{r}");
+                        break;
+                    }
+                }
+            }
+            last_acked
+        })
+    };
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(cmd(rport, &["CLUSTER", "FAILOVER"]), "+OK\r\n");
+    let last_acked = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !writer.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer never redirected"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap()
+    };
+    assert!(last_acked > 0);
+    assert_eq!(
+        cmd(rport + shard, &["GET", k]),
+        format!("${}\r\n{last_acked}\r\n", last_acked.to_string().len()),
+        "acknowledged writes lost in the failover"
+    );
+    let _ = std::fs::remove_dir_all(&md);
+    let _ = std::fs::remove_dir_all(&rd);
+}

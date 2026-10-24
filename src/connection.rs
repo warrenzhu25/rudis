@@ -12780,12 +12780,41 @@ async fn execute_command_inner(
                     }
                 }
                 ClusterSubcommand::Failover { force } => {
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
+                    let repl = crate::replication::get_replication_hub(router.base_port);
+                    // Without FORCE, like Redis: the master pauses its
+                    // writers and we take over only once we processed all it
+                    // acknowledged.
+                    let mut caught_up = Ok(());
+                    if !force && hub.replication_master_addr().is_some() {
+                        caught_up = match hub.manual_failover_start().await {
+                            Ok(target) => {
+                                let deadline = std::time::Instant::now()
+                                    + std::time::Duration::from_millis(
+                                        crate::cluster::MANUAL_FAILOVER_TIMEOUT_MS,
+                                    );
+                                loop {
+                                    if repl.master_repl_offset.load(std::sync::atomic::Ordering::SeqCst)
+                                        >= target
+                                    {
+                                        break Ok(());
+                                    }
+                                    if std::time::Instant::now() >= deadline {
+                                        break Err("Manual failover timed out".to_string());
+                                    }
+                                    monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                }
+                            }
+                            Err(e) => Err(e),
+                        };
+                    }
+                    if let Err(e) = caught_up {
+                        out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
+                        return false;
+                    }
                     // End the link to the old master before taking over, so
                     // nothing it sends lands after the promotion.
-                    if crate::cluster::get_cluster_hub(router.base_port)
-                        .replication_master_addr()
-                        .is_some()
-                    {
+                    if hub.replication_master_addr().is_some() {
                         crate::replication::get_replication_hub(router.base_port)
                             .stop_sync_and_wait()
                             .await;
