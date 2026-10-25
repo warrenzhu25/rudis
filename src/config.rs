@@ -44,9 +44,12 @@ pub struct RudisConfig {
     /// `metrics-bind`: address the metrics port listens on. Defaults to
     /// loopback because the endpoint has no authentication.
     pub metrics_bind: std::net::IpAddr,
-    /// `save <seconds> <changes>` points. Empty (the default) means no
-    /// snapshots unless asked for, unlike Redis's built-in defaults.
+    /// `save <seconds> <changes>` points. Defaults to Redis's
+    /// [`DEFAULT_SAVE_POINTS`]; the file's first `save` line replaces them,
+    /// later ones add to it, and `save ""` disables snapshots.
     pub save_points: Vec<(u64, u64)>,
+    /// Whether a `save` line was read yet (the first one drops the defaults).
+    save_points_from_file: bool,
     /// `user <name> <rules...>` lines, applied to the ACL at startup.
     pub users: Vec<(String, Vec<String>)>,
     /// Other recognised directives, in file order (a directive such as
@@ -55,6 +58,10 @@ pub struct RudisConfig {
     /// rudis has no setting for are reported and ignored.
     pub extra_directives: Vec<(String, String)>,
 }
+
+/// Redis's default `save 3600 1 300 100 60 10000`: snapshot after an hour
+/// with a change, 5 minutes with 100, or a minute with 10000.
+pub const DEFAULT_SAVE_POINTS: [(u64, u64); 3] = [(3600, 1), (300, 100), (60, 10000)];
 
 impl Default for RudisConfig {
     fn default() -> Self {
@@ -86,7 +93,8 @@ impl Default for RudisConfig {
             tiered_upload_threshold: 80,
             metrics_port: None,
             metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            save_points: Vec::new(),
+            save_points: DEFAULT_SAVE_POINTS.to_vec(),
+            save_points_from_file: false,
             users: Vec::new(),
             extra_directives: Vec::new(),
         }
@@ -715,11 +723,11 @@ impl RudisConfig {
                     // Like Redis: each line adds points; `save ""` clears them.
                     let points = parse_save_points(&rest.join(" "))
                         .map_err(|e| format!("Invalid save at line {}: {}", line_num + 1, e))?;
-                    if points.is_empty() {
+                    if !config.save_points_from_file || points.is_empty() {
                         config.save_points.clear();
-                    } else {
-                        config.save_points.extend(points);
                     }
+                    config.save_points_from_file = true;
+                    config.save_points.extend(points);
                 }
                 "include" => {
                     // Like Redis, a relative path is resolved against the
@@ -1294,7 +1302,19 @@ mod tests {
 
     #[test]
     fn test_parse_save_points_and_shutdown_rule() {
-        assert!(RudisConfig::parse_str("").unwrap().save_points.is_empty());
+        // Redis's defaults until the file says otherwise.
+        assert_eq!(
+            RudisConfig::parse_str("").unwrap().save_points,
+            DEFAULT_SAVE_POINTS.to_vec()
+        );
+        let cfg = RudisConfig::parse_str("save 3 4\n").unwrap();
+        assert_eq!(cfg.save_points, vec![(3, 4)]);
+        assert!(
+            RudisConfig::parse_str("save \"\"\n")
+                .unwrap()
+                .save_points
+                .is_empty()
+        );
         let cfg = RudisConfig::parse_str("save 900 1\nsave 300 10 60 10000\n").unwrap();
         assert_eq!(cfg.save_points, vec![(900, 1), (300, 10), (60, 10000)]);
         let cfg = RudisConfig::parse_str("save 900 1\nsave \"\"\n").unwrap();

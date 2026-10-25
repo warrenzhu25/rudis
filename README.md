@@ -274,7 +274,7 @@ lists only directives and flags verified against [`src/config.rs`](src/config.rs
 | `appendfsync <always\|everysec\|no>` | AOF fsync durability mode | `everysec` |
 | `auto-aof-rewrite-percentage <pct>` / `auto-aof-rewrite-min-size <size>` | Automatic background AOF compaction thresholds | `100` / `64mb` |
 | `dir <path>` / `dbfilename <name>` | Data directory and RDB filename | `.` / `dump.rdb` |
-| `save <seconds> <changes>` | Automatic background RDB snapshot schedule | unset |
+| `save <seconds> <changes>` | Automatic background RDB snapshot schedule | `3600 1 300 100 60 10000` (Redis's) |
 | `requirepass <password>` / `aclfile <path>` | Default user password / external ACL users file (`ACL SAVE` / `ACL LOAD`) | unset |
 | `tls-port <n>` | Port for TLS connections | unset |
 | `tls-cert-file <path>` / `tls-key-file <path>` | TLS certificate / key PEM files | unset (self-signed cert generated in memory if a `tls-port` is set without them) |
@@ -438,9 +438,10 @@ Understand what "durable" means here today before relying on it:
   fsyncs roughly every second), and `appendfsync no` (leaves flushing to the OS). Both
   `appendonly` and `appendfsync` can be changed at runtime via `CONFIG SET`. Automatic background
   AOF compaction is driven by `auto-aof-rewrite-percentage` and `auto-aof-rewrite-min-size`.
-- **RDB autosave**: `save <seconds> <changes>` points schedule `BGSAVE` like Redis. Unlike
-  Redis there are no default save points; with none configured, nothing is saved automatically
-  (and not on shutdown unless `SHUTDOWN SAVE` is used).
+- **RDB autosave**: `save <seconds> <changes>` points schedule `BGSAVE` like Redis, with
+  Redis's defaults (`save 3600 1 300 100 60 10000`) unless the config file or command line sets
+  `save`. Save points also make a graceful shutdown save first. `save ""` turns autosave off
+  (then nothing is saved on shutdown unless `SHUTDOWN SAVE` is used).
 - **NVMe-tiered keys** (`RudisValue::Tiered`) are read back from the tier and written with their
   real value and type by `SAVE`/`BGSAVE` and `BGREWRITEAOF`. After a restart they come back as
   ordinary in-memory keys (tiering state itself is not persisted). If a tiered record cannot be

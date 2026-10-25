@@ -32,16 +32,19 @@ fn sweep_dead_test_server_dirs() {
     });
 }
 
-/// The server binary, run from a per-process scratch dir (swept like the
-/// others) so files it puts in its working dir, such as the default tier
-/// dir, stay out of the repo.
+/// The server binary, run from its own scratch dir (swept like the others)
+/// so files it puts in its working dir, such as the default tier dir or the
+/// `dump.rdb` its default save points write on shutdown, stay out of the
+/// repo and out of the next spawned server's way.
 /// Appended to spawned servers' arguments: the binary defaults to
 /// `enable-debug-command no`, as Redis does, and many tests use DEBUG.
 const DEBUG_ON: [&str; 2] = ["--enable-debug-command", "yes"];
 
 fn rudis_bin() -> std::process::Command {
     sweep_dead_test_server_dirs();
-    let cwd = std::env::temp_dir().join(format!("rudis-srv-{}-cwd", std::process::id()));
+    static SPAWNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SPAWNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cwd = std::env::temp_dir().join(format!("rudis-srv-{}-cwd{}", std::process::id(), n));
     std::fs::create_dir_all(&cwd).unwrap();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"));
     cmd.current_dir(cwd);
@@ -15517,6 +15520,9 @@ fn test_shutdown_without_save_points_writes_no_rdb_e2e() {
         "--no-pin",
         "--aof-dir",
         dir.to_str().unwrap(),
+        // Autosave off: by default (Redis's save points) shutdown saves.
+        "--save",
+        "",
     ];
     let mut child = spawn_rudis_listening(&args, port);
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -34467,4 +34473,43 @@ fn test_dead_shard_thread_exits_the_process_e2e() {
         .unwrap();
     assert_eq!(status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("FATAL: shard 1 panicked"), "{stderr}");
+}
+
+/// With no `save` setting the binary uses Redis's default save points;
+/// `--save ""` turns autosave off.
+#[test]
+fn test_default_save_points_match_redis_e2e() {
+    for (port, extra, want) in [
+        (29781u16, None, "3600 1 300 100 60 10000"),
+        (29782u16, Some(""), ""),
+    ] {
+        let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cmd = rudis_bin();
+        cmd.args(["--port", &port.to_string(), "--threads", "1", "--no-pin"])
+            .args(["--dir", dir.to_str().unwrap()])
+            .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(save) = extra {
+            cmd.args(["--save", save]);
+        }
+        let mut child = cmd.spawn().expect("spawn rudis");
+        let mut c = None;
+        for _ in 0..100 {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                c = Some(s);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let mut c = c.expect("server never listened");
+        let got = resp_cmd(&mut c, &["CONFIG", "GET", "save"]);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            got,
+            format!("*2\r\n$4\r\nsave\r\n${}\r\n{}\r\n", want.len(), want)
+        );
+    }
 }
