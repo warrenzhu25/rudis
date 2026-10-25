@@ -3157,6 +3157,78 @@ static CONFIG_MAXMEMORY_CLIENTS: std::sync::LazyLock<parking_lot::RwLock<String>
     std::sync::LazyLock::new(|| parking_lot::RwLock::new("0".to_string()));
 static CONFIG_BACKUPDIRNAME: std::sync::LazyLock<parking_lot::RwLock<String>> =
     std::sync::LazyLock::new(|| parking_lot::RwLock::new("backup".to_string()));
+
+/// The process's `oom_score_adj` before rudis changed it: what `relative`
+/// values add to, and what `oom-score-adj no` restores.
+static OOM_SCORE_ADJ_BASE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+const OOM_SCORE_ADJ_PATH: &str = "/proc/self/oom_score_adj";
+
+/// Parses `oom-score-adj-values`: three integers (master, replica,
+/// background child) in -2000..=2000, as in Redis.
+fn parse_oom_score_adj_values(val: &str) -> Result<[i32; 3], String> {
+    let nums: Vec<i32> = val
+        .split_whitespace()
+        .map(|v| v.parse::<i32>().ok().filter(|n| (-2000..=2000).contains(n)))
+        .collect::<Option<_>>()
+        .ok_or(
+            "Invalid oom-score-adj-values: each value must be an integer between -2000 and 2000",
+        )?;
+    <[i32; 3]>::try_from(nums).map_err(|_| "oom-score-adj-values must have 3 values".to_string())
+}
+
+/// The `oom_score_adj` to set for `mode`/`values` (or None for `no`, which
+/// keeps `base`): `absolute` uses the value as is, `yes`/`relative` adds it
+/// to `base`; clamped to the kernel's -1000..=1000.
+fn oom_score_adj_target(
+    mode: &str,
+    values: &[i32; 3],
+    base: i32,
+    is_replica: bool,
+) -> Result<Option<i32>, String> {
+    let v = values[usize::from(is_replica)];
+    let target = match mode.to_ascii_lowercase().as_str() {
+        "no" => return Ok(None),
+        "yes" | "relative" => base + v,
+        "absolute" => v,
+        _ => {
+            return Err(
+                "argument(s) must be one of the following: no, yes, relative, absolute".into(),
+            );
+        }
+    };
+    Ok(Some(target.clamp(-1000, 1000)))
+}
+
+/// Applies `oom-score-adj`/`oom-score-adj-values` for the current role
+/// (master or replica) to the process, like Redis's `setOOMScoreAdj`.
+pub fn apply_oom_score_adj(is_replica: bool) -> Result<(), String> {
+    let read = || -> Option<i32> {
+        std::fs::read_to_string(OOM_SCORE_ADJ_PATH)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let mode = CONFIG_OOM_SCORE_ADJ.read().clone();
+    let values = parse_oom_score_adj_values(&CONFIG_OOM_SCORE_ADJ_VALUES.read())?;
+    if mode.eq_ignore_ascii_case("no") && OOM_SCORE_ADJ_BASE.get().is_none() {
+        return Ok(()); // never changed it
+    }
+    let Some(&base) = OOM_SCORE_ADJ_BASE.get().or_else(|| {
+        let base = read()?;
+        Some(OOM_SCORE_ADJ_BASE.get_or_init(|| base))
+    }) else {
+        return Err("Failed to read the current oom_score_adj".into());
+    };
+    let target = oom_score_adj_target(&mode, &values, base, is_replica)?.unwrap_or(base);
+    if read() == Some(target) {
+        return Ok(());
+    }
+    std::fs::write(OOM_SCORE_ADJ_PATH, target.to_string()).map_err(|e| {
+        crate::log_warning!("Unable to write oom_score_adj {}: {}", target, e);
+        "Failed to set current oom_score_adj. Check server logs.".to_string()
+    })
+}
 static CONFIG_SLAVEOF: std::sync::LazyLock<parking_lot::RwLock<String>> =
     std::sync::LazyLock::new(|| parking_lot::RwLock::new(String::new()));
 
@@ -3377,8 +3449,32 @@ pub fn apply_config_value(
         "lua-time-limit" | "busy-reply-threshold" => {
             CONFIG_LUA_TIME_LIMIT.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
-        "oom-score-adj" => *CONFIG_OOM_SCORE_ADJ.write() = val_str.to_string(),
-        "oom-score-adj-values" => *CONFIG_OOM_SCORE_ADJ_VALUES.write() = val_str.to_string(),
+        "oom-score-adj" | "oom-score-adj-values" => {
+            let (mode, values) = if name == "oom-score-adj" {
+                (
+                    val_str.to_ascii_lowercase(),
+                    CONFIG_OOM_SCORE_ADJ_VALUES.read().clone(),
+                )
+            } else {
+                (CONFIG_OOM_SCORE_ADJ.read().clone(), val_str.to_string())
+            };
+            oom_score_adj_target(&mode, &parse_oom_score_adj_values(&values)?, 0, false)?;
+            let old = if name == "oom-score-adj" {
+                std::mem::replace(&mut *CONFIG_OOM_SCORE_ADJ.write(), mode)
+            } else {
+                std::mem::replace(&mut *CONFIG_OOM_SCORE_ADJ_VALUES.write(), values)
+            };
+            let is_replica = crate::replication::get_replication_hub(base_port).is_slave();
+            if let Err(e) = apply_oom_score_adj(is_replica) {
+                // Keep the setting in effect.
+                if name == "oom-score-adj" {
+                    *CONFIG_OOM_SCORE_ADJ.write() = old;
+                } else {
+                    *CONFIG_OOM_SCORE_ADJ_VALUES.write() = old;
+                }
+                return Err(e);
+            }
+        }
         "cross-shard-spin" => {
             crate::mailbox::set_cross_shard_spin(parse_config_num(name, val_str)?)
         }
@@ -4337,6 +4433,19 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 out.extend_from_slice(err.as_bytes());
                 return;
             }
+        } else if let Some(Err(e)) = match p_str.as_str() {
+            "oom-score-adj" => Some(oom_score_adj_target(&val_str, &[0; 3], 0, false).map(|_| ())),
+            "oom-score-adj-values" => Some(parse_oom_score_adj_values(&val_str).map(|_| ())),
+            _ => None,
+        } {
+            out.extend_from_slice(
+                format!(
+                    "-ERR CONFIG SET failed (possibly related to argument '{}') - {}\r\n",
+                    p_str, e
+                )
+                .as_bytes(),
+            );
+            return;
         } else if p_str == "maxmemory-samples" {
             if let Err(e) = maxmemory_samples_arg(&val_str) {
                 out.extend_from_slice(
@@ -29251,6 +29360,36 @@ mod tests {
         }
         assert_eq!(integral_score_digits(1.5, &mut [0u8; 20]), None);
         assert_eq!(integral_score_digits(1e15, &mut [0u8; 20]), None);
+    }
+
+    #[test]
+    fn test_oom_score_adj_targets() {
+        let v = parse_oom_score_adj_values("0 200 800").unwrap();
+        assert_eq!(v, [0, 200, 800]);
+        assert_eq!(oom_score_adj_target("no", &v, 50, false), Ok(None));
+        assert_eq!(oom_score_adj_target("yes", &v, 50, false), Ok(Some(50)));
+        assert_eq!(
+            oom_score_adj_target("relative", &v, 50, true),
+            Ok(Some(250))
+        );
+        assert_eq!(
+            oom_score_adj_target("ABSOLUTE", &v, 50, true),
+            Ok(Some(200))
+        );
+        // Clamped to the kernel's range.
+        let high = parse_oom_score_adj_values("2000 -2000 0").unwrap();
+        assert_eq!(
+            oom_score_adj_target("relative", &high, 100, false),
+            Ok(Some(1000))
+        );
+        assert_eq!(
+            oom_score_adj_target("absolute", &high, 0, true),
+            Ok(Some(-1000))
+        );
+        assert!(oom_score_adj_target("maybe", &v, 0, false).is_err());
+        for bad in ["0 200", "0 200 800 1", "0 x 800", "0 2001 800", ""] {
+            assert!(parse_oom_score_adj_values(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

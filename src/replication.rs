@@ -724,6 +724,7 @@ impl ReplicationHub {
             *role = ReplicationRole::Master;
             self.cached_master.store(false, Ordering::Relaxed);
             self.is_slave_atomic.store(false, Ordering::Release);
+            let _ = crate::connection::apply_oom_score_adj(false);
             // Like Redis, the backlog TTL counts from the promotion.
             self.no_replicas_since.store(unix_secs(), Ordering::Relaxed);
             self.take_replicas_locked()
@@ -2118,6 +2119,7 @@ pub fn start_replica_sync(
         };
         hub.is_slave_atomic.store(true, Ordering::Release);
     }
+    let _ = crate::connection::apply_oom_score_adj(true);
     HAS_SLAVE_INSTANCE.store(true, Ordering::Release);
     crate::log::set_role_replica(true);
     // Like Redis: a blocked BLPOP & co. served here would change data the

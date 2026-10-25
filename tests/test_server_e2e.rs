@@ -34540,3 +34540,60 @@ fn test_maxmemory_samples_config_e2e() {
         "+OK\r\n"
     );
 }
+
+/// `oom-score-adj` sets the process's `/proc/<pid>/oom_score_adj` from
+/// `oom-score-adj-values` (master value here), at startup and on CONFIG
+/// SET, as in Redis.
+#[test]
+fn test_oom_score_adj_sets_the_process_score_e2e() {
+    let port = 29751;
+    let mut child = rudis_bin()
+        .args([
+            "--port",
+            &port.to_string(),
+            "--threads",
+            "1",
+            "--no-pin",
+            "--oom-score-adj",
+            "absolute",
+            "--oom-score-adj-values",
+            "300 400 800",
+        ])
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rudis");
+    let score = || {
+        std::fs::read_to_string(format!("/proc/{}/oom_score_adj", child.id()))
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let mut c = None;
+    for _ in 0..100 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            c = Some(s);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut c = c.expect("server never listened");
+    assert_eq!(score(), "300");
+    // Raising the score needs no privilege (lowering it may).
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "oom-score-adj-values", "500 600 800"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(score(), "500");
+    let r = resp_cmd(&mut c, &["CONFIG", "SET", "oom-score-adj-values", "1 2"]);
+    assert!(r.starts_with("-ERR"), "{r}");
+    let r = resp_cmd(&mut c, &["CONFIG", "SET", "oom-score-adj", "sometimes"]);
+    assert!(r.starts_with("-ERR"), "{r}");
+    assert_eq!(score(), "500");
+    let _ = child.kill();
+    let _ = child.wait();
+}
