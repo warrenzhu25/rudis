@@ -3112,6 +3112,13 @@ fn parse_config_num<T: std::str::FromStr>(name: &str, val: &str) -> Result<T, St
         .map_err(|_| format!("argument '{}' for '{}' is not a valid number", val, name))
 }
 
+/// A `proto-max-bulk-len` value: a memory size, units allowed (`512mb`), as
+/// in Redis. CONFIG SET took digits only, though the setting applied below
+/// and the config file accept units.
+fn proto_max_bulk_len_arg(val: &str) -> Option<u64> {
+    crate::tiering::parse_memory_bytes(val)
+}
+
 fn parse_config_bytes(name: &str, val: &str) -> Result<u64, String> {
     crate::tiering::parse_memory_bytes(val).ok_or_else(|| {
         format!(
@@ -4135,7 +4142,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 }
             }
         } else if p_str == "proto-max-bulk-len" {
-            if val_str.parse::<usize>().is_err() {
+            if proto_max_bulk_len_arg(&val_str).is_none() {
                 out.extend_from_slice(
                     b"-ERR Invalid argument for CONFIG SET proto-max-bulk-len\r\n",
                 );
@@ -29034,6 +29041,13 @@ mod tests {
         touch_watched_key_in_db(base, CURRENT_DB.get(), b"wk2");
         assert!(is_watch_tainted(shard, 9_000_003));
         unwatch_keys(shard, 9_000_003);
+    }
+
+    #[test]
+    fn test_proto_max_bulk_len_takes_memory_units() {
+        assert_eq!(super::proto_max_bulk_len_arg("512mb"), Some(512 << 20));
+        assert_eq!(super::proto_max_bulk_len_arg("1048576"), Some(1 << 20));
+        assert_eq!(super::proto_max_bulk_len_arg("lots"), None);
     }
 
     #[test]

@@ -34339,3 +34339,22 @@ fn test_cluster_client_kill_reaches_every_shard_port_e2e() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// CONFIG SET proto-max-bulk-len takes memory units, like Redis.
+#[test]
+fn test_config_set_proto_max_bulk_len_with_units_e2e() {
+    let port = 18303u16;
+    let _srv = ServerGuard(spawn_rudis_listening(
+        &["--port", &port.to_string(), "--threads", "1", "--no-pin"],
+        port,
+    ));
+    let mut c = connect_ready(port);
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "proto-max-bulk-len", "512mb"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "proto-max-bulk-len"]),
+        "*2\r\n$18\r\nproto-max-bulk-len\r\n$9\r\n536870912\r\n"
+    );
+}
