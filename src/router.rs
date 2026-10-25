@@ -7495,6 +7495,7 @@ mod tests {
 
     #[test]
     fn test_sync_image_steps_publish_the_shards_memory() {
+        let _sync_images = crate::shard::SYNC_IMAGE_TEST_LOCK.lock();
         // Eviction sums the shards' published allocator counts minus
         // SYNC_IMAGE_BYTES, which an image's buffers leave at once when it
         // finishes (or move in and out of as pieces are handed back). Each

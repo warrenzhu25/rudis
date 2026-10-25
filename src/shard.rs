@@ -4967,6 +4967,11 @@ pub struct AofImage {
 /// evict.
 pub static SYNC_IMAGE_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// Held by unit tests that build full-sync images, which all move the
+/// process-wide [`SYNC_IMAGE_BYTES`] some of them assert on.
+#[cfg(test)]
+pub(crate) static SYNC_IMAGE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// A share of [`SYNC_IMAGE_BYTES`] (an image's buffers, or a piece in
 /// flight to the replica), given back when dropped.
 #[derive(Default)]
@@ -5642,6 +5647,7 @@ mod tests {
     /// made it evict.
     #[test]
     fn test_sync_image_bytes_are_counted_apart() {
+        let _sync_images = SYNC_IMAGE_TEST_LOCK.lock();
         use std::sync::atomic::Ordering::Relaxed;
         let mut db = ShardDb::new(0);
         for i in 0..20_000 {
@@ -5701,6 +5707,7 @@ mod tests {
     /// kept before, so a streamed full sync could not run.
     #[test]
     fn test_concurrent_images_each_stay_point_in_time() {
+        let _sync_images = SYNC_IMAGE_TEST_LOCK.lock();
         let mut db = ShardDb::new(0);
         let key = |i: usize| Bytes::from(format!("l{i}"));
         let n = 2000;
