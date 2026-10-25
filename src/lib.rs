@@ -55,6 +55,7 @@ pub mod tiering;
 pub mod tls;
 pub mod transport;
 pub mod vector;
+pub mod version;
 pub mod xdp;
 pub mod zerocopy;
 pub mod zindex;

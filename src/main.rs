@@ -10,7 +10,7 @@ use rudis::{log_fatal, log_notice, log_warning};
 #[derive(Parser, Debug)]
 #[command(
     name = "rudis",
-    version = "0.1.0",
+    version = rudis::version::long_version(),
     about = "Multi-threaded Shared-Nothing Redis in Rust based on io_uring"
 )]
 struct Args {
@@ -436,7 +436,7 @@ fn main() {
     log_notice!("oO0OoO0OoO0Oo Rudis is starting oO0OoO0OoO0Oo");
     log_notice!(
         "Rudis version={}, bits={}, pid={}, just started",
-        env!("CARGO_PKG_VERSION"),
+        rudis::version::long_version(),
         usize::BITS,
         std::process::id()
     );

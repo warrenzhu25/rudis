@@ -12244,7 +12244,9 @@ async fn execute_command_inner(
                 s
             };
             let server_str = format!(
-                "# Server\r\nredis_version:7.2.4\r\nredis_git_sha1:00000000\r\nredis_git_dirty:0\r\nredis_build_id:0\r\nredis_mode:{}\r\nos:Linux\r\narch_bits:64\r\nmultiplexing_api:{}\r\n{}rudis_version:{}\r\narch:shared-nothing-{}\r\nshard_id:{}\r\nnum_shards:{}\r\ntcp_port:{}\r\n",
+                "# Server\r\nredis_version:7.2.4\r\nredis_git_sha1:{}\r\nredis_git_dirty:{}\r\nredis_build_id:0\r\nredis_mode:{}\r\nos:Linux\r\narch_bits:64\r\nmultiplexing_api:{}\r\n{}rudis_version:{}\r\narch:shared-nothing-{}\r\nshard_id:{}\r\nnum_shards:{}\r\ntcp_port:{}\r\n",
+                crate::version::GIT_SHA,
+                u8::from(crate::version::GIT_DIRTY),
                 if router.cluster_enabled { "cluster" } else { "standalone" },
                 io_driver_name(),
                 server_info_process_fields(),

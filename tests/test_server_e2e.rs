@@ -34621,3 +34621,33 @@ fn test_maxmemory_clients_refuses_a_limit_e2e() {
         "*2\r\n$17\r\nmaxmemory-clients\r\n$1\r\n0\r\n"
     );
 }
+
+/// `--version` and `INFO server` name the version and the commit the
+/// binary was built from.
+#[test]
+fn test_version_and_info_report_the_build_commit_e2e() {
+    let out = rudis_bin()
+        .arg("--version")
+        .output()
+        .expect("rudis --version");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        text.trim(),
+        format!("rudis {}", rudis::version::long_version()),
+        "{text}"
+    );
+
+    let port = 29761;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let info = resp_cmd_full(&mut c, &["INFO", "server"]);
+    assert!(
+        info.contains(&format!("redis_git_sha1:{}\r\n", rudis::version::GIT_SHA)),
+        "{info}"
+    );
+    assert!(
+        info.contains(&format!("rudis_version:{}\r\n", rudis::version::VERSION)),
+        "{info}"
+    );
+}
