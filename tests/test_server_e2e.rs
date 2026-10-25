@@ -34651,3 +34651,52 @@ fn test_version_and_info_report_the_build_commit_e2e() {
         "{info}"
     );
 }
+
+/// `/metrics` breaks keys and memory down by shard and reports the
+/// process RSS and mailbox overflows.
+#[test]
+fn test_metrics_report_per_shard_keys_and_memory_e2e() {
+    let (port, metrics_port) = (29791u16, 29792u16);
+    let mut child = rudis_bin()
+        .args(["--port", &port.to_string(), "--threads", "2", "--no-pin"])
+        .args(["--metrics-port", &metrics_port.to_string(), "--save", ""])
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rudis");
+    let mut c = None;
+    for _ in 0..100 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            c = Some(s);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut c = c.expect("server never listened");
+    for i in 0..200 {
+        assert_eq!(resp_cmd(&mut c, &["SET", &format!("k{i}"), "v"]), "+OK\r\n");
+    }
+    let mut m = TcpStream::connect(("127.0.0.1", metrics_port)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    m.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let mut body = String::new();
+    let _ = m.read_to_string(&mut body);
+    let _ = child.kill();
+    let _ = child.wait();
+    let gauge = |name: &str| -> u64 {
+        body.lines()
+            .find_map(|l| l.strip_prefix(name)?.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))
+    };
+    let (k0, k1) = (
+        gauge("rudis_shard_keys{shard=\"0\"}"),
+        gauge("rudis_shard_keys{shard=\"1\"}"),
+    );
+    assert_eq!(k0 + k1, 200);
+    assert!(k0 > 0 && k1 > 0, "keys spread over both shards: {k0} {k1}");
+    assert!(gauge("rudis_shard_used_memory_bytes{shard=\"0\"}") > 0);
+    assert!(gauge("rudis_process_resident_memory_bytes") > 0);
+    gauge("rudis_mailbox_overflows_total");
+}

@@ -3466,6 +3466,26 @@ impl Router {
         total
     }
 
+    /// Each shard's key count in the current DB, by shard id (for the
+    /// per-shard metrics: a skewed key spread shows as one shard's count).
+    pub async fn shard_dbsizes(&self) -> Vec<usize> {
+        let mut sizes = Vec::with_capacity(self.num_shards);
+        for s in 0..self.num_shards {
+            let n = if s == self.shard_id {
+                self.local_db.borrow_mut().dbsize()
+            } else {
+                let res = self.execute_remote(s, Command::Dbsize).await;
+                std::str::from_utf8(&res)
+                    .ok()
+                    .and_then(|r| r.strip_prefix(':'))
+                    .and_then(|r| r.trim_end().parse().ok())
+                    .unwrap_or(0)
+            };
+            sizes.push(n);
+        }
+        sizes
+    }
+
     /// Server-wide `(keys, keys with a TTL)` for the current DB.
     pub async fn keyspace_stats(&self) -> (usize, usize) {
         let (mut keys, mut expires) = {

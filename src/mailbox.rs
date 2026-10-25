@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, Default)]
@@ -733,6 +733,11 @@ impl Default for BatchResponder {
     }
 }
 
+/// Messages that found a shard-to-shard ring full and went to its
+/// mutex-guarded overflow queue: a sustained rise means a shard can't keep
+/// up with what the others send it.
+pub static MAILBOX_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+
 /// Cache-line aligned, lock-free Single-Producer Single-Consumer circular ring buffer
 /// with fallback overflow queue for unbounded durability.
 #[repr(align(64))]
@@ -824,6 +829,7 @@ impl<T> SpscQueue<T> {
             self.tail.store(tail.wrapping_add(1), Ordering::Release);
         } else {
             q.push_back(item);
+            MAILBOX_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
         }
         self.has_overflow.store(!q.is_empty(), Ordering::Release);
     }

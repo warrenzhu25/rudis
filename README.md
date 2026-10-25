@@ -444,7 +444,10 @@ docker run -d --name rudis \
   stops startup. The same text is available as `INFO metrics` (alias `INFO prometheus`) on the
   normal port ([`src/telemetry.rs`](src/telemetry.rs)): connected clients, memory used/limit,
   expired/evicted keys, tiering hits and misses, and the INFO stats counters (commands processed,
-  connections, network bytes, keyspace hits/misses).
+  connections, network bytes, keyspace hits/misses). The HTTP endpoint also has per-command
+  calls/latency histograms, persistence and replication state, keys and used memory per shard
+  (`rudis_shard_keys`, `rudis_shard_used_memory_bytes`: a hot or oversized shard limits the
+  whole node), the process RSS and cross-shard mailbox overflows.
 - There is no built-in log file rotation or structured JSON logging; redirect and rotate at the
   process-manager level (systemd journal, your container runtime's log driver, or `logrotate`).
 

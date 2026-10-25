@@ -303,6 +303,48 @@ pub fn format_server_state_metrics(router: &crate::router::Router) -> String {
     out
 }
 
+/// The process's resident set size in bytes (`/proc/self/statm`), which
+/// `maxmemory` doesn't bound: allocator fragmentation and buffers sit on top
+/// of `used_memory`.
+pub fn process_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf takes no pointers and only reads a system setting.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    (page > 0).then(|| pages * page as u64)
+}
+
+/// Per-shard and process-level gauges: each shard's keys (`shard_keys`)
+/// and used memory (`shard_used`), indexed by shard id; the process RSS;
+/// and mailbox overflows. In a thread-per-core server one hot or
+/// oversized shard limits the whole node, which server totals hide.
+pub fn format_shard_metrics(
+    shard_keys: &[usize],
+    shard_used: &[usize],
+    rss: Option<u64>,
+    mailbox_overflows: u64,
+) -> String {
+    let mut out = String::from(
+        "# HELP rudis_shard_keys Keys held by each shard (current DB)\n# TYPE rudis_shard_keys gauge\n",
+    );
+    for (shard, n) in shard_keys.iter().enumerate() {
+        out += &format!("rudis_shard_keys{{shard=\"{shard}\"}} {n}\n");
+    }
+    out += "# HELP rudis_shard_used_memory_bytes Memory used by each shard\n# TYPE rudis_shard_used_memory_bytes gauge\n";
+    for (shard, n) in shard_used.iter().enumerate() {
+        out += &format!("rudis_shard_used_memory_bytes{{shard=\"{shard}\"}} {n}\n");
+    }
+    if let Some(rss) = rss {
+        out += &format!(
+            "# HELP rudis_process_resident_memory_bytes Resident set size of the process\n# TYPE rudis_process_resident_memory_bytes gauge\nrudis_process_resident_memory_bytes {rss}\n"
+        );
+    }
+    out += &format!(
+        "# HELP rudis_mailbox_overflows_total Cross-shard messages that found the target's ring full\n# TYPE rudis_mailbox_overflows_total counter\nrudis_mailbox_overflows_total {mailbox_overflows}\n"
+    );
+    out
+}
+
 /// `--metrics-port` listeners, bound at startup so a bad address fails
 /// fast, then served by shard 0. Keyed by the server's base port.
 static METRICS_LISTENERS: Mutex<Option<HashMap<u16, std::net::TcpListener>>> = Mutex::new(None);
@@ -394,15 +436,29 @@ async fn serve_metrics_conn(router: &crate::router::Router, mut stream: monoio::
         }
     }
     let wants_metrics = request.starts_with(b"GET /metrics");
-    let used = if wants_metrics {
+    let (used, shard_keys) = if wants_metrics {
         // Per-command stats are buffered per shard; merge them first.
         router.flush_all_command_stats().await;
-        router.get_total_used_memory().await
+        (
+            router.get_total_used_memory().await,
+            router.shard_dbsizes().await,
+        )
     } else {
-        0
+        (0, Vec::new())
     };
     let response = metrics_http_response(&request, || {
-        format_prometheus_metrics(router.base_port, used) + &format_server_state_metrics(router)
+        // Fresh: `get_total_used_memory` just had every shard publish.
+        let shard_used: Vec<usize> = (0..router.num_shards)
+            .map(|s| router.tier_stats.published_shard_used(s))
+            .collect();
+        format_prometheus_metrics(router.base_port, used)
+            + &format_server_state_metrics(router)
+            + &format_shard_metrics(
+                &shard_keys,
+                &shard_used,
+                process_rss_bytes(),
+                crate::mailbox::MAILBOX_OVERFLOWS.load(Ordering::Relaxed),
+            )
     });
     let _ = stream.write_all(response).await;
 }
@@ -410,6 +466,18 @@ async fn serve_metrics_conn(router: &crate::router::Router, mut stream: monoio::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_shard_metrics() {
+        let m = format_shard_metrics(&[10, 0, 7], &[4096, 0, 2048], Some(1 << 20), 3);
+        assert!(m.contains("rudis_shard_keys{shard=\"0\"} 10\n"));
+        assert!(m.contains("rudis_shard_keys{shard=\"2\"} 7\n"));
+        assert!(m.contains("rudis_shard_used_memory_bytes{shard=\"0\"} 4096\n"));
+        assert!(m.contains("rudis_process_resident_memory_bytes 1048576\n"));
+        assert!(m.contains("rudis_mailbox_overflows_total 3\n"));
+        assert!(!format_shard_metrics(&[], &[], None, 0).contains("resident"));
+        assert!(process_rss_bytes().is_some_and(|b| b > 0));
+    }
 
     #[test]
     fn test_init_telemetry_idempotency() {
