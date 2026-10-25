@@ -205,3 +205,17 @@ jobs:
           path: |
             /tmp/rudis_tcl_test_16379.log
             /tmp/rudis_tcl_suites.log
+
+  supply_chain:
+    name: Dependency audit (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Advisories (RustSec), licenses, banned/duplicate crates and sources,
+      # per deny.toml.
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

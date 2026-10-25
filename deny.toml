@@ -1,0 +1,43 @@
+# cargo-deny policy (`cargo deny check`), run in CI by the supply-chain job.
+
+[graph]
+# Only the platform rudis runs on (Linux); Windows-only crates in the lock
+# file are never built.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+# Fail on any vulnerability or unsoundness advisory; unmaintained crates
+# are listed below once reviewed.
+ignore = [
+    # fxhash: unmaintained, no fix. Pulled in by monoio (vendored); a plain
+    # non-cryptographic hasher with no known issue.
+    { id = "RUSTSEC-2025-0057", reason = "via monoio; hasher only, no vulnerability" },
+    # paste: unmaintained, no fix. A build-time macro helper (via mlua).
+    { id = "RUSTSEC-2024-0436", reason = "proc-macro at build time only" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The vendored monoio is a path dependency (see [patch.crates-io]).
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
