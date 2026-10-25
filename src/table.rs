@@ -4013,15 +4013,17 @@ impl RudisTable {
     /// Attempts to evict one key under the specified eviction policy (allkeys-lru, volatile-lru, volatile-ttl, allkeys-random).
     /// Returns the number of bytes freed, or None if no evictable key was found.
     pub fn try_evict_one_key(&mut self, policy: &str) -> Option<usize> {
-        self.try_evict_one_key_with(policy, |_| {})
+        self.try_evict_one_key_with(policy, 10, |_| {})
     }
 
-    /// [`Self::try_evict_one_key`], calling `on_evict` with the evicted
-    /// key right after it is removed (before its `evicted` keyspace event),
-    /// so the caller can propagate the deletion to the AOF and replicas.
+    /// [`Self::try_evict_one_key`], comparing `samples` candidate keys
+    /// (`maxmemory-samples`) and calling `on_evict` with the evicted key
+    /// right after it is removed (before its `evicted` keyspace event), so
+    /// the caller can propagate the deletion to the AOF and replicas.
     pub fn try_evict_one_key_with(
         &mut self,
         policy: &str,
+        samples: usize,
         on_evict: impl FnOnce(&[u8]),
     ) -> Option<usize> {
         let bound = self.table.cursor_bound();
@@ -4041,13 +4043,14 @@ impl RudisTable {
             return None;
         }
 
-        // Sample up to 10 occupied slots starting at sample_cursor
+        // Sample up to `samples` occupied slots starting at sample_cursor
+        let samples = samples.max(1);
         let mut best_slot: Option<usize> = None;
         let mut min_ttl: Option<Instant> = None;
         let mut checked = 0;
         let mut attempts = 0;
 
-        while checked < 10 && attempts < bound {
+        while checked < samples && attempts < bound {
             let cur = self.sample_cursor % bound;
             self.sample_cursor = (self.sample_cursor + 1) % bound;
             attempts += 1;
@@ -18344,6 +18347,46 @@ mod tests {
             idle_evicted >= 95,
             "only {idle_evicted}/100 evictions hit idle keys"
         );
+    }
+
+    /// Eviction compares `samples` keys (`maxmemory-samples`): one sample
+    /// is a random pick, 64 always include an idle key.
+    #[test]
+    fn test_eviction_compares_maxmemory_samples_keys() {
+        let idle_evictions = |samples: usize| {
+            let mut table = RudisTable::new();
+            let n = 2_000usize;
+            let now = lru_now();
+            for i in 0..n {
+                let k = format!("k{i}");
+                table.set(Bytes::from(k.clone()), Bytes::from_static(b"v"), None);
+                let access = if i % 2 == 1 {
+                    now.wrapping_sub(3600)
+                } else {
+                    now
+                };
+                set_key_access(&mut table, k.as_bytes(), access);
+            }
+            let mut idle = 0;
+            for _ in 0..100 {
+                let before: Vec<bool> = (0..n)
+                    .map(|i| table.key_is_live(format!("k{i}").as_bytes()))
+                    .collect();
+                assert!(
+                    table
+                        .try_evict_one_key_with("allkeys-lru", samples, |_| {})
+                        .is_some()
+                );
+                let gone = (0..n)
+                    .find(|&i| before[i] && !table.key_is_live(format!("k{i}").as_bytes()))
+                    .unwrap();
+                idle += gone % 2;
+            }
+            idle
+        };
+        let one = idle_evictions(1);
+        assert!((15..=85).contains(&one), "{one}/100 idle with 1 sample");
+        assert_eq!(idle_evictions(64), 100);
     }
 
     /// Randomized differential test of the dense-arena segments against a

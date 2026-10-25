@@ -34513,3 +34513,30 @@ fn test_default_save_points_match_redis_e2e() {
         );
     }
 }
+
+/// `maxmemory-samples` is validated like Redis (1..=64) and read back.
+#[test]
+fn test_maxmemory_samples_config_e2e() {
+    let port = 29741;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for bad in ["0", "65", "x"] {
+        let r = resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-samples", bad]);
+        assert!(
+            r.starts_with("-ERR") && r.contains("between 1 and 64"),
+            "{bad}: {r}"
+        );
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-samples", "64"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "maxmemory-samples"]),
+        "*2\r\n$17\r\nmaxmemory-samples\r\n$2\r\n64\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-samples", "5"]),
+        "+OK\r\n"
+    );
+}

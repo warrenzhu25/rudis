@@ -3069,6 +3069,21 @@ static CONFIG_BACKUP_SEALED_TTL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(86400);
 static CONFIG_MAXMEMORY_SAMPLES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(5);
+
+/// A `maxmemory-samples` value: 1..=64, as in Redis.
+fn maxmemory_samples_arg(val: &str) -> Result<u64, String> {
+    match val.trim().parse::<u64>() {
+        Ok(n) if (1..=64).contains(&n) => Ok(n),
+        _ => Err("argument must be between 1 and 64 inclusive".to_string()),
+    }
+}
+
+/// `maxmemory-samples`: how many keys eviction compares to pick its victim.
+pub fn maxmemory_samples() -> usize {
+    CONFIG_MAXMEMORY_SAMPLES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .clamp(1, 64) as usize
+}
 static CONFIG_CLIENT_QUERY_BUFFER_LIMIT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1073741824);
 static CONFIG_KEY_LOAD_DELAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -3331,7 +3346,7 @@ pub fn apply_config_value(
             CONFIG_BACKUP_SEALED_TTL.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
         "maxmemory-samples" => {
-            CONFIG_MAXMEMORY_SAMPLES.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+            CONFIG_MAXMEMORY_SAMPLES.store(maxmemory_samples_arg(val_str)?, Ordering::Relaxed)
         }
         "auto-aof-rewrite-percentage" => crate::aof::auto_rewrite_config(base_port)
             .percentage
@@ -4320,6 +4335,17 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
         } else if p_str == "client-output-buffer-limit" {
             if let Err(err) = set_client_output_buffer_limit_str(&val_str) {
                 out.extend_from_slice(err.as_bytes());
+                return;
+            }
+        } else if p_str == "maxmemory-samples" {
+            if let Err(e) = maxmemory_samples_arg(&val_str) {
+                out.extend_from_slice(
+                    format!(
+                        "-ERR CONFIG SET failed (possibly related to argument 'maxmemory-samples') - {}\r\n",
+                        e
+                    )
+                    .as_bytes(),
+                );
                 return;
             }
         } else if p_str == "latency-monitor-threshold" {
@@ -29225,6 +29251,15 @@ mod tests {
         }
         assert_eq!(integral_score_digits(1.5, &mut [0u8; 20]), None);
         assert_eq!(integral_score_digits(1e15, &mut [0u8; 20]), None);
+    }
+
+    #[test]
+    fn test_maxmemory_samples_arg_range() {
+        assert_eq!(maxmemory_samples_arg("1"), Ok(1));
+        assert_eq!(maxmemory_samples_arg(" 64 "), Ok(64));
+        for bad in ["0", "65", "-1", "five", ""] {
+            assert!(maxmemory_samples_arg(bad).is_err(), "{bad}");
+        }
     }
 
     /// `replica-ignore-maxmemory` (alias `slave-…`) defaults to yes and only

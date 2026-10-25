@@ -991,10 +991,11 @@ impl ShardDb {
                 crate::resp::Command::Del(smallvec::smallvec![Bytes::copy_from_slice(key)])
             });
         };
+        let samples = crate::connection::maxmemory_samples();
         let saved_db = self.current_db;
         let prev_tl = crate::connection::CURRENT_DB.get();
         crate::connection::CURRENT_DB.set(saved_db);
-        let res = self.table.try_evict_one_key_with(policy, log_del);
+        let res = self.table.try_evict_one_key_with(policy, samples, log_del);
         crate::connection::CURRENT_DB.set(prev_tl);
         if res.is_some() {
             return res;
@@ -1007,7 +1008,7 @@ impl ShardDb {
             if self.table_for_db(db_idx).is_some_and(|t| !t.is_empty()) {
                 self.select_db(db_idx);
                 crate::connection::CURRENT_DB.set(db_idx);
-                let res = self.table.try_evict_one_key_with(policy, log_del);
+                let res = self.table.try_evict_one_key_with(policy, samples, log_del);
                 self.select_db(saved_db);
                 crate::connection::CURRENT_DB.set(prev_tl);
                 if let Some(freed) = res {
