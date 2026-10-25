@@ -3158,6 +3158,17 @@ static CONFIG_MAXMEMORY_CLIENTS: std::sync::LazyLock<parking_lot::RwLock<String>
 static CONFIG_BACKUPDIRNAME: std::sync::LazyLock<parking_lot::RwLock<String>> =
     std::sync::LazyLock::new(|| parking_lot::RwLock::new("backup".to_string()));
 
+/// Whether a `maxmemory-clients` value asks for client eviction (anything
+/// but 0 / 0%), which rudis does not implement.
+fn maxmemory_clients_enabled(val: &str) -> bool {
+    let val = val.trim();
+    let n = match val.strip_suffix('%') {
+        Some(pct) => pct.trim().parse::<u64>().ok(),
+        None => crate::tiering::parse_memory_bytes(val),
+    };
+    n != Some(0)
+}
+
 /// The process's `oom_score_adj` before rudis changed it: what `relative`
 /// values add to, and what `oom-score-adj no` restores.
 static OOM_SCORE_ADJ_BASE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
@@ -3501,7 +3512,14 @@ pub fn apply_config_value(
         "save" => {
             crate::config::set_save_points(base_port, crate::config::parse_save_points(val_str)?)
         }
-        "maxmemory-clients" => *CONFIG_MAXMEMORY_CLIENTS.write() = val_str.to_string(),
+        "maxmemory-clients" => {
+            // No client eviction: a limit would be ignored, so the config
+            // file's is reported as an unsupported directive instead.
+            if maxmemory_clients_enabled(val_str) {
+                return Ok(false);
+            }
+            *CONFIG_MAXMEMORY_CLIENTS.write() = val_str.to_string()
+        }
         "backupdirname" => *CONFIG_BACKUPDIRNAME.write() = val_str.to_string(),
         "slaveof" | "replicaof" => *CONFIG_SLAVEOF.write() = val_str.to_string(),
         "dbfilename" => crate::config::set_dbfilename(base_port, val_str)?,
@@ -4243,6 +4261,12 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
             } else if crate::tiering::parse_memory_bytes(&val_str).is_none() {
                 out.extend_from_slice(
                     b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory-clients') - invalid maxmemory-clients\r\n",
+                );
+                return;
+            }
+            if maxmemory_clients_enabled(&val_str) {
+                out.extend_from_slice(
+                    b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory-clients') - client eviction is not supported, only 0 (off) is accepted\r\n",
                 );
                 return;
             }
@@ -29390,6 +29414,24 @@ mod tests {
         for bad in ["0 200", "0 200 800 1", "0 x 800", "0 2001 800", ""] {
             assert!(parse_oom_score_adj_values(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn test_maxmemory_clients_only_accepts_off() {
+        for off in ["0", "0%", " 0 ", "0mb"] {
+            assert!(!maxmemory_clients_enabled(off), "{off}");
+        }
+        for on in ["1", "10%", "1gb", "junk"] {
+            assert!(maxmemory_clients_enabled(on), "{on}");
+        }
+        assert_eq!(
+            apply_config_value(65142, 65142, "maxmemory-clients", "1gb"),
+            Ok(false)
+        );
+        assert_eq!(
+            apply_config_value(65142, 65142, "maxmemory-clients", "0"),
+            Ok(true)
+        );
     }
 
     #[test]

@@ -34597,3 +34597,27 @@ fn test_oom_score_adj_sets_the_process_score_e2e() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// Client eviction isn't implemented, so `maxmemory-clients` only accepts
+/// 0 (off): a limit that would be silently ignored is refused.
+#[test]
+fn test_maxmemory_clients_refuses_a_limit_e2e() {
+    let port = 29771;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for limit in ["1gb", "10%"] {
+        let r = resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-clients", limit]);
+        assert!(
+            r.contains("client eviction is not supported"),
+            "{limit}: {r}"
+        );
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-clients", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "maxmemory-clients"]),
+        "*2\r\n$17\r\nmaxmemory-clients\r\n$1\r\n0\r\n"
+    );
+}
