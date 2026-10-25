@@ -560,6 +560,11 @@ stop past its grace period) skips all of the above, so give the process at least
 
 ---
 
+### Operations Runbook
+
+Alerts to set, crash recovery, backups and restore, runaway scripts, failover, resharding and
+upgrades: see [`docs/operations.md`](docs/operations.md).
+
 ## Design Decisions
 
 ### 1. Shared-Nothing Thread-Per-Core on Linux `io_uring`
