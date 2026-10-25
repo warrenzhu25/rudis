@@ -87,9 +87,6 @@ jobs:
       - name: Build Optimized Release Binary
         run: cargo build --release
 
-      - name: Verify Zero Hardware, Throughput & Latency Regression Invariants
-        run: python3 scripts/check_perf_regression.py --live
-
 
   io_uring_tests:
     name: Tests on the io_uring driver (production default)

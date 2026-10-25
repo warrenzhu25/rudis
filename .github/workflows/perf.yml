@@ -1,0 +1,32 @@
+name: Perf smoke
+
+# The live throughput/latency check needs a quiet host: on shared CI runners
+# its fixed floors (>= 1M ops/s, p99 <= 2.9 ms) measure the neighbours as
+# much as the build, so it doesn't gate pushes. It runs nightly and on
+# demand to catch gross regressions; the per-commit performance gate is the
+# A/B in scripts/gate.sh (agent.md Rule 2), run on a dedicated host.
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf_smoke:
+    name: Live throughput & latency smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Keep in sync with rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Build optimized release binary
+        run: cargo build --release
+
+      - name: Verify throughput, latency and page-fault invariants
+        run: python3 scripts/check_perf_regression.py --live
