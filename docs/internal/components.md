@@ -641,8 +641,8 @@ callable object.
 **Notable implementation detail.** The Redis-facing API surface is exactly 6 functions: `redis.call`,
 `redis.pcall`, `redis.status_reply`, `redis.error_reply`, `redis.sha1hex`, plus `redis.register_function`
 (load/call context only) — no `redis.log`, `setresp`, `breakpoint`, `replicate_commands`, or `set_repl` exist
-anywhere. No execution timeout/instruction budget exists; `FUNCTION KILL` always replies `+OK` and kills
-nothing. `FUNCTION DUMP`/`FUNCTION RESTORE` do not exist at all — `FUNCTION_LIBS` has no persistence and is
+anywhere. An instruction-count hook enforces `busy-reply-threshold` (`-BUSY` from other shards) and lets
+`SCRIPT KILL`/`FUNCTION KILL` stop a script that has not written. `FUNCTION DUMP`/`FUNCTION RESTORE` do not exist at all — `FUNCTION_LIBS` has no persistence and is
 lost on every restart.
 
 **Verified findings.** `EVAL_RO`/`EVALSHA_RO`/`FCALL_RO` parse to the identical `Command` variants as their

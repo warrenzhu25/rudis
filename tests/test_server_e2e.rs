@@ -34358,3 +34358,76 @@ fn test_config_set_proto_max_bulk_len_with_units_e2e() {
         "*2\r\n$18\r\nproto-max-bulk-len\r\n$9\r\n536870912\r\n"
     );
 }
+
+/// A script that never returns occupies its shard's thread. Past
+/// `busy-reply-threshold` other clients get -BUSY, and SCRIPT KILL from a
+/// connection on another shard ends it (FUNCTION KILL can't).
+#[test]
+fn test_script_kill_ends_endless_script_e2e() {
+    let port = 29721;
+    start_test_server(port, 4);
+    let shard_of = |c: &mut TcpStream| -> u64 {
+        let id = resp_cmd(c, &["CLIENT", "ID"]);
+        id.trim_start_matches(':').trim().parse::<u64>().unwrap() >> 48
+    };
+    let mut script_conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    script_conn
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let script_shard = shard_of(&mut script_conn);
+    // An admin connection served by another shard thread.
+    let mut admin = loop {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        if shard_of(&mut c) != script_shard {
+            break c;
+        }
+    };
+    assert_eq!(
+        resp_cmd(&mut admin, &["SCRIPT", "KILL"]),
+        "-NOTBUSY No scripts in execution right now.\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["CONFIG", "SET", "busy-reply-threshold", "100"]
+        ),
+        "+OK\r\n"
+    );
+
+    script_conn
+        .write_all(b"*3\r\n$4\r\nEVAL\r\n$17\r\nwhile true do end\r\n$1\r\n0\r\n")
+        .unwrap();
+    // PING: a command whose key lives on the busy shard may just wait for
+    // the script instead (a fast path can route it there directly).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = resp_cmd(&mut admin, &["PING"]);
+        if r.starts_with("-BUSY") {
+            assert!(r.contains("SCRIPT KILL"), "{r}");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never got -BUSY: {r}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(resp_cmd(&mut admin, &["FUNCTION", "KILL"]).starts_with("-BUSY"));
+    assert_eq!(resp_cmd(&mut admin, &["SCRIPT", "KILL"]), "+OK\r\n");
+
+    let mut buf = [0u8; 512];
+    let n = script_conn.read(&mut buf).unwrap();
+    let reply = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        reply.starts_with("-ERR") && reply.contains("killed by user"),
+        "{reply}"
+    );
+    // Both shards serve again.
+    assert_eq!(resp_cmd(&mut script_conn, &["PING"]), "+PONG\r\n");
+    assert_eq!(resp_cmd(&mut admin, &["GET", "somekey"]), "$-1\r\n");
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["CONFIG", "SET", "busy-reply-threshold", "5000"]
+        ),
+        "+OK\r\n"
+    );
+}

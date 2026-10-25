@@ -53,6 +53,211 @@ pub fn cached_scripts_count() -> usize {
     SCRIPT_CACHE.read().len()
 }
 
+/// How many Lua instructions run between two checks of a script's deadline
+/// and kill flag. A check is one relaxed load plus, until the script is
+/// busy, one clock read: noise next to 10k instructions.
+const SCRIPT_HOOK_INSTRUCTIONS: u32 = 10_000;
+
+/// A script (EVAL/EVALSHA/FCALL) running on some shard thread. A shard runs
+/// one script at a time, synchronously, so while it runs that shard serves
+/// nothing else: SCRIPT KILL / FUNCTION KILL / SHUTDOWN reach it from
+/// another shard's connection through this registry, and the script's own
+/// instruction hook acts on them.
+pub struct RunningScript {
+    /// Base (node) port of the server running it.
+    port: u16,
+    /// EVAL/EVALSHA (killed by SCRIPT KILL) or FCALL (FUNCTION KILL).
+    is_eval: bool,
+    start: std::time::Instant,
+    /// Set by SCRIPT KILL / FUNCTION KILL; the hook then fails the script.
+    killed: std::sync::atomic::AtomicBool,
+    /// A write command ran: killing it now would leave a partial effect, so
+    /// only SHUTDOWN NOSAVE (or waiting) ends it, as in Redis.
+    wrote: std::sync::atomic::AtomicBool,
+    /// It has run past `busy-reply-threshold`.
+    busy: std::sync::atomic::AtomicBool,
+}
+
+impl RunningScript {
+    fn killed_message(&self) -> String {
+        let by = if self.is_eval {
+            "SCRIPT KILL"
+        } else {
+            "FUNCTION KILL"
+        };
+        format!("ERR Script killed by user with {}...", by)
+    }
+
+    fn killed_error(&self) -> mlua::Error {
+        mlua::Error::RuntimeError(self.killed_message())
+    }
+
+    /// A failed run's error: the kill message if the hook ended it (Lua may
+    /// report the hook's error as "error in error handling").
+    fn error_or_killed(&self, err: String) -> String {
+        if self.was_stopped() {
+            self.killed_message()
+        } else {
+            err
+        }
+    }
+
+    /// Whether the hook ended (or is ending) the script.
+    fn was_stopped(&self) -> bool {
+        self.killed.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::shutdown::is_shutting_down()
+    }
+
+    fn mark_busy(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.busy.swap(true, Ordering::SeqCst) {
+            BUSY_SCRIPTS.fetch_add(1, Ordering::SeqCst);
+            crate::log_warning!(
+                "Slow script detected: still in execution after {} milliseconds. \
+                 You can try killing the script using the {} command.",
+                self.start.elapsed().as_millis(),
+                if self.is_eval {
+                    "SCRIPT KILL"
+                } else {
+                    "FUNCTION KILL"
+                }
+            );
+        }
+    }
+}
+
+/// Every script currently running, across all servers in the process.
+static RUNNING_SCRIPTS: LazyLock<parking_lot::Mutex<Vec<std::sync::Arc<RunningScript>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+
+/// How many running scripts are past `busy-reply-threshold`: lets
+/// [`busy_script_reply`] skip the registry on every command while none is.
+static BUSY_SCRIPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// The script running on this thread, for `redis.call` to flag writes.
+    static CURRENT_SCRIPT: RefCell<Option<std::sync::Arc<RunningScript>>> =
+        const { RefCell::new(None) };
+}
+
+/// Registers a script for its whole run; dropping it unregisters.
+struct ScriptRunGuard(std::sync::Arc<RunningScript>);
+
+impl ScriptRunGuard {
+    fn start(port: u16, is_eval: bool) -> Self {
+        let run = std::sync::Arc::new(RunningScript {
+            port: crate::connection::node_port(port),
+            is_eval,
+            start: std::time::Instant::now(),
+            killed: std::sync::atomic::AtomicBool::new(false),
+            wrote: std::sync::atomic::AtomicBool::new(false),
+            busy: std::sync::atomic::AtomicBool::new(false),
+        });
+        RUNNING_SCRIPTS.lock().push(run.clone());
+        CURRENT_SCRIPT.with(|c| *c.borrow_mut() = Some(run.clone()));
+        Self(run)
+    }
+}
+
+impl Drop for ScriptRunGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        CURRENT_SCRIPT.with(|c| *c.borrow_mut() = None);
+        RUNNING_SCRIPTS
+            .lock()
+            .retain(|r| !std::sync::Arc::ptr_eq(r, &self.0));
+        if self.0.busy.load(Ordering::SeqCst) {
+            BUSY_SCRIPTS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Notes that the running script issued a write command.
+fn note_script_write() {
+    CURRENT_SCRIPT.with(|c| {
+        if let Some(run) = c.borrow().as_ref() {
+            run.wrote.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// Installs the hook that ends `run` on SCRIPT KILL / FUNCTION KILL or
+/// shutdown, and marks it busy past `busy-reply-threshold`. A global hook,
+/// so coroutines the script creates inherit it.
+fn install_script_hook(lua: &Lua, run: &std::sync::Arc<RunningScript>) -> Result<(), String> {
+    let run = run.clone();
+    lua.set_global_hook(
+        mlua::HookTriggers::new().every_nth_instruction(SCRIPT_HOOK_INSTRUCTIONS),
+        move |lua, _| {
+            use std::sync::atomic::Ordering;
+            if run.was_stopped() {
+                // Fire on every line from now on, so a `pcall` loop in the
+                // script cannot swallow the error and keep going.
+                let err_run = run.clone();
+                let _ = lua.set_global_hook(
+                    mlua::HookTriggers::new()
+                        .every_line()
+                        .every_nth_instruction(1),
+                    move |_, _| Err(err_run.killed_error()),
+                );
+                return Err(run.killed_error());
+            }
+            if !run.busy.load(Ordering::Relaxed) {
+                let limit_ms = crate::connection::busy_reply_threshold_ms();
+                if limit_ms > 0 && run.start.elapsed().as_millis() >= limit_ms as u128 {
+                    run.mark_busy();
+                }
+            }
+            Ok(mlua::VmState::Continue)
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// The `-BUSY` reply for a command arriving while a script on `port` runs
+/// past `busy-reply-threshold`, if any (callers exempt the commands Redis
+/// flags `allow-busy`).
+pub fn busy_script_reply(port: u16) -> Option<&'static [u8]> {
+    if BUSY_SCRIPTS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let port = crate::connection::node_port(port);
+    let scripts = RUNNING_SCRIPTS.lock();
+    let run = scripts
+        .iter()
+        .find(|r| r.port == port && r.busy.load(std::sync::atomic::Ordering::Relaxed))?;
+    Some(busy_error(run.is_eval))
+}
+
+fn busy_error(is_eval: bool) -> &'static [u8] {
+    if is_eval {
+        b"-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\r\n"
+    } else {
+        b"-BUSY Redis is busy running a script. You can only call FUNCTION KILL or SHUTDOWN NOSAVE.\r\n"
+    }
+}
+
+/// SCRIPT KILL (`is_eval`) or FUNCTION KILL for the server on `port`: the
+/// RESP reply. Kills a script that has not written yet; the script fails
+/// with "killed by user" at its next hook check.
+pub fn kill_running_script(port: u16, is_eval: bool) -> &'static [u8] {
+    use std::sync::atomic::Ordering;
+    let port = crate::connection::node_port(port);
+    let scripts = RUNNING_SCRIPTS.lock();
+    let Some(run) = scripts.iter().find(|r| r.port == port) else {
+        return b"-NOTBUSY No scripts in execution right now.\r\n";
+    };
+    if run.wrote.load(Ordering::Relaxed) {
+        return b"-UNKILLABLE Sorry the script already executed write commands against the dataset. You can either wait the script termination or kill the server in a hard way using the SHUTDOWN NOSAVE command.\r\n";
+    }
+    if run.is_eval != is_eval {
+        // SCRIPT KILL can't end a function, nor FUNCTION KILL a script.
+        return busy_error(run.is_eval);
+    }
+    run.killed.store(true, Ordering::Relaxed);
+    b"+OK\r\n"
+}
+
 /// A registered Redis 7 Function definition
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FunctionDef {
@@ -853,6 +1058,8 @@ pub fn call_function(
     let effective_read_only = read_only || func_def.flags.iter().any(|f| f == "no-writes");
 
     let lua = Lua::new();
+    let run = ScriptRunGuard::start(db.borrow().port, false);
+    install_script_hook(&lua, &run.0)?;
     // A scope lets `redis.call`/`redis.pcall` borrow `aof` for exactly this
     // run instead of smuggling it in as a raw pointer.
     #[allow(clippy::redundant_closure_call)]
@@ -972,6 +1179,7 @@ pub fn call_function(
         })())
     })
     .map_err(|e| e.to_string())?
+    .map_err(|e| run.0.error_or_killed(e))
 }
 
 pub fn eval_script(
@@ -1037,6 +1245,8 @@ pub fn eval_script(
     }
 
     let lua = Lua::new();
+    let run = ScriptRunGuard::start(db.borrow().port, true);
+    install_script_hook(&lua, &run.0)?;
     // A scope lets `redis.call`/`redis.pcall` borrow `aof` for exactly this
     // run instead of smuggling it in as a raw pointer.
     #[allow(clippy::redundant_closure_call)]
@@ -1115,6 +1325,7 @@ pub fn eval_script(
         })())
     })
     .map_err(|e| e.to_string())?
+    .map_err(|e| run.0.error_or_killed(e))
 }
 
 fn setup_redis_lua_env<'scope, 'env: 'scope>(
@@ -2276,6 +2487,9 @@ fn register_redis_module<'scope, 'env: 'scope>(
         }
 
         crate::connection::record_cmd_stat(cmd_name);
+        if cmd.is_write_command() {
+            note_script_write();
+        }
         if cmd.is_write_command() && !crate::connection::dirty_counted_on_change(&cmd) {
             crate::snapshot::note_write();
         }
@@ -2460,6 +2674,9 @@ fn register_redis_module<'scope, 'env: 'scope>(
         }
 
         crate::connection::record_cmd_stat(cmd_name);
+        if cmd.is_write_command() {
+            note_script_write();
+        }
         if cmd.is_write_command() && !crate::connection::dirty_counted_on_change(&cmd) {
             crate::snapshot::note_write();
         }
@@ -3179,5 +3396,94 @@ mod tests {
         assert!(merge_function_libs(&mut cache, libs, "APPEND").is_err());
         assert_eq!(cache.len(), 20_000);
         assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// Runs `script` as EVAL on its own thread against a fresh shard of
+    /// `port`, once that thread has registered it as running.
+    fn spawn_script(
+        port: u16,
+        script: &'static str,
+    ) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
+        let handle = std::thread::spawn(move || {
+            let db = Rc::new(RefCell::new(ShardDb::new(port)));
+            eval_script(script, &[], &[], &db, None, false)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !RUNNING_SCRIPTS.lock().iter().any(|r| r.port == port) {
+            assert!(std::time::Instant::now() < deadline, "script never started");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        handle
+    }
+
+    #[test]
+    fn test_script_kill_without_running_script_is_notbusy() {
+        assert!(kill_running_script(64511, true).starts_with(b"-NOTBUSY"));
+        assert!(kill_running_script(64511, false).starts_with(b"-NOTBUSY"));
+        assert_eq!(busy_script_reply(64511), None);
+    }
+
+    #[test]
+    fn test_script_kill_stops_an_endless_script() {
+        let port = 64512;
+        let handle = spawn_script(port, "while true do end");
+        // FUNCTION KILL can't stop an EVAL script.
+        let reply = kill_running_script(port, false);
+        assert!(reply.starts_with(b"-BUSY") && reply.windows(11).any(|w| w == b"SCRIPT KILL"));
+        assert_eq!(kill_running_script(port, true), b"+OK\r\n");
+        let err = handle.join().unwrap().unwrap_err();
+        assert!(err.contains("killed by user with SCRIPT KILL"), "{err}");
+        assert!(!RUNNING_SCRIPTS.lock().iter().any(|r| r.port == port));
+        assert!(kill_running_script(port, true).starts_with(b"-NOTBUSY"));
+    }
+
+    #[test]
+    fn test_script_kill_is_not_swallowed_by_pcall() {
+        let port = 64513;
+        let handle = spawn_script(
+            port,
+            "local f = function() while true do end end while true do pcall(f) end",
+        );
+        assert_eq!(kill_running_script(port, true), b"+OK\r\n");
+        let err = handle.join().unwrap().unwrap_err();
+        assert!(err.contains("killed by user"), "{err}");
+    }
+
+    #[test]
+    fn test_script_kill_stops_endless_coroutine() {
+        let port = 64514;
+        let handle = spawn_script(
+            port,
+            "local co = coroutine.wrap(function() while true do end end) co()",
+        );
+        assert_eq!(kill_running_script(port, true), b"+OK\r\n");
+        let err = handle.join().unwrap().unwrap_err();
+        assert!(err.contains("killed by user"), "{err}");
+    }
+
+    #[test]
+    fn test_script_that_wrote_is_unkillable() {
+        // A shutdown would end the script (it must run to completion here).
+        let _no_shutdown = crate::shutdown::TEST_LOCK.lock();
+        let port = 64515;
+        let handle = spawn_script(
+            port,
+            "redis.call('SET', 'k', 'v') local n = 0 for i = 1, 30000000 do n = n + 1 end return n",
+        );
+        // Wait for the write, then try to kill.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !RUNNING_SCRIPTS
+            .lock()
+            .iter()
+            .any(|r| r.port == port && r.wrote.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the script never wrote"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(kill_running_script(port, true).starts_with(b"-UNKILLABLE"));
+        assert_eq!(handle.join().unwrap().unwrap(), b":30000000\r\n");
     }
 }

@@ -46,13 +46,35 @@ named library once (`FUNCTION LOAD`) and have clients invoke individual function
 name (`FCALL`) without resending source on every call — closer to a stored-procedure model than
 `EVAL`'s "send source, get SHA1 back" workflow.
 
+### 2.3a Long-running scripts: `busy-reply-threshold`, `SCRIPT KILL`, `FUNCTION KILL`
+
+A script runs synchronously on its shard's thread, so that shard serves nothing else until it
+returns. Every running script is registered (`RUNNING_SCRIPTS` in `src/scripting.rs`) and runs
+under a global Lua count hook (every 10,000 instructions, inherited by coroutines):
+
+- Past `busy-reply-threshold` (alias `lua-time-limit`, default 5000 ms, 0 = never) the script
+  is marked busy and a "Slow script detected" warning is logged. Commands then get
+  `-BUSY ... You can only call SCRIPT KILL or SHUTDOWN NOSAVE.` (`FUNCTION KILL` for an
+  `FCALL`) on every *other* shard, except the commands Redis flags `allow-busy`. A command
+  that needs the busy shard (its key lives there) can instead wait for the script to end.
+- `SCRIPT KILL` (for `EVAL`/`EVALSHA`) and `FUNCTION KILL` (for `FCALL`) set the script's kill
+  flag. At its next check the hook fails the script with `ERR Script killed by user with ...`,
+  and from then on fires on every line so a `pcall` loop can't catch the error and keep going.
+  A script that has already run a write command can't be killed (`-UNKILLABLE`, as in Redis).
+  Using the wrong kill command gets `-BUSY`, and `-NOTBUSY` means no script is running.
+- Shutdown (`SHUTDOWN`, `SIGTERM`) ends a running script the same way, so the shard can drain.
+
+Difference from Redis: the busy shard's own connections are not served while the script runs,
+including a `SCRIPT KILL` sent on one of them. With several shards a new connection usually
+lands on another shard, and the kill reaches the script from there. With `--threads 1`, the way
+to stop a runaway script is to restart the server (`SIGTERM` ends the script, as above).
+
 ### 2.4 Sandboxing and isolation model — stated honestly
 
 **Rudis's Lua environment is not sandboxed.** Each `eval_script`/`call_function` invocation
 creates a fresh `mlua::Lua::new()` instance and does not strip, replace, or restrict any part of
 the default Lua 5.4 standard library — there is no removal of `os`, `io`, `package`, or
-`debug`, no instruction-count or execution-time limit, and no `SCRIPT KILL`-style mechanism to
-interrupt a running script. This is a materially different posture from upstream Redis, which
+`debug`. This is a materially different posture from upstream Redis, which
 maintains an explicit Lua sandbox (stripping filesystem/OS access, limiting available globals)
 specifically because `EVAL` is reachable by any client with command access. Until this changes,
 `EVAL`/`EVALSHA`/`FCALL` should be treated as requiring the same trust level as direct shell

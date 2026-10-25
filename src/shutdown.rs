@@ -204,13 +204,15 @@ pub fn all_shards_drained(num_shards: usize) -> bool {
     SHARDS_DRAINED.load(Ordering::SeqCst) >= num_shards
 }
 
+/// Held by unit tests that set the process-wide shutdown flag, and by those
+/// that need it to stay clear (a running script ends when it is set).
+#[cfg(test)]
+pub(crate) static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::Mutex;
     use std::thread;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_quiesce_holds_new_batches_and_waits_for_running_ones() {

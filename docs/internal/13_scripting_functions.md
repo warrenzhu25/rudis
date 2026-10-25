@@ -308,10 +308,10 @@ do have a real wire dump format).
 an in-flight script anywhere in `scripting.rs`, so this field can never be non-nil. It reports
 `engines.LUA.libraries_count`/`functions_count` computed live from `list_functions()`.
 
-`FUNCTION KILL` (also duplicated at `connection.rs:11391` and `19033`) unconditionally replies
-`+OK\r\n` — there is no script-execution-in-progress state to check, so it never returns real
-Redis's `NOTBUSY No scripts in execution right now.` error, and it never actually kills anything
-(consistent with there being no timeout/interrupt mechanism at all — §5).
+`SCRIPT KILL` and `FUNCTION KILL` call `scripting::kill_running_script(port, is_eval)`, which
+looks the server's running script up in `RUNNING_SCRIPTS` and replies `-NOTBUSY`, `-UNKILLABLE`
+(the script already wrote), `-BUSY` (wrong kill command for the script type) or `+OK` after
+setting the script's kill flag (see §6).
 
 ---
 
@@ -348,11 +348,15 @@ author.
 
 ## 6. Concrete Numbers, Limits, and What's Absent
 
-* No execution timeout: no instruction-count budget, no wall-clock deadline, no
-  `lua-time-limit`-equivalent configuration key is read anywhere in `src/scripting.rs`, and
-  `FUNCTION KILL` cannot interrupt a running script (it doesn't even track one — §4). An infinite
-  Lua loop (`while true do end`) blocks the entire shard's reactor thread forever, since script
-  execution is fully synchronous on the calling shard.
+* Long-running scripts: `eval_script`/`call_function` register the run (`ScriptRunGuard`) and
+  install a global count hook (`install_script_hook`, every `SCRIPT_HOOK_INSTRUCTIONS` = 10,000
+  instructions). The hook marks the script busy past `busy-reply-threshold`
+  (`connection::busy_reply_threshold_ms`), after which `execute_command_inner` answers non
+  `allow-busy` commands with `scripting::busy_script_reply`. When the kill flag is set (or a
+  shutdown starts), the hook fails the script and switches itself to fire on every line. `redis.call`/
+  `redis.pcall` of a write command sets `wrote`, which makes the script `-UNKILLABLE`. A script
+  still blocks its own shard's reactor until it ends; the kill has to come from a connection
+  on another shard.
 * No sandboxing: `Lua::new()` (used identically at `scripting.rs:60`, `434`, `498`) is `mlua`'s
   default full-library constructor — scripts have unrestricted access to Lua's standard library
   (`os`, `io`, `debug`, etc.), including `os.execute`, arbitrary file I/O via `io.open`, and so on.
@@ -413,8 +417,7 @@ author.
   own match arms.
 * **Gotcha 2**: there is no sandboxing — a script has full access to Lua's standard library
   (`os`, `io`, `debug`, etc.) via `mlua::Lua::new()`'s defaults, and no execution-time or
-  instruction-count limit exists anywhere (§6). `FUNCTION KILL` always replies `+OK` and kills
-  nothing.
+  only an instruction-count hook that serves `-BUSY` and `SCRIPT KILL`/`FUNCTION KILL` (§6).
 * **Gotcha 3**: `FCALL` re-executes a function library's entire top-level source on every call
   (to re-discover/re-capture the requested closure) — library-level initialization code runs once
   per `FCALL`, not once at load time (§3.4).

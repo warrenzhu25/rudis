@@ -558,7 +558,9 @@ falls out of the shard's single-threaded event loop for free, with no explicit l
 
 **Key design choice, stated plainly by the design doc itself: Rudis's Lua environment is not sandboxed.**
 Each invocation constructs a fresh `mlua::Lua::new()` with the full default standard library present (`os`,
-`io`, `package`, `debug` all available), no instruction/time limit, and no `SCRIPT KILL`. `EVAL`/`EVALSHA`/
+`io`, `package`, `debug` all available). Scripts run under an instruction-count hook: past
+`busy-reply-threshold` other shards reply `-BUSY`, and `SCRIPT KILL`/`FUNCTION KILL` stop a script that
+has not written yet (design doc §2.3a). `EVAL`/`EVALSHA`/
 `FCALL` should be treated as requiring the same trust level as direct shell access.
 
 **Key invariants.**

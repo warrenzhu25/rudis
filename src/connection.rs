@@ -1646,6 +1646,39 @@ pub fn paused_clients_count() -> usize {
     PAUSED_CLIENTS.lock().len()
 }
 
+/// Commands Redis flags `allow-busy`: served while a script runs past
+/// `busy-reply-threshold`, when every other command gets `-BUSY`.
+fn allowed_while_busy(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Auth { .. }
+            | Command::Hello { .. }
+            | Command::Client(
+                ClientSubcommand::Caching(_)
+                    | ClientSubcommand::GetName
+                    | ClientSubcommand::GetRedir
+                    | ClientSubcommand::Id
+                    | ClientSubcommand::NoEvict(_)
+                    | ClientSubcommand::NoTouch(_)
+                    | ClientSubcommand::Reply(_)
+                    | ClientSubcommand::SetInfo { .. }
+                    | ClientSubcommand::SetName(_)
+            )
+            | Command::Discard
+            | Command::FunctionKill
+            | Command::FunctionStats
+            | Command::Multi
+            | Command::Quit
+            | Command::Replconf(_)
+            | Command::Reset
+            | Command::ScriptKill
+            | Command::Select(_)
+            | Command::Shutdown { .. }
+            | Command::Unwatch
+            | Command::Watch(_)
+    )
+}
+
 pub fn should_pause_command(cmd: &Command, write_only: bool) -> bool {
     if matches!(
         cmd,
@@ -2039,7 +2072,7 @@ pub fn set_node_port(shard_port: u16, base_port: u16) {
 }
 
 /// The base port of the node `port` belongs to.
-fn node_port(port: u16) -> u16 {
+pub(crate) fn node_port(port: u16) -> u16 {
     NODE_PORTS.read().get(&port).copied().unwrap_or(port)
 }
 
@@ -3095,6 +3128,12 @@ pub fn key_load_delay_us() -> u64 {
 }
 static CONFIG_LUA_TIME_LIMIT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(5000);
+
+/// `busy-reply-threshold` (alias `lua-time-limit`) in milliseconds: how long
+/// a script runs before other clients get `-BUSY` (0: never).
+pub fn busy_reply_threshold_ms() -> u64 {
+    CONFIG_LUA_TIME_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
 static CONFIG_OOM_SCORE_ADJ: std::sync::LazyLock<parking_lot::RwLock<String>> =
     std::sync::LazyLock::new(|| parking_lot::RwLock::new("no".to_string()));
 static CONFIG_OOM_SCORE_ADJ_VALUES: std::sync::LazyLock<parking_lot::RwLock<String>> =
@@ -10671,6 +10710,12 @@ async fn execute_command_inner(
     };
 
     wait_if_client_paused(router.port, client_id, &cmd).await;
+    if !allowed_while_busy(&cmd)
+        && let Some(busy) = crate::scripting::busy_script_reply(router.port)
+    {
+        out.extend_from_slice(busy);
+        return false;
+    }
     if has_monitor_clients() && !matches!(cmd, Command::Monitor | Command::Reset | Command::Quit) {
         let addr_s = client_registry
             .borrow()
@@ -17813,7 +17858,7 @@ async fn execute_command_inner(
             false
         }
         Command::ScriptKill => {
-            out.extend_from_slice(b"-NOTBUSY No scripts in execution right now.\r\n");
+            out.extend_from_slice(crate::scripting::kill_running_script(router.port, true));
             false
         }
         Command::ScriptFlush => {
@@ -18050,7 +18095,7 @@ async fn execute_command_inner(
             false
         }
         Command::FunctionKill => {
-            out.extend_from_slice(b"-NOTBUSY No scripts in execution right now.\r\n");
+            out.extend_from_slice(crate::scripting::kill_running_script(router.port, false));
             false
         }
         Command::FunctionStats => {
