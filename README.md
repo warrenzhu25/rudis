@@ -371,6 +371,11 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 ```
 
+If a shard thread dies (a panic outside a single client's command, which is caught and counted
+per connection), the process logs `FATAL: shard N panicked: ...` and exits with status 1 rather
+than serving on without that shard's keys. Run it under a supervisor that restarts it
+(`Restart=always`/`on-failure`, a container restart policy); it recovers from the AOF/RDB.
+
 Create the `rudis` user/group and a data directory it owns (matching `dir` in `rudis.conf`)
 before enabling the unit. If the host or container has a restricted CPU set (cgroups, a VM with
 fewer cores than the physical host), pass `--no-pin` — `core_affinity` pinning assumes it can

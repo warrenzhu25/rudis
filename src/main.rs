@@ -617,17 +617,25 @@ fn main() {
             .name(format!("rudis-shard-{}", shard_id))
             .stack_size(rudis::server::SHARD_THREAD_STACK_SIZE)
             .spawn(move || {
-                run_shard_worker(
-                    shard_id,
-                    num_shards,
-                    port,
-                    shard_senders,
-                    rx,
-                    core_id,
-                    shard_aof_config,
-                    shard_tls_config,
-                    cluster_enabled,
-                );
+                let res = rudis::server::supervise_shard(shard_id, || {
+                    run_shard_worker(
+                        shard_id,
+                        num_shards,
+                        port,
+                        shard_senders,
+                        rx,
+                        core_id,
+                        shard_aof_config,
+                        shard_tls_config,
+                        cluster_enabled,
+                    )
+                });
+                if let Err(e) = res {
+                    // The other shards can't serve its keys nor finish requests
+                    // waiting on it: exit so the supervisor restarts the server.
+                    log_fatal!("FATAL: {}; exiting", e);
+                    std::process::exit(1);
+                }
             })
             .expect("Failed to spawn shard worker thread");
 

@@ -34431,3 +34431,40 @@ fn test_script_kill_ends_endless_script_e2e() {
         "+OK\r\n"
     );
 }
+
+/// A shard thread that dies takes the process down (exit 1), so a
+/// supervisor restarts it, instead of the other shards serving on without
+/// it. Here shard 1 panics as it starts (a fault-injection hook).
+#[test]
+fn test_dead_shard_thread_exits_the_process_e2e() {
+    let port = 19731;
+    let mut child = rudis_bin()
+        .args(["--port", &port.to_string(), "--threads", "2", "--no-pin"])
+        .env("RUDIS_FAILPOINT_SHARD_PANIC", "1")
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rudis");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("rudis kept running with a dead shard");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("FATAL: shard 1 panicked"), "{stderr}");
+}

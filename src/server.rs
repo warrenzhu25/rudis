@@ -36,6 +36,30 @@ use crate::resp::Command;
 use crate::router::Router;
 use crate::shard::{ShardDb, ShardMessage};
 
+/// Runs one shard's worker to its end and reports whether its exit is fatal
+/// for the process.
+///
+/// A shard that dies, by panicking or by returning while the server is not
+/// shutting down, can't be replaced: its keys can't be served and requests
+/// other shards send it get no answer. A process that keeps running in that
+/// state looks healthy to its supervisor (systemd `Restart=`, Kubernetes),
+/// so the caller should exit and let the supervisor restart the whole
+/// server, which then recovers from the AOF/RDB.
+pub fn supervise_shard(shard_id: usize, worker: impl FnOnce()) -> Result<(), String> {
+    match std::panic::catch_unwind(AssertUnwindSafe(worker)) {
+        Err(panic) => Err(format!(
+            "shard {} panicked: {}",
+            shard_id,
+            crate::log::panic_message(&*panic)
+        )),
+        Ok(()) if !crate::shutdown::is_shutting_down() => Err(format!(
+            "shard {} stopped while the server was not shutting down",
+            shard_id
+        )),
+        Ok(()) => Ok(()),
+    }
+}
+
 thread_local! {
     /// Client id sequence for connections adopted from another shard.
     ///
@@ -186,6 +210,12 @@ pub fn run_shard_worker(
     tls_config: Option<crate::tls::TlsWorkerConfig>,
     cluster_enabled: bool,
 ) {
+    // Fault injection for the dead-shard test: this shard dies on start.
+    if std::env::var("RUDIS_FAILPOINT_SHARD_PANIC").ok().as_deref()
+        == Some(shard_id.to_string().as_str())
+    {
+        panic!("RUDIS_FAILPOINT_SHARD_PANIC: shard {} panics", shard_id);
+    }
     if let Some(core) = core_id {
         core_affinity::set_for_current(core);
     }
@@ -2714,6 +2744,21 @@ mod tests {
             })
             .expect("spawn");
         assert_eq!(h.join().unwrap(), 7);
+    }
+
+    #[test]
+    fn test_dead_shard_is_fatal_unless_shutting_down() {
+        let _guard = crate::shutdown::TEST_LOCK.lock();
+        crate::shutdown::reset_shutdown();
+        let err = supervise_shard(3, || panic!("boom")).unwrap_err();
+        assert!(err.contains("shard 3 panicked: boom"), "{err}");
+        let err = supervise_shard(1, || {}).unwrap_err();
+        assert!(err.contains("shard 1 stopped"), "{err}");
+        crate::shutdown::request_shutdown();
+        assert_eq!(supervise_shard(1, || {}), Ok(()));
+        // A panic during shutdown is still reported.
+        assert!(supervise_shard(2, || panic!("late")).is_err());
+        crate::shutdown::reset_shutdown();
     }
 
     #[monoio::test]
