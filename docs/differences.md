@@ -8,7 +8,7 @@ This document summarizes the architectural, operational, and semantic difference
 
 | Feature / Property | Redis 7.2 | Dragonfly v1.39 | Rudis |
 | :--- | :--- | :--- | :--- |
-| **Language** | C99 | C++20 | **Rust (edition 2024, requires Rust 1.85+)** |
+| **Language** | C99 | C++20 | **Rust (edition 2024, toolchain pinned to 1.99 in `rust-toolchain.toml`)** |
 | **Concurrency Model** | Single-threaded event loop (I/O threads in 6.0+) | Shared-nothing with Boost.Fibers and epoll | **Shared-nothing Thread-Per-Core on Linux `io_uring` (Monoio)** |
 | **Ingress Load Balancing** | Single listener socket | Single listener socket + thread dispatch | **Kernel `SO_REUSEPORT` 4-tuple balancing** |
 | **Kernel Bypass & Hardware** | None (standard libc sockets) | None (standard libc sockets) | **AF_XDP and `SO_ZEROCOPY` code paths exist but are not wired onto the live network path; kernel TLS offload is not implemented (TLS is userspace `rustls` only) — see [architecture.md](architecture.md) and [design/10_kernel_bypass_xdp.md](design/10_kernel_bypass_xdp.md)** |

@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/warrenzhu25/rudis/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status"></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.85+-blue.svg" alt="Rust Version"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.99-blue.svg" alt="Rust Version"></a>
   <a href="https://kernel.dk/io_uring.pdf"><img src="https://img.shields.io/badge/Linux-io__uring-orange.svg" alt="Linux io_uring"></a>
 </p>
 
@@ -192,8 +192,8 @@ at 16 physical cores.
 
 ### 1. Build from Source
 
-Rudis targets Linux (for `io_uring`) and requires a Rust toolchain new enough for the 2024
-edition (`edition = "2024"` in `Cargo.toml`), i.e. **Rust 1.85 or newer**:
+Rudis targets Linux (for `io_uring`) and builds with the Rust toolchain pinned in
+`rust-toolchain.toml` (**Rust 1.99**; `rustup` installs it on the first `cargo` run):
 
 ```bash
 git clone https://github.com/warrenzhu25/rudis.git
@@ -350,10 +350,14 @@ degraded deployment is visible in logs instead of silently running with a bad ke
 
 ### Running as a systemd Service
 
+The repository ships [`rudis.service`](rudis.service):
+
 ```ini
 [Unit]
-Description=Rudis in-memory datastore
-After=network.target
+Description=Rudis High-Performance In-Memory Data Store (io_uring)
+After=network.target network-online.target
+Wants=network-online.target
+Documentation=https://github.com/warrenzhu25/rudis
 
 [Service]
 Type=notify
@@ -361,11 +365,23 @@ NotifyAccess=all
 User=rudis
 Group=rudis
 ExecStart=/usr/local/bin/rudis -c /etc/rudis/rudis.conf
+Restart=always
+RestartSec=3s
 TimeoutStopSec=300s
-Restart=on-failure
-RestartSec=2
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Hardening & Production Limits
 LimitNOFILE=65536
+LimitNPROC=65536
 LimitMEMLOCK=infinity
+TasksMax=infinity
+
+# Security Sandboxing
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -383,7 +399,8 @@ address the physical core IDs it sees, which will not line up 1:1 inside a const
 
 ### Docker
 
-A multi-stage [`Dockerfile`](Dockerfile) is included: a `rust:1.85-bookworm` build stage and a
+A multi-stage [`Dockerfile`](Dockerfile) is included: a `rust:1.99-bookworm` build stage (the
+toolchain pinned in `rust-toolchain.toml`) and a
 `debian:bookworm-slim` runtime stage that runs as a non-root `rudis` system user, with
 `/var/lib/rudis` declared as a volume.
 
@@ -395,7 +412,9 @@ docker run -d --name rudis \
   rudis:latest
 ```
 
-The image's `CMD` defaults to `--port 6379 --aof true --aof-dir /var/lib/rudis`. Note that
+The image's `CMD` defaults to `--port 6379 --aof true --aof-dir /var/lib/rudis --protected-mode no`
+(protected mode would refuse every client arriving over the container network; set `requirepass`
+before publishing the port beyond a trusted network). Note that
 `--aof` takes an explicit `true`/`false` token (it is `Option<bool>` in [`src/main.rs`](src/main.rs),
 not a bare flag) — passing bare `--aof` immediately followed by another `--flag` fails to parse
 and the container will not start; any `docker run ... rudis:latest <args>` override must follow
