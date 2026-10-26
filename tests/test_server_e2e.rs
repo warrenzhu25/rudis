@@ -35680,20 +35680,31 @@ fn test_shutdown_abort_and_now_e2e() {
     let _ = replica.wait();
 }
 
-/// A master restarted from its RDB keeps replication off until a replica
-/// comes (writes don't pay for a backlog nobody uses): INFO shows
-/// repl_backlog_active:0. A replica returning before any write continues
-/// the saved history with a partial resync; one returning after a write
-/// full-syncs and gets that write.
+/// A master restarted from its RDB keeps its backlog for replicas to come
+/// back to, as Redis does: one returning promptly continues with a partial
+/// resync even after a write. With no replica back within the restart
+/// grace (at most repl-backlog-ttl), the backlog is released
+/// (repl_backlog_active:0, writes no longer pay for it) and a replica
+/// returning later full-syncs.
 #[test]
-fn test_restarted_master_turns_the_backlog_on_with_its_first_replica_e2e() {
+fn test_restarted_master_releases_an_unused_backlog_e2e() {
     let (mport, rport) = (29921u16, 29922u16);
     let mdir = std::env::temp_dir().join(format!("rudis-lazybl-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&mdir);
     std::fs::create_dir_all(&mdir).unwrap();
     let md = mdir.to_str().unwrap().to_string();
     let ms = mport.to_string();
-    let margs = ["--port", &ms, "--threads", "2", "--no-pin", "--dir", &md];
+    let margs = [
+        "--port",
+        &ms,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &md,
+        "--repl-backlog-ttl",
+        "3",
+    ];
     let rs = rport.to_string();
     let mut master = spawn_rudis_listening(&margs, mport);
     let mut replica = spawn_rudis_listening(
@@ -35721,8 +35732,18 @@ fn test_restarted_master_turns_the_backlog_on_with_its_first_replica_e2e() {
             .find_map(|l| l.strip_prefix(&format!("{name}:")).map(str::to_string))
             .unwrap_or_else(|| panic!("no {name}: {info}"))
     };
-    // Restarts the master from its RDB with the replica stopped, so it
-    // can't come back before `between` ran on the new master.
+    let wait_value = |c: &mut TcpStream, want: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while resp_cmd(c, &["GET", "k"]) != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replica lacks {want:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // Restarts the master from its RDB with the replica stopped, runs
+    // `between` on the new master, then lets the replica come back.
     let mut restart = |master: &mut std::process::Child, between: &dyn Fn(&mut TcpStream)| {
         // SAFETY: kill(2) on our own live child.
         unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGSTOP) };
@@ -35731,32 +35752,36 @@ fn test_restarted_master_turns_the_backlog_on_with_its_first_replica_e2e() {
         let _ = master.wait();
         *master = spawn_rudis_listening(&margs, mport);
         let mut m = connect(mport);
-        assert_eq!(stat(&mut m, "repl_backlog_active"), "0");
+        assert_eq!(stat(&mut m, "repl_backlog_active"), "1");
         between(&mut m);
         // SAFETY: as above.
         unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGCONT) };
         wait_for_master_link(&mut r);
         m
     };
-    // Nothing written in between: the replica continues.
-    let mut m = restart(&mut master, &|_| {});
-    assert_eq!(stat(&mut m, "repl_backlog_active"), "1");
-    assert_eq!(stat(&mut m, "sync_partial_ok"), "1");
-    assert_eq!(stat(&mut m, "sync_full"), "0");
-    // A write in between: the replica full-syncs and has it.
+    // Back at once, after a write: partial resync, write included.
     let mut m = restart(&mut master, &|m| {
         assert_eq!(resp_cmd(m, &["SET", "k", "2"]), "+OK\r\n");
     });
+    assert_eq!(stat(&mut m, "sync_partial_ok"), "1");
+    assert_eq!(stat(&mut m, "sync_full"), "0");
+    wait_value(&mut connect(rport), "$1\r\n2\r\n");
+    // Back after the grace: the backlog was released; full sync.
+    let mut m = restart(&mut master, &|m| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while stat(m, "repl_backlog_active") != "0" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "backlog never released"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(resp_cmd(m, &["SET", "k", "3"]), "+OK\r\n");
+    });
     assert_eq!(stat(&mut m, "sync_full"), "1");
     assert_eq!(stat(&mut m, "sync_partial_ok"), "0");
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while resp_cmd(&mut r, &["GET", "k"]) != "$1\r\n2\r\n" {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "replica missed the write"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    assert_eq!(stat(&mut m, "repl_backlog_active"), "1");
+    wait_value(&mut connect(rport), "$1\r\n3\r\n");
     for c in [&mut master, &mut replica] {
         let _ = c.kill();
         let _ = c.wait();

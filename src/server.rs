@@ -2389,6 +2389,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                 while !crate::shutdown::is_shutting_down() {
                     monoio::time::sleep(std::time::Duration::from_millis(100)).await;
                     tick += 1;
+                    if tick.is_multiple_of(10) {
+                        crate::replication::get_replication_hub(r.base_port).release_idle_backlog();
+                    }
                     let snap = crate::snapshot::state(r.base_port);
                     // `in_progress` too: a save releases `is_saving` just
                     // before it records what it covered.

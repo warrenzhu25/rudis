@@ -568,10 +568,10 @@ pub struct ReplicationHub {
     pub link_phase: std::sync::atomic::AtomicU8,
     /// The coordinated failover (FAILOVER command) under way, if any.
     failover: Mutex<Failover>,
-    /// Set when a master restored the history saved in its RDB without
-    /// turning the backlog on: `unlogged_change_marker()` then, plus one
-    /// (0: nothing pending). See `settle_restored_history`.
-    restored_at_changes: AtomicU64,
+    /// A master restarted from its RDB with no replica back yet: its
+    /// backlog is released after `RESTART_BACKLOG_GRACE_SECS` (see
+    /// `release_idle_backlog`).
+    restart_grace: AtomicBool,
     /// Set while a failover has turned us into the target's replica: the
     /// replica worker then sends `PSYNC <replid> <offset> FAILOVER`.
     failover_in_progress: AtomicBool,
@@ -599,6 +599,14 @@ impl Drop for ApplyGuard {
 /// `repl-backlog-ttl`: seconds without replicas after which a master drops
 /// its backlog (0: never), so a replica returning after that full-syncs.
 pub static REPL_BACKLOG_TTL: AtomicU64 = AtomicU64::new(3600);
+
+/// After a restart from an RDB, how long (seconds, at most
+/// `repl-backlog-ttl`) a master keeps its backlog for replicas to come
+/// back to. Shorter than Redis's (which waits repl-backlog-ttl, an hour by
+/// default): feeding it costs rudis much more (see `release_idle_backlog`),
+/// and a server that never had replicas would pay that for an hour after
+/// every restart. Replicas reconnect within seconds.
+pub const RESTART_BACKLOG_GRACE_SECS: u64 = 60;
 
 /// `repl-ping-replica-period`: a master PINGs its replicas this often
 /// (seconds), through the replication stream like Redis.
@@ -724,7 +732,7 @@ impl ReplicationHub {
             last_master_io_secs: AtomicU64::new(0),
             link_phase: std::sync::atomic::AtomicU8::new(LINK_CONNECTING),
             failover: Mutex::new(Failover::default()),
-            restored_at_changes: AtomicU64::new(0),
+            restart_grace: AtomicBool::new(false),
             failover_in_progress: AtomicBool::new(false),
         }
     }
@@ -1001,46 +1009,15 @@ impl ReplicationHub {
             self.master_repl_offset.store(offset, Ordering::SeqCst);
             backlog.clear(offset);
         }
-        if as_replica {
-            self.activate_backlog();
-        } else {
-            // Unlike Redis, a master does not turn the backlog on here:
-            // every shard's writes would go through it (one lock for all of
-            // them, ~2.5x slower SET on 8 threads) for up to
-            // repl-backlog-ttl with no replica at all. It is turned on when
-            // the first replica comes; the saved history is still
-            // continued then if nothing was written meanwhile.
-            self.restored_at_changes
-                .store(unlogged_change_marker() + 1, Ordering::SeqCst);
-        }
-    }
-
-    /// When the first replica comes after a master restored its saved
-    /// history (see `restore_saved_history`): turns the backlog on, and if
-    /// writes happened before (they reached no backlog), forgets the saved
-    /// history, so a replica asking to continue it full-syncs rather than
-    /// partially resyncing past writes it never got. Called with the
-    /// backlog lock held.
-    fn settle_restored_history(&self) {
-        if self.restored_at_changes.load(Ordering::SeqCst) != 0 {
-            // On first, then checked: a write racing with this either
-            // counts as a change or reaches the backlog.
-            self.activate_backlog();
-            self.settle_restored_history_at(unlogged_change_marker());
-        }
-    }
-
-    fn settle_restored_history_at(&self, marker_now: u64) {
-        let at = self.restored_at_changes.swap(0, Ordering::SeqCst);
-        if at == 0 {
-            return;
+        // Like Redis, which creates the backlog at load time, so replicas
+        // coming back continue with a partial resync even after writes
+        // and expirations. A master with no replica back within
+        // RESTART_BACKLOG_GRACE_SECS releases it (`release_idle_backlog`).
+        if !as_replica {
+            self.no_replicas_since.store(unix_secs(), Ordering::Relaxed);
+            self.restart_grace.store(true, Ordering::Relaxed);
         }
         self.activate_backlog();
-        if marker_now + 1 != at {
-            let mut ids = self.ids.write();
-            ids.replid2 = NULL_REPLID.to_string();
-            ids.second_offset = -1;
-        }
     }
 
     /// The `repl-id` / `repl-offset` / `repl-stream-db` to save in an RDB: a
@@ -1230,7 +1207,7 @@ impl ReplicationHub {
         sender: flume::Sender<Vec<u8>>,
         full_sync: Option<FullSyncCut>,
     ) -> Arc<ConnectedReplica> {
-        self.settle_restored_history();
+        self.restart_grace.store(false, Ordering::Relaxed);
         let peer = self.pending_peers.lock().remove(&id).unwrap_or_default();
         let rep = Arc::new(ConnectedReplica {
             id,
@@ -1526,7 +1503,47 @@ impl ReplicationHub {
     fn backlog_idle_expired(&self) -> bool {
         let since = self.no_replicas_since.load(Ordering::Relaxed);
         let ttl = REPL_BACKLOG_TTL.load(Ordering::Relaxed);
+        let ttl = if self.restart_grace.load(Ordering::Relaxed) {
+            ttl.min(RESTART_BACKLOG_GRACE_SECS)
+        } else {
+            ttl
+        };
         since != 0 && ttl != 0 && unix_secs().saturating_sub(since) >= ttl
+    }
+
+    /// Releases the backlog of a master that has had no replica for
+    /// `repl-backlog-ttl` (`RESTART_BACKLOG_GRACE_SECS` after a restart),
+    /// as Redis's replication cron does: new replication id, no replid2,
+    /// nothing kept, and writes no longer appended (every shard appends to
+    /// the one backlog, ~2.5x slower SET on 8 threads). A replica coming
+    /// later full-syncs. Called about once a second.
+    pub fn release_idle_backlog(&self) {
+        if !self.replication_active.load(Ordering::Relaxed)
+            || !self.is_master()
+            || self.has_replicas.load(Ordering::Acquire)
+            || self.has_shard_flows.load(Ordering::Acquire)
+            || !self.backlog_idle_expired()
+        {
+            return;
+        }
+        let mut backlog = self.backlog.write();
+        if !self.replicas.read().is_empty() {
+            return;
+        }
+        let since = self.no_replicas_since.swap(0, Ordering::Relaxed);
+        self.restart_grace.store(false, Ordering::Relaxed);
+        self.replication_active.store(false, Ordering::Release);
+        {
+            let mut ids = self.ids.write();
+            ids.replid = new_replid();
+            ids.replid2 = NULL_REPLID.to_string();
+            ids.second_offset = -1;
+        }
+        backlog.clear(self.master_repl_offset.load(Ordering::SeqCst));
+        crate::log_notice!(
+            "Replication backlog freed after {} seconds without connected replicas.",
+            unix_secs().saturating_sub(since)
+        );
     }
 
     /// Whether `req_replid` names our history up to `target_offset` (the
@@ -1566,7 +1583,6 @@ impl ReplicationHub {
         // change lands between the diff and the live stream (and our ids
         // cannot change meanwhile).
         let mut backlog = self.backlog.write();
-        self.settle_restored_history();
         if !self.can_serve_replicas() || !self.replid_matches(req_replid, target_offset) {
             return None;
         }
@@ -1954,14 +1970,6 @@ impl ReplicationHub {
             }
         }
     }
-}
-
-/// Grows with every change to any dataset in this process: client writes,
-/// expirations and evictions (which replicas get as DELs).
-fn unlogged_change_marker() -> u64 {
-    crate::snapshot::changes_total()
-        .wrapping_add(crate::table::get_expired_keys())
-        .wrapping_add(crate::table::get_evicted_keys())
 }
 
 /// Redis's coordinated failover states (INFO `master_failover_state`).
@@ -4799,39 +4807,38 @@ mod tests {
         assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 0);
     }
 
-    /// A master restoring its saved history leaves replication off (no
-    /// write pays for a backlog nobody uses). The first replica turns it
-    /// on and may continue the saved history only if nothing changed in
-    /// between.
+    /// A master restarted from its RDB keeps the backlog only for the
+    /// restart grace; then (no replica back) it is released: replication
+    /// off, a new id and no replid2, so a later replica full-syncs.
     #[test]
-    fn test_restored_history_turns_the_backlog_on_lazily() {
+    fn test_restarted_master_releases_an_unused_backlog() {
         let saved = "4".repeat(40);
         let hub = ReplicationHub::new(19986);
-        hub.replication_active.store(false, Ordering::SeqCst);
         hub.restore_saved_history(&saved, 300, 0, false);
-        assert!(
-            !hub.replication_active.load(Ordering::SeqCst),
-            "turned on at load"
-        );
-        // No change since: a replica continues the saved history.
-        hub.restored_at_changes.store(7 + 1, Ordering::SeqCst);
-        hub.settle_restored_history_at(7);
-        let (tx, _rx) = flume::unbounded();
-        let (_, diff, rep) = hub
-            .try_partial_resync(1, tx, &saved, 301)
-            .expect("continues");
-        assert!(diff.is_empty());
         assert!(hub.replication_active.load(Ordering::SeqCst));
-        hub.unregister_replica(rep.id);
-
-        // A change before the first replica: the saved history is gone.
+        hub.release_idle_backlog();
+        assert!(
+            hub.replication_active.load(Ordering::SeqCst),
+            "released at once"
+        );
+        // The grace has passed with no replica.
+        hub.no_replicas_since
+            .store(unix_secs() - RESTART_BACKLOG_GRACE_SECS, Ordering::SeqCst);
+        hub.release_idle_backlog();
+        assert!(!hub.replication_active.load(Ordering::SeqCst));
+        let ids = hub.ids();
+        assert_eq!(ids.replid2, NULL_REPLID);
+        assert_ne!(ids.replid, saved);
+        assert!(!hub.can_partial_resync(&saved, 301));
+        // A replica back within the grace keeps it (repl-backlog-ttl then).
         let hub = ReplicationHub::new(19987);
         hub.restore_saved_history(&saved, 300, 0, false);
-        hub.restored_at_changes.store(7 + 1, Ordering::SeqCst);
-        hub.settle_restored_history_at(8);
         let (tx, _rx) = flume::unbounded();
-        assert!(hub.try_partial_resync(2, tx, &saved, 301).is_none());
-        assert_eq!(hub.ids().replid2, NULL_REPLID);
+        let rep = hub.register_replica(5, tx);
+        hub.unregister_replica(rep.id);
+        hub.no_replicas_since
+            .store(unix_secs() - RESTART_BACKLOG_GRACE_SECS, Ordering::SeqCst);
+        hub.release_idle_backlog();
         assert!(hub.replication_active.load(Ordering::SeqCst));
     }
 
