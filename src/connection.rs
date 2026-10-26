@@ -3322,6 +3322,13 @@ pub fn apply_config_value(
         }
         "shutdown-timeout" => crate::replication::SHUTDOWN_TIMEOUT_SECS
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "repl-timeout" => {
+            let secs: u64 = parse_config_num(name, val_str)?;
+            if secs == 0 {
+                return Err(format!("argument for '{}' must be greater than 0", name));
+            }
+            crate::replication::REPL_TIMEOUT_SECS.store(secs, Ordering::Relaxed)
+        }
         "repl-backlog-ttl" => crate::replication::REPL_BACKLOG_TTL
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
         "repl-ping-replica-period" | "repl-ping-slave-period" => {
@@ -3827,7 +3834,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
-    let all_configs: [(&str, String); 96] = [
+    let all_configs: [(&str, String); 97] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
@@ -4032,6 +4039,12 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         ("repl-ping-replica-period", repl_ping_period.clone()),
         ("repl-ping-slave-period", repl_ping_period),
         (
+            "repl-timeout",
+            crate::replication::REPL_TIMEOUT_SECS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
             "shutdown-timeout",
             crate::replication::SHUTDOWN_TIMEOUT_SECS
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -4126,6 +4139,19 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 format!(
                     "-ERR CONFIG SET failed (possibly related to argument '{}') - {}\r\n",
                     p_str, e
+                )
+                .as_bytes(),
+            );
+            return;
+        } else if matches!(
+            p_str.as_str(),
+            "repl-timeout" | "repl-ping-replica-period" | "repl-ping-slave-period"
+        ) && !val_str.parse::<u64>().is_ok_and(|v| v > 0)
+        {
+            out.extend_from_slice(
+                format!(
+                    "-ERR CONFIG SET failed (possibly related to argument '{}') - argument must be greater than 0\r\n",
+                    p_str
                 )
                 .as_bytes(),
             );

@@ -59,6 +59,10 @@ A script runs on its shard's thread until it returns. Past `busy-reply-threshold
 
 - Point a replica at a master with `REPLICAOF <host> <port>` (or `replicaof` in the config).
   `INFO replication` shows the link and offsets.
+- **Dead links**: a replica that hears nothing from its master (no data, no PING) for
+  `repl-timeout` seconds (default 60) marks the link down and reconnects, and a master drops
+  a replica that hasn't acked for that long. Keep `repl-timeout` above
+  `repl-ping-replica-period` (default 10), or idle links time out.
 - **Promote a replica**: `REPLICAOF NO ONE` on it, then repoint clients and the other
   replicas. There is no Sentinel: promotion is manual or done by your orchestrator.
 - In cluster mode, `CLUSTER FAILOVER` on a replica switches roles without losing

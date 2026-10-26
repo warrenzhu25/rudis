@@ -56,6 +56,8 @@ pub struct ConnectedReplica {
     pub sender: flume::Sender<Vec<u8>>,
     pub listening_port: AtomicU64,
     pub ack_offset: AtomicU64,
+    /// The replica has acked at least once (so `repl-timeout` applies).
+    acked: AtomicBool,
     /// The offset the replica last reported fsynced to its AOF (`REPLCONF
     /// ACK <offset> FACK <aofoffset>`).
     pub aof_ack_offset: AtomicU64,
@@ -582,6 +584,51 @@ pub static REPL_BACKLOG_TTL: AtomicU64 = AtomicU64::new(3600);
 /// (seconds), through the replication stream like Redis.
 pub static REPL_PING_PERIOD: AtomicU64 = AtomicU64::new(10);
 
+/// `repl-timeout` (seconds): a replica that hears nothing from its master
+/// for this long (no data, no PING) drops the link and reconnects, and a
+/// master drops a replica that has not acked for this long. Without it a
+/// master or replica that vanished without closing the connection (host
+/// down, network partition) kept the link "up" until TCP gave up, which
+/// can take hours.
+pub static REPL_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(60);
+
+fn repl_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(REPL_TIMEOUT_SECS.load(Ordering::Relaxed).max(1))
+}
+
+/// One read from the master, failing with `TimedOut` after `repl-timeout`
+/// without data. On a timeout `buf` is left empty: the caller reconnects.
+async fn read_from_master<R: monoio::io::AsyncReadRent>(
+    stream: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    read_within(stream, buf, repl_timeout()).await
+}
+
+async fn read_within<R: monoio::io::AsyncReadRent>(
+    stream: &mut R,
+    buf: &mut Vec<u8>,
+    timeout: std::time::Duration,
+) -> std::io::Result<usize> {
+    match monoio::time::timeout(timeout, stream.read(std::mem::take(buf))).await {
+        Ok((res, returned)) => {
+            *buf = returned;
+            res
+        }
+        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+    }
+}
+
+fn log_bulk_timeout() {
+    crate::log_warning!(
+        "Timeout receiving bulk data from MASTER... If the problem persists try to set the 'repl-timeout' parameter in redis.conf to a larger value."
+    );
+}
+
+fn is_timeout<T>(res: &std::io::Result<T>) -> bool {
+    matches!(res, Err(e) if e.kind() == std::io::ErrorKind::TimedOut)
+}
+
 /// See `ReplicationHub::pending_peers`.
 #[derive(Default, Clone)]
 struct PendingPeer {
@@ -961,6 +1008,7 @@ impl ReplicationHub {
                     }
                     return;
                 }
+                hub.drop_timed_out_replicas(REPL_TIMEOUT_SECS.load(Ordering::Relaxed).max(1));
                 let period = REPL_PING_PERIOD.load(Ordering::Relaxed).max(1);
                 if ticks.is_multiple_of(period) && hub.is_master() && !PROPAGATION_SUPPRESSED.get()
                 {
@@ -968,6 +1016,31 @@ impl ReplicationHub {
                 }
             }
         });
+    }
+
+    /// Drops online replicas that have not acked for `timeout_secs`, as
+    /// Redis does after `repl-timeout`: one that vanished without closing
+    /// the connection otherwise stays listed (and counted by WAIT and
+    /// min-replicas-to-write) until TCP gives up. Replicas that never ack
+    /// (old `SYNC` ones) are left alone.
+    pub fn drop_timed_out_replicas(&self, timeout_secs: u64) {
+        let now = unix_secs();
+        for r in self.replicas.read().values() {
+            if !r.is_online() || !r.acked.load(Ordering::Relaxed) || r.is_disconnected() {
+                continue;
+            }
+            if now.saturating_sub(r.last_ack_time.load(Ordering::SeqCst)) > timeout_secs {
+                let ip = r.announced_ip.read().clone().unwrap_or_else(|| {
+                    r.ip.map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string())
+                });
+                crate::log_warning!(
+                    "Disconnecting timedout replica (streaming sync): {}:{}",
+                    ip,
+                    r.listening_port.load(Ordering::SeqCst)
+                );
+                r.disconnect();
+            }
+        }
     }
 
     pub fn stop_sync(&self) {
@@ -1082,6 +1155,7 @@ impl ReplicationHub {
             sender,
             listening_port: AtomicU64::new(peer.port as u64),
             ack_offset: AtomicU64::new(0),
+            acked: AtomicBool::new(false),
             aof_ack_offset: AtomicU64::new(0),
             aof_acks: AtomicBool::new(false),
             // Like Redis, the lag clock starts at registration, so a new
@@ -1208,6 +1282,7 @@ impl ReplicationHub {
             rep.aof_ack_offset
                 .store(aof_offset.unwrap_or(0).min(offset), Ordering::SeqCst);
             rep.aof_acks.store(aof_offset.is_some(), Ordering::SeqCst);
+            rep.acked.store(true, Ordering::Relaxed);
             rep.ack_offset.store(offset, Ordering::SeqCst);
             rep.last_ack_time.store(unix_secs(), Ordering::SeqCst);
         }
@@ -2570,10 +2645,6 @@ impl Drop for SyncConnGuard<'_> {
 /// replica sends (REPLCONF ACKs). Like Redis' PROTO_INLINE_MAX_SIZE.
 pub const MAX_REPL_LINE: usize = 64 * 1024;
 
-/// How long a replica waits for each handshake reply (Redis' default
-/// repl-timeout) before reconnecting.
-const REPL_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Splits the first CRLF-terminated line off `buf`. `Ok(None)` means more
 /// data is needed; `Err` that `buf` holds a longer line than a master ever
 /// sends, so the link is dropped rather than buffered without bound.
@@ -2759,7 +2830,7 @@ async fn run_replica_worker(
     cancel_rx: flume::Receiver<()>,
     hub: Arc<ReplicationHub>,
 ) {
-    use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+    use monoio::io::AsyncWriteRentExt;
     use monoio::net::TcpStream;
 
     // Failed attempts are retried every 50ms; like Redis (which retries once
@@ -2842,21 +2913,12 @@ async fn run_replica_worker(
                         Ok(None) => {}
                         Err(()) => break,
                     }
-                    let read = monoio::time::timeout(
-                        REPL_HANDSHAKE_TIMEOUT,
-                        stream.read(std::mem::take(&mut read_buf)),
-                    )
-                    .await;
-                    let res = match read {
-                        Ok((res, returned)) => {
-                            read_buf = returned;
-                            res
-                        }
-                        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
-                    };
+                    let res = read_from_master(&mut stream, &mut read_buf).await;
                     match res {
                         Ok(0) | Err(_) => {
-                            if log_attempt {
+                            if is_timeout(&res) {
+                                crate::log_warning!("Timeout connecting to the MASTER...");
+                            } else if log_attempt {
                                 crate::log_warning!(
                                     "Master did not respond to command during SYNC handshake: {}",
                                     match res {
@@ -3082,10 +3144,14 @@ async fn run_replica_worker(
                     Ok(None) => {}
                     Err(()) => break None,
                 }
-                let (res, returned) = stream.read(read_buf).await;
-                read_buf = returned;
+                let res = read_from_master(&mut stream, &mut read_buf).await;
                 match res {
-                    Ok(0) | Err(_) => break None,
+                    Ok(0) | Err(_) => {
+                        if is_timeout(&res) {
+                            log_bulk_timeout();
+                        }
+                        break None;
+                    }
                     Ok(n) => {
                         hub.last_master_io_secs
                             .store(unix_secs(), Ordering::Relaxed);
@@ -3137,10 +3203,14 @@ async fn run_replica_worker(
                     Ok(false) => {}
                     Err(e) => break Err(format!("writing the temp file: {e}")),
                 }
-                let (res, returned) = stream.read(read_buf).await;
-                read_buf = returned;
+                let res = read_from_master(&mut stream, &mut read_buf).await;
                 match res {
-                    Ok(0) | Err(_) => break Err("connection lost".to_string()),
+                    Ok(0) | Err(_) => {
+                        if is_timeout(&res) {
+                            log_bulk_timeout();
+                        }
+                        break Err("connection lost".to_string());
+                    }
                     Ok(n) => {
                         hub.last_master_io_secs
                             .store(unix_secs(), Ordering::Relaxed);
@@ -3398,10 +3468,14 @@ async fn run_replica_worker(
                 break;
             }
 
-            let (res, returned) = stream.read(read_buf).await;
-            read_buf = returned;
+            let res = read_from_master(&mut stream, &mut read_buf).await;
             match res {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => {
+                    if is_timeout(&res) {
+                        crate::log_warning!("MASTER timeout: no data nor PING received...");
+                    }
+                    break;
+                }
                 Ok(n) => {
                     hub.last_master_io_secs
                         .store(unix_secs(), Ordering::Relaxed);
@@ -3862,6 +3936,56 @@ mod tests {
         hub.update_replica_ack(rep.id, offset, None);
         assert_eq!(rep.ack_offset.load(Ordering::SeqCst), offset);
         hub.unregister_replica(rep.id);
+    }
+
+    /// `repl-timeout` on the master: an online replica silent for longer
+    /// is dropped; one that never acked (old SYNC) is not.
+    #[test]
+    fn test_master_drops_replicas_silent_past_repl_timeout() {
+        let hub = ReplicationHub::new(19984);
+        let (tx, _rx) = flume::unbounded();
+        let silent = hub.register_replica(41, tx.clone());
+        let fresh = hub.register_replica(42, tx.clone());
+        let never_acked = hub.register_replica(43, tx);
+        hub.update_replica_ack(silent.id, 0, None);
+        hub.update_replica_ack(fresh.id, 0, None);
+        silent
+            .last_ack_time
+            .store(unix_secs() - 61, Ordering::SeqCst);
+        never_acked
+            .last_ack_time
+            .store(unix_secs() - 61, Ordering::SeqCst);
+        hub.drop_timed_out_replicas(60);
+        assert!(silent.is_disconnected());
+        assert!(!fresh.is_disconnected());
+        assert!(!never_acked.is_disconnected());
+        for id in [41, 42, 43] {
+            hub.unregister_replica(id);
+        }
+    }
+
+    /// A replica's read from a master that went silent gives up after the
+    /// timeout instead of waiting forever.
+    #[monoio::test(timer_enabled = true)]
+    async fn test_read_from_a_silent_master_times_out() {
+        let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = monoio::spawn(async move { listener.accept().await.unwrap() });
+        let mut stream = monoio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut peer, _) = accept.await;
+        let mut buf = vec![0u8; 64];
+        let t = std::time::Instant::now();
+        let res = read_within(&mut stream, &mut buf, std::time::Duration::from_millis(100)).await;
+        assert!(is_timeout(&res), "{res:?}");
+        assert!(t.elapsed() >= std::time::Duration::from_millis(100));
+        // Data within the timeout is read as usual.
+        use monoio::io::AsyncWriteRentExt;
+        peer.write_all(b"+PONG\r\n").await.0.unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = read_within(&mut stream, &mut buf, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(&buf[..n], b"+PONG\r\n");
     }
 
     /// WAITAOF counts a replica only by its FACK (the offset it fsynced to

@@ -35289,3 +35289,87 @@ fn test_waitaof_counts_fsynced_copies_e2e() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `repl-timeout`: a replica whose master goes silent without closing the
+/// connection (SIGSTOP here; a dead host or a partition in production)
+/// marks the link down and reconnects instead of reporting it up forever,
+/// and a master drops a replica that stopped acking, as Redis does. The
+/// master's PINGs keep an idle link alive.
+#[test]
+fn test_repl_timeout_drops_silent_links_e2e() {
+    let (mport, rport) = (29881u16, 29882u16);
+    let spawn = |port: u16| {
+        let p = port.to_string();
+        spawn_rudis_listening(
+            &["--port", &p, "--threads", "2", "--no-pin", "--save", ""],
+            port,
+        )
+    };
+    let mut master = spawn(mport);
+    let mut replica = spawn(rport);
+    let connect = |port: u16| {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let (mut m, mut r) = (connect(mport), connect(rport));
+    for (port, name, val) in [
+        (mport, "repl-ping-replica-period", "1"),
+        (mport, "repl-timeout", "3"),
+        (rport, "repl-timeout", "3"),
+    ] {
+        let c = if port == mport { &mut m } else { &mut r };
+        assert_eq!(resp_cmd(c, &["CONFIG", "SET", name, val]), "+OK\r\n");
+    }
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "GET", "repl-timeout"]),
+        "*2\r\n$12\r\nrepl-timeout\r\n$1\r\n3\r\n"
+    );
+    let r0 = resp_cmd(&mut r, &["CONFIG", "SET", "repl-timeout", "0"]);
+    assert!(r0.starts_with("-ERR"), "{r0}");
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &mport.to_string()]),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut r);
+    // Idle for longer than the timeout: the PINGs keep the link up.
+    thread::sleep(Duration::from_secs(4));
+    let info = resp_cmd_full(&mut r, &["INFO", "replication"]);
+    assert!(info.contains("master_link_status:up"), "{info}");
+    let info = resp_cmd_full(&mut m, &["INFO", "replication"]);
+    assert!(info.contains("connected_slaves:1"), "{info}");
+
+    let wait_for = |c: &mut TcpStream, what: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let info = resp_cmd_full(c, &["INFO", "replication"]);
+            if info.contains(what) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "no {what}: {info}");
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    // The master goes silent: the replica gives up on it.
+    // SAFETY: kill(2) on our own live child.
+    unsafe { libc::kill(master.id() as libc::pid_t, libc::SIGSTOP) };
+    wait_for(&mut r, "master_link_status:down");
+    // SAFETY: as above.
+    unsafe { libc::kill(master.id() as libc::pid_t, libc::SIGCONT) };
+    wait_for_master_link(&mut r);
+
+    // The replica goes silent: the master drops it.
+    let mut m = connect(mport);
+    wait_for(&mut m, "connected_slaves:1");
+    // SAFETY: as above.
+    unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGSTOP) };
+    wait_for(&mut m, "connected_slaves:0");
+    // SAFETY: as above.
+    unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGCONT) };
+    wait_for(&mut m, "connected_slaves:1");
+
+    for c in [&mut master, &mut replica] {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+}

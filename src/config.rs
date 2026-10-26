@@ -994,6 +994,12 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
             .to_string(),
     );
     directives.insert(
+        "repl-timeout".to_string(),
+        crate::replication::REPL_TIMEOUT_SECS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    directives.insert(
         "repl-backlog-size".to_string(),
         crate::replication::repl_backlog_size().to_string(),
     );
