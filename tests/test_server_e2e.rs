@@ -34844,3 +34844,43 @@ fn send_and_read_reply_n(stream: &mut TcpStream, cmd: &[u8], n: usize) -> String
         got.extend_from_slice(&buf[..k]);
     }
 }
+
+/// A slot moves in batches of keys over one connection to the target,
+/// not a new connection per batch.
+#[test]
+fn test_slot_migration_reuses_one_connection_e2e() {
+    let (port1, port2) = (29811u16, 29812u16);
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+    let mut c1 = TcpStream::connect(("127.0.0.1", port1)).unwrap();
+    let mut c2 = TcpStream::connect(("127.0.0.1", port2)).unwrap();
+    c1.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let n = 1000;
+    for i in 0..n {
+        assert_eq!(
+            resp_cmd(&mut c1, &["SET", &format!("{{mig}}:{i}"), "v"]),
+            "+OK\r\n"
+        );
+    }
+    let slot = rudis::router::key_slot(b"{mig}:0");
+    let accepted = |c: &mut TcpStream| info_u64(c, "stats", "total_connections_received");
+    let before = accepted(&mut c2);
+    assert_eq!(
+        resp_cmd(
+            &mut c1,
+            &[
+                "CLUSTER",
+                "MIGRATE-SLOT",
+                &slot.to_string(),
+                "127.0.0.1",
+                &port2.to_string()
+            ]
+        ),
+        "+OK\r\n"
+    );
+    let opened = accepted(&mut c2) - before;
+    // SETSLOT IMPORTING, the key transfer and SETSLOT NODE: 3, where one
+    // per batch of 100 keys made it 12.
+    assert!(opened <= 4, "{opened} connections for {n} keys");
+    assert_eq!(resp_cmd(&mut c2, &["DBSIZE"]), format!(":{n}\r\n"));
+}

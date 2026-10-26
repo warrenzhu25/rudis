@@ -8740,12 +8740,17 @@ fn take_simple_replies(buf: &[u8], replies: &mut Vec<Result<(), String>>) -> usi
 /// a rejected, failed or interrupted transfer never loses a key. Missing
 /// keys are skipped. Returns how many keys the target stored, or the first
 /// error as a RESP error line without the leading '-'.
+///
+/// `conn` carries the connection to the target across calls (a slot moves
+/// in many batches): it is opened when `None`, and dropped after an error
+/// so the next call starts on a fresh one.
 async fn migrate_keys_to_node(
     router: &Router,
     keys: &[Bytes],
     host: &str,
     port: u16,
     opts: MigrateOpts,
+    conn: &mut Option<TcpStream>,
 ) -> Result<usize, String> {
     let mut dumps = Vec::with_capacity(keys.len());
     for k in keys {
@@ -8781,20 +8786,24 @@ async fn migrate_keys_to_node(
         write_resp_command(&mut tx_buf, &args);
     }
 
-    let target_addr = format!("{}:{}", host, port);
-    let socket_addr = match std::net::ToSocketAddrs::to_socket_addrs(&target_addr) {
-        Ok(mut iter) => match iter.next() {
-            Some(a) => a,
-            None => return Err("ERR cannot resolve destination host".to_string()),
-        },
-        Err(e) => return Err(format!("ERR invalid destination address: {}", e)),
+    let mut stream = match conn.take() {
+        Some(s) => s,
+        None => {
+            let target_addr = format!("{}:{}", host, port);
+            let socket_addr = match std::net::ToSocketAddrs::to_socket_addrs(&target_addr) {
+                Ok(mut iter) => match iter.next() {
+                    Some(a) => a,
+                    None => return Err("ERR cannot resolve destination host".to_string()),
+                },
+                Err(e) => return Err(format!("ERR invalid destination address: {}", e)),
+            };
+            match monoio::time::timeout(opts.timeout, TcpStream::connect(socket_addr)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(format!("IOERR error connecting to destination: {}", e)),
+                Err(_) => return Err("IOERR timeout connecting to destination".to_string()),
+            }
+        }
     };
-    let mut stream =
-        match monoio::time::timeout(opts.timeout, TcpStream::connect(socket_addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(format!("IOERR error connecting to destination: {}", e)),
-            Err(_) => return Err("IOERR timeout connecting to destination".to_string()),
-        };
     if let Err(e) = stream.write_all(tx_buf).await.0 {
         return Err(format!("IOERR error sending to destination: {}", e));
     }
@@ -8850,7 +8859,11 @@ async fn migrate_keys_to_node(
     }
     match failure {
         Some(e) => Err(e),
-        None => Ok(stored),
+        None => {
+            // Every reply was read: the connection is clean for the next batch.
+            *conn = Some(stream);
+            Ok(stored)
+        }
     }
 }
 
@@ -8904,6 +8917,7 @@ async fn execute_rebalance_plans(
             }
 
             let batch_size = pipeline.clamp(1, 1000);
+            let mut conn = None;
             loop {
                 let keys = router.get_keys_in_slot(p.slot, batch_size).await;
                 if keys.is_empty() {
@@ -8919,6 +8933,7 @@ async fn execute_rebalance_plans(
                         replace: true,
                         timeout: SLOT_MIGRATION_TIMEOUT,
                     },
+                    &mut conn,
                 )
                 .await
                 .is_err()
@@ -12891,7 +12906,9 @@ async fn execute_command_inner(
                         }
                     }
 
-                    // 3. Migrate keys belonging to this slot in batches
+                    // 3. Migrate keys belonging to this slot in batches, over
+                    //    one connection to the target.
+                    let mut conn = None;
                     loop {
                         let keys = router.get_keys_in_slot(slot, 100).await;
                         if keys.is_empty() {
@@ -12907,6 +12924,7 @@ async fn execute_command_inner(
                                 replace: true,
                                 timeout: SLOT_MIGRATION_TIMEOUT,
                             },
+                            &mut conn,
                         )
                         .await
                         {
@@ -12916,6 +12934,8 @@ async fn execute_command_inner(
                             return false;
                         }
                     }
+
+                    drop(conn);
 
                     // 4. Notify remote node to take final ownership: CLUSTER SETSLOT <slot> NODE myself
                     if let Some(sock_addr) = target_sock
@@ -17677,7 +17697,7 @@ async fn execute_command_inner(
                 replace,
                 timeout,
             };
-            match migrate_keys_to_node(router, &migrate_keys, &host, port, opts).await {
+            match migrate_keys_to_node(router, &migrate_keys, &host, port, opts, &mut None).await {
                 Ok(0) => out.extend_from_slice(b"+NOKEY\r\n"),
                 Ok(_) => out.extend_from_slice(b"+OK\r\n"),
                 Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
