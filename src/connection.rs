@@ -4629,6 +4629,21 @@ pub fn get_active_clients() -> usize {
     ACTIVE_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// INFO `connected_clients`: connections other than replicas, as Redis
+/// counts them (replicas are `connected_slaves`), so a master with
+/// replicas does not look like it has clients that aren't there.
+pub fn connected_clients(base_port: u16) -> usize {
+    let replicas = crate::replication::get_replication_hub(base_port)
+        .replicas
+        .read()
+        .len();
+    connected_clients_of(get_active_clients(), replicas)
+}
+
+fn connected_clients_of(connections: usize, replicas: usize) -> usize {
+    connections.saturating_sub(replicas)
+}
+
 pub fn set_max_memory_policy(policy: &str) {
     {
         let mut lock = MAX_MEMORY_POLICY.write();
@@ -12235,7 +12250,7 @@ async fn execute_command_inner(
                 .collect();
             let clients_str = format!(
                 "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\ntracking_clients:{}\r\ntotal_blocking_keys:{}\r\ntotal_blocking_keys_on_nokey:{}\r\nisolated_panics:{}\r\nshard_connections:{}\r\n",
-                get_active_clients(),
+                connected_clients(router.base_port),
                 get_max_clients(),
                 blocked_clients_count,
                 tracking_clients,
@@ -29464,6 +29479,13 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 
 #[cfg(test)]
 mod tests {
+    /// Replica links are not counted in INFO connected_clients.
+    #[test]
+    fn test_connected_clients_leaves_out_replicas() {
+        assert_eq!(super::connected_clients_of(4, 1), 3);
+        assert_eq!(super::connected_clients_of(0, 1), 0);
+    }
+
     #[test]
     fn test_watch_is_the_nodes_on_every_shard_port() {
         // WATCH on a shard port, FLUSHALL (or a write) arriving on the base

@@ -35447,3 +35447,42 @@ fn test_role_shows_replica_link_phases_e2e() {
     let _ = replica.kill();
     let _ = replica.wait();
 }
+
+/// INFO connected_clients leaves out replica links, as in Redis (they are
+/// connected_slaves): a master with one client and one replica reports 1.
+#[test]
+fn test_connected_clients_excludes_replicas_e2e() {
+    let (mport, rport) = (29895u16, 29896u16);
+    let spawn = |port: u16| {
+        let p = port.to_string();
+        spawn_rudis_listening(
+            &["--port", &p, "--threads", "2", "--no-pin", "--save", ""],
+            port,
+        )
+    };
+    let mut master = spawn(mport);
+    let mut replica = spawn(rport);
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &mport.to_string()]),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut r);
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let info = resp_cmd_full(&mut m, &["INFO"]);
+        if info.contains("connected_slaves:1\r\n") {
+            assert!(info.contains("connected_clients:1\r\n"), "{info}");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{info}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    for c in [&mut master, &mut replica] {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+}

@@ -30,7 +30,7 @@ pub fn format_prometheus_metrics(port: u16, total_used_memory: usize) -> String 
     let max_mem = crate::tiering::get_max_memory(port);
     let expired = crate::table::get_expired_keys();
     let evicted = crate::table::get_evicted_keys();
-    let active_clients = crate::connection::get_active_clients();
+    let active_clients = crate::connection::connected_clients(port);
     let max_clients = crate::connection::get_max_clients();
     let isolated_panics = crate::connection::get_isolated_panics();
 
