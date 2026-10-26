@@ -125,6 +125,49 @@ pub fn aof_progress_all(port: u16, shards: usize) -> Vec<std::sync::Arc<AofProgr
     (0..shards).map(|s| aof_progress(port, s)).collect()
 }
 
+/// A shard's AOF writer, if AOF is on, shared by everything on the shard
+/// that appends to it (its router and their clones, its mailbox loop, the
+/// expiry log). Swapped when `CONFIG SET appendonly` turns AOF on or off.
+#[derive(Clone, Default)]
+pub struct AofSlot(
+    std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<AofWriter>>>>>,
+);
+
+impl AofSlot {
+    pub fn new(writer: Option<std::rc::Rc<std::cell::RefCell<AofWriter>>>) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(writer)))
+    }
+
+    /// The writer now (None with AOF off).
+    #[inline]
+    pub fn get(&self) -> Option<std::rc::Rc<std::cell::RefCell<AofWriter>>> {
+        self.0.borrow().clone()
+    }
+
+    #[inline]
+    pub fn is_on(&self) -> bool {
+        self.0.borrow().is_some()
+    }
+
+    pub fn set(&self, writer: Option<std::rc::Rc<std::cell::RefCell<AofWriter>>>) {
+        *self.0.borrow_mut() = writer;
+    }
+
+    /// Whether `writer` is the one in the slot (its flusher stops once not).
+    pub fn holds(&self, writer: &std::rc::Rc<std::cell::RefCell<AofWriter>>) -> bool {
+        self.0
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| std::rc::Rc::ptr_eq(w, writer))
+    }
+}
+
+impl From<Option<std::rc::Rc<std::cell::RefCell<AofWriter>>>> for AofSlot {
+    fn from(writer: Option<std::rc::Rc<std::cell::RefCell<AofWriter>>>) -> Self {
+        Self::new(writer)
+    }
+}
+
 pub struct AofWriter {
     buffer: Vec<u8>,
     spare_buffer: Option<Vec<u8>>,
@@ -8017,6 +8060,20 @@ mod tests {
             assert!(!progress.pending());
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_aof_slot_swaps_the_writer_for_every_holder() {
+        let slot = AofSlot::default();
+        let other_holder = slot.clone();
+        assert!(!slot.is_on() && other_holder.get().is_none());
+        let w = std::rc::Rc::new(std::cell::RefCell::new(AofWriter::new_in_memory()));
+        slot.set(Some(w.clone()));
+        assert!(other_holder.is_on() && other_holder.holds(&w));
+        let w2 = std::rc::Rc::new(std::cell::RefCell::new(AofWriter::new_in_memory()));
+        assert!(!other_holder.holds(&w2));
+        other_holder.set(None);
+        assert!(!slot.is_on() && !slot.holds(&w));
     }
 
     /// WAITAOF's local copy: appended bytes count as fsynced only once an

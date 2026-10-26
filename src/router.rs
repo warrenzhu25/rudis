@@ -203,7 +203,8 @@ pub struct Router {
     pub senders: Vec<crate::mailbox::ShardSender>,
     pub slot_states: Rc<RefCell<hashbrown::HashMap<u16, crate::shard::SlotState>>>,
     pub slot_owners: Rc<RefCell<Vec<usize>>>,
-    pub aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
+    /// This shard's AOF writer (see `Router::aof`).
+    pub aof_slot: crate::aof::AofSlot,
     pub pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
     pub tx_lock: Rc<RefCell<Option<u64>>>,
     pub tx_waiters: Rc<RefCell<std::collections::VecDeque<(u64, flume::Sender<()>)>>>,
@@ -510,9 +511,16 @@ impl Router {
         crate::replication::log_shard_mutation(
             self.base_port,
             self.shard_id,
-            self.aof.as_deref(),
+            self.aof().as_deref(),
             make,
         );
+    }
+
+    /// This shard's AOF writer now: None while AOF is off. It can change
+    /// at runtime (`CONFIG SET appendonly`), so it is fetched per use.
+    #[inline]
+    pub fn aof(&self) -> Option<Rc<RefCell<crate::aof::AofWriter>>> {
+        self.aof_slot.get()
     }
 
     pub fn new(
@@ -521,7 +529,7 @@ impl Router {
         port: u16,
         local_db: Rc<RefCell<ShardDb>>,
         senders: Vec<crate::mailbox::ShardSender>,
-        aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
+        aof: impl Into<crate::aof::AofSlot>,
         pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
         db_dir: std::path::PathBuf,
     ) -> Self {
@@ -536,7 +544,7 @@ impl Router {
             senders,
             slot_states: Rc::new(RefCell::new(slot_states)),
             slot_owners: Rc::new(RefCell::new(Vec::new())),
-            aof,
+            aof_slot: aof.into(),
             pubsub,
             tx_lock: Rc::new(RefCell::new(None)),
             tx_waiters: Rc::new(RefCell::new(std::collections::VecDeque::new())),
@@ -1141,7 +1149,10 @@ impl Router {
                 {
                     break;
                 }
-                if db.try_evict_one_key(policy, self.aof.as_deref()).is_none() {
+                if db
+                    .try_evict_one_key(policy, self.aof().as_deref())
+                    .is_none()
+                {
                     break;
                 }
             }
@@ -3064,7 +3075,7 @@ impl Router {
             let appended = p.appended.load(Acquire);
             if p.written.load(Acquire) < appended {
                 if sid == self.shard_id {
-                    if let Some(aof) = &self.aof {
+                    if let Some(aof) = &self.aof() {
                         let _ = crate::aof::AofWriter::write_through(aof).await;
                     }
                 } else {
@@ -3109,7 +3120,7 @@ impl Router {
     }
 
     pub async fn sync_aof(&self) {
-        if self.aof.is_none() {
+        if self.aof().is_none() {
             return;
         }
         let mut responders = Vec::new();
@@ -3127,7 +3138,7 @@ impl Router {
             }
         }
         // The local fsync overlaps the remote ones.
-        if let Some(aof) = &self.aof {
+        if let Some(aof) = &self.aof() {
             let _ = crate::aof::AofWriter::sync_durable(aof).await;
         }
         for (tx, rx) in responders {
@@ -3562,7 +3573,7 @@ impl Router {
                 &cmd,
                 &mut self.local_db.borrow_mut(),
                 &mut out,
-                self.aof.as_deref(),
+                self.aof().as_deref(),
             );
             out
         } else {
@@ -3882,7 +3893,7 @@ impl Router {
     /// shard empties its data and replays its AOF file. Nothing replayed is
     /// propagated to replicas or appended to the AOF again.
     pub async fn debug_loadaof(&self) -> Result<(), String> {
-        if self.aof.is_none() {
+        if self.aof().is_none() {
             // Nothing to load from; Redis would leave an empty dataset, but
             // dropping everything with no AOF to restore it is never wanted.
             return Ok(());
@@ -4338,7 +4349,7 @@ impl Router {
     /// The RESP of `cmd` for the other shards' AOFs, if the AOF is on (all
     /// shards share the setting).
     fn search_aof_record(&self, cmd: &Command) -> Option<Bytes> {
-        self.aof.as_ref()?;
+        self.aof().as_ref()?;
         crate::aof::command_to_resp(cmd).map(Bytes::from)
     }
 
@@ -4979,7 +4990,7 @@ impl Router {
             &self.local_db,
             &self.db_dir,
             self.shard_id,
-            self.aof.as_ref(),
+            self.aof().as_ref(),
         )
         .await
         .map_err(|e| format!("shard {}: {}", self.shard_id, e))?;
@@ -5092,7 +5103,7 @@ impl Router {
     }
 
     async fn load_full_sync_rdb_on_all_shards(&self, data: Bytes) -> Result<(), String> {
-        let aof_dir = self.aof.as_ref().map(|_| self.db_dir.clone());
+        let aof_dir = self.aof().as_ref().map(|_| self.db_dir.clone());
         self.forget_global_search_indices();
         let mut responders = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
@@ -5108,7 +5119,8 @@ impl Router {
                 responders.push(rx);
             }
         }
-        let local_aof = aof_dir.as_deref().zip(self.aof.as_ref());
+        let local_writer = self.aof();
+        let local_aof = aof_dir.as_deref().zip(local_writer.as_ref());
         let mut result = self.local_db.borrow_mut().load_full_sync_rdb(
             &data,
             self.shard_id,
@@ -5137,7 +5149,7 @@ impl Router {
                     &cmd,
                     &mut self.local_db.borrow_mut(),
                     &mut dummy_out,
-                    self.aof.as_deref(),
+                    self.aof().as_deref(),
                 );
             }
             Some(target) if target < batch.len() => batch[target].push(cmd),
@@ -5183,7 +5195,7 @@ impl Router {
                 &cmd,
                 &mut self.local_db.borrow_mut(),
                 &mut dummy_out,
-                self.aof.as_deref(),
+                self.aof().as_deref(),
             );
         } else {
             let (tx, rx) = self.acquire_notify_channel();

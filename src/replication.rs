@@ -2637,11 +2637,7 @@ thread_local! {
     static SHARD_LOG: std::cell::RefCell<Option<ShardLog>> = const { std::cell::RefCell::new(None) };
 }
 
-type ShardLog = (
-    u16,
-    usize,
-    Option<std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>>,
-);
+type ShardLog = (u16, usize, crate::aof::AofSlot);
 
 thread_local! {
     /// Whether this shard thread belongs to a read-only replica (refreshed
@@ -2666,11 +2662,8 @@ pub fn hide_expired_keys() -> bool {
 
 /// Registers this shard thread's port, shard id and AOF writer (call once at
 /// shard startup).
-pub fn set_shard_log_context(
-    port: u16,
-    shard_id: usize,
-    aof: Option<std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>>,
-) {
+pub fn set_shard_log_context(port: u16, shard_id: usize, aof: impl Into<crate::aof::AofSlot>) {
+    let aof = aof.into();
     SHARD_LOG.with(|l| *l.borrow_mut() = Some((port, shard_id, aof)));
 }
 
@@ -2687,7 +2680,7 @@ pub fn log_expired_key(key: &[u8]) {
     }
     SHARD_LOG.with(|l| {
         if let Some((port, shard_id, aof)) = &*l.borrow() {
-            log_shard_mutation(*port, *shard_id, aof.as_deref(), || {
+            log_shard_mutation(*port, *shard_id, aof.get().as_deref(), || {
                 crate::resp::Command::Del(smallvec::smallvec![bytes::Bytes::copy_from_slice(key)])
             });
         }
@@ -2703,7 +2696,7 @@ pub fn log_expired_fields(key: &[u8], fields: &[bytes::Bytes]) {
     }
     SHARD_LOG.with(|l| {
         if let Some((port, shard_id, aof)) = &*l.borrow() {
-            log_shard_mutation(*port, *shard_id, aof.as_deref(), || {
+            log_shard_mutation(*port, *shard_id, aof.get().as_deref(), || {
                 crate::resp::Command::Hdel {
                     key: bytes::Bytes::copy_from_slice(key),
                     fields: fields.iter().cloned().collect(),
@@ -3726,7 +3719,7 @@ async fn run_replica_worker(
                 first = false;
                 while ack_rx.try_recv().is_ok() {}
                 let off = applied_w.get();
-                let ack = if ack_router.aof.is_some() {
+                let ack = if ack_router.aof().is_some() {
                     if let Some((p_off, t)) = &pending
                         && t.fsynced()
                     {

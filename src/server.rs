@@ -354,45 +354,6 @@ pub fn run_shard_worker(
                 Ok(mut w) => {
                     w.set_progress(crate::aof::aof_progress(base_port, shard_id));
                     let writer = Rc::new(RefCell::new(w));
-                    let flush_writer = writer.clone();
-                    let fsync_every_sec = crate::aof::fsync_every_sec_flag(base_port);
-                    monoio::spawn(async move {
-                        let mut ticker = 0u64;
-                        loop {
-                            monoio::time::sleep(std::time::Duration::from_millis(5)).await;
-                            // Not under appendfsync always (whose fsync path
-                            // writes chunks asynchronously): a plain write,
-                            // so replies' write-through never waits on an
-                            // in-flight chunk.
-                            if !crate::aof::appendfsync_is_always(base_port)
-                                && flush_writer
-                                    .borrow_mut()
-                                    .write_pending_sync()
-                                    .unwrap_or(false)
-                            {
-                                ticker += 1;
-                                if ticker.is_multiple_of(200)
-                                    && fsync_every_sec.load(std::sync::atomic::Ordering::Relaxed)
-                                {
-                                    everysec_fsync(&flush_writer).await;
-                                }
-                                continue;
-                            }
-                            let flush_chunk = flush_writer.borrow_mut().take_flush_chunk();
-                            if let Some((file, chunk, offset)) = flush_chunk {
-                                let (res, returned_chunk) = file.write_all_at(chunk, offset).await;
-                                flush_writer
-                                    .borrow_mut()
-                                    .chunk_written(&res, returned_chunk, offset);
-                            }
-                            ticker += 1;
-                            if ticker.is_multiple_of(200)
-                                && fsync_every_sec.load(std::sync::atomic::Ordering::Relaxed)
-                            {
-                                everysec_fsync(&flush_writer).await;
-                            }
-                        }
-                    });
                     Some(writer)
                 }
                 Err(e) => fatal_startup_error(
@@ -403,8 +364,14 @@ pub fn run_shard_worker(
         } else {
             None
         };
+        // Everything on this shard appends to the writer in this slot,
+        // which `CONFIG SET appendonly` can swap.
+        let aof_slot = crate::aof::AofSlot::new(aof_writer.clone());
+        if let Some(w) = &aof_writer {
+            spawn_aof_flusher(aof_slot.clone(), w.clone(), base_port);
+        }
         // Expired keys are logged as DELs from wherever they expire.
-        crate::replication::set_shard_log_context(base_port, shard_id, aof_writer.clone());
+        crate::replication::set_shard_log_context(base_port, shard_id, aof_slot.clone());
 
         // 4. Background Cluster Bus & Gossip Engine (on Shard 0), cluster mode only.
         if shard_id == 0 && cluster_enabled {
@@ -437,7 +404,7 @@ pub fn run_shard_worker(
             shard_port,
             local_db.clone(),
             senders,
-            aof_writer.clone(),
+            aof_slot.clone(),
             pubsub.clone(),
             aof_config.dir.clone(),
         );
@@ -531,7 +498,7 @@ pub fn run_shard_worker(
         // 5. AF_XDP Kernel Bypass Ingress Loop: poll zero-copy Rx ring for packet descriptors
         let xdp_engine = crate::xdp::get_xdp_engine();
         let xdp_db = local_db.clone();
-        let xdp_aof = aof_writer.clone();
+        let xdp_aof = aof_slot.clone();
         let xdp_router = router.clone();
         monoio::spawn(async move {
             let mut frames = Vec::new();
@@ -558,7 +525,7 @@ pub fn run_shard_worker(
                                         &cmd,
                                         &mut db,
                                         &mut out,
-                                        xdp_aof.as_ref().map(|a| a.as_ref()),
+                                        xdp_aof.get().as_deref(),
                                     );
                                 } else {
                                     let resp = xdp_router.execute_remote(target_sid, cmd).await;
@@ -591,7 +558,7 @@ pub fn run_shard_worker(
         let cross_shard_clients = client_registry.clone();
         let cross_shard_slot_states = router.slot_states.clone();
         let cross_shard_slot_owners = router.slot_owners.clone();
-        let cross_shard_aof = aof_writer.clone();
+        let cross_shard_aof_slot = aof_slot.clone();
         let cross_shard_pubsub = pubsub.clone();
         let cross_shard_tx_lock = router.tx_lock.clone();
         let cross_shard_tx_waiters = router.tx_waiters.clone();
@@ -599,6 +566,8 @@ pub fn run_shard_worker(
             while let Ok(mut msg) = rx.recv_async().await {
                 let mut burst = 0;
                 loop {
+                    // Per message: AOF can be turned on or off meanwhile.
+                    let cross_shard_aof = cross_shard_aof_slot.get();
                     match msg {
                     ShardMessage::AdoptConnection { fd, peer } => {
                         // Take ownership of a connection handed over by an
@@ -2141,7 +2110,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     ShardMessage::TryEvictOneKey { policy, responder } => {
                         let freed = cross_shard_db
                             .borrow_mut()
-                            .try_evict_one_key(&policy, cross_shard_router.aof.as_deref());
+                            .try_evict_one_key(&policy, cross_shard_router.aof().as_deref());
                         let _ = responder.send(freed);
                     }
                     ShardMessage::StreamColdRead { key, responder } => {
@@ -2401,7 +2370,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             // Counts start now: data loaded at startup is not "changes".
             crate::snapshot::state(r.base_port);
             // The AOF as loaded is the base automatic rewrites grow from.
-            let aof_on = r.aof.is_some();
+            let aof_on = r.aof().is_some();
             let rewrite_state = crate::snapshot::aof_rewrite_state(r.base_port);
             if aof_on {
                 rewrite_state.set_base_size(crate::aof::aof_files_size(&r.db_dir, r.num_shards));
@@ -2515,8 +2484,52 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
         {
             monoio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        if let Some(aof) = aof_writer {
+        if let Some(aof) = aof_slot.get() {
             let _ = crate::aof::AofWriter::sync_durable(&aof).await;
+        }
+    });
+}
+
+/// Starts the task that writes `writer`'s buffer every 5 ms (and fsyncs it
+/// every second under `appendfsync everysec`) for as long as it is the
+/// writer in `slot`.
+pub(crate) fn spawn_aof_flusher(
+    slot: crate::aof::AofSlot,
+    writer: Rc<RefCell<crate::aof::AofWriter>>,
+    base_port: u16,
+) {
+    let fsync_every_sec = crate::aof::fsync_every_sec_flag(base_port);
+    monoio::spawn(async move {
+        let mut ticker = 0u64;
+        while slot.holds(&writer) {
+            monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // Not under appendfsync always (whose fsync path writes chunks
+            // asynchronously): a plain write, so replies' write-through
+            // never waits on an in-flight chunk.
+            if !crate::aof::appendfsync_is_always(base_port)
+                && writer.borrow_mut().write_pending_sync().unwrap_or(false)
+            {
+                ticker += 1;
+                if ticker.is_multiple_of(200)
+                    && fsync_every_sec.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    everysec_fsync(&writer).await;
+                }
+                continue;
+            }
+            let flush_chunk = writer.borrow_mut().take_flush_chunk();
+            if let Some((file, chunk, offset)) = flush_chunk {
+                let (res, returned_chunk) = file.write_all_at(chunk, offset).await;
+                writer
+                    .borrow_mut()
+                    .chunk_written(&res, returned_chunk, offset);
+            }
+            ticker += 1;
+            if ticker.is_multiple_of(200)
+                && fsync_every_sec.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                everysec_fsync(&writer).await;
+            }
         }
     });
 }

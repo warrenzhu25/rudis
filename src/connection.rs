@@ -3739,7 +3739,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
-    let app = if router.aof.is_some() {
+    let app = if router.aof().is_some() {
         "yes".to_string()
     } else {
         "no".to_string()
@@ -4174,7 +4174,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                     return;
                 }
             };
-            if requested != router.aof.is_some() {
+            if requested != router.aof().is_some() {
                 out.extend_from_slice(
                     b"-ERR CONFIG SET failed (possibly related to argument 'appendonly') - changing appendonly at runtime is not supported; set it in the config file and restart\r\n",
                 );
@@ -5626,7 +5626,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
     let mut aof_appends_seen = crate::aof::AOF_APPENDS.load(std::sync::atomic::Ordering::Relaxed);
     // AOF write-through before replies (see `aof_reply_barrier`): only with
     // an AOF, and only for batches that write.
-    let aof_on = router.aof.is_some();
+    let aof_on = router.aof().is_some();
     let aof_progress = if aof_on {
         crate::aof::aof_progress_all(router.base_port, router.num_shards)
     } else {
@@ -9962,7 +9962,7 @@ async fn handle_bzpop(
                             }
                         };
                         if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                            if let Some(aof_w) = &router.aof {
+                            if let Some(aof_w) = &router.aof() {
                                 aof_w.borrow_mut().append(&bytes);
                             }
                             if crate::replication::has_connected_replicas(router.base_port) {
@@ -10391,7 +10391,7 @@ async fn query_cross_shard_streams(
                 &sub_cmd,
                 &mut router.local_db.borrow_mut(),
                 &mut tmp,
-                router.aof.as_deref(),
+                router.aof().as_deref(),
             );
             tmp
         } else {
@@ -11444,7 +11444,7 @@ async fn execute_command_inner(
                     && !get
                     && !keepttl
                     && !past_expired
-                    && router.aof.is_none()
+                    && router.aof().is_none()
                     && !crate::replication::has_connected_replicas(router.base_port)
                     && crate::connection::NOTIFY_KEYSPACE_FLAGS
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -11603,7 +11603,7 @@ async fn execute_command_inner(
                     && !get
                     && !keepttl
                     && !past_expired
-                    && router.aof.is_none()
+                    && router.aof().is_none()
                     && !crate::replication::has_connected_replicas(router.base_port)
                     && crate::connection::NOTIFY_KEYSPACE_FLAGS
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -12310,7 +12310,7 @@ async fn execute_command_inner(
                 if snap.last_save_ok() { "ok" } else { "err" },
                 crate::server::rdb_last_load_keys_expired(router.base_port),
                 crate::server::LAST_LOAD_KEYS_LOADED.load(std::sync::atomic::Ordering::Relaxed),
-                u8::from(router.aof.is_some()),
+                u8::from(router.aof().is_some()),
                 u8::from(aof_rw.in_progress()),
                 if aof_rw.last_ok() { "ok" } else { "err" },
                 if crate::aof::aof_write_misconf(router.port).is_some() {
@@ -12323,7 +12323,7 @@ async fn execute_command_inner(
                 // Live rewrites that had to fall back to a blocking pass.
                 crate::aof::LIVE_REWRITE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
                 // Redis lists these only while the AOF is on.
-                if router.aof.is_some() {
+                if router.aof().is_some() {
                     format!(
                         "aof_current_size:{}\r\naof_base_size:{}\r\n",
                         crate::aof::aof_files_size(&router.db_dir, router.num_shards),
@@ -14034,7 +14034,7 @@ async fn execute_command_inner(
                         &cmd,
                         &mut router.local_db.borrow_mut(),
                         out,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let res = router.execute_remote(target, cmd).await;
@@ -14083,12 +14083,12 @@ async fn execute_command_inner(
                                     touch_watched_key(router.port, k);
                                 });
                             }
-                            let need_aof = router.aof.is_some();
+                            let need_aof = router.aof().is_some();
                             let need_rep = crate::replication::has_connected_replicas(router.base_port);
                             if (need_aof || need_rep)
                                 && let Some(bytes) = crate::aof::command_to_resp(&rep)
                             {
-                                if let Some(aof_writer) = router.aof.as_deref() {
+                                if let Some(aof_writer) = router.aof().as_deref() {
                                     aof_writer.borrow_mut().append(&bytes);
                                 }
                                 if need_rep {
@@ -14179,7 +14179,7 @@ async fn execute_command_inner(
                         &cmd,
                         &mut router.local_db.borrow_mut(),
                         out,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let res = router.execute_remote(first_target, cmd.clone()).await;
@@ -14318,7 +14318,7 @@ async fn execute_command_inner(
                                             &unblocked_cmd,
                                             &mut router.local_db.borrow_mut(),
                                             out,
-                                            router.aof.as_deref(),
+                                            router.aof().as_deref(),
                                         );
                                     } else {
                                         let res = router
@@ -14935,7 +14935,7 @@ async fn execute_command_inner(
                         count: None,
                     };
                     if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                        if let Some(aof_w) = &router.aof {
+                        if let Some(aof_w) = &router.aof() {
                             aof_w.borrow_mut().append(&bytes);
                         }
                         if crate::replication::has_connected_replicas(router.base_port) {
@@ -15079,7 +15079,7 @@ async fn execute_command_inner(
                         count: None,
                     };
                     if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                        if let Some(aof_w) = &router.aof {
+                        if let Some(aof_w) = &router.aof() {
                             aof_w.borrow_mut().append(&bytes);
                         }
                         if crate::replication::has_connected_replicas(router.base_port) {
@@ -15197,7 +15197,7 @@ async fn execute_command_inner(
                     &cmd,
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router.execute_remote(s_target, cmd).await;
@@ -15459,7 +15459,7 @@ async fn execute_command_inner(
                     &cmd,
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router.execute_remote(s_target, cmd).await;
@@ -15511,7 +15511,7 @@ async fn execute_command_inner(
                     },
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router
@@ -15628,7 +15628,7 @@ async fn execute_command_inner(
                     &cmd,
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router.execute_remote(s_target, cmd.clone()).await;
@@ -15697,7 +15697,7 @@ async fn execute_command_inner(
                     &non_blocking_cmd,
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router.execute_remote(s_target, non_blocking_cmd).await;
@@ -15863,7 +15863,7 @@ async fn execute_command_inner(
                                     },
                                 };
                                 if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                                    if let Some(aof_w) = &router.aof {
+                                    if let Some(aof_w) = &router.aof() {
                                         aof_w.borrow_mut().append(&bytes);
                                     }
                                     if crate::replication::has_connected_replicas(router.base_port) {
@@ -15963,7 +15963,7 @@ async fn execute_command_inner(
                                     },
                                 };
                                 if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                                    if let Some(aof_w) = &router.aof {
+                                    if let Some(aof_w) = &router.aof() {
                                         aof_w.borrow_mut().append(&bytes);
                                     }
                                     if crate::replication::has_connected_replicas(router.base_port) {
@@ -16138,7 +16138,7 @@ async fn execute_command_inner(
                                     }
                                 };
                                 if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                                    if let Some(aof_w) = &router.aof {
+                                    if let Some(aof_w) = &router.aof() {
                                         aof_w.borrow_mut().append(&bytes);
                                     }
                                     if crate::replication::has_connected_replicas(router.base_port) {
@@ -16225,7 +16225,7 @@ async fn execute_command_inner(
                                     }
                                 };
                                 if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                                    if let Some(aof_w) = &router.aof {
+                                    if let Some(aof_w) = &router.aof() {
                                         aof_w.borrow_mut().append(&bytes);
                                     }
                                     if crate::replication::has_connected_replicas(router.base_port) {
@@ -16495,7 +16495,7 @@ async fn execute_command_inner(
                         &cmd,
                         &mut router.local_db.borrow_mut(),
                         out,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let res = router.execute_remote(src_target, cmd).await;
@@ -16566,7 +16566,7 @@ async fn execute_command_inner(
                     &del_cmd,
                     &mut router.local_db.borrow_mut(),
                     &mut tmp,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let _ = router.execute_remote(dst_target, del_cmd).await;
@@ -16592,7 +16592,7 @@ async fn execute_command_inner(
                         &zadd_cmd,
                         &mut router.local_db.borrow_mut(),
                         &mut tmp,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let _ = router.execute_remote(dst_target, zadd_cmd).await;
@@ -16616,7 +16616,7 @@ async fn execute_command_inner(
                         &cmd,
                         &mut router.local_db.borrow_mut(),
                         out,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let res = router.execute_remote(first_target, cmd).await;
@@ -16720,7 +16720,7 @@ async fn execute_command_inner(
                         &cmd,
                         &mut router.local_db.borrow_mut(),
                         out,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let res = router.execute_remote(first_target, cmd).await;
@@ -16850,7 +16850,7 @@ async fn execute_command_inner(
                         &cmd,
                         &mut router.local_db.borrow_mut(),
                         out,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let res = router.execute_remote(dest_target, cmd).await;
@@ -16922,7 +16922,7 @@ async fn execute_command_inner(
                     &del_cmd,
                     &mut router.local_db.borrow_mut(),
                     &mut tmp,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let _ = router.execute_remote(dest_target, del_cmd).await;
@@ -16939,7 +16939,7 @@ async fn execute_command_inner(
                         &sadd_cmd,
                         &mut router.local_db.borrow_mut(),
                         &mut tmp,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let _ = router.execute_remote(dest_target, sadd_cmd).await;
@@ -16976,7 +16976,7 @@ async fn execute_command_inner(
                         &cmd,
                         &mut router.local_db.borrow_mut(),
                         out,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let res = router.execute_remote(first_target, cmd).await;
@@ -17114,7 +17114,7 @@ async fn execute_command_inner(
                         &cmd,
                         &mut router.local_db.borrow_mut(),
                         out,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let res = router.execute_remote(dest_target, cmd).await;
@@ -17222,7 +17222,7 @@ async fn execute_command_inner(
                     &del_cmd,
                     &mut router.local_db.borrow_mut(),
                     &mut tmp,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let _ = router.execute_remote(dest_target, del_cmd).await;
@@ -17240,7 +17240,7 @@ async fn execute_command_inner(
                         &zadd_cmd,
                         &mut router.local_db.borrow_mut(),
                         &mut tmp,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let _ = router.execute_remote(dest_target, zadd_cmd).await;
@@ -17430,7 +17430,7 @@ async fn execute_command_inner(
                     &cmd,
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router.execute_remote(target, cmd).await;
@@ -17490,7 +17490,7 @@ async fn execute_command_inner(
                     &cmd,
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router.execute_remote(target_src, cmd).await;
@@ -17557,7 +17557,7 @@ async fn execute_command_inner(
                     &cmd,
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router.execute_remote(target_src, cmd).await;
@@ -17589,7 +17589,7 @@ async fn execute_command_inner(
                     &cmd,
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router.execute_remote(first_shard, cmd).await;
@@ -17616,7 +17616,7 @@ async fn execute_command_inner(
                         &cmd,
                         &mut router.local_db.borrow_mut(),
                         out,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let res = router.execute_remote(first_shard, cmd).await;
@@ -17677,7 +17677,7 @@ async fn execute_command_inner(
                     &cmd,
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router.execute_remote(first_shard, cmd).await;
@@ -17705,7 +17705,7 @@ async fn execute_command_inner(
                         &cmd,
                         &mut router.local_db.borrow_mut(),
                         out,
-                        router.aof.as_deref(),
+                        router.aof().as_deref(),
                     );
                 } else {
                     let res = router.execute_remote(first_shard, cmd).await;
@@ -17776,7 +17776,7 @@ async fn execute_command_inner(
                     &cmd,
                     &mut router.local_db.borrow_mut(),
                     out,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                 );
             } else {
                 let res = router.execute_remote(target, cmd).await;
@@ -18106,7 +18106,7 @@ async fn execute_command_inner(
                 &keys,
                 &args,
                 &router.local_db,
-                router.aof.as_deref(),
+                router.aof().as_deref(),
                 read_only,
             );
             CURRENT_DB.set(saved_db);
@@ -18177,7 +18177,7 @@ async fn execute_command_inner(
                     &keys,
                     &args,
                     &router.local_db,
-                    router.aof.as_deref(),
+                    router.aof().as_deref(),
                     read_only,
                 );
                 CURRENT_DB.set(saved_db);
@@ -18356,7 +18356,7 @@ async fn execute_command_inner(
                 &keys,
                 &args,
                 &router.local_db,
-                router.aof.as_deref(),
+                router.aof().as_deref(),
                 read_only,
             );
             CURRENT_DB.set(saved_db);
@@ -19186,7 +19186,7 @@ async fn execute_command_inner(
                 out.extend_from_slice(b"-ERR WAITAOF cannot be used with replica instances. Please also note that writes to replicas are just local and are not propagated.\r\n");
                 return false;
             }
-            if numlocal > 0 && router.aof.is_none() {
+            if numlocal > 0 && router.aof().is_none() {
                 out.extend_from_slice(
                     b"-ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.\r\n",
                 );
@@ -19196,7 +19196,7 @@ async fn execute_command_inner(
             // fsynced (at once under appendfsync always, by the next
             // everysec fsync, or never under appendfsync no).
             let local = router
-                .aof
+                .aof()
                 .is_some()
                 .then(|| crate::replication::LocalAofTarget::now(router.base_port, router.num_shards));
             let (local_ok, count) = crate::replication::wait_aof(
@@ -19491,7 +19491,7 @@ async fn execute_command_inner(
                 args,
                 &mut router.local_db.borrow_mut(),
                 out,
-                router.aof.as_deref(),
+                router.aof().as_deref(),
             );
             false
         }
@@ -27538,7 +27538,7 @@ async fn execute_commands_squashed_inner(
     let is_resp3 = CURRENT_CLIENT_RESP3.get();
     // Write fast paths skip AOF, replication and keyspace notifications; when
     // any of those is needed, writes go through `execute_local_command`.
-    let write_fast_path = router.aof.is_none()
+    let write_fast_path = router.aof().is_none()
         && !crate::replication::has_connected_replicas(router.base_port)
         && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0;
     let mut local_db = router.local_db.borrow_mut();
@@ -28217,7 +28217,7 @@ async fn execute_commands_squashed_inner(
                             &cmd,
                             &mut local_db,
                             &mut local_buf,
-                            router.aof.as_deref(),
+                            router.aof().as_deref(),
                         ) {
                             should_close = true;
                         }
@@ -28783,7 +28783,7 @@ async fn exec_on_shard(router: &Router, shard: usize, cmd: Command) -> Vec<u8> {
             &cmd,
             &mut router.local_db.borrow_mut(),
             &mut out,
-            router.aof.as_deref(),
+            router.aof().as_deref(),
         );
         out
     } else {
@@ -29324,7 +29324,7 @@ pub async fn execute_cross_shard_replica_command(router: &Router, cmd: Command) 
                 &other,
                 &mut router.local_db.borrow_mut(),
                 &mut dummy_out,
-                router.aof.as_deref(),
+                router.aof().as_deref(),
             );
             dummy_out
         }

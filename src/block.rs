@@ -776,7 +776,7 @@ impl BlockHub {
         }
         if let Some(waiters) = self.stream_waiters.get_mut(&db_key) {
             let aof = crate::connection::CURRENT_ROUTER
-                .with(|cr| cr.borrow().as_ref().and_then(|r| r.aof.clone()));
+                .with(|cr| cr.borrow().as_ref().and_then(|r| r.aof().clone()));
             let mut satisfied = Vec::new();
             for (idx, waiter) in waiters.iter().enumerate() {
                 if waiter.sender.is_disconnected() {
@@ -915,7 +915,7 @@ fn propagate_served_opts(port: u16, cmd: &crate::resp::Command, suppress_repl: b
     crate::connection::CURRENT_ROUTER.with(|cr| {
         if let Some(router) = cr.borrow().as_ref() {
             shard_id = Some(router.shard_id);
-            if let Some(aof) = &router.aof {
+            if let Some(aof) = &router.aof() {
                 aof.borrow_mut().append(&bytes);
             }
         }

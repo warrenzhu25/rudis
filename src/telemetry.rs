@@ -251,7 +251,7 @@ pub fn format_server_state_metrics(router: &crate::router::Router) -> String {
         (
             "aof_enabled",
             "1 if AOF is on",
-            u64::from(router.aof.is_some()),
+            u64::from(router.aof().is_some()),
         ),
         (
             "aof_rewrite_in_progress",
