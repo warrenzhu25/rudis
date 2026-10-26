@@ -13824,7 +13824,11 @@ async fn execute_command_inner(
                 } => {
                     let hub_arc = crate::block::get_block_hub_for_port(router.port);
                     let mut hub = hub_arc.lock();
-                    let unblocked = hub.unblock_client(target_id, unblock_type);
+                    let unblocked = hub.unblock_client(target_id, unblock_type)
+                        || crate::replication::unblock_waiter(
+                            target_id,
+                            unblock_type != crate::block::ClientUnblockType::Timeout,
+                        );
                     if unblocked {
                         out.extend_from_slice(b":1\r\n");
                     } else {
@@ -19207,8 +19211,12 @@ async fn execute_command_inner(
             numreplicas,
             timeout,
         } => {
-            let count = crate::replication::wait_replicas(router.base_port, numreplicas, timeout).await;
-            write_resp_integer(out, count as i64);
+            match crate::replication::wait_replicas_for(client_id, router.base_port, numreplicas, timeout)
+                .await
+            {
+                Ok(count) => write_resp_integer(out, count as i64),
+                Err(_) => out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n"),
+            }
             false
         }
         Command::WaitAof {
@@ -19234,6 +19242,7 @@ async fn execute_command_inner(
                 .is_some()
                 .then(|| crate::replication::LocalAofTarget::now(router.base_port, router.num_shards));
             match crate::replication::wait_aof(
+                client_id,
                 router.base_port,
                 local,
                 numlocal,
@@ -19246,7 +19255,12 @@ async fn execute_command_inner(
                 Ok((local_ok, count)) => out.extend_from_slice(
                     format!("*2\r\n:{}\r\n:{}\r\n", u8::from(local_ok), count).as_bytes(),
                 ),
-                Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+                Err(crate::replication::WaitError::Unblocked) => {
+                    out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
+                }
+                Err(crate::replication::WaitError::AofOff) => out.extend_from_slice(
+                    b"-ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.\r\n",
+                ),
             }
             false
         }

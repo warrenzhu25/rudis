@@ -2314,7 +2314,7 @@ pub async fn wait_replicas_before_shutdown(port: u16) -> bool {
     }
     let aborts = SHUTDOWN_ABORTS.load(Ordering::SeqCst);
     SHUTDOWN_WAITERS.fetch_add(1, Ordering::SeqCst);
-    let _blocked = WaitBlocked::new();
+    let _blocked = WaitBlocked::new(0);
     let aborted = || SHUTDOWN_ABORTS.load(Ordering::SeqCst) != aborts;
     crate::connection::set_client_pause(secs * 1000 + 1000, true);
     crate::log_notice!("Waiting for replicas before shutting down.");
@@ -2437,19 +2437,59 @@ fn replconf_ack(offset: u64, fsynced: Option<u64>) -> String {
 pub static WAIT_BLOCKED_CLIENTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Counts a client in [`WAIT_BLOCKED_CLIENTS`] while it lives.
-struct WaitBlocked;
+/// Clients blocked in WAIT / WAITAOF, by client id, with what `CLIENT
+/// UNBLOCK` asked for (0: nothing yet, 1: timeout, 2: error).
+static WAIT_UNBLOCK: LazyLock<Mutex<HashMap<u64, u8>>> = LazyLock::new(Default::default);
+
+/// `CLIENT UNBLOCK <id> [TIMEOUT|ERROR]` for a client blocked in WAIT or
+/// WAITAOF: it returns at once, with what it has (TIMEOUT) or an UNBLOCKED
+/// error. False if that client isn't blocked there.
+pub fn unblock_waiter(client_id: u64, error: bool) -> bool {
+    match WAIT_UNBLOCK.lock().get_mut(&client_id) {
+        Some(flag) => {
+            *flag = if error { 2 } else { 1 };
+            true
+        }
+        None => false,
+    }
+}
+
+/// Why a WAIT / WAITAOF ended early.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WaitError {
+    /// CLIENT UNBLOCK ... ERROR.
+    Unblocked,
+    /// WAITAOF's local copy while AOF was turned off.
+    AofOff,
+}
+
+/// Counts a client in [`WAIT_BLOCKED_CLIENTS`] (and makes it unblockable
+/// by id, if it has one) while it lives.
+struct WaitBlocked(u64);
 
 impl WaitBlocked {
-    fn new() -> Self {
+    fn new(client_id: u64) -> Self {
         WAIT_BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
-        Self
+        if client_id != 0 {
+            WAIT_UNBLOCK.lock().insert(client_id, 0);
+        }
+        Self(client_id)
+    }
+
+    fn unblock_request(&self) -> u8 {
+        if self.0 == 0 {
+            return 0;
+        }
+        WAIT_UNBLOCK.lock().get(&self.0).copied().unwrap_or(0)
     }
 }
 
 impl Drop for WaitBlocked {
     fn drop(&mut self) {
         WAIT_BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+        if self.0 != 0 {
+            WAIT_UNBLOCK.lock().remove(&self.0);
+        }
     }
 }
 
@@ -2499,24 +2539,47 @@ impl ReplicationHub {
 /// WAIT: blocks until `numreplicas` replicas acknowledged every write so
 /// far, or `timeout_ms` passes (0 = no timeout); returns how many did.
 pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> usize {
-    wait_acks(port, numreplicas, timeout_ms, false, None, false, &|| true)
+    wait_replicas_for(0, port, numreplicas, timeout_ms)
         .await
-        .1
+        .unwrap_or(0)
+}
+
+/// [`wait_replicas`] for client `client_id`, which CLIENT UNBLOCK can end.
+pub async fn wait_replicas_for(
+    client_id: u64,
+    port: u16,
+    numreplicas: usize,
+    timeout_ms: u64,
+) -> Result<usize, WaitError> {
+    wait_acks(
+        client_id,
+        port,
+        numreplicas,
+        timeout_ms,
+        false,
+        None,
+        false,
+        &|| true,
+    )
+    .await
+    .map(|r| r.1)
 }
 
 /// WAITAOF: like WAIT, but counts replicas that fsynced the writes to
 /// their AOF, and with `numlocal` also waits for `local` (this server's
 /// AOF fsync; `None` without AOF). Returns (local fsynced, replicas).
 pub async fn wait_aof(
+    client_id: u64,
     port: u16,
     local: Option<LocalAofTarget>,
     numlocal: usize,
     numreplicas: usize,
     timeout_ms: u64,
     aof_on: impl Fn() -> bool,
-) -> Result<(bool, usize), &'static str> {
+) -> Result<(bool, usize), WaitError> {
     let need_local = numlocal > 0;
     let res = wait_acks(
+        client_id,
         port,
         numreplicas,
         timeout_ms,
@@ -2525,15 +2588,17 @@ pub async fn wait_aof(
         need_local,
         &aof_on,
     )
-    .await;
+    .await?;
     // AOF turned off while waiting for the local copy (Redis's error).
     if need_local && !aof_on() {
-        return Err("WAITAOF cannot be used when numlocal is set but appendonly is disabled.");
+        return Err(WaitError::AofOff);
     }
     Ok(res)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_acks(
+    client_id: u64,
     port: u16,
     numreplicas: usize,
     timeout_ms: u64,
@@ -2541,7 +2606,7 @@ async fn wait_acks(
     local: Option<&LocalAofTarget>,
     need_local: bool,
     aof_on: &dyn Fn() -> bool,
-) -> (bool, usize) {
+) -> Result<(bool, usize), WaitError> {
     let hub = get_replication_hub(port);
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms);
@@ -2550,15 +2615,19 @@ async fn wait_acks(
     let mut asked_at: Option<std::time::Instant> = None;
     loop {
         if need_local && !aof_on() {
-            return (false, hub.count_acks(target_offset, aof));
+            return Ok((false, hub.count_acks(target_offset, aof)));
         }
         let local_ok = local.is_some_and(|l| l.fsynced());
         let count = hub.count_acks(target_offset, aof);
         let done = count >= numreplicas && (local_ok || !need_local);
-        if done || (timeout_ms > 0 && start.elapsed() >= timeout) {
-            return (local_ok, count);
+        let unblock = blocked.as_ref().map_or(0, WaitBlocked::unblock_request);
+        if unblock == 2 {
+            return Err(WaitError::Unblocked);
         }
-        blocked.get_or_insert_with(WaitBlocked::new);
+        if done || unblock == 1 || (timeout_ms > 0 && start.elapsed() >= timeout) {
+            return Ok((local_ok, count));
+        }
+        blocked.get_or_insert_with(|| WaitBlocked::new(client_id));
         // Ask for acks now, like Redis: replicas otherwise report their
         // offset once a second, so every WAIT took ~1 s. The request goes
         // into the stream after the writes being waited for, and a replica
@@ -4442,6 +4511,23 @@ mod tests {
         p[1].appended.store(9, Ordering::SeqCst);
         p[1].fsynced.store(4, Ordering::SeqCst);
         assert!(t.fsynced());
+    }
+
+    /// CLIENT UNBLOCK ends a WAIT: TIMEOUT with what it has, ERROR with
+    /// an error; a client not waiting isn't unblocked.
+    #[monoio::test(timer_enabled = true)]
+    async fn test_client_unblock_ends_a_wait() {
+        let port = 19988;
+        assert!(!unblock_waiter(9001, false));
+        let waiter = monoio::spawn(wait_replicas_for(9001, port, 1, 0));
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(unblock_waiter(9001, false));
+        assert_eq!(waiter.await, Ok(0));
+        let waiter = monoio::spawn(wait_replicas_for(9001, port, 1, 0));
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(unblock_waiter(9001, true));
+        assert_eq!(waiter.await, Err(WaitError::Unblocked));
+        assert!(!unblock_waiter(9001, true), "still registered");
     }
 
     /// WAIT with no timeout (0) blocks until enough replicas ack, counted

@@ -35906,3 +35906,38 @@ fn test_config_set_appendonly_at_runtime_e2e() {
     let _ = server.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// CLIENT UNBLOCK ends a client blocked in WAIT, as in Redis: TIMEOUT
+/// replies with the replicas counted so far, ERROR with UNBLOCKED.
+#[test]
+fn test_client_unblock_ends_wait_e2e() {
+    let port = 29941u16;
+    start_test_server(port, 2);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let (mut w, mut c) = (connect(), connect());
+    let id = resp_cmd(&mut w, &["CLIENT", "ID"]);
+    let id = id.trim().trim_start_matches(':').to_string();
+    assert_eq!(resp_cmd(&mut c, &["CLIENT", "UNBLOCK", &id]), ":0\r\n");
+    for (how, want) in [
+        ("TIMEOUT", ":0\r\n"),
+        (
+            "ERROR",
+            "-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n",
+        ),
+    ] {
+        w.write_all(b"*3\r\n$4\r\nWAIT\r\n$1\r\n1\r\n$1\r\n0\r\n")
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while resp_cmd(&mut c, &["CLIENT", "UNBLOCK", &id, how]) != ":1\r\n" {
+            assert!(std::time::Instant::now() < deadline, "WAIT not blocked");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut buf = [0u8; 128];
+        let n = w.read(&mut buf).unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), want);
+    }
+}
