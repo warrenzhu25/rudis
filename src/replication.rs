@@ -568,6 +568,10 @@ pub struct ReplicationHub {
     pub link_phase: std::sync::atomic::AtomicU8,
     /// The coordinated failover (FAILOVER command) under way, if any.
     failover: Mutex<Failover>,
+    /// Set when a master restored the history saved in its RDB without
+    /// turning the backlog on: `unlogged_change_marker()` then, plus one
+    /// (0: nothing pending). See `settle_restored_history`.
+    restored_at_changes: AtomicU64,
     /// Set while a failover has turned us into the target's replica: the
     /// replica worker then sends `PSYNC <replid> <offset> FAILOVER`.
     failover_in_progress: AtomicBool,
@@ -720,6 +724,7 @@ impl ReplicationHub {
             last_master_io_secs: AtomicU64::new(0),
             link_phase: std::sync::atomic::AtomicU8::new(LINK_CONNECTING),
             failover: Mutex::new(Failover::default()),
+            restored_at_changes: AtomicU64::new(0),
             failover_in_progress: AtomicBool::new(false),
         }
     }
@@ -996,8 +1001,46 @@ impl ReplicationHub {
             self.master_repl_offset.store(offset, Ordering::SeqCst);
             backlog.clear(offset);
         }
-        // Like Redis, which creates the backlog at load time.
+        if as_replica {
+            self.activate_backlog();
+        } else {
+            // Unlike Redis, a master does not turn the backlog on here:
+            // every shard's writes would go through it (one lock for all of
+            // them, ~2.5x slower SET on 8 threads) for up to
+            // repl-backlog-ttl with no replica at all. It is turned on when
+            // the first replica comes; the saved history is still
+            // continued then if nothing was written meanwhile.
+            self.restored_at_changes
+                .store(unlogged_change_marker() + 1, Ordering::SeqCst);
+        }
+    }
+
+    /// When the first replica comes after a master restored its saved
+    /// history (see `restore_saved_history`): turns the backlog on, and if
+    /// writes happened before (they reached no backlog), forgets the saved
+    /// history, so a replica asking to continue it full-syncs rather than
+    /// partially resyncing past writes it never got. Called with the
+    /// backlog lock held.
+    fn settle_restored_history(&self) {
+        if self.restored_at_changes.load(Ordering::SeqCst) != 0 {
+            // On first, then checked: a write racing with this either
+            // counts as a change or reaches the backlog.
+            self.activate_backlog();
+            self.settle_restored_history_at(unlogged_change_marker());
+        }
+    }
+
+    fn settle_restored_history_at(&self, marker_now: u64) {
+        let at = self.restored_at_changes.swap(0, Ordering::SeqCst);
+        if at == 0 {
+            return;
+        }
         self.activate_backlog();
+        if marker_now + 1 != at {
+            let mut ids = self.ids.write();
+            ids.replid2 = NULL_REPLID.to_string();
+            ids.second_offset = -1;
+        }
     }
 
     /// The `repl-id` / `repl-offset` / `repl-stream-db` to save in an RDB: a
@@ -1187,6 +1230,7 @@ impl ReplicationHub {
         sender: flume::Sender<Vec<u8>>,
         full_sync: Option<FullSyncCut>,
     ) -> Arc<ConnectedReplica> {
+        self.settle_restored_history();
         let peer = self.pending_peers.lock().remove(&id).unwrap_or_default();
         let rep = Arc::new(ConnectedReplica {
             id,
@@ -1522,6 +1566,7 @@ impl ReplicationHub {
         // change lands between the diff and the live stream (and our ids
         // cannot change meanwhile).
         let mut backlog = self.backlog.write();
+        self.settle_restored_history();
         if !self.can_serve_replicas() || !self.replid_matches(req_replid, target_offset) {
             return None;
         }
@@ -1820,7 +1865,7 @@ impl ReplicationHub {
              master_replid2:{}\r\n\
              master_repl_offset:{}\r\n\
              second_repl_offset:{}\r\n\
-             repl_backlog_active:1\r\n\
+             repl_backlog_active:{}\r\n\
              repl_backlog_size:{}\r\n\
              repl_backlog_first_byte_offset:{}\r\n\
              repl_backlog_histlen:{}\r\n",
@@ -1828,6 +1873,8 @@ impl ReplicationHub {
             ids.replid2,
             offset,
             ids.second_offset,
+            // Like Redis: 0 until a replica (or our own master) needs it.
+            u8::from(self.replication_active.load(Ordering::Relaxed)),
             backlog.max_size,
             backlog.first_byte_offset,
             backlog.len()
@@ -1907,6 +1954,14 @@ impl ReplicationHub {
             }
         }
     }
+}
+
+/// Grows with every change to any dataset in this process: client writes,
+/// expirations and evictions (which replicas get as DELs).
+fn unlogged_change_marker() -> u64 {
+    crate::snapshot::changes_total()
+        .wrapping_add(crate::table::get_expired_keys())
+        .wrapping_add(crate::table::get_evicted_keys())
 }
 
 /// Redis's coordinated failover states (INFO `master_failover_state`).
@@ -4644,6 +4699,42 @@ mod tests {
         let hub = ReplicationHub::new(19983);
         hub.restore_saved_history("short", 300, 0, true);
         assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 0);
+    }
+
+    /// A master restoring its saved history leaves replication off (no
+    /// write pays for a backlog nobody uses). The first replica turns it
+    /// on and may continue the saved history only if nothing changed in
+    /// between.
+    #[test]
+    fn test_restored_history_turns_the_backlog_on_lazily() {
+        let saved = "4".repeat(40);
+        let hub = ReplicationHub::new(19986);
+        hub.replication_active.store(false, Ordering::SeqCst);
+        hub.restore_saved_history(&saved, 300, 0, false);
+        assert!(
+            !hub.replication_active.load(Ordering::SeqCst),
+            "turned on at load"
+        );
+        // No change since: a replica continues the saved history.
+        hub.restored_at_changes.store(7 + 1, Ordering::SeqCst);
+        hub.settle_restored_history_at(7);
+        let (tx, _rx) = flume::unbounded();
+        let (_, diff, rep) = hub
+            .try_partial_resync(1, tx, &saved, 301)
+            .expect("continues");
+        assert!(diff.is_empty());
+        assert!(hub.replication_active.load(Ordering::SeqCst));
+        hub.unregister_replica(rep.id);
+
+        // A change before the first replica: the saved history is gone.
+        let hub = ReplicationHub::new(19987);
+        hub.restore_saved_history(&saved, 300, 0, false);
+        hub.restored_at_changes.store(7 + 1, Ordering::SeqCst);
+        hub.settle_restored_history_at(8);
+        let (tx, _rx) = flume::unbounded();
+        assert!(hub.try_partial_resync(2, tx, &saved, 301).is_none());
+        assert_eq!(hub.ids().replid2, NULL_REPLID);
+        assert!(hub.replication_active.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -70,6 +70,11 @@ pub fn any_save_failing() -> bool {
     SAVES_FAILING.load(Ordering::Relaxed) != 0
 }
 
+/// Changes made so far by every server in this process (monotonic).
+pub fn changes_total() -> u64 {
+    dirty_now()
+}
+
 fn dirty_now() -> u64 {
     WRITES.iter().map(|s| s.0.load(Ordering::Relaxed)).sum()
 }

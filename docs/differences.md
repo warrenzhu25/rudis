@@ -66,6 +66,9 @@ This document summarizes the architectural, operational, and semantic difference
 * A rudis replica always receives the master's RDB into a temp file and loads it once the transfer is complete, like Redis's default `repl-diskless-load disabled`: a transfer that breaks off leaves the old dataset untouched. `repl-diskless-load swapdb` / `on-empty-db` are accepted and behave the same way; there is no `async_loading` (serving the old dataset while the new one loads) — data commands get `-LOADING` during the load.
 * `repl-diskless-sync-delay` is accepted but ignored: each replica's snapshot is streamed on its own, so there is no shared BGSAVE for late replicas to join.
 
+### Replication Backlog After a Restart
+* A Redis master restarted from its RDB creates the replication backlog at load time, so a replica can partially resync even after writes. A rudis master turns the backlog on only when the first replica connects: until then writes skip it (all shards append to one backlog, which costs ~2.5x SET throughput on 8 threads). A replica that returns before any write (or expiry/eviction) still continues with a partial resync; one that returns after does a full sync. `INFO replication`'s `repl_backlog_active` shows the state.
+
 ### Turning AOF On or Off
 * `appendonly` is read at startup only. `CONFIG SET appendonly` (which Redis uses to enable AOF on a live server, starting with a rewrite) is refused; restart with the new setting.
 

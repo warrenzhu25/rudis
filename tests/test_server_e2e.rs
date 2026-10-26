@@ -35681,3 +35681,87 @@ fn test_shutdown_abort_and_now_e2e() {
     let _ = replica.kill();
     let _ = replica.wait();
 }
+
+/// A master restarted from its RDB keeps replication off until a replica
+/// comes (writes don't pay for a backlog nobody uses): INFO shows
+/// repl_backlog_active:0. A replica returning before any write continues
+/// the saved history with a partial resync; one returning after a write
+/// full-syncs and gets that write.
+#[test]
+fn test_restarted_master_turns_the_backlog_on_with_its_first_replica_e2e() {
+    let (mport, rport) = (29921u16, 29922u16);
+    let mdir = std::env::temp_dir().join(format!("rudis-lazybl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    std::fs::create_dir_all(&mdir).unwrap();
+    let md = mdir.to_str().unwrap().to_string();
+    let ms = mport.to_string();
+    let margs = ["--port", &ms, "--threads", "2", "--no-pin", "--dir", &md];
+    let rs = rport.to_string();
+    let mut master = spawn_rudis_listening(&margs, mport);
+    let mut replica = spawn_rudis_listening(
+        &["--port", &rs, "--threads", "2", "--no-pin", "--save", ""],
+        rport,
+    );
+    let connect = |port: u16| {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let mut r = connect(rport);
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut r);
+    let mut m = connect(mport);
+    assert_eq!(resp_cmd(&mut m, &["SET", "k", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut m, &["WAIT", "1", "5000"]), ":1\r\n");
+
+    let stat = |c: &mut TcpStream, name: &str| -> String {
+        let info = resp_cmd_full(c, &["INFO"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")).map(str::to_string))
+            .unwrap_or_else(|| panic!("no {name}: {info}"))
+    };
+    // Restarts the master from its RDB with the replica stopped, so it
+    // can't come back before `between` ran on the new master.
+    let mut restart = |master: &mut std::process::Child, between: &dyn Fn(&mut TcpStream)| {
+        // SAFETY: kill(2) on our own live child.
+        unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGSTOP) };
+        let mut m = connect(mport);
+        let _ = m.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$4\r\nSAVE\r\n");
+        let _ = master.wait();
+        *master = spawn_rudis_listening(&margs, mport);
+        let mut m = connect(mport);
+        assert_eq!(stat(&mut m, "repl_backlog_active"), "0");
+        between(&mut m);
+        // SAFETY: as above.
+        unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGCONT) };
+        wait_for_master_link(&mut r);
+        m
+    };
+    // Nothing written in between: the replica continues.
+    let mut m = restart(&mut master, &|_| {});
+    assert_eq!(stat(&mut m, "repl_backlog_active"), "1");
+    assert_eq!(stat(&mut m, "sync_partial_ok"), "1");
+    assert_eq!(stat(&mut m, "sync_full"), "0");
+    // A write in between: the replica full-syncs and has it.
+    let mut m = restart(&mut master, &|m| {
+        assert_eq!(resp_cmd(m, &["SET", "k", "2"]), "+OK\r\n");
+    });
+    assert_eq!(stat(&mut m, "sync_full"), "1");
+    assert_eq!(stat(&mut m, "sync_partial_ok"), "0");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd(&mut r, &["GET", "k"]) != "$1\r\n2\r\n" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica missed the write"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    for c in [&mut master, &mut replica] {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    let _ = std::fs::remove_dir_all(&mdir);
+}
