@@ -92,6 +92,9 @@ pub const OP_EXPIRETIME: u8 = 253;
 pub const OP_SELECTDB: u8 = 254;
 pub const OP_EOF: u8 = 255;
 
+/// The largest field expire time Redis accepts (`EB_EXPIRE_TIME_MAX`,
+/// 2^48 - 1 ms).
+const EB_EXPIRE_TIME_MAX: u64 = (1 << 48) - 1;
 const QUICKLIST_NODE_PLAIN: u64 = 1;
 const QUICKLIST_NODE_PACKED: u64 = 2;
 
@@ -447,10 +450,29 @@ pub fn ziplist_for_each<'a>(
         return corrupt("invalid ziplist header");
     }
     let end = zl.len() - 1;
+    // As Redis's ziplistValidateIntegrity: the tail offset, entry count
+    // and each entry's prevlen must agree with the entries themselves.
+    let tail = le_u32(zl, 4)? as usize;
+    let count = u16::from_le_bytes([zl[8], zl[9]]);
     let mut p = 10;
+    let (mut prev_start, mut prev_len, mut entries) = (None, 0usize, 0usize);
     while p < end {
-        // prevlen: 1 byte, or 0xFE followed by 4 bytes.
-        p += if zl[p] < 254 { 1 } else { 5 };
+        let entry_start = p;
+        // prevlen: 1 byte, or 0xFE followed by 4 bytes (0xFF is the end).
+        let prevlen = match zl[p] {
+            0xFF => return corrupt("ziplist entry starts with the end marker"),
+            0xFE => {
+                p += 5;
+                le_u32(zl, entry_start + 1)? as usize
+            }
+            b => {
+                p += 1;
+                b as usize
+            }
+        };
+        if prevlen != prev_len {
+            return corrupt("ziplist entry prevlen doesn't match the previous entry");
+        }
         let enc = *zl.get(p).ok_or_else(truncated)?;
         let (elem, size) = match enc >> 6 {
             0 => {
@@ -492,9 +514,18 @@ pub fn ziplist_for_each<'a>(
         }
         f(elem)?;
         p += size;
+        prev_start = Some(entry_start);
+        prev_len = p - entry_start;
+        entries += 1;
     }
     if p != end {
         return corrupt("ziplist entries overrun the end marker");
+    }
+    if tail != prev_start.unwrap_or(10) {
+        return corrupt("ziplist tail offset doesn't point at its last entry");
+    }
+    if count != u16::MAX && count as usize != entries {
+        return corrupt("ziplist entry count doesn't match its entries");
     }
     Ok(())
 }
@@ -523,6 +554,10 @@ pub fn listpack_for_each<'a>(
         return corrupt("invalid listpack header");
     }
     let end = lp.len() - 1;
+    // As Redis's lpValidateIntegrity: each entry's backlen must encode its
+    // length, and the entry count must match the entries.
+    let count = u16::from_le_bytes([lp[4], lp[5]]);
+    let mut entries = 0usize;
     let mut p = 6;
     while p < end {
         let b = lp[p];
@@ -559,10 +594,28 @@ pub fn listpack_for_each<'a>(
         if p + total > end {
             return corrupt("listpack entry overruns the listpack");
         }
+        if lp_decode_backlen(&lp[p + len..p + total]) != Some(len) {
+            return corrupt("listpack entry backlen doesn't match its length");
+        }
         f(elem)?;
         p += total;
+        entries += 1;
+    }
+    if count != u16::MAX && count as usize != entries {
+        return corrupt("listpack entry count doesn't match its entries");
     }
     Ok(())
+}
+
+/// The entry length a listpack backlen encodes, as Redis's
+/// lpEncodeBacklen lays it out: 7 bits per byte, most significant first;
+/// the first byte has its high bit clear, every later byte has it set.
+fn lp_decode_backlen(b: &[u8]) -> Option<usize> {
+    let (first, rest) = b.split_first()?;
+    if first & 0x80 != 0 || rest.iter().any(|x| x & 0x80 == 0) {
+        return None;
+    }
+    Some(b.iter().fold(0usize, |v, x| (v << 7) | (x & 0x7F) as usize))
 }
 
 fn listpack_elems(lp: &[u8]) -> RdbResult<Vec<Elem<'_>>> {
@@ -840,10 +893,14 @@ pub fn decode_value(t: u8, r: &mut Reader<'_>, now_ms: u64) -> RdbResult<Option<
             let mut list = VecDeque::new();
             for _ in 0..n {
                 let blob = r.string()?;
+                let before = list.len();
                 ziplist_for_each(&blob, |e| {
                     list.push_back(e.to_bytes());
                     Ok(())
                 })?;
+                if list.len() == before {
+                    return corrupt("empty quicklist node");
+                }
             }
             Ok(list_value(list))
         }
@@ -853,6 +910,10 @@ pub fn decode_value(t: u8, r: &mut Reader<'_>, now_ms: u64) -> RdbResult<Option<
             for _ in 0..n {
                 let container = r.length()?;
                 let blob = r.string()?;
+                if blob.is_empty() {
+                    return corrupt("empty quicklist node");
+                }
+                let before = list.len();
                 match container {
                     QUICKLIST_NODE_PLAIN => list.push_back(Bytes::copy_from_slice(&blob)),
                     QUICKLIST_NODE_PACKED => listpack_for_each(&blob, |e| {
@@ -860,6 +921,9 @@ pub fn decode_value(t: u8, r: &mut Reader<'_>, now_ms: u64) -> RdbResult<Option<
                         Ok(())
                     })?,
                     _ => return corrupt("unknown quicklist node container"),
+                }
+                if list.len() == before {
+                    return corrupt("empty quicklist node");
                 }
             }
             Ok(list_value(list))
@@ -885,6 +949,9 @@ pub fn decode_value(t: u8, r: &mut Reader<'_>, now_ms: u64) -> RdbResult<Option<
                     (ttl, Some(min)) => ttl.wrapping_add(min).wrapping_sub(1),
                     (ttl, None) => ttl,
                 };
+                if at > EB_EXPIRE_TIME_MAX {
+                    return corrupt("hash field TTL beyond the largest expire time");
+                }
                 if at != 0 && at <= now_ms {
                     continue;
                 }
@@ -909,8 +976,18 @@ pub fn decode_value(t: u8, r: &mut Reader<'_>, now_ms: u64) -> RdbResult<Option<
             }
             let mut pairs = Vec::with_capacity(elems.len() / 3);
             let mut expires = Vec::new();
+            // As Redis writes them: fields with a TTL first, by ascending
+            // TTL, then those without (TTL 0).
+            let mut last_at = 1u64;
             for c in elems.as_chunks::<3>().0 {
                 let at = c[2].as_int()? as u64;
+                if at > EB_EXPIRE_TIME_MAX {
+                    return corrupt("hash field TTL beyond the largest expire time");
+                }
+                if at != 0 && (last_at == 0 || at < last_at) {
+                    return corrupt("hash fields out of TTL order");
+                }
+                last_at = at;
                 if at != 0 && at <= now_ms {
                     continue;
                 }
@@ -2369,9 +2446,10 @@ mod tests {
     fn ziplist(entries: &[&[u8]]) -> Vec<u8> {
         // Entries are pre-encoded (encoding + data); prevlen is filled in.
         let mut body = Vec::new();
-        let mut prev = 0usize;
+        let (mut prev, mut last) = (0usize, 0usize);
         for e in entries {
             let start = body.len();
+            last = start;
             if prev < 254 {
                 body.push(prev as u8);
             } else {
@@ -2384,11 +2462,107 @@ mod tests {
         let mut zl = Vec::new();
         let total = 10 + body.len() + 1;
         zl.extend_from_slice(&(total as u32).to_le_bytes());
-        zl.extend_from_slice(&0u32.to_le_bytes());
+        // zltail: offset of the last entry.
+        zl.extend_from_slice(&((10 + last) as u32).to_le_bytes());
         zl.extend_from_slice(&(entries.len() as u16).to_le_bytes());
         zl.extend_from_slice(&body);
         zl.push(0xFF);
         zl
+    }
+
+    /// Damaged ziplists and listpacks are refused, as Redis's integrity
+    /// checks refuse them, instead of decoding to garbage.
+    #[test]
+    fn damaged_ziplists_and_listpacks_are_refused() {
+        let good = ziplist(&[b"\x01a", b"\x01b", b"\x01c"]);
+        assert_eq!(ziplist_elems(&good).unwrap().len(), 3);
+        let err = |zl: &[u8]| ziplist_elems(zl).unwrap_err().to_string();
+        // Entry count (zllen) off by one.
+        let mut zl = good.clone();
+        zl[8] = 2;
+        assert!(err(&zl).contains("count"), "{}", err(&zl));
+        // zltail not at the last entry.
+        let mut zl = good.clone();
+        zl[4] = 10;
+        assert!(err(&zl).contains("tail"), "{}", err(&zl));
+        // The second entry's prevlen (byte 13) doesn't match the first (3).
+        let mut zl = good.clone();
+        zl[13] = 9;
+        assert!(err(&zl).contains("prevlen"), "{}", err(&zl));
+        // An unknown count (0xFFFF) is allowed, as in Redis.
+        let mut zl = good.clone();
+        zl[8] = 0xFF;
+        zl[9] = 0xFF;
+        assert_eq!(ziplist_elems(&zl).unwrap().len(), 3);
+
+        let lp = lp_of(|w| {
+            w.str(b"x");
+            w.str(&[b'y'; 200]);
+            w.int(7);
+        });
+        assert_eq!(lp_vals(&lp).len(), 3);
+        let lp_err = |lp: &[u8]| listpack_elems(lp).unwrap_err().to_string();
+        let mut bad = lp.clone();
+        bad[4] = 2;
+        assert!(lp_err(&bad).contains("count"), "{}", lp_err(&bad));
+        // The first entry ("x": 2 bytes) has a 1-byte backlen of 2 at 6 + 2.
+        let mut bad = lp.clone();
+        bad[8] = 3;
+        assert!(lp_err(&bad).contains("backlen"), "{}", lp_err(&bad));
+        for (len, enc) in [(5usize, vec![5u8]), (200, vec![1, 200 & 0x7F | 0x80])] {
+            assert_eq!(lp_decode_backlen(&enc), Some(len));
+        }
+        assert_eq!(lp_decode_backlen(&[0x81]), None);
+
+        // A quicklist node with no entries.
+        let mut body = vec![TYPE_LIST_QUICKLIST_2];
+        write_len(&mut body, 1);
+        write_len(&mut body, QUICKLIST_NODE_PLAIN);
+        write_raw_string(&mut body, b"");
+        assert!(decode_dump_body(&body, 0).is_err());
+    }
+
+    /// Hash field TTLs beyond EB_EXPIRE_TIME_MAX, or out of the order
+    /// Redis writes them in, are refused.
+    #[test]
+    fn hash_field_ttls_are_validated() {
+        let body = |lp: &[u8]| {
+            let mut body = vec![TYPE_HASH_LISTPACK_EX];
+            body.extend_from_slice(&1i64.to_le_bytes());
+            write_raw_string(&mut body, lp);
+            body
+        };
+        let decode = |lp: &[u8]| decode_dump_body(&body(lp), 0).map(|d| d.field_expires.len());
+        let ordered = lp_of(|w| {
+            for (f, ttl) in [(b"a", 100i64), (b"b", 200), (b"c", 0)] {
+                w.str(f);
+                w.str(b"v");
+                w.int(ttl);
+            }
+        });
+        assert_eq!(decode(&ordered).unwrap(), 2);
+        let unordered = lp_of(|w| {
+            for (f, ttl) in [(b"a", 200i64), (b"b", 100)] {
+                w.str(f);
+                w.str(b"v");
+                w.int(ttl);
+            }
+        });
+        assert!(decode(&unordered).is_err());
+        let ttl_after_none = lp_of(|w| {
+            for (f, ttl) in [(b"a", 0i64), (b"b", 100)] {
+                w.str(f);
+                w.str(b"v");
+                w.int(ttl);
+            }
+        });
+        assert!(decode(&ttl_after_none).is_err());
+        let too_far = lp_of(|w| {
+            w.str(b"a");
+            w.str(b"v");
+            w.int(1 << 48);
+        });
+        assert!(decode(&too_far).is_err());
     }
 
     #[test]
@@ -2738,16 +2912,17 @@ mod tests {
         assert_eq!(d.field_expires.len(), 1);
 
         // RDB_TYPE_HASH_LISTPACK_EX: min expire, listpack of triplets.
+        // As Redis orders them: by ascending TTL, fields without one last.
         let lp = lp_of(|w| {
-            w.str(b"a");
-            w.str(b"1");
-            w.int(0);
-            w.str(b"b");
-            w.str(b"2");
-            w.int(now as i64 + 10);
             w.str(b"gone");
             w.str(b"3");
             w.int(now as i64 - 10);
+            w.str(b"b");
+            w.str(b"2");
+            w.int(now as i64 + 10);
+            w.str(b"a");
+            w.str(b"1");
+            w.int(0);
         });
         let mut body = vec![TYPE_HASH_LISTPACK_EX];
         body.extend_from_slice(&(now as i64 + 10).to_le_bytes());

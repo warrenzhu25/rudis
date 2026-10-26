@@ -34884,3 +34884,65 @@ fn test_slot_migration_reuses_one_connection_e2e() {
     assert!(opened <= 4, "{opened} connections for {n} keys");
     assert_eq!(resp_cmd(&mut c2, &["DBSIZE"]), format!(":{n}\r\n"));
 }
+
+/// Corrupt DUMP payloads from Redis's corrupt-dump suite (a ziplist with a
+/// wrong prevlen or count, an empty quicklist node, hash field TTLs out of
+/// range or out of order) are refused with "Bad data format" rather than
+/// stored, and the server keeps serving.
+#[test]
+fn test_restore_refuses_corrupt_payloads_e2e() {
+    // Redis TCL string escapes: \xHH and \t.
+    fn unescape(s: &str) -> Vec<u8> {
+        let b = s.as_bytes();
+        let (mut out, mut i) = (Vec::new(), 0);
+        while i < b.len() {
+            if b[i] == b'\\' && b[i + 1] == b'x' {
+                out.push(u8::from_str_radix(&s[i + 2..i + 4], 16).unwrap());
+                i += 4;
+            } else if b[i] == b'\\' && b[i + 1] == b't' {
+                out.push(b'\t');
+                i += 2;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+    let payloads = [
+        // quicklist big ziplist prev len
+        r"\x0E\x01\x13\x13\x00\x00\x00\x0E\x00\x00\x00\x02\x00\x00\x02\x61\x00\x0E\x02\x62\x00\xFF\x09\x00\x49\x97\x30\xB2\x0D\xA1\xED\xAA",
+        // quicklist small ziplist prev len
+        r"\x0E\x01\x13\x13\x00\x00\x00\x0E\x00\x00\x00\x02\x00\x00\x02\x61\x00\x02\x02\x62\x00\xFF\x09\x00\xC7\x71\x03\x97\x07\x75\xB0\x63",
+        // quicklist ziplist wrong count
+        r"\x0E\x01\x13\x13\x00\x00\x00\x0E\x00\x00\x00\x03\x00\x00\x02\x61\x00\x04\x02\x62\x00\xFF\x09\x00\x4D\xE2\x0A\x2F\x08\x25\xDF\x91",
+        // quicklist encoded_len is 0
+        r"\x12\x01\x01\x00\x0a\x00\x8f\xc6\xc0\x57\x1c\x0a\xb3\x3c",
+        // hash listpackex with TTL larger than EB_EXPIRE_TIME_MAX
+        r"\x17\x33\x33\x00\x00\x00\x09\x00\x00\x01\x00\x01\xf4\x01\xc5\x89\x95\x8f\x01\x00\x00\x09\x01\x01\x82\x5f\x31\x03\xf4\x29\x94\x97\x95\x8f\x01\x00\x00\x09\x02\x01\x02\x01\xf4\x01\x5e\xaf\x95\x8f\x01\x33\x00\x09\xff\x0c\x00\x7e\x4f\xf4\x33\xe9\xc5\x3e\x56",
+        // hash listpackex with unordered TTL fields
+        r"\x17\xc3\x30\x35\x14\x35\x00\x00\x00\t\x00\x82\x66\x32\x03\x82\x76\x32\x03\xf4\x80\x73\x16\xd1\x8f\x01\x20\x12\x02\x82\x66\x31\x20\x11\x03\x31\x03\xf4\x7f\xe0\x01\x11\x00\x33\x20\x11\x04\x33\x03\x00\x01\xff\x0c\x00\xf6\x70\x29\x57\x11\x68\x9d\xe5",
+        // hash listpackex: a field without TTL followed by one with TTL
+        r"\x17\x2d\x2d\x00\x00\x00\x09\x00\x82\x66\x31\x03\x82\x76\x31\x03\x00\x01\x82\x66\x32\x03\x82\x76\x32\x03\xf4\xe0\x59\x7a\x96\x00\x00\x00\x00\x09\x82\x66\x33\x03\x82\x76\x33\x03\x00\x01\xff\x0c\x00\x42\x66\xd4\xbe\x17\xc3\x96\x72",
+        // hash hashtable with TTL larger than EB_EXPIRE_TIME_MAX
+        r"\x16\x02\x81\x00\x01\x00\x00\x00\x00\x00\x00\x02\x66\x31\x02\x76\x31\x81\x00\x01\x00\x00\x00\x00\x00\x00\x02\x66\x32\x02\x76\x32\x0c\x00\xb9\x3c\x65\x28\x40\x94\x58\x36",
+    ];
+    let port = 29821;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for (i, p) in payloads.iter().enumerate() {
+        let payload = unescape(p);
+        let mut frame = b"*5\r\n$7\r\nRESTORE\r\n$3\r\nkey\r\n$1\r\n0\r\n".to_vec();
+        frame.extend_from_slice(format!("${}\r\n", payload.len()).as_bytes());
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(b"\r\n$7\r\nREPLACE\r\n");
+        let r = send_and_read_reply(&mut c, &frame);
+        assert!(r.contains("Bad data format"), "payload {i}: {r}");
+        assert_eq!(
+            resp_cmd(&mut c, &["EXISTS", "key"]),
+            ":0\r\n",
+            "payload {i}"
+        );
+    }
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+}

@@ -901,9 +901,10 @@ fn old_encodings_load() {
     }
     fn ziplist(items: &[&[u8]]) -> Vec<u8> {
         let mut body = Vec::new();
-        let mut prev = 0usize;
+        let (mut prev, mut last) = (0usize, 0usize);
         for it in items {
             let start = body.len();
+            last = start;
             body.push(prev as u8);
             if let Ok(v) = std::str::from_utf8(it).unwrap().parse::<i16>() {
                 body.push(0xC0);
@@ -915,7 +916,8 @@ fn old_encodings_load() {
             prev = body.len() - start;
         }
         let mut zl = ((10 + body.len() + 1) as u32).to_le_bytes().to_vec();
-        zl.extend_from_slice(&0u32.to_le_bytes());
+        // zltail: offset of the last entry, as Redis writes it.
+        zl.extend_from_slice(&((10 + last) as u32).to_le_bytes());
         zl.extend_from_slice(&(items.len() as u16).to_le_bytes());
         zl.extend_from_slice(&body);
         zl.push(0xFF);

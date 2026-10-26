@@ -15200,16 +15200,31 @@ impl RudisTable {
         rdb_ver: u16,
         now_unix_ms: u64,
     ) -> Result<crate::redis_rdb::Decoded, &'static str> {
-        if rdb_ver as u32 <= crate::redis_rdb::MAX_RDB_VERSION
-            && let Ok(d) = crate::redis_rdb::decode_dump_body(body, now_unix_ms)
-        {
-            return Ok(d);
+        let redis_err = if rdb_ver as u32 <= crate::redis_rdb::MAX_RDB_VERSION {
+            match crate::redis_rdb::decode_dump_body(body, now_unix_ms) {
+                Ok(d) => return Ok(d),
+                Err(e) => Some(e),
+            }
+        } else {
+            None
+        };
+        // The legacy format must account for every byte: a damaged Redis
+        // payload could otherwise be taken for a short legacy one.
+        match Self::deserialize_val_payload(body) {
+            Ok((value, used)) if used == body.len() => Ok(crate::redis_rdb::Decoded {
+                value,
+                field_expires: Vec::new(),
+            }),
+            _ => {
+                crate::log_warning!(
+                    "DUMP payload integrity check failed: {}",
+                    redis_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "unknown format".to_string())
+                );
+                Err("ERR Bad data format")
+            }
         }
-        let (value, _) = Self::deserialize_val_payload(body).map_err(|_| "ERR Bad data format")?;
-        Ok(crate::redis_rdb::Decoded {
-            value,
-            field_expires: Vec::new(),
-        })
     }
 
     pub fn restore(
