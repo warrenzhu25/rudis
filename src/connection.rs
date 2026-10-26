@@ -19185,6 +19185,9 @@ async fn execute_command_inner(
                         let shard_id = router.target_shard(key);
                         if shard_id == router.shard_id {
                             let mut db = router.local_db.borrow_mut();
+                            // Like Redis, DEBUG OBJECT looks at the keyspace
+                            // as stored: an expired key not yet deleted shows.
+                            let _raw = ReplayingWrites::new();
                             if let Some(enc) = db.object_encoding(key) {
                                 let (lru, idle) = db.lru_and_idletime(key).unwrap_or((0, 0));
                                 out.extend_from_slice(format!("+Value at:0x12345678 refcount:1 encoding:{} serializedlength:10 lru:{} lru_seconds_idle:{}\r\n", enc, lru, idle).as_bytes());
@@ -25568,6 +25571,8 @@ pub fn execute_local_command(
                 if let Some(sub) = args.first() {
                     if sub.eq_ignore_ascii_case(b"object") {
                         if let Some(key) = args.get(1) {
+                            // As stored, expired keys included (see above).
+                            let _raw = ReplayingWrites::new();
                             if let Some(enc) = db.object_encoding(key) {
                                 let (lru, idle) = db.lru_and_idletime(key).unwrap_or((0, 0));
                                 out.extend_from_slice(format!("+Value at:0x12345678 refcount:1 encoding:{} serializedlength:10 lru:{} lru_seconds_idle:{}\r\n", enc, lru, idle).as_bytes());

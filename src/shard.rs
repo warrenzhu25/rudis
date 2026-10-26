@@ -5690,6 +5690,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Under `ReplayingWrites` (as DEBUG OBJECT runs) an expired key not
+    /// yet deleted is still seen, and isn't deleted by the look.
+    #[test]
+    fn test_expired_key_visible_while_replaying() {
+        let mut db = ShardDb::new(0);
+        db.set(
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"v"),
+            Some(Duration::from_millis(1)),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        {
+            let _raw = crate::connection::ReplayingWrites::new();
+            assert!(db.object_encoding(b"k").is_some());
+        }
+        assert_eq!(db.table.key_has_expire(b"k"), Some(true), "still stored");
+        assert!(db.object_encoding(b"k").is_none());
+    }
+
     /// Keys clients wrote on a writable replica are expired once their TTL
     /// passes; those without a TTL (or gone) are just forgotten.
     #[test]

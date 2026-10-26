@@ -35011,3 +35011,26 @@ fn test_writable_replica_expires_its_own_keys_e2e() {
         "+OK\r\n"
     );
 }
+
+/// DEBUG OBJECT shows a key as stored, like Redis: an expired key that is
+/// not deleted yet (active expiry off) is still described, while reads
+/// treat it as gone.
+#[test]
+fn test_debug_object_shows_expired_but_present_key_e2e() {
+    let port = 29841;
+    start_test_server(port, 1);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "SET-ACTIVE-EXPIRE", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["SET", "k", "1", "PX", "20"]), "+OK\r\n");
+    thread::sleep(Duration::from_millis(60));
+    let obj = resp_cmd(&mut c, &["DEBUG", "OBJECT", "k"]);
+    assert!(obj.starts_with("+Value at:"), "{obj}");
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "k"]), ":0\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "SET-ACTIVE-EXPIRE", "1"]),
+        "+OK\r\n"
+    );
+}
