@@ -2341,8 +2341,20 @@ pub fn parse_command_trusted(buf: &mut BytesMut) -> Result<Option<Command>, Stri
     parsed
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Unit tests: a `proto-max-bulk-len` for this thread only, so a test
+    /// of the limit doesn't fail parse tests running beside it.
+    static TEST_PROTO_MAX_BULK_LEN: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[inline(always)]
 pub fn get_proto_max_bulk_len() -> usize {
+    #[cfg(test)]
+    if let Some(v) = TEST_PROTO_MAX_BULK_LEN.with(|c| c.get()) {
+        return v;
+    }
     PROTO_MAX_BULK_LEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -15781,8 +15793,7 @@ mod tests {
         assert_eq!(cmd, Command::Object(ObjectSubcommand::Help));
 
         // PROTO MAX BULK LEN
-        let old = get_proto_max_bulk_len();
-        set_proto_max_bulk_len(5);
+        TEST_PROTO_MAX_BULK_LEN.with(|c| c.set(Some(5)));
         let mut buf = BytesMut::from("*2\r\n$4\r\nECHO\r\n$6\r\n123456\r\n");
         let err = parse_command(&mut buf).unwrap_err();
         assert!(err.contains("invalid bulk length"));
@@ -15792,7 +15803,7 @@ mod tests {
         // ...and the next client parse on this thread is again.
         let mut buf = BytesMut::from("*2\r\n$4\r\nECHO\r\n$6\r\n123456\r\n");
         assert!(parse_command(&mut buf).is_err());
-        set_proto_max_bulk_len(old);
+        TEST_PROTO_MAX_BULK_LEN.with(|c| c.set(None));
 
         // XINFO STREAM
         let mut buf = BytesMut::from("*3\r\n$5\r\nXINFO\r\n$6\r\nSTREAM\r\n$8\r\nmystream\r\n");
