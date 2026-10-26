@@ -1,6 +1,8 @@
 /target
 /benchmark_logs
 *.rdb
+# Fixtures of the Redis/Valkey TCL suites (integration/rdb, corrupt-dump, convert-*).
+!/tests/redis-tests/assets/*.rdb
 *.tmp.*
 __pycache__/
 *.pyc
