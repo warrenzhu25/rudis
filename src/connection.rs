@@ -3320,6 +3320,8 @@ pub fn apply_config_value(
         "min-replicas-to-write" | "min-slaves-to-write" => {
             MIN_REPLICAS_TO_WRITE.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
+        "shutdown-timeout" => crate::replication::SHUTDOWN_TIMEOUT_SECS
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
         "repl-backlog-ttl" => crate::replication::REPL_BACKLOG_TTL
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
         "repl-ping-replica-period" | "repl-ping-slave-period" => {
@@ -3825,7 +3827,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
-    let all_configs: [(&str, String); 95] = [
+    let all_configs: [(&str, String); 96] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
@@ -4029,6 +4031,12 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         ),
         ("repl-ping-replica-period", repl_ping_period.clone()),
         ("repl-ping-slave-period", repl_ping_period),
+        (
+            "shutdown-timeout",
+            crate::replication::SHUTDOWN_TIMEOUT_SECS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
     ];
     let hidden_configs: [(&str, String); 2] = [
         ("key-load-delay", key_load_delay),
@@ -4557,7 +4565,7 @@ fn server_info_process_fields() -> String {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     format!(
-        "process_id:{}\r\nprocess_supervised:no\r\nrun_id:{}\r\nserver_time_usec:{}\r\nuptime_in_seconds:{}\r\nuptime_in_days:{}\r\nhz:10\r\nconfigured_hz:10\r\nlru_clock:{}\r\nexecutable:{}\r\nconfig_file:{}\r\nio_threads_active:0\r\n",
+        "process_id:{}\r\nprocess_supervised:no\r\nrun_id:{}\r\nserver_time_usec:{}\r\nuptime_in_seconds:{}\r\nuptime_in_days:{}\r\nhz:10\r\nconfigured_hz:10\r\nlru_clock:{}\r\nexecutable:{}\r\nconfig_file:{}\r\nio_threads_active:0\r\nshutdown_in_milliseconds:{}\r\n",
         std::process::id(),
         run_id,
         now_us,
@@ -4566,6 +4574,7 @@ fn server_info_process_fields() -> String {
         (now_us / 1_000_000) as u64 & ((1 << 24) - 1),
         executable,
         config_file,
+        crate::replication::shutdown_in_milliseconds(),
     )
 }
 
@@ -12065,6 +12074,9 @@ async fn execute_command_inner(
                 max_mem,
                 stats.cooled_keys.load(std::sync::atomic::Ordering::Relaxed),
                 stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed),
+            ) + &format!(
+                "mem_total_replication_buffers:{}\r\n",
+                hub.replication_buffer_bytes()
             );
             let storage_str = format!(
                 "# Storage\r\ntier_enabled:1\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\nused_memory:{}\r\nused_memory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\ndecommit_count:{}\r\ncoalesced_reads:{}\r\nbin_pages:{}\r\ntotal_stashes:{}\r\ntotal_fetches:{}\r\ntotal_deletes:{}\r\nram_hits:{}\r\nram_misses:{}\r\nstreaming_reads:{}\r\noffload_threshold_pct:{}\r\nupload_threshold_pct:{}\r\n",
@@ -18998,6 +19010,7 @@ async fn execute_command_inner(
         Command::MemcachedQuit => true,
         Command::Shutdown { save } => {
             crate::log_warning!("User requested shutdown...");
+            crate::replication::wait_replicas_before_shutdown(router.base_port).await;
             if let Err(e) = router.save_before_shutdown(save, 1).await {
                 crate::log_warning!("Error trying to save the DB, can't exit: {}", e);
                 crate::log_warning!(

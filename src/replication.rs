@@ -1877,6 +1877,109 @@ pub fn get_connected_replicas_count(port: u16) -> usize {
     }
 }
 
+/// `shutdown-timeout`: seconds a master shutting down waits for its
+/// replicas to acknowledge everything it sent (Redis's default, 10; 0
+/// doesn't wait).
+pub static SHUTDOWN_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(10);
+
+/// Unix ms at which a shutdown waiting for replicas gives up, 0 when none
+/// is waiting (INFO `shutdown_in_milliseconds`).
+pub static SHUTDOWN_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// INFO `shutdown_in_milliseconds`: how long a shutdown keeps waiting for
+/// replicas, or 0.
+pub fn shutdown_in_milliseconds() -> u64 {
+    match SHUTDOWN_DEADLINE_MS.load(Ordering::Relaxed) {
+        0 => 0,
+        deadline => deadline.saturating_sub(unix_ms()).max(1),
+    }
+}
+
+/// Before a master shuts down (SHUTDOWN, SIGTERM), as Redis does: pauses
+/// writes so the stream stops growing, then waits up to `shutdown-timeout`
+/// for every replica to acknowledge all of it, so a failover to any of
+/// them loses no acknowledged write. Logs which replicas lag. A replica,
+/// or a master without replicas, doesn't wait.
+pub async fn wait_replicas_before_shutdown(port: u16) {
+    let secs = SHUTDOWN_TIMEOUT_SECS.load(Ordering::Relaxed);
+    let hub = get_replication_hub(port);
+    if secs == 0 || hub.is_slave() || hub.replicas.read().is_empty() {
+        return;
+    }
+    crate::connection::set_client_pause(secs * 1000 + 1000, true);
+    crate::log_notice!("Waiting for replicas before shutting down.");
+    let deadline = unix_ms() + secs * 1000;
+    SHUTDOWN_DEADLINE_MS.store(deadline, Ordering::Relaxed);
+    let target = hub.master_repl_offset.load(Ordering::SeqCst);
+    let in_sync = |r: &ConnectedReplica| r.ack_offset.load(Ordering::SeqCst) >= target;
+    let mut asked_at = 0u64;
+    loop {
+        let all_in_sync = hub.replicas.read().values().all(|r| in_sync(r));
+        let now = unix_ms();
+        if all_in_sync || now >= deadline {
+            break;
+        }
+        // Replicas ack once a second on their own; ask more often.
+        if now >= asked_at + 100 {
+            asked_at = now;
+            propagate_bytes(port, b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n");
+        }
+        monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (mut synced, mut total) = (0, 0);
+    let now_secs = unix_secs();
+    for r in hub.replicas.read().values() {
+        total += 1;
+        if in_sync(r) {
+            synced += 1;
+            continue;
+        }
+        let ip = r.announced_ip.read().clone().unwrap_or_else(|| {
+            r.ip.map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string())
+        });
+        crate::log_warning!(
+            "Lagging replica {}:{} reported offset {} behind master, lag={}, state={}.",
+            ip,
+            r.listening_port.load(Ordering::SeqCst),
+            target.saturating_sub(r.ack_offset.load(Ordering::SeqCst)),
+            now_secs.saturating_sub(r.last_ack_time.load(Ordering::SeqCst)),
+            if r.is_online() {
+                "online"
+            } else {
+                "wait_bgsave"
+            }
+        );
+    }
+    crate::log_notice!(
+        "{} of {} replicas are in sync when shutting down.",
+        synced,
+        total
+    );
+    SHUTDOWN_DEADLINE_MS.store(0, Ordering::Relaxed);
+    crate::connection::unpause_clients();
+}
+
+impl ReplicationHub {
+    /// INFO `mem_total_replication_buffers`: the backlog plus the stream
+    /// bytes buffered for each replica.
+    pub fn replication_buffer_bytes(&self) -> usize {
+        let backlog = self.backlog.read().len();
+        let replicas: usize = self
+            .replicas
+            .read()
+            .values()
+            .map(|r| r.pending.lock().len() + r.inflight.load(Ordering::Relaxed))
+            .sum();
+        backlog + replicas
+    }
+}
+
 pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> usize {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
         return 0;
@@ -3161,6 +3264,30 @@ async fn run_replica_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_shutdown_in_milliseconds_counts_down_to_the_deadline() {
+        assert_eq!(shutdown_in_milliseconds(), 0);
+        SHUTDOWN_DEADLINE_MS.store(unix_ms() + 5000, Ordering::Relaxed);
+        let left = shutdown_in_milliseconds();
+        assert!((1..=5000).contains(&left), "{left}");
+        SHUTDOWN_DEADLINE_MS.store(unix_ms().saturating_sub(10), Ordering::Relaxed);
+        assert_eq!(
+            shutdown_in_milliseconds(),
+            1,
+            "past the deadline but still waiting"
+        );
+        SHUTDOWN_DEADLINE_MS.store(0, Ordering::Relaxed);
+    }
+
+    /// Without replicas a master doesn't wait (nor pause writes).
+    #[monoio::test(timer_enabled = true)]
+    async fn test_shutdown_without_replicas_does_not_wait() {
+        let start = std::time::Instant::now();
+        wait_replicas_before_shutdown(64521).await;
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        assert!(crate::connection::is_client_paused().is_none());
+    }
     use bytes::BytesMut;
 
     #[monoio::test(timer_enabled = true)]

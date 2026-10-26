@@ -35052,3 +35052,103 @@ fn test_wait_refuses_out_of_range_timeouts_e2e() {
     // No replicas: WAIT 0 returns at once.
     assert_eq!(resp_cmd(&mut c, &["WAIT", "0", "100"]), ":0\r\n");
 }
+
+/// A master shutting down (SIGTERM) waits up to `shutdown-timeout` for its
+/// replica to acknowledge everything, as Redis does: a replica that catches
+/// up within it has every acknowledged write, and one that doesn't is
+/// logged as lagging.
+#[test]
+fn test_master_shutdown_waits_for_replicas_e2e() {
+    for (mport, rport, resume) in [(29861u16, 29862u16, true), (29863, 29864, false)] {
+        let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), mport));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("master.log");
+        let mut master = rudis_bin()
+            .args([
+                "--port",
+                &mport.to_string(),
+                "--threads",
+                "2",
+                "--no-pin",
+                "--save",
+                "",
+            ])
+            .args(["--dir", dir.to_str().unwrap()])
+            .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut replica = spawn_rudis_listening(
+            &[
+                "--port",
+                &rport.to_string(),
+                "--threads",
+                "2",
+                "--no-pin",
+                "--save",
+                "",
+            ],
+            rport,
+        );
+        let connect = |port: u16| {
+            for _ in 0..100 {
+                if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                    return s;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            panic!("no server on {port}");
+        };
+        let (mut m, mut r) = (connect(mport), connect(rport));
+        assert_eq!(
+            resp_cmd(&mut m, &["CONFIG", "SET", "shutdown-timeout", "2"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &mport.to_string()]),
+            "+OK\r\n"
+        );
+        wait_for_master_link(&mut r);
+        assert_eq!(resp_cmd(&mut m, &["SET", "k", "1"]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut m, &["WAIT", "1", "5000"]), ":1\r\n");
+        // SAFETY: kill(2) on our own live child.
+        unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGSTOP) };
+        assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":2\r\n");
+        // SAFETY: as above.
+        unsafe { libc::kill(master.id() as libc::pid_t, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let info = resp_cmd_full(&mut connect(mport), &["INFO", "server"]);
+            if info.lines().any(|l| {
+                l.starts_with("shutdown_in_milliseconds:") && l != "shutdown_in_milliseconds:0"
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no shutdown wait: {info}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        if resume {
+            // SAFETY: as above.
+            unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGCONT) };
+        }
+        assert!(wait_exit(&mut master, Duration::from_secs(20)).is_some());
+        let text = std::fs::read_to_string(&log).unwrap();
+        if resume {
+            assert!(text.contains("1 of 1 replicas are in sync"), "{text}");
+            assert!(!text.contains("Lagging replica"), "{text}");
+            assert_eq!(resp_cmd(&mut r, &["GET", "k"]), "$1\r\n2\r\n");
+        } else {
+            assert!(text.contains("0 of 1 replicas are in sync"), "{text}");
+            assert!(text.contains("Lagging replica"), "{text}");
+            // SAFETY: as above.
+            unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGCONT) };
+        }
+        let _ = replica.kill();
+        let _ = replica.wait();
+    }
+}

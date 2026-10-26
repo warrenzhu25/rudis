@@ -516,6 +516,10 @@ index holds, and `FLAT` `INITIAL_CAP` preallocates at most 64 MiB of vectors.
 `SIGTERM`/`SIGINT` and `SHUTDOWN` run the same sequence ([`src/shutdown.rs`](src/shutdown.rs),
 `run_shard_worker` in [`src/server.rs`](src/server.rs)):
 
+1. **Wait for replicas** (masters with replicas, as Redis): writes are paused and the master
+   waits up to `shutdown-timeout` (default 10s; 0 skips it) for every replica to acknowledge
+   everything it was sent, then logs `N of M replicas are in sync` and any `Lagging replica`.
+   `INFO server` shows `shutdown_in_milliseconds` meanwhile.
 1. **Save**: if save points are configured (or `SHUTDOWN SAVE` is given), a snapshot is taken
    first. If it fails the server keeps running and reports the error (`SHUTDOWN NOSAVE` skips it).
 2. **Stop accepting**: every shard stops accepting new connections within ~200ms.
@@ -527,8 +531,9 @@ index holds, and `FLAT` `INITIAL_CAP` preallocates at most 64 MiB of vectors.
 5. **Final AOF flush + fsync**, then the process exits with status 0.
 
 With AOF enabled, every write acknowledged before exit is in the AOF. `SIGKILL` (a `docker stop`/systemd
-stop past its grace period) skips all of the above, so give the process at least ~6s:
-`docker stop -t 10`, systemd `TimeoutStopSec=10` or more.
+stop past its grace period) skips all of the above, so give the process at least ~6s, plus
+`shutdown-timeout` on a master with replicas: `docker stop -t 20`, systemd `TimeoutStopSec=20`
+or more.
 
 ### Security Checklist
 
