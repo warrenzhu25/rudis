@@ -38,6 +38,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -223,10 +224,12 @@ def run_live_gate(rudis_bin, port, duration_sec, attach=False, throughput_floor=
     if not attach:
         if not os.path.exists(rudis_bin):
             return [f"Rudis binary not found for --live gate: {rudis_bin}"], []
+        workdir = tempfile.mkdtemp(prefix="rudis-perf-")
         proc = subprocess.Popen(
-            [rudis_bin, "--port", str(port), "--threads", str(shards), "--no-pin"],
+            server_argv(rudis_bin, port, shards, workdir, ("--no-pin",)),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            cwd=workdir,
         )
         target_pid = proc.pid
 
@@ -279,6 +282,8 @@ def run_live_gate(rudis_bin, port, duration_sec, attach=False, throughput_floor=
                 proc.wait(timeout=5)
             except Exception:
                 proc.kill()
+                proc.wait()
+            shutil.rmtree(workdir, ignore_errors=True)
 
     return regressions, rows
 
@@ -332,6 +337,16 @@ def _memtier_run(memtier, port, client_cpus, client_threads, args, secs, json_pa
             os.remove(json_path)
 
 
+def server_argv(rudis_bin, port, threads, workdir, extra=()):
+    """A measured server: no snapshots (`save ""`) and its files in `workdir`,
+    a fresh temp dir. rudis defaults to Redis's save points, so a server run in
+    the repo saved a dump.rdb on exit that every later launch loaded: writes
+    then went through the replication backlog its history restored, and SET
+    measured ~2.5x slower than on an empty server."""
+    return [rudis_bin, "--port", str(port), "--threads", str(threads), *extra,
+            "--save", "", "--dir", workdir]
+
+
 def run_memtier_gate(rudis_bin, port, threads, launches, runs, secs):
     """Measure live SET/GET throughput with memtier. Returns ({wl: [ops...]}, errors)."""
     memtier = find_memtier()
@@ -348,9 +363,10 @@ def run_memtier_gate(rudis_bin, port, threads, launches, runs, secs):
     json_path = f"/tmp/perf_gate_{port}.json"
     samples = {wl: [] for wl in MEMTIER_WORKLOADS}
     for _ in range(launches):
+        workdir = tempfile.mkdtemp(prefix="rudis-perf-")
         proc = subprocess.Popen(
-            ["taskset", "-c", server_cpus, rudis_bin, "--port", str(port), "--threads", str(threads)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ["taskset", "-c", server_cpus, *server_argv(rudis_bin, port, threads, workdir)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=workdir,
         )
         try:
             if not wait_ping(port, timeout=10.0):
@@ -378,6 +394,8 @@ def run_memtier_gate(rudis_bin, port, threads, launches, runs, secs):
                 proc.wait(timeout=5)
             except Exception:
                 proc.kill()
+                proc.wait()
+            shutil.rmtree(workdir, ignore_errors=True)
             time.sleep(0.5)
     return samples, []
 
@@ -541,8 +559,10 @@ def check_ab_host_health(samples, baseline_path):
 
 
 def self_test():
-    """Checks check_ab_host_health's classification on synthetic samples."""
-    import tempfile
+    """Checks check_ab_host_health's classification on synthetic samples,
+    and that measured servers neither save nor load a snapshot."""
+    argv = server_argv("rudis", 1, 2, "/tmp/w", ("--no-pin",))
+    assert argv[argv.index("--save") + 1] == "" and argv[argv.index("--dir") + 1] == "/tmp/w", argv
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump({"workloads": {"SET": {"ops_sec_median": 2_000_000},
                                  "GET": {"ops_sec_median": 1_800_000}}}, f)
