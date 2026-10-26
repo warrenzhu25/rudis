@@ -34946,3 +34946,68 @@ fn test_restore_refuses_corrupt_payloads_e2e() {
     }
     assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
 }
+
+/// Keys a client writes with a TTL on a writable replica expire there (no
+/// master will send their DEL), while the master's keys still wait for it.
+#[test]
+fn test_writable_replica_expires_its_own_keys_e2e() {
+    let (mport, rport) = (29831u16, 29832u16);
+    start_test_server(mport, 2);
+    start_test_server(rport, 2);
+    let mut master = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    let mut replica = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    replica
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(
+        resp_cmd(
+            &mut replica,
+            &["REPLICAOF", "127.0.0.1", &mport.to_string()]
+        ),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut replica);
+    assert_eq!(
+        resp_cmd(&mut master, &["SET", "from_master", "v"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut replica, &["CONFIG", "SET", "replica-read-only", "no"]),
+        "+OK\r\n"
+    );
+    for k in ["k1", "k2", "k3"] {
+        assert_eq!(
+            resp_cmd(&mut replica, &["SET", k, "1", "PX", "300"]),
+            "+OK\r\n"
+        );
+    }
+    // Pipelined writes too.
+    replica
+        .write_all(b"SET k4 1 PX 300\r\nSET k5 1 PX 300\r\n")
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let mut got = 0;
+    while got < 10 {
+        got += replica.read(&mut buf[got..]).unwrap();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let size = resp_cmd(&mut replica, &["DBSIZE"]);
+        if size == ":1\r\n" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica kept its expired keys: DBSIZE {size}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        resp_cmd(&mut replica, &["GET", "from_master"]),
+        "$1\r\nv\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut replica, &["CONFIG", "SET", "replica-read-only", "yes"]),
+        "+OK\r\n"
+    );
+}

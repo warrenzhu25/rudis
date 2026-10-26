@@ -4137,6 +4137,13 @@ impl RudisTable {
         }
     }
 
+    /// Whether `key` (expired or not) has a TTL; `None` if it is absent.
+    pub fn key_has_expire(&self, key: &[u8]) -> Option<bool> {
+        self.table
+            .find_entry(key, hash_key(key))
+            .map(|(_, e)| e.expire_at().is_some())
+    }
+
     pub fn is_key_expired(&mut self, key: &[u8]) -> bool {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {

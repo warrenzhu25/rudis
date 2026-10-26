@@ -477,7 +477,13 @@ pub fn run_shard_worker(
                             .load(std::sync::atomic::Ordering::Relaxed),
                 );
                 if !is_replica {
-                    active_db.borrow_mut().active_expire_cycle();
+                    let mut db = active_db.borrow_mut();
+                    db.active_expire_cycle();
+                    // A promoted replica expires everything normally now.
+                    db.replica_local_keys.clear();
+                } else {
+                    // Except keys clients wrote here, which no master expires.
+                    active_db.borrow_mut().expire_replica_local_keys();
                 }
                 // Give back table segments emptied by deletes and expiry.
                 // Not while a snapshot walks the segments: moving entries
@@ -2001,6 +2007,11 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         } else {
                             cross_shard_tx_waiters.borrow_mut().push_back((tx_id, responder));
                         }
+                    }
+                    ShardMessage::RememberReplicaKeys { db, keys } => {
+                        let mut sdb = cross_shard_db.borrow_mut();
+                        sdb.replica_local_keys
+                            .extend(keys.into_iter().map(|k| (db, k)));
                     }
                     ShardMessage::ReleaseTxLock { tx_id } => {
                         let mut lock = cross_shard_tx_lock.borrow_mut();

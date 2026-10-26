@@ -699,6 +699,12 @@ pub enum ShardMessage {
     ReleaseTxLock {
         tx_id: u64,
     },
+    /// Keys a client wrote on this (writable replica) server: the owner
+    /// shard tracks them for expiry (see `ShardDb::replica_local_keys`).
+    RememberReplicaKeys {
+        db: usize,
+        keys: Vec<Bytes>,
+    },
     /// Replaces the shard's dataset with its part of a full-sync RDB.
     RestoreRdbChunk {
         data: Bytes,
@@ -840,6 +846,12 @@ pub struct ShardDb {
     pub json_store: crate::json::JsonStore,
     pub probabilistic_store: crate::probabilistic::ProbabilisticStore,
     pub sticky_keys: hashbrown::HashSet<Bytes>,
+    /// Keys clients wrote while this server was a writable replica, with
+    /// their DB. A replica doesn't expire its master's keys (it waits for
+    /// the master's DEL), so these, which the master never sees, are
+    /// expired from here (`expire_replica_local_keys`), as Redis does with
+    /// its `slaveKeysWithExpire`.
+    pub replica_local_keys: hashbrown::HashSet<(usize, Bytes)>,
     pub search_indices: std::collections::HashMap<String, crate::search::InvertedIndex>,
 }
 
@@ -862,6 +874,7 @@ impl ShardDb {
             json_store: crate::json::JsonStore::new(),
             probabilistic_store: crate::probabilistic::ProbabilisticStore::new(),
             sticky_keys: hashbrown::HashSet::new(),
+            replica_local_keys: hashbrown::HashSet::new(),
             search_indices: std::collections::HashMap::new(),
         }
     }
@@ -2647,6 +2660,43 @@ impl ShardDb {
     #[inline]
     pub fn get_keys_in_slot(&mut self, slot: u16, count: usize) -> Vec<Bytes> {
         self.table.get_keys_in_slot(slot, count)
+    }
+
+    /// Expires the keys clients wrote on this writable replica whose TTL
+    /// passed, and forgets those deleted or left without a TTL. Returns
+    /// how many expired.
+    pub fn expire_replica_local_keys(&mut self) -> usize {
+        if self.replica_local_keys.is_empty() {
+            return 0;
+        }
+        let saved_db = self.current_db;
+        let prev_tl = crate::connection::CURRENT_DB.get();
+        let keys: Vec<(usize, Bytes)> = self.replica_local_keys.iter().cloned().collect();
+        let mut expired = 0;
+        for (db, key) in keys {
+            self.select_db(db);
+            crate::connection::CURRENT_DB.set(db);
+            let keep = match self.table.key_has_expire(&key) {
+                Some(true) => {
+                    if self.table.is_key_expired(&key) {
+                        expired += 1;
+                        // Still there if expired keys are only hidden
+                        // (the replica turned read-only meanwhile).
+                        self.table.key_has_expire(&key) == Some(true)
+                    } else {
+                        true
+                    }
+                }
+                Some(false) | None => false,
+            };
+            if !keep {
+                self.replica_local_keys.remove(&(db, key));
+            }
+        }
+        self.select_db(saved_db);
+        crate::connection::CURRENT_DB.set(prev_tl);
+        self.drain_dropped_tier();
+        expired
     }
 
     #[inline]
@@ -5638,6 +5688,42 @@ mod tests {
             }
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keys clients wrote on a writable replica are expired once their TTL
+    /// passes; those without a TTL (or gone) are just forgotten.
+    #[test]
+    fn test_expire_replica_local_keys() {
+        let mut db = ShardDb::new(0);
+        db.set(
+            Bytes::from_static(b"ttl"),
+            Bytes::from_static(b"v"),
+            Some(Duration::from_millis(1)),
+        );
+        db.set(
+            Bytes::from_static(b"live"),
+            Bytes::from_static(b"v"),
+            Some(Duration::from_secs(60)),
+        );
+        db.set(Bytes::from_static(b"plain"), Bytes::from_static(b"v"), None);
+        for k in ["ttl", "live", "plain", "missing"] {
+            db.replica_local_keys.insert((0, Bytes::from(k)));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(db.expire_replica_local_keys(), 1);
+        assert!(!db.table.key_is_live(b"ttl"));
+        assert_eq!(
+            db.table.key_has_expire(b"ttl"),
+            None,
+            "deleted, not just hidden"
+        );
+        assert!(db.table.key_is_live(b"live") && db.table.key_is_live(b"plain"));
+        let left: Vec<_> = db
+            .replica_local_keys
+            .iter()
+            .map(|(_, k)| k.clone())
+            .collect();
+        assert_eq!(left, vec![Bytes::from_static(b"live")]);
     }
 
     /// A full-sync image's buffers are counted in `SYNC_IMAGE_BYTES` (which

@@ -10757,6 +10757,7 @@ async fn execute_command(
         .get(&client_id)
         .map(|c| c.db)
         .unwrap_or_else(|| CURRENT_DB.get());
+    let replica_keys = writable_replica_write_keys(router, &cmd);
     let fut = execute_command_inner(
         cmd,
         router,
@@ -10769,13 +10770,57 @@ async fn execute_command(
     );
     #[cfg(debug_assertions)]
     let fut = Box::pin(fut);
-    WithCurrentDb {
+    let quit = WithCurrentDb {
         router,
         db: initial_db,
         fut,
     }
     .await
-    .1
+    .1;
+    if let Some(keys) = replica_keys {
+        remember_replica_keys(router, initial_db, keys);
+    }
+    quit
+}
+
+/// The keys of a write a client sends to this server while it is a
+/// writable replica (`replica-read-only no`), which the replica must
+/// expire itself; `None` otherwise (the usual case: one atomic load).
+fn writable_replica_write_keys(router: &Router, cmd: &Command) -> Option<Vec<Bytes>> {
+    if !crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
+        || REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+        || !cmd.is_write_command()
+        || !crate::replication::get_replication_hub(router.base_port).is_slave()
+    {
+        return None;
+    }
+    let mut keys = Vec::new();
+    for_each_cmd_key(cmd, |k| keys.push(Bytes::copy_from_slice(k)));
+    (!keys.is_empty()).then_some(keys)
+}
+
+/// Hands `keys` (written by a client on this writable replica) to the
+/// shards that own them, to expire them (`ShardDb::replica_local_keys`).
+fn remember_replica_keys(router: &Router, db: usize, keys: Vec<Bytes>) {
+    let mut by_shard: Vec<Vec<Bytes>> = vec![Vec::new(); router.num_shards];
+    for k in keys {
+        by_shard[router.target_shard(&k)].push(k);
+    }
+    for (shard, keys) in by_shard.into_iter().enumerate() {
+        if keys.is_empty() {
+            continue;
+        }
+        if shard == router.shard_id {
+            router
+                .local_db
+                .borrow_mut()
+                .replica_local_keys
+                .extend(keys.into_iter().map(|k| (db, k)));
+        } else {
+            let _ = router.senders[shard]
+                .send(crate::shard::ShardMessage::RememberReplicaKeys { db, keys });
+        }
+    }
 }
 
 /// While an AOF rewrite builds its image of this shard (see
@@ -27095,6 +27140,16 @@ async fn execute_commands_squashed_inner(
     if can_squash
         && crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
         && REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::replication::get_replication_hub(router.base_port).is_slave()
+        && batch_has_writes(commands)
+    {
+        can_squash = false;
+    }
+    // On a writable replica, `execute_command` notes the keys clients
+    // write so the replica can expire them (batched writes would skip it).
+    if can_squash
+        && crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
+        && !REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
         && crate::replication::get_replication_hub(router.base_port).is_slave()
         && batch_has_writes(commands)
     {
