@@ -140,6 +140,14 @@ fn unix_secs() -> u64 {
 }
 
 impl ConnectedReplica {
+    /// The address INFO shows for the replica (announced, else seen).
+    fn addr_ip(&self) -> String {
+        self.announced_ip.read().clone().unwrap_or_else(|| {
+            self.ip
+                .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string())
+        })
+    }
+
     /// False while the replica's full-sync snapshot is still being taken
     /// (Redis's `wait_bgsave`).
     pub fn is_online(&self) -> bool {
@@ -558,6 +566,11 @@ pub struct ReplicationHub {
     /// What the replica worker's link is doing while not up (a `LINK_*`),
     /// for ROLE.
     pub link_phase: std::sync::atomic::AtomicU8,
+    /// The coordinated failover (FAILOVER command) under way, if any.
+    failover: Mutex<Failover>,
+    /// Set while a failover has turned us into the target's replica: the
+    /// replica worker then sends `PSYNC <replid> <offset> FAILOVER`.
+    failover_in_progress: AtomicBool,
 }
 
 /// Suppresses replication propagation across all shards for a `ReplicationHub`
@@ -706,6 +719,8 @@ impl ReplicationHub {
             announce_port: AtomicU16::new(0),
             last_master_io_secs: AtomicU64::new(0),
             link_phase: std::sync::atomic::AtomicU8::new(LINK_CONNECTING),
+            failover: Mutex::new(Failover::default()),
+            failover_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -1829,8 +1844,12 @@ impl ReplicationHub {
                  role:master\r\n\
                  connected_slaves:{}\r\n\
                  {}\
+                 master_failover_state:{}\r\n\
                  {}",
-                connected, slaves, history
+                connected,
+                slaves,
+                self.failover_state_name(),
+                history
             ),
             ReplicationRole::Slave {
                 master_host,
@@ -1869,6 +1888,7 @@ impl ReplicationHub {
                      slave_read_only:{}\r\n\
                      connected_slaves:{}\r\n\
                      {}\
+                     master_failover_state:{}\r\n\
                      {}",
                     master_host,
                     master_port,
@@ -1881,10 +1901,221 @@ impl ReplicationHub {
                     ro,
                     connected,
                     slaves,
+                    self.failover_state_name(),
                     history,
                 )
             }
         }
+    }
+}
+
+/// Redis's coordinated failover states (INFO `master_failover_state`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FailoverPhase {
+    #[default]
+    None,
+    /// Writes are paused; waiting for a replica to ack everything.
+    WaitForSync,
+    /// We turned into the target's replica and asked it to take over.
+    InProgress,
+}
+
+#[derive(Default)]
+struct Failover {
+    phase: FailoverPhase,
+    /// TO host port, or the replica found caught up.
+    target: Option<(String, u16)>,
+    force: bool,
+    deadline: Option<std::time::Instant>,
+}
+
+/// A parsed `FAILOVER [TO host port [FORCE]] [TIMEOUT ms]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FailoverRequest {
+    pub target: Option<(String, u16)>,
+    pub force: bool,
+    pub timeout_ms: u64,
+}
+
+impl ReplicationHub {
+    /// Our replication id (a replica's is its master's).
+    pub fn current_replid(&self) -> String {
+        self.ids.read().replid.clone()
+    }
+
+    pub fn failover_phase(&self) -> FailoverPhase {
+        self.failover.lock().phase
+    }
+
+    fn failover_state_name(&self) -> &'static str {
+        match self.failover_phase() {
+            FailoverPhase::None => "no-failover",
+            FailoverPhase::WaitForSync => "waiting-for-sync",
+            FailoverPhase::InProgress => "failover-in-progress",
+        }
+    }
+
+    /// The online replica listening on `host:port` (as INFO lists it).
+    fn find_replica(&self, host: &str, port: u16) -> Option<Arc<ConnectedReplica>> {
+        self.replicas
+            .read()
+            .values()
+            .find(|r| r.listening_port.load(Ordering::SeqCst) == port as u64 && r.addr_ip() == host)
+            .cloned()
+    }
+
+    /// FAILOVER: validates the request as Redis does, pauses writes and
+    /// starts the task that fails over once a replica has caught up.
+    pub fn start_failover(
+        self: &Arc<Self>,
+        req: FailoverRequest,
+        router: crate::router::Router,
+    ) -> Result<(), String> {
+        let mut f = self.failover.lock();
+        if f.phase != FailoverPhase::None {
+            return Err("FAILOVER already in progress.".into());
+        }
+        if self.is_slave() {
+            return Err("FAILOVER is not valid when server is a replica.".into());
+        }
+        if self.replicas.read().is_empty() {
+            return Err("FAILOVER requires connected replicas.".into());
+        }
+        if req.force && (req.timeout_ms == 0 || req.target.is_none()) {
+            return Err(
+                "FAILOVER with force option requires both a timeout and target HOST and IP.".into(),
+            );
+        }
+        if let Some((host, port)) = &req.target {
+            match self.find_replica(host, *port) {
+                None => return Err("FAILOVER target HOST and PORT is not a replica.".into()),
+                Some(r) if !r.is_online() => {
+                    return Err("FAILOVER target replica is not online.".into());
+                }
+                Some(_) => crate::log_notice!("FAILOVER requested to {}:{}.", host, port),
+            }
+        } else {
+            crate::log_notice!("FAILOVER requested to any replica.");
+        }
+        *f = Failover {
+            phase: FailoverPhase::WaitForSync,
+            target: req.target,
+            force: req.force,
+            deadline: (req.timeout_ms > 0).then(|| {
+                std::time::Instant::now() + std::time::Duration::from_millis(req.timeout_ms)
+            }),
+        };
+        drop(f);
+        // Until the failover ends either way (Redis pauses with no end).
+        crate::connection::set_client_pause(u64::MAX / 4, true);
+        let hub = self.clone();
+        monoio::spawn(async move { hub.drive_failover(router).await });
+        Ok(())
+    }
+
+    /// Waits (writes paused) for the target, or any replica, to ack the
+    /// whole stream, then turns us into its replica with a PSYNC FAILOVER
+    /// request; or gives up at the timeout (failing over anyway with FORCE).
+    async fn drive_failover(self: Arc<Self>, router: crate::router::Router) {
+        let mut asked_at: Option<std::time::Instant> = None;
+        loop {
+            {
+                let mut f = self.failover.lock();
+                if f.phase != FailoverPhase::WaitForSync {
+                    return;
+                }
+                let offset = self.master_repl_offset.load(Ordering::SeqCst);
+                let caught_up = |r: &ConnectedReplica| {
+                    r.is_online() && r.ack_offset.load(Ordering::SeqCst) == offset
+                };
+                let synced = match &f.target {
+                    Some((host, port)) => self
+                        .find_replica(host, *port)
+                        .filter(|r| caught_up(r))
+                        .map(|_| (host.clone(), *port)),
+                    None => self
+                        .replicas
+                        .read()
+                        .values()
+                        .find(|r| caught_up(r))
+                        .map(|r| (r.addr_ip(), r.listening_port.load(Ordering::SeqCst) as u16)),
+                };
+                let timed_out = f.deadline.is_some_and(|d| std::time::Instant::now() >= d);
+                let go = match synced {
+                    Some(t) => {
+                        crate::log_notice!(
+                            "Failover target {}:{} is synced, failing over.",
+                            t.0,
+                            t.1
+                        );
+                        Some(t)
+                    }
+                    None if timed_out && f.force => {
+                        let t = f.target.clone().expect("FORCE requires a target");
+                        crate::log_notice!(
+                            "FAILOVER to {}:{} time out exceeded, failing over.",
+                            t.0,
+                            t.1
+                        );
+                        Some(t)
+                    }
+                    None if timed_out => {
+                        drop(f);
+                        self.abort_failover("Replica never caught up before timeout");
+                        return;
+                    }
+                    None => None,
+                };
+                if let Some((host, port)) = go {
+                    f.phase = FailoverPhase::InProgress;
+                    f.target = Some((host.clone(), port));
+                    self.failover_in_progress.store(true, Ordering::SeqCst);
+                    drop(f);
+                    start_replica_sync(self.port, host, port, router);
+                    return;
+                }
+            }
+            // Replicas ack once a second on their own; ask more often.
+            if asked_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100)) {
+                asked_at = Some(std::time::Instant::now());
+                propagate_bytes(
+                    self.port,
+                    b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n",
+                );
+            }
+            monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Ends a failover that did not happen: back to master if we had
+    /// turned into the target's replica, writes resumed.
+    pub fn abort_failover(&self, why: &str) -> bool {
+        let phase = {
+            let f = self.failover.lock();
+            if f.phase == FailoverPhase::None {
+                return false;
+            }
+            match &f.target {
+                Some((h, p)) => crate::log_notice!("FAILOVER to {}:{} aborted: {}", h, p, why),
+                None => crate::log_notice!("FAILOVER to any replica aborted: {}", why),
+            }
+            f.phase
+        };
+        if phase == FailoverPhase::InProgress {
+            self.stop_sync();
+            self.make_master();
+        }
+        self.clear_failover();
+        true
+    }
+
+    /// The failover is over (done or aborted): writes resume. After a
+    /// successful one we are the new master's replica, so they get
+    /// -READONLY.
+    fn clear_failover(&self) {
+        *self.failover.lock() = Failover::default();
+        self.failover_in_progress.store(false, Ordering::SeqCst);
+        crate::connection::unpause_clients();
     }
 }
 
@@ -3092,6 +3323,7 @@ async fn run_replica_worker(
         // cached master: what we got from a previous master, or our own
         // history when we were a master).
         let (cached_replid, cached_offset) = hub.psync_request().unwrap_or_default();
+        let failing_over = hub.failover_in_progress.load(Ordering::SeqCst);
         let psync_payload = if !cached_replid.is_empty() {
             // Like Redis, ask for the next byte: one past what was applied.
             let next = (cached_offset + 1).to_string();
@@ -3102,25 +3334,51 @@ async fn run_replica_worker(
                     next
                 );
             }
+            // During a failover, FAILOVER asks the target to take over.
+            let (n, extra) = if failing_over {
+                (4, "$8\r\nFAILOVER\r\n")
+            } else {
+                (3, "")
+            };
             format!(
-                "*3\r\n$5\r\nPSYNC\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                "*{}\r\n$5\r\nPSYNC\r\n${}\r\n{}\r\n${}\r\n{}\r\n{}",
+                n,
                 cached_replid.len(),
                 cached_replid,
                 next.len(),
-                next
+                next,
+                extra
             )
             .into_bytes()
         } else {
             if log_attempt {
                 crate::log_notice!("Partial resynchronization not possible (no cached master)");
             }
-            b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n".to_vec()
+            if failing_over {
+                // No history to hand over: the target refuses, which
+                // aborts the failover.
+                b"*4\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n$8\r\nFAILOVER\r\n".to_vec()
+            } else {
+                b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n".to_vec()
+            }
         };
 
         let line = send_and_expect_line!(psync_payload);
-        let Some((is_continue, new_replid, initial_offset)) =
-            parse_psync_reply(&line, &cached_replid, cached_offset)
-        else {
+        let parsed = parse_psync_reply(&line, &cached_replid, cached_offset);
+        if failing_over {
+            if parsed.is_some() {
+                // The target took over; we continue as its replica.
+                hub.clear_failover();
+            } else {
+                crate::log_warning!(
+                    "Failover target rejected the PSYNC request: {}",
+                    String::from_utf8_lossy(&line).trim_end()
+                );
+                hub.abort_failover("Failover target rejected psync request");
+                break 'reconnect_loop;
+            }
+        }
+        let Some((is_continue, new_replid, initial_offset)) = parsed else {
             if line.starts_with(b"-NOMASTERLINK") || line.starts_with(b"-LOADING") {
                 // A replica serving us lost its own master, or loads: it
                 // can serve us later, and we keep our history.
@@ -3961,6 +4219,24 @@ mod tests {
         hub.update_replica_ack(rep.id, offset, None);
         assert_eq!(rep.ack_offset.load(Ordering::SeqCst), offset);
         hub.unregister_replica(rep.id);
+    }
+
+    #[test]
+    fn test_failover_state_names_and_abort_without_one() {
+        let hub = ReplicationHub::new(19985);
+        assert_eq!(hub.failover_state_name(), "no-failover");
+        assert!(!hub.abort_failover("test"), "nothing to abort");
+        hub.failover.lock().phase = FailoverPhase::WaitForSync;
+        assert_eq!(hub.failover_state_name(), "waiting-for-sync");
+        assert!(
+            hub.format_info_replication()
+                .contains("master_failover_state:waiting-for-sync")
+        );
+        hub.failover.lock().phase = FailoverPhase::InProgress;
+        assert_eq!(hub.failover_state_name(), "failover-in-progress");
+        hub.failover.lock().phase = FailoverPhase::WaitForSync;
+        assert!(hub.abort_failover("test"));
+        assert_eq!(hub.failover_phase(), FailoverPhase::None);
     }
 
     #[test]

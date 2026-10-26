@@ -63,6 +63,10 @@ A script runs on its shard's thread until it returns. Past `busy-reply-threshold
   `repl-timeout` seconds (default 60) marks the link down and reconnects, and a master drops
   a replica that hasn't acked for that long. Keep `repl-timeout` above
   `repl-ping-replica-period` (default 10), or idle links time out.
+- **Planned switchover**: `FAILOVER [TO <host> <port>] [TIMEOUT <ms> [FORCE]]` on the master
+  pauses writes, waits for the replica to catch up, promotes it and turns the old master into
+  its replica, with no acknowledged write lost. `INFO replication`'s `master_failover_state`
+  shows progress; `FAILOVER ABORT` cancels it, and without `FORCE` it aborts at the timeout.
 - **Promote a replica**: `REPLICAOF NO ONE` on it, then repoint clients and the other
   replicas. There is no Sentinel: promotion is manual or done by your orchestrator.
 - In cluster mode, `CLUSTER FAILOVER` on a replica switches roles without losing

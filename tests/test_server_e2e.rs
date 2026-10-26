@@ -35486,3 +35486,115 @@ fn test_connected_clients_excludes_replicas_e2e() {
         let _ = c.wait();
     }
 }
+
+/// FAILOVER (Redis 6.2+): the master pauses writes, waits for the target
+/// to catch up, hands over with PSYNC FAILOVER and continues as its
+/// replica, losing no write. A failover whose target never catches up is
+/// aborted at its timeout and writes resume. Bad requests get Redis's
+/// errors.
+#[test]
+fn test_failover_command_switches_master_and_replica_e2e() {
+    let (mport, aport, bport) = (29901u16, 29902u16, 29903u16);
+    let spawn = |port: u16| {
+        let p = port.to_string();
+        spawn_rudis_listening(
+            &["--port", &p, "--threads", "2", "--no-pin", "--save", ""],
+            port,
+        )
+    };
+    let mut nodes = [spawn(mport), spawn(aport), spawn(bport)];
+    let connect = |port: u16| {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let (mut m, mut a, mut b) = (connect(mport), connect(aport), connect(bport));
+    let err = |c: &mut TcpStream, args: &[&str], want: &str| {
+        let r = resp_cmd(c, args);
+        assert!(r.starts_with("-ERR") && r.contains(want), "{args:?}: {r}");
+    };
+    err(
+        &mut m,
+        &["FAILOVER"],
+        "FAILOVER requires connected replicas.",
+    );
+    err(&mut m, &["FAILOVER", "ABORT"], "No failover in progress.");
+    for r in [&mut a, &mut b] {
+        assert_eq!(
+            resp_cmd(r, &["REPLICAOF", "127.0.0.1", &mport.to_string()]),
+            "+OK\r\n"
+        );
+        wait_for_master_link(r);
+    }
+    let wait_info = |c: &mut TcpStream, what: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let info = resp_cmd_full(c, &["INFO", "replication"]);
+            if info.contains(what) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "no {what}: {info}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    wait_info(&mut m, "connected_slaves:2");
+    assert!(
+        resp_cmd_full(&mut m, &["INFO", "replication"])
+            .contains("master_failover_state:no-failover")
+    );
+    err(
+        &mut m,
+        &["FAILOVER", "TO", "127.0.0.1", "1"],
+        "is not a replica",
+    );
+    err(
+        &mut m,
+        &["FAILOVER", "FORCE", "TIMEOUT", "100"],
+        "requires both a timeout",
+    );
+    err(&mut a, &["FAILOVER"], "not valid when server is a replica");
+
+    // Hand over to a.
+    assert_eq!(resp_cmd(&mut m, &["SET", "k", "1"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut m, &["FAILOVER", "TO", "127.0.0.1", &aport.to_string()]),
+        "+OK\r\n"
+    );
+    wait_info(&mut a, "role:master");
+    wait_info(&mut m, &format!("master_port:{aport}"));
+    wait_info(&mut m, "master_link_status:up");
+    wait_info(&mut m, "master_failover_state:no-failover");
+    assert_eq!(resp_cmd(&mut a, &["GET", "k"]), "$1\r\n1\r\n");
+    let r = resp_cmd(&mut m, &["SET", "k", "x"]);
+    assert!(r.starts_with("-READONLY"), "{r}");
+    assert_eq!(resp_cmd(&mut a, &["SET", "k", "2"]), "+OK\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd(&mut m, &["GET", "k"]) != "$1\r\n2\r\n" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "old master did not follow"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // a's only replica (m) is stopped: the failover times out and aborts.
+    wait_info(&mut a, "connected_slaves:1");
+    // SAFETY: kill(2) on our own live child.
+    unsafe { libc::kill(nodes[0].id() as libc::pid_t, libc::SIGSTOP) };
+    assert_eq!(resp_cmd(&mut a, &["SET", "k", "3"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut a, &["FAILOVER", "TIMEOUT", "500"]), "+OK\r\n");
+    assert!(
+        resp_cmd_full(&mut a, &["INFO", "replication"])
+            .contains("master_failover_state:waiting-for-sync")
+    );
+    wait_info(&mut a, "master_failover_state:no-failover");
+    assert!(resp_cmd_full(&mut a, &["INFO", "replication"]).contains("role:master"));
+    assert_eq!(resp_cmd(&mut a, &["SET", "k", "4"]), "+OK\r\n");
+    // SAFETY: as above.
+    unsafe { libc::kill(nodes[0].id() as libc::pid_t, libc::SIGCONT) };
+
+    for n in nodes.iter_mut() {
+        let _ = n.kill();
+        let _ = n.wait();
+    }
+}

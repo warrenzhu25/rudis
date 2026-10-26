@@ -7769,6 +7769,40 @@ async fn run_master_replica_stream(
 
     let is_sync = matches!(&psync_cmd, Command::Sync);
 
+    // Our master's FAILOVER: it asks us to take over, then continues as
+    // our replica with this same PSYNC.
+    if let Command::Psync {
+        replid,
+        failover: true,
+        ..
+    } = &psync_cmd
+    {
+        let replid = String::from_utf8_lossy(replid).into_owned();
+        crate::log_notice!("Failover request received for replid {}.", replid);
+        if !hub.is_slave() {
+            let _ = writer
+                .write_all(b"-ERR PSYNC FAILOVER can't be sent to a master.\r\n".to_vec())
+                .await;
+            return;
+        }
+        if replid != hub.current_replid() {
+            let _ = writer
+                .write_all(b"-ERR PSYNC FAILOVER replid must match my replid.\r\n".to_vec())
+                .await;
+            return;
+        }
+        hub.stop_sync_and_wait().await;
+        hub.make_master();
+        crate::log_notice!("MASTER MODE enabled (failover request from '{}')", name);
+    }
+    // Don't let replicas sync with us while we fail over.
+    if hub.failover_phase() != crate::replication::FailoverPhase::None {
+        let _ = writer
+            .write_all(b"-NOMASTERLINK Can't SYNC while failing over\r\n".to_vec())
+            .await;
+        return;
+    }
+
     // Like Redis, a replica serves (P)SYNC only while its own master link
     // is up: before that it has no consistent data and history to offer.
     if !hub.can_serve_replicas() {
@@ -7783,7 +7817,7 @@ async fn run_master_replica_stream(
     let mut after_ack: Option<Vec<u8>> = None;
     if !is_sync {
         let (req_replid, req_offset) = match &psync_cmd {
-            Command::Psync { replid, offset } => {
+            Command::Psync { replid, offset, .. } => {
                 (std::str::from_utf8(replid).unwrap_or(""), *offset)
             }
             _ => ("", -1),
@@ -9369,6 +9403,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::CommandDocs(_) => "COMMAND",
         Command::Info(_) => "INFO",
         Command::Replicaof { .. } => "REPLICAOF",
+        Command::Failover { .. } => "FAILOVER",
         Command::Psync { .. } => "PSYNC",
         Command::Sync => "SYNC",
         Command::Replconf(_) => "REPLCONF",
@@ -12582,6 +12617,24 @@ async fn execute_command_inner(
                 );
             } else {
                 out.extend_from_slice(b"+OK\r\n");
+            }
+            false
+        }
+        Command::Failover { abort, request } => {
+            let hub = crate::replication::get_replication_hub(router.base_port);
+            if router.cluster_enabled {
+                out.extend_from_slice(b"-ERR FAILOVER not allowed in cluster mode.\r\n");
+            } else if abort {
+                if hub.abort_failover("Failover manually aborted") {
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(b"-ERR No failover in progress.\r\n");
+                }
+            } else {
+                match hub.start_failover(request, router.clone()) {
+                    Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                    Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+                }
             }
             false
         }
@@ -29987,6 +30040,7 @@ mod tests {
         let psync = Command::Psync {
             replid: Bytes::from_static(b"?"),
             offset: -1,
+            failover: false,
         };
         let sub = Command::Subscribe(vec![Bytes::from_static(b"ch")]);
         // Not a mode switch: never gated here.

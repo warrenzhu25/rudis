@@ -851,8 +851,16 @@ pub enum Command {
     Psync {
         replid: Bytes,
         offset: i64,
+        /// `PSYNC <replid> <offset> FAILOVER`: our master asks us to take
+        /// over (its FAILOVER command).
+        failover: bool,
     },
     Sync,
+    /// `FAILOVER ABORT`, or `FAILOVER [TO host port [FORCE]] [TIMEOUT ms]`.
+    Failover {
+        abort: bool,
+        request: crate::replication::FailoverRequest,
+    },
     Replconf(Vec<Bytes>),
     Role,
     // LUA SCRIPTING COMMANDS
@@ -2347,6 +2355,50 @@ thread_local! {
     /// of the limit doesn't fail parse tests running beside it.
     static TEST_PROTO_MAX_BULK_LEN: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// FAILOVER's arguments, checked as Redis checks them.
+fn parse_failover(args: &[Bytes]) -> Result<Option<Command>, String> {
+    if args.len() == 2 && args[1].eq_ignore_ascii_case(b"abort") {
+        return Ok(Some(Command::Failover {
+            abort: true,
+            request: Default::default(),
+        }));
+    }
+    let int = |b: &Bytes| -> Result<i64, String> {
+        std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| "value is not an integer or out of range".to_string())
+    };
+    let mut request = crate::replication::FailoverRequest::default();
+    let mut j = 1;
+    while j < args.len() {
+        let a = &args[j];
+        if a.eq_ignore_ascii_case(b"timeout") && j + 1 < args.len() && request.timeout_ms == 0 {
+            let ms = int(&args[j + 1])?;
+            if ms <= 0 {
+                return Err("FAILOVER timeout must be greater than 0".to_string());
+            }
+            request.timeout_ms = ms as u64;
+            j += 2;
+        } else if a.eq_ignore_ascii_case(b"to") && j + 2 < args.len() && request.target.is_none() {
+            let port = int(&args[j + 2])?;
+            let host = String::from_utf8_lossy(&args[j + 1]).into_owned();
+            // An impossible port matches no replica (Redis's error).
+            request.target = Some((host, u16::try_from(port).unwrap_or(0)));
+            j += 3;
+        } else if a.eq_ignore_ascii_case(b"force") && !request.force {
+            request.force = true;
+            j += 1;
+        } else {
+            return Err("syntax error".to_string());
+        }
+    }
+    Ok(Some(Command::Failover {
+        abort: false,
+        request,
+    }))
 }
 
 /// A WAIT / WAITAOF timeout in milliseconds (0 = forever), checked as
@@ -6706,8 +6758,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 port: args[2].clone(),
             }))
         }
+        "FAILOVER" => parse_failover(&args),
         "PSYNC" => {
-            if args.len() != 3 {
+            let failover = args.len() == 4 && args[3].eq_ignore_ascii_case(b"failover");
+            if args.len() != 3 && !failover {
                 return Err("wrong number of arguments for 'psync' command".to_string());
             }
             let replid = args[1].clone();
@@ -6718,7 +6772,11 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 Some(o) => o,
                 None => return Err("ERR value is not an integer or out of range".to_string()),
             };
-            Ok(Some(Command::Psync { replid, offset }))
+            Ok(Some(Command::Psync {
+                replid,
+                offset,
+                failover,
+            }))
         }
         "SYNC" => {
             if args.len() != 1 {
@@ -14401,6 +14459,65 @@ fn find_newline_at(buf: &[u8], start: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_failover_and_psync_failover_parse_like_redis() {
+        let parse = |args: &[&str]| {
+            let mut frame = format!("*{}\r\n", args.len());
+            for a in args {
+                frame.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            parse_command(&mut BytesMut::from(frame.as_str()))
+        };
+        let req = |args: &[&str]| match parse(args) {
+            Ok(Some(Command::Failover { abort, request })) => Ok((abort, request)),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e),
+        };
+        let r = req(&[
+            "FAILOVER", "TO", "10.0.0.1", "6380", "FORCE", "TIMEOUT", "500",
+        ])
+        .unwrap();
+        assert!(!r.0);
+        assert_eq!(r.1.target, Some(("10.0.0.1".to_string(), 6380)));
+        assert!(r.1.force);
+        assert_eq!(r.1.timeout_ms, 500);
+        assert!(req(&["FAILOVER", "ABORT"]).unwrap().0);
+        assert_eq!(req(&["FAILOVER"]).unwrap().1, Default::default());
+        assert_eq!(
+            req(&["FAILOVER", "TIMEOUT", "0"]).unwrap_err(),
+            "FAILOVER timeout must be greater than 0"
+        );
+        assert_eq!(
+            req(&["FAILOVER", "TIMEOUT", "x"]).unwrap_err(),
+            "value is not an integer or out of range"
+        );
+        assert_eq!(
+            req(&["FAILOVER", "FORCE", "FORCE"]).unwrap_err(),
+            "syntax error"
+        );
+        assert_eq!(
+            req(&["FAILOVER", "ABORT", "FORCE"]).unwrap_err(),
+            "syntax error"
+        );
+        assert_eq!(req(&["FAILOVER", "TO", "h"]).unwrap_err(), "syntax error");
+        assert!(matches!(
+            parse(&["PSYNC", "abc", "10", "FAILOVER"]),
+            Ok(Some(Command::Psync {
+                offset: 10,
+                failover: true,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            parse(&["PSYNC", "abc", "10"]),
+            Ok(Some(Command::Psync {
+                failover: false,
+                ..
+            }))
+        ));
+        assert!(parse(&["PSYNC", "abc", "10", "NOPE"]).is_err());
+    }
 
     #[test]
     fn test_wait_timeout_is_validated_like_redis() {
