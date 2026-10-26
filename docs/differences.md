@@ -39,6 +39,22 @@ This document summarizes the architectural, operational, and semantic difference
 
 ---
 
+### Multi-Key Atomicity Across Shards
+* **Redis**: Single-threaded, so every command and `MULTI`/`EXEC` is atomic.
+* **Dragonfly**: Multi-key commands and transactions are scheduled across shards atomically.
+* **Rudis**: A cross-shard `MGET` never sees a cross-shard `MSET` or `MULTI`/`EXEC` half applied
+  (a seqlock check, with a fallback to per-shard VLL locks; see
+  [`design/04_sharding_mesh.md`](design/04_sharding_mesh.md) §4.4), and `EXEC`s are ordered
+  against each other. Some gaps remain:
+  - Two concurrent cross-shard `MSET`s (or an `MSET` and an `EXEC`) of the same keys can apply
+    in a different order on each shard.
+  - A cross-shard `EXEC` isn't isolated from plain single-key commands.
+  - Other multi-key commands spanning shards (`DEL`, `UNLINK`, `EXISTS`, `TOUCH` with several
+    keys) run per shard.
+
+  To make related keys atomic in every case, put them on one shard with a hash tag
+  (`{user:1}:a`, `{user:1}:b`).
+
 ## 3. Replication & High Availability
 
 ### Parallel Replication vs. Single Stream

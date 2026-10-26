@@ -283,6 +283,25 @@ some concurrency (a transaction touching shard N blocks *any other* transaction 
 shard N, even on disjoint keys) for a scheme that is simple to reason about and cannot
 deadlock as long as every transaction acquires shard locks in the same global order.
 
+Cross-shard `MGET` sees cross-shard writes whole without taking those locks in the common
+case, through a seqlock (`XShardWriteGuard` in `src/router.rs`). Every cross-shard write
+(`EXEC`, `MSET`, key moves) bumps a process-wide epoch when it starts and when it ends, and
+counts itself as running. An `MGET` notes the epoch before its per-shard reads (and needs no
+write to be running) and checks it after. If a write overlapped, it reads again, and after three
+tries it reads under the shards' locks. `EXEC` and key moves hold the locks while they write.
+A cross-shard `MSET` doesn't: taking every shard's lock serialized all cross-shard `MSET`s
+(-98% throughput). It takes them only while an `MGET` reads under them, and that `MGET` first
+waits for the lock-free `MSET`s to finish. A pipeline made only of `MGET`s is still folded into
+per-shard batches and checked as a whole: if a write overlapped, its `MGET`s are read again in
+order. A pipeline that mixes a cross-shard `MGET` with other commands runs command by command.
+
+Not covered: two concurrent cross-shard writes of the same keys aren't ordered against each
+other when one is a lock-free `MSET`, so each shard can apply them in a different order. The
+transaction locks don't stop plain single-key commands, so an `EXEC` spanning shards can see
+another client's single-key writes land between its per-shard steps.
+Other multi-key commands that span shards (`DEL`/`UNLINK`/`EXISTS`/`TOUCH` with several
+keys) are applied per shard without this check. Replicas apply a cross-shard `MSET` per shard.
+
 ### 4.5 Live slot migration and cluster redirection
 
 Rudis tracks, per slot, whether it is `Stable`, `Migrating` (to another node),

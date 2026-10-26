@@ -370,6 +370,8 @@ struct ExecCleanup<'a> {
     router: &'a Router,
     client_id: u64,
     locks: Option<(Vec<usize>, u64)>,
+    /// Marks the transaction as a cross-shard write while it holds `locks`.
+    xwrite: Option<crate::router::XShardWriteGuard>,
     hub: Option<std::sync::Arc<parking_lot::Mutex<crate::block::BlockHub>>>,
 }
 
@@ -379,6 +381,9 @@ impl Drop for ExecCleanup<'_> {
         exit_tx(self.client_id);
         flush_pending_bcast(self.router.port);
         EXECUTING_CLIENT_ID.set(0);
+        // Before the locks go: a reader that then locks the shards must
+        // not take the write for still running.
+        self.xwrite.take();
         if let Some((shards, tx_id)) = self.locks.take() {
             self.router.release_tx_locks_now(&shards, tx_id);
         }
@@ -5167,12 +5172,14 @@ async fn execute_tx_step(
                         router,
                         client_id,
                         locks: None,
+                        xwrite: None,
                         hub: None,
                     };
                     if use_vll {
                         let id = next_tx_id();
                         cleanup.locks = Some((sorted_shards.clone(), id));
                         router.acquire_tx_locks(&sorted_shards, id).await;
+                        cleanup.xwrite = Some(crate::router::XShardWriteGuard::locked());
                     }
 
                     let hub_arc = crate::block::get_block_hub_for_port(router.port);
@@ -11466,11 +11473,16 @@ async fn execute_command_inner(
             }
         }
         Command::Mget(keys) => {
+            // Inside EXEC the transaction's locks already keep cross-shard
+            // writers out (and taking them again would wait on itself).
+            let atomic = !in_tx(client_id);
             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                router.write_mget_resp(keys.clone(), out).await;
                 for key in &keys {
                     record_client_read(router.port, client_id, key.as_ref());
                 }
+            }
+            if atomic {
+                router.write_mget_resp_atomic(keys, out).await;
             } else {
                 router.write_mget_resp(keys, out).await;
             }
@@ -11494,7 +11506,11 @@ async fn execute_command_inner(
                 } else {
                     Vec::new()
                 };
-            router.mset(pairs).await;
+            if in_tx(client_id) {
+                router.mset(pairs).await;
+            } else {
+                router.mset_atomic(pairs).await;
+            }
             for key in &keys {
                 notify_keyspace_event_sync(router, NOTIFY_STRING, "set", key);
             }
@@ -27187,6 +27203,46 @@ async fn execute_commands_squashed_inner(
         }
     }
 
+    // Cross-shard MSET / MGET are atomic (see `router::XShardWriteGuard`).
+    // A batch with a cross-shard MSET is marked as one cross-shard write
+    // while it runs (or runs command by command while an MGET reads under
+    // the shards' locks). A batch of nothing but MGETs is folded as usual,
+    // its reads checked against cross-shard writes once all replied and
+    // read again one by one if one overlapped; mixed with anything else,
+    // rereading an MGET could reorder it after the batch's later commands,
+    // so such a batch runs command by command.
+    let mut mget_check: Option<(u64, Vec<Command>)> = None;
+    let mut _batch_write: Option<crate::router::XShardWriteGuard> = None;
+    if can_squash && router.num_shards > 1 {
+        let (mut cross_mget, mut cross_mset, mut only_mgets) = (false, false, true);
+        for cmd in commands.iter() {
+            match cmd {
+                Command::Mget(keys) => {
+                    cross_mget |= keys_span_shards(keys, |k| router.target_shard(k));
+                }
+                Command::Mset(pairs) => {
+                    only_mgets = false;
+                    let first = pairs.first().map(|(k, _)| router.target_shard(k));
+                    cross_mset |= pairs
+                        .iter()
+                        .any(|(k, _)| Some(router.target_shard(k)) != first);
+                }
+                _ => only_mgets = false,
+            }
+        }
+        if cross_mget && !only_mgets {
+            can_squash = false;
+        } else if cross_mset {
+            _batch_write = crate::router::XShardWriteGuard::lock_free();
+            can_squash = _batch_write.is_some();
+        } else if cross_mget {
+            match crate::router::xshard_read_begin() {
+                Some(epoch) => mget_check = Some((epoch, commands.clone())),
+                None => can_squash = false,
+            }
+        }
+    }
+
     if !can_squash {
         let mut should_close = false;
         for cmd in commands.drain(..) {
@@ -28238,6 +28294,21 @@ async fn execute_commands_squashed_inner(
         }
     }
 
+    if let Some((epoch, mgets)) = mget_check
+        && !crate::router::xshard_read_is_consistent(epoch)
+    {
+        // A cross-shard write overlapped the folded MGETs: read them again,
+        // in order, each checked on its own.
+        folded_mgets.clear();
+        responses.truncate(n);
+        for cmd in mgets {
+            if let Command::Mget(keys) = cmd {
+                router.write_mget_resp_atomic(keys, out).await;
+            }
+        }
+        return should_close;
+    }
+
     // 5. Append responses in exact FIFO pipeline order with pre-reserved
     //    capacity. A folded MGET's array is written directly from its
     //    per-key slots (in `responses` past the pipeline's), so its values
@@ -28453,13 +28524,7 @@ fn keys_span_shards(keys: &[Bytes], shard_of: impl Fn(&[u8]) -> usize) -> bool {
     }
 }
 
-/// Ids for `Router::acquire_tx_locks`, shared by EXEC and the cross-shard
-/// key commands so a lock is never released by a different holder.
-static NEXT_TX_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-fn next_tx_id() -> u64 {
-    NEXT_TX_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
+use crate::router::next_tx_id;
 
 /// Runs `cmd` on `shard`, locally or through its mailbox, and returns the
 /// RESP reply.
@@ -28548,6 +28613,7 @@ async fn move_key_across_shards(
     if lock {
         router.acquire_tx_locks(&shards, tx_id).await;
     }
+    let xwrite = lock.then(crate::router::XShardWriteGuard::locked);
     let res = async {
         let dump = exec_on_shard(router, s, Command::Dump(src.clone())).await;
         let Some(payload) = resp_bulk_payload(&dump) else {
@@ -28602,6 +28668,7 @@ async fn move_key_across_shards(
         Ok(Some(true))
     }
     .await;
+    drop(xwrite);
     if lock {
         router.release_tx_locks(&shards, tx_id).await;
     }
@@ -28654,6 +28721,7 @@ async fn move_element_across_shards(
     if lock {
         router.acquire_tx_locks(&shards, tx_id).await;
     }
+    let xwrite = lock.then(crate::router::XShardWriteGuard::locked);
     const WRONGTYPE: &[u8] =
         b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
     let (kind, missing): (&[u8], Vec<u8>) = match op {
@@ -28763,6 +28831,7 @@ async fn move_element_across_shards(
         }
     }
     .await;
+    drop(xwrite);
     if lock {
         router.release_tx_locks(&shards, tx_id).await;
     }
@@ -29070,6 +29139,7 @@ async fn msetnx_across_shards(router: &Router, pairs: &[(Bytes, Bytes)], in_tx: 
     if lock {
         router.acquire_tx_locks(&shards, tx_id).await;
     }
+    let xwrite = lock.then(crate::router::XShardWriteGuard::locked);
     let exists = exec_on_shards(
         router,
         groups
@@ -29101,6 +29171,7 @@ async fn msetnx_across_shards(router: &Router, pairs: &[(Bytes, Bytes)], in_tx: 
             None => b":1\r\n".to_vec(),
         }
     };
+    drop(xwrite);
     if lock {
         router.release_tx_locks(&shards, tx_id).await;
     }
@@ -29130,6 +29201,7 @@ async fn bitop_across_shards(
     if lock {
         router.acquire_tx_locks(&shards, tx_id).await;
     }
+    let xwrite = lock.then(crate::router::XShardWriteGuard::locked);
     let reply = async {
         let gets = exec_on_shards(
             router,
@@ -29168,6 +29240,7 @@ async fn bitop_across_shards(
         format!(":{len}\r\n").into_bytes()
     }
     .await;
+    drop(xwrite);
     if lock {
         router.release_tx_locks(&shards, tx_id).await;
     }

@@ -229,6 +229,9 @@ pub struct Router {
     pub notify_channel_pool: Rc<RefCell<Vec<(flume::Sender<()>, flume::Receiver<()>)>>>,
     pub remote_responder_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::BatchResponder>>>>,
     pub mget_batch_pool: Rc<RefCell<Vec<Vec<Vec<(usize, Bytes)>>>>>,
+    /// Key lists kept by cross-shard MGETs for a retry (see
+    /// [`Router::write_mget_resp`]), reused across calls.
+    pub mget_keys_pool: Rc<RefCell<Vec<Vec<Bytes>>>>,
     pub mset_batch_pool: Rc<RefCell<Vec<Vec<Vec<(Bytes, Bytes)>>>>>,
     pub mget_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMgetDescriptor>>>>,
     pub mset_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMsetDescriptor>>>>,
@@ -361,6 +364,131 @@ impl Drop for SaveFlagGuard {
     }
 }
 
+/// Cross-shard writes in progress (MSET, EXEC and key moves that span
+/// shards), and an epoch bumped as each starts and ends. Together they make
+/// a seqlock for cross-shard reads: an MGET whose keys span shards reads
+/// them in one hop per shard, but those hops land at different times, so a
+/// concurrent cross-shard write could be half visible. The MGET notes the
+/// epoch (and that no writer runs) before reading and checks it after, and
+/// reads again if a writer overlapped.
+///
+/// EXEC and key moves hold the shards' VLL locks while they write. A
+/// cross-shard MSET normally doesn't: taking the locks of every shard it
+/// touches serialized all cross-shard MSETs (-98% throughput). It writes
+/// "lock-free" (counted in `XSHARD_LOCKFREE_WRITERS`) unless an MGET has
+/// fallen back to reading under the locks (`XSHARD_LOCKED_READERS`): that
+/// reader waits for the lock-free writers to finish, and later MSETs take
+/// the locks until it is done, so it can't starve. The MSET bumps its count
+/// before checking for readers, and the reader its count before checking
+/// for writers, so at least one of them sees the other.
+///
+/// Process-wide rather than per server: servers sharing a process (tests)
+/// only cost each other an occasional retry.
+static XSHARD_WRITERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static XSHARD_LOCKFREE_WRITERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static XSHARD_LOCKED_READERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static XSHARD_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many lock-free attempts a cross-shard MGET makes before it reads
+/// under the shards' VLL locks.
+const XSHARD_READ_ATTEMPTS: usize = 3;
+
+/// Marks a cross-shard write in progress.
+pub struct XShardWriteGuard {
+    lock_free: bool,
+}
+
+impl XShardWriteGuard {
+    /// A write holding the VLL locks of its shards, from after they are
+    /// taken until before they are released.
+    pub fn locked() -> Self {
+        XSHARD_WRITERS.fetch_add(1, Ordering::SeqCst);
+        XSHARD_EPOCH.fetch_add(1, Ordering::SeqCst);
+        Self { lock_free: false }
+    }
+
+    /// A write without the VLL locks, or `None` while an MGET reads under
+    /// them (the write must then take them, see `XSHARD_LOCKED_READERS`).
+    pub fn lock_free() -> Option<Self> {
+        XSHARD_LOCKFREE_WRITERS.fetch_add(1, Ordering::SeqCst);
+        if XSHARD_LOCKED_READERS.load(Ordering::SeqCst) > 0 {
+            XSHARD_LOCKFREE_WRITERS.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        XSHARD_WRITERS.fetch_add(1, Ordering::SeqCst);
+        XSHARD_EPOCH.fetch_add(1, Ordering::SeqCst);
+        Some(Self { lock_free: true })
+    }
+}
+
+impl Drop for XShardWriteGuard {
+    fn drop(&mut self) {
+        XSHARD_EPOCH.fetch_add(1, Ordering::SeqCst);
+        XSHARD_WRITERS.fetch_sub(1, Ordering::SeqCst);
+        if self.lock_free {
+            XSHARD_LOCKFREE_WRITERS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// An MGET reading under the shards' VLL locks: lock-free MSETs drain and
+/// new ones take the locks until it is dropped.
+struct XShardLockedRead(());
+
+impl XShardLockedRead {
+    async fn begin() -> Self {
+        XSHARD_LOCKED_READERS.fetch_add(1, Ordering::SeqCst);
+        while XSHARD_LOCKFREE_WRITERS.load(Ordering::SeqCst) > 0 {
+            monoio::time::sleep(Duration::from_micros(20)).await;
+        }
+        Self(())
+    }
+}
+
+impl Drop for XShardLockedRead {
+    fn drop(&mut self) {
+        XSHARD_LOCKED_READERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Starts a cross-shard read: the epoch to check with
+/// [`xshard_read_is_consistent`], or `None` while a cross-shard write runs.
+#[inline]
+pub fn xshard_read_begin() -> Option<u64> {
+    let epoch = XSHARD_EPOCH.load(Ordering::SeqCst);
+    (XSHARD_WRITERS.load(Ordering::SeqCst) == 0).then_some(epoch)
+}
+
+/// Whether no cross-shard write started or ended since
+/// [`xshard_read_begin`] returned `epoch`: the read saw none half done.
+#[inline]
+pub fn xshard_read_is_consistent(epoch: u64) -> bool {
+    XSHARD_EPOCH.load(Ordering::SeqCst) == epoch
+}
+
+/// Ids for [`Router::acquire_tx_locks`], shared by every holder (EXEC,
+/// cross-shard MSET / MGET / key moves) so a lock is never released by a
+/// different one.
+static NEXT_TX_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn next_tx_id() -> u64 {
+    NEXT_TX_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Releases VLL locks on drop, so a task dropped while it holds them (a
+/// panicking connection is isolated) doesn't leave the shards locked.
+struct TxLocksGuard<'a> {
+    router: &'a Router,
+    shards: SmallVec<[usize; 8]>,
+    tx_id: u64,
+}
+
+impl Drop for TxLocksGuard<'_> {
+    fn drop(&mut self) {
+        self.router.release_tx_locks_now(&self.shards, self.tx_id);
+    }
+}
+
 /// Hands a released VLL lock to the next waiter still waiting. A waiter whose
 /// transaction was dropped while queued (its receiver is gone) is skipped;
 /// granting it would leave the lock held by nobody, forever.
@@ -424,6 +552,7 @@ impl Router {
             notify_channel_pool: Rc::new(RefCell::new(Vec::new())),
             remote_responder_pool: Rc::new(RefCell::new(Vec::new())),
             mget_batch_pool: Rc::new(RefCell::new(Vec::new())),
+            mget_keys_pool: Rc::new(RefCell::new(Vec::new())),
             mset_batch_pool: Rc::new(RefCell::new(Vec::new())),
             mget_desc_pool: Rc::new(RefCell::new(Vec::new())),
             mset_desc_pool: Rc::new(RefCell::new(Vec::new())),
@@ -2264,8 +2393,70 @@ impl Router {
         self.release_mget_descriptor(descriptor);
     }
 
+    /// MGET without the cross-shard consistency check (inside EXEC, whose
+    /// locks already keep cross-shard writers out, or where it doesn't
+    /// matter). See [`Router::write_mget_resp_atomic`].
     pub async fn write_mget_resp(&self, keys: Vec<Bytes>, out: &mut Vec<u8>) {
         if let Some(inflight) = self.begin_mget_resp(keys, out).await {
+            self.finish_mget_resp(inflight, out).await;
+        }
+    }
+
+    /// MGET, atomic against cross-shard writes: keys on several shards are
+    /// read again if a cross-shard write overlapped the read (see
+    /// [`XShardWriteGuard`]), finally under the shards' VLL locks.
+    ///
+    /// Not for a command inside EXEC: the transaction holds those locks.
+    pub async fn write_mget_resp_atomic(&self, keys: Vec<Bytes>, out: &mut Vec<u8>) {
+        let first = keys.first().map(|k| self.target_shard(k));
+        if self.num_shards <= 1
+            || keys
+                .iter()
+                .skip(1)
+                .all(|k| Some(self.target_shard(k)) == first)
+        {
+            // One shard: its reads all run in one step.
+            if let Some(inflight) = self.begin_mget_resp(keys, out).await {
+                self.finish_mget_resp(inflight, out).await;
+            }
+            return;
+        }
+        let mut retry_keys = self.mget_keys_pool.borrow_mut().pop().unwrap_or_default();
+        retry_keys.clear();
+        retry_keys.extend(keys.iter().cloned());
+        let start = out.len();
+        let mut keys = Some(keys);
+        for _ in 0..XSHARD_READ_ATTEMPTS {
+            let Some(epoch) = xshard_read_begin() else {
+                break;
+            };
+            let attempt = keys.take().unwrap_or_else(|| retry_keys.clone());
+            if let Some(inflight) = self.begin_mget_resp(attempt, out).await {
+                self.finish_mget_resp(inflight, out).await;
+            }
+            if xshard_read_is_consistent(epoch) {
+                self.mget_keys_pool.borrow_mut().push(retry_keys);
+                return;
+            }
+            out.truncate(start);
+        }
+        // Contended: read under the shards' VLL locks, once no lock-free
+        // MSET runs (later ones take the locks too while this waits).
+        let mut shards: SmallVec<[usize; 8]> =
+            retry_keys.iter().map(|k| self.target_shard(k)).collect();
+        shards.sort_unstable();
+        shards.dedup();
+        let _locked_read = XShardLockedRead::begin().await;
+        let tx_id = next_tx_id();
+        self.acquire_tx_locks(&shards, tx_id).await;
+        let _locks = TxLocksGuard {
+            router: self,
+            shards,
+            tx_id,
+        };
+        let attempt = retry_keys.clone();
+        self.mget_keys_pool.borrow_mut().push(retry_keys);
+        if let Some(inflight) = self.begin_mget_resp(attempt, out).await {
             self.finish_mget_resp(inflight, out).await;
         }
     }
@@ -2383,7 +2574,53 @@ impl Router {
         self.release_mset_descriptor(descriptor);
     }
 
+    /// MSET without taking locks (inside EXEC, which holds them). See
+    /// [`Router::mset_atomic`].
     pub async fn mset(&self, pairs: Vec<(Bytes, Bytes)>) {
+        if let Some(inflight) = self.begin_mset(pairs) {
+            self.finish_mset(inflight).await;
+        }
+    }
+
+    /// MSET, atomic toward readers across shards: pairs on several shards
+    /// are written as a cross-shard write for MGET's consistency check (see
+    /// [`XShardWriteGuard`]), without locks unless an MGET reads under them.
+    /// Two concurrent cross-shard MSETs of the same keys aren't ordered
+    /// against each other.
+    ///
+    /// Not for a command inside EXEC: the transaction holds those locks.
+    pub async fn mset_atomic(&self, pairs: Vec<(Bytes, Bytes)>) {
+        let first = pairs.first().map(|(k, _)| self.target_shard(k));
+        if self.num_shards <= 1
+            || pairs
+                .iter()
+                .skip(1)
+                .all(|(k, _)| Some(self.target_shard(k)) == first)
+        {
+            if let Some(inflight) = self.begin_mset(pairs) {
+                self.finish_mset(inflight).await;
+            }
+            return;
+        }
+        if let Some(_write) = XShardWriteGuard::lock_free() {
+            if let Some(inflight) = self.begin_mset(pairs) {
+                self.finish_mset(inflight).await;
+            }
+            return;
+        }
+        // An MGET reads under the locks: take them too.
+        let mut shards: SmallVec<[usize; 8]> =
+            pairs.iter().map(|(k, _)| self.target_shard(k)).collect();
+        shards.sort_unstable();
+        shards.dedup();
+        let tx_id = next_tx_id();
+        self.acquire_tx_locks(&shards, tx_id).await;
+        let _locks = TxLocksGuard {
+            router: self,
+            shards,
+            tx_id,
+        };
+        let _write = XShardWriteGuard::locked();
         if let Some(inflight) = self.begin_mset(pairs) {
             self.finish_mset(inflight).await;
         }
@@ -5379,6 +5616,29 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cross-shard read is consistent only if no cross-shard write ran
+    /// at its start and none started or ended before its end.
+    #[test]
+    fn test_xshard_read_sees_overlapping_writes() {
+        // Other tests' writes may move the counters: retry until a quiet
+        // window, then check each case.
+        let quiet_epoch = || loop {
+            if let Some(e) = xshard_read_begin() {
+                return e;
+            }
+            std::thread::yield_now();
+        };
+        let e = quiet_epoch();
+        let w = XShardWriteGuard::locked();
+        assert!(!xshard_read_is_consistent(e), "a write started meanwhile");
+        assert_eq!(xshard_read_begin(), None, "a write is running");
+        drop(w);
+        let e = quiet_epoch();
+        drop(XShardWriteGuard::lock_free().expect("no locked reader"));
+        assert!(!xshard_read_is_consistent(e), "a write ran meanwhile");
+        assert_ne!(next_tx_id(), next_tx_id());
+    }
 
     #[test]
     fn test_keys_differing_in_last_bytes_spread_over_shards() {

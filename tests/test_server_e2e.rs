@@ -34700,3 +34700,147 @@ fn test_metrics_report_per_shard_keys_and_memory_e2e() {
     assert!(gauge("rudis_process_resident_memory_bytes") > 0);
     gauge("rudis_mailbox_overflows_total");
 }
+
+/// A cross-shard MGET never sees a cross-shard MSET or MULTI/EXEC half
+/// applied, as in Redis: with 8 keys spread over 4 shards and a writer
+/// setting all of them to one value at a time, every read (alone or in a
+/// pipeline of MGETs) finds the keys equal.
+#[test]
+fn test_cross_shard_mget_sees_mset_and_exec_whole_e2e() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let port = 29801;
+    start_test_server(port, 4);
+    let keys: Vec<String> = (0..8).map(|i| format!("atomic:{i}")).collect();
+    let shards: std::collections::HashSet<usize> =
+        keys.iter().map(|k| target_shard(k.as_bytes(), 4)).collect();
+    assert!(shards.len() > 1, "keys must span shards");
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    };
+    let mut init = vec!["MSET".to_string()];
+    for k in &keys {
+        init.push(k.clone());
+        init.push("0".to_string());
+    }
+    let init: Vec<&str> = init.iter().map(String::as_str).collect();
+    assert_eq!(resp_cmd_full(&mut connect(), &init), "+OK\r\n");
+
+    let mget: Vec<&str> = std::iter::once("MGET")
+        .chain(keys.iter().map(String::as_str))
+        .collect();
+    let mut mget_frame = format!("*{}\r\n", mget.len());
+    for a in &mget {
+        mget_frame.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+    }
+    let values = |reply: &str| -> Vec<String> {
+        reply
+            .split("\r\n")
+            .skip(1)
+            .filter(|l| !l.starts_with('$') && !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    for use_exec in [false, true] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (stop, keys) = (stop.clone(), keys.clone());
+            thread::spawn(move || {
+                let mut w = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                w.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    i += 1;
+                    let v = i.to_string();
+                    let mut frame = Vec::new();
+                    if use_exec {
+                        frame.extend_from_slice(b"*1\r\n$5\r\nMULTI\r\n");
+                        for k in &keys {
+                            frame.extend_from_slice(
+                                format!(
+                                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                                    k.len(),
+                                    k,
+                                    v.len(),
+                                    v
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                        frame.extend_from_slice(b"*1\r\n$4\r\nEXEC\r\n");
+                        let r = send_and_read_reply_n(&mut w, &frame, keys.len() + 2);
+                        assert!(r.ends_with("+OK\r\n"), "{r}");
+                    } else {
+                        let mut args = vec!["MSET".to_string()];
+                        for k in &keys {
+                            args.push(k.clone());
+                            args.push(v.clone());
+                        }
+                        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                        assert_eq!(resp_cmd_full(&mut w, &refs), "+OK\r\n");
+                    }
+                }
+            })
+        };
+        let (mut reader, mut pipelined) = (connect(), connect());
+        let (mut reads, mut torn) = (0, Vec::new());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let mut replies = vec![resp_cmd_full(&mut reader, &mget)];
+            // Four MGETs in one pipeline (folded into per-shard batches).
+            let batch = send_and_read_reply_n(&mut pipelined, mget_frame.repeat(4).as_bytes(), 4);
+            replies.extend(
+                batch
+                    .split("*8\r\n")
+                    .filter(|r| !r.is_empty())
+                    .map(|r| format!("*8\r\n{r}")),
+            );
+            for r in replies {
+                let vals = values(&r);
+                assert_eq!(vals.len(), keys.len(), "{r}");
+                reads += 1;
+                if vals.windows(2).any(|w| w[0] != w[1]) {
+                    torn.push(vals);
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        let what = if use_exec { "EXEC" } else { "MSET" };
+        assert!(reads > 100, "only {reads} reads against {what}");
+        assert!(
+            torn.is_empty(),
+            "{} of {reads} reads torn against {what}, e.g. {:?}",
+            torn.len(),
+            torn.first()
+        );
+    }
+}
+
+/// Sends `cmd` and reads until `n` complete RESP replies arrived.
+fn send_and_read_reply_n(stream: &mut TcpStream, cmd: &[u8], n: usize) -> String {
+    stream.write_all(cmd).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        let mut at = 0;
+        let mut complete = 0;
+        while complete < n {
+            match resp_value_end(&got, at) {
+                Some(end) => {
+                    at = end;
+                    complete += 1;
+                }
+                None => break,
+            }
+        }
+        if complete == n {
+            return String::from_utf8_lossy(&got).to_string();
+        }
+        let k = stream.read(&mut buf).unwrap();
+        assert!(k > 0, "connection closed mid-reply");
+        got.extend_from_slice(&buf[..k]);
+    }
+}
