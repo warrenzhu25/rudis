@@ -40,5 +40,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "load_aof"
+path = "fuzz_targets/load_aof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cluster_bus"
+path = "fuzz_targets/cluster_bus.rs"
+test = false
+doc = false
+bench = false
+
 [patch.crates-io]
 monoio = { path = "../vendor/monoio" }

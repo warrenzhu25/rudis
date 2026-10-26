@@ -2393,7 +2393,10 @@ fn handle_cluster_bus_conn(stream: TcpStream, hub: &Arc<ClusterHub>) {
 }
 
 /// Applies one cluster-bus frame from a peer and returns the reply to send, if any.
-fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
+/// Public for the `cluster_bus` fuzz target: peers are unauthenticated, so
+/// any bytes may arrive here.
+#[doc(hidden)]
+pub fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     let cmd = *parts.first()?;
     match cmd {
@@ -3717,5 +3720,27 @@ mod tests {
         assert_eq!(peer.config_epoch, 9);
         assert_eq!(peer.slots, vec![(5461, 9999), (10001, 16383)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Malformed bus lines from a peer are ignored (no reply, no node added)
+    /// rather than panicking.
+    #[test]
+    fn test_malformed_bus_lines_are_ignored() {
+        let hub = ClusterHub::new(17002);
+        for line in [
+            "",
+            "MEET",
+            "MEET 1.2.3.4 notaport",
+            "MEET 1.2.3.4 65535 short",
+            "PING",
+            "PING id notanepoch master",
+            "PING id 1 master 99999-1",
+            "PONG \u{0}\u{ff}",
+            "FAIL",
+            "BOGUS 1 2 3",
+        ] {
+            let _ = handle_cluster_bus_line(line, &hub);
+        }
+        assert!(!hub.cluster_nodes().contains("notaport"));
     }
 }

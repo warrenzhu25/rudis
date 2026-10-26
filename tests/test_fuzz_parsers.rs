@@ -453,3 +453,78 @@ fn test_fuzz_rdb_and_dump_decoders() {
         let _ = rudis::redis_rdb::decode_dump_body(&junk, 0);
     }
 }
+
+/// Mutations of valid cluster-bus lines from an (unauthenticated) peer:
+/// applying them never panics and the node table still renders.
+#[test]
+fn test_fuzz_cluster_bus_lines() {
+    let id = "a".repeat(40);
+    let seeds = [
+        format!("MEET 127.0.0.1 7001 {id} 0"),
+        format!("PING {id} 3 master 0-5460 GOSSIP"),
+        format!("PONG {id} 3 slave 0-5460 shards=2 of={}", "b".repeat(40)),
+        format!("FAIL {id}"),
+        format!("MFSTART {id}"),
+        format!("AUTH_REQUEST {id} 4"),
+        "PING x 18446744073709551615 master 0-99999,16383-0".to_string(),
+    ];
+    let mut rng = SimplePrng::new(0xB05);
+    let hub = rudis::cluster::ClusterHub::new(17001);
+    for _ in 0..2000 {
+        let seed = seeds[rng.next_usize(seeds.len())].as_bytes();
+        let mut m = seed.to_vec();
+        for _ in 0..rng.next_usize(4) {
+            match rng.next_usize(3) {
+                0 if !m.is_empty() => {
+                    let i = rng.next_usize(m.len());
+                    m[i] = rng.next_u64() as u8;
+                }
+                1 if !m.is_empty() => {
+                    m.truncate(rng.next_usize(m.len()));
+                }
+                _ => {
+                    let n = rng.next_usize(8);
+                    m.extend(rng.random_bytes(n));
+                }
+            }
+        }
+        let line = String::from_utf8_lossy(&m);
+        let _ = rudis::cluster::handle_cluster_bus_line(&line, &hub);
+    }
+    let _ = hub.cluster_nodes();
+    rudis::connection::unpause_clients();
+}
+
+/// Damaged AOF files (flipped bytes, truncation, junk) load or are
+/// refused, with `aof-load-truncated` on or off; they never panic.
+#[test]
+fn test_fuzz_aof_replay() {
+    let valid = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n*1\r\n$5\r\nMULTI\r\n*3\r\n$5\r\nLPUSH\r\n$1\r\nl\r\n$1\r\na\r\n*1\r\n$4\r\nEXEC\r\n#TS:1700000000\r\n*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$3\r\n100\r\n";
+    let path = std::env::temp_dir().join(format!("rudis-fuzz-aof-{}.aof", std::process::id()));
+    let mut rng = SimplePrng::new(0xA0F);
+    for _ in 0..1500 {
+        let mut m = valid.to_vec();
+        for _ in 0..1 + rng.next_usize(4) {
+            match rng.next_usize(3) {
+                0 => {
+                    let i = rng.next_usize(m.len());
+                    m[i] = rng.next_u64() as u8;
+                }
+                1 => m.truncate(rng.next_usize(m.len() + 1)),
+                _ => {
+                    let n = rng.next_usize(16);
+                    m.extend(rng.random_bytes(n));
+                }
+            }
+            if m.is_empty() {
+                break;
+            }
+        }
+        std::fs::write(&path, &m).unwrap();
+        for load_truncated in [true, false] {
+            let mut db = rudis::shard::ShardDb::new(0);
+            let _ = rudis::aof::replay_aof_with(&path, &mut db, load_truncated);
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
