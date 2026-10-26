@@ -64,6 +64,16 @@ pub fn note_changes(n: u64) {
 /// per-port check (`stop-writes-on-bgsave-error`) while there are none.
 static SAVES_FAILING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How a save's outcome changes [`SAVES_FAILING`]: +1 when a server's saves
+/// start failing, -1 when they work again, 0 otherwise (counted once).
+fn failing_change(was_ok: bool, ok: bool) -> i8 {
+    match (was_ok, ok) {
+        (true, false) => 1,
+        (false, true) => -1,
+        _ => 0,
+    }
+}
+
 /// Whether some server's last RDB save failed (cheap; then check its state).
 #[inline]
 pub fn any_save_failing() -> bool {
@@ -119,10 +129,14 @@ impl SnapshotState {
             self.last_save_unix.store(unix_now(), Ordering::Relaxed);
         }
         let was_ok = self.last_save_ok.swap(ok, Ordering::SeqCst);
-        if was_ok && !ok {
-            SAVES_FAILING.fetch_add(1, Ordering::SeqCst);
-        } else if !was_ok && ok {
-            SAVES_FAILING.fetch_sub(1, Ordering::SeqCst);
+        match failing_change(was_ok, ok) {
+            1 => {
+                SAVES_FAILING.fetch_add(1, Ordering::SeqCst);
+            }
+            -1 => {
+                SAVES_FAILING.fetch_sub(1, Ordering::SeqCst);
+            }
+            _ => {}
         }
         self.in_progress.store(false, Ordering::SeqCst);
     }
@@ -309,21 +323,20 @@ mod tests {
     fn test_failed_save_counts_once_until_a_save_succeeds() {
         // A port no server uses; other tests may have saves failing too, so
         // compare against the count before.
+        // (The process-wide count is shared with concurrent tests, so the
+        // counting rule is checked on its own and the state end to end.)
+        assert_eq!(failing_change(true, false), 1);
+        assert_eq!(failing_change(false, false), 0, "counted once");
+        assert_eq!(failing_change(false, true), -1);
+        assert_eq!(failing_change(true, true), 0);
         let st = state(65_002);
-        let base = SAVES_FAILING.load(Ordering::SeqCst);
         st.finish(st.begin(), false);
         assert!(!st.last_save_ok());
         assert!(any_save_failing());
-        assert_eq!(SAVES_FAILING.load(Ordering::SeqCst), base + 1);
         st.finish(st.begin(), false);
-        assert_eq!(
-            SAVES_FAILING.load(Ordering::SeqCst),
-            base + 1,
-            "counted once"
-        );
+        assert!(!st.last_save_ok());
         st.finish(st.begin(), true);
         assert!(st.last_save_ok());
-        assert_eq!(SAVES_FAILING.load(Ordering::SeqCst), base);
     }
 
     #[test]

@@ -4450,10 +4450,18 @@ mod tests {
         let rep = hub.register_replica(31, tx);
         hub.propagate(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
         let off = hub.master_repl_offset.load(Ordering::SeqCst);
-        let before = WAIT_BLOCKED_CLIENTS.load(Ordering::SeqCst);
-        let waiter = monoio::spawn(wait_replicas(port, 1, 0));
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        let d = done.clone();
+        let waiter = monoio::spawn(async move {
+            let n = wait_replicas(port, 1, 0).await;
+            d.set(true);
+            n
+        });
         monoio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(WAIT_BLOCKED_CLIENTS.load(Ordering::SeqCst) > before);
+        // Still blocked (WAIT_BLOCKED_CLIENTS is shared with concurrent
+        // tests, so it can only be checked to be non-zero).
+        assert!(!done.get(), "WAIT 0 returned without an ack");
+        assert!(WAIT_BLOCKED_CLIENTS.load(Ordering::SeqCst) > 0);
         hub.update_replica_ack(rep.id, off, None);
         assert_eq!(waiter.await, 1);
         hub.unregister_replica(rep.id);
