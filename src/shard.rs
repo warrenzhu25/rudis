@@ -530,6 +530,13 @@ pub enum ShardMessage {
         shard_id: usize,
         responder: flume::Sender<Result<usize, String>>,
     },
+    /// `CONFIG SET appendonly`: turns this shard's AOF writer on (writing
+    /// to an incremental file until the initial rewrite) or off.
+    SetAppendonly {
+        on: bool,
+        dir: std::path::PathBuf,
+        responder: flume::Sender<Result<(), String>>,
+    },
     ScatterMset {
         shard_id: usize,
         pairs: Vec<(Bytes, Bytes)>,

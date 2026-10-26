@@ -31,8 +31,9 @@ detected` (§4). Alert on:
 - **Corrupt AOF tail** (torn last write): with `aof-load-truncated yes` (the default) the tail
   is cut and the server starts; with `no` it refuses to start and logs the offset. A corruption
   in the middle of the file always refuses: restore the AOF from a backup, or start from
-  `dump.rdb` with `appendonly no`, then turn AOF back on with `CONFIG SET appendonly yes` and
-  run `BGREWRITEAOF` so the new AOF holds the whole dataset.
+  `dump.rdb` with `appendonly no`, then turn AOF back on with `CONFIG SET appendonly yes` (it
+  writes an AOF holding the whole dataset; wait for `aof_rewrite_in_progress:0`) and
+  `CONFIG REWRITE`.
 
 ## 3. Backups and restore
 
@@ -40,8 +41,8 @@ detected` (§4). Alert on:
   `dir/dump.rdb` once `rudis_rdb_bgsave_in_progress` is back to 0. A snapshot is consistent
   per key, not a single point in time across keys (see [rdbsave.md](rdbsave.md)).
 - To restore, stop the server, put the RDB at `dir/dump.rdb` and start it with `appendonly no`
-  (with `appendonly yes` the AOF is loaded instead). Then `CONFIG SET appendonly yes` and
-  `BGREWRITEAOF`.
+  (with `appendonly yes` the AOF is loaded instead). Then `CONFIG SET appendonly yes` (and
+  `CONFIG REWRITE` to keep it on).
 - RDB files from Redis/Valkey load; see `tests/test_redis_rdb_compat.rs` for the versions
   covered.
 

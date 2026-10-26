@@ -4174,12 +4174,9 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                     return;
                 }
             };
-            if requested != router.aof().is_some() {
-                out.extend_from_slice(
-                    b"-ERR CONFIG SET failed (possibly related to argument 'appendonly') - changing appendonly at runtime is not supported; set it in the config file and restart\r\n",
-                );
-                return;
-            }
+            // Applied by the caller once every pair is valid (it is async:
+            // see `Router::enable_aof`).
+            let _ = requested;
         } else if p_str == "cross-shard-spin" {
             if val_str.parse::<usize>().is_err() {
                 out.extend_from_slice(
@@ -12299,7 +12296,7 @@ async fn execute_command_inner(
             let persistence_str = format!(
                 // The fork/COW fields are always 0: snapshots are taken in
                 // place, without a child process.
-                "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:{}\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\naof_rewrites:{}\r\naof_rewrites_consecutive_failures:{}\r\naof_rewrite_fallbacks:{}\r\n{}unpropagated_changes:{}\r\n",
+                "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:{}\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:{}\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\naof_rewrites:{}\r\naof_rewrites_consecutive_failures:{}\r\naof_rewrite_fallbacks:{}\r\n{}unpropagated_changes:{}\r\n",
                 u8::from(crate::replication::is_loading(router.base_port)),
                 snap.changes_since_last_save(),
                 u8::from(
@@ -12312,6 +12309,9 @@ async fn execute_command_inner(
                 crate::server::LAST_LOAD_KEYS_LOADED.load(std::sync::atomic::Ordering::Relaxed),
                 u8::from(router.aof().is_some()),
                 u8::from(aof_rw.in_progress()),
+                // The initial rewrite of AOF turned on at runtime, waiting
+                // for a save to end.
+                u8::from(crate::aof::aof_enabling(router.base_port) && !aof_rw.in_progress()),
                 if aof_rw.last_ok() { "ok" } else { "err" },
                 if crate::aof::aof_write_misconf(router.port).is_some() {
                     "err"
@@ -12829,7 +12829,32 @@ async fn execute_command_inner(
                         }
                     }
 
+                    let appendonly = pairs
+                        .iter()
+                        .find(|(p, _)| p.eq_ignore_ascii_case(b"appendonly"))
+                        .map(|(_, v)| v.eq_ignore_ascii_case(b"yes"));
+                    let start = out.len();
                     apply_config_set_pairs(router, &pairs, out);
+                    // AOF on or off at runtime, once the rest applied.
+                    if let Some(on) = appendonly
+                        && out[start..].starts_with(b"+OK")
+                    {
+                        let res = if on {
+                            router.enable_aof().await
+                        } else {
+                            router.disable_aof().await
+                        };
+                        if let Err(e) = res {
+                            out.truncate(start);
+                            out.extend_from_slice(
+                                format!(
+                                    "-ERR CONFIG SET failed (possibly related to argument 'appendonly') - {}\r\n",
+                                    e.replace(['\r', '\n'], " ")
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                    }
                     false
                 }
                 _ => unreachable!(),
@@ -19135,6 +19160,15 @@ async fn execute_command_inner(
                 out.extend_from_slice(b"-ERR Errors trying to SHUTDOWN. Check logs.\r\n");
                 return false;
             }
+            if crate::aof::aof_enabling(router.base_port) && !force {
+                // Its AOF files don't hold the dataset yet (Redis too).
+                crate::log_warning!("Writing initial AOF, can't exit.");
+                crate::log_warning!(
+                    "Errors trying to shut down the server. Check the logs for more information."
+                );
+                out.extend_from_slice(b"-ERR Errors trying to SHUTDOWN. Check logs.\r\n");
+                return false;
+            }
             let saved = router.save_before_shutdown(save, 1).await;
             if let Err(e) = &saved {
                 if force {
@@ -19199,15 +19233,21 @@ async fn execute_command_inner(
                 .aof()
                 .is_some()
                 .then(|| crate::replication::LocalAofTarget::now(router.base_port, router.num_shards));
-            let (local_ok, count) = crate::replication::wait_aof(
+            match crate::replication::wait_aof(
                 router.base_port,
                 local,
                 numlocal,
                 numreplicas,
                 timeout,
+                || crate::aof::aof_on(router.base_port),
             )
-            .await;
-            out.extend_from_slice(format!("*2\r\n:{}\r\n:{}\r\n", u8::from(local_ok), count).as_bytes());
+            .await
+            {
+                Ok((local_ok, count)) => out.extend_from_slice(
+                    format!("*2\r\n:{}\r\n:{}\r\n", u8::from(local_ok), count).as_bytes(),
+                ),
+                Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+            }
             false
         }
         Command::Object(crate::resp::ObjectSubcommand::Help) => {

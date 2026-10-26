@@ -4962,6 +4962,109 @@ impl Router {
         Ok(())
     }
 
+    /// Sends `SetAppendonly` to every shard (this one directly).
+    async fn set_appendonly_everywhere(&self, on: bool) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if let Err(e) = crate::server::set_shard_appendonly(
+            &self.aof_slot,
+            &self.db_dir,
+            self.shard_id,
+            self.base_port,
+            on,
+        )
+        .await
+        {
+            errors.push(e);
+        }
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid == self.shard_id {
+                continue;
+            }
+            let (tx, rx) = flume::bounded(1);
+            let sent = sender
+                .send(ShardMessage::SetAppendonly {
+                    on,
+                    dir: self.db_dir.clone(),
+                    responder: tx,
+                })
+                .is_ok();
+            match rx.recv_async().await {
+                Ok(Ok(())) if sent => {}
+                Ok(Err(e)) => errors.push(e),
+                _ => errors.push(format!("shard {sid}: no reply")),
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// `CONFIG SET appendonly yes` on a running server, as Redis does it:
+    /// every shard starts logging writes at once, and a background rewrite
+    /// writes the initial AOF (the dataset, then what was logged since).
+    /// Until it ends INFO shows the rewrite and SHUTDOWN refuses to exit
+    /// ("Writing initial AOF, can't exit."); if it fails AOF is turned off
+    /// again. Waits for a save or rewrite already running to end first.
+    pub async fn enable_aof(&self) -> Result<(), String> {
+        if self.aof().is_some() {
+            return Ok(());
+        }
+        if let Err(e) = self.set_appendonly_everywhere(true).await {
+            let _ = self.set_appendonly_everywhere(false).await;
+            return Err(e);
+        }
+        crate::aof::set_aof_on(self.base_port, true);
+        crate::aof::set_aof_enabling(self.base_port, true);
+        let router = self.clone();
+        monoio::spawn(async move {
+            // After a save or rewrite already running (Redis schedules it
+            // the same way: INFO aof_rewrite_scheduled meanwhile).
+            while router
+                .is_saving
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                if !crate::aof::aof_enabling(router.base_port) {
+                    return; // turned off meanwhile
+                }
+                monoio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if !crate::aof::aof_enabling(router.base_port) {
+                router.is_saving.store(false, Ordering::SeqCst);
+                return;
+            }
+            let guard = SaveFlagGuard::new(&router, None);
+            crate::snapshot::aof_rewrite_state(router.base_port).begin();
+            crate::log_notice!("Background append only file rewriting started");
+            let res = router.perform_rewrite_aof().await;
+            guard.disarm();
+            crate::aof::set_aof_enabling(router.base_port, false);
+            if let Err(e) = res {
+                crate::log_warning!(
+                    "Writing the initial AOF failed ({}); turning AOF off again",
+                    e
+                );
+                let _ = router.set_appendonly_everywhere(false).await;
+                crate::aof::set_aof_on(router.base_port, false);
+            }
+        });
+        Ok(())
+    }
+
+    /// `CONFIG SET appendonly no`: every shard makes what it logged durable
+    /// and stops logging. An initial rewrite still running finishes on its
+    /// own but is no longer used.
+    pub async fn disable_aof(&self) -> Result<(), String> {
+        if self.aof().is_none() {
+            return Ok(());
+        }
+        crate::aof::set_aof_enabling(self.base_port, false);
+        crate::aof::set_aof_on(self.base_port, false);
+        self.set_appendonly_everywhere(false).await
+    }
+
     /// Rewrites every shard's AOF. Clears `is_saving` (set by
     /// `bgrewriteaof`) however it ends, and records the outcome for INFO.
     /// The flag is cleared first: once INFO shows the rewrite finished, a

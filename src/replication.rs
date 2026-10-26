@@ -2499,7 +2499,7 @@ impl ReplicationHub {
 /// WAIT: blocks until `numreplicas` replicas acknowledged every write so
 /// far, or `timeout_ms` passes (0 = no timeout); returns how many did.
 pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> usize {
-    wait_acks(port, numreplicas, timeout_ms, false, None, false)
+    wait_acks(port, numreplicas, timeout_ms, false, None, false, &|| true)
         .await
         .1
 }
@@ -2513,17 +2513,24 @@ pub async fn wait_aof(
     numlocal: usize,
     numreplicas: usize,
     timeout_ms: u64,
-) -> (bool, usize) {
+    aof_on: impl Fn() -> bool,
+) -> Result<(bool, usize), &'static str> {
     let need_local = numlocal > 0;
-    wait_acks(
+    let res = wait_acks(
         port,
         numreplicas,
         timeout_ms,
         true,
         local.as_ref(),
         need_local,
+        &aof_on,
     )
-    .await
+    .await;
+    // AOF turned off while waiting for the local copy (Redis's error).
+    if need_local && !aof_on() {
+        return Err("WAITAOF cannot be used when numlocal is set but appendonly is disabled.");
+    }
+    Ok(res)
 }
 
 async fn wait_acks(
@@ -2533,6 +2540,7 @@ async fn wait_acks(
     aof: bool,
     local: Option<&LocalAofTarget>,
     need_local: bool,
+    aof_on: &dyn Fn() -> bool,
 ) -> (bool, usize) {
     let hub = get_replication_hub(port);
     let start = std::time::Instant::now();
@@ -2541,6 +2549,9 @@ async fn wait_acks(
     let mut blocked = None;
     let mut asked_at: Option<std::time::Instant> = None;
     loop {
+        if need_local && !aof_on() {
+            return (false, hub.count_acks(target_offset, aof));
+        }
         let local_ok = local.is_some_and(|l| l.fsynced());
         let count = hub.count_acks(target_offset, aof);
         let done = count >= numreplicas && (local_ok || !need_local);

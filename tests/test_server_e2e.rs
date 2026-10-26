@@ -15810,9 +15810,7 @@ fn test_appendonly_and_appendfsync_are_reported_truthfully_e2e() {
         "*2\r\n$11\r\nappendfsync\r\n$8\r\neverysec\r\n"
     );
 
-    // appendonly can't be toggled at runtime; a no-op SET is fine.
-    let r = resp_cmd(&mut c, &["CONFIG", "SET", "appendonly", "no"]);
-    assert!(r.starts_with("-ERR") && r.contains("restart"), "{r}");
+    // Setting appendonly to what it is changes nothing.
     assert_eq!(
         resp_cmd(&mut c, &["CONFIG", "SET", "appendonly", "yes"]),
         "+OK\r\n"
@@ -35764,4 +35762,147 @@ fn test_restarted_master_turns_the_backlog_on_with_its_first_replica_e2e() {
         let _ = c.wait();
     }
     let _ = std::fs::remove_dir_all(&mdir);
+}
+
+/// CONFIG SET appendonly yes on a running server, as in Redis: writes are
+/// logged at once and a background rewrite writes the initial AOF, so a
+/// restart with AOF on (even after kill -9) has every key, from before and
+/// after the switch. While it runs SHUTDOWN refuses to exit. appendonly no
+/// turns logging off again, and WAITAOF's local copy is then refused.
+#[test]
+fn test_config_set_appendonly_at_runtime_e2e() {
+    let port = 29931u16;
+    let dir = std::env::temp_dir().join(format!("rudis-aofrt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_str().unwrap().to_string();
+    let conf = dir.join("rudis.conf");
+    std::fs::write(&conf, "appendonly no\n").unwrap();
+    let cf = conf.to_str().unwrap().to_string();
+    let p = port.to_string();
+    let base = [
+        "--config",
+        &cf,
+        "--port",
+        &p,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--save",
+        "",
+        "--dir",
+        &d,
+    ];
+    let mut server = spawn_rudis_listening(&base, port);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s
+    };
+    let mut c = connect();
+    let info_field = |c: &mut TcpStream, name: &str| -> String {
+        let info = resp_cmd_full(c, &["INFO", "persistence"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")).map(str::to_string))
+            .unwrap_or_else(|| panic!("no {name}: {info}"))
+    };
+    assert_eq!(resp_cmd(&mut c, &["DEBUG", "POPULATE", "20000"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HSET", "h", "f", "v"]), ":1\r\n");
+    assert_eq!(info_field(&mut c, "aof_enabled"), "0");
+    let r = resp_cmd(&mut c, &["CONFIG", "SET", "appendonly", "maybe"]);
+    assert!(r.contains("argument must be 'yes' or 'no'"), "{r}");
+
+    // A slow initial rewrite, so SHUTDOWN comes while it runs.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "rdb-key-save-delay", "50000"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "appendonly", "yes"]),
+        "+OK\r\n"
+    );
+    assert_eq!(info_field(&mut c, "aof_enabled"), "1");
+    // The initial rewrite starts right after the reply.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while info_field(&mut c, "aof_rewrite_in_progress") != "1" {
+        assert!(std::time::Instant::now() < deadline, "no initial rewrite");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["SHUTDOWN", "NOSAVE"]),
+        "-ERR Errors trying to SHUTDOWN. Check logs.\r\n"
+    );
+    // Written during the rewrite: reaches the AOF through its tail.
+    assert_eq!(resp_cmd(&mut c, &["SET", "during", "1"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "rdb-key-save-delay", "0"]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while info_field(&mut c, "aof_rewrite_in_progress") != "0" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "initial rewrite never ended"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(info_field(&mut c, "aof_last_bgrewrite_status"), "ok");
+    assert_eq!(resp_cmd(&mut c, &["SET", "after", "2"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "appendonly"]),
+        "*2\r\n$10\r\nappendonly\r\n$3\r\nyes\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["WAITAOF", "1", "0", "5000"]),
+        "*2\r\n:1\r\n:0\r\n"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".incr") || n.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // CONFIG REWRITE keeps it on; kill -9 and restart: everything is there.
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "REWRITE"]), "+OK\r\n");
+    let written = std::fs::read_to_string(&conf).unwrap();
+    assert!(written.lines().any(|l| l == "appendonly yes"), "{written}");
+    let _ = server.kill();
+    let _ = server.wait();
+    let mut server = spawn_rudis_listening(&base, port);
+    let mut c = connect();
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":20003\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "during"]), "$1\r\n1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "after"]), "$1\r\n2\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HGET", "h", "f"]), "$1\r\nv\r\n");
+
+    // Off again: WAITAOF's local copy is refused, also for one waiting.
+    let mut w = connect();
+    assert_eq!(
+        resp_cmd(&mut w, &["CONFIG", "SET", "appendfsync", "no"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut w, &["INCR", "n"]), ":1\r\n");
+    w.write_all(b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$1\r\n0\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "appendonly", "no"]),
+        "+OK\r\n"
+    );
+    let mut buf = [0u8; 256];
+    let n = w.read(&mut buf).unwrap();
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).contains("appendonly is disabled"),
+        "{}",
+        String::from_utf8_lossy(&buf[..n])
+    );
+    assert_eq!(info_field(&mut c, "aof_enabled"), "0");
+    let r = resp_cmd(&mut c, &["WAITAOF", "1", "0", "0"]);
+    assert!(r.contains("appendonly is disabled"), "{r}");
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
 }

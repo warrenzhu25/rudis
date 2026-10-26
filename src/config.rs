@@ -896,6 +896,13 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
     // 2. Prepare current dynamic directives
     let mut directives: HashMap<String, String> = HashMap::new();
     directives.insert("port".to_string(), port.to_string());
+    // As Redis: AOF turned on (or off) at runtime is kept across restarts.
+    let appendonly = if crate::aof::aof_on(port) {
+        "yes"
+    } else {
+        "no"
+    };
+    directives.insert("appendonly".to_string(), appendonly.to_string());
     directives.insert(
         "maxclients".to_string(),
         crate::connection::get_max_clients().to_string(),

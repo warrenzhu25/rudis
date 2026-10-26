@@ -69,8 +69,8 @@ This document summarizes the architectural, operational, and semantic difference
 ### Replication Backlog After a Restart
 * A Redis master restarted from its RDB creates the replication backlog at load time, so a replica can partially resync even after writes. A rudis master turns the backlog on only when the first replica connects: until then writes skip it (all shards append to one backlog, which costs ~2.5x SET throughput on 8 threads). A replica that returns before any write (or expiry/eviction) still continues with a partial resync; one that returns after does a full sync. `INFO replication`'s `repl_backlog_active` shows the state.
 
-### Turning AOF On or Off
-* `appendonly` is read at startup only. `CONFIG SET appendonly` (which Redis uses to enable AOF on a live server, starting with a rewrite) is refused; restart with the new setting.
+### Turning AOF On at Runtime
+* `CONFIG SET appendonly yes` works as in Redis (writes logged at once, initial AOF written by a background rewrite, `SHUTDOWN` refused until it is done). Until then the writes go to `appendonly-<shard>.aof.incr` and no `appendonly-<shard>.aof` exists, so a crash in between never leaves an AOF without the dataset. Redis 7 tracks this in its multi-part AOF manifest, which rudis doesn't have.
 
 ---
 

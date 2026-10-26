@@ -367,6 +367,9 @@ pub fn run_shard_worker(
         // Everything on this shard appends to the writer in this slot,
         // which `CONFIG SET appendonly` can swap.
         let aof_slot = crate::aof::AofSlot::new(aof_writer.clone());
+        if shard_id == 0 {
+            crate::aof::set_aof_on(base_port, aof_writer.is_some());
+        }
         if let Some(w) = &aof_writer {
             spawn_aof_flusher(aof_slot.clone(), w.clone(), base_port);
         }
@@ -1676,6 +1679,13 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             let _ = responder.send(res);
                         });
                     }
+                    ShardMessage::SetAppendonly { on, dir, responder } => {
+                        let slot = cross_shard_aof_slot.clone();
+                        monoio::spawn(async move {
+                            let res = set_shard_appendonly(&slot, &dir, shard_id, base_port, on).await;
+                            let _ = responder.send(res);
+                        });
+                    }
                     ShardMessage::SetSlotState { slot, state } => {
                         if state == crate::shard::SlotState::Stable {
                             cross_shard_slot_states.borrow_mut().remove(&slot);
@@ -2370,9 +2380,8 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             // Counts start now: data loaded at startup is not "changes".
             crate::snapshot::state(r.base_port);
             // The AOF as loaded is the base automatic rewrites grow from.
-            let aof_on = r.aof().is_some();
             let rewrite_state = crate::snapshot::aof_rewrite_state(r.base_port);
-            if aof_on {
+            if r.aof().is_some() {
                 rewrite_state.set_base_size(crate::aof::aof_files_size(&r.db_dir, r.num_shards));
             }
             monoio::spawn(async move {
@@ -2402,7 +2411,11 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     }
                     // `auto-aof-rewrite-*`, checked once a second (it stats
                     // every shard's file).
-                    if aof_on && tick.is_multiple_of(10) && !rewrite_state.auto_rewrite_limited(now) {
+                    // Per check: CONFIG SET appendonly turns AOF on and off.
+                    if r.aof().is_some()
+                        && tick.is_multiple_of(10)
+                        && !rewrite_state.auto_rewrite_limited(now)
+                    {
                         let cfg = crate::aof::auto_rewrite_config(r.base_port);
                         if let Some(growth) = crate::aof::auto_rewrite_due(
                             cfg.percentage.load(std::sync::atomic::Ordering::Relaxed),
@@ -2436,6 +2449,12 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         crate::shutdown::last_shutdown_signal_name()
                     );
                     if !crate::replication::wait_replicas_before_shutdown(r.base_port).await {
+                        continue;
+                    }
+                    if crate::aof::aof_enabling(r.base_port) {
+                        crate::log_warning!(
+                            "Writing initial AOF, can't exit. Send the signal again once it is written, or use SHUTDOWN FORCE."
+                        );
                         continue;
                     }
                     match r.save_before_shutdown(None, 0).await {
@@ -2488,6 +2507,43 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             let _ = crate::aof::AofWriter::sync_durable(&aof).await;
         }
     });
+}
+
+/// Turns shard `shard_id`'s AOF on or off at runtime (`CONFIG SET
+/// appendonly`). On: a writer appending to an incremental file goes into
+/// the slot (any old AOF of this shard is removed first: it is stale, and
+/// must not be loaded if the server stops before the initial rewrite puts
+/// a complete one in its place). Off: what was appended is made durable
+/// and the writer leaves the slot. Doing what is already done is a no-op.
+pub(crate) async fn set_shard_appendonly(
+    slot: &crate::aof::AofSlot,
+    dir: &std::path::Path,
+    shard_id: usize,
+    base_port: u16,
+    on: bool,
+) -> Result<(), String> {
+    if on == slot.is_on() {
+        return Ok(());
+    }
+    if on {
+        let target = dir.join(format!("appendonly-{}.aof", shard_id));
+        let incr = dir.join(format!("appendonly-{}.aof.incr", shard_id));
+        let _ = std::fs::remove_file(&target);
+        let mut w = crate::aof::AofWriter::open_incremental(target, incr)
+            .await
+            .map_err(|e| format!("shard {shard_id}: opening the AOF: {e}"))?;
+        w.set_progress(crate::aof::aof_progress(base_port, shard_id));
+        let writer = Rc::new(RefCell::new(w));
+        slot.set(Some(writer.clone()));
+        spawn_aof_flusher(slot.clone(), writer, base_port);
+    } else if let Some(writer) = slot.get() {
+        // Out of the slot first: nothing appends any more, and a WAITAOF
+        // waiting for this AOF fails rather than counting the final fsync.
+        slot.set(None);
+        let _ = crate::aof::AofWriter::write_through(&writer).await;
+        let _ = crate::aof::AofWriter::sync_durable(&writer).await;
+    }
+    Ok(())
 }
 
 /// Starts the task that writes `writer`'s buffer every 5 ms (and fsyncs it
@@ -2766,6 +2822,49 @@ fn aof_write_after_mailbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Turning a shard's AOF on puts an incremental writer in the slot and
+    /// removes a stale AOF (it must not be loaded before the initial
+    /// rewrite replaces it); turning it off empties the slot after making
+    /// what was appended durable. Repeating either is a no-op.
+    #[test]
+    fn test_set_shard_appendonly_swaps_the_writer() {
+        let dir = std::env::temp_dir().join(format!("rudis-setaof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("appendonly-0.aof"), b"stale").unwrap();
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let slot = crate::aof::AofSlot::default();
+            set_shard_appendonly(&slot, &dir, 0, 41901, true)
+                .await
+                .unwrap();
+            let w = slot.get().expect("on");
+            assert!(w.borrow().is_incremental());
+            assert!(!dir.join("appendonly-0.aof").exists(), "stale AOF kept");
+            assert!(dir.join("appendonly-0.aof.incr").exists());
+            set_shard_appendonly(&slot, &dir, 0, 41901, true)
+                .await
+                .unwrap();
+            assert!(slot.holds(&w), "a second on replaced the writer");
+            w.borrow_mut().append(b"*1\r\n$4\r\nPING\r\n");
+            set_shard_appendonly(&slot, &dir, 0, 41901, false)
+                .await
+                .unwrap();
+            assert!(!slot.is_on());
+            assert_eq!(
+                std::fs::read(dir.join("appendonly-0.aof.incr")).unwrap(),
+                b"*1\r\n$4\r\nPING\r\n"
+            );
+            set_shard_appendonly(&slot, &dir, 0, 41901, false)
+                .await
+                .unwrap();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_shard_thread_stack_size_supports_deep_frames() {

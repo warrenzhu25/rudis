@@ -270,7 +270,7 @@ lists only directives and flags verified against [`src/config.rs`](src/config.rs
 | `maxclients <n>` | Maximum concurrent client connections | `10000` |
 | `maxmemory <size>` | Memory threshold that drives tiered offload sizing (e.g. `4gb`) | unset |
 | `maxmemory-policy <policy>` | Eviction policy (`noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-lfu`, `allkeys-random`, `volatile-random`, `volatile-ttl`) | `noeviction` |
-| `appendonly <yes\|no>` | Enable AOF persistence (startup only: `CONFIG SET appendonly` is refused) | `no` |
+| `appendonly <yes\|no>` | Enable AOF persistence (also at runtime with `CONFIG SET appendonly`, see below) | `no` |
 | `appendfsync <always\|everysec\|no>` | AOF fsync durability mode | `everysec` |
 | `auto-aof-rewrite-percentage <pct>` / `auto-aof-rewrite-min-size <size>` | Automatic background AOF compaction thresholds | `100` / `64mb` |
 | `dir <path>` / `dbfilename <name>` | Data directory and RDB filename | `.` / `dump.rdb` |
@@ -458,7 +458,12 @@ Understand what "durable" means here today before relying on it:
 - **AOF** (`appendonly yes`): supports `appendfsync always` (waits for the background AOF writer
   to `fdatasync` the batch before replying to the client), `appendfsync everysec` (default,
   fsyncs roughly every second), and `appendfsync no` (leaves flushing to the OS). `appendfsync`
-  can be changed at runtime via `CONFIG SET`; `appendonly` only at startup. Automatic background
+  can be changed at runtime via `CONFIG SET`. `CONFIG SET appendonly yes` turns AOF on for a
+  running server as in Redis: writes are logged at once and a background rewrite writes the
+  initial AOF (`aof_rewrite_in_progress` in `INFO persistence`; `SHUTDOWN` refuses to exit until
+  it is done, unless `FORCE`). `CONFIG REWRITE` then keeps it on across restarts. This is the safe
+  way to move a dataset to AOF: restarting with `appendonly yes` and no AOF yet starts empty, as
+  in Redis. Automatic background
   AOF compaction is driven by `auto-aof-rewrite-percentage` and `auto-aof-rewrite-min-size`.
 - **RDB autosave**: `save <seconds> <changes>` points schedule `BGSAVE` like Redis, with
   Redis's defaults (`save 3600 1 300 100 60 10000`) unless the config file or command line sets

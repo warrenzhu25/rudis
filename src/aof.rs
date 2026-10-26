@@ -184,6 +184,10 @@ pub struct AofWriter {
     /// Bytes ever appended (monotonic, unlike `offset`, which a rewrite resets).
     appended_total: u64,
     progress: std::sync::Arc<AofProgress>,
+    /// While AOF is being turned on at runtime: the file actually written
+    /// (`path` doesn't exist yet). The initial rewrite renames a complete
+    /// AOF into `path`, switches to it and removes this file.
+    incr_path: Option<PathBuf>,
 }
 
 impl AofWriter {
@@ -208,7 +212,30 @@ impl AofWriter {
             durable: offset,
             appended_total: 0,
             progress: std::sync::Arc::new(AofProgress::default()),
+            incr_path: None,
         })
+    }
+
+    /// A writer for AOF turned on at runtime: appends go to `incr` (created
+    /// empty) until the initial rewrite puts a complete AOF at `target`, so
+    /// a crash meanwhile never leaves a `target` lacking the dataset.
+    pub async fn open_incremental(target: PathBuf, incr: PathBuf) -> std::io::Result<Self> {
+        let _ = std::fs::remove_file(&incr);
+        let mut w = Self::open(incr.clone()).await?;
+        w.path = target;
+        w.incr_path = Some(incr);
+        Ok(w)
+    }
+
+    /// Whether the initial rewrite of AOF turned on at runtime is pending.
+    pub fn is_incremental(&self) -> bool {
+        self.incr_path.is_some()
+    }
+
+    fn drop_incremental_file(&mut self) {
+        if let Some(incr) = self.incr_path.take() {
+            let _ = std::fs::remove_file(incr);
+        }
     }
 
     pub fn new_in_memory() -> Self {
@@ -223,6 +250,7 @@ impl AofWriter {
             durable: 0,
             appended_total: 0,
             progress: std::sync::Arc::new(AofProgress::default()),
+            incr_path: None,
         }
     }
 
@@ -572,6 +600,7 @@ impl AofWriter {
             .written
             .store(self.appended_total, std::sync::atomic::Ordering::Release);
         self.mark_fsynced(self.appended_total);
+        self.drop_incremental_file();
         Ok(())
     }
 
@@ -600,6 +629,7 @@ impl AofWriter {
             .written
             .store(self.appended_total, std::sync::atomic::Ordering::Release);
         self.mark_fsynced(self.appended_total);
+        self.drop_incremental_file();
         self.current_db = 0;
         Ok(new_size)
     }
@@ -729,13 +759,9 @@ async fn rewrite_live_inner(
         if let Some(piece) = piece {
             tx.send_async(piece).await.map_err(|_| gone())?;
         }
+        rewrite_key_save_delay().await;
         if done {
             break;
-        }
-        let delay_us =
-            crate::connection::RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed);
-        if delay_us > 0 {
-            monoio::time::sleep(std::time::Duration::from_micros(delay_us.clamp(1, 50_000))).await;
         }
         crate::mailbox::yield_now().await;
     }
@@ -755,6 +781,23 @@ async fn rewrite_live_inner(
         }
     }
     Ok(keys)
+}
+
+/// `rdb-key-save-delay` (a test knob, in microseconds) for one step of a
+/// live AOF rewrite, also the last one, so even a tiny dataset's rewrite
+/// can be caught running. Slept in short slices, ending early once the
+/// knob is lowered, so a test can let a slowed rewrite finish.
+async fn rewrite_key_save_delay() {
+    let delay = || crate::connection::RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed);
+    let start = std::time::Instant::now();
+    loop {
+        let want = std::time::Duration::from_micros(delay());
+        let elapsed = start.elapsed();
+        if elapsed >= want {
+            return;
+        }
+        monoio::time::sleep((want - elapsed).min(std::time::Duration::from_millis(10))).await;
+    }
 }
 
 /// Writes an image's pieces (as they come) to `tmp`, then its CRC64, and
@@ -3407,6 +3450,44 @@ pub fn set_fsync_every_sec(port: u16, every_sec: bool) {
 }
 
 /// Sets the full `appendfsync` policy from its config value.
+static AOF_ENABLING: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<u16>>> =
+    std::sync::LazyLock::new(Default::default);
+
+static AOF_ON: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<u16>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Records whether the server on `port` has AOF on (at startup, and when
+/// `CONFIG SET appendonly` changes it), for CONFIG REWRITE.
+pub fn set_aof_on(port: u16, on: bool) {
+    let mut set = AOF_ON.lock();
+    if on {
+        set.insert(port);
+    } else {
+        set.remove(&port);
+    }
+}
+
+pub fn aof_on(port: u16) -> bool {
+    AOF_ON.lock().contains(&port)
+}
+
+/// Marks the server on `port` as writing its initial AOF (AOF turned on at
+/// runtime, rewrite not done yet).
+pub fn set_aof_enabling(port: u16, on: bool) {
+    let mut set = AOF_ENABLING.lock();
+    if on {
+        set.insert(port);
+    } else {
+        set.remove(&port);
+    }
+}
+
+/// Whether the server on `port` is still writing its initial AOF: until
+/// then its AOF files don't hold the dataset, so it must not exit.
+pub fn aof_enabling(port: u16) -> bool {
+    AOF_ENABLING.lock().contains(&port)
+}
+
 pub fn set_appendfsync(port: u16, value: &str) -> Result<(), String> {
     let every_sec = parse_appendfsync(value)?;
     let always = value.eq_ignore_ascii_case("always");
@@ -8060,6 +8141,15 @@ mod tests {
             assert!(!progress.pending());
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_aof_enabling_flag_is_per_server() {
+        assert!(!aof_enabling(41902));
+        set_aof_enabling(41902, true);
+        assert!(aof_enabling(41902) && !aof_enabling(41903));
+        set_aof_enabling(41902, false);
+        assert!(!aof_enabling(41902));
     }
 
     #[test]
