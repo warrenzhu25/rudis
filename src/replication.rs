@@ -2082,6 +2082,16 @@ impl ReplicationHub {
     async fn drive_failover(self: Arc<Self>, router: crate::router::Router) {
         let mut asked_at: Option<std::time::Instant> = None;
         loop {
+            // Writes that passed the pause before it began finish first:
+            // until then the offset isn't final, and one landing after we
+            // turned into a replica would never be replicated.
+            if crate::connection::writes_running() > 0 {
+                if self.failover_phase() != FailoverPhase::WaitForSync {
+                    return;
+                }
+                monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+                continue;
+            }
             {
                 let mut f = self.failover.lock();
                 if f.phase != FailoverPhase::WaitForSync {
@@ -2328,6 +2338,11 @@ pub async fn wait_replicas_before_shutdown(port: u16) -> bool {
     crate::log_notice!("Waiting for replicas before shutting down.");
     let deadline = unix_ms() + secs * 1000;
     SHUTDOWN_DEADLINE_MS.store(deadline, Ordering::Relaxed);
+    // Writes that passed the pause before it began finish first, so the
+    // offset waited for includes them.
+    while crate::connection::writes_running() > 0 && unix_ms() < deadline && !aborted() {
+        monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
     let target = hub.master_repl_offset.load(Ordering::SeqCst);
     let in_sync = |r: &ConnectedReplica| r.ack_offset.load(Ordering::SeqCst) >= target;
     let mut asked_at = 0u64;

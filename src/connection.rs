@@ -1722,6 +1722,73 @@ pub fn should_pause_command(cmd: &Command, write_only: bool) -> bool {
     }
 }
 
+const WRITE_SLOTS: usize = 64;
+/// Write commands (and squashed batches with writes) executing now, past
+/// the CLIENT PAUSE gate; slotted per thread so the count isn't one
+/// contended cache line. See [`writes_running`].
+static WRITES_RUNNING: [crate::mailbox::CachePadded<std::sync::atomic::AtomicUsize>; WRITE_SLOTS] =
+    [const { crate::mailbox::CachePadded(std::sync::atomic::AtomicUsize::new(0)) }; WRITE_SLOTS];
+static NEXT_WRITE_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    static MY_WRITE_SLOT: usize =
+        NEXT_WRITE_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % WRITE_SLOTS;
+}
+
+/// Counts a write as running (see [`writes_running`]) while it lives.
+pub struct WriteRunning(Option<usize>);
+
+impl WriteRunning {
+    /// Counted before checking the pause (both SeqCst), so a pause and a
+    /// write racing it see each other: either the write waits, or whoever
+    /// paused sees it running.
+    fn enter(counts: bool) -> Self {
+        if !counts {
+            return Self(None);
+        }
+        let slot = MY_WRITE_SLOT.with(|s| *s);
+        WRITES_RUNNING[slot].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Some(slot))
+    }
+}
+
+impl Drop for WriteRunning {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0 {
+            WRITES_RUNNING[slot].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Write commands that passed the pause gate and haven't finished. Right
+/// after pausing writes, some may still be running; once this is 0 every
+/// write is applied and replicated, so the replication offset is final
+/// (FAILOVER, and a shutdown waiting for replicas, compare it).
+pub fn writes_running() -> usize {
+    WRITES_RUNNING
+        .iter()
+        .map(|c| c.0.load(std::sync::atomic::Ordering::SeqCst))
+        .sum()
+}
+
+/// Whether `cmd` counts in [`writes_running`]: a write a pause holds, and
+/// not one that may block (a blocked BLPOP changes nothing until a write
+/// serves it).
+fn counts_as_running_write(cmd: &Command) -> bool {
+    should_pause_command(cmd, true) && !may_block(cmd)
+}
+
+/// A squashed pipeline batch with writes, counted while it runs; None
+/// (nothing counted) if writes are paused now: then it must take the
+/// per-command path, which waits at the pause gate.
+pub fn enter_write_batch(commands: &[Command]) -> Option<WriteRunning> {
+    let guard = WriteRunning::enter(commands.iter().any(counts_as_running_write));
+    if guard.0.is_some() && is_client_paused().is_some() {
+        return None;
+    }
+    Some(guard)
+}
+
 struct PausedClientGuard {
     client_id: u64,
 }
@@ -1733,14 +1800,20 @@ impl Drop for PausedClientGuard {
     }
 }
 
-pub async fn wait_if_client_paused(port: u16, client_id: u64, cmd: &Command) {
+pub async fn wait_if_client_paused(port: u16, client_id: u64, cmd: &Command) -> WriteRunning {
     if in_tx(client_id) {
-        return;
+        return WriteRunning(None);
     }
-    while let Some((rem_ms, write_only)) = is_client_paused() {
+    let counts = counts_as_running_write(cmd);
+    loop {
+        let running = WriteRunning::enter(counts);
+        let Some((rem_ms, write_only)) = is_client_paused() else {
+            return running;
+        };
         if !should_pause_command(cmd, write_only) {
-            return;
+            return running;
         }
+        drop(running);
         let (tx, rx) = flume::bounded(1);
         {
             let mut list = PAUSED_CLIENTS.lock();
@@ -1757,18 +1830,23 @@ pub async fn wait_if_client_paused(port: u16, client_id: u64, cmd: &Command) {
         drop(_guard);
         if now_epoch_ms() > PAUSE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = unpause_clients();
-            return;
         }
     }
 }
 
-pub async fn wait_if_tx_paused(port: u16, client_id: u64, tx_queue: &[Command]) {
-    while let Some((rem_ms, write_only)) = is_client_paused() {
+pub async fn wait_if_tx_paused(port: u16, client_id: u64, tx_queue: &[Command]) -> WriteRunning {
+    let counts = tx_queue.iter().any(counts_as_running_write);
+    loop {
+        let running = WriteRunning::enter(counts);
+        let Some((rem_ms, write_only)) = is_client_paused() else {
+            return running;
+        };
         let should_pause =
             !write_only || tx_queue.iter().any(|c| should_pause_command(c, write_only));
         if !should_pause {
-            return;
+            return running;
         }
+        drop(running);
         let (tx, rx) = flume::bounded(1);
         {
             let mut list = PAUSED_CLIENTS.lock();
@@ -1785,7 +1863,6 @@ pub async fn wait_if_tx_paused(port: u16, client_id: u64, tx_queue: &[Command]) 
         drop(_guard);
         if now_epoch_ms() > PAUSE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = unpause_clients();
-            return;
         }
     }
 }
@@ -5200,7 +5277,7 @@ async fn execute_tx_step(
                     write_resp_null_array(out_buf);
                     false
                 } else {
-                    wait_if_tx_paused(router.port, client_id, tx_queue).await;
+                    let _write_running = wait_if_tx_paused(router.port, client_id, tx_queue).await;
                     unwatch_keys(router.port, client_id);
                     let mut shards = hashbrown::HashSet::new();
                     for cmd in tx_queue.iter() {
@@ -5998,6 +6075,17 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 )
                             }));
 
+                    // A squashed batch's writes count as running (see
+                    // `writes_running`); with writes paused it takes the
+                    // per-command path, which waits at the pause gate.
+                    let mut batch_running = None;
+                    let mut batch_paused = false;
+                    if !has_tx && commands.len() > 1 {
+                        match enter_write_batch(&commands) {
+                            Some(guard) => batch_running = Some(guard),
+                            None => batch_paused = true,
+                        }
+                    }
                     if has_tx {
                         for cmd in commands.drain(..) {
                             if execute_tx_step(
@@ -6024,7 +6112,8 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 }
                             }
                         }
-                    } else if is_client_paused().is_some()
+                    } else if batch_paused
+                        || is_client_paused().is_some()
                         || HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
                         || has_monitor_clients()
                         || crate::block::has_blocked_waiters(router.port)
@@ -6060,6 +6149,8 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 )
                             }))
                     {
+                        // Each command counts itself at the pause gate.
+                        drop(batch_running.take());
                         for cmd in commands.drain(..) {
                             if (is_client_paused().is_some()
                                 || matches!(
@@ -6201,6 +6292,8 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 break;
                             }
                         }
+                        // Applied and replicated: no longer running.
+                        drop(batch_running.take());
                         stats
                             .tot_cmds
                             .fetch_add(cmd_cnt, std::sync::atomic::Ordering::Relaxed);
@@ -11031,7 +11124,7 @@ async fn execute_command_inner(
         should_reset: !is_caching_or_trackinginfo,
     };
 
-    wait_if_client_paused(router.port, client_id, &cmd).await;
+    let _write_running = wait_if_client_paused(router.port, client_id, &cmd).await;
     if !allowed_while_busy(&cmd)
         && let Some(busy) = crate::scripting::busy_script_reply(router.port)
     {
@@ -29607,6 +29700,25 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 
 #[cfg(test)]
 mod tests {
+    /// A write past the pause gate counts as running until it ends, and a
+    /// squashed batch with writes is refused (per-command path) while
+    /// writes are paused: so once writes are paused and nothing runs, the
+    /// replication offset is final (FAILOVER, shutdown).
+    #[test]
+    fn test_running_writes_are_counted_around_the_pause_gate() {
+        let set = Command::Mset(vec![(Bytes::from_static(b"k"), Bytes::from_static(b"v"))]);
+        let get = Command::Get(Bytes::from_static(b"k"));
+        assert!(super::counts_as_running_write(&set));
+        assert!(!super::counts_as_running_write(&get));
+        let g = super::WriteRunning::enter(true);
+        assert!(super::writes_running() >= 1);
+        drop(g);
+        let batch = super::enter_write_batch(&[set.clone(), get.clone()]).expect("not paused");
+        drop(batch);
+        // Reads only: never counted, never refused.
+        assert!(super::enter_write_batch(&[get.clone(), get]).is_some());
+    }
+
     /// Replica links are not counted in INFO connected_clients.
     #[test]
     fn test_connected_clients_leaves_out_replicas() {
