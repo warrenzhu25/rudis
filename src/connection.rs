@@ -19118,11 +19118,32 @@ async fn execute_command_inner(
             false
         }
         Command::MemcachedQuit => true,
-        Command::Shutdown { save } => {
+        Command::Shutdown { abort: true, .. } => {
+            if crate::replication::abort_shutdown() {
+                out.extend_from_slice(b"+OK\r\n");
+            } else {
+                out.extend_from_slice(b"-ERR No shutdown in progress.\r\n");
+            }
+            false
+        }
+        Command::Shutdown {
+            save, now, force, ..
+        } => {
             crate::log_warning!("User requested shutdown...");
-            crate::replication::wait_replicas_before_shutdown(router.base_port).await;
-            if let Err(e) = router.save_before_shutdown(save, 1).await {
-                crate::log_warning!("Error trying to save the DB, can't exit: {}", e);
+            if !now && !crate::replication::wait_replicas_before_shutdown(router.base_port).await {
+                // SHUTDOWN ABORT (already logged).
+                out.extend_from_slice(b"-ERR Errors trying to SHUTDOWN. Check logs.\r\n");
+                return false;
+            }
+            let saved = router.save_before_shutdown(save, 1).await;
+            if let Err(e) = &saved {
+                if force {
+                    crate::log_warning!("Error trying to save the DB, exiting anyway (FORCE): {}", e);
+                } else {
+                    crate::log_warning!("Error trying to save the DB, can't exit: {}", e);
+                }
+            }
+            if saved.is_err() && !force {
                 crate::log_warning!(
                     "Errors trying to shut down the server. Check the logs for more information."
                 );

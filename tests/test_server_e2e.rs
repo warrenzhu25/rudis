@@ -35598,3 +35598,86 @@ fn test_failover_command_switches_master_and_replica_e2e() {
         let _ = n.wait();
     }
 }
+
+/// SHUTDOWN waiting for a lagging replica can be cancelled with SHUTDOWN
+/// ABORT, as in Redis: every client waiting in SHUTDOWN (counted in
+/// blocked_clients meanwhile) gets an error and the server keeps serving.
+/// SHUTDOWN NOW does not wait for replicas.
+#[test]
+fn test_shutdown_abort_and_now_e2e() {
+    let (mport, rport) = (29911u16, 29912u16);
+    let spawn = |port: u16| {
+        let p = port.to_string();
+        spawn_rudis_listening(
+            &["--port", &p, "--threads", "2", "--no-pin", "--save", ""],
+            port,
+        )
+    };
+    let mut master = spawn(mport);
+    let mut replica = spawn(rport);
+    let connect = |port: u16| {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let (mut m, mut r) = (connect(mport), connect(rport));
+    for bad in [
+        &["SHUTDOWN", "ABORT", "NOW"][..],
+        &["SHUTDOWN", "SAVE", "NOSAVE"],
+    ] {
+        assert!(resp_cmd(&mut m, bad).contains("syntax error"), "{bad:?}");
+    }
+    assert_eq!(
+        resp_cmd(&mut m, &["SHUTDOWN", "ABORT"]),
+        "-ERR No shutdown in progress.\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut m, &["CONFIG", "SET", "shutdown-timeout", "60"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &mport.to_string()]),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut r);
+    // SAFETY: kill(2) on our own live child.
+    unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGSTOP) };
+    assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":1\r\n");
+    let (mut s1, mut s2) = (connect(mport), connect(mport));
+    for s in [&mut s1, &mut s2] {
+        s.write_all(b"*1\r\n$8\r\nSHUTDOWN\r\n").unwrap();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let info = resp_cmd_full(&mut m, &["INFO", "clients"]);
+        if info.contains("blocked_clients:2\r\n") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{info}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(resp_cmd(&mut m, &["SHUTDOWN", "ABORT"]), "+OK\r\n");
+    for s in [&mut s1, &mut s2] {
+        let mut buf = [0u8; 128];
+        let n = s.read(&mut buf).unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"-ERR Errors trying to SHUTDOWN. Check logs.\r\n"
+        );
+    }
+    // Still serving, writes resumed.
+    assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":2\r\n");
+    assert!(resp_cmd_full(&mut m, &["INFO", "clients"]).contains("blocked_clients:0\r\n"));
+
+    // NOW: no waiting for the stopped replica.
+    let t = std::time::Instant::now();
+    m.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$3\r\nNOW\r\n")
+        .unwrap();
+    let status = master.wait().unwrap();
+    assert!(status.success(), "{status}");
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    // SAFETY: as above.
+    unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGCONT) };
+    let _ = replica.kill();
+    let _ = replica.wait();
+}

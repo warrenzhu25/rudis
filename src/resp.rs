@@ -889,8 +889,15 @@ pub enum Command {
     // CONFIG COMMANDS
     ConfigGet(Vec<Bytes>),
     ConfigSet(Vec<(Bytes, Bytes)>),
+    /// `SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE]`, or `SHUTDOWN ABORT`.
     Shutdown {
         save: Option<bool>,
+        /// Don't wait for replicas to catch up.
+        now: bool,
+        /// Exit even if the final save fails.
+        force: bool,
+        /// Cancel a shutdown that is waiting for replicas.
+        abort: bool,
     },
     Quit,
     // PUBSUB COMMANDS
@@ -7195,19 +7202,31 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "QUIT" => Ok(Some(Command::Quit)),
         "SHUTDOWN" => {
-            let save = if args.len() > 1 {
-                let arg = String::from_utf8_lossy(&args[1]).to_uppercase();
-                if arg == "SAVE" {
-                    Some(true)
-                } else if arg == "NOSAVE" {
-                    Some(false)
-                } else {
-                    None
+            // As Redis: each flag at most once, SAVE and NOSAVE exclusive,
+            // ABORT alone, anything else a syntax error.
+            let (mut save, mut now, mut force, mut abort) = (None, false, false, false);
+            let mut flags = 0;
+            for a in &args[1..] {
+                let a = String::from_utf8_lossy(a).to_ascii_uppercase();
+                match a.as_str() {
+                    "SAVE" if save.is_none() => save = Some(true),
+                    "NOSAVE" if save.is_none() => save = Some(false),
+                    "NOW" => now = true,
+                    "FORCE" => force = true,
+                    "ABORT" => abort = true,
+                    _ => return Err("syntax error".to_string()),
                 }
-            } else {
-                None
-            };
-            Ok(Some(Command::Shutdown { save }))
+                flags += 1;
+            }
+            if abort && flags > 1 {
+                return Err("syntax error".to_string());
+            }
+            Ok(Some(Command::Shutdown {
+                save,
+                now,
+                force,
+                abort,
+            }))
         }
         "SUBSCRIBE" => {
             if args.len() < 2 {
@@ -14459,6 +14478,47 @@ fn find_newline_at(buf: &[u8], start: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_shutdown_flags_parse_like_redis() {
+        let parse = |args: &[&str]| {
+            let mut frame = format!("*{}\r\n", args.len());
+            for a in args {
+                frame.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            parse_command(&mut BytesMut::from(frame.as_str()))
+        };
+        assert!(matches!(
+            parse(&["SHUTDOWN", "nosave", "NOW", "FORCE"]),
+            Ok(Some(Command::Shutdown {
+                save: Some(false),
+                now: true,
+                force: true,
+                abort: false
+            }))
+        ));
+        assert!(matches!(
+            parse(&["SHUTDOWN", "ABORT"]),
+            Ok(Some(Command::Shutdown { abort: true, .. }))
+        ));
+        assert!(matches!(
+            parse(&["SHUTDOWN"]),
+            Ok(Some(Command::Shutdown {
+                save: None,
+                now: false,
+                force: false,
+                abort: false
+            }))
+        ));
+        for bad in [
+            &["SHUTDOWN", "SAVE", "NOSAVE"][..],
+            &["SHUTDOWN", "ABORT", "NOW"],
+            &["SHUTDOWN", "NOSAVE", "ABORT"],
+            &["SHUTDOWN", "BOGUS"],
+        ] {
+            assert_eq!(parse(bad).unwrap_err(), "syntax error", "{bad:?}");
+        }
+    }
 
     #[test]
     fn test_failover_and_psync_failover_parse_like_redis() {

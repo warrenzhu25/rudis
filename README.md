@@ -519,9 +519,12 @@ index holds, and `FLAT` `INITIAL_CAP` preallocates at most 64 MiB of vectors.
 1. **Wait for replicas** (masters with replicas, as Redis): writes are paused and the master
    waits up to `shutdown-timeout` (default 10s; 0 skips it) for every replica to acknowledge
    everything it was sent, then logs `N of M replicas are in sync` and any `Lagging replica`.
-   `INFO server` shows `shutdown_in_milliseconds` meanwhile.
+   `INFO server` shows `shutdown_in_milliseconds` meanwhile, and clients waiting in `SHUTDOWN`
+   count as `blocked_clients`. `SHUTDOWN ABORT` cancels the shutdown (waiting clients get an
+   error, a `SIGTERM`'d server stays up); `SHUTDOWN NOW` skips the wait.
 1. **Save**: if save points are configured (or `SHUTDOWN SAVE` is given), a snapshot is taken
-   first. If it fails the server keeps running and reports the error (`SHUTDOWN NOSAVE` skips it).
+   first. If it fails the server keeps running and reports the error (`SHUTDOWN NOSAVE` skips it;
+   `SHUTDOWN FORCE` exits anyway).
 2. **Stop accepting**: every shard stops accepting new connections within ~200ms.
 3. **Drain clients** (up to 2s): the read side of every client socket is shut. Idle clients see
    EOF at once; a command already running (including a blocked `BLPOP`/`XREAD` until its own

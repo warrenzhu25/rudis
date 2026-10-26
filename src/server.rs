@@ -2466,7 +2466,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         "Received {} scheduling shutdown...",
                         crate::shutdown::last_shutdown_signal_name()
                     );
-                    crate::replication::wait_replicas_before_shutdown(r.base_port).await;
+                    if !crate::replication::wait_replicas_before_shutdown(r.base_port).await {
+                        continue;
+                    }
                     match r.save_before_shutdown(None, 0).await {
                         Ok(()) => crate::shutdown::request_shutdown(),
                         Err(e) => crate::log_warning!(

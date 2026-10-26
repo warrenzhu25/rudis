@@ -2247,12 +2247,20 @@ pub fn shutdown_in_milliseconds() -> u64 {
 /// for every replica to acknowledge all of it, so a failover to any of
 /// them loses no acknowledged write. Logs which replicas lag. A replica,
 /// or a master without replicas, doesn't wait.
-pub async fn wait_replicas_before_shutdown(port: u16) {
+///
+/// Returns false if `SHUTDOWN ABORT` cancelled the shutdown meanwhile.
+/// Several shutdowns (SHUTDOWN from several clients, SIGTERM) may wait at
+/// once; each counts as a blocked client while it waits.
+pub async fn wait_replicas_before_shutdown(port: u16) -> bool {
     let secs = SHUTDOWN_TIMEOUT_SECS.load(Ordering::Relaxed);
     let hub = get_replication_hub(port);
     if secs == 0 || hub.is_slave() || hub.replicas.read().is_empty() {
-        return;
+        return true;
     }
+    let aborts = SHUTDOWN_ABORTS.load(Ordering::SeqCst);
+    SHUTDOWN_WAITERS.fetch_add(1, Ordering::SeqCst);
+    let _blocked = WaitBlocked::new();
+    let aborted = || SHUTDOWN_ABORTS.load(Ordering::SeqCst) != aborts;
     crate::connection::set_client_pause(secs * 1000 + 1000, true);
     crate::log_notice!("Waiting for replicas before shutting down.");
     let deadline = unix_ms() + secs * 1000;
@@ -2263,7 +2271,7 @@ pub async fn wait_replicas_before_shutdown(port: u16) {
     loop {
         let all_in_sync = hub.replicas.read().values().all(|r| in_sync(r));
         let now = unix_ms();
-        if all_in_sync || now >= deadline {
+        if all_in_sync || now >= deadline || aborted() {
             break;
         }
         // Replicas ack once a second on their own; ask more often.
@@ -2272,6 +2280,17 @@ pub async fn wait_replicas_before_shutdown(port: u16) {
             propagate_bytes(port, b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n");
         }
         monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let last = SHUTDOWN_WAITERS.fetch_sub(1, Ordering::SeqCst) == 1;
+    let resume = || {
+        if last {
+            SHUTDOWN_DEADLINE_MS.store(0, Ordering::Relaxed);
+            crate::connection::unpause_clients();
+        }
+    };
+    if aborted() {
+        resume();
+        return false;
     }
     let (mut synced, mut total) = (0, 0);
     let now_secs = unix_secs();
@@ -2302,8 +2321,24 @@ pub async fn wait_replicas_before_shutdown(port: u16) {
         synced,
         total
     );
-    SHUTDOWN_DEADLINE_MS.store(0, Ordering::Relaxed);
-    crate::connection::unpause_clients();
+    resume();
+    true
+}
+
+/// Shutdowns waiting for replicas (see `wait_replicas_before_shutdown`).
+static SHUTDOWN_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Bumped by `SHUTDOWN ABORT`: waiting shutdowns see it and give up.
+static SHUTDOWN_ABORTS: AtomicU64 = AtomicU64::new(0);
+
+/// `SHUTDOWN ABORT`: cancels the shutdowns waiting for replicas (their
+/// clients get an error; a SIGTERM's server stays up). False if none.
+pub fn abort_shutdown() -> bool {
+    if SHUTDOWN_WAITERS.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    SHUTDOWN_ABORTS.fetch_add(1, Ordering::SeqCst);
+    crate::log_warning!("Shutdown manually aborted.");
+    true
 }
 
 impl ReplicationHub {
