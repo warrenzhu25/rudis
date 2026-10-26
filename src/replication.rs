@@ -56,6 +56,11 @@ pub struct ConnectedReplica {
     pub sender: flume::Sender<Vec<u8>>,
     pub listening_port: AtomicU64,
     pub ack_offset: AtomicU64,
+    /// The offset the replica last reported fsynced to its AOF (`REPLCONF
+    /// ACK <offset> FACK <aofoffset>`).
+    pub aof_ack_offset: AtomicU64,
+    /// The replica's last ack had a FACK (it runs with AOF on).
+    pub aof_acks: AtomicBool,
     pub last_ack_time: AtomicU64,
     /// The replica's address as seen by the master (INFO and ROLE).
     pub ip: Option<std::net::IpAddr>,
@@ -1077,6 +1082,8 @@ impl ReplicationHub {
             sender,
             listening_port: AtomicU64::new(peer.port as u64),
             ack_offset: AtomicU64::new(0),
+            aof_ack_offset: AtomicU64::new(0),
+            aof_acks: AtomicBool::new(false),
             // Like Redis, the lag clock starts at registration, so a new
             // replica counts as good until it misses acks.
             last_ack_time: AtomicU64::new(unix_secs()),
@@ -1187,14 +1194,20 @@ impl ReplicationHub {
         }
     }
 
-    pub fn update_replica_ack(&self, id: u64, offset: u64) {
+    pub fn update_replica_ack(&self, id: u64, offset: u64, aof_offset: Option<u64>) {
         // Every byte is counted in the master offset before it is queued
         // for a replica, so an ack beyond it is a lie or a bug; counting it
         // would let WAIT succeed for writes the replica never received.
-        if offset > self.master_repl_offset.load(Ordering::SeqCst) {
+        let master = self.master_repl_offset.load(Ordering::SeqCst);
+        if offset > master {
             return;
         }
         if let Some(rep) = self.replicas.read().get(&id) {
+            // A replica without AOF sends no FACK: none of its copies count
+            // for WAITAOF.
+            rep.aof_ack_offset
+                .store(aof_offset.unwrap_or(0).min(offset), Ordering::SeqCst);
+            rep.aof_acks.store(aof_offset.is_some(), Ordering::SeqCst);
             rep.ack_offset.store(offset, Ordering::SeqCst);
             rep.last_ack_time.store(unix_secs(), Ordering::SeqCst);
         }
@@ -1980,41 +1993,163 @@ impl ReplicationHub {
     }
 }
 
-pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> usize {
-    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
-        return 0;
+/// `REPLCONF ACK <offset> [FACK <aofoffset>]`, as a replica acks.
+fn replconf_ack(offset: u64, fsynced: Option<u64>) -> String {
+    let off = offset.to_string();
+    match fsynced {
+        None => format!(
+            "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
+            off.len(),
+            off
+        ),
+        Some(f) => {
+            let f = f.to_string();
+            format!(
+                "*5\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n$4\r\nFACK\r\n${}\r\n{}\r\n",
+                off.len(),
+                off,
+                f.len(),
+                f
+            )
+        }
     }
+}
+
+/// Clients blocked in WAIT / WAITAOF (counted in INFO `blocked_clients`).
+pub static WAIT_BLOCKED_CLIENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts a client in [`WAIT_BLOCKED_CLIENTS`] while it lives.
+struct WaitBlocked;
+
+impl WaitBlocked {
+    fn new() -> Self {
+        WAIT_BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for WaitBlocked {
+    fn drop(&mut self) {
+        WAIT_BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// WAITAOF's local copy: every shard's AOF bytes appended when WAITAOF
+/// ran, which are fsynced once each shard's fsynced count reaches them.
+pub struct LocalAofTarget {
+    progress: Vec<Arc<crate::aof::AofProgress>>,
+    target: Vec<u64>,
+}
+
+impl LocalAofTarget {
+    pub fn now(port: u16, shards: usize) -> Self {
+        let progress = crate::aof::aof_progress_all(port, shards);
+        let target = progress
+            .iter()
+            .map(|p| p.appended.load(Ordering::Acquire))
+            .collect();
+        Self { progress, target }
+    }
+
+    pub fn fsynced(&self) -> bool {
+        self.progress
+            .iter()
+            .zip(&self.target)
+            .all(|(p, &t)| p.fsynced.load(Ordering::Acquire) >= t)
+    }
+}
+
+impl ReplicationHub {
+    /// Replicas that acknowledged `target` (or, with `aof`, fsynced it to
+    /// their AOF). Before any write every replica counts.
+    fn count_acks(&self, target: u64, aof: bool) -> usize {
+        let reps = self.replicas.read();
+        reps.values()
+            .filter(|r| {
+                if aof {
+                    r.aof_acks.load(Ordering::SeqCst)
+                        && r.aof_ack_offset.load(Ordering::SeqCst) >= target
+                } else {
+                    r.ack_offset.load(Ordering::SeqCst) >= target
+                }
+            })
+            .count()
+    }
+}
+
+/// WAIT: blocks until `numreplicas` replicas acknowledged every write so
+/// far, or `timeout_ms` passes (0 = no timeout); returns how many did.
+pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> usize {
+    wait_acks(port, numreplicas, timeout_ms, false, None, false)
+        .await
+        .1
+}
+
+/// WAITAOF: like WAIT, but counts replicas that fsynced the writes to
+/// their AOF, and with `numlocal` also waits for `local` (this server's
+/// AOF fsync; `None` without AOF). Returns (local fsynced, replicas).
+pub async fn wait_aof(
+    port: u16,
+    local: Option<LocalAofTarget>,
+    numlocal: usize,
+    numreplicas: usize,
+    timeout_ms: u64,
+) -> (bool, usize) {
+    let need_local = numlocal > 0;
+    wait_acks(
+        port,
+        numreplicas,
+        timeout_ms,
+        true,
+        local.as_ref(),
+        need_local,
+    )
+    .await
+}
+
+async fn wait_acks(
+    port: u16,
+    numreplicas: usize,
+    timeout_ms: u64,
+    aof: bool,
+    local: Option<&LocalAofTarget>,
+    need_local: bool,
+) -> (bool, usize) {
     let hub = get_replication_hub(port);
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms);
     let target_offset = hub.master_repl_offset.load(Ordering::SeqCst);
-    let mut asked = false;
+    let mut blocked = None;
+    let mut asked_at: Option<std::time::Instant> = None;
     loop {
-        let count = {
-            let reps = hub.replicas.read();
-            if reps.is_empty() {
-                return 0;
-            }
-            if target_offset == 0 {
-                reps.len()
-            } else {
-                reps.values()
-                    .filter(|r| r.ack_offset.load(Ordering::SeqCst) >= target_offset)
-                    .count()
-            }
-        };
-        if count >= numreplicas || timeout_ms == 0 || start.elapsed() >= timeout {
-            return count;
+        let local_ok = local.is_some_and(|l| l.fsynced());
+        let count = hub.count_acks(target_offset, aof);
+        let done = count >= numreplicas && (local_ok || !need_local);
+        if done || (timeout_ms > 0 && start.elapsed() >= timeout) {
+            return (local_ok, count);
         }
-        if !asked {
-            // Ask for acks now, like Redis: replicas otherwise report their
-            // offset once a second, so every WAIT took ~1 s. The request
-            // goes into the stream after the writes being waited for, and
-            // a replica acks only once it has applied up to it.
-            asked = true;
+        blocked.get_or_insert_with(WaitBlocked::new);
+        // Ask for acks now, like Redis: replicas otherwise report their
+        // offset once a second, so every WAIT took ~1 s. The request goes
+        // into the stream after the writes being waited for, and a replica
+        // acks only once it has applied up to it. Asked again each second
+        // in case a replica (re)connected meanwhile.
+        if count < numreplicas
+            && HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed)
+            && asked_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            asked_at = Some(std::time::Instant::now());
             propagate_bytes(port, b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n");
         }
-        monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+        // Polled every ms at first (acks usually come within a few), then
+        // less often for long waits.
+        let poll = if start.elapsed() < std::time::Duration::from_millis(100) {
+            1
+        } else {
+            10
+        };
+        monoio::time::sleep(std::time::Duration::from_millis(poll)).await;
     }
 }
 
@@ -3109,31 +3244,70 @@ async fn run_replica_worker(
         // Wakes the writer for an immediate ack (REPLCONF GETACK).
         let (ack_tx, ack_rx) = flume::unbounded::<()>();
         let applied_w = applied.clone();
+        let ack_router = router.clone();
         monoio::spawn(async move {
             // The first ack goes out at once, as Redis replicas send theirs:
             // after a streamed full sync the master holds the stream until
             // it (see `run_master_replica_stream`).
             let mut first = true;
+            let mut last_sent = std::time::Instant::now();
+            // With AOF on, acks also carry FACK, the applied offset known
+            // fsynced to the AOF (for the master's WAITAOF). `pending` is an
+            // applied offset with the AOF bytes every shard had appended
+            // when it was read: once those are fsynced, so is the offset.
+            let mut fsynced_off = 0u64;
+            let mut pending: Option<(u64, LocalAofTarget)> = None;
             loop {
                 if !first {
+                    // Checked often while a FACK is pending, so the master
+                    // hears of the fsync soon after it.
+                    let wait = if pending.is_some() { 100 } else { 1000 };
                     match monoio::time::timeout(
-                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_millis(wait),
                         ack_rx.recv_async(),
                     )
                     .await
                     {
-                        Ok(Ok(())) | Err(_) => {}
+                        Ok(Ok(())) => {}
                         Ok(Err(_)) => break,
+                        Err(_) => {
+                            let fack_moved = pending.as_ref().is_some_and(|(_, t)| t.fsynced());
+                            if !fack_moved
+                                && last_sent.elapsed() < std::time::Duration::from_secs(1)
+                            {
+                                continue;
+                            }
+                        }
                     }
                 }
                 first = false;
                 while ack_rx.try_recv().is_ok() {}
-                let off = applied_w.get().to_string();
-                let ack = format!(
-                    "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
-                    off.len(),
-                    off
-                );
+                let off = applied_w.get();
+                let ack = if ack_router.aof.is_some() {
+                    if let Some((p_off, t)) = &pending
+                        && t.fsynced()
+                    {
+                        fsynced_off = *p_off;
+                        pending = None;
+                    }
+                    if pending.is_none() && off > fsynced_off {
+                        // appendfsync always: fsync now, as a Redis
+                        // replica does before its next event loop turn.
+                        if crate::aof::appendfsync_is_always(ack_router.base_port) {
+                            ack_router.sync_aof().await;
+                        }
+                        let t = LocalAofTarget::now(ack_router.base_port, ack_router.num_shards);
+                        if t.fsynced() {
+                            fsynced_off = off;
+                        } else {
+                            pending = Some((off, t));
+                        }
+                    }
+                    replconf_ack(off, Some(fsynced_off))
+                } else {
+                    replconf_ack(off, None)
+                };
+                last_sent = std::time::Instant::now();
                 if ack_writer.write_all(ack.into_bytes()).await.0.is_err() {
                     break;
                 }
@@ -3680,13 +3854,85 @@ mod tests {
         // do not touch it.
         rep.last_ack_time.store(0, Ordering::SeqCst);
 
-        hub.update_replica_ack(rep.id, offset + 1);
-        hub.update_replica_ack(rep.id, u64::MAX);
+        hub.update_replica_ack(rep.id, offset + 1, None);
+        hub.update_replica_ack(rep.id, u64::MAX, None);
         assert_eq!(rep.ack_offset.load(Ordering::SeqCst), 0);
         assert_eq!(rep.last_ack_time.load(Ordering::SeqCst), 0);
 
-        hub.update_replica_ack(rep.id, offset);
+        hub.update_replica_ack(rep.id, offset, None);
         assert_eq!(rep.ack_offset.load(Ordering::SeqCst), offset);
+        hub.unregister_replica(rep.id);
+    }
+
+    /// WAITAOF counts a replica only by its FACK (the offset it fsynced to
+    /// its AOF), and not at all if its acks carry none (no AOF).
+    #[test]
+    fn test_waitaof_counts_replicas_by_fack() {
+        let hub = ReplicationHub::new(19981);
+        let (tx, _rx) = flume::unbounded();
+        let with_aof = hub.register_replica(21, tx.clone());
+        let without = hub.register_replica(22, tx);
+        hub.propagate(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        let off = hub.master_repl_offset.load(Ordering::SeqCst);
+        hub.update_replica_ack(with_aof.id, off, Some(off - 1));
+        hub.update_replica_ack(without.id, off, None);
+        assert_eq!(hub.count_acks(off, false), 2);
+        assert_eq!(hub.count_acks(off, true), 0, "not fsynced up to off yet");
+        assert_eq!(hub.count_acks(off - 1, true), 1);
+        hub.update_replica_ack(with_aof.id, off, Some(off));
+        assert_eq!(hub.count_acks(off, true), 1);
+        // A FACK beyond the acked offset is capped at it.
+        hub.update_replica_ack(with_aof.id, off - 1, Some(off));
+        assert_eq!(hub.count_acks(off, true), 0);
+        hub.unregister_replica(with_aof.id);
+        hub.unregister_replica(without.id);
+    }
+
+    #[test]
+    fn test_replconf_ack_carries_fack_only_with_aof() {
+        assert_eq!(
+            replconf_ack(12, None),
+            "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$2\r\n12\r\n"
+        );
+        assert_eq!(
+            replconf_ack(12, Some(7)),
+            "*5\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$2\r\n12\r\n$4\r\nFACK\r\n$1\r\n7\r\n"
+        );
+    }
+
+    /// The local target is met once every shard fsynced what it had
+    /// appended when WAITAOF ran; later appends do not matter.
+    #[test]
+    fn test_local_aof_target_waits_for_every_shard() {
+        let port = 19982;
+        let p = crate::aof::aof_progress_all(port, 2);
+        p[0].appended.store(10, Ordering::SeqCst);
+        p[1].appended.store(4, Ordering::SeqCst);
+        let t = LocalAofTarget::now(port, 2);
+        assert!(!t.fsynced());
+        p[0].fsynced.store(10, Ordering::SeqCst);
+        assert!(!t.fsynced(), "shard 1 not fsynced");
+        p[1].appended.store(9, Ordering::SeqCst);
+        p[1].fsynced.store(4, Ordering::SeqCst);
+        assert!(t.fsynced());
+    }
+
+    /// WAIT with no timeout (0) blocks until enough replicas ack, counted
+    /// as a blocked client meanwhile.
+    #[monoio::test(timer_enabled = true)]
+    async fn test_wait_without_timeout_blocks_until_acked() {
+        let port = 19983;
+        let hub = get_replication_hub(port);
+        let (tx, _rx) = flume::unbounded();
+        let rep = hub.register_replica(31, tx);
+        hub.propagate(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        let off = hub.master_repl_offset.load(Ordering::SeqCst);
+        let before = WAIT_BLOCKED_CLIENTS.load(Ordering::SeqCst);
+        let waiter = monoio::spawn(wait_replicas(port, 1, 0));
+        monoio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(WAIT_BLOCKED_CLIENTS.load(Ordering::SeqCst) > before);
+        hub.update_replica_ack(rep.id, off, None);
+        assert_eq!(waiter.await, 1);
         hub.unregister_replica(rep.id);
     }
 

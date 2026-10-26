@@ -411,23 +411,21 @@ and load the relevant atomics on every call. Both still only enumerate `self.rep
 neither iterates `self.shard_flows`, so `DFLY FLOW` clients are invisible to `connected_slaves`/`ROLE`'s replica
 list.
 
-### 3.8 `WAIT` / `WAITAOF` (`replication.rs:687-714`, `connection.rs:12024-12040`) — new since the prior revision, and `WAITAOF` does not actually check local AOF state
+### 3.8 `WAIT` / `WAITAOF` (`replication.rs` `wait_acks`, `connection.rs` `Command::Wait`/`Command::WaitAof`)
 
-```rust
-pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> usize {
-    // polls hub.replicas every 5ms until `numreplicas` replicas' ack_offset >= the
-    // master_repl_offset captured at call time, or the timeout elapses, or timeout_ms == 0
-    // (return immediately with however many already qualify)
-}
-```
+Both poll until enough copies are acknowledged or the timeout passes (0 = forever); see
+`06_blocking_hub.md` §6.10. `WAIT` counts replicas whose `ack_offset` reached the master offset taken at call
+time. `WAITAOF` counts only copies fsynced to an AOF:
 
-`Command::Wait { numreplicas, timeout }` calls this directly and replies with the resulting count as a RESP
-integer. **`Command::WaitAof { numlocal: _, numreplicas, timeout }` calls the exact same `wait_replicas`
-function and ignores `numlocal` entirely** (`connection.rs:12032-12040`) — it replies `*2\r\n:1\r\n:{count}\r\n`,
-hardcoding the "local AOF persisted" half of the reply to `1` unconditionally, regardless of whether AOF is even
-enabled on this node, whether it's caught up to the fsync point, or whether `numlocal` requested `0`. `WAITAOF`
-is therefore functionally identical to `WAIT` today except for its reply shape; it provides no actual guarantee
-about local AOF durability.
+- **local**: each shard's `AofProgress` tracks `fsynced`, the appended bytes an fsync covered (the everysec
+  fsync, `AofWriter::sync_durable`, or a rewrite swapping in a synced file). The local copy counts once every
+  shard's `fsynced` reaches what it had appended when `WAITAOF` ran — at once under `appendfsync always`, at the
+  next fsync under `everysec`, never under `no`.
+- **replicas**: a replica with AOF on appends `FACK <offset>` to its `REPLCONF ACK`: the applied offset whose
+  AOF bytes are fsynced (its ack task snapshots every shard's appended bytes with the offset, and reports it once
+  those are fsynced, checking every 100 ms while one is pending). A replica without AOF sends no `FACK`
+  (`ConnectedReplica::aof_acks` false) and never counts.
+- `numlocal` without AOF, and `WAITAOF` on a replica, are refused with Redis's errors.
 
 ### 3.9 Live AOF and replication coverage of the experimental families — JSON.*, probabilistic and CRDT.* covered
 

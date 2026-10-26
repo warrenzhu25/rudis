@@ -374,10 +374,7 @@ pub fn run_shard_worker(
                                 if ticker.is_multiple_of(200)
                                     && fsync_every_sec.load(std::sync::atomic::Ordering::Relaxed)
                                 {
-                                    let file = flush_writer.borrow().get_file();
-                                    if let Some(file) = file {
-                                        let _ = file.sync_data().await;
-                                    }
+                                    everysec_fsync(&flush_writer).await;
                                 }
                                 continue;
                             }
@@ -392,10 +389,7 @@ pub fn run_shard_worker(
                             if ticker.is_multiple_of(200)
                                 && fsync_every_sec.load(std::sync::atomic::Ordering::Relaxed)
                             {
-                                let file = flush_writer.borrow().get_file();
-                                if let Some(file) = file {
-                                    let _ = file.sync_data().await;
-                                }
+                                everysec_fsync(&flush_writer).await;
                             }
                         }
                     });
@@ -2523,6 +2517,20 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             let _ = crate::aof::AofWriter::sync_durable(&aof).await;
         }
     });
+}
+
+/// The `appendfsync everysec` fsync: makes what is written so far durable
+/// and records it, for WAITAOF.
+async fn everysec_fsync(aof: &Rc<RefCell<crate::aof::AofWriter>>) {
+    let (file, upto) = {
+        let w = aof.borrow();
+        (w.get_file(), w.written_total())
+    };
+    if let Some(file) = file
+        && file.sync_data().await.is_ok()
+    {
+        aof.borrow().mark_fsynced(upto);
+    }
 }
 
 /// A TLS client must finish its handshake within this time, so idle or

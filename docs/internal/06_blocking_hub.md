@@ -326,29 +326,19 @@ Only `ids == ">"` for every key (new-message mode) is eligible to block for `XRE
 
 ### 6.10 `WAIT`/`WAITAOF` — NOT part of `BlockHub`
 
-```rust
-Command::Wait { numreplicas, timeout } => {
-    let count = crate::replication::wait_replicas(router.port, numreplicas, timeout).await;
-    write_resp_integer(out, count as i64);
-}
-Command::WaitAof { numlocal: _, numreplicas, timeout } => {
-    let count = crate::replication::wait_replicas(router.port, numreplicas, timeout).await;
-    out.extend_from_slice(&format!("*2\r\n:1\r\n:{}\r\n", count));
-}
-```
-(`connection.rs:12024-12037`)
-
-`wait_replicas` (`replication.rs:687-712`) is a **pure poll loop**, entirely separate from `BlockHub` — no waiter registration, no `flume` channel, no `notify_*`:
+`Command::Wait` calls `replication::wait_replicas`, `Command::WaitAof` calls `replication::wait_aof`; both are thin wrappers over `wait_acks` (`src/replication.rs`), a **pure poll loop**, entirely separate from `BlockHub` — no waiter registration, no `flume` channel, no `notify_*`:
 
 ```rust
 loop {
-    let count = /* replicas whose ack_offset >= target_offset */;
-    if count >= numreplicas || timeout_ms == 0 || start.elapsed() >= timeout { return count; }
-    monoio::time::sleep(Duration::from_millis(5)).await;
+    let local_ok = local.is_some_and(|l| l.fsynced());      // WAITAOF only
+    let count = hub.count_acks(target_offset, aof);          // ack_offset, or FACK for WAITAOF
+    if (count >= numreplicas && (local_ok || !need_local))
+        || (timeout_ms > 0 && start.elapsed() >= timeout) { return (local_ok, count); }
+    // GETACK once a second while short of replicas; poll 1 ms, then 10 ms after 100 ms
 }
 ```
 
-So `WAIT`/`WAITAOF` block the calling task (asynchronously — `monoio::time::sleep` yields the reactor, it does not stall the thread) by re-checking replica ACK offsets every **5ms** until satisfied or timed out. `WaitAof`'s `numlocal` parameter is accepted but ignored (`numlocal: _`) — it's always reported as `1` (local AOF persisted) regardless of actual local durability state. Grep confirms no reference to `block::` anywhere in `wait_replicas` or its call sites — this is a deliberate separate mechanism, not an oversight to "fix" by wiring it into `BlockHub`, but worth knowing so a reader doesn't go looking for `WAIT` inside `block.rs`.
+So `WAIT`/`WAITAOF` block the calling task (asynchronously — `monoio::time::sleep` yields the reactor, it does not stall the thread). A timeout of 0 waits forever, as in Redis; while waiting the client is counted in `WAIT_BLOCKED_CLIENTS` (INFO `blocked_clients`). `WAITAOF`'s local copy is a `LocalAofTarget`: every shard's `AofProgress::appended` at call time, met once each shard's `AofProgress::fsynced` reaches it. Replica copies count only by the `FACK` a replica with AOF sends in `REPLCONF ACK <off> FACK <aofoff>`. Grep confirms no reference to `block::` anywhere in `wait_replicas` or its call sites — this is a deliberate separate mechanism, not an oversight to "fix" by wiring it into `BlockHub`, but worth knowing so a reader doesn't go looking for `WAIT` inside `block.rs`.
 
 ---
 
@@ -416,7 +406,7 @@ The `ZADD` guard was added later than the others, in a dedicated fix: commit `36
 6. **`CLIENT PAUSE`/`CLIENT UNPAUSE` are no-ops** unrelated to `BlockHub.pause()`/`resume()`, which are reserved exclusively for internal `MULTI`/`EXEC` bookkeeping — a reader should not expect `CLIENT PAUSE` to interact with blocking commands at all in the current implementation.
 7. **`PORT_BLOCK_HUBS` entries are never removed** — `get_block_hub_for_port` only inserts, never evicts, so a process that creates many short-lived `BlockHub`s for many distinct ports (e.g. a test harness cycling through ports) leaks one `Arc<Mutex<BlockHub>>` map entry per port for the lifetime of the process. Not a concern for a single long-running production port.
 8. **`XREADGROUP ... CLAIM` polls at a clamped 1-50ms interval** (`connection.rs:7624-7636`) layered on top of the push-based stream notification — this is by design (there's no timer-wheel in `BlockHub` to schedule a wake at a PEL entry's exact eligibility time), but it means CLAIM-eligible messages can be delivered up to ~50ms late even though the entry has technically been eligible since `delivery_time_ms + min_idle`.
-9. **`WAITAOF`'s `numlocal` argument is accepted but ignored** — the reply always reports local persistence as `1` (`connection.rs:12032-12037`), regardless of whether the write was actually fsynced locally. Not a `BlockHub` issue (`WAIT`/`WAITAOF` don't use `BlockHub` at all, §6.10) but easy to mistake for one given their adjacency to the other blocking commands.
+9. **`WAIT`/`WAITAOF` are polled, not `BlockHub` waiters** (§6.10): easy to mistake for `BlockHub` users given their adjacency to the other blocking commands.
 
 ---
 

@@ -11749,9 +11749,14 @@ fn test_e2e_unlink_readonly_wait_object_and_proto_max() {
 
     // 3. WAIT and WAITAOF
     assert_eq!(send_and_read(&mut stream, b"WAIT 1 50\r\n"), ":0\r\n");
+    // No AOF here: there is no local copy to wait for.
+    assert!(
+        send_and_read(&mut stream, b"WAITAOF 1 1 50\r\n")
+            .contains("numlocal is set but appendonly is disabled")
+    );
     assert_eq!(
-        send_and_read(&mut stream, b"WAITAOF 1 1 50\r\n"),
-        "*2\r\n:1\r\n:0\r\n"
+        send_and_read(&mut stream, b"WAITAOF 0 1 50\r\n"),
+        "*2\r\n:0\r\n:0\r\n"
     );
 
     // 4. OBJECT ENCODING, IDLETIME, REFCOUNT, FREQ, HELP
@@ -35151,4 +35156,136 @@ fn test_master_shutdown_waits_for_replicas_e2e() {
         let _ = replica.kill();
         let _ = replica.wait();
     }
+}
+
+/// WAITAOF counts a copy only once it is fsynced to an AOF, as Redis does:
+/// the local one by the AOF's own fsync (never under `appendfsync no`), a
+/// replica's by its `FACK`, which a replica without AOF does not send. A
+/// WAIT with no timeout blocks (and is counted in `blocked_clients`) until
+/// the replica acks.
+#[test]
+fn test_waitaof_counts_fsynced_copies_e2e() {
+    let (mport, aport, nport) = (29871u16, 29872u16, 29873u16);
+    let base = std::env::temp_dir().join(format!("rudis-waitaof-{}", std::process::id()));
+    let dirs: Vec<String> = ["m", "a", "n"]
+        .iter()
+        .map(|d| {
+            let p = base.join(d);
+            std::fs::create_dir_all(&p).unwrap();
+            p.to_str().unwrap().to_string()
+        })
+        .collect();
+    let spawn = |port: u16, dir: &str, aof: &str| {
+        let p = port.to_string();
+        let args = [
+            "--port",
+            &p,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--save",
+            "",
+            "--dir",
+            dir,
+            "--appendonly",
+            aof,
+        ];
+        spawn_rudis_listening(&args, port)
+    };
+    let mut master = spawn(mport, &dirs[0], "yes");
+    let mut aof_replica = spawn(aport, &dirs[1], "yes");
+    let mut plain_replica = spawn(nport, &dirs[2], "no");
+    let connect = |port: u16| {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let (mut m, mut a, mut n) = (connect(mport), connect(aport), connect(nport));
+
+    // Without AOF there is no local copy to wait for.
+    let r = resp_cmd(&mut n, &["WAITAOF", "1", "0", "0"]);
+    assert!(
+        r.contains("numlocal is set but appendonly is disabled"),
+        "{r}"
+    );
+    assert_eq!(
+        resp_cmd(&mut n, &["WAITAOF", "0", "0", "0"]),
+        "*2\r\n:0\r\n:0\r\n"
+    );
+
+    // appendfsync no never fsyncs: the local copy times out.
+    assert_eq!(
+        resp_cmd(&mut m, &["CONFIG", "SET", "appendfsync", "no"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":1\r\n");
+    assert_eq!(
+        resp_cmd(&mut m, &["WAITAOF", "1", "0", "50"]),
+        "*2\r\n:0\r\n:0\r\n"
+    );
+    // everysec: the next fsync counts it.
+    assert_eq!(
+        resp_cmd(&mut m, &["CONFIG", "SET", "appendfsync", "everysec"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut m, &["WAITAOF", "1", "0", "0"]),
+        "*2\r\n:1\r\n:0\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut m, &["CONFIG", "SET", "appendfsync", "always"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":2\r\n");
+    assert_eq!(
+        resp_cmd(&mut m, &["WAITAOF", "1", "0", "0"]),
+        "*2\r\n:1\r\n:0\r\n"
+    );
+
+    for r in [&mut a, &mut n] {
+        assert_eq!(
+            resp_cmd(r, &["REPLICAOF", "127.0.0.1", &mport.to_string()]),
+            "+OK\r\n"
+        );
+        wait_for_master_link(r);
+    }
+    let r = resp_cmd(&mut a, &["WAITAOF", "0", "0", "0"]);
+    assert!(r.contains("cannot be used with replica instances"), "{r}");
+    assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":3\r\n");
+    assert_eq!(resp_cmd(&mut m, &["WAIT", "2", "5000"]), ":2\r\n");
+    // Both replicas have the write, but only the one with AOF fsyncs it.
+    assert_eq!(
+        resp_cmd(&mut m, &["WAITAOF", "1", "1", "5000"]),
+        "*2\r\n:1\r\n:1\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut m, &["WAITAOF", "0", "2", "1500"]),
+        "*2\r\n:1\r\n:1\r\n"
+    );
+
+    // WAIT 0 has no timeout: it blocks until the stopped replica acks.
+    // SAFETY: kill(2) on our own live child.
+    unsafe { libc::kill(aof_replica.id() as libc::pid_t, libc::SIGSTOP) };
+    assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":4\r\n");
+    m.write_all(b"*3\r\n$4\r\nWAIT\r\n$1\r\n2\r\n$1\r\n0\r\n")
+        .unwrap();
+    let mut probe = connect(mport);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !resp_cmd_full(&mut probe, &["INFO", "clients"]).contains("blocked_clients:1\r\n") {
+        assert!(std::time::Instant::now() < deadline, "WAIT did not block");
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(300));
+    // SAFETY: as above.
+    unsafe { libc::kill(aof_replica.id() as libc::pid_t, libc::SIGCONT) };
+    let mut buf = [0u8; 16];
+    let len = m.read(&mut buf).unwrap();
+    assert_eq!(&buf[..len], b":2\r\n");
+    assert!(resp_cmd_full(&mut probe, &["INFO", "clients"]).contains("blocked_clients:0\r\n"));
+
+    for c in [&mut master, &mut aof_replica, &mut plain_replica] {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }

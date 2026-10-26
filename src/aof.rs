@@ -40,6 +40,8 @@ impl Default for AofConfig {
 pub struct AofProgress {
     pub appended: std::sync::atomic::AtomicU64,
     pub written: std::sync::atomic::AtomicU64,
+    /// Appended bytes an fsync has made durable (WAITAOF's local copy).
+    pub fsynced: std::sync::atomic::AtomicU64,
     /// errno of this shard's last failed AOF write, 0 once a write succeeds.
     pub write_error: std::sync::atomic::AtomicI32,
 }
@@ -191,8 +193,26 @@ impl AofWriter {
             .max(progress.written.load(Relaxed));
         self.appended_total = base + self.buffer.len() as u64;
         progress.written.store(base, Relaxed);
+        progress.fsynced.fetch_max(base, Relaxed);
         progress.appended.store(self.appended_total, Relaxed);
         self.progress = progress;
+    }
+
+    /// Appended bytes already handed to the kernel: what an fsync started
+    /// now makes durable.
+    #[inline]
+    pub fn written_total(&self) -> u64 {
+        self.progress
+            .written
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Records that an fsync made the first `upto` appended bytes durable.
+    #[inline]
+    pub fn mark_fsynced(&self, upto: u64) {
+        self.progress
+            .fsynced
+            .fetch_max(upto, std::sync::atomic::Ordering::Release);
     }
 
     /// With no chunk in flight, everything taken from the buffer is written.
@@ -358,10 +378,10 @@ impl AofWriter {
     /// commit: a caller whose data an fsync already covered returns without
     /// another one.
     pub async fn sync_durable(aof: &std::rc::Rc<std::cell::RefCell<Self>>) -> std::io::Result<()> {
-        let (chunk, target) = {
+        let (chunk, target, logical) = {
             let mut w = aof.borrow_mut();
             let c = w.take_flush_chunk();
-            (c, w.offset)
+            (c, w.offset, w.appended_total)
         };
         if let Some((file, chunk, offset)) = chunk {
             let (res, buf) = file.write_all_at(chunk, offset).await;
@@ -374,6 +394,7 @@ impl AofWriter {
                 (w.durable, w.inflight)
             };
             if durable >= target {
+                aof.borrow().mark_fsynced(logical);
                 return Ok(());
             }
             if inflight == 0 {
@@ -390,6 +411,8 @@ impl AofWriter {
         if w.offset >= target {
             w.durable = w.durable.max(target);
         }
+        // A swapped-in file was synced too, so either way all is durable.
+        w.mark_fsynced(logical);
         Ok(())
     }
 
@@ -505,6 +528,7 @@ impl AofWriter {
         self.progress
             .written
             .store(self.appended_total, std::sync::atomic::Ordering::Release);
+        self.mark_fsynced(self.appended_total);
         Ok(())
     }
 
@@ -532,6 +556,7 @@ impl AofWriter {
         self.progress
             .written
             .store(self.appended_total, std::sync::atomic::Ordering::Release);
+        self.mark_fsynced(self.appended_total);
         self.current_db = 0;
         Ok(new_size)
     }
@@ -7990,6 +8015,43 @@ mod tests {
             // Nothing pending: returns at once, still nothing pending.
             AofWriter::write_through(&aof).await.unwrap();
             assert!(!progress.pending());
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WAITAOF's local copy: appended bytes count as fsynced only once an
+    /// fsync covered them, not when written to the kernel.
+    #[test]
+    fn test_fsynced_tracks_only_fsynced_appends() {
+        use std::sync::atomic::Ordering::Acquire;
+        let dir = std::env::temp_dir().join(format!("rudis-aof-fsynced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appendonly-0.aof");
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let progress = std::sync::Arc::new(AofProgress::default());
+            let mut w = AofWriter::open(path.clone()).await.unwrap();
+            w.set_progress(progress.clone());
+            let aof = std::rc::Rc::new(std::cell::RefCell::new(w));
+            aof.borrow_mut().append(b"first;");
+            AofWriter::write_through(&aof).await.unwrap();
+            assert_eq!(progress.written.load(Acquire), 6);
+            assert_eq!(progress.fsynced.load(Acquire), 0, "written is not fsynced");
+            // The everysec fsync covers what was written when it started.
+            let upto = aof.borrow().written_total();
+            aof.borrow_mut().append(b"second;");
+            aof.borrow().mark_fsynced(upto);
+            assert_eq!(progress.fsynced.load(Acquire), 6);
+            // sync_durable covers everything appended before it.
+            AofWriter::sync_durable(&aof).await.unwrap();
+            assert_eq!(progress.fsynced.load(Acquire), 13);
+            // Never goes back.
+            aof.borrow().mark_fsynced(3);
+            assert_eq!(progress.fsynced.load(Acquire), 13);
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

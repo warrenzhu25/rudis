@@ -7274,11 +7274,27 @@ fn replica_output_limit_reached(client_id: u64, name: &str) {
     );
 }
 
+fn parse_ack_offset(arg: &[u8]) -> Option<u64> {
+    std::str::from_utf8(arg).ok()?.parse().ok()
+}
+
+/// The `FACK <aofoffset>` after `REPLCONF ACK <offset>` (args from `ACK`
+/// on), sent by a replica with AOF on.
+fn parse_fack(args: &[bytes::Bytes]) -> Option<u64> {
+    match args.get(2..4) {
+        Some([k, v]) if k.eq_ignore_ascii_case(b"fack") => parse_ack_offset(v),
+        _ => None,
+    }
+}
+
 /// Reads what a replica sends back, which is only `REPLCONF ACK <offset>`,
 /// until the link ends. Malformed input or a partial command longer than
 /// any ack drops the link instead of being skipped or buffered without
 /// bound.
-async fn read_replica_acks<R: AsyncReadRent>(reader: &mut R, mut on_ack: impl FnMut(u64)) {
+async fn read_replica_acks<R: AsyncReadRent>(
+    reader: &mut R,
+    mut on_ack: impl FnMut(u64, Option<u64>),
+) {
     let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
     let mut buf = BytesMut::with_capacity(32768);
     loop {
@@ -7293,10 +7309,8 @@ async fn read_replica_acks<R: AsyncReadRent>(reader: &mut R, mut on_ack: impl Fn
                 Ok(Some(Command::Replconf(args)))
                     if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"ack") =>
                 {
-                    if let Ok(s) = std::str::from_utf8(&args[1])
-                        && let Ok(ack_off) = s.parse::<u64>()
-                    {
-                        on_ack(ack_off);
+                    if let Some(ack_off) = parse_ack_offset(&args[1]) {
+                        on_ack(ack_off, parse_fack(&args));
                     }
                 }
                 Ok(Some(_)) => {}
@@ -7902,11 +7916,11 @@ async fn run_master_replica_stream(
         writer_hub.unregister_replica(client_id);
     });
 
-    read_replica_acks(&mut reader, |off| {
+    read_replica_acks(&mut reader, |off, fack| {
         if let Some(tx) = ack_tx.take() {
             let _ = tx.send(());
         }
-        hub.update_replica_ack(client_id, off)
+        hub.update_replica_ack(client_id, off, fack)
     })
     .await;
     drop(link);
@@ -7998,7 +8012,7 @@ async fn run_shard_replication_flow(
         writer_hub.unregister_shard_flow(shard_id, client_id);
     });
 
-    read_replica_acks(&mut reader, |off| {
+    read_replica_acks(&mut reader, |off, _| {
         hub.update_shard_flow_ack(shard_id, client_id, off)
     })
     .await;
@@ -12179,7 +12193,10 @@ async fn execute_command_inner(
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
                 let hub = hub_arc.lock();
                 (
-                    hub.blocked_clients_count() + paused_clients_count(),
+                    hub.blocked_clients_count()
+                        + paused_clients_count()
+                        + crate::replication::WAIT_BLOCKED_CLIENTS
+                            .load(std::sync::atomic::Ordering::Relaxed),
                     hub.blocking_keys_count(),
                     hub.blocking_keys_on_nokey_count(),
                 )
@@ -12503,11 +12520,10 @@ async fn execute_command_inner(
                 }
             } else if args[0].eq_ignore_ascii_case(b"ack") {
                 if args.len() >= 2
-                    && let Ok(s) = std::str::from_utf8(&args[1])
-                    && let Ok(off) = s.parse::<u64>()
+                    && let Some(off) = parse_ack_offset(&args[1])
                 {
                     let hub = crate::replication::get_replication_hub(router.base_port);
-                    hub.update_replica_ack(client_id, off);
+                    hub.update_replica_ack(client_id, off, parse_fack(&args));
                 }
             } else if args[0].eq_ignore_ascii_case(b"getack") {
                 let hub = crate::replication::get_replication_hub(router.base_port);
@@ -19047,12 +19063,36 @@ async fn execute_command_inner(
             false
         }
         Command::WaitAof {
-            numlocal: _,
+            numlocal,
             numreplicas,
             timeout,
         } => {
-            let count = crate::replication::wait_replicas(router.base_port, numreplicas, timeout).await;
-            out.extend_from_slice(format!("*2\r\n:1\r\n:{}\r\n", count).as_bytes());
+            if crate::replication::get_replication_hub(router.base_port).is_slave() {
+                out.extend_from_slice(b"-ERR WAITAOF cannot be used with replica instances. Please also note that writes to replicas are just local and are not propagated.\r\n");
+                return false;
+            }
+            if numlocal > 0 && router.aof.is_none() {
+                out.extend_from_slice(
+                    b"-ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.\r\n",
+                );
+                return false;
+            }
+            // The local copy counts once the AOF bytes appended so far are
+            // fsynced (at once under appendfsync always, by the next
+            // everysec fsync, or never under appendfsync no).
+            let local = router
+                .aof
+                .is_some()
+                .then(|| crate::replication::LocalAofTarget::now(router.base_port, router.num_shards));
+            let (local_ok, count) = crate::replication::wait_aof(
+                router.base_port,
+                local,
+                numlocal,
+                numreplicas,
+                timeout,
+            )
+            .await;
+            out.extend_from_slice(format!("*2\r\n:{}\r\n:{}\r\n", u8::from(local_ok), count).as_bytes());
             false
         }
         Command::Object(crate::resp::ObjectSubcommand::Help) => {
