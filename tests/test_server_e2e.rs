@@ -35373,3 +35373,77 @@ fn test_repl_timeout_drops_silent_links_e2e() {
         let _ = c.wait();
     }
 }
+
+/// ROLE on a replica names its link's phase as Redis does: `connecting`
+/// while no master answers, `handshake` while the master has not answered
+/// PSYNC, `sync` while the RDB transfer runs, `connected` once up.
+#[test]
+fn test_role_shows_replica_link_phases_e2e() {
+    let port = 29891u16;
+    let p = port.to_string();
+    let mut replica = spawn_rudis_listening(
+        &["--port", &p, "--threads", "2", "--no-pin", "--save", ""],
+        port,
+    );
+    let mut r = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let wait_state = |r: &mut TcpStream, state: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let role = resp_cmd_full(r, &["ROLE"]);
+            if role.contains(&format!("\r\n{state}\r\n")) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "no {state}: {role}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // Nobody listens on 29892.
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", "29892"]),
+        "+OK\r\n"
+    );
+    wait_state(&mut r, "connecting");
+
+    // A fake master: answers the handshake but holds back PSYNC's reply
+    // until told, then announces a full sync and sends no RDB.
+    let listener = std::net::TcpListener::bind("127.0.0.1:29893").unwrap();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let fake = thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // The replica sends one command and waits for its reply.
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "replica hung up");
+            let cmd = String::from_utf8_lossy(&buf[..n]).to_string();
+            if cmd.contains("PSYNC") {
+                break;
+            }
+            let reply: &[u8] = if cmd.contains("PING") {
+                b"+PONG\r\n"
+            } else {
+                b"+OK\r\n"
+            };
+            s.write_all(reply).unwrap();
+        }
+        go_rx.recv().unwrap();
+        s.write_all(b"+FULLRESYNC 0123456789012345678901234567890123456789 0\r\n")
+            .unwrap();
+        // Hold the connection until the test ends.
+        let _ = go_rx.recv();
+    });
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", "29893"]),
+        "+OK\r\n"
+    );
+    wait_state(&mut r, "handshake");
+    go_tx.send(()).unwrap();
+    wait_state(&mut r, "sync");
+    drop(go_tx);
+    let _ = fake.join();
+
+    assert_eq!(resp_cmd(&mut r, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    let _ = replica.kill();
+    let _ = replica.wait();
+}

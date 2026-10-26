@@ -555,6 +555,9 @@ pub struct ReplicationHub {
     pub announce_port: AtomicU16,
     /// Unix timestamp (seconds) of the last successful read from our master (0 if never).
     pub last_master_io_secs: AtomicU64,
+    /// What the replica worker's link is doing while not up (a `LINK_*`),
+    /// for ROLE.
+    pub link_phase: std::sync::atomic::AtomicU8,
 }
 
 /// Suppresses replication propagation across all shards for a `ReplicationHub`
@@ -583,6 +586,25 @@ pub static REPL_BACKLOG_TTL: AtomicU64 = AtomicU64::new(3600);
 /// `repl-ping-replica-period`: a master PINGs its replicas this often
 /// (seconds), through the replication stream like Redis.
 pub static REPL_PING_PERIOD: AtomicU64 = AtomicU64::new(10);
+
+/// A replica's link phases before it is up, shown by ROLE as Redis's
+/// replication states: connecting (TCP connect), handshake (PING, AUTH,
+/// REPLCONF, PSYNC) and sync (receiving the RDB).
+pub const LINK_CONNECTING: u8 = 0;
+pub const LINK_HANDSHAKE: u8 = 1;
+pub const LINK_SYNC: u8 = 2;
+
+/// ROLE's state of a replica's link to its master.
+fn link_state_name(up: bool, phase: u8) -> &'static str {
+    if up {
+        return "connected";
+    }
+    match phase {
+        LINK_HANDSHAKE => "handshake",
+        LINK_SYNC => "sync",
+        _ => "connecting",
+    }
+}
 
 /// `repl-timeout` (seconds): a replica that hears nothing from its master
 /// for this long (no data, no PING) drops the link and reconnects, and a
@@ -683,6 +705,7 @@ impl ReplicationHub {
             announce_ip: RwLock::new(None),
             announce_port: AtomicU16::new(0),
             last_master_io_secs: AtomicU64::new(0),
+            link_phase: std::sync::atomic::AtomicU8::new(LINK_CONNECTING),
         }
     }
 
@@ -1715,13 +1738,12 @@ impl ReplicationHub {
                 out.extend_from_slice(b"\r\n");
                 out.extend_from_slice(master_host.as_bytes());
                 out.extend_from_slice(format!("\r\n:{}\r\n$", master_port).as_bytes());
-                let state_str = if link_status == "up" {
-                    "connected"
-                } else if sync_in_progress && self.loading.load(Ordering::Relaxed) {
-                    "sync"
+                let phase = if sync_in_progress && self.loading.load(Ordering::Relaxed) {
+                    LINK_SYNC
                 } else {
-                    "connect"
+                    self.link_phase.load(Ordering::Relaxed)
                 };
+                let state_str = link_state_name(link_status == "up", phase);
                 out.extend_from_slice(state_str.len().to_string().as_bytes());
                 out.extend_from_slice(b"\r\n");
                 out.extend_from_slice(state_str.as_bytes());
@@ -2849,6 +2871,7 @@ async fn run_replica_worker(
             crate::log_notice!("MASTER <-> REPLICA sync started");
         }
 
+        hub.link_phase.store(LINK_CONNECTING, Ordering::Relaxed);
         // Resolved on every attempt, so a master behind a DNS name (e.g. a
         // Kubernetes service) is found again after it moves.
         let addr = resolve_master_addr(&master_host, master_port);
@@ -2876,6 +2899,7 @@ async fn run_replica_worker(
                 continue 'reconnect_loop;
             }
         };
+        hub.link_phase.store(LINK_HANDSHAKE, Ordering::Relaxed);
         *hub.sync_conn.lock() = Some(std::os::unix::io::AsRawFd::as_raw_fd(&stream));
         // Declared after `stream`, so it is dropped (clearing the slot)
         // before the socket is closed.
@@ -3134,6 +3158,7 @@ async fn run_replica_worker(
             );
         } else {
             crate::log_notice!("Full resync from master: {}:{}", new_replid, initial_offset);
+            hub.link_phase.store(LINK_SYNC, Ordering::Relaxed);
             // Our history no longer gets continued: if this sync fails, the
             // next attempt is a full one too.
             hub.cached_master.store(false, Ordering::Relaxed);
@@ -3936,6 +3961,14 @@ mod tests {
         hub.update_replica_ack(rep.id, offset, None);
         assert_eq!(rep.ack_offset.load(Ordering::SeqCst), offset);
         hub.unregister_replica(rep.id);
+    }
+
+    #[test]
+    fn test_role_names_link_phases_like_redis() {
+        assert_eq!(link_state_name(true, LINK_SYNC), "connected");
+        assert_eq!(link_state_name(false, LINK_CONNECTING), "connecting");
+        assert_eq!(link_state_name(false, LINK_HANDSHAKE), "handshake");
+        assert_eq!(link_state_name(false, LINK_SYNC), "sync");
     }
 
     /// `repl-timeout` on the master: an online replica silent for longer
