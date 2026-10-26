@@ -2349,6 +2349,27 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// A WAIT / WAITAOF timeout in milliseconds (0 = forever), checked as
+/// Redis checks it: an integer, not negative, and not so large that adding
+/// it to the current time overflows (a near-i64::MAX value used to block
+/// the client for good instead of erroring).
+fn parse_wait_timeout(arg: &[u8]) -> Result<u64, String> {
+    let ms: i64 = std::str::from_utf8(arg)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+    if ms < 0 {
+        return Err("timeout is negative".to_string());
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    if ms.checked_add(now_ms).is_none() {
+        return Err("timeout is out of range".to_string());
+    }
+    Ok(ms as u64)
+}
+
 #[inline(always)]
 pub fn get_proto_max_bulk_len() -> usize {
     #[cfg(test)]
@@ -3734,10 +3755,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            let timeout: u64 = std::str::from_utf8(&args[2])
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let timeout = parse_wait_timeout(&args[2])?;
             Ok(Some(Command::Wait {
                 numreplicas,
                 timeout,
@@ -3755,10 +3773,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            let timeout: u64 = std::str::from_utf8(&args[3])
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let timeout = parse_wait_timeout(&args[3])?;
             Ok(Some(Command::WaitAof {
                 numlocal,
                 numreplicas,
@@ -14386,6 +14401,32 @@ fn find_newline_at(buf: &[u8], start: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_wait_timeout_is_validated_like_redis() {
+        let parse = |args: &[&str]| {
+            let mut frame = format!("*{}\r\n", args.len());
+            for a in args {
+                frame.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            parse_command(&mut BytesMut::from(frame.as_str()))
+        };
+        assert!(matches!(
+            parse(&["WAIT", "1", "5000"]),
+            Ok(Some(Command::Wait {
+                numreplicas: 1,
+                timeout: 5000
+            }))
+        ));
+        let err = |args: &[&str]| parse(args).unwrap_err();
+        assert!(err(&["WAIT", "2", "9223372036854775808"]).contains("out of range"));
+        assert_eq!(
+            err(&["WAIT", "2", "9223372036854775807"]),
+            "timeout is out of range"
+        );
+        assert_eq!(err(&["WAIT", "2", "-1"]), "timeout is negative");
+        assert_eq!(err(&["WAITAOF", "0", "0", "-5"]), "timeout is negative");
+    }
 
     /// Deterministic byte-level mutator shared by the parser fuzz tests.
     /// `RUDIS_FUZZ_ITERS` raises the iteration count for longer local runs.

@@ -35034,3 +35034,21 @@ fn test_debug_object_shows_expired_but_present_key_e2e() {
         "+OK\r\n"
     );
 }
+
+/// WAIT refuses a negative timeout, or one so large it overflows when
+/// added to the clock, instead of blocking the client for good.
+#[test]
+fn test_wait_refuses_out_of_range_timeouts_e2e() {
+    let port = 29851;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let r = resp_cmd(&mut c, &["WAIT", "2", "9223372036854775807"]);
+    assert!(r.contains("timeout is out of range"), "{r}");
+    let r = resp_cmd(&mut c, &["WAIT", "2", "9223372036854775808"]);
+    assert!(r.contains("out of range"), "{r}");
+    let r = resp_cmd(&mut c, &["WAIT", "2", "-1"]);
+    assert!(r.contains("timeout is negative"), "{r}");
+    // No replicas: WAIT 0 returns at once.
+    assert_eq!(resp_cmd(&mut c, &["WAIT", "0", "100"]), ":0\r\n");
+}
