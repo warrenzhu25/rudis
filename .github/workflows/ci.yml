@@ -187,6 +187,16 @@ jobs:
           set -o pipefail
           SKIP_BUILD=1 bash scripts/run_redis_test_suite.sh 16379 all 2>&1 | tee /tmp/rudis_tcl_suites.log
 
+      # Replication suites that start their own servers (a master, replicas,
+      # restarts), through the integration wrapper. Only suites that need no
+      # redis-cli / redis-benchmark binaries, which the runner lacks.
+      - name: Run the replication integration suites
+        run: |
+          set -o pipefail
+          SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
+            integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart \
+            2>&1 | tee -a /tmp/rudis_tcl_suites.log
+
       # Annotations are visible on the run page without downloading logs.
       - name: Report failing TCL tests
         if: failure()
