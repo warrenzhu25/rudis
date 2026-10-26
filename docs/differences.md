@@ -62,6 +62,13 @@ This document summarizes the architectural, operational, and semantic difference
 * **Rudis's own replica implementation also uses a single-connection `PSYNC` stream** against another Rudis (or Redis/Valkey) master — this is not a difference from Redis.
 * Rudis's master side additionally implements the Dragonfly-specific handshake (`REPLCONF capa dragonfly`) and can serve $N$ parallel `DFLY FLOW` connections (`DFLY FLOW <replid> <sync_id> <shard_id>`) to a client that performs that handshake itself — but this is a compatibility surface for Dragonfly-protocol-aware clients, not something Rudis-to-Rudis replication exercises today. No linear-scaling replication bandwidth figure for this path has been independently measured for this revision; treat any such figure as unverified until traced to a committed benchmark document. See [replication.md](replication.md) for the full protocol split.
 
+### Full-Sync Loading on the Replica
+* A rudis replica always receives the master's RDB into a temp file and loads it once the transfer is complete, like Redis's default `repl-diskless-load disabled`: a transfer that breaks off leaves the old dataset untouched. `repl-diskless-load swapdb` / `on-empty-db` are accepted and behave the same way; there is no `async_loading` (serving the old dataset while the new one loads) — data commands get `-LOADING` during the load.
+* `repl-diskless-sync-delay` is accepted but ignored: each replica's snapshot is streamed on its own, so there is no shared BGSAVE for late replicas to join.
+
+### Turning AOF On or Off
+* `appendonly` is read at startup only. `CONFIG SET appendonly` (which Redis uses to enable AOF on a live server, starting with a rewrite) is refused; restart with the new setting.
+
 ---
 
 ## 4. Multi-Protocol Engine (Redis + Memcached)
