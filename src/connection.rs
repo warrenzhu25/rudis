@@ -29713,8 +29713,12 @@ mod tests {
         let g = super::WriteRunning::enter(true);
         assert!(super::writes_running() >= 1);
         drop(g);
-        let batch = super::enter_write_batch(&[set.clone(), get.clone()]).expect("not paused");
-        drop(batch);
+        // Other tests may pause clients meanwhile (the pause is global):
+        // then the batch is refused instead.
+        match super::enter_write_batch(&[set.clone(), get.clone()]) {
+            Some(batch) => drop(batch),
+            None => assert!(super::is_client_paused().is_some()),
+        }
         // Reads only: never counted, never refused.
         assert!(super::enter_write_batch(&[get.clone(), get]).is_some());
     }
