@@ -2896,6 +2896,25 @@ pub async fn wait_streams_flushed(port: u16, shards: usize) {
     }
 }
 
+/// For a thread outside the runtime (the cluster bus): blocks until no
+/// write that passed the pause gate is still running and every shard
+/// streamed what it holds, so the offset read next covers every
+/// acknowledged write. False if that took longer than `timeout`.
+pub fn wait_writes_streamed_blocking(
+    port: u16,
+    shards: usize,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while crate::connection::writes_running() > 0 || !streams_flushed(port, shards) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+    true
+}
+
 #[inline(always)]
 pub fn propagate_bytes(port: u16, bytes: &[u8]) {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) || PROPAGATION_SUPPRESSED.get() {
@@ -5474,6 +5493,39 @@ mod tests {
         // Returned only once the other shard streamed what it held.
         assert!(rep.take_pending().ends_with(b"held"));
         assert!(streams_flushed(port, 2));
+        shard.join().unwrap();
+        hub.unregister_replica(rep.id);
+    }
+
+    #[test]
+    fn test_wait_writes_streamed_blocking_waits_for_held_bytes() {
+        let port = 19965;
+        let hub = get_replication_hub(port);
+        let (tx, _rx) = flume::unbounded();
+        let rep = hub.register_replica(65, tx);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let shard = std::thread::spawn(move || {
+            begin_stream_batch(port, 2);
+            propagate_shard_bytes(port, 2, b"*1\r\n$4\r\nheld\r\n");
+            held_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            end_stream_batch();
+        });
+        held_rx.recv().unwrap();
+        // Held: times out rather than report an offset missing them.
+        assert!(!wait_writes_streamed_blocking(
+            port,
+            3,
+            std::time::Duration::from_millis(30)
+        ));
+        go_tx.send(()).unwrap();
+        assert!(wait_writes_streamed_blocking(
+            port,
+            3,
+            std::time::Duration::from_secs(5)
+        ));
+        assert!(rep.take_pending().ends_with(b"held\r\n"));
         shard.join().unwrap();
         hub.unregister_replica(rep.id);
     }

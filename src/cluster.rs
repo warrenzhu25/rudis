@@ -2584,6 +2584,15 @@ pub fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             }
             crate::connection::set_client_pause(MANUAL_FAILOVER_TIMEOUT_MS, true);
             hub.mf_paused.store(true, Ordering::SeqCst);
+            // Writes that passed the pause gate before it closed, and bytes
+            // shards still hold, must be in the offset the replica reaches.
+            if !crate::replication::wait_writes_streamed_blocking(
+                hub.port,
+                hub.num_shards.load(Ordering::Acquire).max(1),
+                Duration::from_secs(1),
+            ) {
+                return Some("-ERR writes did not settle for the manual failover\r\n".to_string());
+            }
             let offset = crate::replication::get_replication_hub(hub.port)
                 .master_repl_offset
                 .load(Ordering::SeqCst);
