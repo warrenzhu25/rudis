@@ -135,3 +135,4 @@ Because each shard streams independently and in parallel over its own socket, th
 - `DFLY FLOW` sessions do not appear in `INFO replication`'s `connected_slaves` or in `ROLE`'s replica list.
 - `DFLY FLOW`'s `lsn` resume parameter is accepted but not wired up to a partial per-flow resync.
 - Rudis's own replica implementation only ever speaks `PSYNC`; there is no rudis-to-rudis `DFLY FLOW` mode.
+- A full sync serializes each shard at its own moment, so a cross-shard write (`MSET`, `EXEC`, `LMOVE`) racing it can be half in the snapshot; and a cross-shard `LMOVE`/`RPOPLPUSH`/`SMOVE` racing a plain write to its source key can reach a replica in the other order (see [`differences.md`](differences.md)).

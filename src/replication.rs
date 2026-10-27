@@ -552,9 +552,6 @@ pub struct ReplicationHub {
     /// `cached_primary->db`, and reset to `repl-stream-db` (default 0) on full
     /// resynchronization.
     pub replica_selected_db: std::sync::atomic::AtomicUsize,
-    /// Cross-shard composite operations increment this while running internal
-    /// per-shard steps so they can propagate a single logical command instead.
-    pub suppress_propagation: std::sync::atomic::AtomicUsize,
     /// `replica-priority` / `slave-priority` (default 100; 0 = never promote).
     pub replica_priority: AtomicU64,
     /// `replica-announce-ip` / `slave-announce-ip` sent in `REPLCONF ip-address`.
@@ -575,16 +572,6 @@ pub struct ReplicationHub {
     /// Set while a failover has turned us into the target's replica: the
     /// replica worker then sends `PSYNC <replid> <offset> FAILOVER`.
     failover_in_progress: AtomicBool,
-}
-
-/// Suppresses replication propagation across all shards for a `ReplicationHub`
-/// until dropped.
-pub struct SuppressHubPropagation(Arc<ReplicationHub>);
-
-impl Drop for SuppressHubPropagation {
-    fn drop(&mut self) {
-        self.0.suppress_propagation.fetch_sub(1, Ordering::Release);
-    }
 }
 
 /// Holds `ReplicationHub::apply_token` until dropped.
@@ -725,7 +712,6 @@ impl ReplicationHub {
             apply_token: (token_tx, token_rx),
             pinger_running: AtomicBool::new(false),
             replica_selected_db: std::sync::atomic::AtomicUsize::new(0),
-            suppress_propagation: std::sync::atomic::AtomicUsize::new(0),
             replica_priority: AtomicU64::new(100),
             announce_ip: RwLock::new(None),
             announce_port: AtomicU16::new(0),
@@ -735,11 +721,6 @@ impl ReplicationHub {
             restart_grace: AtomicBool::new(false),
             failover_in_progress: AtomicBool::new(false),
         }
-    }
-
-    pub fn suppress_hub_propagation(self: &Arc<Self>) -> SuppressHubPropagation {
-        self.suppress_propagation.fetch_add(1, Ordering::Acquire);
-        SuppressHubPropagation(self.clone())
     }
 
     /// True when this server is already replicating from `host:port`.
@@ -2712,9 +2693,7 @@ pub fn propagate_bytes(port: u16, bytes: &[u8]) {
         return;
     }
     let hub = get_replication_hub(port);
-    if !hub.replication_active.load(Ordering::Relaxed)
-        || hub.suppress_propagation.load(Ordering::Acquire) != 0
-    {
+    if !hub.replication_active.load(Ordering::Relaxed) {
         return;
     }
     hub.propagate(bytes);
@@ -2726,9 +2705,7 @@ pub fn propagate_shard_bytes(port: u16, shard_id: usize, bytes: &[u8]) {
         return;
     }
     let hub = get_replication_hub(port);
-    if !hub.replication_active.load(Ordering::Relaxed)
-        || hub.suppress_propagation.load(Ordering::Acquire) != 0
-    {
+    if !hub.replication_active.load(Ordering::Relaxed) {
         return;
     }
     hub.propagate_shard(shard_id, bytes);

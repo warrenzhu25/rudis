@@ -28860,6 +28860,7 @@ async fn flush_remote_batches(
                 client_id: requesting_client_id(),
                 no_touch: CLIENT_NO_TOUCH.get(),
                 defer_bcast: DEFER_BCAST_FLUSH.get(),
+                replicate_as: None,
             };
             if router.senders[target_shard].send(msg).is_ok() {
                 pending_mask |= 1u64 << target_shard;
@@ -28936,6 +28937,43 @@ async fn exec_on_shard(router: &Router, shard: usize, cmd: Command) -> Vec<u8> {
     } else {
         router.execute_remote(shard, cmd).await
     }
+}
+
+/// [`exec_on_shard`], but the shard replicates `bytes` (empty: nothing)
+/// instead of what `cmd` changes, right after running it and in its own
+/// stream order: one half of a cross-shard command replicated as one
+/// logical command (see `Router::execute_remote_replicate_as`).
+async fn exec_on_shard_replicate_as(
+    router: &Router,
+    shard: usize,
+    cmd: Command,
+    bytes: Bytes,
+) -> Vec<u8> {
+    if shard == router.shard_id {
+        let mut out = Vec::new();
+        {
+            let _no_repl = crate::replication::SuppressPropagation::new();
+            execute_local_command(
+                &cmd,
+                &mut router.local_db.borrow_mut(),
+                &mut out,
+                router.aof().as_deref(),
+            );
+        }
+        if !bytes.is_empty() {
+            crate::replication::propagate_shard_bytes(router.base_port, router.shard_id, &bytes);
+        }
+        out
+    } else {
+        router.execute_remote_replicate_as(shard, cmd, bytes).await
+    }
+}
+
+/// The RESP form of `cmd` to replicate (empty if it has none).
+fn logical_repl_bytes(cmd: &Command) -> Bytes {
+    crate::aof::command_to_resp(cmd)
+        .map(Bytes::from)
+        .unwrap_or_default()
 }
 
 /// Payload of a `$N\r\n...\r\n` bulk reply; None for nil or anything else.
@@ -29139,8 +29177,6 @@ async fn move_element_across_shards(
         if dst_type != b"+none\r\n" && dst_type != kind {
             return WRONGTYPE.to_vec();
         }
-        let suppress =
-            crate::replication::get_replication_hub(router.base_port).suppress_hub_propagation();
         match op {
             CrossShardElementMove::List {
                 from,
@@ -29157,7 +29193,7 @@ async fn move_element_across_shards(
                         count: None,
                     },
                 };
-                let popped = exec_on_shard(router, s, pop).await;
+                let popped = exec_on_shard_replicate_as(router, s, pop, Bytes::new()).await;
                 let Some(elem) = resp_bulk_payload(&popped) else {
                     return popped;
                 };
@@ -29172,55 +29208,50 @@ async fn move_element_across_shards(
                         values,
                     },
                 };
-                let _ = exec_on_shard(router, d, push).await;
-                drop(suppress);
-                if crate::replication::has_connected_replicas(router.base_port)
-                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Lmove {
-                        source: src.clone(),
-                        destination: dst.clone(),
-                        where_from: from,
-                        where_to: to,
-                        is_rpoplpush,
-                    })
-                {
-                    crate::replication::propagate_bytes(router.base_port, &bytes);
-                }
+                // The destination's shard replicates the logical LMOVE with
+                // the push, so it keeps its place among that list's other
+                // writes (a later RPUSH from another client stays later).
+                let lmove = logical_repl_bytes(&Command::Lmove {
+                    source: src.clone(),
+                    destination: dst.clone(),
+                    where_from: from,
+                    where_to: to,
+                    is_rpoplpush,
+                });
+                let _ = exec_on_shard_replicate_as(router, d, push, lmove).await;
                 let mut out = Vec::new();
                 write_resp_bulk(&mut out, &elem);
                 out
             }
             CrossShardElementMove::Set { member } => {
-                let removed = exec_on_shard(
+                let removed = exec_on_shard_replicate_as(
                     router,
                     s,
                     Command::Srem {
                         key: src.clone(),
                         members: smallvec::smallvec![member.clone()],
                     },
+                    Bytes::new(),
                 )
                 .await;
                 if resp_integer(&removed) != Some(1) {
                     return removed;
                 }
-                let _ = exec_on_shard(
+                let smove = logical_repl_bytes(&Command::Smove {
+                    source: src.clone(),
+                    destination: dst.clone(),
+                    member: member.clone(),
+                });
+                let _ = exec_on_shard_replicate_as(
                     router,
                     d,
                     Command::Sadd {
                         key: dst.clone(),
-                        members: smallvec::smallvec![member.clone()],
+                        members: smallvec::smallvec![member],
                     },
+                    smove,
                 )
                 .await;
-                drop(suppress);
-                if crate::replication::has_connected_replicas(router.base_port)
-                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Smove {
-                        source: src.clone(),
-                        destination: dst.clone(),
-                        member,
-                    })
-                {
-                    crate::replication::propagate_bytes(router.base_port, &bytes);
-                }
                 b":1\r\n".to_vec()
             }
         }
@@ -29310,30 +29341,36 @@ async fn blmove_across_shards(
                 router.target_shard(source),
                 router.target_shard(destination),
             );
-            let suppress = crate::replication::get_replication_hub(router.base_port)
-                .suppress_hub_propagation();
             let dst_type = exec_on_shard(router, d, Command::Type(destination.clone())).await;
             if dst_type != b"+none\r\n" && dst_type != b"+list\r\n" {
-                let _ = exec_on_shard(router, s, push(source, where_from, elem)).await;
-                drop(suppress);
+                let _ = exec_on_shard_replicate_as(
+                    router,
+                    s,
+                    push(source, where_from, elem),
+                    Bytes::new(),
+                )
+                .await;
                 out.extend_from_slice(
                     b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
                 );
                 return client_disconnected;
             }
-            let _ = exec_on_shard(router, d, push(destination, where_to, elem.clone())).await;
-            drop(suppress);
-            if crate::replication::has_connected_replicas(router.base_port)
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Lmove {
-                    source: source.clone(),
-                    destination: destination.clone(),
-                    where_from,
-                    where_to,
-                    is_rpoplpush,
-                })
-            {
-                crate::replication::propagate_bytes(router.base_port, &bytes);
-            }
+            // Replicated by the destination's shard with the push (see
+            // `move_element_across_shards`).
+            let lmove = logical_repl_bytes(&Command::Lmove {
+                source: source.clone(),
+                destination: destination.clone(),
+                where_from,
+                where_to,
+                is_rpoplpush,
+            });
+            let _ = exec_on_shard_replicate_as(
+                router,
+                d,
+                push(destination, where_to, elem.clone()),
+                lmove,
+            )
+            .await;
             if client_disconnected {
                 return true;
             }

@@ -51,6 +51,9 @@ This document summarizes the architectural, operational, and semantic difference
   - A cross-shard `EXEC` isn't isolated from plain single-key commands.
   - Other multi-key commands spanning shards (`DEL`, `UNLINK`, `EXISTS`, `TOUCH` with several
     keys) run per shard.
+  - Replicas: a cross-shard `LMOVE`/`RPOPLPUSH`/`SMOVE` racing a plain write to its *source*
+    key (that doesn't commute with the pop) can apply in the other order on a replica, and one
+    racing a full sync can be half in the replica's snapshot.
 
   To make related keys atomic in every case, put them on one shard with a hash tag
   (`{user:1}:a`, `{user:1}:b`).

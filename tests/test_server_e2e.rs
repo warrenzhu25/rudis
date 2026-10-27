@@ -23224,6 +23224,117 @@ fn test_debug_digest_replica_matches_master_e2e() {
     resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
 }
 
+/// Sends `cmds` as one pipeline and reads until the trailing ECHO marker
+/// comes back, so every reply has arrived.
+fn pipeline_all(c: &mut TcpStream, cmds: &[Vec<String>], marker: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for cmd in cmds.iter().chain(std::iter::once(&vec![
+        "ECHO".to_string(),
+        marker.to_string(),
+    ])) {
+        out.extend_from_slice(format!("*{}\r\n", cmd.len()).as_bytes());
+        for a in cmd {
+            out.extend_from_slice(format!("${}\r\n{}\r\n", a.len(), a).as_bytes());
+        }
+    }
+    c.write_all(&out).unwrap();
+    let end = format!("${}\r\n{}\r\n", marker.len(), marker);
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !got.ends_with(end.as_bytes()) {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        got.extend_from_slice(&buf[..n]);
+    }
+    got
+}
+
+/// Cross-shard LMOVE / SMOVE replicate as one logical command, from the
+/// destination's shard right after the push. Other clients' writes
+/// meanwhile must still reach the replica (the moves once muted the whole
+/// stream while they ran), and later pushes to the destination must stay
+/// after the move.
+///
+/// Known gap, not covered: the source half is popped before the logical
+/// command is streamed, so a plain write to the source key in between that
+/// doesn't commute with the pop (an RPUSH racing an RPOPLPUSH from the
+/// same list) can still reach the replica in the other order. Tail pushes
+/// do commute with head pops, which is what this test races.
+#[test]
+fn test_cross_shard_moves_replicate_without_losing_concurrent_writes_e2e() {
+    let (mp, rp) = (18410, 18411);
+    start_test_server(mp, 4);
+    start_test_server(rp, 2);
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd_all(&mut m, &["WAIT", "1", "100"]) != ":1\r\n" {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+    }
+    // Keys on different shards, so the moves really cross shards.
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let handles: Vec<_> = (0..4)
+        .map(|c| {
+            let mut cmds = Vec::new();
+            for i in 0..1500 {
+                cmds.push(s(&["SET", &format!("k:{c}:{i}"), "v"]));
+                if i % 5 == 0 {
+                    cmds.push(s(&[
+                        "RPUSH",
+                        &format!("list:{}", c % 2),
+                        &format!("{c}-{i}"),
+                    ]));
+                    cmds.push(s(&["SADD", "set:a", &format!("{c}-{i}")]));
+                }
+                if i % 7 == 0 {
+                    cmds.push(s(&["LMOVE", "list:0", "list:1", "LEFT", "RIGHT"]));
+                    cmds.push(s(&[
+                        "SMOVE",
+                        "set:a",
+                        "set:b",
+                        &format!("{c}-{}", i / 5 * 5),
+                    ]));
+                }
+            }
+            thread::spawn(move || {
+                let mut conn = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+                pipeline_all(&mut conn, &cmds, &format!("done-{c}"));
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(resp_cmd_all(&mut m, &["WAIT", "1", "5000"]), ":1\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (dm, dr) = (debug_digest(&mut m), debug_digest(&mut r));
+        if dm == dr {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "digests differ: {dm} {dr}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        resp_cmd_all(&mut r, &["DBSIZE"]),
+        resp_cmd_all(&mut m, &["DBSIZE"])
+    );
+    for key in ["list:0", "list:1"] {
+        assert_eq!(
+            resp_cmd_all(&mut r, &["LRANGE", key, "0", "-1"]),
+            resp_cmd_all(&mut m, &["LRANGE", key, "0", "-1"])
+        );
+    }
+    resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
+}
+
 /// Flattens a RESP reply into its scalar values, dropping the nesting.
 fn resp_scalars(reply: &str) -> Vec<String> {
     let mut out = Vec::new();

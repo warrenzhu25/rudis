@@ -502,6 +502,11 @@ pub enum ShardMessage {
         /// Defer tracking broadcasts until the requesting client's EXEC
         /// ends (it flushes them).
         defer_bcast: bool,
+        /// Replicate these bytes instead of what the commands change (empty:
+        /// nothing), right after running them, in this shard's stream: one
+        /// half of a cross-shard command replicated as one logical command
+        /// (see `Router::execute_remote_replicate_as`).
+        replicate_as: Option<bytes::Bytes>,
     },
     Mget {
         db: usize,

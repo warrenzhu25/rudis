@@ -875,9 +875,13 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         client_id,
                         no_touch,
                         defer_bcast,
+                        replicate_as,
                     } => {
                         let has_tier_manager = cross_shard_db.borrow().tier_manager.is_some();
                         {
+                            let no_repl = replicate_as
+                                .as_ref()
+                                .map(|_| crate::replication::SuppressPropagation::new());
                             crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
                             crate::connection::CURRENT_DB.set(batch_db);
                             let prev_no_touch = crate::connection::CLIENT_NO_TOUCH.replace(no_touch);
@@ -1474,6 +1478,11 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             }
                             db.drain_dropped_tier();
                             drop(db);
+                            drop(no_repl);
+                            if let Some(bytes) = replicate_as.filter(|b| !b.is_empty()) {
+                                crate::connection::CURRENT_DB.set(batch_db);
+                                crate::replication::propagate_shard_bytes(port, shard_id, &bytes);
+                            }
                             crate::connection::CURRENT_CLIENT_ID.set(prev_cid);
                             crate::connection::CLIENT_NO_TOUCH.set(prev_no_touch);
                             crate::connection::DEFER_BCAST_FLUSH.set(prev_defer);
