@@ -194,7 +194,7 @@ jobs:
         run: |
           set -o pipefail
           SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
-            integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover \
+            integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown \
             2>&1 | tee -a /tmp/rudis_tcl_suites.log
 
       # Annotations are visible on the run page without downloading logs.
