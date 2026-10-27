@@ -23335,6 +23335,91 @@ fn test_cross_shard_moves_replicate_without_losing_concurrent_writes_e2e() {
     resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
 }
 
+/// A full sync while clients do nothing but cross-shard LMOVEs, each
+/// waiting 2 ms between its pop and its push (DEBUG
+/// CROSS-SHARD-MOVE-DELAY), so one is nearly always half done. Each
+/// shard's snapshot is
+/// cut at its own moment, so without holding moves back a move could be
+/// popped before the source's cut and pushed after the destination's,
+/// then replicated (as one LMOVE) on top of a snapshot already missing
+/// the element: the replica would pop a second one.
+#[test]
+fn test_full_sync_during_cross_shard_moves_matches_master_e2e() {
+    let (mp, rp) = (18412, 18413);
+    start_test_server(mp, 4);
+    start_test_server(rp, 2);
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    assert_eq!(
+        resp_cmd_all(&mut m, &["DEBUG", "CROSS-SHARD-MOVE-DELAY", "2000"]),
+        "+OK\r\n"
+    );
+    // Eight list pairs: most pairs straddle shards.
+    let pairs = 8;
+    for p in 0..pairs {
+        for side in ["a", "b"] {
+            let key = format!("ring:{p}:{side}");
+            let mut cmd = vec!["RPUSH".to_string(), key.clone()];
+            cmd.extend((0..200).map(|i| format!("{side}{i}")));
+            let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            assert_eq!(resp_cmd_all(&mut m, &args), ":200\r\n");
+        }
+    }
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let writers: Vec<_> = (0..4)
+        .map(|c| {
+            let mut cmds = Vec::new();
+            for i in 0..400 {
+                let p = (i + c) % pairs;
+                let (from, to) = if c % 2 == 0 { ("a", "b") } else { ("b", "a") };
+                cmds.push(s(&[
+                    "LMOVE",
+                    &format!("ring:{p}:{from}"),
+                    &format!("ring:{p}:{to}"),
+                    "LEFT",
+                    "RIGHT",
+                ]));
+            }
+            thread::spawn(move || {
+                let mut conn = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+                pipeline_all(&mut conn, &cmds, &format!("moved-{c}"));
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    for w in writers {
+        w.join().unwrap();
+    }
+    resp_cmd_all(&mut m, &["DEBUG", "CROSS-SHARD-MOVE-DELAY", "0"]);
+    assert_eq!(resp_cmd_all(&mut m, &["WAIT", "1", "10000"]), ":1\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (dm, dr) = (debug_digest(&mut m), debug_digest(&mut r));
+        if dm == dr {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let lens: Vec<String> = (0..pairs)
+                .flat_map(|p| ["a", "b"].map(|side| format!("ring:{p}:{side}")))
+                .map(|k| {
+                    format!(
+                        "{k} {}/{}",
+                        resp_cmd_all(&mut m, &["LLEN", &k]).trim(),
+                        resp_cmd_all(&mut r, &["LLEN", &k]).trim()
+                    )
+                })
+                .collect();
+            panic!("digests differ: master {dm} replica {dr}; LLEN master/replica: {lens:?}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
+}
+
 /// Shards hold their replication bytes for a mailbox burst and stream them
 /// once. Pipelined writes from several clients over every shard (DB
 /// switches, cross-shard LMOVE, a FLUSHALL right after remote writes, a
@@ -23359,12 +23444,13 @@ fn test_batched_replication_stream_keeps_order_and_wait_counts_it_e2e() {
     }
 
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-    // `moves`: cross-shard LMOVEs too. Not while a full sync runs: shards
-    // serialize at different moments, so a move between them is half in
-    // the snapshot (a known gap of the per-shard full sync).
-    let writes = |c: usize, round: usize, moves: bool| {
+    // Cross-shard writes too: LMOVE, MSET, MULTI/EXEC. A full sync holds
+    // them back while it cuts each shard, so none is half in the snapshot.
+    let writes = |c: usize, round: usize| {
         let mut cmds = Vec::new();
-        for i in 0..1500 {
+        // Round 1 runs long enough for the full sync to start inside it.
+        let n = if round == 1 { 6000 } else { 1500 };
+        for i in 0..n {
             cmds.push(s(&["SET", &format!("k:{c}:{i}"), &format!("v{round}-{i}")]));
             cmds.push(s(&["INCR", &format!("ctr:{c}")]));
             if i % 10 == 0 {
@@ -23380,16 +23466,35 @@ fn test_batched_replication_stream_keeps_order_and_wait_counts_it_e2e() {
                     &format!("{c}-{i}"),
                 ]));
             }
-            if moves && i % 13 == 0 {
+            if i % 11 == 0 {
+                let (a, b) = (format!("ma:{c}:{i}"), format!("mb:{c}:{i}"));
+                cmds.push(s(&[
+                    "MSET",
+                    &a,
+                    "1",
+                    &b,
+                    "2",
+                    "mcount",
+                    &format!("{c}-{i}"),
+                ]));
+            }
+            if i % 17 == 0 {
+                cmds.push(s(&["MULTI"]));
+                cmds.push(s(&["INCR", "tx:a"]));
+                cmds.push(s(&["INCR", "tx:b"]));
+                cmds.push(s(&["RPUSH", "tx:log", &format!("{c}-{i}")]));
+                cmds.push(s(&["EXEC"]));
+            }
+            if i % 13 == 0 {
                 cmds.push(s(&["LMOVE", "list:0", "list:1", "LEFT", "RIGHT"]));
             }
         }
         cmds
     };
-    let run_round = |round: usize, moves: bool| {
+    let run_round = |round: usize| {
         let handles: Vec<_> = (0..4)
             .map(|c| {
-                let cmds = writes(c, round, moves);
+                let cmds = writes(c, round);
                 thread::spawn(move || {
                     let mut conn = TcpStream::connect(("127.0.0.1", mp)).unwrap();
                     let replies = pipeline_all(&mut conn, &cmds, &format!("done-{c}"));
@@ -23400,7 +23505,7 @@ fn test_batched_replication_stream_keeps_order_and_wait_counts_it_e2e() {
         handles
     };
 
-    for h in run_round(0, true) {
+    for h in run_round(0) {
         h.join().unwrap();
     }
     // A FLUSHALL right behind writes other shards still hold, then more.
@@ -23433,7 +23538,7 @@ fn test_batched_replication_stream_keeps_order_and_wait_counts_it_e2e() {
     );
 
     // A second replica full-syncs while four clients write.
-    let writers = run_round(1, false);
+    let writers = run_round(1);
     thread::sleep(Duration::from_millis(20));
     assert_eq!(
         resp_cmd_all(&mut rep2, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
@@ -23487,7 +23592,7 @@ fn test_batched_replication_stream_keeps_order_and_wait_counts_it_e2e() {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    assert_eq!(resp_cmd_all(&mut rep1, &["GET", "ctr:3"]), "$4\r\n1500\r\n");
+    assert_eq!(resp_cmd_all(&mut rep1, &["GET", "ctr:3"]), "$4\r\n6000\r\n");
     resp_cmd_all(&mut rep1, &["REPLICAOF", "NO", "ONE"]);
     resp_cmd_all(&mut rep2, &["REPLICAOF", "NO", "ONE"]);
 }

@@ -452,6 +452,13 @@ impl Drop for XShardLockedRead {
     }
 }
 
+/// Every cross-shard write held back (see [`Router::pause_cross_shard_writes`])
+/// until dropped.
+pub struct CrossShardWritesPaused<'a> {
+    _locks: TxLocksGuard<'a>,
+    _locked_read: XShardLockedRead,
+}
+
 /// Starts a cross-shard read: the epoch to check with
 /// [`xshard_read_is_consistent`], or `None` while a cross-shard write runs.
 #[inline]
@@ -4863,6 +4870,29 @@ impl Router {
         }
     }
 
+    /// Holds back every cross-shard write until the guard is dropped, and
+    /// returns once none is half applied: lock-free MSETs drain (later ones
+    /// take the locks), and every shard's VLL lock is taken, which EXEC,
+    /// MSETNX and cross-shard key / element moves hold while they write.
+    /// Single-key commands are not held. A full sync starts its snapshot
+    /// under it: each shard is cut at its own moment, and a cross-shard write
+    /// landing between two cuts would be half in the snapshot, half in the
+    /// stream, and never repaired on the replica.
+    pub async fn pause_cross_shard_writes(&self) -> CrossShardWritesPaused<'_> {
+        let locked_read = XShardLockedRead::begin().await;
+        let shards: SmallVec<[usize; 8]> = (0..self.num_shards).collect();
+        let tx_id = next_tx_id();
+        self.acquire_tx_locks(&shards, tx_id).await;
+        CrossShardWritesPaused {
+            _locks: TxLocksGuard {
+                router: self,
+                shards,
+                tx_id,
+            },
+            _locked_read: locked_read,
+        }
+    }
+
     pub async fn release_tx_locks(&self, shard_ids: &[usize], tx_id: u64) {
         self.release_tx_locks_now(shard_ids, tx_id);
     }
@@ -5776,8 +5806,15 @@ mod tests {
         assert!(!xshard_read_is_consistent(e), "a write started meanwhile");
         assert_eq!(xshard_read_begin(), None, "a write is running");
         drop(w);
-        let e = quiet_epoch();
-        drop(XShardWriteGuard::lock_free().expect("no locked reader"));
+        // (Another test may hold a locked reader: retry.)
+        let e = loop {
+            let e = quiet_epoch();
+            if let Some(w) = XShardWriteGuard::lock_free() {
+                drop(w);
+                break e;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
         assert!(!xshard_read_is_consistent(e), "a write ran meanwhile");
         assert_ne!(next_tx_id(), next_tx_id());
     }
@@ -7529,6 +7566,68 @@ mod tests {
         assert_eq!(quiet, b"+LOGICAL\r\n");
         assert_eq!(normal, b"_\r\n");
         t1.join().unwrap();
+    }
+
+    #[test]
+    fn test_pause_cross_shard_writes_holds_back_both_kinds_of_writer() {
+        let (mut senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
+        let router = Rc::new(Router::new(
+            0,
+            1,
+            9978,
+            Rc::new(RefCell::new(ShardDb::new(9978))),
+            senders_mesh.remove(0),
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        ));
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // A lock-free writer already running: the pause waits for it.
+            // (Another test may briefly read under the locks: retry.)
+            let writer = loop {
+                if let Some(w) = XShardWriteGuard::lock_free() {
+                    break w;
+                }
+                monoio::time::sleep(Duration::from_millis(1)).await;
+            };
+            let done = Rc::new(std::cell::Cell::new(false));
+            let pauser = {
+                let (router, done) = (router.clone(), done.clone());
+                monoio::spawn(async move {
+                    let paused = router.pause_cross_shard_writes().await;
+                    done.set(true);
+                    // Paused: a new MSET can't go lock-free, an EXEC or a
+                    // key move can't take a shard's lock.
+                    assert!(XShardWriteGuard::lock_free().is_none());
+                    let tx = next_tx_id();
+                    let locked = monoio::time::timeout(
+                        Duration::from_millis(50),
+                        router.acquire_tx_locks(&[0], tx),
+                    )
+                    .await;
+                    assert!(locked.is_err(), "took a lock the pause holds");
+                    drop(paused);
+                    // The timed-out waiter was dropped: the lock is free.
+                    let tx = next_tx_id();
+                    monoio::time::timeout(
+                        Duration::from_secs(2),
+                        router.acquire_tx_locks(&[0], tx),
+                    )
+                    .await
+                    .expect("lock free after the pause");
+                    router.release_tx_locks_now(&[0], tx);
+                })
+            };
+            monoio::time::sleep(Duration::from_millis(30)).await;
+            assert!(!done.get(), "paused while a lock-free write ran");
+            drop(writer);
+            pauser.await;
+            assert!(done.get());
+        });
     }
 
     #[test]

@@ -3143,6 +3143,20 @@ impl Drop for ReplayingWrites {
     }
 }
 pub static PAUSE_CRON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `DEBUG CROSS-SHARD-MOVE-DELAY <microseconds>` (a test knob): how long a
+/// cross-shard LMOVE / SMOVE waits between its pop and its push, so a test
+/// can catch one half done.
+pub static CROSS_SHARD_MOVE_DELAY_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Sleeps [`CROSS_SHARD_MOVE_DELAY_US`], if set.
+async fn cross_shard_move_delay() {
+    let us = CROSS_SHARD_MOVE_DELAY_US.load(std::sync::atomic::Ordering::Relaxed);
+    if us > 0 {
+        monoio::time::sleep(std::time::Duration::from_micros(us)).await;
+    }
+}
 pub static ACTIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static MAX_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
 pub static MAX_MEMORY_POLICY: parking_lot::RwLock<String> = parking_lot::RwLock::new(String::new());
@@ -7563,7 +7577,11 @@ async fn snapshot_for_replica(
         .ok_or(ReplicaSnapshotError::NoMasterLink)?;
     crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
     crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
-    let rdb = match router.generate_full_rdb(Some(client_id)).await {
+    // No cross-shard write may land between two shards' chunks.
+    let paused = router.pause_cross_shard_writes().await;
+    let rdb = router.generate_full_rdb(Some(client_id)).await;
+    drop(paused);
+    let rdb = match rdb {
         Ok(rdb) => rdb,
         Err(e) => {
             // Never ship a partial dataset: drop this attempt, the replica
@@ -7672,9 +7690,12 @@ async fn stream_full_sync(
         Some(ReplicaSnapshotError::Failed(e))
     };
     // 1. Start every shard's image (each arms its cut in the same step),
-    // after this shard streamed what it holds: held bytes streamed after
-    // the cut would reach the replica on top of an image already holding
-    // them (other shards do the same when StartSyncImage arrives).
+    // with cross-shard writes held back so none lands between two shards'
+    // cuts, and after this shard streamed what it holds: held bytes
+    // streamed after the cut would reach the replica on top of an image
+    // already holding them (other shards do the same when StartSyncImage
+    // arrives).
+    let paused = router.pause_cross_shard_writes().await;
     crate::replication::flush_stream_batch();
     let mut first_err =
         crate::shard::start_sync_image(&router.local_db.borrow(), router.shard_id, client_id)
@@ -7709,6 +7730,7 @@ async fn stream_full_sync(
             }
         }
     }
+    drop(paused);
     if let Some(e) = first_err {
         return Err(fail(e));
     }
@@ -19544,6 +19566,15 @@ async fn execute_command_inner(
                     crate::replication::cached_hub(router.base_port).change_replid();
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
+                } else if sub.eq_ignore_ascii_case(b"cross-shard-move-delay") {
+                    match args.get(1).and_then(|v| std::str::from_utf8(v).ok()?.parse::<u64>().ok()) {
+                        Some(us) => {
+                            CROSS_SHARD_MOVE_DELAY_US.store(us, std::sync::atomic::Ordering::Relaxed);
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                        None => out.extend_from_slice(b"-ERR value is not an integer or out of range\r\n"),
+                    }
+                    return false;
                 } else if sub.eq_ignore_ascii_case(b"set-active-expire") {
                     let enabled = args.get(1).map(|v| v.as_ref() != b"0").unwrap_or(true);
                     PAUSE_CRON.store(!enabled, std::sync::atomic::Ordering::Relaxed);
@@ -29212,6 +29243,7 @@ async fn move_element_across_shards(
                 let Some(elem) = resp_bulk_payload(&popped) else {
                     return popped;
                 };
+                cross_shard_move_delay().await;
                 let values = smallvec::smallvec![elem.clone()];
                 let push = match to {
                     crate::table::ListDirection::Left => Command::Lpush {
@@ -29253,6 +29285,7 @@ async fn move_element_across_shards(
                 if resp_integer(&removed) != Some(1) {
                     return removed;
                 }
+                cross_shard_move_delay().await;
                 let smove = logical_repl_bytes(&Command::Smove {
                     source: src.clone(),
                     destination: dst.clone(),

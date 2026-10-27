@@ -87,6 +87,9 @@ pub fn write_digest_array(out: &mut Vec<u8>, digests: &[crate::digest::Digest20]
 
 const HELP: &[&str] = &[
     "DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+    "CROSS-SHARD-MOVE-DELAY <microseconds>",
+    "    Wait <microseconds> between the two halves of a cross-shard LMOVE/SMOVE",
+    "    (a test knob; 0 turns it off).",
     "DIGEST",
     "    Output a hex signature representing the current DB content.",
     "DIGEST-VALUE <key> [<key> ...]",
