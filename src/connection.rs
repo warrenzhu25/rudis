@@ -1136,7 +1136,7 @@ pub fn not_enough_good_replicas(port: u16) -> bool {
     if min == 0 {
         return false;
     }
-    let hub = crate::replication::get_replication_hub(port);
+    let hub = crate::replication::cached_hub(port);
     if hub.is_slave() {
         return false;
     }
@@ -1527,7 +1527,7 @@ pub static REPLICA_IGNORE_MAXMEMORY: std::sync::atomic::AtomicBool =
 pub fn maxmemory_ignored_as_replica(port: u16) -> bool {
     REPLICA_IGNORE_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed)
         && crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
-        && crate::replication::get_replication_hub(port).is_slave()
+        && crate::replication::cached_hub(port).is_slave()
 }
 
 /// Applies `tcp-keepalive` to an accepted client socket, like Redis's
@@ -3566,7 +3566,7 @@ pub fn apply_config_value(
             } else {
                 std::mem::replace(&mut *CONFIG_OOM_SCORE_ADJ_VALUES.write(), values)
             };
-            let is_replica = crate::replication::get_replication_hub(base_port).is_slave();
+            let is_replica = crate::replication::cached_hub(base_port).is_slave();
             if let Err(e) = apply_oom_score_adj(is_replica) {
                 // Keep the setting in effect.
                 if name == "oom-score-adj" {
@@ -3630,12 +3630,12 @@ pub fn apply_config_value(
             REPLICA_IGNORE_MAXMEMORY.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
         }
         "replica-priority" | "slave-priority" => {
-            crate::replication::get_replication_hub(base_port)
+            crate::replication::cached_hub(base_port)
                 .replica_priority
                 .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
         }
         "replica-announce-ip" | "slave-announce-ip" => {
-            let hub = crate::replication::get_replication_hub(base_port);
+            let hub = crate::replication::cached_hub(base_port);
             *hub.announce_ip.write() = if val_str.is_empty() {
                 None
             } else {
@@ -3643,7 +3643,7 @@ pub fn apply_config_value(
             };
         }
         "replica-announce-port" | "slave-announce-port" => {
-            crate::replication::get_replication_hub(base_port)
+            crate::replication::cached_hub(base_port)
                 .announce_port
                 .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
         }
@@ -3882,7 +3882,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
     let repl_ping_period = crate::replication::REPL_PING_PERIOD
         .load(std::sync::atomic::Ordering::Relaxed)
         .to_string();
-    let hub = crate::replication::get_replication_hub(router.base_port);
+    let hub = crate::replication::cached_hub(router.base_port);
     let replica_priority = hub
         .replica_priority
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -4707,7 +4707,7 @@ pub fn get_active_clients() -> usize {
 /// counts them (replicas are `connected_slaves`), so a master with
 /// replicas does not look like it has clients that aren't there.
 pub fn connected_clients(base_port: u16) -> usize {
-    let replicas = crate::replication::get_replication_hub(base_port)
+    let replicas = crate::replication::cached_hub(base_port)
         .replicas
         .read()
         .len();
@@ -7671,7 +7671,11 @@ async fn stream_full_sync(
         crate::log_warning!("BGSAVE for replication failed: {}", e);
         Some(ReplicaSnapshotError::Failed(e))
     };
-    // 1. Start every shard's image (each arms its cut in the same step).
+    // 1. Start every shard's image (each arms its cut in the same step),
+    // after this shard streamed what it holds: held bytes streamed after
+    // the cut would reach the replica on top of an image already holding
+    // them (other shards do the same when StartSyncImage arrives).
+    crate::replication::flush_stream_batch();
     let mut first_err =
         crate::shard::start_sync_image(&router.local_db.borrow(), router.shard_id, client_id)
             .err()
@@ -8113,6 +8117,9 @@ async fn run_shard_replication_flow(
     }
     let (write_tx, write_rx) = flume::bounded::<Vec<u8>>(4096);
 
+    // Bytes this thread holds predate the snapshot below: stream them
+    // before the flow exists, as unbatched writes would have been.
+    crate::replication::flush_stream_batch();
     let flow_link = ShardFlowLink {
         hub: hub.clone(),
         shard_id,
@@ -10760,6 +10767,11 @@ async fn aof_reply_barrier(
     if batch_writes && !crate::aof::appendfsync_is_always(router.base_port) {
         router.write_aof_through(progress).await;
     }
+    // Shards hold replication bytes for a mailbox burst: an acknowledged
+    // write must be in the stream (WAIT, a replica promoted after it).
+    if batch_writes && crate::replication::has_connected_replicas(router.base_port) {
+        crate::replication::wait_streams_flushed(router.base_port, router.num_shards).await;
+    }
 }
 
 async fn aof_always_barrier(router: &Router, seen: &mut u64) {
@@ -10979,7 +10991,7 @@ fn writable_replica_write_keys(router: &Router, cmd: &Command) -> Option<Vec<Byt
     if !crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
         || REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
         || !cmd.is_write_command()
-        || !crate::replication::get_replication_hub(router.base_port).is_slave()
+        || !crate::replication::cached_hub(router.base_port).is_slave()
     {
         return None;
     }
@@ -11388,7 +11400,7 @@ async fn execute_command_inner(
 
     if crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
         && REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && crate::replication::get_replication_hub(router.base_port).is_slave()
+        && crate::replication::cached_hub(router.base_port).is_slave()
         && (cmd.is_write_command() || crate::aof::command_to_resp(&cmd).is_some())
     {
         out.extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");
@@ -12245,7 +12257,7 @@ async fn execute_command_inner(
             false
         }
         Command::Info(section) => {
-            let hub = crate::replication::get_replication_hub(router.base_port);
+            let hub = crate::replication::cached_hub(router.base_port);
             let stats = crate::tiering::get_tier_stats(router.base_port);
             let max_mem = crate::tiering::get_max_memory(router.base_port);
             let used_mem = router.get_total_used_memory().await;
@@ -12643,7 +12655,7 @@ async fn execute_command_inner(
             false
         }
         Command::Role => {
-            let hub = crate::replication::get_replication_hub(router.base_port);
+            let hub = crate::replication::cached_hub(router.base_port);
             out.extend_from_slice(&hub.format_role_resp());
             false
         }
@@ -12655,7 +12667,7 @@ async fn execute_command_inner(
                     && let Ok(s) = std::str::from_utf8(&args[1])
                     && let Ok(rport) = s.parse::<u16>()
                 {
-                    let hub = crate::replication::get_replication_hub(router.base_port);
+                    let hub = crate::replication::cached_hub(router.base_port);
                     hub.set_replica_port(client_id, rport);
                 }
                 out.extend_from_slice(b"+OK\r\n");
@@ -12663,16 +12675,16 @@ async fn execute_command_inner(
                 if args.len() >= 2
                     && let Ok(s) = std::str::from_utf8(&args[1])
                 {
-                    let hub = crate::replication::get_replication_hub(router.base_port);
+                    let hub = crate::replication::cached_hub(router.base_port);
                     hub.set_replica_announced_ip(client_id, s);
                 }
                 out.extend_from_slice(b"+OK\r\n");
             } else if args[0].eq_ignore_ascii_case(b"capa") {
                 if args.iter().any(|a| a.eq_ignore_ascii_case(b"eof")) {
-                    crate::replication::get_replication_hub(router.base_port).note_replica_capa_eof(client_id);
+                    crate::replication::cached_hub(router.base_port).note_replica_capa_eof(client_id);
                 }
                 if args.iter().any(|a| a.eq_ignore_ascii_case(b"dragonfly")) {
-                    let hub = crate::replication::get_replication_hub(router.base_port);
+                    let hub = crate::replication::cached_hub(router.base_port);
                     let replid = &hub.replid();
                     let num_shards = router.num_shards;
                     out.extend_from_slice(
@@ -12691,11 +12703,11 @@ async fn execute_command_inner(
                 if args.len() >= 2
                     && let Some(off) = parse_ack_offset(&args[1])
                 {
-                    let hub = crate::replication::get_replication_hub(router.base_port);
+                    let hub = crate::replication::cached_hub(router.base_port);
                     hub.update_replica_ack(client_id, off, parse_fack(&args));
                 }
             } else if args[0].eq_ignore_ascii_case(b"getack") {
-                let hub = crate::replication::get_replication_hub(router.base_port);
+                let hub = crate::replication::cached_hub(router.base_port);
                 let off = hub
                     .master_repl_offset
                     .load(std::sync::atomic::Ordering::SeqCst)
@@ -12732,7 +12744,7 @@ async fn execute_command_inner(
             false
         }
         Command::Replicaof { host, port } => {
-            let hub = crate::replication::get_replication_hub(router.base_port);
+            let hub = crate::replication::cached_hub(router.base_port);
             if host.eq_ignore_ascii_case(b"no") && port.eq_ignore_ascii_case(b"one") {
                 if hub.is_slave() {
                     hub.stop_sync_and_wait().await;
@@ -13335,7 +13347,7 @@ async fn execute_command_inner(
                 }
                 ClusterSubcommand::Failover { force } => {
                     let hub = crate::cluster::get_cluster_hub(router.base_port);
-                    let repl = crate::replication::get_replication_hub(router.base_port);
+                    let repl = crate::replication::cached_hub(router.base_port);
                     // Without FORCE, like Redis: the master pauses its
                     // writers and we take over only once we processed all it
                     // acknowledged.
@@ -13369,7 +13381,7 @@ async fn execute_command_inner(
                     // End the link to the old master before taking over, so
                     // nothing it sends lands after the promotion.
                     if hub.replication_master_addr().is_some() {
-                        crate::replication::get_replication_hub(router.base_port)
+                        crate::replication::cached_hub(router.base_port)
                             .stop_sync_and_wait()
                             .await;
                     }
@@ -13399,7 +13411,7 @@ async fn execute_command_inner(
                     Ok((host, mport)) => {
                         // The cluster role alone moves no data: replicate the
                         // master like REPLICAOF does.
-                        let hub = crate::replication::get_replication_hub(router.base_port);
+                        let hub = crate::replication::cached_hub(router.base_port);
                         if !hub.is_replicating_from(&host, mport) {
                             crate::log_notice!(
                                 "CLUSTER REPLICATE {}: replicating {}:{}",
@@ -13657,7 +13669,7 @@ async fn execute_command_inner(
                         if killed_cids.is_empty() {
                             // A replica's link to its master is a client in
                             // Redis, listed under the master's address.
-                            let hub = crate::replication::get_replication_hub(router.base_port);
+                            let hub = crate::replication::cached_hub(router.base_port);
                             if hub.drop_master_link_to(&target_addr) {
                                 out.extend_from_slice(b"+OK\r\n");
                             } else {
@@ -13863,7 +13875,7 @@ async fn execute_command_inner(
                                 && filter_user.is_none()
                                 && filter_laddr.is_none()
                             {
-                                let hub = crate::replication::get_replication_hub(router.base_port);
+                                let hub = crate::replication::cached_hub(router.base_port);
                                 let addr = match &*hub.role.read() {
                                     crate::replication::ReplicationRole::Slave {
                                         master_host,
@@ -16546,7 +16558,7 @@ async fn execute_command_inner(
 
             let is_replica = crate::replication::HAS_SLAVE_INSTANCE
                 .load(std::sync::atomic::Ordering::Relaxed)
-                && crate::replication::get_replication_hub(router.base_port).is_slave();
+                && crate::replication::cached_hub(router.base_port).is_slave();
             if is_replica {
                 out.extend_from_slice(b"$4\r\nrole\r\n$7\r\nreplica\r\n");
             } else {
@@ -19252,7 +19264,7 @@ async fn execute_command_inner(
             save, now, force, ..
         } => {
             crate::log_warning!("User requested shutdown...");
-            if !now && !crate::replication::wait_replicas_before_shutdown(router.base_port).await {
+            if !now && !crate::replication::wait_replicas_before_shutdown(router.base_port, router.num_shards).await {
                 // SHUTDOWN ABORT (already logged).
                 out.extend_from_slice(b"-ERR Errors trying to SHUTDOWN. Check logs.\r\n");
                 return false;
@@ -19304,6 +19316,8 @@ async fn execute_command_inner(
             numreplicas,
             timeout,
         } => {
+            // Writes pipelined before WAIT may still be held by a shard.
+            crate::replication::wait_streams_flushed(router.base_port, router.num_shards).await;
             match crate::replication::wait_replicas_for(client_id, router.base_port, numreplicas, timeout)
                 .await
             {
@@ -19317,7 +19331,7 @@ async fn execute_command_inner(
             numreplicas,
             timeout,
         } => {
-            if crate::replication::get_replication_hub(router.base_port).is_slave() {
+            if crate::replication::cached_hub(router.base_port).is_slave() {
                 out.extend_from_slice(b"-ERR WAITAOF cannot be used with replica instances. Please also note that writes to replicas are just local and are not propagated.\r\n");
                 return false;
             }
@@ -19334,6 +19348,7 @@ async fn execute_command_inner(
                 .aof()
                 .is_some()
                 .then(|| crate::replication::LocalAofTarget::now(router.base_port, router.num_shards));
+            crate::replication::wait_streams_flushed(router.base_port, router.num_shards).await;
             match crate::replication::wait_aof(
                 client_id,
                 router.base_port,
@@ -19526,7 +19541,7 @@ async fn execute_command_inner(
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
                 } else if sub.eq_ignore_ascii_case(b"change-repl-id") {
-                    crate::replication::get_replication_hub(router.base_port).change_replid();
+                    crate::replication::cached_hub(router.base_port).change_replid();
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
                 } else if sub.eq_ignore_ascii_case(b"set-active-expire") {
@@ -27460,7 +27475,7 @@ async fn execute_commands_squashed_inner(
     if can_squash
         && crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
         && REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && crate::replication::get_replication_hub(router.base_port).is_slave()
+        && crate::replication::cached_hub(router.base_port).is_slave()
         && batch_has_writes(commands)
     {
         can_squash = false;
@@ -27470,7 +27485,7 @@ async fn execute_commands_squashed_inner(
     if can_squash
         && crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
         && !REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && crate::replication::get_replication_hub(router.base_port).is_slave()
+        && crate::replication::cached_hub(router.base_port).is_slave()
         && batch_has_writes(commands)
     {
         can_squash = false;
@@ -29219,6 +29234,7 @@ async fn move_element_across_shards(
                     is_rpoplpush,
                 });
                 let _ = exec_on_shard_replicate_as(router, d, push, lmove).await;
+                crate::replication::wait_streams_flushed(router.base_port, router.num_shards).await;
                 let mut out = Vec::new();
                 write_resp_bulk(&mut out, &elem);
                 out
@@ -29252,6 +29268,7 @@ async fn move_element_across_shards(
                     smove,
                 )
                 .await;
+                crate::replication::wait_streams_flushed(router.base_port, router.num_shards).await;
                 b":1\r\n".to_vec()
             }
         }
@@ -29371,6 +29388,7 @@ async fn blmove_across_shards(
                 lmove,
             )
             .await;
+            crate::replication::wait_streams_flushed(router.base_port, router.num_shards).await;
             if client_disconnected {
                 return true;
             }
@@ -29993,7 +30011,7 @@ mod tests {
         );
         assert!(!maxmemory_ignored_as_replica(PORT), "a master enforces it");
 
-        let hub = crate::replication::get_replication_hub(PORT);
+        let hub = crate::replication::cached_hub(PORT);
         crate::replication::HAS_SLAVE_INSTANCE.store(true, Ordering::Release);
         hub.is_slave_atomic.store(true, Ordering::Release);
         assert!(maxmemory_ignored_as_replica(PORT));

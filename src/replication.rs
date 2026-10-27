@@ -2066,7 +2066,9 @@ impl ReplicationHub {
             // Writes that passed the pause before it began finish first:
             // until then the offset isn't final, and one landing after we
             // turned into a replica would never be replicated.
-            if crate::connection::writes_running() > 0 {
+            if crate::connection::writes_running() > 0
+                || !streams_flushed(self.port, router.num_shards)
+            {
                 if self.failover_phase() != FailoverPhase::WaitForSync {
                     return;
                 }
@@ -2222,6 +2224,29 @@ pub fn get_replication_hub(port: u16) -> Arc<ReplicationHub> {
         .clone()
 }
 
+thread_local! {
+    /// The hub this thread used last: a shard thread always writes to its
+    /// own server's, so the per-write paths skip the global map (its lock,
+    /// the port hash and an Arc refcount bump, all shared between threads).
+    static CACHED_HUB: std::cell::Cell<Option<(u16, &'static ReplicationHub)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The hub for `port`, from this thread's cache when it can: for the
+/// per-write paths. Hubs are never removed from the map, so a hub can be
+/// held for good; the one `Arc` leaked per thread and port keeps it alive.
+#[inline]
+pub fn cached_hub(port: u16) -> &'static ReplicationHub {
+    if let Some((p, hub)) = CACHED_HUB.get()
+        && p == port
+    {
+        return hub;
+    }
+    let hub: &'static ReplicationHub = Box::leak(Box::new(get_replication_hub(port)));
+    CACHED_HUB.set(Some((port, hub)));
+    hub
+}
+
 static REPL_BACKLOG_SIZE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(1024 * 1024);
 
@@ -2245,14 +2270,9 @@ pub fn has_connected_replicas(port: u16) -> bool {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
         return false;
     }
-    let hubs = REPLICATION_HUBS.read();
-    if let Some(hub) = hubs.get(&port) {
-        hub.replication_active.load(Ordering::Relaxed)
-            && (hub.has_replicas.load(Ordering::Relaxed)
-                || hub.backlog_active.load(Ordering::Relaxed))
-    } else {
-        false
-    }
+    let hub = cached_hub(port);
+    hub.replication_active.load(Ordering::Relaxed)
+        && (hub.has_replicas.load(Ordering::Relaxed) || hub.backlog_active.load(Ordering::Relaxed))
 }
 
 #[inline(always)]
@@ -2260,13 +2280,9 @@ pub fn get_connected_replicas_count(port: u16) -> usize {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
         return 0;
     }
-    let hubs = REPLICATION_HUBS.read();
-    if let Some(hub) = hubs.get(&port) {
-        if hub.has_replicas.load(Ordering::Relaxed) {
-            hub.replicas.read().len()
-        } else {
-            0
-        }
+    let hub = cached_hub(port);
+    if hub.has_replicas.load(Ordering::Relaxed) {
+        hub.replicas.read().len()
     } else {
         0
     }
@@ -2305,7 +2321,7 @@ pub fn shutdown_in_milliseconds() -> u64 {
 /// Returns false if `SHUTDOWN ABORT` cancelled the shutdown meanwhile.
 /// Several shutdowns (SHUTDOWN from several clients, SIGTERM) may wait at
 /// once; each counts as a blocked client while it waits.
-pub async fn wait_replicas_before_shutdown(port: u16) -> bool {
+pub async fn wait_replicas_before_shutdown(port: u16, shards: usize) -> bool {
     let secs = SHUTDOWN_TIMEOUT_SECS.load(Ordering::Relaxed);
     let hub = get_replication_hub(port);
     if secs == 0 || hub.is_slave() || hub.replicas.read().is_empty() {
@@ -2321,7 +2337,10 @@ pub async fn wait_replicas_before_shutdown(port: u16) -> bool {
     SHUTDOWN_DEADLINE_MS.store(deadline, Ordering::Relaxed);
     // Writes that passed the pause before it began finish first, so the
     // offset waited for includes them.
-    while crate::connection::writes_running() > 0 && unix_ms() < deadline && !aborted() {
+    while (crate::connection::writes_running() > 0 || !streams_flushed(port, shards))
+        && unix_ms() < deadline
+        && !aborted()
+    {
         monoio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
     let target = hub.master_repl_offset.load(Ordering::SeqCst);
@@ -2687,12 +2706,204 @@ impl Drop for SuppressPropagation {
     }
 }
 
+/// A shard's bytes held back during a mailbox burst (see
+/// [`begin_stream_batch`]): counted when held (`appended`) and when handed
+/// to the stream (`flushed`), so a connection can wait, before replying,
+/// until every shard has streamed what it held.
+#[derive(Debug, Default)]
+pub struct StreamProgress {
+    pub appended: AtomicU64,
+    pub flushed: AtomicU64,
+}
+
+static STREAM_PROGRESS: LazyLock<Mutex<HashMap<(u16, usize), &'static StreamProgress>>> =
+    LazyLock::new(Default::default);
+
+thread_local! {
+    /// This thread's view of [`STREAM_PROGRESS`] for one port, indexed by
+    /// shard: replies look shards up without the global lock.
+    static PROGRESS_CACHE: std::cell::RefCell<(u16, Vec<&'static StreamProgress>)> =
+        const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+/// A shard's stream counters. One per (port, shard), never freed: there
+/// are only as many as shards a process ever ran.
+pub fn stream_progress(port: u16, shard: usize) -> &'static StreamProgress {
+    PROGRESS_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != port {
+            c.0 = port;
+            c.1.clear();
+        }
+        while c.1.len() <= shard {
+            let s = c.1.len();
+            let p = *STREAM_PROGRESS
+                .lock()
+                .entry((port, s))
+                .or_insert_with(|| Box::leak(Box::default()));
+            c.1.push(p);
+        }
+        c.1[shard]
+    })
+}
+
+/// What a shard thread holds back for the replication stream during one
+/// mailbox burst: every shard used to take the stream's lock once per
+/// write, and with a replica attached eight shards spent most of their
+/// time waiting on it (SET 2.28M -> 0.48M ops/s). Now each takes it once
+/// per burst.
+#[derive(Default)]
+struct StreamBuf {
+    active: bool,
+    port: u16,
+    shard: usize,
+    /// The DB the held bytes were written in (a change flushes first).
+    db: usize,
+    held: u64,
+    bytes: Vec<u8>,
+    progress: Option<&'static StreamProgress>,
+}
+
+thread_local! {
+    static STREAM_BUF: std::cell::RefCell<StreamBuf> = std::cell::RefCell::new(StreamBuf::default());
+}
+
+/// Starts holding this shard thread's replication bytes (one mailbox
+/// burst). Held bytes keep their order and are streamed by
+/// [`flush_stream_batch`] / [`end_stream_batch`], always before the
+/// shard's next message that could depend on them (see the shard loop),
+/// and before any reply reaches a client (connections wait for it).
+pub fn begin_stream_batch(port: u16, shard: usize) {
+    let switch = STREAM_BUF.with(|b| {
+        let b = b.borrow();
+        b.progress.is_none() || b.port != port || b.shard != shard
+    });
+    if switch {
+        flush_stream_batch();
+        STREAM_BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            let progress = stream_progress(port, shard);
+            b.port = port;
+            b.shard = shard;
+            b.held = progress.appended.load(Ordering::Acquire);
+            b.progress = Some(progress);
+        });
+    }
+    STREAM_BUF.with(|b| b.borrow_mut().active = true);
+}
+
+/// Streams what this thread holds (still holding later writes).
+pub fn flush_stream_batch() {
+    let taken = STREAM_BUF.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.bytes.is_empty() {
+            return None;
+        }
+        let bytes = std::mem::take(&mut b.bytes);
+        Some((b.port, b.shard, b.db, b.held, bytes, b.progress))
+    });
+    let Some((port, shard, db, held, bytes, progress)) = taken else {
+        return;
+    };
+    let prev = crate::connection::CURRENT_DB.replace(db);
+    cached_hub(port).propagate_shard(shard, &bytes);
+    crate::connection::CURRENT_DB.set(prev);
+    if let Some(p) = progress {
+        p.flushed.fetch_max(held, Ordering::Release);
+    }
+    // Keep the allocation for the next burst.
+    STREAM_BUF.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.bytes.is_empty() {
+            let mut bytes = bytes;
+            bytes.clear();
+            b.bytes = bytes;
+        }
+    });
+}
+
+/// Streams what this thread holds and stops holding (end of a burst).
+pub fn end_stream_batch() {
+    flush_stream_batch();
+    STREAM_BUF.with(|b| b.borrow_mut().active = false);
+}
+
+/// Holds `bytes` if this thread is in a burst for this shard; false if
+/// they must go to the stream now.
+fn hold_stream_bytes(port: u16, shard: usize, bytes: &[u8]) -> bool {
+    let db = crate::connection::CURRENT_DB.get();
+    let flush_first = STREAM_BUF.with(|b| {
+        let b = b.borrow();
+        b.active && b.port == port && b.shard == shard && !b.bytes.is_empty() && b.db != db
+    });
+    if flush_first {
+        flush_stream_batch();
+    }
+    STREAM_BUF.with(|b| {
+        let mut b = b.borrow_mut();
+        if !b.active || b.port != port || b.shard != shard {
+            return false;
+        }
+        if b.bytes.is_empty() {
+            b.db = db;
+        }
+        b.bytes.extend_from_slice(bytes);
+        b.held += 1;
+        let held = b.held;
+        if let Some(p) = &b.progress {
+            p.appended.store(held, Ordering::Release);
+        }
+        true
+    })
+}
+
+/// Whether no shard holds replication bytes (this thread's are streamed
+/// first).
+pub fn streams_flushed(port: u16, shards: usize) -> bool {
+    flush_stream_batch();
+    (0..shards).all(|shard| {
+        let p = stream_progress(port, shard);
+        p.flushed.load(Ordering::Acquire) >= p.appended.load(Ordering::Acquire)
+    })
+}
+
+/// Waits until every shard has streamed what it held when this was
+/// called (this thread's own held bytes are streamed at once). Called
+/// before replying to writes, and before WAIT / WAITAOF / FAILOVER /
+/// shutdown take the replication offset.
+pub async fn wait_streams_flushed(port: u16, shards: usize) {
+    flush_stream_batch();
+    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut targets: smallvec::SmallVec<[(&'static StreamProgress, u64); 8]> =
+        smallvec::SmallVec::new();
+    for shard in 0..shards {
+        let p = stream_progress(port, shard);
+        let appended = p.appended.load(Ordering::Acquire);
+        if p.flushed.load(Ordering::Acquire) < appended {
+            targets.push((p, appended));
+        }
+    }
+    // Shards stream at the end of each mailbox burst: usually a few
+    // yields away.
+    while !targets.is_empty() {
+        targets.retain(|(p, t)| p.flushed.load(Ordering::Acquire) < *t);
+        if targets.is_empty() {
+            break;
+        }
+        crate::mailbox::yield_now().await;
+    }
+}
+
 #[inline(always)]
 pub fn propagate_bytes(port: u16, bytes: &[u8]) {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) || PROPAGATION_SUPPRESSED.get() {
         return;
     }
-    let hub = get_replication_hub(port);
+    // After what this thread holds, to keep its order.
+    flush_stream_batch();
+    let hub = cached_hub(port);
     if !hub.replication_active.load(Ordering::Relaxed) {
         return;
     }
@@ -2704,8 +2915,11 @@ pub fn propagate_shard_bytes(port: u16, shard_id: usize, bytes: &[u8]) {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) || PROPAGATION_SUPPRESSED.get() {
         return;
     }
-    let hub = get_replication_hub(port);
+    let hub = cached_hub(port);
     if !hub.replication_active.load(Ordering::Relaxed) {
+        return;
+    }
+    if hold_stream_bytes(port, shard_id, bytes) {
         return;
     }
     hub.propagate_shard(shard_id, bytes);
@@ -3978,7 +4192,7 @@ mod tests {
     #[monoio::test(timer_enabled = true)]
     async fn test_shutdown_without_replicas_does_not_wait() {
         let start = std::time::Instant::now();
-        wait_replicas_before_shutdown(64521).await;
+        wait_replicas_before_shutdown(64521, 1).await;
         assert!(start.elapsed() < std::time::Duration::from_millis(500));
         assert!(crate::connection::is_client_paused().is_none());
     }
@@ -5182,5 +5396,104 @@ mod tests {
                 || info_after_io.contains("master_last_io_seconds_ago:3\r\n"),
             "{info_after_io}"
         );
+    }
+
+    #[test]
+    fn test_stream_batch_holds_bytes_until_flush_in_order() {
+        let port = 19961;
+        let hub = get_replication_hub(port);
+        let (tx, _rx) = flume::unbounded();
+        let rep = hub.register_replica(61, tx);
+        let progress = stream_progress(port, 0);
+        crate::connection::CURRENT_DB.set(0);
+
+        begin_stream_batch(port, 0);
+        propagate_shard_bytes(port, 0, b"*1\r\n$3\r\none\r\n");
+        propagate_shard_bytes(port, 0, b"*1\r\n$3\r\ntwo\r\n");
+        // Held: nothing streamed, and the shard counts as unflushed.
+        assert!(rep.take_pending().is_empty());
+        assert!(
+            progress.flushed.load(Ordering::Acquire) < progress.appended.load(Ordering::Acquire)
+        );
+
+        // Another shard's bytes are not this burst's: they go out at once.
+        propagate_shard_bytes(port, 1, b"*1\r\n$5\r\nother\r\n");
+        assert_eq!(rep.take_pending(), b"*1\r\n$5\r\nother\r\n");
+
+        // A DB change streams the held bytes first, in the old DB.
+        crate::connection::CURRENT_DB.set(1);
+        propagate_shard_bytes(port, 0, b"*1\r\n$5\r\nthree\r\n");
+        let out = rep.take_pending();
+        let pos = |needle: &[u8]| out.windows(needle.len()).position(|w| w == needle);
+        assert!(
+            pos(b"one\r\n*1\r\n$3\r\ntwo\r\n").is_some(),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(pos(b"*1\r\n$5\r\nthree\r\n").is_none());
+
+        end_stream_batch();
+        let out = rep.take_pending();
+        let s = String::from_utf8_lossy(&out);
+        // Streamed in DB 1, after a SELECT.
+        assert!(s.contains("SELECT") && s.ends_with("three\r\n"), "{s}");
+        assert_eq!(
+            progress.flushed.load(Ordering::Acquire),
+            progress.appended.load(Ordering::Acquire)
+        );
+        assert!(streams_flushed(port, 2));
+
+        // Outside a burst nothing is held.
+        propagate_shard_bytes(port, 0, b"*1\r\n$4\r\nfour\r\n");
+        assert!(rep.take_pending().ends_with(b"*1\r\n$4\r\nfour\r\n"));
+        crate::connection::CURRENT_DB.set(0);
+        hub.unregister_replica(rep.id);
+    }
+
+    #[test]
+    fn test_wait_streams_flushed_waits_for_other_shard() {
+        let port = 19962;
+        let hub = get_replication_hub(port);
+        let (tx, _rx) = flume::unbounded();
+        let rep = hub.register_replica(62, tx);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let shard = std::thread::spawn(move || {
+            begin_stream_batch(port, 1);
+            propagate_shard_bytes(port, 1, b"held");
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            end_stream_batch();
+        });
+        held_rx.recv().unwrap();
+        assert!(!streams_flushed(port, 2));
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(wait_streams_flushed(port, 2));
+        // Returned only once the other shard streamed what it held.
+        assert!(rep.take_pending().ends_with(b"held"));
+        assert!(streams_flushed(port, 2));
+        shard.join().unwrap();
+        hub.unregister_replica(rep.id);
+    }
+
+    #[test]
+    fn test_cached_hub_is_the_registered_hub() {
+        let hub = get_replication_hub(19963);
+        assert!(std::ptr::eq(cached_hub(19963), &*hub));
+        assert!(std::ptr::eq(
+            cached_hub(19964),
+            &*get_replication_hub(19964)
+        ));
+        assert!(std::ptr::eq(cached_hub(19963), &*hub));
+        assert!(std::ptr::eq(
+            stream_progress(19963, 3),
+            stream_progress(19963, 3)
+        ));
+        assert!(!std::ptr::eq(
+            stream_progress(19963, 2),
+            stream_progress(19963, 3)
+        ));
     }
 }

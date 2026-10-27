@@ -23335,6 +23335,163 @@ fn test_cross_shard_moves_replicate_without_losing_concurrent_writes_e2e() {
     resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
 }
 
+/// Shards hold their replication bytes for a mailbox burst and stream them
+/// once. Pipelined writes from several clients over every shard (DB
+/// switches, cross-shard LMOVE, a FLUSHALL right after remote writes, a
+/// full sync started mid-stream) must still reach replicas in the master's
+/// order, and WAIT must count them.
+#[test]
+fn test_batched_replication_stream_keeps_order_and_wait_counts_it_e2e() {
+    let (mp, r1, r2) = (18407, 18408, 18409);
+    start_test_server(mp, 4);
+    start_test_server(r1, 2);
+    start_test_server(r2, 3);
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    let mut rep1 = TcpStream::connect(("127.0.0.1", r1)).unwrap();
+    let mut rep2 = TcpStream::connect(("127.0.0.1", r2)).unwrap();
+    assert_eq!(
+        resp_cmd_all(&mut rep1, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd_all(&mut m, &["WAIT", "1", "100"]) != ":1\r\n" {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+    }
+
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    // `moves`: cross-shard LMOVEs too. Not while a full sync runs: shards
+    // serialize at different moments, so a move between them is half in
+    // the snapshot (a known gap of the per-shard full sync).
+    let writes = |c: usize, round: usize, moves: bool| {
+        let mut cmds = Vec::new();
+        for i in 0..1500 {
+            cmds.push(s(&["SET", &format!("k:{c}:{i}"), &format!("v{round}-{i}")]));
+            cmds.push(s(&["INCR", &format!("ctr:{c}")]));
+            if i % 10 == 0 {
+                cmds.push(s(&["SELECT", "1"]));
+                cmds.push(s(&["SET", &format!("d1:{c}:{i}"), "x"]));
+                cmds.push(s(&["INCR", &format!("d1ctr:{c}")]));
+                cmds.push(s(&["SELECT", "0"]));
+            }
+            if i % 7 == 0 {
+                cmds.push(s(&[
+                    "RPUSH",
+                    &format!("list:{}", c % 2),
+                    &format!("{c}-{i}"),
+                ]));
+            }
+            if moves && i % 13 == 0 {
+                cmds.push(s(&["LMOVE", "list:0", "list:1", "LEFT", "RIGHT"]));
+            }
+        }
+        cmds
+    };
+    let run_round = |round: usize, moves: bool| {
+        let handles: Vec<_> = (0..4)
+            .map(|c| {
+                let cmds = writes(c, round, moves);
+                thread::spawn(move || {
+                    let mut conn = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+                    let replies = pipeline_all(&mut conn, &cmds, &format!("done-{c}"));
+                    assert!(!replies.starts_with(b"-"), "{:?}", &replies[..64]);
+                })
+            })
+            .collect();
+        handles
+    };
+
+    for h in run_round(0, true) {
+        h.join().unwrap();
+    }
+    // A FLUSHALL right behind writes other shards still hold, then more.
+    let mut cmds = vec![
+        s(&["SET", "before-flush-a", "1"]),
+        s(&["SET", "before-flush-b", "1"]),
+        s(&["SELECT", "1"]),
+        s(&["SET", "before-flush-db1", "1"]),
+        s(&["SELECT", "0"]),
+        s(&["FLUSHALL"]),
+    ];
+    for i in 0..200 {
+        cmds.push(s(&["SET", &format!("after-flush:{i}"), "1"]));
+    }
+    // WAIT straight behind pipelined writes counts them.
+    cmds.push(s(&["WAIT", "1", "5000"]));
+    let replies = pipeline_all(&mut m, &cmds, "flushed");
+    assert!(
+        String::from_utf8_lossy(&replies).contains(":1\r\n$7\r\nflushed"),
+        "{}",
+        String::from_utf8_lossy(&replies[replies.len().saturating_sub(64)..])
+    );
+    assert_eq!(
+        resp_cmd_all(&mut rep1, &["EXISTS", "after-flush:199"]),
+        ":1\r\n"
+    );
+    assert_eq!(
+        resp_cmd_all(&mut rep1, &["EXISTS", "before-flush-a"]),
+        ":0\r\n"
+    );
+
+    // A second replica full-syncs while four clients write.
+    let writers = run_round(1, false);
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        resp_cmd_all(&mut rep2, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    for h in writers {
+        h.join().unwrap();
+    }
+    assert_eq!(resp_cmd_all(&mut m, &["WAIT", "2", "10000"]), ":2\r\n");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let dm = debug_digest(&mut m);
+        let (d1, d2) = (debug_digest(&mut rep1), debug_digest(&mut rep2));
+        if dm == d1 && dm == d2 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let mut report = String::new();
+            for (name, r) in [("replica1", &mut rep1), ("replica2", &mut rep2)] {
+                for db in ["0", "1"] {
+                    resp_cmd_all(&mut m, &["SELECT", db]);
+                    resp_cmd_all(r, &["SELECT", db]);
+                    let mk = resp_scalars(&resp_cmd_all(&mut m, &["KEYS", "*"]));
+                    let rk = resp_scalars(&resp_cmd_all(r, &["KEYS", "*"]));
+                    let missing: Vec<_> = mk.iter().filter(|k| !rk.contains(k)).take(5).collect();
+                    let extra: Vec<_> = rk.iter().filter(|k| !mk.contains(k)).take(5).collect();
+                    let mut diff = Vec::new();
+                    for k in &mk {
+                        let t = resp_cmd_all(&mut m, &["TYPE", k]);
+                        let q: &[&str] = if t.contains("list") {
+                            &["LRANGE", k, "0", "-1"]
+                        } else {
+                            &["GET", k]
+                        };
+                        let mut args = q.to_vec();
+                        args[1] = k;
+                        if resp_cmd_all(&mut m, &args) != resp_cmd_all(r, &args) {
+                            diff.push(k.clone());
+                        }
+                    }
+                    report += &format!(
+                        "{name} db{db}: master {} keys, replica {}; missing {missing:?} extra {extra:?} differ {:?}\n",
+                        mk.len(),
+                        rk.len(),
+                        &diff[..diff.len().min(8)]
+                    );
+                }
+            }
+            panic!("digests differ: master {dm} replica1 {d1} replica2 {d2}\n{report}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(resp_cmd_all(&mut rep1, &["GET", "ctr:3"]), "$4\r\n1500\r\n");
+    resp_cmd_all(&mut rep1, &["REPLICAOF", "NO", "ONE"]);
+    resp_cmd_all(&mut rep2, &["REPLICAOF", "NO", "ONE"]);
+}
+
 /// Flattens a RESP reply into its scalar values, dropping the nesting.
 fn resp_scalars(reply: &str) -> Vec<String> {
     let mut out = Vec::new();

@@ -5159,7 +5159,9 @@ impl Router {
         let used_mem = self.local_db.borrow().total_used_memory() as u64;
         crate::redis_rdb::write_file_header(&mut full_rdb, used_mem);
 
-        // Local shard chunk
+        // Local shard chunk. Held replication bytes predate it: stream
+        // them before the cut is armed, or the replica gets them twice.
+        crate::replication::flush_stream_batch();
         let mut first_err = self
             .local_db
             .borrow_mut()

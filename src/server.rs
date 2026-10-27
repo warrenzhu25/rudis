@@ -568,9 +568,27 @@ pub fn run_shard_worker(
         monoio::spawn(async move {
             while let Ok(mut msg) = rx.recv_async().await {
                 let mut burst = 0;
+                // Replication bytes are held for the burst and streamed
+                // once (see `replication::begin_stream_batch`).
+                crate::replication::begin_stream_batch(port, shard_id);
                 loop {
                     // Per message: AOF can be turned on or off meanwhile.
                     let cross_shard_aof = cross_shard_aof_slot.get();
+                    // Held bytes go out before any message but the plain
+                    // data ones, so what such a message does (a flush, a
+                    // full-sync cut, a cross-shard step) follows them.
+                    if !matches!(
+                        msg,
+                        ShardMessage::FastGet { .. }
+                            | ShardMessage::FastSet { .. }
+                            | ShardMessage::Batch { .. }
+                            | ShardMessage::Mget { .. }
+                            | ShardMessage::Mset { .. }
+                            | ShardMessage::ScatterMget { .. }
+                            | ShardMessage::ScatterMset { .. }
+                    ) {
+                        crate::replication::flush_stream_batch();
+                    }
                     match msg {
                     ShardMessage::AdoptConnection { fd, peer } => {
                         // Take ownership of a connection handed over by an
@@ -2213,6 +2231,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     // without a yield a steady stream from other shards
                     // would keep this task running and starve the local
                     // connections on this thread.
+                    crate::replication::end_stream_batch();
                     aof_write_after_mailbox(&cross_shard_aof, base_port);
                     crate::mailbox::yield_now().await;
                     break;
@@ -2220,6 +2239,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                 match rx.try_recv() {
                     Ok(next) => msg = next,
                     Err(_) => {
+                        crate::replication::end_stream_batch();
                         aof_write_after_mailbox(&cross_shard_aof, base_port);
                         break;
                     }
@@ -2460,7 +2480,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         "Received {} scheduling shutdown...",
                         crate::shutdown::last_shutdown_signal_name()
                     );
-                    if !crate::replication::wait_replicas_before_shutdown(r.base_port).await {
+                    if !crate::replication::wait_replicas_before_shutdown(r.base_port, r.num_shards).await {
                         continue;
                     }
                     if crate::aof::aof_enabling(r.base_port) {
