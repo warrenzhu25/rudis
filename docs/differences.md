@@ -51,10 +51,10 @@ This document summarizes the architectural, operational, and semantic difference
   - A cross-shard `EXEC` isn't isolated from plain single-key commands.
   - Other multi-key commands spanning shards (`DEL`, `UNLINK`, `EXISTS`, `TOUCH` with several
     keys) run per shard.
-  - Replicas: a cross-shard `LMOVE`/`RPOPLPUSH`/`SMOVE` racing a plain write to its *source*
-    key (that doesn't commute with the pop) can apply in the other order on a replica. A full
-    sync holds cross-shard writes back while it cuts each shard's snapshot, except a blocked
-    `BLMOVE`/`BRPOPLPUSH` being served (its pop isn't under the shards' locks).
+  - Replicas: a full sync holds cross-shard writes back while it cuts each shard's snapshot,
+    except a blocked `BLMOVE`/`BRPOPLPUSH` being served (its pop isn't under the shards' locks);
+    one served right then, racing a plain write to its source key, can also reach a replica in
+    the other order.
 
   To make related keys atomic in every case, put them on one shard with a hash tag
   (`{user:1}:a`, `{user:1}:b`).

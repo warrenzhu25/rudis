@@ -1500,6 +1500,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             if let Some(bytes) = replicate_as.filter(|b| !b.is_empty()) {
                                 crate::connection::CURRENT_DB.set(batch_db);
                                 crate::replication::propagate_shard_bytes(port, shard_id, &bytes);
+                                // In the stream before the requester hears back:
+                                // a move's source shard resumes only then.
+                                crate::replication::flush_stream_batch();
                             }
                             crate::connection::CURRENT_CLIENT_ID.set(prev_cid);
                             crate::connection::CLIENT_NO_TOUCH.set(prev_no_touch);
@@ -1998,6 +2001,29 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         sdb.select_db(db);
                         let res = sdb.expiretime(&key, in_millis);
                         let _ = responder.send(res);
+                    }
+                    ShardMessage::MoveElement(m) => {
+                        let crate::shard::MoveElement {
+                            db,
+                            pop,
+                            dst_shard,
+                            push,
+                            logical,
+                            client_id,
+                            is_resp3,
+                            responder,
+                        } = *m;
+                        crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
+                        let reply = crate::connection::move_element_from_source(
+                            &cross_shard_router,
+                            db,
+                            &pop,
+                            dst_shard,
+                            push,
+                            logical,
+                            client_id,
+                        );
+                        let _ = responder.send(reply);
                     }
                     ShardMessage::AcquireTxLock { tx_id, responder } => {
                         let mut lock = cross_shard_tx_lock.borrow_mut();

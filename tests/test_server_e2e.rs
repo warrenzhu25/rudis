@@ -23253,13 +23253,11 @@ fn pipeline_all(c: &mut TcpStream, cmds: &[Vec<String>], marker: &str) -> Vec<u8
 /// destination's shard right after the push. Other clients' writes
 /// meanwhile must still reach the replica (the moves once muted the whole
 /// stream while they ran), and later pushes to the destination must stay
-/// after the move.
-///
-/// Known gap, not covered: the source half is popped before the logical
-/// command is streamed, so a plain write to the source key in between that
-/// doesn't commute with the pop (an RPUSH racing an RPOPLPUSH from the
-/// same list) can still reach the replica in the other order. Tail pushes
-/// do commute with head pops, which is what this test races.
+/// after the move. The source's shard waits for the push, so a plain
+/// write to the source in between (an RPUSH racing an RPOPLPUSH of the
+/// same list) can't reach the replica on the other side of the move either.
+/// Each move waits 300 us between its halves (DEBUG CROSS-SHARD-MOVE-DELAY)
+/// to make those races likely.
 #[test]
 fn test_cross_shard_moves_replicate_without_losing_concurrent_writes_e2e() {
     let (mp, rp) = (18410, 18411);
@@ -23275,6 +23273,10 @@ fn test_cross_shard_moves_replicate_without_losing_concurrent_writes_e2e() {
     while resp_cmd_all(&mut m, &["WAIT", "1", "100"]) != ":1\r\n" {
         assert!(std::time::Instant::now() < deadline, "replica never linked");
     }
+    assert_eq!(
+        resp_cmd_all(&mut m, &["DEBUG", "CROSS-SHARD-MOVE-DELAY", "300"]),
+        "+OK\r\n"
+    );
     // Keys on different shards, so the moves really cross shards.
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     let handles: Vec<_> = (0..4)
@@ -23292,6 +23294,7 @@ fn test_cross_shard_moves_replicate_without_losing_concurrent_writes_e2e() {
                 }
                 if i % 7 == 0 {
                     cmds.push(s(&["LMOVE", "list:0", "list:1", "LEFT", "RIGHT"]));
+                    cmds.push(s(&["RPOPLPUSH", "list:1", "list:0"]));
                     cmds.push(s(&[
                         "SMOVE",
                         "set:a",
@@ -23309,6 +23312,7 @@ fn test_cross_shard_moves_replicate_without_losing_concurrent_writes_e2e() {
     for h in handles {
         h.join().unwrap();
     }
+    resp_cmd_all(&mut m, &["DEBUG", "CROSS-SHARD-MOVE-DELAY", "0"]);
     assert_eq!(resp_cmd_all(&mut m, &["WAIT", "1", "5000"]), ":1\r\n");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {

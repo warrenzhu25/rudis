@@ -3149,14 +3149,6 @@ pub static PAUSE_CRON: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// can catch one half done.
 pub static CROSS_SHARD_MOVE_DELAY_US: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-
-/// Sleeps [`CROSS_SHARD_MOVE_DELAY_US`], if set.
-async fn cross_shard_move_delay() {
-    let us = CROSS_SHARD_MOVE_DELAY_US.load(std::sync::atomic::Ordering::Relaxed);
-    if us > 0 {
-        monoio::time::sleep(std::time::Duration::from_micros(us)).await;
-    }
-}
 pub static ACTIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static MAX_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
 pub static MAX_MEMORY_POLICY: parking_lot::RwLock<String> = parking_lot::RwLock::new(String::new());
@@ -29008,11 +29000,142 @@ async fn exec_on_shard_replicate_as(
         }
         if !bytes.is_empty() {
             crate::replication::propagate_shard_bytes(router.base_port, router.shard_id, &bytes);
+            crate::replication::flush_stream_batch();
         }
         out
     } else {
         router.execute_remote_replicate_as(shard, cmd, bytes).await
     }
+}
+
+/// The source half of a cross-shard LMOVE / SMOVE, on the source's shard
+/// thread: pops `pop` (its own propagation left out), then has
+/// `dst_shard` push what it took and stream the `logical` command, and
+/// waits for that, blocking this thread, before returning the pop's reply.
+/// So no other write on this shard can come between the pop and the
+/// logical command in the replication stream: a racing RPUSH to the
+/// source of an RPOPLPUSH reaches replicas on the same side of the move as
+/// it ran here. Costs this shard one cross-shard round trip per move.
+///
+/// Can't deadlock: a move holds both shards' VLL locks (taken in shard
+/// order), so no other move can block the destination's thread on ours.
+pub(crate) fn move_element_from_source(
+    router: &Router,
+    db: usize,
+    pop: &Command,
+    dst_shard: usize,
+    push: crate::shard::MovePush,
+    logical: Bytes,
+    client_id: u64,
+) -> Vec<u8> {
+    // Earlier writes here go out before the move.
+    crate::replication::flush_stream_batch();
+    let prev_db = CURRENT_DB.replace(db);
+    // Run as the requesting client (tracking, NOLOOP), like a Batch.
+    let prev_cid = CURRENT_CLIENT_ID.replace(client_id);
+    let mut popped = Vec::new();
+    {
+        let _no_repl = crate::replication::SuppressPropagation::new();
+        let mut local = router.local_db.borrow_mut();
+        local.select_db(db);
+        execute_local_command(pop, &mut local, &mut popped, router.aof().as_deref());
+    }
+    CURRENT_DB.set(prev_db);
+    CURRENT_CLIENT_ID.set(prev_cid);
+    let push = match push {
+        crate::shard::MovePush::List { key, to } => {
+            let Some(elem) = resp_bulk_payload(&popped) else {
+                return popped;
+            };
+            let values = smallvec::smallvec![elem];
+            match to {
+                crate::table::ListDirection::Left => Command::Lpush { key, values },
+                crate::table::ListDirection::Right => Command::Rpush { key, values },
+            }
+        }
+        crate::shard::MovePush::Set { key, member } => {
+            if resp_integer(&popped) != Some(1) {
+                return popped;
+            }
+            Command::Sadd {
+                key,
+                members: smallvec::smallvec![member],
+            }
+        }
+    };
+    let delay = CROSS_SHARD_MOVE_DELAY_US.load(std::sync::atomic::Ordering::Relaxed);
+    if delay > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(delay));
+    }
+    let hash = cmd_primary_key(&push)
+        .map(|k| crate::table::hash_key(k))
+        .unwrap_or(0);
+    // The reply slot lives on the heap: if the destination never answers,
+    // it is leaked rather than written after this frame is gone.
+    let mut slot = Box::new(crate::shard::CompactResp::empty());
+    let responder = std::sync::Arc::new(crate::mailbox::BatchResponder::new());
+    responder.prepare(&mut *slot as *mut _, 1);
+    let msg = ShardMessage::Batch {
+        db,
+        items: vec![(0, hash, push)],
+        responder: responder.clone(),
+        is_resp3: false,
+        client_id,
+        no_touch: false,
+        defer_bcast: false,
+        replicate_as: Some(logical),
+    };
+    if router.senders[dst_shard].send(msg).is_err() {
+        crate::log_warning!("cross-shard move: shard {} is not reachable", dst_shard);
+        return popped;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while responder.try_take().is_none() {
+        if std::time::Instant::now() >= deadline {
+            crate::log_warning!(
+                "cross-shard move: shard {} did not answer the push",
+                dst_shard
+            );
+            std::mem::forget(slot);
+            return popped;
+        }
+        std::thread::yield_now();
+    }
+    popped
+}
+
+/// Runs the source half of a cross-shard move on shard `s` (see
+/// [`move_element_from_source`]) and returns the pop's reply.
+async fn move_element_via_source(
+    router: &Router,
+    s: usize,
+    d: usize,
+    pop: Command,
+    push: crate::shard::MovePush,
+    logical: Bytes,
+) -> Vec<u8> {
+    let db = CURRENT_DB.get();
+    let client_id = requesting_client_id();
+    if s == router.shard_id {
+        return move_element_from_source(router, db, &pop, d, push, logical, client_id);
+    }
+    let (tx, rx) = flume::bounded(1);
+    let msg = ShardMessage::MoveElement(Box::new(crate::shard::MoveElement {
+        db,
+        pop,
+        dst_shard: d,
+        push,
+        logical,
+        client_id,
+        is_resp3: CURRENT_CLIENT_RESP3.get(),
+        responder: tx,
+    }));
+    if router.senders[s].send(msg).is_err() {
+        return b"-ERR internal shard routing error\r\n".to_vec();
+    }
+    rx.recv_async()
+        .await
+        .unwrap_or_else(|_| b"-ERR internal shard routing error\r\n".to_vec())
 }
 
 /// The RESP form of `cmd` to replicate (empty if it has none).
@@ -29239,25 +29362,11 @@ async fn move_element_across_shards(
                         count: None,
                     },
                 };
-                let popped = exec_on_shard_replicate_as(router, s, pop, Bytes::new()).await;
-                let Some(elem) = resp_bulk_payload(&popped) else {
-                    return popped;
-                };
-                cross_shard_move_delay().await;
-                let values = smallvec::smallvec![elem.clone()];
-                let push = match to {
-                    crate::table::ListDirection::Left => Command::Lpush {
-                        key: dst.clone(),
-                        values,
-                    },
-                    crate::table::ListDirection::Right => Command::Rpush {
-                        key: dst.clone(),
-                        values,
-                    },
-                };
                 // The destination's shard replicates the logical LMOVE with
                 // the push, so it keeps its place among that list's other
-                // writes (a later RPUSH from another client stays later).
+                // writes (a later RPUSH from another client stays later),
+                // while the source's shard waits, so none of its writes
+                // comes between the pop and the LMOVE either.
                 let lmove = logical_repl_bytes(&Command::Lmove {
                     source: src.clone(),
                     destination: dst.clone(),
@@ -29265,42 +29374,37 @@ async fn move_element_across_shards(
                     where_to: to,
                     is_rpoplpush,
                 });
-                let _ = exec_on_shard_replicate_as(router, d, push, lmove).await;
+                let push = crate::shard::MovePush::List {
+                    key: dst.clone(),
+                    to,
+                };
+                let popped = move_element_via_source(router, s, d, pop, push, lmove).await;
+                let Some(elem) = resp_bulk_payload(&popped) else {
+                    return popped;
+                };
                 crate::replication::wait_streams_flushed(router.base_port, router.num_shards).await;
                 let mut out = Vec::new();
                 write_resp_bulk(&mut out, &elem);
                 out
             }
             CrossShardElementMove::Set { member } => {
-                let removed = exec_on_shard_replicate_as(
-                    router,
-                    s,
-                    Command::Srem {
-                        key: src.clone(),
-                        members: smallvec::smallvec![member.clone()],
-                    },
-                    Bytes::new(),
-                )
-                .await;
-                if resp_integer(&removed) != Some(1) {
-                    return removed;
-                }
-                cross_shard_move_delay().await;
                 let smove = logical_repl_bytes(&Command::Smove {
                     source: src.clone(),
                     destination: dst.clone(),
                     member: member.clone(),
                 });
-                let _ = exec_on_shard_replicate_as(
-                    router,
-                    d,
-                    Command::Sadd {
-                        key: dst.clone(),
-                        members: smallvec::smallvec![member],
-                    },
-                    smove,
-                )
-                .await;
+                let srem = Command::Srem {
+                    key: src.clone(),
+                    members: smallvec::smallvec![member.clone()],
+                };
+                let push = crate::shard::MovePush::Set {
+                    key: dst.clone(),
+                    member,
+                };
+                let removed = move_element_via_source(router, s, d, srem, push, smove).await;
+                if resp_integer(&removed) != Some(1) {
+                    return removed;
+                }
                 crate::replication::wait_streams_flushed(router.base_port, router.num_shards).await;
                 b":1\r\n".to_vec()
             }
@@ -29792,6 +29896,100 @@ mod tests {
     /// squashed batch with writes is refused (per-command path) while
     /// writes are paused: so once writes are paused and nothing runs, the
     /// replication offset is final (FAILOVER, shutdown).
+    #[test]
+    fn test_move_element_from_source_waits_for_the_destination_push() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
+        let router = crate::router::Router::new(
+            0,
+            2,
+            9977,
+            Rc::new(RefCell::new(crate::shard::ShardDb::new(9977))),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+        let mut out = Vec::new();
+        execute_local_command(
+            &Command::Rpush {
+                key: Bytes::from_static(b"src"),
+                values: smallvec::smallvec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            },
+            &mut router.local_db.borrow_mut(),
+            &mut out,
+            None,
+        );
+        // The fake destination: checks the push, holds it a while, answers.
+        let answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dest = {
+            let answered = answered.clone();
+            std::thread::spawn(move || {
+                let Ok(ShardMessage::Batch {
+                    items,
+                    responder,
+                    replicate_as,
+                    ..
+                }) = rx1.recv()
+                else {
+                    panic!("no push");
+                };
+                assert_eq!(replicate_as.as_deref(), Some(&b"LOGICAL"[..]));
+                match &items[0].2 {
+                    Command::Lpush { key, values } => {
+                        assert_eq!(key.as_ref(), b"dst");
+                        assert_eq!(values[0].as_ref(), b"b");
+                    }
+                    other => panic!("pushed {other:?}"),
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                answered.store(true, std::sync::atomic::Ordering::SeqCst);
+                responder.write_slot(0, crate::shard::CompactResp::from_slice(b":1\r\n"));
+                responder.finish(items);
+            })
+        };
+        let reply = move_element_from_source(
+            &router,
+            0,
+            &Command::Rpop {
+                key: Bytes::from_static(b"src"),
+                count: None,
+            },
+            1,
+            crate::shard::MovePush::List {
+                key: Bytes::from_static(b"dst"),
+                to: crate::table::ListDirection::Left,
+            },
+            Bytes::from_static(b"LOGICAL"),
+            0,
+        );
+        // Returned only once the destination had pushed.
+        assert!(answered.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(reply, b"$1\r\nb\r\n");
+        dest.join().unwrap();
+        // Nothing to move: no push is sent, the pop's reply comes back.
+        let reply = move_element_from_source(
+            &router,
+            0,
+            &Command::Rpop {
+                key: Bytes::from_static(b"missing"),
+                count: None,
+            },
+            1,
+            crate::shard::MovePush::List {
+                key: Bytes::from_static(b"dst"),
+                to: crate::table::ListDirection::Left,
+            },
+            Bytes::from_static(b"LOGICAL"),
+            0,
+        );
+        assert!(reply == b"$-1\r\n" || reply == b"_\r\n", "{reply:?}");
+    }
+
     #[test]
     fn test_running_writes_are_counted_around_the_pause_gate() {
         let set = Command::Mset(vec![(Bytes::from_static(b"k"), Bytes::from_static(b"v"))]);

@@ -413,6 +413,35 @@ impl std::fmt::Display for TieredReadError {
 }
 
 /// Messages passed across CPU cores to access or mutate a shard's data.
+/// The source half of a cross-shard move (see `ShardMessage::MoveElement`).
+#[derive(Debug)]
+pub struct MoveElement {
+    pub db: usize,
+    pub pop: crate::resp::Command,
+    pub dst_shard: usize,
+    pub push: MovePush,
+    pub logical: bytes::Bytes,
+    pub client_id: u64,
+    pub is_resp3: bool,
+    pub responder: flume::Sender<Vec<u8>>,
+}
+
+/// Where the source half of a cross-shard move puts what it took (see
+/// `ShardMessage::MoveElement`).
+#[derive(Debug, Clone)]
+pub enum MovePush {
+    /// LPUSH / RPUSH the popped element to `key`.
+    List {
+        key: bytes::Bytes,
+        to: crate::table::ListDirection,
+    },
+    /// SADD the removed member to `key`.
+    Set {
+        key: bytes::Bytes,
+        member: bytes::Bytes,
+    },
+}
+
 pub enum ShardMessage {
     /// Transfer an accepted connection to a less loaded shard.
     ///
@@ -708,6 +737,11 @@ pub enum ShardMessage {
         tx_id: u64,
         responder: flume::Sender<()>,
     },
+    /// The source half of a cross-shard LMOVE / SMOVE, run on the source's
+    /// shard (see `connection::move_element_from_source`): pops, has the
+    /// destination's shard push and replicate the logical command, and
+    /// answers with the pop's reply.
+    MoveElement(Box<MoveElement>),
     ReleaseTxLock {
         tx_id: u64,
     },
