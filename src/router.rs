@@ -3531,29 +3531,6 @@ impl Router {
     }
 
     pub async fn execute_remote(&self, target: usize, cmd: Command) -> Vec<u8> {
-        self.execute_remote_opts(target, cmd, None).await
-    }
-
-    /// [`Self::execute_remote`], but the target shard replicates `bytes`
-    /// (empty: nothing) instead of what `cmd` changes, right after running
-    /// it: one half of a cross-shard command replicated as one logical
-    /// command, ordered with that shard's other writes. Only this command's
-    /// own propagation is replaced, never other clients' writes meanwhile.
-    pub async fn execute_remote_replicate_as(
-        &self,
-        target: usize,
-        cmd: Command,
-        bytes: Bytes,
-    ) -> Vec<u8> {
-        self.execute_remote_opts(target, cmd, Some(bytes)).await
-    }
-
-    async fn execute_remote_opts(
-        &self,
-        target: usize,
-        cmd: Command,
-        replicate_as: Option<Bytes>,
-    ) -> Vec<u8> {
         let is_resp3 = crate::connection::CURRENT_CLIENT_RESP3.get();
         let responder = self
             .remote_responder_pool
@@ -3573,7 +3550,7 @@ impl Router {
             client_id: crate::connection::requesting_client_id(),
             no_touch: crate::connection::CLIENT_NO_TOUCH.get(),
             defer_bcast: crate::connection::DEFER_BCAST_FLUSH.get(),
-            replicate_as,
+            replicate_as: None,
         };
         let res = if self.senders[target].send(msg).is_ok() {
             let mut completed = false;
@@ -7512,60 +7489,6 @@ mod tests {
         assert_eq!(router.remote_responder_pool.borrow().len(), 2);
         t1.join().unwrap();
         t2.join().unwrap();
-    }
-
-    #[test]
-    fn test_execute_remote_replicate_as_only_marks_its_own_message() {
-        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
-        let senders = senders_mesh.remove(0);
-        drop(senders_mesh);
-        let rx1 = receivers.remove(1);
-        // The fake shard echoes each message's `replicate_as`.
-        let t1 = std::thread::spawn(move || {
-            for _ in 0..2 {
-                if let Ok(ShardMessage::Batch {
-                    items,
-                    responder,
-                    replicate_as,
-                    ..
-                }) = rx1.recv()
-                {
-                    let reply = match replicate_as {
-                        Some(b) => format!("+{}\r\n", String::from_utf8_lossy(&b)),
-                        None => "_\r\n".to_string(),
-                    };
-                    responder
-                        .write_slot(0, crate::shard::CompactResp::from_slice(reply.as_bytes()));
-                    responder.finish(items);
-                }
-            }
-        });
-        let router = Router::new(
-            0,
-            2,
-            9979,
-            Rc::new(RefCell::new(ShardDb::new(9979))),
-            senders,
-            None,
-            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
-            std::env::temp_dir(),
-        );
-        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (quiet, normal) = rt.block_on(async {
-            let cmd = || Command::Exists(smallvec![Bytes::from("a")]);
-            (
-                router
-                    .execute_remote_replicate_as(1, cmd(), Bytes::from_static(b"LOGICAL"))
-                    .await,
-                router.execute_remote(1, cmd()).await,
-            )
-        });
-        assert_eq!(quiet, b"+LOGICAL\r\n");
-        assert_eq!(normal, b"_\r\n");
-        t1.join().unwrap();
     }
 
     #[test]

@@ -53,7 +53,6 @@ pub enum WaiterOp {
     Pop {
         pop_type: ListPopType,
         count: usize,
-        suppress_repl: bool,
     },
     Move {
         where_from: ListPopType,
@@ -69,6 +68,11 @@ pub enum WaiterOp {
         count: usize,
         ordering: crate::resp::LmovemOrdering,
     },
+    /// Wake the client (an empty `Popped`) without popping, keeping one
+    /// element back from the waiters behind it: a cross-shard BLMOVE, which
+    /// then moves the element itself the way LMOVE does, under both shards'
+    /// locks (see `connection::blmove_across_shards`).
+    Wake,
 }
 
 pub struct ListWaiter {
@@ -342,27 +346,25 @@ impl BlockHub {
         count: usize,
         sender: Sender<BlockedListResult>,
     ) {
-        self.register_list_waiter_inner(client_id, key, pop_type, count, false, sender);
+        let db = crate::connection::CURRENT_DB.get();
+        self.list_waiters
+            .entry((db, key.clone()))
+            .or_default()
+            .push_back(ListWaiter {
+                client_id,
+                key,
+                op: WaiterOp::Pop { pop_type, count },
+                sender,
+            });
+        self.sync_atomic_waiters_count();
     }
 
-    pub fn register_list_waiter_no_repl(
+    /// Blocks `client_id` until `key` has an element, then wakes it (see
+    /// [`WaiterOp::Wake`]).
+    pub fn register_list_wake_waiter(
         &mut self,
         client_id: u64,
         key: Bytes,
-        pop_type: ListPopType,
-        count: usize,
-        sender: Sender<BlockedListResult>,
-    ) {
-        self.register_list_waiter_inner(client_id, key, pop_type, count, true, sender);
-    }
-
-    fn register_list_waiter_inner(
-        &mut self,
-        client_id: u64,
-        key: Bytes,
-        pop_type: ListPopType,
-        count: usize,
-        suppress_repl: bool,
         sender: Sender<BlockedListResult>,
     ) {
         let db = crate::connection::CURRENT_DB.get();
@@ -372,11 +374,7 @@ impl BlockHub {
             .push_back(ListWaiter {
                 client_id,
                 key,
-                op: WaiterOp::Pop {
-                    pop_type,
-                    count,
-                    suppress_repl,
-                },
+                op: WaiterOp::Wake,
                 sender,
             });
         self.sync_atomic_waiters_count();
@@ -456,6 +454,8 @@ impl BlockHub {
         let db_key = (db, key.clone());
         let mut dest_to_notify: Option<Bytes> = None;
         let mut satisfied_clients = Vec::new();
+        // Elements kept back for woken clients (`WaiterOp::Wake`).
+        let mut reserved = 0usize;
         if let Some(waiters) = self.list_waiters.get_mut(&db_key) {
             while let Some(waiter) = waiters.pop_front() {
                 if waiter.sender.is_disconnected() {
@@ -465,16 +465,21 @@ impl BlockHub {
                 // waiter whose destination has the wrong type would fail
                 // with WRONGTYPE on a wakeup check before any element
                 // arrived; Redis only fails once an element is there.
-                if !table.exists(key.as_ref()) {
+                if !table.exists(key.as_ref())
+                    || (reserved > 0 && table.llen(key.as_ref()).unwrap_or(0) <= reserved)
+                {
                     waiters.push_front(waiter);
                     break;
                 }
                 match waiter.op {
-                    WaiterOp::Pop {
-                        pop_type,
-                        count,
-                        suppress_repl,
-                    } => {
+                    WaiterOp::Wake => {
+                        let _ = waiter
+                            .sender
+                            .send(BlockedListResult::Popped(key.clone(), Vec::new()));
+                        satisfied_clients.push(waiter.client_id);
+                        reserved += 1;
+                    }
+                    WaiterOp::Pop { pop_type, count } => {
                         let popped = match pop_type {
                             ListPopType::Left => table.lpop(key.as_ref(), count).ok(),
                             ListPopType::Right => table.rpop(key.as_ref(), count).ok(),
@@ -482,7 +487,7 @@ impl BlockHub {
                         if let Some(vals) = popped {
                             if !vals.is_empty() {
                                 let count = Some(vals.len());
-                                propagate_served_opts(
+                                propagate_served(
                                     self.port,
                                     &match pop_type {
                                         ListPopType::Left => crate::resp::Command::Lpop {
@@ -494,7 +499,6 @@ impl BlockHub {
                                             count,
                                         },
                                     },
-                                    suppress_repl,
                                 );
                                 let _ = waiter
                                     .sender
@@ -903,10 +907,6 @@ impl BlockHub {
 /// client, so the AOF and the replicas see the pop in the same order, and in
 /// the same shard's AOF, as the data change itself.
 fn propagate_served(port: u16, cmd: &crate::resp::Command) {
-    propagate_served_opts(port, cmd, false);
-}
-
-fn propagate_served_opts(port: u16, cmd: &crate::resp::Command, suppress_repl: bool) {
     let Some(bytes) = crate::aof::command_to_resp(cmd) else {
         crate::aof::note_unpropagated(cmd);
         return;
@@ -920,7 +920,7 @@ fn propagate_served_opts(port: u16, cmd: &crate::resp::Command, suppress_repl: b
             }
         }
     });
-    if !suppress_repl && crate::replication::has_connected_replicas(port) {
+    if crate::replication::has_connected_replicas(port) {
         match shard_id {
             Some(id) => crate::replication::propagate_shard_bytes(port, id, &bytes),
             None => crate::replication::propagate_bytes(port, &bytes),
@@ -1034,6 +1034,45 @@ mod tests {
             _ => panic!("unexpected move result: {:?}", res_m),
         }
         assert_eq!(table.llen(dst.as_ref()), Ok(1));
+    }
+
+    #[test]
+    fn test_wake_waiter_wakes_without_popping_and_keeps_an_element_back() {
+        let mut hub = BlockHub::new(12349);
+        let mut table = crate::table::RudisTable::new();
+        let key = Bytes::from_static(b"wl");
+        let (wake_tx, wake_rx) = unbounded();
+        let (pop_tx, pop_rx) = unbounded();
+        hub.register_list_wake_waiter(301, key.clone(), wake_tx);
+        hub.register_list_waiter(302, key.clone(), ListPopType::Left, 1, pop_tx);
+
+        // Nothing there yet: nobody is woken.
+        hub.notify_list(&mut table, &key);
+        assert!(wake_rx.try_recv().is_err());
+
+        // One element: the wake waiter is woken and it stays in the list for
+        // that client; the pop waiter behind doesn't take it.
+        table
+            .rpush(key.clone(), vec![Bytes::from_static(b"a")])
+            .unwrap();
+        hub.notify_list(&mut table, &key);
+        match wake_rx.try_recv().expect("woken") {
+            BlockedListResult::Popped(k, items) => {
+                assert_eq!(k, key);
+                assert!(items.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(pop_rx.try_recv().is_err());
+        assert_eq!(table.llen(key.as_ref()), Ok(1));
+
+        // A second element is for the next waiter.
+        table
+            .rpush(key.clone(), vec![Bytes::from_static(b"b")])
+            .unwrap();
+        hub.register_list_wake_waiter(303, key.clone(), unbounded().0);
+        hub.notify_list(&mut table, &key);
+        assert!(matches!(pop_rx.try_recv(), Ok(BlockedListResult::Popped(_, v)) if v.len() == 1));
     }
 
     #[test]

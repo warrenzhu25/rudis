@@ -23424,6 +23424,109 @@ fn test_full_sync_during_cross_shard_moves_matches_master_e2e() {
     resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
 }
 
+/// Clients blocked in cross-shard BLMOVEs (tail pops) are served while
+/// feeders RPUSH to the same lists' tails and a second replica full-syncs.
+/// A served move runs as a locked LMOVE (the source's shard only wakes the
+/// client), so replicas get each move in its place: a racing RPUSH stays on
+/// its side, and a full sync never catches one half done. Each move waits
+/// 300 us between its halves (DEBUG CROSS-SHARD-MOVE-DELAY).
+#[test]
+fn test_blocked_cross_shard_moves_replicate_in_place_e2e() {
+    let (mp, r1, r2) = (18414u16, 18415u16, 18416u16);
+    start_test_server(mp, 4);
+    start_test_server(r1, 2);
+    start_test_server(r2, 3);
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    let mut rep1 = TcpStream::connect(("127.0.0.1", r1)).unwrap();
+    let mut rep2 = TcpStream::connect(("127.0.0.1", r2)).unwrap();
+    assert_eq!(
+        resp_cmd_all(&mut rep1, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd_all(&mut m, &["WAIT", "1", "100"]) != ":1\r\n" {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+    }
+    assert_eq!(
+        resp_cmd_all(&mut m, &["DEBUG", "CROSS-SHARD-MOVE-DELAY", "300"]),
+        "+OK\r\n"
+    );
+    // Two source/destination pairs on different shards.
+    let mut pairs = Vec::new();
+    for i in 0.. {
+        let (src, dst) = (format!("bsrc:{i}"), format!("bdst:{i}"));
+        if rudis::router::target_shard(src.as_bytes(), 4)
+            != rudis::router::target_shard(dst.as_bytes(), 4)
+        {
+            pairs.push((src, dst));
+            if pairs.len() == 2 {
+                break;
+            }
+        }
+    }
+    const MOVES: usize = 120;
+    // Two movers per pair, blocked whenever the source is empty.
+    let movers: Vec<_> = (0..4)
+        .map(|c| {
+            let (src, dst) = pairs[c % 2].clone();
+            thread::spawn(move || {
+                let mut conn = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+                for _ in 0..MOVES {
+                    let r = resp_cmd_all(&mut conn, &["BLMOVE", &src, &dst, "RIGHT", "LEFT", "10"]);
+                    assert!(r.starts_with('$') && r != "$-1\r\n", "{r}");
+                }
+            })
+        })
+        .collect();
+    // One feeder per pair: as many pushes as its two movers take.
+    let feeders: Vec<_> = (0..2)
+        .map(|f| {
+            let (src, _) = pairs[f].clone();
+            thread::spawn(move || {
+                let mut conn = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+                for i in 0..2 * MOVES {
+                    resp_cmd_all(&mut conn, &["RPUSH", &src, &format!("{f}-{i}")]);
+                    if i % 8 == 0 {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        resp_cmd_all(&mut rep2, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    for t in movers.into_iter().chain(feeders) {
+        t.join().unwrap();
+    }
+    resp_cmd_all(&mut m, &["DEBUG", "CROSS-SHARD-MOVE-DELAY", "0"]);
+    for (src, dst) in &pairs {
+        assert_eq!(resp_cmd_all(&mut m, &["LLEN", src]), ":0\r\n");
+        assert_eq!(
+            resp_cmd_all(&mut m, &["LLEN", dst]),
+            format!(":{}\r\n", 2 * MOVES)
+        );
+    }
+    assert_eq!(resp_cmd_all(&mut m, &["WAIT", "2", "10000"]), ":2\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let dm = debug_digest(&mut m);
+        let (d1, d2) = (debug_digest(&mut rep1), debug_digest(&mut rep2));
+        if dm == d1 && dm == d2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "digests differ: master {dm} replica1 {d1} replica2 {d2}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    resp_cmd_all(&mut rep1, &["REPLICAOF", "NO", "ONE"]);
+    resp_cmd_all(&mut rep2, &["REPLICAOF", "NO", "ONE"]);
+}
+
 /// Shards hold their replication bytes for a mailbox burst and stream them
 /// once. Pipelined writes from several clients over every shard (DB
 /// switches, cross-shard LMOVE, a FLUSHALL right after remote writes, a
