@@ -1,7 +1,7 @@
 # RDB Snapshotting
 
-This document describes how Rudis persists a point-in-time snapshot of the keyspace to an
-RDB-format file: what triggers a save, how the data is serialized, how the operation interacts
+This document describes how Rudis persists a snapshot of the keyspace to an RDB-format file
+(per key, not one point in time: see "No true isolation" below): what triggers a save, how the data is serialized, how the operation interacts
 with the thread-per-core shard model, the on-disk file format, and the configuration and commands
 that control it.
 
@@ -27,7 +27,13 @@ familiar with real Redis might expect, that is called out explicitly.
 - **No true isolation from concurrent writes.** There is no fork and no MVCC, so a save is a
   scan of each shard's live table while that shard keeps serving clients. Each key is written as
   it is when the scan reaches it: the snapshot is consistent per key, not a single point in time
-  (closer to a fuzzy dump).
+  (closer to a fuzzy dump). So a write spanning keys (`MULTI`/`EXEC`, `MSET`, `LMOVE`,
+  `RENAME`) that runs during a save can be in the file for some of its keys and not others, a
+  state that never existed; Redis's forked child can't write that. With AOF on, a restart replays
+  the AOF, which is exact; to take an exact RDB without AOF, pause writes around it
+  (`CLIENT PAUSE <ms> WRITE`, then `SAVE`). Replicas aren't affected: a full sync builds
+  point-in-time per-shard images (the stream after them repeats every later write) and holds
+  cross-shard writes back while it starts them.
 - **Shards stream one after another.** The coordinating shard asks each shard in turn
   (`ShardMessage::StreamRdbChunk`) to serialize its keyspace and send it to the writer in
   ~4 MB pieces through a rendezvous channel, so the file layout is one shard after another and
