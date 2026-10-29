@@ -27,6 +27,7 @@ pub mod hll;
 pub mod json;
 pub mod log;
 pub mod mailbox;
+#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod netsec;
 pub mod packedhash;

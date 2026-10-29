@@ -28,6 +28,7 @@ step() { # name, command...
 
 step "cargo fmt --check" cargo fmt --check
 step "clippy" cargo clippy --all-targets -- -D warnings
+step "clippy (no default features)" cargo clippy --all-targets --no-default-features -- -D warnings
 step "unit tests" cargo test --lib
 step "cross-thread tests" cargo test --test test_cross_thread
 step "redis rdb compat tests" cargo test --test test_redis_rdb_compat

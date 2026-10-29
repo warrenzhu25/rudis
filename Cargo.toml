@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+# Experimental subsystems a production build can leave out
+# (`cargo build --release --no-default-features`): their commands are then
+# refused. MCP serves JSON-RPC tool calls; XDP polls AF_XDP sockets on
+# every shard.
+default = ["mcp", "xdp"]
+mcp = []
+xdp = []
+
 [dependencies]
 parking_lot = "0.12"
 bytes = "1.12.1"

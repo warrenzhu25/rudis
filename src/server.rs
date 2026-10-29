@@ -498,6 +498,9 @@ pub fn run_shard_worker(
             }
         });
 
+        // Only with the xdp cargo feature.
+        #[cfg(feature = "xdp")]
+        {
         // 5. AF_XDP Kernel Bypass Ingress Loop: poll zero-copy Rx ring for packet descriptors
         let xdp_engine = crate::xdp::get_xdp_engine();
         let xdp_db = local_db.clone();
@@ -554,6 +557,7 @@ pub fn run_shard_worker(
                 }
             }
         });
+        }
 
         // 4. Spawn background worker to handle incoming cross-shard messages from peer cores
         let cross_shard_db = local_db.clone();

@@ -201,6 +201,10 @@ cd rudis
 cargo build --release
 ```
 
+For production, `cargo build --release --no-default-features` leaves out the experimental
+`MCP.*` (JSON-RPC tool calls) and `XDP.*` (AF_XDP packet path, polled on every shard)
+subsystems; their commands are then refused even with `enable-experimental-commands yes`.
+
 ### 2. Run Rudis
 
 The binary is `rudis`. Its real command-line flags (from `src/main.rs`, via `clap`) are:
@@ -726,7 +730,9 @@ links go to the corresponding source-verified subsystem specification.
 > `ERR unknown command`. Enable them with `enable-experimental-commands yes` (config file) or
 > `--enable-experimental-commands yes`. All mutating commands across `JSON.*`, `FT.*`,
 > `SEMANTIC.*`, `BF.*`, `CF.*`, `CMS.*`, `TOPK.*`, `CRDT.*`, `AGENT.*`, and `LLM.QUOTA.*` are
-> persisted to RDB and AOF and propagated to replicas.
+> persisted to RDB and AOF and propagated to replicas. `MCP.*` and `XDP.*` are also cargo
+> features (default on): a `--no-default-features` build doesn't contain them. The other
+> families stay compiled in, since their data is in RDB and AOF files.
 
 | Subsystem | Status | Notes | Design Doc |
 | :--- | :---: | :--- | :--- |

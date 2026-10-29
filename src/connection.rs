@@ -12367,6 +12367,12 @@ async fn execute_command_inner(
             crate::command_info::write_docs(out, cmds, CURRENT_CLIENT_RESP3.get());
             false
         }
+        #[cfg(not(feature = "mcp"))]
+        Command::McpTools | Command::McpCall { .. } | Command::McpRpc(_) => {
+            out.extend_from_slice(b"-ERR MCP is not compiled into this build (cargo feature mcp)\r\n");
+            false
+        }
+        #[cfg(feature = "mcp")]
         Command::McpTools => {
             let tools = crate::mcp::builtin_mcp_tools();
             write_resp_array_header(out, tools.len());
@@ -12382,6 +12388,7 @@ async fn execute_command_inner(
             }
             false
         }
+        #[cfg(feature = "mcp")]
         Command::McpCall { tool, args_json } => {
             let args: serde_json::Value = match serde_json::from_slice(&args_json) {
                 Ok(v) => v,
@@ -12418,6 +12425,7 @@ async fn execute_command_inner(
             write_resp_bulk(out, s.as_bytes());
             false
         }
+        #[cfg(feature = "mcp")]
         Command::McpRpc(req_bytes) => {
             let req: serde_json::Value = match serde_json::from_slice(&req_bytes) {
                 Ok(v) => v,
@@ -19219,6 +19227,19 @@ async fn execute_command_inner(
             }
             false
         }
+        #[cfg(not(feature = "xdp"))]
+        Command::XdpInfo
+        | Command::XdpRuleAdd { .. }
+        | Command::XdpRuleDel(_)
+        | Command::XdpRuleList
+        | Command::XdpStats
+        | Command::XdpSocket(_)
+        | Command::XdpInject { .. }
+        | Command::XdpPacket(_) => {
+            out.extend_from_slice(b"-ERR XDP is not compiled into this build (cargo feature xdp)\r\n");
+            false
+        }
+        #[cfg(feature = "xdp")]
         Command::XdpInfo => {
             let engine = crate::xdp::get_xdp_engine();
             for qid in 0..router.num_shards as u32 {
@@ -19228,6 +19249,7 @@ async fn execute_command_inner(
             write_resp_bulk(out, info.as_bytes());
             false
         }
+        #[cfg(feature = "xdp")]
         Command::XdpRuleAdd { action, cidr } => {
             match crate::xdp::get_xdp_engine().add_rule(action, &cidr) {
                 Ok(id) => write_resp_integer(out, id as i64),
@@ -19235,6 +19257,7 @@ async fn execute_command_inner(
             }
             false
         }
+        #[cfg(feature = "xdp")]
         Command::XdpRuleDel(id) => {
             match crate::xdp::get_xdp_engine().del_rule(id) {
                 Ok(()) => out.extend_from_slice(b"+OK\r\n"),
@@ -19242,6 +19265,7 @@ async fn execute_command_inner(
             }
             false
         }
+        #[cfg(feature = "xdp")]
         Command::XdpRuleList => {
             let rules = crate::xdp::get_xdp_engine().list_rules();
             out.extend_from_slice(format!("*{}\r\n", rules.len()).as_bytes());
@@ -19251,6 +19275,7 @@ async fn execute_command_inner(
             }
             false
         }
+        #[cfg(feature = "xdp")]
         Command::XdpStats => {
             use std::sync::atomic::Ordering;
             let engine = crate::xdp::get_xdp_engine();
@@ -19272,12 +19297,14 @@ async fn execute_command_inner(
             write_resp_integer(out, engine.rate_limit_drops.load(Ordering::Relaxed) as i64);
             false
         }
+        #[cfg(feature = "xdp")]
         Command::XdpPacket(payload) => {
             let action = crate::xdp::get_xdp_engine().process_packet(&payload);
             let s = format!("+{}\r\n", action);
             out.extend_from_slice(s.as_bytes());
             false
         }
+        #[cfg(feature = "xdp")]
         Command::XdpSocket(qid) => {
             let engine = crate::xdp::get_xdp_engine();
             let sock = engine.get_or_create_socket(router.port, qid);
@@ -19292,6 +19319,7 @@ async fn execute_command_inner(
             write_resp_integer(out, sock.tx_ring.len() as i64);
             false
         }
+        #[cfg(feature = "xdp")]
         Command::XdpInject { queue_id, payload } => {
             let engine = crate::xdp::get_xdp_engine();
             let sock = engine.get_or_create_socket(router.port, queue_id);

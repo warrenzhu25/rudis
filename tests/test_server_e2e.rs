@@ -5366,6 +5366,7 @@ fn test_redisearch_fulltext_and_hybrid_vector_e2e() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "xdp"), ignore = "needs the xdp cargo feature")]
 fn test_af_xdp_ebpf_kernel_bypass_e2e() {
     let port = 16621;
     start_test_server(port, 2);
@@ -8805,6 +8806,7 @@ fn test_simd_vector_distance_acceleration_hnsw_e2e() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "xdp"), ignore = "needs the xdp cargo feature")]
 fn test_af_xdp_kernel_bypass_zero_copy_rings_e2e() {
     let port = 16775;
     let num_shards = 2;
@@ -13808,6 +13810,7 @@ fn test_agent_checkpoint_dag_and_tool_idempotency_e2e() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "mcp"), ignore = "needs the mcp cargo feature")]
 fn test_mcp_protocol_tools_call_and_rpc_e2e() {
     let port = 19156;
     start_test_server(port, 2);
@@ -37208,4 +37211,27 @@ fn test_expired_on_load_deletes_reach_replicas_in_their_db_e2e() {
     assert!(stats.contains("sync_partial_ok:1"), "{stats}");
     drop(master);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// MCP and XDP are cargo features (default on): a build without them
+/// refuses their commands, the rest of the server unchanged.
+#[test]
+fn test_mcp_and_xdp_follow_their_cargo_features_e2e() {
+    let port = 29993u16;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mcp = resp_cmd_all(&mut c, &["MCP.TOOLS"]);
+    let xdp = resp_cmd_all(&mut c, &["XDP.RULE", "LIST"]);
+    if cfg!(feature = "mcp") {
+        assert!(mcp.starts_with('*'), "{mcp}");
+    } else {
+        assert!(mcp.contains("cargo feature mcp"), "{mcp}");
+    }
+    if cfg!(feature = "xdp") {
+        assert!(!xdp.starts_with('-'), "{xdp}");
+    } else {
+        assert!(xdp.contains("cargo feature xdp"), "{xdp}");
+    }
+    assert_eq!(resp_cmd_all(&mut c, &["PING"]), "+PONG\r\n");
 }
