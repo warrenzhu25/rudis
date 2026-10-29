@@ -36272,13 +36272,19 @@ fn test_shutdown_abort_and_now_e2e() {
     assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":2\r\n");
     assert!(resp_cmd_full(&mut m, &["INFO", "clients"]).contains("blocked_clients:0\r\n"));
 
-    // NOW: no waiting for the stopped replica.
+    // NOW: no waiting for the stopped replica, nor for its link, which is
+    // not a command batch the drain waits for (it once sat out the whole
+    // 2 s drain timeout, so a test harness gave up and sent SIGTERM).
     let t = std::time::Instant::now();
     m.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$3\r\nNOW\r\n")
         .unwrap();
     let status = master.wait().unwrap();
     assert!(status.success(), "{status}");
-    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
+    );
     // SAFETY: as above.
     unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGCONT) };
     let _ = replica.kill();

@@ -215,6 +215,17 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn test_a_released_batch_no_longer_counts() {
+        let busy = || INFLIGHT[254 % INFLIGHT_SLOTS].load(Ordering::SeqCst);
+        let before = busy();
+        let mut guard = enter_batch(254);
+        assert_eq!(busy(), before + 1);
+        // A connection turning into a replica link lets its batch go.
+        guard.take();
+        assert_eq!(busy(), before);
+    }
+
+    #[test]
     fn test_quiesce_holds_new_batches_and_waits_for_running_ones() {
         let _guard = TEST_LOCK.lock();
         let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()

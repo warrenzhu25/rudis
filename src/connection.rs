@@ -6060,6 +6060,11 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         switch_cmd,
                         Command::Psync { .. } | Command::Sync | Command::DflyFlow { .. }
                     ) {
+                        // The link lives as long as the replica: it isn't a
+                        // command batch a shutdown waits for (every SHUTDOWN
+                        // on a master with replicas sat out its whole drain
+                        // timeout).
+                        batch_guard.take();
                         stats
                             .is_replica
                             .store(true, std::sync::atomic::Ordering::Relaxed);
