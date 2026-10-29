@@ -4046,18 +4046,42 @@ fn parse_endoff(line: &[u8]) -> Option<(u64, String, u64)> {
     parts.next().is_none().then_some((offset, replid, id))
 }
 
+/// How much of the stream a replica buffers itself during a dual-channel
+/// full sync (see [`dual_channel_sync`]): as in Valkey, the hard limit of
+/// `client-output-buffer-limit replica` (none if 0). Past it the replica
+/// stops reading: the rest waits at the master, under that same limit.
+fn dual_channel_buffer_limit() -> Option<usize> {
+    let hard =
+        crate::connection::get_client_output_buffer_limit(crate::connection::ClientClass::Replica)
+            .hard_limit;
+    (hard > 0).then_some(hard as usize)
+}
+
+fn log_dual_channel_buffer_full(bytes: usize) {
+    crate::log_notice!(
+        "Dual-channel sync: buffered {} bytes of the stream (client-output-buffer-limit replica); the rest waits at the master",
+        bytes
+    );
+}
+
 /// Runs `fut` to completion while reading more of our master's stream from
-/// `main` onto the end of `buf`. A broken `main` stops the reading (the
+/// `main` onto the end of `buf`, until `buf` holds `limit` bytes (see
+/// [`dual_channel_buffer_limit`]). A broken `main` stops the reading (the
 /// error is returned) but not `fut`.
 async fn read_stream_while<F: std::future::Future>(
     main: &mut monoio::net::TcpStream,
     buf: &mut bytes::BytesMut,
+    limit: Option<usize>,
     fut: F,
 ) -> (F::Output, std::io::Result<()>) {
     use monoio::buf::IoBufMut;
     use monoio::io::CancelableAsyncReadRent;
     let mut fut = std::pin::pin!(fut);
     loop {
+        if limit.is_some_and(|l| buf.len() >= l) {
+            log_dual_channel_buffer_full(buf.len());
+            return (fut.await, Ok(()));
+        }
         buf.reserve(STREAM_READ_BYTES);
         let (len, cap) = (buf.len(), buf.capacity());
         let owned = std::mem::take(buf);
@@ -4105,7 +4129,8 @@ struct SideReader {
 }
 
 impl SideReader {
-    fn start(fd: std::os::unix::io::RawFd) -> std::io::Result<Self> {
+    /// Reads at most about `budget` bytes (no bound if None).
+    fn start(fd: std::os::unix::io::RawFd, budget: Option<usize>) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let thread = std::thread::Builder::new()
@@ -4117,6 +4142,14 @@ impl SideReader {
                 // mode (the io_uring driver doesn't need O_NONBLOCK). What
                 // is left once stopped stays in it for the caller.
                 while !flag.load(Ordering::Acquire) {
+                    if budget.is_some_and(|b| out.len() >= b) {
+                        // Full: the rest waits at the master until stopped.
+                        log_dual_channel_buffer_full(out.len());
+                        while !flag.load(Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        break;
+                    }
                     let mut pfd = libc::pollfd {
                         fd,
                         events: libc::POLLIN,
@@ -4275,7 +4308,13 @@ async fn dual_channel_sync(
             .map(|b| (b, written))
             .map_err(|e| format!("mapping the temp file: {e}"))
     };
-    let (received, stream_res) = read_stream_while(&mut main, &mut buffered, receive).await;
+    let (received, stream_res) = read_stream_while(
+        &mut main,
+        &mut buffered,
+        dual_channel_buffer_limit(),
+        receive,
+    )
+    .await;
     let (rdb_bytes, rdb_len) = received.map_err(|e| format!("RDB channel: {e}"))?;
     stream_res.map_err(|e| format!("main channel: {e}"))?;
     Ok(DualChannelSync {
@@ -4807,7 +4846,12 @@ async fn run_replica_worker(
                 // A broken main connection shows up in the streaming loop,
                 // which resumes from what was applied.
                 let side = dual_stream
-                    .then(|| SideReader::start(std::os::unix::io::AsRawFd::as_raw_fd(&stream)).ok())
+                    .then(|| {
+                        let budget =
+                            dual_channel_buffer_limit().map(|l| l.saturating_sub(buf.len()));
+                        SideReader::start(std::os::unix::io::AsRawFd::as_raw_fd(&stream), budget)
+                            .ok()
+                    })
                     .flatten();
                 let loaded = router.restore_rdb_bytes(rdb_bytes).await;
                 if let Some(side) = side {
@@ -6586,7 +6630,7 @@ mod tests {
         use std::io::Write;
         let (mut tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&rx);
-        let side = SideReader::start(fd).unwrap();
+        let side = SideReader::start(fd, None).unwrap();
         tx.write_all(b"hello ").unwrap();
         tx.write_all(b"world").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -6601,9 +6645,23 @@ mod tests {
         drop(rx);
         writer.join().unwrap();
 
+        // A budget stops the reading there (about: whole reads).
+        let (mut tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        let side = SideReader::start(std::os::unix::io::AsRawFd::as_raw_fd(&rx), Some(10)).unwrap();
+        tx.write_all(b"0123456789").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        tx.write_all(b"more").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (got, err) = side.finish();
+        assert!(err.is_none());
+        assert_eq!(got, b"0123456789", "stopped at the budget");
+        let mut left = [0u8; 4];
+        std::io::Read::read_exact(&mut &rx, &mut left).unwrap();
+        assert_eq!(&left, b"more", "the rest stays in the socket");
+
         // A peer that closes ends it with the bytes read so far.
         let (mut tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
-        let side = SideReader::start(std::os::unix::io::AsRawFd::as_raw_fd(&rx)).unwrap();
+        let side = SideReader::start(std::os::unix::io::AsRawFd::as_raw_fd(&rx), None).unwrap();
         tx.write_all(b"bye").unwrap();
         drop(tx);
         std::thread::sleep(std::time::Duration::from_millis(100));

@@ -7064,3 +7064,129 @@ fn test_expired_on_load_deletes_reach_replicas_in_their_db_e2e() {
     drop(master);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A replica in a dual-channel full sync buffers the stream itself only up
+/// to its `client-output-buffer-limit replica` hard limit; then it stops
+/// reading and the rest waits at the master (whose limit is larger here).
+/// The sync still completes at once, with all the data.
+#[test]
+fn test_dual_channel_replica_buffer_stops_at_its_limit_e2e() {
+    let (mp, rp) = (29994u16, 29995u16);
+    let (ms, rs) = (mp.to_string(), rp.to_string());
+    let dir = std::env::temp_dir().join(format!("rudis-duallim-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let rlog = dir.join("replica.log");
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dual = ["--dual-channel-replication-enabled", "yes"];
+    let common = ["--threads", "4", "--no-pin", "--save", ""];
+    let mut margs = vec!["--port", ms.as_str()];
+    margs.extend(common);
+    margs.extend(dual);
+    let _master = Kill(spawn_rudis_listening(&margs, mp));
+    let replica = rudis_bin()
+        .args(["--port", rs.as_str()])
+        .args(common)
+        .args(dual)
+        .args(DEBUG_ON)
+        .args(["--loglevel", "notice"])
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+        .stdout(std::fs::File::create(&rlog).unwrap())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _replica = Kill(replica);
+    let connect = |port: u16| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                return s;
+            }
+            assert!(std::time::Instant::now() < deadline, "no server on {port}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let mut m = connect(mp);
+    let mut r = connect(rp);
+    assert_eq!(
+        resp_cmd_all(&mut m, &["DEBUG", "POPULATE", "300000", "key", "256"]),
+        "+OK\r\n"
+    );
+    // The replica holds at most 1 MB itself; the master up to 256 MB.
+    assert_eq!(
+        resp_cmd_all(
+            &mut r,
+            &[
+                "CONFIG",
+                "SET",
+                "client-output-buffer-limit",
+                "replica 1mb 0 0"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut w = connect(mp);
+            let val = "x".repeat(512);
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut pipe = String::new();
+                for i in 0..200 {
+                    let k = format!("w:{}", (n + i) % 50_000);
+                    pipe.push_str(&format!(
+                        "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n${}\r\n{val}\r\n",
+                        k.len(),
+                        val.len()
+                    ));
+                }
+                w.write_all(pipe.as_bytes()).unwrap();
+                let mut got = 0;
+                let mut buf = [0u8; 4096];
+                while got < 200 * 5 {
+                    got += w.read(&mut buf).unwrap();
+                }
+                n += 200;
+                thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !resp_cmd_all(&mut r, &["INFO", "replication"]).contains("master_link_status:up") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replica never synced"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(500));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert_eq!(resp_cmd_all(&mut m, &["WAIT", "1", "10000"]), ":1\r\n");
+    let stats = resp_cmd_all(&mut m, &["INFO", "stats"]);
+    assert!(stats.contains("sync_full:1\r\n"), "{stats}");
+    assert_eq!(
+        resp_cmd_all(&mut r, &["DEBUG", "DIGEST"]),
+        resp_cmd_all(&mut m, &["DEBUG", "DIGEST"])
+    );
+    let log = std::fs::read_to_string(&rlog).unwrap();
+    assert!(
+        log.contains("Dual-channel sync: buffered"),
+        "the replica never stopped at its limit:\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

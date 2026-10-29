@@ -73,8 +73,10 @@ replica`), so the replica loops through full syncs. With dual channels:
    continues as usual.
 
 The master's buffer for the replica stays at what the network hasn't taken yet. The cost moves to
-the replica: its buffer grows with the write rate times the transfer and load time, with no limit
-of its own. In a test with a 32 MB replica limit, 1M keys and ~60 MB/s of writes, a plain full
+the replica: its buffer grows with the write rate times the transfer and load time, up to the
+replica's own `client-output-buffer-limit replica` hard limit (as in Valkey; none if 0). Past it the
+replica stops reading and logs "Dual-channel sync: buffered N bytes ...": the rest waits at the
+master, under the master's limit. In a test with a 32 MB replica limit, 1M keys and ~60 MB/s of writes, a plain full
 sync was retried 13-18 times without ever linking; a dual-channel one linked at the first attempt
 in ~2.3 s.
 
