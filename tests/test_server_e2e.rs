@@ -36291,6 +36291,77 @@ fn test_shutdown_abort_and_now_e2e() {
     let _ = replica.wait();
 }
 
+/// A signal arriving while a SHUTDOWN NOW runs, or once it is exiting,
+/// doesn't start a second shutdown: that one waited for replicas, sent them a GETACK
+/// (moving the offset) and saved again over the first RDB, so the master
+/// could restart at an offset its replicas never had.
+#[test]
+fn test_signal_during_shutdown_now_does_not_save_again_e2e() {
+    let (mport, rport) = (29931u16, 29932u16);
+    let dir = std::env::temp_dir().join(format!("rudis-sigshut-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let ms = mport.to_string();
+    let args = ["--port", &ms, "--threads", "2", "--no-pin", "--dir", &ds];
+    start_test_server(rport, 2);
+    let connect = |port: u16| {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let mut r = connect(rport);
+    for round in 0..5 {
+        let log_path = dir.join(format!("master-{round}.log"));
+        let mut master = rudis_bin()
+            .args(args)
+            .args(DEBUG_ON)
+            .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+            .stdout(std::fs::File::create(&log_path).unwrap())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn rudis");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut m = loop {
+            if let Ok(mut c) = TcpStream::connect(("127.0.0.1", mport)) {
+                c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                if resp_cmd(&mut c, &["PING"]) == "+PONG\r\n" {
+                    break c;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "rudis did not start");
+            thread::sleep(Duration::from_millis(50));
+        };
+        // From round 1 on the replica already follows this address.
+        assert!(resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &ms]).starts_with("+OK"));
+        wait_for_master_link(&mut r);
+        assert_eq!(resp_cmd(&mut m, &["SET", "k", "v"]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut m, &["WAIT", "1", "5000"]), ":1\r\n");
+        m.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$3\r\nNOW\r\n")
+            .unwrap();
+        // As Redis's test harness does: SIGTERM right behind it, once the
+        // SHUTDOWN runs (at different moments of it, and after it).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .contains("User requested shutdown")
+        {
+            assert!(std::time::Instant::now() < deadline, "SHUTDOWN never ran");
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(4 * round));
+        // SAFETY: kill(2) on our own live child.
+        unsafe { libc::kill(master.id() as libc::pid_t, libc::SIGTERM) };
+        assert!(master.wait().unwrap().success());
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            !log.contains("Received SIGTERM scheduling shutdown"),
+            "round {round}: a second shutdown ran:\n{log}"
+        );
+    }
+    resp_cmd(&mut r, &["REPLICAOF", "NO", "ONE"]);
+}
+
 /// A master restarted from its RDB keeps its backlog for replicas to come
 /// back to, as Redis does: one returning promptly continues with a partial
 /// resync even after a write. With no replica back within the restart

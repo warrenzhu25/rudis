@@ -19344,6 +19344,7 @@ async fn execute_command_inner(
             save, now, force, ..
         } => {
             crate::log_warning!("User requested shutdown...");
+            let _running = crate::shutdown::ShutdownCommand::begin();
             if !now && !crate::replication::wait_replicas_before_shutdown(router.base_port, router.num_shards).await {
                 // SHUTDOWN ABORT (already logged).
                 out.extend_from_slice(b"-ERR Errors trying to SHUTDOWN. Check logs.\r\n");

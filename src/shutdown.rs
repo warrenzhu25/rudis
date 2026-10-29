@@ -7,6 +7,33 @@ pub fn is_shutting_down() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
 }
 
+/// SHUTDOWN commands running now (see [`ShutdownCommand`]).
+static SHUTDOWN_COMMANDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A SHUTDOWN command in progress, until dropped. A SIGTERM / SIGINT
+/// arriving meanwhile stays pending: it takes effect only if this one
+/// fails or is aborted, instead of running a second shutdown beside it
+/// (which waited for replicas, moving the offset, and saved again).
+pub struct ShutdownCommand(());
+
+impl ShutdownCommand {
+    pub fn begin() -> Self {
+        SHUTDOWN_COMMANDS.fetch_add(1, Ordering::SeqCst);
+        Self(())
+    }
+}
+
+impl Drop for ShutdownCommand {
+    fn drop(&mut self) {
+        SHUTDOWN_COMMANDS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether a SHUTDOWN command is in progress.
+pub fn shutdown_command_running() -> bool {
+    SHUTDOWN_COMMANDS.load(Ordering::SeqCst) > 0
+}
+
 /// Initiates a graceful server shutdown.
 pub fn request_shutdown() {
     if !SHUTDOWN_REQUESTED.swap(true, Ordering::SeqCst) {
@@ -213,6 +240,15 @@ pub(crate) static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(()
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn test_shutdown_command_is_tracked_while_it_runs() {
+        let before = SHUTDOWN_COMMANDS.load(Ordering::SeqCst);
+        let cmd = ShutdownCommand::begin();
+        assert!(shutdown_command_running());
+        drop(cmd);
+        assert_eq!(SHUTDOWN_COMMANDS.load(Ordering::SeqCst), before);
+    }
 
     #[test]
     fn test_a_released_batch_no_longer_counts() {

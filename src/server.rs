@@ -2499,6 +2499,17 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             monoio::spawn(async move {
                 while !crate::shutdown::is_shutting_down() {
                     monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    // A SHUTDOWN that completed meanwhile is already exiting:
+                    // a signal arriving now must not wait for replicas and
+                    // save again (it moved the offset the first save wrote).
+                    if crate::shutdown::is_shutting_down() {
+                        break;
+                    }
+                    // Nor while a SHUTDOWN is under way: the signal waits,
+                    // and takes effect if that one fails or is aborted.
+                    if crate::shutdown::shutdown_command_running() {
+                        continue;
+                    }
                     if !crate::shutdown::take_shutdown_signal() {
                         continue;
                     }
