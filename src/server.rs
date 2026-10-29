@@ -2079,6 +2079,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                 aof_ref,
                             );
                         }
+                        crate::replication::cached_hub(port)
+                            .replica_batches_in_flight
+                            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         let _ = responder.send(());
                     }
                     ShardMessage::FlushCommandStats { responder } => {

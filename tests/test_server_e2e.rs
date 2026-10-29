@@ -23652,6 +23652,191 @@ fn test_cross_shard_strict_refuses_commands_spanning_shards_e2e() {
     assert_eq!(resp_cmd_all(&mut c, &["DEL", &a, &b]), ":2\r\n");
 }
 
+/// A replica reads its master's stream in big pieces and keeps applying
+/// while earlier pieces are still in its shards; it hands its snapshot
+/// lock over to a full sync only once they are applied. A sub-replica
+/// full-syncing from it while the master streams pipelined writes over
+/// every shard (and transactions) must end with the same data.
+#[test]
+fn test_sub_replica_full_sync_while_replica_applies_in_flight_e2e() {
+    let (mp, rp, sp) = (18423u16, 18424u16, 18425u16);
+    start_test_server(mp, 4);
+    start_test_server(rp, 4);
+    start_test_server(sp, 2);
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    let mut sub = TcpStream::connect(("127.0.0.1", sp)).unwrap();
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd_all(&mut m, &["WAIT", "1", "100"]) != ":1\r\n" {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+    }
+    let writers: Vec<_> = (0..4)
+        .map(|c| {
+            thread::spawn(move || {
+                let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+                let mut conn = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+                for round in 0..4 {
+                    let mut cmds = Vec::new();
+                    for i in 0..4000 {
+                        cmds.push(s(&[
+                            "SET",
+                            &format!("w:{c}:{i}"),
+                            &format!("{round}-{}", "x".repeat(200)),
+                        ]));
+                        cmds.push(s(&["INCR", &format!("n:{c}")]));
+                        if i % 50 == 0 {
+                            cmds.push(s(&["MULTI"]));
+                            cmds.push(s(&["INCR", &format!("ta:{c}")]));
+                            cmds.push(s(&["INCR", &format!("tb:{c}")]));
+                            cmds.push(s(&["EXEC"]));
+                        }
+                    }
+                    pipeline_all(&mut conn, &cmds, &format!("w-{c}-{round}"));
+                }
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        resp_cmd_all(&mut sub, &["REPLICAOF", "127.0.0.1", &rp.to_string()]),
+        "+OK\r\n"
+    );
+    for w in writers {
+        w.join().unwrap();
+    }
+    assert_eq!(resp_cmd_all(&mut m, &["WAIT", "1", "10000"]), ":1\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (dm, dr, ds) = (
+            debug_digest(&mut m),
+            debug_digest(&mut r),
+            debug_digest(&mut sub),
+        );
+        if dm == dr && dm == ds {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "digests differ: master {dm} replica {dr} sub-replica {ds}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    for c in 0..4 {
+        assert_eq!(
+            resp_cmd_all(&mut sub, &["GET", &format!("n:{c}")]),
+            "$5\r\n16000\r\n"
+        );
+        assert_eq!(
+            resp_cmd_all(&mut sub, &["GET", &format!("ta:{c}")]),
+            resp_cmd_all(&mut sub, &["GET", &format!("tb:{c}")])
+        );
+    }
+    resp_cmd_all(&mut sub, &["REPLICAOF", "NO", "ONE"]);
+    resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
+}
+
+/// A replica whose master's stream is idle (pings off) still serves a
+/// sub-replica's full sync at once: its stream loop must not keep its
+/// snapshot lock while it waits for the next read.
+#[test]
+fn test_idle_replica_serves_a_sub_replica_full_sync_e2e() {
+    let (mp, rp, sp) = (18426u16, 18427u16, 18428u16);
+    start_test_server(mp, 2);
+    start_test_server(rp, 2);
+    start_test_server(sp, 2);
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    let mut sub = TcpStream::connect(("127.0.0.1", sp)).unwrap();
+    assert_eq!(
+        resp_cmd_all(
+            &mut m,
+            &["CONFIG", "SET", "repl-ping-replica-period", "3600"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd_all(&mut m, &["WAIT", "1", "100"]) != ":1\r\n" {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+    }
+    resp_cmd_all(&mut m, &["SET", "k", "v"]);
+    assert_eq!(resp_cmd_all(&mut m, &["WAIT", "1", "5000"]), ":1\r\n");
+    // The stream is idle now.
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        resp_cmd_all(&mut sub, &["REPLICAOF", "127.0.0.1", &rp.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while resp_cmd_all(&mut sub, &["GET", "k"]) != "$1\r\nv\r\n" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sub-replica's full sync waited on the idle stream"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    resp_cmd_all(&mut sub, &["REPLICAOF", "NO", "ONE"]);
+    resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
+}
+
+/// A replica acks what its shards applied even when no more of the stream
+/// comes (pings off): the last read's batches finish after the loop went
+/// back to reading, and the periodic ack must still report them, or the
+/// master sees the replica lagging (INFO, min-replicas-max-lag) until the
+/// next write.
+#[test]
+fn test_idle_replica_acks_everything_it_applied_e2e() {
+    let (mp, rp) = (18429u16, 18430u16);
+    start_test_server(mp, 4);
+    start_test_server(rp, 4);
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    assert_eq!(
+        resp_cmd_all(
+            &mut m,
+            &["CONFIG", "SET", "repl-ping-replica-period", "3600"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd_all(&mut m, &["WAIT", "1", "100"]) != ":1\r\n" {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+    }
+    let acked = |m: &mut TcpStream| -> Option<u64> {
+        let info = resp_cmd_all(m, &["INFO", "replication"]);
+        let line = info.lines().find(|l| l.starts_with("slave0:"))?;
+        line.split(',')
+            .find_map(|kv| kv.strip_prefix("offset="))
+            .and_then(|v| v.parse().ok())
+    };
+    for round in 0..5 {
+        // No WAIT: its GETACK would make the replica drain and ack.
+        pipelined_set_load(mp, 50_000);
+        let target = info_field_u64(&mut m, "replication", "master_repl_offset");
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while acked(&mut m) != Some(target) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "round {round}: the replica acks {:?} of {target} on an idle stream",
+                acked(&mut m)
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
+}
+
 /// Shards hold their replication bytes for a mailbox burst and stream them
 /// once. Pipelined writes from several clients over every shard (DB
 /// switches, cross-shard LMOVE, a FLUSHALL right after remote writes, a

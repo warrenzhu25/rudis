@@ -452,6 +452,44 @@ impl Drop for XShardLockedRead {
     }
 }
 
+/// Replicated commands sent to the shards and not yet known applied (see
+/// [`Router::send_replica_batch`]).
+pub struct ReplicaBatchInFlight {
+    rx: flume::Receiver<()>,
+    pending: usize,
+}
+
+impl ReplicaBatchInFlight {
+    /// A batch completing once `pending` units arrive on `rx` (for tests).
+    #[cfg(test)]
+    pub fn new_for_test(rx: flume::Receiver<()>, pending: usize) -> Self {
+        Self { rx, pending }
+    }
+
+    /// Whether every shard applied its part (without waiting).
+    pub fn is_done(&mut self) -> bool {
+        while self.pending > 0 {
+            match self.rx.try_recv() {
+                Ok(()) => self.pending -= 1,
+                Err(flume::TryRecvError::Empty) => return false,
+                // A shard gone: nothing more will come.
+                Err(flume::TryRecvError::Disconnected) => self.pending = 0,
+            }
+        }
+        true
+    }
+
+    /// Waits until every shard applied its part.
+    pub async fn wait(mut self) {
+        while self.pending > 0 {
+            if self.rx.recv_async().await.is_err() {
+                break;
+            }
+            self.pending -= 1;
+        }
+    }
+}
+
 /// Every cross-shard write held back (see [`Router::pause_cross_shard_writes`])
 /// until dropped.
 pub struct CrossShardWritesPaused<'a> {
@@ -5300,9 +5338,17 @@ impl Router {
     /// Sends each shard its deferred replicated commands in one message and
     /// waits until all of them are applied.
     pub async fn flush_replica_batch(&self, batch: &mut [Vec<Command>]) {
+        self.send_replica_batch(batch).wait().await;
+    }
+
+    /// Sends each shard its deferred replicated commands in one message,
+    /// without waiting: the returned batch completes once every shard
+    /// applied its part. A shard applies its messages in order, so later
+    /// commands for it still follow.
+    pub fn send_replica_batch(&self, batch: &mut [Vec<Command>]) -> ReplicaBatchInFlight {
         let cur_db = crate::connection::CURRENT_DB.get();
         let (tx, rx) = flume::unbounded();
-        let mut sent = 0;
+        let mut pending = 0;
         for (target, cmds) in batch.iter_mut().enumerate() {
             if cmds.is_empty() {
                 continue;
@@ -5312,16 +5358,19 @@ impl Router {
                 cmds: std::mem::take(cmds),
                 responder: tx.clone(),
             };
+            // Counted before it can be applied (see
+            // `ReplicationHub::replica_batches_in_flight`).
+            let hub = crate::replication::cached_hub(self.base_port);
+            hub.replica_batches_in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if self.senders[target].send(msg).is_ok() {
-                sent += 1;
+                pending += 1;
+            } else {
+                hub.replica_batches_in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             }
         }
-        drop(tx);
-        for _ in 0..sent {
-            if rx.recv_async().await.is_err() {
-                break;
-            }
-        }
+        ReplicaBatchInFlight { rx, pending }
     }
 
     /// Applies a replicated command on shard `target` and waits for it.
@@ -7551,6 +7600,40 @@ mod tests {
             pauser.await;
             assert!(done.get());
         });
+    }
+
+    #[test]
+    fn test_replica_batch_in_flight_completes_once_every_shard_answered() {
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(3);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let (rx2, rx1) = (receivers.remove(2), receivers.remove(1));
+        let router = Router::new(
+            0,
+            3,
+            9976,
+            Rc::new(RefCell::new(ShardDb::new(9976))),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+        let set = |k: &'static str| Command::Exists(smallvec![Bytes::from(k)]);
+        let mut batch = vec![Vec::new(), vec![set("a")], vec![set("b")]];
+        let mut in_flight = router.send_replica_batch(&mut batch);
+        assert!(batch.iter().all(|b| b.is_empty()));
+        assert!(!in_flight.is_done());
+        let answer = |rx: &crate::mailbox::ShardReceiver| match rx.try_recv() {
+            Ok(ShardMessage::ExecuteReplicaCmds { responder, .. }) => responder.send(()).unwrap(),
+            _ => panic!("no batch"),
+        };
+        answer(&rx1);
+        assert!(!in_flight.is_done(), "shard 2 hasn't applied yet");
+        answer(&rx2);
+        assert!(in_flight.is_done());
+        // Nothing to send: done at once.
+        let mut empty = vec![Vec::new(); 3];
+        assert!(router.send_replica_batch(&mut empty).is_done());
     }
 
     #[test]

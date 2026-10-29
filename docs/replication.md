@@ -67,6 +67,8 @@ The backlog is retained even while zero replicas are connected, specifically so 
 
 After either sync path, the master registers the connection and streams every subsequent propagated write to it live, in the same canonical RESP encoding used for AOF (§3 below covers this shared encoding). The replica applies each command through the normal command-execution path (`Router::execute_replica_command`), which routes it to whichever shard owns the affected key(s) rather than assuming the replica's shard layout mirrors the master's.
 
+The replica reads the stream up to 4 MB at a time straight into its parse buffer, feeds the complete commands to its own backlog from there, and sends each shard its part of a read without waiting for the shards to finish before reading on (up to 8 reads in flight). It acks an offset only once every shard has applied up to it, and waits for all of them before a command for no single shard, a `MULTI` block or a `GETACK`. It takes its snapshot lock (`ReplicationHub::apply_token`) for each read only; a full sync or a save that takes the lock also waits for the batches still applying (`replica_batches_in_flight`), so its snapshot matches the backlog. Waiting for every shard after each 64 KB read held a replica at ~0.4 GB/s, below what an 8-thread master writes.
+
 The replica periodically (in response to the master's `REPLCONF GETACK`) sends `REPLCONF ACK <offset>` back to the master, which the master records per-replica (`ConnectedReplica::ack_offset`, `last_ack_time`) and exposes via `INFO replication` / `ROLE` (§4).
 
 ---

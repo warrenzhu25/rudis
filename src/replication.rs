@@ -561,6 +561,11 @@ pub struct ReplicationHub {
     /// replica while it snapshots: the snapshot then matches one offset of
     /// the stream exactly.
     apply_token: (flume::Sender<()>, flume::Receiver<()>),
+    /// Replicated batches sent to this server's shards and not applied yet
+    /// (see `Router::send_replica_batch`): the stream loop reads on while
+    /// they apply, so whoever takes the apply token for a snapshot waits
+    /// for them too.
+    pub replica_batches_in_flight: std::sync::atomic::AtomicUsize,
     /// Held by an EXEC while its `MULTI` ... `EXEC` block is open in the
     /// stream, so blocks never nest (see [`Self::lock_tx_stream`]).
     tx_stream_token: (flume::Sender<()>, flume::Receiver<()>),
@@ -651,6 +656,171 @@ fn repl_timeout() -> std::time::Duration {
 
 /// One read from the master, failing with `TimedOut` after `repl-timeout`
 /// without data. On a timeout `buf` is left empty: the caller reconnects.
+/// How much a replica reads of its master's stream at once (see
+/// [`read_stream_into`]).
+const STREAM_READ_BYTES: usize = 4 << 20;
+
+/// Reads more of the master's stream onto the end of `buf` (up to
+/// [`STREAM_READ_BYTES`]), within `repl-timeout`. A timeout loses `buf`,
+/// but the link is dropped then anyway.
+async fn read_stream_into<R: monoio::io::AsyncReadRent>(
+    stream: &mut R,
+    buf: &mut bytes::BytesMut,
+) -> std::io::Result<usize> {
+    use monoio::buf::IoBufMut;
+    buf.reserve(STREAM_READ_BYTES);
+    let (len, cap) = (buf.len(), buf.capacity());
+    let owned = std::mem::take(buf);
+    match monoio::time::timeout(repl_timeout(), stream.read(owned.slice_mut(len..cap))).await {
+        Ok((res, slice)) => {
+            *buf = slice.into_inner();
+            res
+        }
+        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+    }
+}
+
+/// How many bytes at the start of `buf` are complete commands of a
+/// master's stream (arrays of bulk strings), stopping before a `MULTI`
+/// block whose `EXEC` hasn't arrived (see [`take_tx_block`]). None if the
+/// stream holds anything else, for the caller to handle the slow way.
+fn complete_stream_prefix(buf: &[u8]) -> Option<usize> {
+    // One command's length, Ok(None) if incomplete.
+    fn frame(buf: &[u8]) -> Result<Option<usize>, ()> {
+        fn line(buf: &[u8], at: usize, tag: u8) -> Result<Option<(usize, usize)>, ()> {
+            if at >= buf.len() {
+                return Ok(None);
+            }
+            if buf[at] != tag {
+                return Err(());
+            }
+            let Some(nl) = buf[at..].iter().position(|&b| b == b'\n') else {
+                return Ok(None);
+            };
+            let end = at + nl;
+            if end == at + 1 || buf[end - 1] != b'\r' {
+                return Err(());
+            }
+            let n = std::str::from_utf8(&buf[at + 1..end - 1])
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .ok_or(())?;
+            Ok(Some((n, end + 1)))
+        }
+        let Some((argc, mut at)) = line(buf, 0, b'*')? else {
+            return Ok(None);
+        };
+        for _ in 0..argc {
+            let Some((len, data)) = line(buf, at, b'$')? else {
+                return Ok(None);
+            };
+            if buf.len() < data + len + 2 {
+                return Ok(None);
+            }
+            if &buf[data + len..data + len + 2] != b"\r\n" {
+                return Err(());
+            }
+            at = data + len + 2;
+        }
+        Ok(Some(at))
+    }
+    let is = |f: &[u8], name: &[u8]| {
+        f.len() == 4 + 1 + name.len().to_string().len() + 2 + name.len() + 2
+            && f.starts_with(b"*1\r\n$")
+            && f[f.len() - 2 - name.len()..f.len() - 2].eq_ignore_ascii_case(name)
+    };
+    let mut done = 0;
+    while done < buf.len() {
+        let Some(n) = frame(&buf[done..]).ok()? else {
+            break;
+        };
+        if is(&buf[done..done + n], b"MULTI") {
+            // The whole block or nothing.
+            let mut at = done + n;
+            loop {
+                let Some(m) = frame(&buf[at..]).ok()? else {
+                    return Some(done);
+                };
+                let f = &buf[at..at + m];
+                at += m;
+                if is(f, b"EXEC") {
+                    break;
+                }
+            }
+            done = at;
+        } else {
+            done += n;
+        }
+    }
+    Some(done)
+}
+
+/// Replicated batches a replica keeps in flight to its shards before it
+/// waits for the oldest (each is one read of the stream).
+const MAX_REPLICA_BATCHES_IN_FLIGHT: usize = 8;
+
+/// A replica's batches sent to its shards and not known applied yet, in
+/// stream order, each with the offset it completes. Shared by the stream
+/// loop and the periodic ack (which acks what finished meanwhile, so an
+/// idle stream doesn't leave the acked offset behind).
+#[derive(Default)]
+struct ReplicaBatches {
+    queue:
+        std::cell::RefCell<std::collections::VecDeque<(crate::router::ReplicaBatchInFlight, u64)>>,
+    /// The stream loop waits for a batch it took off the queue: the ones
+    /// behind it must not be acked before it.
+    waiting: std::cell::Cell<bool>,
+}
+
+impl ReplicaBatches {
+    fn len(&self) -> usize {
+        self.queue.borrow().len()
+    }
+
+    fn push(&self, b: crate::router::ReplicaBatchInFlight, off: u64) {
+        self.queue.borrow_mut().push_back((b, off));
+    }
+
+    /// Acks the batches at the front that finished, without waiting.
+    fn reap(&self, applied: &std::cell::Cell<u64>) {
+        if self.waiting.get() {
+            return;
+        }
+        let mut q = self.queue.borrow_mut();
+        while let Some((b, off)) = q.front_mut() {
+            if !b.is_done() {
+                break;
+            }
+            applied.set(*off);
+            q.pop_front();
+        }
+    }
+
+    /// Waits for the oldest batches until at most `keep` are in flight,
+    /// acking each one's offset.
+    async fn wait_until(&self, keep: usize, applied: &std::cell::Cell<u64>) {
+        loop {
+            let next = {
+                let mut q = self.queue.borrow_mut();
+                if q.len() <= keep {
+                    break;
+                }
+                q.pop_front()
+            };
+            let Some((b, off)) = next else { break };
+            self.waiting.set(true);
+            b.wait().await;
+            applied.set(off);
+            self.waiting.set(false);
+        }
+    }
+}
+
+/// Waits for every batch in flight, acking each one's offset.
+async fn drain_replica_batches(in_flight: &ReplicaBatches, applied: &std::cell::Cell<u64>) {
+    in_flight.wait_until(0, applied).await;
+}
+
 /// Whether `buf` starts with a `MULTI` command (any case).
 fn starts_with_multi(buf: &[u8]) -> bool {
     const HEAD: &[u8] = b"*1\r\n$5\r\n";
@@ -779,6 +949,7 @@ impl ReplicationHub {
             no_replicas_since: AtomicU64::new(0),
             cached_master: AtomicBool::new(false),
             apply_token: (token_tx, token_rx),
+            replica_batches_in_flight: std::sync::atomic::AtomicUsize::new(0),
             tx_stream_token: (tx_stream_tx, tx_stream_rx),
             pinger_running: AtomicBool::new(false),
             replica_selected_db: std::sync::atomic::AtomicUsize::new(0),
@@ -835,7 +1006,20 @@ impl ReplicationHub {
     }
 
     /// Waits for the apply token (see `ReplicationHub::apply_token`).
+    /// The apply token for a snapshot: once every replicated batch already
+    /// sent to the shards is applied, so the dataset matches the backlog
+    /// (the stream loop, which sends them, can't send more meanwhile).
     pub async fn lock_apply(&self) -> ApplyGuard {
+        let guard = self.lock_apply_for_stream().await;
+        while self.replica_batches_in_flight.load(Ordering::Acquire) > 0 {
+            crate::mailbox::yield_now().await;
+        }
+        guard
+    }
+
+    /// The apply token for the replica's stream loop, which applies a read
+    /// under it and leaves the read's batches applying when it lets go.
+    pub async fn lock_apply_for_stream(&self) -> ApplyGuard {
         let _ = self.apply_token.1.recv_async().await;
         ApplyGuard(self.apply_token.0.clone())
     }
@@ -4170,6 +4354,13 @@ async fn run_replica_worker(
         // Wakes the writer for an immediate ack (REPLCONF GETACK).
         let (ack_tx, ack_rx) = flume::unbounded::<()>();
         let applied_w = applied.clone();
+        // Batches sent to the shards and not known applied yet, each with
+        // the stream offset it completes. The loop reads on while they
+        // apply (waiting for every shard after each read held the replica
+        // well below what a master writes); the acked offset is the last
+        // completed one.
+        let in_flight = std::rc::Rc::new(ReplicaBatches::default());
+        let in_flight_w = in_flight.clone();
         let ack_router = router.clone();
         monoio::spawn(async move {
             // The first ack goes out at once, as Redis replicas send theirs:
@@ -4208,6 +4399,7 @@ async fn run_replica_worker(
                 }
                 first = false;
                 while ack_rx.try_recv().is_ok() {}
+                in_flight_w.reap(&applied_w);
                 let off = applied_w.get();
                 let ack = if ack_router.aof().is_some() {
                     if let Some((p_off, t)) = &pending
@@ -4248,12 +4440,23 @@ async fn run_replica_worker(
             router.local_db.borrow_mut().select_db(replica_selected_db);
 
             if !buf.is_empty() {
-                // Applying a batch and feeding it to our backlog and
-                // sub-replicas is atomic with respect to snapshots taken
-                // on this server (see `ReplicationHub::apply_token`).
-                let _apply = hub.lock_apply().await;
-                // The exact bytes we process are what our sub-replicas get.
-                let raw = buf.clone().freeze();
+                // Applying a read and feeding it to our backlog and
+                // sub-replicas is atomic with respect to snapshots taken on
+                // this server (see `ReplicationHub::apply_token`); a snapshot
+                // also waits for the batches still applying.
+                let _apply = hub.lock_apply_for_stream().await;
+                // The exact bytes we process are what our backlog and
+                // sub-replicas get. The complete commands are known up front,
+                // so they are fed from the buffer as they are; only a stream
+                // the scan doesn't follow is copied aside first.
+                let fed_ahead = match complete_stream_prefix(&buf) {
+                    Some(n) if n > 0 => {
+                        hub.feed_from_master(&buf[..n]);
+                        Some(n)
+                    }
+                    _ => None,
+                };
+                let raw = fed_ahead.is_none().then(|| buf.clone().freeze());
                 let start_len = buf.len();
                 while !buf.is_empty() {
                     // A MULTI ... EXEC block is applied only once all of it is
@@ -4270,6 +4473,8 @@ async fn run_replica_worker(
                             }
                         };
                         current_offset += block.len as u64;
+                        // After everything before it (its GETACK acks it all).
+                        drain_replica_batches(&in_flight, &applied).await;
                         let (new_db, ()) = crate::connection::WithCurrentDb {
                             router: &router,
                             db: replica_selected_db,
@@ -4300,6 +4505,7 @@ async fn run_replica_worker(
                                 crate::resp::Command::Replconf(args) => {
                                     if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"getack") {
                                         // Acknowledge only what is applied.
+                                        drain_replica_batches(&in_flight, &applied).await;
                                         let (new_db, ()) = crate::connection::WithCurrentDb {
                                             router: &router,
                                             db: replica_selected_db,
@@ -4315,6 +4521,16 @@ async fn run_replica_worker(
                                 }
                                 crate::resp::Command::Ping(_) => {}
                                 _ => {
+                                    // A command for no single shard runs after
+                                    // everything before it is applied.
+                                    if crate::connection::target_shard_of_cmd(
+                                        &cmd,
+                                        router.num_shards,
+                                    )
+                                    .is_none()
+                                    {
+                                        drain_replica_batches(&in_flight, &applied).await;
+                                    }
                                     let (new_db, ()) = crate::connection::WithCurrentDb {
                                         router: &router,
                                         db: replica_selected_db,
@@ -4336,19 +4552,35 @@ async fn run_replica_worker(
                         }
                     }
                 }
-                let (new_db, ()) = crate::connection::WithCurrentDb {
-                    router: &router,
-                    db: replica_selected_db,
-                    fut: router.flush_replica_batch(&mut batch),
+                crate::connection::CURRENT_DB.set(replica_selected_db);
+                in_flight.push(router.send_replica_batch(&mut batch), current_offset);
+                let consumed = start_len - buf.len();
+                match (fed_ahead, &raw) {
+                    (Some(fed), _) if fed != consumed => {
+                        // Our backlog got bytes we didn't apply: our history
+                        // can't be continued, the next sync is a full one.
+                        crate::log_warning!(
+                            "Replication stream: applied {} of {} bytes fed to the backlog",
+                            consumed,
+                            fed
+                        );
+                        hub.cached_master.store(false, Ordering::Relaxed);
+                        protocol_error = true;
+                    }
+                    (Some(_), _) => {}
+                    (None, Some(raw)) => hub.feed_from_master(&raw[..consumed]),
+                    (None, None) => {}
                 }
-                .await;
-                replica_selected_db = new_db;
-                hub.replica_selected_db
-                    .store(replica_selected_db, Ordering::Relaxed);
-                hub.feed_from_master(&raw[..start_len - buf.len()]);
             }
-            // The periodic ack reports this from its next tick.
-            applied.set(current_offset);
+            // What the shards finished is acked (by the periodic ack's next
+            // tick); a bounded number of batches stay in flight.
+            in_flight.reap(&applied);
+            in_flight
+                .wait_until(MAX_REPLICA_BATCHES_IN_FLIGHT, &applied)
+                .await;
+            if in_flight.len() == 0 {
+                applied.set(current_offset);
+            }
             if protocol_error {
                 crate::log_warning!(
                     "Protocol error in the replication stream from MASTER {}:{}",
@@ -4358,7 +4590,10 @@ async fn run_replica_worker(
                 break;
             }
 
-            let res = read_from_master(&mut stream, &mut read_buf).await;
+            // Straight into `buf`, up to 4 MB: a replica applying the stream
+            // waits for its shards once per read, so 64 KB reads held it at
+            // ~0.4 GB/s.
+            let res = read_stream_into(&mut stream, &mut buf).await;
             match res {
                 Ok(0) | Err(_) => {
                     if is_timeout(&res) {
@@ -4366,14 +4601,15 @@ async fn run_replica_worker(
                     }
                     break;
                 }
-                Ok(n) => {
+                Ok(_) => {
                     hub.last_master_io_secs
                         .store(unix_secs(), Ordering::Relaxed);
-                    buf.extend_from_slice(&read_buf[..n]);
                 }
             }
         }
 
+        // Applied before a reconnect resumes from the offset.
+        drain_replica_batches(&in_flight, &applied).await;
         if let ReplicationRole::Slave {
             ref mut link_status,
             ..
@@ -5783,6 +6019,88 @@ mod tests {
     }
 
     #[test]
+    fn test_replica_batches_ack_in_order_and_while_idle() {
+        use crate::router::ReplicaBatchInFlight;
+        let mut rt = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let batches = std::rc::Rc::new(ReplicaBatches::default());
+            let applied = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let (tx1, rx1) = flume::unbounded();
+            let (tx2, rx2) = flume::unbounded();
+            batches.push(ReplicaBatchInFlight::new_for_test(rx1, 1), 10);
+            batches.push(ReplicaBatchInFlight::new_for_test(rx2, 1), 20);
+            // The later batch finishing first acks nothing.
+            tx2.send(()).unwrap();
+            batches.reap(&applied);
+            assert_eq!(applied.get(), 0);
+            // Once the first finishes, a reap (the periodic ack's, with no
+            // read coming) acks both.
+            tx1.send(()).unwrap();
+            batches.reap(&applied);
+            assert_eq!((applied.get(), batches.len()), (20, 0));
+
+            // While the stream loop waits for a batch it took off the queue,
+            // a reap doesn't ack the finished ones behind it.
+            let (tx3, rx3) = flume::unbounded();
+            let (tx4, rx4) = flume::unbounded();
+            batches.push(ReplicaBatchInFlight::new_for_test(rx3, 1), 30);
+            batches.push(ReplicaBatchInFlight::new_for_test(rx4, 1), 40);
+            tx4.send(()).unwrap();
+            let (b, a) = (batches.clone(), applied.clone());
+            let waiter = monoio::spawn(async move { b.wait_until(1, &a).await });
+            monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+            batches.reap(&applied);
+            assert_eq!(applied.get(), 20);
+            tx3.send(()).unwrap();
+            waiter.await;
+            assert_eq!(applied.get(), 30);
+            batches.reap(&applied);
+            assert_eq!(applied.get(), 40);
+        });
+    }
+
+    #[test]
+    fn test_complete_stream_prefix_stops_at_partial_commands_and_blocks() {
+        let cmd = |args: &[&str]| {
+            let mut out = format!("*{}\r\n", args.len());
+            for a in args {
+                out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            out
+        };
+        let set = cmd(&["SET", "k", "v"]);
+        let block = [cmd(&["MULTI"]), cmd(&["INCR", "a"]), cmd(&["exec"])].concat();
+        assert_eq!(complete_stream_prefix(b""), Some(0));
+        assert_eq!(complete_stream_prefix(set.as_bytes()), Some(set.len()));
+        // Every cut inside a command stops before it.
+        let two = format!("{set}{set}");
+        for cut in set.len() + 1..two.len() {
+            assert_eq!(
+                complete_stream_prefix(&two.as_bytes()[..cut]),
+                Some(set.len()),
+                "{cut}"
+            );
+        }
+        // A block counts only once its EXEC is there.
+        let s = format!("{set}{block}{set}");
+        assert_eq!(complete_stream_prefix(s.as_bytes()), Some(s.len()));
+        for cut in set.len() + 1..set.len() + block.len() {
+            assert_eq!(
+                complete_stream_prefix(&s.as_bytes()[..cut]),
+                Some(set.len()),
+                "{cut}"
+            );
+        }
+        // Something else than arrays of bulk strings: the slow way.
+        assert_eq!(complete_stream_prefix(b"+OK\r\n"), None);
+        assert_eq!(complete_stream_prefix(b"*1\r\n:5\r\n"), None);
+        assert_eq!(complete_stream_prefix(b"*1\r\n$1\r\nab\r\n"), None);
+    }
+
+    #[test]
     fn test_tx_block_sends_multi_lazily_and_nothing_when_empty() {
         let hub = get_replication_hub(19966);
         let (tx, _rx) = flume::unbounded();
@@ -5809,6 +6127,26 @@ mod tests {
             "{out:?}"
         );
         hub.unregister_replica(rep.id);
+    }
+
+    #[monoio::test(timer_enabled = true)]
+    async fn test_lock_apply_waits_for_replicated_batches_in_flight() {
+        let hub = get_replication_hub(19967);
+        hub.replica_batches_in_flight.store(1, Ordering::Release);
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        let waiter = {
+            let (hub, done) = (hub.clone(), done.clone());
+            monoio::spawn(async move {
+                let _g = hub.lock_apply().await;
+                done.set(true);
+            })
+        };
+        monoio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!done.get(), "a snapshot started while a batch was applying");
+        // The stream loop's own lock doesn't wait.
+        drop(waiter);
+        hub.replica_batches_in_flight.store(0, Ordering::Release);
+        let _g = hub.lock_apply().await;
     }
 
     #[test]

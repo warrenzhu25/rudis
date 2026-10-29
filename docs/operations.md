@@ -72,6 +72,16 @@ A script runs on its shard's thread until it returns. Past `busy-reply-threshold
   replicas. There is no Sentinel: promotion is manual or done by your orchestrator.
 - In cluster mode, `CLUSTER FAILOVER` on a replica switches roles without losing
   acknowledged writes. Without `FORCE`, the master must be reachable.
+- **Write-heavy masters: raise the replica output buffer limit.** As in Redis, a master drops a
+  replica whose output buffer passes `client-output-buffer-limit replica` (default
+  `256mb 64mb 60`), and the replica then full-syncs. A multi-core rudis master can write ~1 GB/s
+  (SET of 1 KB values at ~0.85M ops/s on 8 threads), so the default holds only a fraction of a
+  second: a lag spike, or the writes a full sync must buffer while it runs, trips it, and the
+  replica can loop through full syncs (`sync_full` and `client_output_buffer_limit_disconnections`
+  in `INFO stats` climbing, "scheduled to be closed ASAP for overcoming of output buffer limits"
+  in the log). In our soak test, `CONFIG SET client-output-buffer-limit "replica 2gb 1gb 60"`
+  kept a replica linked through 90 s at that rate with no resync; size it to a few seconds of
+  your write rate, and watch the replica's memory headroom too.
 
 ## 6. Cluster resharding
 
