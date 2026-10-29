@@ -32,7 +32,7 @@ cargo llvm-cov --no-report --test test_cross_thread
 echo "============================================================"
 echo " 4. Running End-to-End Integration Tests (serial)"
 echo "============================================================"
-cargo llvm-cov --no-report --test test_server_e2e -- --test-threads=1
+cargo llvm-cov --no-report --test 'e2e_*' -- --test-threads=1
 
 echo "============================================================"
 echo " 5. Generating Aggregated Coverage Reports"

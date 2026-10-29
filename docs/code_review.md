@@ -281,7 +281,7 @@ regression test to catch them.
 
 **Fix:** add unit tests for the descriptor types' basic read/write correctness in
 `src/mailbox.rs`, and an end-to-end test in `tests/` exercising a real cross-shard scattered
-`MGET`/`MSET` over actual TCP sockets (per the pattern `tests/test_server_e2e.rs` already
+`MGET`/`MSET` over actual TCP sockets (per the pattern `tests/e2e_*.rs` already
 uses elsewhere).
 
 ---

@@ -54,7 +54,7 @@ Every commit to `main` must strictly adhere to the following four rules:
 * **Mandatory Dual-Test Coverage (Unit + Integration Tests)**:
   * Every change (bug fix, new feature, or architectural modification) **must** include both:
     1. **Unit Test(s)** in `src/` (e.g., in module-level `#[cfg(test)] mod tests` blocks) testing the isolated logic, edge conditions, AST/protocol parsing, or internal state transitions.
-    2. **Integration Test(s)** in `tests/` (e.g., `tests/test_server_e2e.rs`) testing end-to-end client-server behavior over actual TCP sockets, command pipelines, clustering, or persistence replays.
+    2. **Integration Test(s)** in `tests/` (e.g., `tests/e2e_<area>.rs`, helpers in `tests/common`) testing end-to-end client-server behavior over actual TCP sockets, command pipelines, clustering, or persistence replays.
   * No change may be merged or committed with only one testing tier or without dedicated tests asserting the specific behavior.
 * No compiler warnings, dead code, or broken test assertions are permitted.
 
@@ -102,8 +102,8 @@ Every commit to `main` must strictly adhere to the following four rules:
   # 5. Run end-to-end integration tests (serial), then again on the io_uring
   #    driver production uses (the first pass runs servers on monoio's legacy
   #    epoll driver)
-  cargo test --test test_server_e2e -- --test-threads=1
-  MONOIO_FORCE_LEGACY_DRIVER=0 cargo test --test test_server_e2e -- --test-threads=1
+  cargo test --test 'e2e_*' -- --test-threads=1
+  MONOIO_FORCE_LEGACY_DRIVER=0 cargo test --test 'e2e_*' -- --test-threads=1
 
   # 6. Live throughput regression check on this host: this build vs HEAD (the
   #    baseline commit is built once and cached), measured back to back in
@@ -165,7 +165,7 @@ All official benchmark numbers must be committed under `docs/benchmarks/`:
 | **Cross-Shard Mailbox** | `src/mailbox.rs` | Lock-free per-shard-pair SPSC rings, `flume`-based wake signal, pooled reply descriptors (`FastGetDescriptor`, `BatchResponder`, etc.), mutex-guarded overflow queue. | [04_sharding_mesh](docs/design/04_sharding_mesh.md) |
 | **RESP Engine** | `src/resp.rs` | Zero-copy parser for RESP arrays and inline Redis commands. | [03_resp_engine](docs/design/03_resp_engine.md) |
 | **Entrypoint** | `src/main.rs` | CLI arguments, core affinity mapping, cross-shard channel instantiation. | [01_reactor_runtime](docs/design/01_reactor_runtime.md) |
-| **Tests** | `tests/` | Multi-threaded end-to-end tests (`test_server_e2e.rs`) and channel waker verification (`test_cross_thread.rs`). | — |
+| **Tests** | `tests/` | Multi-threaded end-to-end tests (`e2e_<area>.rs`, one binary per subsystem, helpers in `common/`) and channel waker verification (`test_cross_thread.rs`). | — |
 
 All 19 components are documented in [`docs/design/components.md`](docs/design/components.md) (high-level design and rationale) and [`docs/internal/components.md`](docs/internal/components.md) (concrete implementation and code references),
 written as learning guides against the *actual* shipped code — not just what it does, but why

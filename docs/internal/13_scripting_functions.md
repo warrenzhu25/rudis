@@ -378,7 +378,7 @@ author.
   `scripts/run_redis_test_suite.sh`'s suite set — they are not run against Rudis as part of the
   compatibility gate that other subsystems use (verified: grepping `scripting\|functions` against
   that script finds nothing). Coverage for this subsystem instead comes from the three unit tests
-  in `scripting.rs:612-739` and the E2E tests in `tests/test_server_e2e.rs`
+  in `scripting.rs:612-739` and the E2E tests in `tests/e2e_scripting.rs`
   (`test_lua_scripting_engine_e2e`, line 3253; `test_fcall_mutating_aof_persistence_and_replay_e2e`,
   line 5619).
 
@@ -445,6 +445,6 @@ cargo clippy --all-targets -- -D warnings
 cargo test --lib scripting -- --test-threads=1
 
 # 4. Run the scripting/functions E2E tests
-cargo test --test test_server_e2e test_lua_scripting_engine_e2e -- --test-threads=1
-cargo test --test test_server_e2e test_fcall_mutating_aof_persistence_and_replay_e2e -- --test-threads=1
+cargo test --test e2e_scripting test_lua_scripting_engine_e2e -- --test-threads=1
+cargo test --test e2e_persistence test_fcall_mutating_aof_persistence_and_replay_e2e -- --test-threads=1
 ```

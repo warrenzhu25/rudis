@@ -63,7 +63,7 @@ jobs:
       - name: Run End-to-End Integration Tests (serial)
         run: |
           set -o pipefail
-          cargo test --test test_server_e2e -- --test-threads=1 2>&1 | tee e2e.log || {
+          cargo test --test 'e2e_*' -- --test-threads=1 2>&1 | tee e2e.log || {
             if [ -n "$GITHUB_STEP_SUMMARY" ]; then
               echo "### E2E Test Failures" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -145,7 +145,7 @@ jobs:
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           ulimit -l
           set -o pipefail
-          cargo test --release --test test_server_e2e -- --test-threads=1 2>&1 | tee e2e.log || {
+          cargo test --release --test 'e2e_*' -- --test-threads=1 2>&1 | tee e2e.log || {
             # Annotations are readable on the run page (and the public API)
             # without downloading logs.
             sed -n '/^failures:$/,$p' e2e.log | grep -E '^    test_' | head -n 20 | while read -r t; do

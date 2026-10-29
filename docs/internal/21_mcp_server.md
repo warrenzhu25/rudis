@@ -360,5 +360,5 @@ cargo clippy --all-targets -- -D warnings
 cargo test --lib mcp::tests -- --test-threads=1
 
 # 4. Run the MCP protocol E2E test (MCP.TOOLS / MCP.CALL / MCP.RPC over a real connection)
-cargo test --test test_server_e2e test_mcp_protocol_tools_call_and_rpc_e2e -- --test-threads=1
+cargo test --test e2e_experimental test_mcp_protocol_tools_call_and_rpc_e2e -- --test-threads=1
 ```

@@ -137,7 +137,7 @@ latitude range, but `GEOHASH`'s textual output must match the public geohash.org
 with the standard range before being sliced into 5-bit base32 groups. 11 characters are emitted
 (55 bits sliced from the 52-bit value, 5 bits short — Redis pads the missing bits as zero), and the
 11th character is **hardcoded to index 0** (`'0'`) rather than reading past the 52-bit value.
-Verified against `tests/test_server_e2e.rs:4483–4487`, which asserts the literal strings
+Verified against `tests/e2e_commands.rs` (`test_geospatial_engine_e2e`), which asserts the literal strings
 `tc1q585vb58` (Palermo) and `tc26yj70z7h` (Catania) for the test fixture's coordinates.
 
 ### 3.3 `GeoUnit` (`src/geo.rs:14–49`) — unit parsing and conversion
@@ -683,7 +683,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --lib geo:: -- --test-threads=1
 
 # 4. Run the e2e geo integration test
-cargo test --test test_server_e2e test_geospatial_engine_e2e
+cargo test --test e2e_commands test_geospatial_engine_e2e
 
 # 5. Run real Redis's own geo.tcl compatibility suite (part of CORE_SUITES)
 #    args are: PORT SUITE_ARG CLIENTS
