@@ -5316,6 +5316,14 @@ async fn execute_tx_step(
                     hub_arc.lock().pause();
                     cleanup.hub = Some(hub_arc);
 
+                    // Writes go to replicas as one MULTI ... EXEC block; a
+                    // single one goes alone, as Redis sends it.
+                    let tx_block = if tx_queue.iter().filter(|c| c.is_write_command()).count() > 1 {
+                        crate::replication::TxStreamBlock::open(router.base_port, router.num_shards)
+                            .await
+                    } else {
+                        None
+                    };
                     let count = tx_queue.len();
                     out_buf.extend_from_slice(format!("*{}\r\n", count).as_bytes());
                     let queued = std::mem::take(tx_queue);
@@ -5339,6 +5347,9 @@ async fn execute_tx_step(
                             should_quit = true;
                             break;
                         }
+                    }
+                    if let Some(block) = tx_block {
+                        block.close().await;
                     }
                     if let Some(ref addr_s) = monitor_addr {
                         broadcast_monitor(router.port, addr_s, &[Bytes::from_static(b"exec")]);

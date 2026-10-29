@@ -77,6 +77,8 @@ Every mutating command that has been applied locally is re-encoded once, determi
 
 Replication and AOF persistence are independent: a node can run with replication active and AOF disabled, or vice versa, or both, or neither.
 
+A transaction's writes reach replicas as one `MULTI` ... `EXEC` block, as Redis sends them (`replication::TxStreamBlock`; blocks never nest, and writes of other clients streamed meanwhile end up inside, in order). As in Redis, `MULTI` goes out ahead of the block's `SELECT`, a transaction with a single write sends it alone, and one that streams nothing sends nothing. A replica applies a block only once all of it has arrived, and only then feeds it to its backlog and acks past it, so a link lost mid-block resumes from its `MULTI` and a promoted replica never holds half a transaction. Unlike Redis, a rudis replica applies the block's commands shard by shard, so a reader on the replica can see part of a block while it is being applied.
+
 ---
 
 ## 4. Observing Replication State

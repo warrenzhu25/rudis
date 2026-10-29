@@ -362,6 +362,21 @@ pub struct ReplicationBacklog {
     pub max_size: usize,
     pub first_byte_offset: u64,
     pub stream_db: usize,
+    /// An EXEC's block in the stream (see `TxStreamBlock`).
+    pub tx_block: TxBlockState,
+}
+
+/// Where an EXEC's `MULTI` ... `EXEC` block stands in the stream. `MULTI`
+/// goes out lazily, ahead of the first byte the block streams (and of its
+/// SELECT), so a transaction that streams nothing sends nothing, as Redis's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TxBlockState {
+    #[default]
+    None,
+    /// Begun; `MULTI` not sent yet.
+    Pending,
+    /// `MULTI` sent; `EXEC` due at the end.
+    Open,
 }
 
 impl ReplicationBacklog {
@@ -373,6 +388,7 @@ impl ReplicationBacklog {
             max_size,
             first_byte_offset: 1,
             stream_db: 0,
+            tx_block: TxBlockState::None,
         }
     }
 
@@ -545,6 +561,9 @@ pub struct ReplicationHub {
     /// replica while it snapshots: the snapshot then matches one offset of
     /// the stream exactly.
     apply_token: (flume::Sender<()>, flume::Receiver<()>),
+    /// Held by an EXEC while its `MULTI` ... `EXEC` block is open in the
+    /// stream, so blocks never nest (see [`Self::lock_tx_stream`]).
+    tx_stream_token: (flume::Sender<()>, flume::Receiver<()>),
     /// A task sends `repl-ping-replica-period` PINGs to the replicas.
     pinger_running: AtomicBool,
     /// Selected DB index of the replication stream from our master. Preserved
@@ -632,6 +651,54 @@ fn repl_timeout() -> std::time::Duration {
 
 /// One read from the master, failing with `TimedOut` after `repl-timeout`
 /// without data. On a timeout `buf` is left empty: the caller reconnects.
+/// Whether `buf` starts with a `MULTI` command (any case).
+fn starts_with_multi(buf: &[u8]) -> bool {
+    const HEAD: &[u8] = b"*1\r\n$5\r\n";
+    buf.len() >= HEAD.len() + 5
+        && buf.starts_with(HEAD)
+        && buf[HEAD.len()..HEAD.len() + 5].eq_ignore_ascii_case(b"MULTI")
+}
+
+/// A complete `MULTI` ... `EXEC` block taken off a replica's stream.
+struct TxBlock {
+    /// The commands in between (PINGs and REPLCONFs left out).
+    cmds: Vec<crate::resp::Command>,
+    /// The block's length in the stream, `MULTI` and `EXEC` included.
+    len: usize,
+    /// A `REPLCONF GETACK` came inside it: ack once it is applied.
+    getack: bool,
+}
+
+/// Takes the `MULTI` ... `EXEC` block `buf` starts with, if all of it is
+/// there (`Ok(None)` leaves `buf` untouched); an error for bytes that
+/// don't parse.
+fn take_tx_block(buf: &mut bytes::BytesMut) -> Result<Option<TxBlock>, ()> {
+    let mut probe = buf.clone();
+    let start = probe.len();
+    match crate::resp::parse_command_trusted(&mut probe) {
+        Ok(Some(crate::resp::Command::Multi)) => {}
+        Ok(None) => return Ok(None),
+        _ => return Err(()),
+    }
+    let mut cmds = Vec::new();
+    let mut getack = false;
+    loop {
+        match crate::resp::parse_command_trusted(&mut probe) {
+            Ok(Some(crate::resp::Command::Exec)) => break,
+            Ok(Some(crate::resp::Command::Ping(_))) => {}
+            Ok(Some(crate::resp::Command::Replconf(args))) => {
+                getack |= args.len() >= 2 && args[0].eq_ignore_ascii_case(b"getack");
+            }
+            Ok(Some(cmd)) => cmds.push(cmd),
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(()),
+        }
+    }
+    let len = start - probe.len();
+    bytes::Buf::advance(buf, len);
+    Ok(Some(TxBlock { cmds, len, getack }))
+}
+
 async fn read_from_master<R: monoio::io::AsyncReadRent>(
     stream: &mut R,
     buf: &mut Vec<u8>,
@@ -684,6 +751,8 @@ impl ReplicationHub {
     pub fn new(port: u16) -> Self {
         let (token_tx, token_rx) = flume::bounded(1);
         let _ = token_tx.try_send(());
+        let (tx_stream_tx, tx_stream_rx) = flume::bounded(1);
+        let _ = tx_stream_tx.try_send(());
         Self {
             port,
             role: RwLock::new(ReplicationRole::Master),
@@ -710,6 +779,7 @@ impl ReplicationHub {
             no_replicas_since: AtomicU64::new(0),
             cached_master: AtomicBool::new(false),
             apply_token: (token_tx, token_rx),
+            tx_stream_token: (tx_stream_tx, tx_stream_rx),
             pinger_running: AtomicBool::new(false),
             replica_selected_db: std::sync::atomic::AtomicUsize::new(0),
             replica_priority: AtomicU64::new(100),
@@ -753,6 +823,15 @@ impl ReplicationHub {
     /// Our current replication id (a replica's is its master's).
     pub fn replid(&self) -> String {
         self.ids.read().replid.clone()
+    }
+
+    /// Waits until no other transaction's `MULTI` ... `EXEC` block is open
+    /// in the stream. Taken after the transaction's VLL locks; whoever holds
+    /// it only waits for shards to stream what they hold, so it can't
+    /// deadlock.
+    pub async fn lock_tx_stream(&self) -> ApplyGuard {
+        let _ = self.tx_stream_token.1.recv_async().await;
+        ApplyGuard(self.tx_stream_token.0.clone())
     }
 
     /// Waits for the apply token (see `ReplicationHub::apply_token`).
@@ -1679,6 +1758,12 @@ impl ReplicationHub {
             if from_master == self.is_master() {
                 return;
             }
+            if !from_master && backlog.tx_block == TxBlockState::Pending && bytes != REPL_PING {
+                // An EXEC's block begins with its first byte, ahead of the
+                // SELECT that may come with it.
+                backlog.tx_block = TxBlockState::Open;
+                self.append_locked(&mut backlog, None, REPL_MULTI, false, &mut wake);
+            }
             let payload: &[u8] = if !from_master
                 && bytes != REPL_PING
                 && bytes.starts_with(b"*")
@@ -1699,40 +1784,78 @@ impl ReplicationHub {
             } else {
                 bytes
             };
-            if from_master || self.backlog_active.load(Ordering::Relaxed) {
-                let new_offset = self
-                    .master_repl_offset
-                    .fetch_add(payload.len() as u64, Ordering::SeqCst)
-                    + payload.len() as u64;
-                backlog.append(payload, new_offset);
-            }
-            if self.has_replicas.load(Ordering::Relaxed) {
-                let reps = self.replicas.read();
-                let mut any_skipped = false;
-                for rep in reps.values() {
-                    match rep.delivery(shard) {
-                        Delivery::Send => {
-                            if rep.append_pending(payload) {
-                                wake.push(rep.clone());
-                            }
-                        }
-                        Delivery::Buffer => {
-                            if let Some(cut) = &rep.full_sync
-                                && rep.append_pre(cut, payload)
-                            {
-                                wake.push(rep.clone());
-                            }
-                        }
-                        Delivery::Skip => {
-                            any_skipped = true;
-                        }
-                    }
-                }
-                if any_skipped && !from_master {
-                    backlog.stream_db = usize::MAX;
-                }
+            self.append_locked(&mut backlog, shard, payload, from_master, &mut wake);
+        }
+        self.wake_replicas(wake);
+    }
+
+    /// Begins an EXEC's block (see `TxStreamBlock`): `MULTI` goes out with
+    /// the next byte streamed.
+    fn tx_block_begin(&self) {
+        self.backlog.write().tx_block = TxBlockState::Pending;
+    }
+
+    /// Ends an EXEC's block: `EXEC` if its `MULTI` went out, else nothing.
+    fn tx_block_end(&self) {
+        let mut wake = Vec::new();
+        {
+            let mut backlog = self.backlog.write();
+            let state = std::mem::take(&mut backlog.tx_block);
+            if state == TxBlockState::Open && self.is_master() {
+                self.append_locked(&mut backlog, None, REPL_EXEC, false, &mut wake);
             }
         }
+        self.wake_replicas(wake);
+    }
+
+    /// Appends `payload` to the backlog and the replicas' buffers (see
+    /// `deliver`), under the backlog lock; replicas to wake go to `wake`.
+    fn append_locked(
+        &self,
+        backlog: &mut ReplicationBacklog,
+        shard: Option<usize>,
+        payload: &[u8],
+        from_master: bool,
+        wake: &mut Vec<Arc<ConnectedReplica>>,
+    ) {
+        if from_master || self.backlog_active.load(Ordering::Relaxed) {
+            let new_offset = self
+                .master_repl_offset
+                .fetch_add(payload.len() as u64, Ordering::SeqCst)
+                + payload.len() as u64;
+            backlog.append(payload, new_offset);
+        }
+        if self.has_replicas.load(Ordering::Relaxed) {
+            let reps = self.replicas.read();
+            let mut any_skipped = false;
+            for rep in reps.values() {
+                match rep.delivery(shard) {
+                    Delivery::Send => {
+                        if rep.append_pending(payload) {
+                            wake.push(rep.clone());
+                        }
+                    }
+                    Delivery::Buffer => {
+                        if let Some(cut) = &rep.full_sync
+                            && rep.append_pre(cut, payload)
+                        {
+                            wake.push(rep.clone());
+                        }
+                    }
+                    Delivery::Skip => {
+                        any_skipped = true;
+                    }
+                }
+            }
+            if any_skipped && !from_master {
+                backlog.stream_db = usize::MAX;
+            }
+        }
+    }
+
+    /// Wakes the replicas `append_locked` queued bytes for, dropping those
+    /// over their output limit.
+    fn wake_replicas(&self, wake: Vec<Arc<ConnectedReplica>>) {
         for rep in &wake {
             if rep.is_overflowed() {
                 // The writer may be blocked on the full socket.
@@ -2915,6 +3038,60 @@ pub fn wait_writes_streamed_blocking(
     true
 }
 
+/// `MULTI` and `EXEC` as they go in the stream around a transaction.
+pub const REPL_MULTI: &[u8] = b"*1\r\n$5\r\nMULTI\r\n";
+pub const REPL_EXEC: &[u8] = b"*1\r\n$4\r\nEXEC\r\n";
+
+/// An EXEC's `MULTI` ... `EXEC` block in the replication stream: the
+/// transaction's writes, streamed by its shards in between, reach replicas
+/// (and the backlog) as one block, which a replica applies only once it has
+/// all of it, as Redis's do. As in Redis, `MULTI` comes before the block's
+/// SELECT, and a transaction that streams nothing sends no block (see
+/// `TxBlockState`). Writes of other clients streamed meanwhile end up inside
+/// the block too, which keeps their order.
+pub struct TxStreamBlock {
+    port: u16,
+    shards: usize,
+    closed: bool,
+    _token: ApplyGuard,
+}
+
+impl Drop for TxStreamBlock {
+    /// An EXEC that ended early (its connection quit or panicked) still
+    /// closes its block: a `MULTI` left open would swallow the stream.
+    fn drop(&mut self) {
+        if !self.closed {
+            cached_hub(self.port).tx_block_end();
+        }
+    }
+}
+
+impl TxStreamBlock {
+    /// Opens a block, unless nothing is replicated.
+    pub async fn open(port: u16, shards: usize) -> Option<Self> {
+        if !has_connected_replicas(port) {
+            return None;
+        }
+        let token = cached_hub(port).lock_tx_stream().await;
+        // Writes held from before go out ahead of the block.
+        wait_streams_flushed(port, shards).await;
+        cached_hub(port).tx_block_begin();
+        Some(Self {
+            port,
+            shards,
+            closed: false,
+            _token: token,
+        })
+    }
+
+    /// Closes the block once every shard streamed the transaction's writes.
+    pub async fn close(mut self) {
+        wait_streams_flushed(self.port, self.shards).await;
+        cached_hub(self.port).tx_block_end();
+        self.closed = true;
+    }
+}
+
 #[inline(always)]
 pub fn propagate_bytes(port: u16, bytes: &[u8]) {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) || PROPAGATION_SUPPRESSED.get() {
@@ -4079,6 +4256,40 @@ async fn run_replica_worker(
                 let raw = buf.clone().freeze();
                 let start_len = buf.len();
                 while !buf.is_empty() {
+                    // A MULTI ... EXEC block is applied only once all of it is
+                    // here: until then it stays unread, so a link lost
+                    // mid-block resumes from its MULTI and the block is
+                    // never half applied (nor half in our backlog).
+                    if starts_with_multi(&buf) {
+                        let block = match take_tx_block(&mut buf) {
+                            Ok(Some(block)) => block,
+                            Ok(None) => break,
+                            Err(()) => {
+                                protocol_error = true;
+                                break;
+                            }
+                        };
+                        current_offset += block.len as u64;
+                        let (new_db, ()) = crate::connection::WithCurrentDb {
+                            router: &router,
+                            db: replica_selected_db,
+                            fut: async {
+                                for cmd in block.cmds {
+                                    router.apply_replica_command_batched(cmd, &mut batch).await;
+                                }
+                                router.flush_replica_batch(&mut batch).await;
+                            },
+                        }
+                        .await;
+                        replica_selected_db = new_db;
+                        hub.replica_selected_db
+                            .store(replica_selected_db, Ordering::Relaxed);
+                        if block.getack {
+                            applied.set(current_offset);
+                            let _ = ack_tx.send(());
+                        }
+                        continue;
+                    }
                     let initial_buf_len = buf.len();
                     match crate::resp::parse_command_trusted(&mut buf) {
                         Ok(Some(cmd)) => {
@@ -5527,6 +5738,76 @@ mod tests {
         ));
         assert!(rep.take_pending().ends_with(b"held\r\n"));
         shard.join().unwrap();
+        hub.unregister_replica(rep.id);
+    }
+
+    #[test]
+    fn test_take_tx_block_waits_for_the_whole_block() {
+        let cmd = |args: &[&str]| {
+            let mut out = format!("*{}\r\n", args.len());
+            for a in args {
+                out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            out
+        };
+        let block = [
+            cmd(&["MULTI"]),
+            cmd(&["SET", "a", "1"]),
+            cmd(&["REPLCONF", "GETACK", "*"]),
+            cmd(&["PING"]),
+            cmd(&["SET", "b", "2"]),
+            cmd(&["EXEC"]),
+        ]
+        .concat();
+        let tail = cmd(&["SET", "after", "3"]);
+        assert!(starts_with_multi(block.as_bytes()));
+        assert!(starts_with_multi(b"*1\r\n$5\r\nmulti\r\n"));
+        assert!(!starts_with_multi(tail.as_bytes()));
+
+        // Every prefix short of EXEC: nothing taken, the bytes stay.
+        for cut in [3, 20, block.len() - 1] {
+            let mut buf = bytes::BytesMut::from(&block.as_bytes()[..cut]);
+            assert!(take_tx_block(&mut buf).unwrap().is_none(), "cut {cut}");
+            assert_eq!(buf.len(), cut);
+        }
+
+        let mut buf = bytes::BytesMut::from(format!("{block}{tail}").as_bytes());
+        let taken = take_tx_block(&mut buf).unwrap().expect("complete");
+        assert_eq!(taken.len, block.len());
+        assert!(taken.getack);
+        assert_eq!(taken.cmds.len(), 2, "{:?}", taken.cmds);
+        assert_eq!(&buf[..], tail.as_bytes());
+
+        let mut bad = bytes::BytesMut::from(&b"*1\r\n$5\r\nMULTI\r\n*x\r\n"[..]);
+        assert!(take_tx_block(&mut bad).is_err());
+    }
+
+    #[test]
+    fn test_tx_block_sends_multi_lazily_and_nothing_when_empty() {
+        let hub = get_replication_hub(19966);
+        let (tx, _rx) = flume::unbounded();
+        let rep = hub.register_replica(66, tx);
+        // Nothing streamed inside: no block at all.
+        hub.tx_block_begin();
+        hub.tx_block_end();
+        assert!(rep.take_pending().is_empty());
+        // MULTI goes out with the first write, ahead of its SELECT.
+        crate::connection::CURRENT_DB.set(3);
+        hub.tx_block_begin();
+        hub.propagate_shard(0, b"*2\r\n$4\r\nINCR\r\n$1\r\na\r\n");
+        hub.propagate_shard(1, b"*2\r\n$4\r\nINCR\r\n$1\r\nb\r\n");
+        hub.tx_block_end();
+        crate::connection::CURRENT_DB.set(0);
+        let out = String::from_utf8(rep.take_pending()).unwrap();
+        let words: Vec<&str> = out
+            .split("\r\n")
+            .filter(|w| !w.is_empty() && !w.starts_with(['*', '$']))
+            .collect();
+        assert_eq!(
+            words,
+            ["MULTI", "SELECT", "3", "INCR", "a", "INCR", "b", "EXEC"],
+            "{out:?}"
+        );
         hub.unregister_replica(rep.id);
     }
 

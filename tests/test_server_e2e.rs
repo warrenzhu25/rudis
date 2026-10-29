@@ -23527,6 +23527,64 @@ fn test_blocked_cross_shard_moves_replicate_in_place_e2e() {
     resp_cmd_all(&mut rep2, &["REPLICAOF", "NO", "ONE"]);
 }
 
+/// A transaction reaches replicas as one MULTI ... EXEC block, which a
+/// replica applies only once it has all of it. Promoted while the master
+/// streams cross-shard `MULTI; INCR a; INCR b; EXEC`s, a replica must never
+/// hold half of one (a != b), whatever read the stream was cut at.
+#[test]
+fn test_replica_never_keeps_half_a_transaction_e2e() {
+    let mp = 18417u16;
+    start_test_server(mp, 4);
+    // Two keys on different shards.
+    let (a, b) = (0..)
+        .map(|i| (format!("txa:{i}"), format!("txb:{i}")))
+        .find(|(a, b)| {
+            rudis::router::target_shard(a.as_bytes(), 4)
+                != rudis::router::target_shard(b.as_bytes(), 4)
+        })
+        .unwrap();
+    for (attempt, rp) in (18418u16..18421).enumerate() {
+        start_test_server(rp, 2);
+        let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+        let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+        resp_cmd_all(&mut m, &["DEL", &a, &b]);
+        assert_eq!(
+            resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+            "+OK\r\n"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while resp_cmd_all(&mut m, &["WAIT", "1", "100"]) != ":1\r\n" {
+            assert!(std::time::Instant::now() < deadline, "replica never linked");
+        }
+        let (wa, wb) = (a.clone(), b.clone());
+        let writer = thread::spawn(move || {
+            let mut conn = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+            let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+            let mut cmds = Vec::new();
+            for _ in 0..3000 {
+                cmds.push(s(&["MULTI"]));
+                cmds.push(s(&["INCR", &wa]));
+                cmds.push(s(&["INCR", &wb]));
+                cmds.push(s(&["EXEC"]));
+            }
+            pipeline_all(&mut conn, &cmds, "txs-done");
+        });
+        // Promote the replica while the transactions stream in.
+        thread::sleep(Duration::from_millis(20 + 15 * attempt as u64));
+        assert_eq!(resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+        writer.join().unwrap();
+        let (ra, rb) = (
+            resp_cmd_all(&mut r, &["GET", &a]),
+            resp_cmd_all(&mut r, &["GET", &b]),
+        );
+        assert_eq!(ra, rb, "attempt {attempt}: replica kept half a transaction");
+        assert_eq!(
+            resp_cmd_all(&mut m, &["GET", &a]),
+            resp_cmd_all(&mut m, &["GET", &b])
+        );
+    }
+}
+
 /// Shards hold their replication bytes for a mailbox burst and stream them
 /// once. Pipelined writes from several clients over every shard (DB
 /// switches, cross-shard LMOVE, a FLUSHALL right after remote writes, a
