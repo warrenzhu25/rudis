@@ -301,7 +301,7 @@ impl ConnectedReplica {
 
     /// Drops the link so the replica reconnects (and learns our new
     /// history); wakes the writer so it exits even before it has the fd.
-    fn disconnect(&self) {
+    pub fn disconnect(&self) {
         self.disconnected.store(true, Ordering::Release);
         self.drop_link();
         let _ = self.sender.send(Vec::new());
@@ -548,6 +548,9 @@ pub struct ReplicationHub {
     /// Address details a connection reported before its PSYNC registered
     /// it as a replica (REPLCONF listening-port comes first), by client id.
     pending_peers: Mutex<HashMap<u64, PendingPeer>>,
+    /// Dual-channel full syncs whose stream no main connection took yet,
+    /// by RDB channel client id.
+    rdb_claims: Mutex<HashMap<u64, RdbChannelClaim>>,
     /// When the last replica disconnected (unix seconds), 0 while replicas
     /// are connected or before the first one: `repl-backlog-ttl` counts
     /// from it.
@@ -650,7 +653,7 @@ fn link_state_name(up: bool, phase: u8) -> &'static str {
 /// can take hours.
 pub static REPL_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(60);
 
-fn repl_timeout() -> std::time::Duration {
+pub(crate) fn repl_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(REPL_TIMEOUT_SECS.load(Ordering::Relaxed).max(1))
 }
 
@@ -908,6 +911,41 @@ struct PendingPeer {
     announced_ip: Option<String>,
     /// It sent `REPLCONF capa eof`: it takes streamed (`$EOF:`) full syncs.
     capa_eof: bool,
+    /// It sent `REPLCONF capa dual-channel` (see [`dual_channel_replication`]).
+    capa_dual: bool,
+    /// It sent `REPLCONF rdb-channel 1`: its PSYNC asks for the RDB only.
+    rdb_channel: bool,
+    /// It sent `REPLCONF rdb-client-id <id>`: its PSYNC takes the stream
+    /// of the RDB channel `<id>`'s full sync.
+    rdb_client_id: Option<u64>,
+}
+
+/// `dual-channel-replication-enabled` (as in Valkey): a full sync sends the
+/// RDB over a second connection while the stream after it flows over the
+/// main one, buffered by the replica, so the master doesn't hold it for the
+/// whole transfer and load (which overran `client-output-buffer-limit
+/// replica` under heavy writes). Both sides must have it on.
+static DUAL_CHANNEL: AtomicBool = AtomicBool::new(false);
+
+pub fn set_dual_channel_replication(on: bool) {
+    DUAL_CHANNEL.store(on, Ordering::Relaxed);
+}
+
+pub fn dual_channel_replication() -> bool {
+    DUAL_CHANNEL.load(Ordering::Relaxed)
+}
+
+/// A dual-channel full sync's stream, waiting for the replica's main
+/// connection to take it (see `ReplicationHub::offer_rdb_claim`).
+pub struct RdbChannelClaim {
+    /// Registered under the RDB channel's client id; its buffered stream
+    /// starts right after the snapshot.
+    pub rep: Arc<ConnectedReplica>,
+    /// Its writer wakeups.
+    pub wakeups: flume::Receiver<Vec<u8>>,
+    pub replid: String,
+    /// Stream bytes before the replica's first ones in `rep`'s buffer.
+    pub pre: Vec<u8>,
 }
 
 /// Bound on `pending_peers`, which only clients that never send PSYNC
@@ -946,6 +984,7 @@ impl ReplicationHub {
             sync_conn: Mutex::new(None),
             worker_exit: Mutex::new(None),
             pending_peers: Mutex::new(HashMap::new()),
+            rdb_claims: Mutex::new(HashMap::new()),
             no_replicas_since: AtomicU64::new(0),
             cached_master: AtomicBool::new(false),
             apply_token: (token_tx, token_rx),
@@ -1662,6 +1701,68 @@ impl ReplicationHub {
             .lock()
             .get(&id)
             .is_some_and(|p| p.capa_eof)
+    }
+
+    /// Records that replica `id` sent `REPLCONF capa dual-channel`.
+    pub fn note_replica_capa_dual(&self, id: u64) {
+        self.note_pending_peer(id, |p| p.capa_dual = true);
+    }
+
+    /// Whether a full sync of replica `id` goes over two connections: both
+    /// sides have dual-channel replication on, and it takes `$EOF:` ones.
+    pub fn replica_takes_dual_channel(&self, id: u64) -> bool {
+        dual_channel_replication()
+            && self
+                .pending_peers
+                .lock()
+                .get(&id)
+                .is_some_and(|p| p.capa_dual && p.capa_eof)
+    }
+
+    /// Records `REPLCONF rdb-channel <on>` from connection `id`.
+    pub fn note_rdb_channel(&self, id: u64, on: bool) {
+        self.note_pending_peer(id, |p| p.rdb_channel = on);
+    }
+
+    /// Whether connection `id` is a dual-channel sync's RDB channel.
+    pub fn is_rdb_channel(&self, id: u64) -> bool {
+        self.pending_peers
+            .lock()
+            .get(&id)
+            .is_some_and(|p| p.rdb_channel)
+    }
+
+    /// Records `REPLCONF rdb-client-id <rdb_id>` from connection `id`.
+    pub fn note_rdb_client_id(&self, id: u64, rdb_id: u64) {
+        self.note_pending_peer(id, |p| p.rdb_client_id = Some(rdb_id));
+    }
+
+    /// The RDB channel whose stream connection `id` asks for, if any.
+    pub fn rdb_client_id_of(&self, id: u64) -> Option<u64> {
+        self.pending_peers
+            .lock()
+            .get(&id)
+            .and_then(|p| p.rdb_client_id)
+    }
+
+    /// Leaves RDB channel `id`'s stream for the replica's main connection
+    /// to take ([`Self::take_rdb_claim`]).
+    pub fn offer_rdb_claim(&self, id: u64, claim: RdbChannelClaim) {
+        self.rdb_claims.lock().insert(id, claim);
+    }
+
+    pub fn take_rdb_claim(&self, id: u64) -> Option<RdbChannelClaim> {
+        self.rdb_claims.lock().remove(&id)
+    }
+
+    /// Withdraws RDB channel `id`'s stream if no main connection took it;
+    /// true if it was still there.
+    pub fn withdraw_rdb_claim(&self, id: u64) -> bool {
+        self.rdb_claims.lock().remove(&id).is_some()
+    }
+
+    pub fn rdb_claim_pending(&self, id: u64) -> bool {
+        self.rdb_claims.lock().contains_key(&id)
     }
 
     fn note_pending_peer(&self, id: u64, f: impl FnOnce(&mut PendingPeer)) {
@@ -3832,6 +3933,353 @@ fn parse_psync_reply(
     }
 }
 
+/// A RESP array of bulk strings.
+fn resp_array(args: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// Sends `payload` and reads the one-line reply (more bytes the master
+/// sent after it stay in `buf`).
+async fn master_command_line(
+    stream: &mut monoio::net::TcpStream,
+    buf: &mut bytes::BytesMut,
+    payload: Vec<u8>,
+) -> Result<bytes::BytesMut, String> {
+    use monoio::io::AsyncWriteRentExt;
+    stream
+        .write_all(payload)
+        .await
+        .0
+        .map_err(|e| e.to_string())?;
+    loop {
+        match take_repl_line(buf) {
+            Ok(Some(line)) => return Ok(line),
+            Ok(None) => {}
+            Err(()) => return Err("bad reply line".to_string()),
+        }
+        match read_stream_into(stream, buf).await {
+            Ok(0) => return Err("connection closed".to_string()),
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// Opens another connection to our master for a dual-channel full sync
+/// (see [`dual_channel_replication`]), introduced as the main one is
+/// (AUTH, listening port, address, capabilities), then sends `extra`,
+/// each command answered with +OK.
+async fn open_master_channel(
+    hub: &ReplicationHub,
+    host: &str,
+    port: u16,
+    my_port: u16,
+    extra: &[Vec<u8>],
+) -> Result<(monoio::net::TcpStream, bytes::BytesMut), String> {
+    let addr =
+        resolve_master_addr(host, port).ok_or_else(|| format!("Unable to resolve '{host}'"))?;
+    let mut stream = monoio::time::timeout(repl_timeout(), monoio::net::TcpStream::connect(&addr))
+        .await
+        .map_err(|_| "timed out connecting".to_string())?
+        .map_err(|e| e.to_string())?;
+    let mut buf = bytes::BytesMut::with_capacity(64 * 1024);
+    let announced_port = hub.announce_port.load(Ordering::Relaxed);
+    let port_s = if announced_port != 0 {
+        announced_port
+    } else {
+        my_port
+    }
+    .to_string();
+    let mut cmds = Vec::new();
+    if let Some(auth) = master_auth_command(hub.port) {
+        cmds.push(auth);
+    }
+    cmds.push(resp_array(&[
+        b"REPLCONF",
+        b"listening-port",
+        port_s.as_bytes(),
+    ]));
+    if let Some(ip) = hub.announce_ip.read().clone().filter(|s| !s.is_empty()) {
+        cmds.push(resp_array(&[b"REPLCONF", b"ip-address", ip.as_bytes()]));
+    }
+    cmds.push(resp_array(&[
+        b"REPLCONF",
+        b"capa",
+        b"eof",
+        b"capa",
+        b"psync2",
+        b"capa",
+        b"dual-channel",
+    ]));
+    cmds.extend_from_slice(extra);
+    for cmd in cmds {
+        let line = master_command_line(&mut stream, &mut buf, cmd).await?;
+        if !line.starts_with(b"+OK") {
+            return Err(String::from_utf8_lossy(&line).trim_end().to_string());
+        }
+    }
+    Ok((stream, buf))
+}
+
+/// Parses `$ENDOFF:<offset> <replid> <rdb client id>`, the reply a
+/// dual-channel full sync's RDB channel gets to its PSYNC.
+fn parse_endoff(line: &[u8]) -> Option<(u64, String, u64)> {
+    let rest = std::str::from_utf8(line.strip_prefix(b"$ENDOFF:")?).ok()?;
+    let mut parts = rest.split_ascii_whitespace();
+    let offset = parts.next()?.parse().ok()?;
+    let replid = parts.next().filter(|id| valid_replid(id))?.to_string();
+    let id = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((offset, replid, id))
+}
+
+/// Runs `fut` to completion while reading more of our master's stream from
+/// `main` onto the end of `buf`. A broken `main` stops the reading (the
+/// error is returned) but not `fut`.
+async fn read_stream_while<F: std::future::Future>(
+    main: &mut monoio::net::TcpStream,
+    buf: &mut bytes::BytesMut,
+    fut: F,
+) -> (F::Output, std::io::Result<()>) {
+    use monoio::buf::IoBufMut;
+    use monoio::io::CancelableAsyncReadRent;
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        buf.reserve(STREAM_READ_BYTES);
+        let (len, cap) = (buf.len(), buf.capacity());
+        let owned = std::mem::take(buf);
+        let canceller = monoio::io::Canceller::new();
+        let read = main.cancelable_read(owned.slice_mut(len..cap), canceller.handle());
+        let mut read = std::pin::pin!(read);
+        let out = monoio::select! {
+            (res, slice) = &mut read => {
+                *buf = slice.into_inner();
+                match res {
+                    Ok(n) if n > 0 => continue,
+                    Ok(_) => Err(std::io::ErrorKind::UnexpectedEof.into()),
+                    Err(e) => Err(e),
+                }
+            }
+            out = &mut fut => Ok(out),
+        };
+        match out {
+            Ok(out) => {
+                // The read may have completed before the cancel took effect.
+                let _ = canceller.cancel();
+                let (res, slice) = read.await;
+                *buf = slice.into_inner();
+                let res = match res {
+                    Ok(n) if n > 0 => Ok(()),
+                    Ok(_) => Err(std::io::ErrorKind::UnexpectedEof.into()),
+                    Err(e) if e.raw_os_error() == Some(libc::ECANCELED) => Ok(()),
+                    Err(e) => Err(e),
+                };
+                return (out, res);
+            }
+            Err(e) => return (fut.await, Err(e)),
+        }
+    }
+}
+
+/// Reads a nonblocking socket on a thread of its own while this one is
+/// busy (loading a dual-channel full sync's RDB parses on this shard's
+/// thread without yielding, and the stream must keep flowing meanwhile, or
+/// our master holds it). Nothing else may use the socket until
+/// [`Self::finish`].
+struct SideReader {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<(Vec<u8>, Option<std::io::Error>)>,
+}
+
+impl SideReader {
+    fn start(fd: std::os::unix::io::RawFd) -> std::io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("repl-side-read".into())
+            .spawn(move || {
+                let mut out = Vec::new();
+                let mut chunk = vec![0u8; 1 << 20];
+                // Polled before each read: the socket may be in blocking
+                // mode (the io_uring driver doesn't need O_NONBLOCK). What
+                // is left once stopped stays in it for the caller.
+                while !flag.load(Ordering::Acquire) {
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: one valid pollfd.
+                    let ready = unsafe { libc::poll(&mut pfd, 1, 20) };
+                    if ready <= 0 {
+                        continue;
+                    }
+                    // SAFETY: `fd` stays open until `finish` joins this
+                    // thread, and `chunk` is a live buffer of its length.
+                    let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+                    if n > 0 {
+                        out.extend_from_slice(&chunk[..n as usize]);
+                    } else if n == 0 {
+                        return (out, Some(std::io::ErrorKind::UnexpectedEof.into()));
+                    } else {
+                        let err = std::io::Error::last_os_error();
+                        if !matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) {
+                            return (out, Some(err));
+                        }
+                    }
+                }
+                (out, None)
+            })?;
+        Ok(SideReader { stop, thread })
+    }
+
+    /// Stops reading; returns what was read and the error that ended the
+    /// reading early, if any.
+    fn finish(self) -> (Vec<u8>, Option<std::io::Error>) {
+        self.stop.store(true, Ordering::Release);
+        self.thread.join().unwrap_or_else(|_| {
+            (
+                Vec::new(),
+                Some(std::io::Error::other("side reader panicked")),
+            )
+        })
+    }
+}
+
+/// A dual-channel full sync's result (see [`dual_channel_sync`]).
+struct DualChannelSync {
+    /// The connection the stream after the snapshot comes over.
+    main: monoio::net::TcpStream,
+    /// What of that stream arrived while the RDB did.
+    buffered: bytes::BytesMut,
+    rdb: bytes::Bytes,
+    rdb_len: u64,
+    replid: String,
+    offset: u64,
+}
+
+/// A full sync over two connections, after our master answered our PSYNC
+/// with `+DUALCHANNELSYNC` (see [`dual_channel_replication`]): an RDB
+/// channel gets the snapshot (`$ENDOFF:` tells where the stream continues),
+/// and a new main connection takes the stream from there at once, which we
+/// buffer while the RDB arrives, so our master doesn't hold it.
+async fn dual_channel_sync(
+    hub: &ReplicationHub,
+    router: &crate::router::Router,
+    host: &str,
+    port: u16,
+    my_port: u16,
+) -> Result<DualChannelSync, String> {
+    let (mut rdb, mut rdb_buf) = open_master_channel(
+        hub,
+        host,
+        port,
+        my_port,
+        &[resp_array(&[b"REPLCONF", b"rdb-channel", b"1"])],
+    )
+    .await
+    .map_err(|e| format!("RDB channel: {e}"))?;
+    let line = master_command_line(&mut rdb, &mut rdb_buf, resp_array(&[b"PSYNC", b"?", b"-1"]))
+        .await
+        .map_err(|e| format!("RDB channel: {e}"))?;
+    let (offset, replid, rdb_id) = parse_endoff(&line).ok_or_else(|| {
+        format!(
+            "RDB channel: unexpected reply to PSYNC: {}",
+            String::from_utf8_lossy(&line).trim_end()
+        )
+    })?;
+    crate::log_notice!(
+        "MASTER <-> REPLICA sync: RDB channel started the snapshot at {}:{}",
+        replid,
+        offset
+    );
+    let id_s = rdb_id.to_string();
+    let (mut main, mut buffered) = open_master_channel(
+        hub,
+        host,
+        port,
+        my_port,
+        &[resp_array(&[
+            b"REPLCONF",
+            b"rdb-client-id",
+            id_s.as_bytes(),
+        ])],
+    )
+    .await
+    .map_err(|e| format!("main channel: {e}"))?;
+    let next = (offset + 1).to_string();
+    let line = master_command_line(
+        &mut main,
+        &mut buffered,
+        resp_array(&[b"PSYNC", replid.as_bytes(), next.as_bytes()]),
+    )
+    .await
+    .map_err(|e| format!("main channel: {e}"))?;
+    if !line.starts_with(b"+CONTINUE") {
+        return Err(format!(
+            "main channel: unexpected reply to PSYNC: {}",
+            String::from_utf8_lossy(&line).trim_end()
+        ));
+    }
+    hub.last_master_io_secs
+        .store(unix_secs(), Ordering::Relaxed);
+    // The RDB, while the stream after it is buffered.
+    let receive = async {
+        let header = loop {
+            match take_rdb_header(&mut rdb_buf) {
+                Ok(Some(len)) => break len,
+                Ok(None) => {}
+                Err(()) => return Err("bad RDB header".to_string()),
+            }
+            match read_stream_into(&mut rdb, &mut rdb_buf).await {
+                Ok(0) => return Err("connection lost".to_string()),
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        let mut spool = RdbSpool::create(&router.db_dir, router.port, header)
+            .map_err(|e| format!("opening the temp file: {e}"))?;
+        loop {
+            match spool.feed(&mut rdb_buf) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(e) => return Err(format!("writing the temp file: {e}")),
+            }
+            match read_stream_into(&mut rdb, &mut rdb_buf).await {
+                Ok(0) => return Err("connection lost".to_string()),
+                Ok(_) => hub
+                    .last_master_io_secs
+                    .store(unix_secs(), Ordering::Relaxed),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let written = spool.written as u64;
+        spool
+            .finish()
+            .map(|b| (b, written))
+            .map_err(|e| format!("mapping the temp file: {e}"))
+    };
+    let (received, stream_res) = read_stream_while(&mut main, &mut buffered, receive).await;
+    let (rdb_bytes, rdb_len) = received.map_err(|e| format!("RDB channel: {e}"))?;
+    stream_res.map_err(|e| format!("main channel: {e}"))?;
+    Ok(DualChannelSync {
+        main,
+        buffered,
+        rdb: rdb_bytes,
+        rdb_len,
+        replid,
+        offset,
+    })
+}
+
 async fn run_replica_worker(
     my_port: u16,
     master_host: String,
@@ -4058,10 +4506,21 @@ async fn run_replica_worker(
         }
 
         // 3. REPLCONF capa eof capa psync2 (eof: we take diskless `$EOF:`
-        // transfers)
-        let line = send_and_expect_line!(
-            b"*5\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$3\r\neof\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
-        );
+        // transfers; dual-channel: see `dual_channel_replication`)
+        let capa: &[&[u8]] = if dual_channel_replication() {
+            &[
+                b"REPLCONF",
+                b"capa",
+                b"eof",
+                b"capa",
+                b"psync2",
+                b"capa",
+                b"dual-channel",
+            ]
+        } else {
+            &[b"REPLCONF", b"capa", b"eof", b"capa", b"psync2"]
+        };
+        let line = send_and_expect_line!(resp_array(capa));
         if !line.starts_with(b"+OK") {
             if log_attempt {
                 crate::log_warning!(
@@ -4121,7 +4580,37 @@ async fn run_replica_worker(
         };
 
         let line = send_and_expect_line!(psync_payload);
-        let parsed = parse_psync_reply(&line, &cached_replid, cached_offset);
+        // Our master sends the full sync over two connections.
+        let mut dual = None;
+        if !failing_over && line.starts_with(b"+DUALCHANNELSYNC") {
+            crate::log_notice!(
+                "Full resync from master over two connections (dual-channel replication)"
+            );
+            hub.link_phase.store(LINK_SYNC, Ordering::Relaxed);
+            hub.cached_master.store(false, Ordering::Relaxed);
+            match dual_channel_sync(&hub, &router, &master_host, master_port, my_port).await {
+                Ok(d) => dual = Some(d),
+                Err(e) => {
+                    crate::log_warning!("Dual-channel full sync with MASTER failed: {}", e);
+                    if let ReplicationRole::Slave {
+                        ref mut link_status,
+                        ..
+                    } = *hub.role.write()
+                    {
+                        *link_status = "down".to_string();
+                    }
+                    if is_sync_cancelled(&cancel_rx) {
+                        break 'reconnect_loop;
+                    }
+                    monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue 'reconnect_loop;
+                }
+            }
+        }
+        let parsed = match &dual {
+            Some(d) => Some((false, d.replid.clone(), d.offset)),
+            None => parse_psync_reply(&line, &cached_replid, cached_offset),
+        };
         if failing_over {
             if parsed.is_some() {
                 // The target took over; we continue as its replica.
@@ -4177,110 +4666,122 @@ async fn run_replica_worker(
             // Our history no longer gets continued: if this sync fails, the
             // next attempt is a full one too.
             hub.cached_master.store(false, Ordering::Relaxed);
-            // 5. Read RDB header: $<len>\r\n
-            let rdb_header = loop {
-                match take_rdb_header(&mut buf) {
-                    Ok(Some(len)) => break Some(len),
-                    Ok(None) => {}
-                    Err(()) => break None,
-                }
-                let res = read_from_master(&mut stream, &mut read_buf).await;
-                match res {
-                    Ok(0) | Err(_) => {
-                        if is_timeout(&res) {
-                            log_bulk_timeout();
+            // The main connection's stream from the snapshot on is read
+            // while the RDB loads (dual-channel), not left to our master.
+            let mut dual_stream = false;
+            let (rdb_bytes, rdb_len) = if let Some(d) = dual.take() {
+                stream = d.main;
+                *hub.sync_conn.lock() = Some(std::os::unix::io::AsRawFd::as_raw_fd(&stream));
+                buf = d.buffered;
+                dual_stream = true;
+                (d.rdb, d.rdb_len)
+            } else {
+                // 5. Read RDB header: $<len>\r\n
+                let rdb_header = loop {
+                    match take_rdb_header(&mut buf) {
+                        Ok(Some(len)) => break Some(len),
+                        Ok(None) => {}
+                        Err(()) => break None,
+                    }
+                    let res = read_from_master(&mut stream, &mut read_buf).await;
+                    match res {
+                        Ok(0) | Err(_) => {
+                            if is_timeout(&res) {
+                                log_bulk_timeout();
+                            }
+                            break None;
                         }
-                        break None;
-                    }
-                    Ok(n) => {
-                        hub.last_master_io_secs
-                            .store(unix_secs(), Ordering::Relaxed);
-                        buf.extend_from_slice(&read_buf[..n]);
-                    }
-                }
-            };
-
-            let rdb_header = match rdb_header {
-                Some(l) => l,
-                None => {
-                    crate::log_warning!(
-                        "I/O error reading bulk count from MASTER: connection lost or bad header"
-                    );
-                    if let ReplicationRole::Slave {
-                        ref mut link_status,
-                        ..
-                    } = *hub.role.write()
-                    {
-                        *link_status = "down".to_string();
-                    }
-                    if is_sync_cancelled(&cancel_rx) {
-                        break 'reconnect_loop;
-                    }
-                    monoio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue 'reconnect_loop;
-                }
-            };
-
-            // 6. Receive the RDB (`rdb_len` bytes, or up to the EOF mark)
-            // into a spool file.
-            let mut spool = match RdbSpool::create(&router.db_dir, router.port, rdb_header) {
-                Ok(spool) => spool,
-                Err(e) => {
-                    crate::log_warning!(
-                        "Opening the temp file for the RDB from MASTER failed: {}",
-                        e
-                    );
-                    if is_sync_cancelled(&cancel_rx) {
-                        break 'reconnect_loop;
-                    }
-                    monoio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                    continue 'reconnect_loop;
-                }
-            };
-            let received = loop {
-                match spool.feed(&mut buf) {
-                    Ok(true) => break Ok(()),
-                    Ok(false) => {}
-                    Err(e) => break Err(format!("writing the temp file: {e}")),
-                }
-                let res = read_from_master(&mut stream, &mut read_buf).await;
-                match res {
-                    Ok(0) | Err(_) => {
-                        if is_timeout(&res) {
-                            log_bulk_timeout();
+                        Ok(n) => {
+                            hub.last_master_io_secs
+                                .store(unix_secs(), Ordering::Relaxed);
+                            buf.extend_from_slice(&read_buf[..n]);
                         }
-                        break Err("connection lost".to_string());
                     }
-                    Ok(n) => {
-                        hub.last_master_io_secs
-                            .store(unix_secs(), Ordering::Relaxed);
-                        buf.extend_from_slice(&read_buf[..n]);
+                };
+
+                let rdb_header = match rdb_header {
+                    Some(l) => l,
+                    None => {
+                        crate::log_warning!(
+                            "I/O error reading bulk count from MASTER: connection lost or bad header"
+                        );
+                        if let ReplicationRole::Slave {
+                            ref mut link_status,
+                            ..
+                        } = *hub.role.write()
+                        {
+                            *link_status = "down".to_string();
+                        }
+                        if is_sync_cancelled(&cancel_rx) {
+                            break 'reconnect_loop;
+                        }
+                        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue 'reconnect_loop;
                     }
-                }
-            };
-            let rdb_len = spool.written;
-            let rdb_bytes = received.and_then(|()| {
-                spool
-                    .finish()
-                    .map_err(|e| format!("mapping the temp file: {e}"))
-            });
-            let rdb_bytes = match rdb_bytes {
-                Ok(b) => b,
-                Err(e) => {
-                    crate::log_warning!("I/O error trying to sync with MASTER: {}", e);
-                    if let ReplicationRole::Slave {
-                        ref mut link_status,
-                        ..
-                    } = *hub.role.write()
-                    {
-                        *link_status = "down".to_string();
+                };
+
+                // 6. Receive the RDB (`rdb_len` bytes, or up to the EOF mark)
+                // into a spool file.
+                let mut spool = match RdbSpool::create(&router.db_dir, router.port, rdb_header) {
+                    Ok(spool) => spool,
+                    Err(e) => {
+                        crate::log_warning!(
+                            "Opening the temp file for the RDB from MASTER failed: {}",
+                            e
+                        );
+                        if is_sync_cancelled(&cancel_rx) {
+                            break 'reconnect_loop;
+                        }
+                        monoio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                        continue 'reconnect_loop;
                     }
-                    if is_sync_cancelled(&cancel_rx) {
-                        break 'reconnect_loop;
+                };
+                let received = loop {
+                    match spool.feed(&mut buf) {
+                        Ok(true) => break Ok(()),
+                        Ok(false) => {}
+                        Err(e) => break Err(format!("writing the temp file: {e}")),
                     }
-                    monoio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue 'reconnect_loop;
-                }
+                    let res = read_from_master(&mut stream, &mut read_buf).await;
+                    match res {
+                        Ok(0) | Err(_) => {
+                            if is_timeout(&res) {
+                                log_bulk_timeout();
+                            }
+                            break Err("connection lost".to_string());
+                        }
+                        Ok(n) => {
+                            hub.last_master_io_secs
+                                .store(unix_secs(), Ordering::Relaxed);
+                            buf.extend_from_slice(&read_buf[..n]);
+                        }
+                    }
+                };
+                let rdb_len = spool.written as u64;
+                let rdb_bytes = received.and_then(|()| {
+                    spool
+                        .finish()
+                        .map_err(|e| format!("mapping the temp file: {e}"))
+                });
+                let rdb_bytes = match rdb_bytes {
+                    Ok(b) => b,
+                    Err(e) => {
+                        crate::log_warning!("I/O error trying to sync with MASTER: {}", e);
+                        if let ReplicationRole::Slave {
+                            ref mut link_status,
+                            ..
+                        } = *hub.role.write()
+                        {
+                            *link_status = "down".to_string();
+                        }
+                        if is_sync_cancelled(&cancel_rx) {
+                            break 'reconnect_loop;
+                        }
+                        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue 'reconnect_loop;
+                    }
+                };
+                (rdb_bytes, rdb_len)
             };
             crate::log_notice!(
                 "MASTER <-> REPLICA sync: received {} bytes from master to disk",
@@ -4295,7 +4796,20 @@ async fn run_replica_worker(
             crate::log_notice!("MASTER <-> REPLICA sync: Loading DB in memory");
             let loaded = {
                 let _loading = LoadingGuard::new(&hub);
-                router.restore_rdb_bytes(rdb_bytes).await
+                // A broken main connection shows up in the streaming loop,
+                // which resumes from what was applied.
+                let side = dual_stream
+                    .then(|| SideReader::start(std::os::unix::io::AsRawFd::as_raw_fd(&stream)).ok())
+                    .flatten();
+                let loaded = router.restore_rdb_bytes(rdb_bytes).await;
+                if let Some(side) = side {
+                    let (read, err) = side.finish();
+                    buf.extend_from_slice(&read);
+                    if let Some(e) = err {
+                        crate::log_warning!("Reading the stream from MASTER while loading: {}", e);
+                    }
+                }
+                loaded
             };
             if let Err(e) = loaded {
                 crate::log_warning!(
@@ -6016,6 +6530,95 @@ mod tests {
 
         let mut bad = bytes::BytesMut::from(&b"*1\r\n$5\r\nMULTI\r\n*x\r\n"[..]);
         assert!(take_tx_block(&mut bad).is_err());
+    }
+
+    #[test]
+    fn test_parse_endoff() {
+        let id = "a".repeat(40);
+        assert_eq!(
+            parse_endoff(format!("$ENDOFF:42 {id} 7").as_bytes()),
+            Some((42, id.clone(), 7))
+        );
+        for bad in [
+            format!("$ENDOFF:x {id} 7"),
+            "$ENDOFF:42 short 7".to_string(),
+            format!("$ENDOFF:42 {id}"),
+            format!("$ENDOFF:42 {id} 7 8"),
+            format!("+FULLRESYNC {id} 42"),
+        ] {
+            assert_eq!(parse_endoff(bad.as_bytes()), None, "{bad}");
+        }
+    }
+
+    /// The side reader takes what arrives while it runs, in blocking mode
+    /// too, and stops when asked even while the peer keeps writing.
+    #[test]
+    fn test_side_reader_reads_until_stopped() {
+        use std::io::Write;
+        let (mut tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&rx);
+        let side = SideReader::start(fd).unwrap();
+        tx.write_all(b"hello ").unwrap();
+        tx.write_all(b"world").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let writer = std::thread::spawn(move || {
+            // A peer that never stops: finish must return anyway.
+            let chunk = [b'x'; 4096];
+            while tx.write_all(&chunk).is_ok() {}
+        });
+        let (got, err) = side.finish();
+        assert!(err.is_none(), "{err:?}");
+        assert!(got.starts_with(b"hello world"));
+        drop(rx);
+        writer.join().unwrap();
+
+        // A peer that closes ends it with the bytes read so far.
+        let (mut tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        let side = SideReader::start(std::os::unix::io::AsRawFd::as_raw_fd(&rx)).unwrap();
+        tx.write_all(b"bye").unwrap();
+        drop(tx);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (got, err) = side.finish();
+        assert_eq!(got, b"bye");
+        assert_eq!(err.unwrap().kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A dual-channel sync's stream waits under its RDB channel's id for
+    /// the main connection that names it, once.
+    #[test]
+    fn test_rdb_claims_and_dual_channel_peers() {
+        let hub = ReplicationHub::new(0);
+        hub.note_replica_capa_eof(1);
+        hub.note_replica_capa_dual(1);
+        set_dual_channel_replication(false);
+        assert!(!hub.replica_takes_dual_channel(1), "off by default");
+        set_dual_channel_replication(true);
+        assert!(hub.replica_takes_dual_channel(1));
+        hub.note_replica_capa_dual(2);
+        assert!(!hub.replica_takes_dual_channel(2), "needs capa eof too");
+        set_dual_channel_replication(false);
+
+        hub.note_rdb_channel(3, true);
+        assert!(hub.is_rdb_channel(3) && !hub.is_rdb_channel(4));
+        hub.note_rdb_client_id(4, 3);
+        assert_eq!(hub.rdb_client_id_of(4), Some(3));
+
+        let (tx, rx) = flume::unbounded();
+        let rep = hub.register_replica(3, tx);
+        hub.offer_rdb_claim(
+            3,
+            RdbChannelClaim {
+                rep,
+                wakeups: rx,
+                replid: "r".into(),
+                pre: b"pre".to_vec(),
+            },
+        );
+        assert!(hub.rdb_claim_pending(3));
+        let claim = hub.take_rdb_claim(3).unwrap();
+        assert_eq!((claim.rep.id, &claim.pre[..]), (3, &b"pre"[..]));
+        assert!(hub.take_rdb_claim(3).is_none());
+        assert!(!hub.withdraw_rdb_claim(3), "already taken");
     }
 
     #[test]

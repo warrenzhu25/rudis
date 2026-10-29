@@ -81,7 +81,10 @@ A script runs on its shard's thread until it returns. Past `busy-reply-threshold
   in `INFO stats` climbing, "scheduled to be closed ASAP for overcoming of output buffer limits"
   in the log). In our soak test, `CONFIG SET client-output-buffer-limit "replica 2gb 1gb 60"`
   kept a replica linked through 90 s at that rate with no resync; size it to a few seconds of
-  your write rate, and watch the replica's memory headroom too.
+  your write rate, and watch the replica's memory headroom too. For the full syncs, also turn on
+  `dual-channel-replication-enabled yes` on master and replicas: the stream written during the
+  sync then goes to the replica as it happens, instead of waiting in the master's buffer (see
+  [`replication.md`](replication.md) §2.2.1).
 
 ## 6. Cluster resharding
 

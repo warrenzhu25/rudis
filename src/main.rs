@@ -96,6 +96,12 @@ struct Args {
     #[arg(long)]
     cross_shard_strict: Option<String>,
 
+    /// Full syncs send the RDB over a second connection while the stream
+    /// flows over the main one, buffered by the replica (yes|no, default
+    /// no; both master and replica must have it on)
+    #[arg(long)]
+    dual_channel_replication_enabled: Option<String>,
+
     /// Serve Prometheus metrics over HTTP (GET /metrics) on this port
     #[arg(long)]
     metrics_port: Option<u16>,
@@ -412,6 +418,20 @@ fn main() {
         };
     }
     rudis::connection::set_cross_shard_strict(server_config.cross_shard_strict);
+    if let Some(v) = args.dual_channel_replication_enabled {
+        server_config.dual_channel_replication = match v.to_lowercase().as_str() {
+            "yes" => true,
+            "no" => false,
+            other => {
+                log_fatal!(
+                    "FATAL CONFIG: --dual-channel-replication-enabled expects yes|no, got '{}'",
+                    other
+                );
+                std::process::exit(1);
+            }
+        };
+    }
+    rudis::replication::set_dual_channel_replication(server_config.dual_channel_replication);
     rudis::config::set_save_points(port, server_config.save_points.clone());
     if let Some(p) = args.metrics_port {
         server_config.metrics_port = Some(p);

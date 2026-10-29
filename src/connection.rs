@@ -3623,6 +3623,9 @@ pub fn apply_config_value(
             LATENCY_TRACKING.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
         }
         "cross-shard-strict" => set_cross_shard_strict(parse_config_bool(name, val_str)?),
+        "dual-channel-replication-enabled" => {
+            crate::replication::set_dual_channel_replication(parse_config_bool(name, val_str)?)
+        }
         "latency-tracking-info-percentiles" => {
             let mut ps = Vec::new();
             for t in val_str.split_whitespace() {
@@ -3950,7 +3953,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
-    let all_configs: [(&str, String); 98] = [
+    let all_configs: [(&str, String); 99] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
@@ -3979,6 +3982,15 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
             crate::log::log_timestamp_format().to_string(),
         ),
         ("idle-poll-us", monoio::idle_poll_us().to_string()),
+        (
+            "dual-channel-replication-enabled",
+            if crate::replication::dual_channel_replication() {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
         (
             "cross-shard-strict",
             if cross_shard_strict() { "yes" } else { "no" }.to_string(),
@@ -7549,10 +7561,16 @@ struct ReplicaLink {
     repl: Option<std::sync::Arc<crate::replication::ConnectedReplica>>,
     /// The replica's `ip:port`, for "Connection with replica ... lost.".
     name: String,
+    /// False for a dual-channel sync's RDB channel: the replica it
+    /// registered lives on with its main connection.
+    active: bool,
 }
 
 impl Drop for ReplicaLink {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         if let Some(r) = self.repl.take() {
             r.detach_fd();
         }
@@ -7713,6 +7731,7 @@ async fn stream_full_sync(
     write_tx: &flume::Sender<Vec<u8>>,
     writer: &mut monoio::net::tcp::TcpOwnedWriteHalf,
     name: &str,
+    rdb_channel: Option<flume::Receiver<Vec<u8>>>,
 ) -> Result<
     (
         std::sync::Arc<crate::replication::ConnectedReplica>,
@@ -7786,11 +7805,17 @@ async fn stream_full_sync(
     if let Some(e) = first_err {
         return Err(fail(e));
     }
-    let (replid, offset, after_snapshot) = hub.finish_full_sync(client_id);
+    let (replid, offset, mut after_snapshot) = hub.finish_full_sync(client_id);
     drop(apply);
     let gone =
         |rep: &crate::replication::ConnectedReplica| rep.is_overflowed() || rep.is_disconnected();
+    let dual = rdb_channel.is_some();
     let broke_off = |why: String| {
+        if dual {
+            // The replica's main connection may be streaming already.
+            hub.withdraw_rdb_claim(client_id);
+            rep.disconnect();
+        }
         hub.unregister_replica(client_id);
         crate::log_warning!(
             "Streaming the full sync to replica {} failed: {}",
@@ -7799,9 +7824,27 @@ async fn stream_full_sync(
         );
         None
     };
-    // 2. +FULLRESYNC, the `$EOF:` header and the RDB file header.
+    // 2. +FULLRESYNC, the `$EOF:` header and the RDB file header. On a
+    // dual-channel sync's RDB channel, `$ENDOFF:` instead tells the
+    // replica where the stream continues and which connection to ask for
+    // it; the stream waits here for that (see `run_master_replica_stream`).
     let mark = crate::replication::new_replid();
-    let mut out = format!("+FULLRESYNC {replid} {offset}\r\n$EOF:{mark}\r\n").into_bytes();
+    let head = match rdb_channel {
+        Some(wakeups) => {
+            hub.offer_rdb_claim(
+                client_id,
+                crate::replication::RdbChannelClaim {
+                    rep: rep.clone(),
+                    wakeups,
+                    replid: replid.clone(),
+                    pre: std::mem::take(&mut after_snapshot),
+                },
+            );
+            format!("$ENDOFF:{offset} {replid} {client_id}\r\n")
+        }
+        None => format!("+FULLRESYNC {replid} {offset}\r\n"),
+    };
+    let mut out = format!("{head}$EOF:{mark}\r\n").into_bytes();
     let mut rdb_head = Vec::new();
     let used_mem = router.local_db.borrow().total_used_memory() as u64;
     crate::redis_rdb::write_file_header(&mut rdb_head, used_mem);
@@ -7861,6 +7904,10 @@ async fn stream_full_sync(
                 if rep.is_overflowed() {
                     replica_output_limit_reached(client_id, name);
                 }
+                if dual {
+                    hub.withdraw_rdb_claim(client_id);
+                    rep.disconnect();
+                }
                 hub.unregister_replica(client_id);
                 return Err(None);
             }
@@ -7908,6 +7955,59 @@ async fn replica_snapshot_failed(
     }
 }
 
+/// The RDB channel of a dual-channel full sync (see
+/// `replication::dual_channel_replication`): a streamed full sync whose
+/// stream waits for the replica's main connection to take it, announced by
+/// `$ENDOFF:<offset> <replid> <this client id>` ahead of the `$EOF:` RDB.
+/// Once the RDB is sent this connection is done; a stream nobody took
+/// within `repl-timeout` is dropped.
+async fn serve_rdb_channel(
+    hub: &std::sync::Arc<crate::replication::ReplicationHub>,
+    router: &Rc<Router>,
+    client_id: u64,
+    write_tx: &flume::Sender<Vec<u8>>,
+    write_rx: flume::Receiver<Vec<u8>>,
+    writer: &mut monoio::net::tcp::TcpOwnedWriteHalf,
+    name: &str,
+) {
+    if !hub.replica_takes_eof(client_id) {
+        let _ = writer
+            .write_all(b"-ERR an RDB channel needs REPLCONF capa eof\r\n".to_vec())
+            .await;
+        return;
+    }
+    crate::log_notice!("Replica {} opened the RDB channel of its full sync", name);
+    match stream_full_sync(
+        hub,
+        router,
+        client_id,
+        write_tx,
+        writer,
+        name,
+        Some(write_rx),
+    )
+    .await
+    {
+        Ok((rep, _)) => {
+            crate::log_notice!("Synchronization with replica {} succeeded", name);
+            let deadline = std::time::Instant::now() + crate::replication::repl_timeout();
+            while hub.rdb_claim_pending(client_id) && std::time::Instant::now() < deadline {
+                monoio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            if hub.withdraw_rdb_claim(client_id) {
+                crate::log_warning!(
+                    "Replica {} never came back for the stream of its full sync",
+                    name
+                );
+                rep.disconnect();
+                hub.unregister_replica(client_id);
+            }
+        }
+        Err(Some(e)) => replica_snapshot_failed(writer, name, e).await,
+        Err(None) => {}
+    }
+}
+
 async fn run_master_replica_stream(
     stream: TcpStream,
     client_id: u64,
@@ -7933,6 +8033,7 @@ async fn run_master_replica_stream(
         client_id,
         repl: None,
         name: name.clone(),
+        active: true,
     };
 
     let is_sync = matches!(&psync_cmd, Command::Sync);
@@ -7979,11 +8080,55 @@ async fn run_master_replica_stream(
     }
     hub.ensure_pinger();
 
+    // Dual-channel replication (see `replication::dual_channel_replication`):
+    // this connection is the replica's RDB channel: it gets the snapshot
+    // only, while its main connection takes the stream after it.
+    if hub.is_rdb_channel(client_id) {
+        link.active = false;
+        serve_rdb_channel(
+            &hub,
+            &router,
+            client_id,
+            &write_tx,
+            write_rx,
+            &mut writer,
+            &name,
+        )
+        .await;
+        return;
+    }
+
     let repl;
     // After a streamed (`$EOF:`) full sync: the stream written during the
     // transfer, held back until the replica's first ack (see below).
     let mut after_ack: Option<Vec<u8>> = None;
-    if !is_sync {
+    // The wakeups of the RDB channel's stream this connection took.
+    let mut claimed_wakeups = None;
+    if let Some(rdb_id) = hub.rdb_client_id_of(client_id) {
+        // The replica's main connection, once its RDB channel started the
+        // snapshot: it takes the stream from right after it, buffering it
+        // while the RDB arrives and loads.
+        let Some(claim) = hub.take_rdb_claim(rdb_id) else {
+            let _ = writer
+                .write_all(b"-ERR no full sync waits for this rdb-client-id\r\n".to_vec())
+                .await;
+            return;
+        };
+        crate::log_notice!(
+            "Replica {} takes the stream of its RDB channel's full sync",
+            name
+        );
+        let mut msg = format!("+CONTINUE {}\r\n", claim.replid).into_bytes();
+        msg.extend_from_slice(&claim.pre);
+        if writer.write_all(msg).await.0.is_err() {
+            claim.rep.disconnect();
+            hub.unregister_replica(claim.rep.id);
+            return;
+        }
+        link.client_id = claim.rep.id;
+        repl = claim.rep;
+        claimed_wakeups = Some(claim.wakeups);
+    } else if !is_sync {
         let (req_replid, req_offset) = match &psync_cmd {
             Command::Psync { replid, offset, .. } => {
                 (std::str::from_utf8(replid).unwrap_or(""), *offset)
@@ -8022,12 +8167,26 @@ async fn run_master_replica_stream(
             } else {
                 crate::log_notice!("Full resync requested by replica {}", name);
             }
-            if hub.replica_takes_eof(client_id) {
+            if hub.replica_takes_dual_channel(client_id) {
+                // The replica opens its RDB channel, then comes back for
+                // the stream (see above).
+                crate::log_notice!("Replica {} gets its full sync over two connections", name);
+                let _ = writer.write_all(b"+DUALCHANNELSYNC\r\n".to_vec()).await;
+                return;
+            } else if hub.replica_takes_eof(client_id) {
                 // No eviction pause: the images' buffers don't count toward
                 // maxmemory (SYNC_IMAGE_BYTES), and sent pieces go back to
                 // their shard rather than being freed on this thread.
-                match stream_full_sync(&hub, &router, client_id, &write_tx, &mut writer, &name)
-                    .await
+                match stream_full_sync(
+                    &hub,
+                    &router,
+                    client_id,
+                    &write_tx,
+                    &mut writer,
+                    &name,
+                    None,
+                )
+                .await
                 {
                     Ok((rep, after_snapshot)) => {
                         repl = rep;
@@ -8104,9 +8263,12 @@ async fn run_master_replica_stream(
         }
     }
 
-    if repl.full_sync.is_some() {
+    if repl.full_sync.is_some() && claimed_wakeups.is_none() {
         crate::log_notice!("Synchronization with replica {} succeeded", name);
     }
+    // The replica's id: this connection's, or its RDB channel's.
+    let client_id = repl.id;
+    let write_rx = claimed_wakeups.unwrap_or(write_rx);
     repl.attach_fd(raw_fd);
     link.repl = Some(repl.clone());
     let writer_hub = hub.clone();
@@ -12771,6 +12933,9 @@ async fn execute_command_inner(
                 if args.iter().any(|a| a.eq_ignore_ascii_case(b"eof")) {
                     crate::replication::cached_hub(router.base_port).note_replica_capa_eof(client_id);
                 }
+                if args.iter().any(|a| a.eq_ignore_ascii_case(b"dual-channel")) {
+                    crate::replication::cached_hub(router.base_port).note_replica_capa_dual(client_id);
+                }
                 if args.iter().any(|a| a.eq_ignore_ascii_case(b"dragonfly")) {
                     let hub = crate::replication::cached_hub(router.base_port);
                     let replid = &hub.replid();
@@ -12786,6 +12951,25 @@ async fn execute_command_inner(
                     );
                 } else {
                     out.extend_from_slice(b"+OK\r\n");
+                }
+            } else if args[0].eq_ignore_ascii_case(b"rdb-channel") {
+                // Dual-channel replication: this connection's PSYNC asks
+                // for the RDB only (see `run_master_replica_stream`).
+                let hub = crate::replication::cached_hub(router.base_port);
+                hub.note_rdb_channel(client_id, args.get(1).is_some_and(|a| a.as_ref() == b"1"));
+                out.extend_from_slice(b"+OK\r\n");
+            } else if args[0].eq_ignore_ascii_case(b"rdb-client-id") {
+                // ... and this one's takes that RDB channel's stream.
+                match args
+                    .get(1)
+                    .and_then(|a| std::str::from_utf8(a).ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    Some(id) => {
+                        crate::replication::cached_hub(router.base_port).note_rdb_client_id(client_id, id);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    None => out.extend_from_slice(b"-ERR invalid rdb-client-id\r\n"),
                 }
             } else if args[0].eq_ignore_ascii_case(b"ack") {
                 if args.len() >= 2

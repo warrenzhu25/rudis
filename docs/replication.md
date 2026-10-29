@@ -51,6 +51,33 @@ The master fans a request out to every shard (`Router::generate_full_rdb`), coll
 
 The replica reads exactly `<len>` bytes and applies them via `Router::restore_rdb_bytes`, which — like RDB startup restore — has every shard independently filter the full blob down to the keys it owns.
 
+### 2.2.1 Dual-channel full sync (`dual-channel-replication-enabled`)
+
+Off by default; both master and replica must have it on (`dual-channel-replication-enabled yes`
+in the config file, `--dual-channel-replication-enabled yes`, or `CONFIG SET`). The name and the
+idea come from Valkey 8; the messages are rudis's own, so it only works between rudis servers.
+
+A plain full sync makes the master hold every write made while the RDB is sent and loaded in the
+replica's output buffer, which a write-heavy master overruns (`client-output-buffer-limit
+replica`), so the replica loops through full syncs. With dual channels:
+
+1. The replica advertises `REPLCONF capa dual-channel`; a master needing a full sync answers its
+   PSYNC with `+DUALCHANNELSYNC` and closes the connection.
+2. The replica opens an **RDB channel**: `REPLCONF rdb-channel 1`, then `PSYNC ? -1`. The master
+   starts the point-in-time snapshot and answers `$ENDOFF:<offset> <replid> <client-id>`, then
+   streams the RDB (`$EOF:` framing). The stream from `<offset>` on waits for step 3.
+3. The replica opens a new **main connection**: `REPLCONF rdb-client-id <client-id>`, then
+   `PSYNC <replid> <offset+1>`. The master answers `+CONTINUE` and streams from there at once.
+4. The replica buffers that stream in its own memory while the RDB arrives and loads (a reader
+   thread keeps draining the socket while the load holds the shard thread), then applies it and
+   continues as usual.
+
+The master's buffer for the replica stays at what the network hasn't taken yet. The cost moves to
+the replica: its buffer grows with the write rate times the transfer and load time, with no limit
+of its own. In a test with a 32 MB replica limit, 1M keys and ~60 MB/s of writes, a plain full
+sync was retried 13-18 times without ever linking; a dual-channel one linked at the first attempt
+in ~2.3 s.
+
 ### 2.3 Partial resync (`+CONTINUE`)
 
 If the requested replid matches the master's current replid (or its immediately-previous `replid2`, within the bound described in §1) **and** the requested offset still falls inside the master's retained *replication backlog* — an in-memory ring buffer of the most recently propagated bytes, per listening port (1 MB default, configurable via `repl-backlog-size` in `rudis.conf` or `CONFIG SET repl-backlog-size`) — the master replies:

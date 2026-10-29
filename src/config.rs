@@ -31,6 +31,9 @@ pub struct RudisConfig {
     /// whose keys live on different shards, with Redis Cluster's CROSSSLOT
     /// error (see `connection::cross_shard_strict`).
     pub cross_shard_strict: bool,
+    /// `dual-channel-replication-enabled` (see
+    /// `replication::dual_channel_replication`).
+    pub dual_channel_replication: bool,
     pub aof_load_truncated: bool,
     pub dir: PathBuf,
     pub requirepass: Option<String>,
@@ -85,6 +88,7 @@ impl Default for RudisConfig {
             idle_poll_us: 50,
             enable_experimental_commands: false,
             cross_shard_strict: false,
+            dual_channel_replication: false,
             aof_load_truncated: true,
             dir: PathBuf::from("."),
             requirepass: None,
@@ -608,6 +612,19 @@ impl RudisConfig {
                     config.idle_poll_us = rest[0].parse::<u64>().map_err(|e| {
                         format!("Invalid idle-poll-us at line {}: {}", line_num + 1, e)
                     })?;
+                }
+                "dual-channel-replication-enabled" => {
+                    config.dual_channel_replication = match rest[0].to_lowercase().as_str() {
+                        "yes" => true,
+                        "no" => false,
+                        other => {
+                            return Err(format!(
+                                "Invalid dual-channel-replication-enabled at line {}: '{}' (expected yes|no)",
+                                line_num + 1,
+                                other
+                            ));
+                        }
+                    };
                 }
                 "cross-shard-strict" => {
                     config.cross_shard_strict = match rest[0].to_lowercase().as_str() {
@@ -1249,6 +1266,17 @@ mod tests {
         );
         assert!(RudisConfig::parse_str("cross-shard-spin -1").is_err());
         assert!(RudisConfig::parse_str("cross-shard-spin lots").is_err());
+    }
+
+    #[test]
+    fn test_parse_dual_channel_replication() {
+        assert!(!RudisConfig::parse_str("").unwrap().dual_channel_replication);
+        assert!(
+            RudisConfig::parse_str("dual-channel-replication-enabled yes")
+                .unwrap()
+                .dual_channel_replication
+        );
+        assert!(RudisConfig::parse_str("dual-channel-replication-enabled 2").is_err());
     }
 
     #[test]

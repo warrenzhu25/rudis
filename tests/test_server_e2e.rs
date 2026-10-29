@@ -37007,3 +37007,130 @@ fn test_bgsave_is_one_point_in_time_across_shards_e2e() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Dual-channel replication: under writes heavier than a small
+/// `client-output-buffer-limit replica` holds for a whole full sync, the
+/// sync still completes at the first attempt, as the stream after the
+/// snapshot flows over the main connection (buffered by the replica) while
+/// the RDB arrives over its RDB channel and loads. The replica ends up with
+/// the master's data.
+#[test]
+fn test_dual_channel_full_sync_under_writes_e2e() {
+    let (mp, rp) = (29961u16, 29962u16);
+    let (ms, rs) = (mp.to_string(), rp.to_string());
+    let common = [
+        "--threads",
+        "4",
+        "--no-pin",
+        "--save",
+        "",
+        "--dual-channel-replication-enabled",
+        "yes",
+    ];
+    let margs: Vec<&str> = ["--port", ms.as_str()]
+        .iter()
+        .chain(common.iter())
+        .copied()
+        .collect();
+    let rargs: Vec<&str> = ["--port", rs.as_str()]
+        .iter()
+        .chain(common.iter())
+        .copied()
+        .collect();
+    // Killed even if an assertion fails.
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _master = Kill(spawn_rudis_listening(&margs, mp));
+    let _replica = Kill(spawn_rudis_listening(&rargs, rp));
+    let connect = |port: u16| {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s
+    };
+    let mut m = connect(mp);
+    let mut r = connect(rp);
+    // ~100 MB of data: its transfer and load take a while.
+    assert_eq!(
+        resp_cmd_all(&mut m, &["DEBUG", "POPULATE", "400000", "key", "256"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd_all(
+            &mut m,
+            &[
+                "CONFIG",
+                "SET",
+                "client-output-buffer-limit",
+                "replica 8mb 4mb 10"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut w = connect(mp);
+            let val = "x".repeat(512);
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut pipe = String::new();
+                for i in 0..200 {
+                    let k = format!("w:{}", (n + i) % 50_000);
+                    pipe.push_str(&format!(
+                        "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n${}\r\n{val}\r\n",
+                        k.len(),
+                        val.len()
+                    ));
+                }
+                w.write_all(pipe.as_bytes()).unwrap();
+                let mut got = 0;
+                let mut buf = [0u8; 4096];
+                while got < 200 * 5 {
+                    got += w.read(&mut buf).unwrap();
+                }
+                n += 200;
+                // ~10 MB/s: what the replica keeps up with, but more than
+                // the limit holds for a whole transfer and load.
+                thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !resp_cmd_all(&mut r, &["INFO", "replication"]).contains("master_link_status:up") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replica never synced"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Keep writing a little longer: the buffered stream applies and the
+    // live one continues.
+    thread::sleep(Duration::from_millis(500));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert_eq!(resp_cmd_all(&mut m, &["WAIT", "1", "10000"]), ":1\r\n");
+    let stats = resp_cmd_all(&mut m, &["INFO", "stats"]);
+    assert!(
+        stats.contains("sync_full:1\r\n"),
+        "the first full sync didn't hold: {stats}"
+    );
+    assert_eq!(
+        resp_cmd_all(&mut r, &["DBSIZE"]),
+        resp_cmd_all(&mut m, &["DBSIZE"])
+    );
+    assert_eq!(
+        resp_cmd_all(&mut r, &["DEBUG", "DIGEST"]),
+        resp_cmd_all(&mut m, &["DEBUG", "DIGEST"])
+    );
+}
