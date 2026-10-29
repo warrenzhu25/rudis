@@ -27,6 +27,10 @@ pub struct RudisConfig {
     /// `enable-experimental-commands`: accept the non-Redis command families
     /// (JSON., BF., FT., CRDT., ...; see `resp::is_experimental_command_name`).
     pub enable_experimental_commands: bool,
+    /// `cross-shard-strict`: refuse multi-key commands and transactions
+    /// whose keys live on different shards, with Redis Cluster's CROSSSLOT
+    /// error (see `connection::cross_shard_strict`).
+    pub cross_shard_strict: bool,
     pub aof_load_truncated: bool,
     pub dir: PathBuf,
     pub requirepass: Option<String>,
@@ -80,6 +84,7 @@ impl Default for RudisConfig {
             cross_shard_spin: 0,
             idle_poll_us: 50,
             enable_experimental_commands: false,
+            cross_shard_strict: false,
             aof_load_truncated: true,
             dir: PathBuf::from("."),
             requirepass: None,
@@ -603,6 +608,19 @@ impl RudisConfig {
                     config.idle_poll_us = rest[0].parse::<u64>().map_err(|e| {
                         format!("Invalid idle-poll-us at line {}: {}", line_num + 1, e)
                     })?;
+                }
+                "cross-shard-strict" => {
+                    config.cross_shard_strict = match rest[0].to_lowercase().as_str() {
+                        "yes" => true,
+                        "no" => false,
+                        other => {
+                            return Err(format!(
+                                "Invalid cross-shard-strict at line {}: '{}' (expected yes|no)",
+                                line_num + 1,
+                                other
+                            ));
+                        }
+                    };
                 }
                 "enable-experimental-commands" => {
                     config.enable_experimental_commands = match rest[0].to_lowercase().as_str() {
@@ -1231,6 +1249,17 @@ mod tests {
         );
         assert!(RudisConfig::parse_str("cross-shard-spin -1").is_err());
         assert!(RudisConfig::parse_str("cross-shard-spin lots").is_err());
+    }
+
+    #[test]
+    fn test_parse_cross_shard_strict() {
+        assert!(!RudisConfig::parse_str("").unwrap().cross_shard_strict);
+        assert!(
+            RudisConfig::parse_str("cross-shard-strict yes")
+                .unwrap()
+                .cross_shard_strict
+        );
+        assert!(RudisConfig::parse_str("cross-shard-strict maybe").is_err());
     }
 
     #[test]

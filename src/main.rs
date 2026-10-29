@@ -90,6 +90,12 @@ struct Args {
     #[arg(long)]
     enable_experimental_commands: Option<String>,
 
+    /// Refuse multi-key commands and transactions whose keys live on
+    /// different shards, with Redis Cluster's CROSSSLOT error, instead of
+    /// running them with weaker atomicity (yes|no, default no)
+    #[arg(long)]
+    cross_shard_strict: Option<String>,
+
     /// Serve Prometheus metrics over HTTP (GET /metrics) on this port
     #[arg(long)]
     metrics_port: Option<u16>,
@@ -392,6 +398,20 @@ fn main() {
         };
     }
     rudis::resp::set_experimental_commands(server_config.enable_experimental_commands);
+    if let Some(v) = args.cross_shard_strict {
+        server_config.cross_shard_strict = match v.to_lowercase().as_str() {
+            "yes" => true,
+            "no" => false,
+            other => {
+                log_fatal!(
+                    "FATAL CONFIG: --cross-shard-strict expects yes|no, got '{}'",
+                    other
+                );
+                std::process::exit(1);
+            }
+        };
+    }
+    rudis::connection::set_cross_shard_strict(server_config.cross_shard_strict);
     rudis::config::set_save_points(port, server_config.save_points.clone());
     if let Some(p) = args.metrics_port {
         server_config.metrics_port = Some(p);

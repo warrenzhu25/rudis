@@ -23585,6 +23585,73 @@ fn test_replica_never_keeps_half_a_transaction_e2e() {
     }
 }
 
+/// `cross-shard-strict yes` refuses multi-key commands and transactions
+/// whose keys live on different shards with Redis Cluster's CROSSSLOT error,
+/// alone or pipelined; keys sharing a hash tag still work, and turning it
+/// off lets cross-shard commands run again.
+#[test]
+fn test_cross_shard_strict_refuses_commands_spanning_shards_e2e() {
+    let port = 18422u16;
+    start_test_server(port, 4);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let (a, b) = (0..)
+        .map(|i| (format!("cs:a{i}"), format!("cs:b{i}")))
+        .find(|(a, b)| {
+            rudis::router::target_shard(a.as_bytes(), 4)
+                != rudis::router::target_shard(b.as_bytes(), 4)
+        })
+        .unwrap();
+    const CROSSSLOT: &str = "-CROSSSLOT Keys in request don't hash to the same slot\r\n";
+    assert_eq!(
+        resp_cmd_all(&mut c, &["CONFIG", "GET", "cross-shard-strict"]),
+        "*2\r\n$18\r\ncross-shard-strict\r\n$2\r\nno\r\n"
+    );
+    assert_eq!(resp_cmd_all(&mut c, &["MSET", &a, "1", &b, "2"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd_all(&mut c, &["CONFIG", "SET", "cross-shard-strict", "yes"]),
+        "+OK\r\n"
+    );
+    for args in [
+        vec!["MSET", &a, "1", &b, "2"],
+        vec!["MGET", &a, &b],
+        vec!["DEL", &a, &b],
+        vec!["EXISTS", &a, &b],
+        vec!["RENAME", &a, &b],
+        vec!["LMOVE", &a, &b, "LEFT", "RIGHT"],
+        vec!["SUNIONSTORE", &a, &b],
+    ] {
+        assert_eq!(resp_cmd_all(&mut c, &args), CROSSSLOT, "{args:?}");
+    }
+    // Pipelined (the batched paths).
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let cmds = vec![
+        s(&["MSET", &a, "1", &b, "2"]),
+        s(&["MGET", &a, &b]),
+        s(&["DEL", &a, &b]),
+        s(&["GET", &a]),
+    ];
+    let replies = String::from_utf8(pipeline_all(&mut c, &cmds, "strict-done")).unwrap();
+    assert_eq!(replies.matches("-CROSSSLOT").count(), 3, "{replies}");
+    assert!(replies.contains("$1\r\n1\r\n"), "{replies}");
+    // A transaction over two shards is refused as a whole.
+    assert_eq!(resp_cmd_all(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["SET", &a, "x"]), "+QUEUED\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["SET", &b, "y"]), "+QUEUED\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["EXEC"]), CROSSSLOT);
+    assert_eq!(resp_cmd_all(&mut c, &["GET", &a]), "$1\r\n1\r\n");
+    // Keys sharing a hash tag share a shard.
+    let (ta, tb) = (format!("{{{a}}}:1"), format!("{{{a}}}:2"));
+    assert_eq!(
+        resp_cmd_all(&mut c, &["MSET", &ta, "1", &tb, "2"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd_all(&mut c, &["CONFIG", "SET", "cross-shard-strict", "no"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd_all(&mut c, &["DEL", &a, &b]), ":2\r\n");
+}
+
 /// Shards hold their replication bytes for a mailbox burst and stream them
 /// once. Pipelined writes from several clients over every shard (DB
 /// switches, cross-shard LMOVE, a FLUSHALL right after remote writes, a

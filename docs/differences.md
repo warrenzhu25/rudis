@@ -56,7 +56,10 @@ This document summarizes the architectural, operational, and semantic difference
     the rest of its timeout (Redis hands the element to the blocked client directly).
 
   To make related keys atomic in every case, put them on one shard with a hash tag
-  (`{user:1}:a`, `{user:1}:b`).
+  (`{user:1}:a`, `{user:1}:b`). To have rudis enforce that, set `cross-shard-strict yes`
+  (config file, `--cross-shard-strict yes`, or `CONFIG SET`): a multi-key command or a
+  transaction whose keys live on different shards then fails with Redis Cluster's `CROSSSLOT`
+  error instead of running with the weaker guarantees above.
 
 ## 3. Replication & High Availability
 

@@ -1068,6 +1068,38 @@ fn latency_bucket(usec: u64) -> usize {
     }
 }
 
+/// `cross-shard-strict`: refuse a multi-key command, or a transaction,
+/// whose keys live on different shards, with Redis Cluster's CROSSSLOT
+/// error. Off by default: such commands then run across shards, with the
+/// weaker atomicity `docs/differences.md` describes.
+static CROSS_SHARD_STRICT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_cross_shard_strict(on: bool) {
+    CROSS_SHARD_STRICT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cross_shard_strict() -> bool {
+    CROSS_SHARD_STRICT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `keys` live on more than one of `num_shards` shards.
+pub fn keys_on_several_shards<'a>(
+    keys: impl IntoIterator<Item = &'a [u8]>,
+    num_shards: usize,
+) -> bool {
+    let mut first = None;
+    for k in keys {
+        let shard = target_shard(k, num_shards);
+        match first {
+            None => first = Some(shard),
+            Some(f) if f != shard => return true,
+            Some(_) => {}
+        }
+    }
+    false
+}
+
 /// `latency-tracking`: whether `INFO latencystats` reports percentiles.
 pub static LATENCY_TRACKING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
@@ -3590,6 +3622,7 @@ pub fn apply_config_value(
         "latency-tracking" => {
             LATENCY_TRACKING.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
         }
+        "cross-shard-strict" => set_cross_shard_strict(parse_config_bool(name, val_str)?),
         "latency-tracking-info-percentiles" => {
             let mut ps = Vec::new();
             for t in val_str.split_whitespace() {
@@ -3917,7 +3950,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
-    let all_configs: [(&str, String); 97] = [
+    let all_configs: [(&str, String); 98] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
@@ -3946,6 +3979,10 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
             crate::log::log_timestamp_format().to_string(),
         ),
         ("idle-poll-us", monoio::idle_poll_us().to_string()),
+        (
+            "cross-shard-strict",
+            if cross_shard_strict() { "yes" } else { "no" }.to_string(),
+        ),
         (
             "latency-tracking",
             if LATENCY_TRACKING.load(std::sync::atomic::Ordering::Relaxed) {
@@ -5260,7 +5297,14 @@ async fn execute_tx_step(
                         b"-EXECABORT Transaction discarded because of previous errors.\r\n",
                     );
                     false
-                } else if router.cluster_enabled && tx_has_cross_slot(tx_queue) {
+                } else if (router.cluster_enabled && tx_has_cross_slot(tx_queue))
+                    || (cross_shard_strict()
+                        && router.num_shards > 1
+                        && keys_on_several_shards(
+                            tx_queue.iter().flat_map(cmd_keys),
+                            router.num_shards,
+                        ))
+                {
                     if let Some(ref addr_s) = monitor_addr {
                         broadcast_monitor(router.port, addr_s, &[Bytes::from_static(b"exec")]);
                     }
@@ -11340,6 +11384,12 @@ async fn execute_command_inner(
                 }
             }
         }
+    } else if cross_shard_strict()
+        && router.num_shards > 1
+        && keys_on_several_shards(cmd_keys(&cmd), router.num_shards)
+    {
+        out.extend_from_slice(b"-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+        return false;
     }
 
     if let Some(key) = cmd_primary_key(&cmd) {
@@ -29935,6 +29985,21 @@ mod tests {
             0,
         );
         assert!(reply == b"$-1\r\n" || reply == b"_\r\n", "{reply:?}");
+    }
+
+    #[test]
+    fn test_keys_on_several_shards() {
+        let one: &[&[u8]] = &[b"{u}a", b"{u}b", b"{u}c"];
+        assert!(!keys_on_several_shards(one.iter().copied(), 8));
+        assert!(!keys_on_several_shards(std::iter::empty::<&[u8]>(), 8));
+        // Some pair of plain keys lands on two shards.
+        let keys: Vec<Vec<u8>> = (0..64).map(|i| format!("k{i}").into_bytes()).collect();
+        assert!(keys_on_several_shards(keys.iter().map(|k| k.as_slice()), 8));
+        // One shard: nothing spans.
+        assert!(!keys_on_several_shards(
+            keys.iter().map(|k| k.as_slice()),
+            1
+        ));
     }
 
     #[test]
