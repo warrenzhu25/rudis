@@ -4864,3 +4864,85 @@ fn test_bgsave_is_one_point_in_time_across_shards_e2e() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Keys evicted while a BGSAVE runs are in the file, as in the snapshot
+/// Redis's forked child writes: the save holds the keys as they were when
+/// it started, whatever eviction does meanwhile.
+#[test]
+fn test_bgsave_keeps_keys_evicted_while_it_runs_e2e() {
+    let port = 29996u16;
+    let dir = std::env::temp_dir().join(format!("rudis-pitevict-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let ps = port.to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--save",
+        "",
+    ];
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s
+    };
+    let server = Kill(spawn_rudis_listening(&args, port));
+    let mut c = connect();
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DEBUG", "POPULATE", "200000", "key", "100"]),
+        "+OK\r\n"
+    );
+    let used = info_field_u64(&mut c, "memory", "used_memory");
+    assert_eq!(
+        resp_cmd_all(
+            &mut c,
+            &["CONFIG", "SET", "maxmemory-policy", "allkeys-random"]
+        ),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd_all(&mut c, &["BGSAVE"]).starts_with("+Background saving started"));
+    // Now well under what the data takes: new writes evict old keys.
+    let limit = (used / 2).to_string();
+    assert_eq!(
+        resp_cmd_all(&mut c, &["CONFIG", "SET", "maxmemory", &limit]),
+        "+OK\r\n"
+    );
+    let val = "n".repeat(100);
+    let mut i = 0;
+    while info_field_u64(&mut c, "persistence", "rdb_bgsave_in_progress") != 0 {
+        for _ in 0..200 {
+            resp_cmd_all(&mut c, &["SET", &format!("new:{i}"), &val]);
+            i += 1;
+        }
+    }
+    assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "ok");
+    let evicted = info_field_u64(&mut c, "stats", "evicted_keys");
+    assert!(
+        evicted > 0,
+        "nothing was evicted during the save ({i} writes)"
+    );
+    drop(server);
+
+    let _server = Kill(spawn_rudis_listening(&args, port));
+    let mut c = connect();
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DBSIZE"]),
+        ":200000\r\n",
+        "the file lost keys evicted during the save ({evicted} evicted)"
+    );
+    assert_eq!(resp_cmd_all(&mut c, &["EXISTS", "new:0"]), ":0\r\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}

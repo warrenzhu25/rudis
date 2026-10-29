@@ -5965,6 +5965,37 @@ mod tests {
         assert!(restored.get(b"born").is_none());
     }
 
+    /// Keys evicted while a SAVE image is written are in it, as in the
+    /// snapshot Redis's forked child writes.
+    #[test]
+    fn save_image_keeps_keys_evicted_meanwhile() {
+        let _g = SYNC_IMAGE_TEST_LOCK.lock();
+        let mut db = ShardDb::new(0);
+        for i in 0..3000 {
+            db.set(Bytes::from(format!("k{i}")), Bytes::from_static(b"v"), None);
+        }
+        start_save_image(&db).unwrap();
+        let (first, done) = with_image(ImageOwner::Save, |img| {
+            img.step(&db, Duration::ZERO, usize::MAX)
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!done);
+        let mut chunk = first.unwrap_or_default();
+        while db.try_evict_one_key("allkeys-random", None).is_some() {}
+        assert_eq!(db.dbsize(), 0);
+        loop {
+            let (piece, done) = image_step(&db, ImageOwner::Save, None).unwrap();
+            chunk.extend(piece);
+            if done {
+                break;
+            }
+        }
+        let mut restored = ShardDb::new(0);
+        restored.restore_rdb_chunk(&chunk).unwrap();
+        assert_eq!(restored.dbsize(), 3000);
+    }
+
     /// Segments split while a snapshot image is written must not get their
     /// keys written twice: Redis and Valkey refuse an RDB with a duplicate
     /// key.

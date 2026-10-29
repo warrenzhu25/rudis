@@ -79,9 +79,8 @@ This document summarizes the architectural, operational, and semantic difference
 * `SAVE`/`BGSAVE` don't fork, but write one point in time like Redis's forked child: every shard
   starts a copy-on-write image with cross-shard writes held back for that moment, and a key
   written while the save runs is copied as it was first. A transaction or MSET spanning shards is
-  in the file whole or not at all. Keys evicted, or deleted on expiry, while the save runs may be
-  missing from the file (Redis's child still has them); a `SWAPDB` during a save fails it (the
-  next scheduled save retries).
+  in the file whole or not at all. Keys evicted while the save runs are in the file too (as Redis's
+  child still has them); a `SWAPDB` during a save fails it (the next scheduled save retries).
 
 ### Turning AOF On at Runtime
 * `CONFIG SET appendonly yes` works as in Redis (writes logged at once, initial AOF written by a background rewrite, `SHUTDOWN` refused until it is done). Until then the writes go to `appendonly-<shard>.aof.incr` and no `appendonly-<shard>.aof` exists, so a crash in between never leaves an AOF without the dataset. Redis 7 tracks this in its multi-part AOF manifest, which rudis doesn't have.

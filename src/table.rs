@@ -4091,6 +4091,16 @@ impl RudisTable {
             }
         }
 
+        // A snapshot being built (SAVE, full sync, AOF rewrite) keeps the
+        // key as it was: Redis's forked child still has an evicted key.
+        // The callers set CURRENT_DB to this table's database.
+        if let Some(slot_idx) = best_slot
+            && crate::shard::aof_image_active()
+            && let Some(entry) = self.table.get_slot(slot_idx)
+        {
+            let key = entry.key.clone();
+            crate::shard::before_write_table(self, crate::connection::CURRENT_DB.get(), &key);
+        }
         if let Some(slot_idx) = best_slot
             && let Some(removed) = self.table.remove(slot_idx)
         {
