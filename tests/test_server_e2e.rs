@@ -36833,3 +36833,177 @@ fn test_client_unblock_ends_wait_e2e() {
         assert_eq!(String::from_utf8_lossy(&buf[..n]), want);
     }
 }
+
+/// BGSAVE writes one point in time across shards, as Redis's forked child
+/// does: an MSET spanning every shard that runs while the save does is in
+/// the file whole or not at all (a fuzzy per-key scan saved the shards
+/// streamed first with older values than the last).
+#[test]
+fn test_bgsave_is_one_point_in_time_across_shards_e2e() {
+    let port = 29951u16;
+    let dir = std::env::temp_dir().join(format!("rudis-pitsave-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let ps = port.to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--save",
+        "",
+    ];
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s
+    };
+    let keys: Vec<String> = (0..16).map(|i| format!("pit:{i}")).collect();
+    for round in 0..3 {
+        let mut server = spawn_rudis_listening(&args, port);
+        let mut c = connect();
+        // Enough data for the save to take many steps.
+        assert_eq!(
+            resp_cmd_all(&mut c, &["DEBUG", "POPULATE", "300000"]),
+            "+OK\r\n"
+        );
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            let keys = keys.clone();
+            let mut w = connect();
+            thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let v = i.to_string();
+                    let mut cmd = vec!["MSET"];
+                    for k in &keys {
+                        cmd.push(k);
+                        cmd.push(&v);
+                    }
+                    assert_eq!(resp_cmd_all(&mut w, &cmd), "+OK\r\n");
+                    i += 1;
+                }
+                i
+            })
+        };
+        // And transactions of several kinds of writes over every shard,
+        // pipelined (each EXEC's writes are one point in time too).
+        let tx_writer = {
+            let stop = stop.clone();
+            let mut w = connect();
+            thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let v = i.to_string();
+                    let mut pipe = String::new();
+                    let mut push = |args: &[&str]| {
+                        pipe.push_str(&format!("*{}\r\n", args.len()));
+                        for a in args {
+                            pipe.push_str(&format!("${}\r\n{a}\r\n", a.len()));
+                        }
+                    };
+                    push(&["MULTI"]);
+                    for j in 0..8 {
+                        push(&["SET", &format!("tx:s{j}"), &v]);
+                        push(&["INCR", &format!("tx:n{j}")]);
+                        push(&["HSET", &format!("tx:h{j}"), "f", &v]);
+                        push(&["RPUSH", &format!("tx:l{j}"), &v]);
+                    }
+                    push(&["EXEC"]);
+                    w.write_all(pipe.as_bytes()).unwrap();
+                    // +OK, 32 +QUEUED, then the EXEC reply's header and 32
+                    // entries (each one line: +OK or :n).
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    while got.windows(2).filter(|w| *w == b"\r\n").count() < 1 + 32 + 1 + 32 {
+                        let n = w.read(&mut buf).unwrap();
+                        assert!(n > 0);
+                        got.extend_from_slice(&buf[..n]);
+                    }
+                    i += 1;
+                }
+            })
+        };
+        thread::sleep(Duration::from_millis(20));
+        assert!(resp_cmd_all(&mut c, &["BGSAVE"]).starts_with("+Background saving started"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while info_field_u64(&mut c, "persistence", "rdb_bgsave_in_progress") != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "BGSAVE never finished"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let writes = writer.join().unwrap();
+        tx_writer.join().unwrap();
+        assert_eq!(
+            info_field(&mut c, "rdb_last_bgsave_status"),
+            "ok",
+            "round {round}"
+        );
+        server.kill().unwrap();
+        server.wait().unwrap();
+
+        // What the file holds.
+        let mut server = spawn_rudis_listening(&args, port);
+        let mut c = connect();
+        let mut mget = vec!["MGET"];
+        mget.extend(keys.iter().map(String::as_str));
+        let got = resp_cmd_all(&mut c, &mget);
+        let values: Vec<&str> = got
+            .lines()
+            .skip(1)
+            .filter(|l| !l.starts_with('$'))
+            .collect();
+        assert_eq!(values.len(), keys.len(), "round {round}: {got}");
+        assert!(
+            values.iter().all(|v| *v == values[0]),
+            "round {round}: the file holds parts of different MSETs \
+             ({writes} ran during the save): {values:?}"
+        );
+        assert!(
+            resp_cmd_all(&mut c, &["DBSIZE"]).starts_with(":3000"),
+            "round {round}"
+        );
+        // Every transaction is in the file whole or not at all.
+        let n0 = resp_cmd_all(&mut c, &["GET", "tx:n0"]);
+        if n0 != "$-1\r\n" {
+            let n: u64 = n0.lines().nth(1).unwrap().parse().unwrap();
+            let last = (n - 1).to_string();
+            let bulk = format!("${}\r\n{last}\r\n", last.len());
+            for j in 0..8 {
+                let get = |c: &mut TcpStream, args: &[&str]| resp_cmd_all(c, args);
+                assert_eq!(
+                    get(&mut c, &["GET", &format!("tx:n{j}")]),
+                    n0,
+                    "round {round}: tx:n{j}"
+                );
+                assert_eq!(
+                    get(&mut c, &["GET", &format!("tx:s{j}")]),
+                    bulk,
+                    "round {round}: tx:s{j}"
+                );
+                assert_eq!(
+                    get(&mut c, &["HGET", &format!("tx:h{j}"), "f"]),
+                    bulk,
+                    "round {round}: tx:h{j}"
+                );
+                assert_eq!(
+                    get(&mut c, &["LLEN", &format!("tx:l{j}")]),
+                    format!(":{n}\r\n"),
+                    "round {round}: tx:l{j}"
+                );
+            }
+        }
+        server.kill().unwrap();
+        server.wait().unwrap();
+        let _ = std::fs::remove_file(dir.join("dump.rdb"));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

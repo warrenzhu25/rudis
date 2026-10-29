@@ -11098,6 +11098,14 @@ fn remember_replica_keys(router: &Router, db: usize, keys: Vec<Bytes>) {
     }
 }
 
+/// [`aof_image_before_command`] for a shard applying `cmd` to its own keys
+/// outside the command path (a batch's fast paths write to the table
+/// directly).
+#[cold]
+pub(crate) fn images_before_command(db: &ShardDb, cmd: &Command) {
+    aof_image_before_command(db, cmd, |_| true);
+}
+
 /// While an AOF rewrite builds its image of this shard (see
 /// [`crate::shard::AofImage`]), keeps it as of the rewrite's start: the
 /// keys `cmd` may change (those `local` accepts) are written to it first.
@@ -27818,6 +27826,11 @@ async fn execute_commands_squashed_inner(
                 'local: {
                     if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                         for_each_read_key(&cmd, |k| record_client_read(router.port, client_id, k));
+                    }
+                    // The fast paths below write straight to the table: a
+                    // snapshot image being built takes the keys' state first.
+                    if crate::shard::aof_image_active() {
+                        images_before_command(&local_db, &cmd);
                     }
                     local_buf.clear();
                     local_db.hydrate_cmd_keys(&cmd);

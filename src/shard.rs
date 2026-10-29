@@ -620,15 +620,6 @@ pub enum ShardMessage {
         /// arms the replica's stream cut right after serializing.
         arm_replica: Option<u64>,
     },
-    /// SAVE/BGSAVE: stream this shard's keyspace into `sink` in pieces,
-    /// yielding in between (see [`save_rdb_chunk_yielding`]), then report on
-    /// `done` (`Ok(false)` if the sink hung up or the save was aborted, `Err`
-    /// if a tiered value could not be read). Unlike `SaveRdbChunk` this is a
-    /// fuzzy snapshot, so it must not be used where an exact cut is needed.
-    StreamRdbChunk {
-        sink: flume::Sender<Option<Vec<u8>>>,
-        done: flume::Sender<Result<bool, TieredReadError>>,
-    },
     /// Streamed full sync to replica `replica`: start this shard's
     /// point-in-time image and arm the replica's stream cut, in one step
     /// (see [`start_sync_image`]).
@@ -648,6 +639,17 @@ pub enum ShardMessage {
     DropSyncImage {
         replica: u64,
     },
+    /// SAVE / BGSAVE: start this shard's point-in-time image (see
+    /// [`start_save_image`]).
+    StartSaveImage {
+        responder: flume::Sender<Result<(), TieredReadError>>,
+    },
+    /// The next piece of that image (see [`save_image_step`]).
+    SaveImageStep {
+        responder: flume::Sender<Result<(Vec<u8>, bool), String>>,
+    },
+    /// Abandons that image: the save failed or was aborted.
+    DropSaveImage,
     Publish {
         channel: Bytes,
         message: Bytes,
@@ -3177,21 +3179,6 @@ impl ShardDb {
         }
     }
 
-    /// Serializes one table segment (see [`crate::table::RudisFlatTable::layout_epoch`]).
-    fn save_rdb_segment_db0(
-        &self,
-        seg: usize,
-        clock: &RdbClock,
-        buf: &mut Vec<u8>,
-    ) -> Result<(), TieredReadError> {
-        if let Some(t0) = self.table_for_db(0) {
-            for entry in t0.segment_entries(seg) {
-                self.save_rdb_entry(entry, clock, buf)?;
-            }
-        }
-        Ok(())
-    }
-
     fn save_rdb_entry(
         &self,
         entry: &crate::table::RudisEntry,
@@ -4806,74 +4793,12 @@ impl RdbClock {
     }
 }
 
-/// How long one step of [`save_rdb_chunk_yielding`] may hold the shard.
+/// How long one step of a snapshot image (see [`AofImage::step`]) may hold
+/// the shard.
 pub(crate) const RDB_SAVE_STEP: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// [`ShardDb::save_rdb_chunk`] for SAVE/BGSAVE: serializes a few table
-/// segments at a time and yields to the shard's other tasks in between, so
-/// a big shard does not stall its clients for the whole serialization.
-///
-/// Like the cross-shard save it is a fuzzy snapshot: each key is written as
-/// it is when its segment is reached. Every key that exists for the whole
-/// save is written; a key moved to a new segment by a split can be written
-/// twice, which loading resolves (the later copy wins). If the table is
-/// renumbered mid-way (FLUSHALL, collapsing defrag), the rest of the table
-/// is small or empty and is written again in one go.
-///
-/// Not for full syncs: those arm the replication stream cut right after
-/// serializing, which needs the shard not to change in between.
-///
-/// Output goes to `sink` as `Some(piece)` every ~[`RDB_FLUSH_BYTES`] (and a
-/// final tail), which keeps memory bounded and avoids reallocating (copying)
-/// one huge buffer on the shard thread. Returns `Ok(false)` if the sink hung
-/// up or the save was aborted, and an error if a tiered value can't be read
-/// back (the pieces sent so far must then be discarded).
-pub async fn save_rdb_chunk_yielding(
-    db: &std::cell::RefCell<ShardDb>,
-    sink: &flume::Sender<Option<Vec<u8>>>,
-) -> Result<bool, TieredReadError> {
-    let mut cursor = RdbSaveCursor::new(&db.borrow());
-    let mut buf = Vec::with_capacity(RDB_FLUSH_BYTES * 2);
-    loop {
-        if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(false);
-        }
-        let prev_seg = cursor.seg;
-        let done = cursor.step(&db.borrow(), &mut buf, RDB_SAVE_STEP, RDB_FLUSH_BYTES)?;
-        if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(false);
-        }
-        if buf.len() >= RDB_FLUSH_BYTES {
-            let piece = std::mem::replace(&mut buf, Vec::with_capacity(RDB_FLUSH_BYTES * 2));
-            if sink.send_async(Some(piece)).await.is_err() {
-                return Ok(false);
-            }
-        }
-        let delay_us =
-            crate::connection::RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed);
-        if delay_us > 0 {
-            let segs_done = cursor.seg.saturating_sub(prev_seg).max(1) as u64;
-            let sleep_ms = (delay_us.saturating_mul(segs_done) / 1000).clamp(1, 50);
-            monoio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-            if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
-                return Ok(false);
-            }
-        }
-        if done {
-            break;
-        }
-        // A send that completes at once does not yield; always let the
-        // shard's other tasks in between steps.
-        crate::mailbox::yield_now().await;
-    }
-    if crate::connection::RDB_BGSAVE_ABORTED.load(std::sync::atomic::Ordering::SeqCst) {
-        return Ok(false);
-    }
-    Ok(buf.is_empty() || sink.send_async(Some(buf)).await.is_ok())
-}
-
 /// Directory patterns (see [`crate::table::RudisFlatTable::segment_pattern`])
-/// of the segments a [`RdbSaveCursor`] has written. Keys matching one were
+/// of the segments an [`AofImage`] walk has written. Keys matching one were
 /// already written: Redis and Valkey refuse an RDB with a key twice, so a
 /// segment split off a written one (or, after a renumbering, any such key)
 /// is skipped.
@@ -4899,76 +4824,6 @@ impl WrittenPatterns {
                     .patterns
                     .contains(&(d, bits & crate::table::dir_bits_mask(d)))
         })
-    }
-}
-
-/// Progress of a [`save_rdb_chunk_yielding`] walk over a shard's table.
-struct RdbSaveCursor {
-    epoch: u64,
-    seg: usize,
-    written: WrittenPatterns,
-}
-
-impl RdbSaveCursor {
-    fn new(db: &ShardDb) -> Self {
-        RdbSaveCursor {
-            epoch: db.table_for_db(0).map_or(0, |t| t.layout_epoch()),
-            seg: 0,
-            written: WrittenPatterns::default(),
-        }
-    }
-
-    /// Serializes at least one segment, then more until `budget` has passed
-    /// or `buf` holds `flush_bytes`. Returns true once everything, the
-    /// extended state included, is in `buf`; fails if a tiered value can't
-    /// be read back.
-    fn step(
-        &mut self,
-        db: &ShardDb,
-        buf: &mut Vec<u8>,
-        budget: Duration,
-        flush_bytes: usize,
-    ) -> Result<bool, TieredReadError> {
-        let clock = RdbClock::now(db.port);
-        let Some(t0) = db.table_for_db(0) else {
-            db.save_extended_rdb_chunk(buf);
-            db.save_other_dbs_rdb_chunk(&clock, buf)?;
-            return Ok(true);
-        };
-        if t0.layout_epoch() != self.epoch {
-            // Renumbered (FLUSHALL, collapsing defrag): what is left is
-            // small; write the keys no written segment covered.
-            for entry in t0.entries() {
-                let bits = crate::table::key_dir_bits(&entry.key);
-                if !self.written.covers(u8::MAX, bits) {
-                    db.save_rdb_entry(entry, &clock, buf)?;
-                }
-            }
-            db.save_extended_rdb_chunk(buf);
-            db.save_other_dbs_rdb_chunk(&clock, buf)?;
-            return Ok(true);
-        }
-        let segments = t0.segment_count();
-        let mut first = true;
-        while self.seg < segments
-            && (first || (clock.now.elapsed() < budget && buf.len() < flush_bytes))
-        {
-            first = false;
-            let pattern = t0.segment_pattern(self.seg);
-            if let Some((depth, bits)) = pattern {
-                if !self.written.covers(depth, bits) {
-                    db.save_rdb_segment_db0(self.seg, &clock, buf)?;
-                }
-                self.written.insert(depth, bits);
-            }
-            self.seg += 1;
-        }
-        if self.seg >= segments {
-            db.save_extended_rdb_chunk(buf);
-            db.save_other_dbs_rdb_chunk(&clock, buf)?;
-            return Ok(true);
-        }
-        Ok(false)
     }
 }
 
@@ -5096,7 +4951,7 @@ impl Drop for SyncImageHeld {
 /// with, since a master holds one per shard while a sync runs.
 const SYNC_IMAGE_BUF: usize = (1 << 20) + (256 << 10);
 
-/// An [`AofImage`]'s walk over one DB's table (see [`RdbSaveCursor`]).
+/// An [`AofImage`]'s walk over one DB's table.
 struct DbWalk {
     db_idx: usize,
     epoch: u64,
@@ -5425,6 +5280,8 @@ pub enum ImageOwner {
     AofRewrite,
     /// The full sync to the replica with this client id.
     FullSync(u64),
+    /// SAVE / BGSAVE (one at a time: `Router::is_saving`).
+    Save,
 }
 
 thread_local! {
@@ -5535,14 +5392,39 @@ pub fn sync_image_step(
     replica: u64,
     recycle: Option<Vec<u8>>,
 ) -> Result<(Vec<u8>, bool), String> {
-    let owner = ImageOwner::FullSync(replica);
+    image_step(db, ImageOwner::FullSync(replica), recycle)
+}
+
+/// Starts this shard's part of a point-in-time SAVE / BGSAVE (see
+/// [`AofImage::start_chunk`]): the keys as they are now, whatever is
+/// written while the save runs.
+pub fn start_save_image(db: &ShardDb) -> Result<(), TieredReadError> {
+    install_image(ImageOwner::Save, AofImage::start_chunk(db)?);
+    Ok(())
+}
+
+/// [`sync_image_step`] for the SAVE / BGSAVE image, publishing this shard's
+/// memory state with the change (see [`publish_after_image_change`]).
+pub fn save_image_step(router: &crate::router::Router) -> Result<(Vec<u8>, bool), String> {
+    let step = image_step(&router.local_db.borrow(), ImageOwner::Save, None);
+    publish_after_image_change(router);
+    step
+}
+
+/// Writes about [`RDB_SAVE_STEP`] more of `owner`'s image (see
+/// [`sync_image_step`]).
+fn image_step(
+    db: &ShardDb,
+    owner: ImageOwner,
+    recycle: Option<Vec<u8>>,
+) -> Result<(Vec<u8>, bool), String> {
     let step = with_image(owner, |img| {
         if let Some(buf) = recycle {
             img.give_buffer(buf);
         }
         img.step(db, RDB_SAVE_STEP, SYNC_IMAGE_PIECE_BYTES)
     })
-    .ok_or_else(|| "the full-sync image is gone".to_string())?;
+    .ok_or_else(|| "the snapshot image is gone".to_string())?;
     let (piece, done) = match step {
         Ok(step) => step,
         Err(e) => {
@@ -6027,23 +5909,76 @@ mod tests {
         assert!(db.try_evict_one_key("allkeys-random", Some(&aof)).is_none());
     }
 
-    /// Segments split while a yielding save runs must not get their keys
-    /// written twice: Redis and Valkey refuse an RDB with a duplicate key.
+    /// A SAVE image holds every key as it was when the image started:
+    /// writes after that (through the write hook) leave it unchanged, keys
+    /// created later aren't in it, and it is removed once written.
     #[test]
-    fn yielding_save_writes_each_key_once_across_splits() {
+    fn save_image_holds_the_keys_as_of_its_start() {
+        let _g = SYNC_IMAGE_TEST_LOCK.lock();
+        let mut db = ShardDb::new(0);
+        for i in 0..3000 {
+            db.set(
+                Bytes::from(format!("k{i}")),
+                Bytes::from_static(b"old"),
+                None,
+            );
+        }
+        start_save_image(&db).unwrap();
+        assert!(aof_image_active());
+        // One segment written (kept buffered), the rest not yet.
+        let (first, done) = with_image(ImageOwner::Save, |img| {
+            img.step(&db, Duration::ZERO, usize::MAX)
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!done, "the table takes several steps");
+        let mut chunk = first.unwrap_or_default();
+        for i in 0..3000 {
+            let k = Bytes::from(format!("k{i}"));
+            before_write(&db, &k);
+            if i % 2 == 0 {
+                db.set(k, Bytes::from_static(b"new"), None);
+            } else {
+                db.del(&k);
+            }
+        }
+        before_write(&db, b"born");
+        db.set(Bytes::from_static(b"born"), Bytes::from_static(b"x"), None);
+        loop {
+            let (piece, done) = image_step(&db, ImageOwner::Save, None).unwrap();
+            chunk.extend(piece);
+            if done {
+                break;
+            }
+        }
+        assert!(!aof_image_active(), "the image is removed when done");
+        let mut restored = ShardDb::new(0);
+        restored.restore_rdb_chunk(&chunk).unwrap();
+        assert_eq!(restored.dbsize(), 3000);
+        for i in 0..3000 {
+            assert_eq!(
+                restored.get(format!("k{i}").as_bytes()).as_deref(),
+                Some(&b"old"[..]),
+                "k{i}"
+            );
+        }
+        assert!(restored.get(b"born").is_none());
+    }
+
+    /// Segments split while a snapshot image is written must not get their
+    /// keys written twice: Redis and Valkey refuse an RDB with a duplicate
+    /// key.
+    #[test]
+    fn image_writes_each_key_once_across_splits() {
         let mut db = ShardDb::new(0);
         for i in 0..6000 {
             db.table
                 .set(Bytes::from(format!("k{i}")), Bytes::from_static(b"v"), None);
         }
-        let mut cursor = RdbSaveCursor::new(&db);
-        let mut buf = Vec::new();
+        let mut image = AofImage::start_chunk(&db).unwrap();
         let mut next = 6000;
         let mut steps = 0;
-        while !cursor
-            .step(&db, &mut buf, Duration::ZERO, usize::MAX)
-            .unwrap()
-        {
+        while !image.step(&db, Duration::ZERO, usize::MAX).unwrap().1 {
             steps += 1;
             // Splits while the walk is under way, then let it finish.
             let grow = if steps <= 6 { 1500 } else { 0 };
@@ -6057,6 +5992,7 @@ mod tests {
             }
         }
         assert!(steps > 2, "the table has several segments");
+        let buf = image.finish().unwrap();
         let keys = chunk_keys(&buf);
         let unique: std::collections::HashSet<&Bytes> = keys.iter().collect();
         assert_eq!(unique.len(), keys.len(), "a key was written twice");
@@ -6415,12 +6351,17 @@ mod tests {
             assert_eq!(err.key, Bytes::from_static(b"lost"));
             assert!(err.to_string().contains("'lost'"), "{err}");
 
-            // The streaming SAVE/BGSAVE path fails the same way.
-            let cell = std::cell::RefCell::new(db);
-            let (tx, rx) = flume::unbounded();
-            let err = save_rdb_chunk_yielding(&cell, &tx).await.unwrap_err();
-            assert_eq!(err.key, Bytes::from_static(b"lost"));
-            drop(rx);
+            // The SAVE/BGSAVE image fails the same way, and goes away.
+            start_save_image(&db).unwrap();
+            let err = loop {
+                match image_step(&db, ImageOwner::Save, None) {
+                    Ok((_, true)) => panic!("saved without the unreadable key"),
+                    Ok(_) => {}
+                    Err(e) => break e,
+                }
+            };
+            assert!(err.contains("'lost'"), "{err}");
+            assert!(take_image(ImageOwner::Save).is_none());
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

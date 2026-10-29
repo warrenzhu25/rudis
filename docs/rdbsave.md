@@ -1,7 +1,7 @@
 # RDB Snapshotting
 
 This document describes how Rudis persists a snapshot of the keyspace to an RDB-format file
-(per key, not one point in time: see "No true isolation" below): what triggers a save, how the data is serialized, how the operation interacts
+(one point in time across shards, without `fork()`): what triggers a save, how the data is serialized, how the operation interacts
 with the thread-per-core shard model, the on-disk file format, and the configuration and commands
 that control it.
 
@@ -24,26 +24,28 @@ familiar with real Redis might expect, that is called out explicitly.
   serialized pieces, computes the CRC64, then `sync_all`s, renames and fsyncs the directory,
   using ordinary blocking `std::fs`/`std::io::Write`. No shard thread does file I/O or the CRC
   for a save. (The AOF uses `monoio`'s async `write_all_at`/`sync_data` instead.)
-- **No true isolation from concurrent writes.** There is no fork and no MVCC, so a save is a
-  scan of each shard's live table while that shard keeps serving clients. Each key is written as
-  it is when the scan reaches it: the snapshot is consistent per key, not a single point in time
-  (closer to a fuzzy dump). So a write spanning keys (`MULTI`/`EXEC`, `MSET`, `LMOVE`,
-  `RENAME`) that runs during a save can be in the file for some of its keys and not others, a
-  state that never existed; Redis's forked child can't write that. With AOF on, a restart replays
-  the AOF, which is exact; to take an exact RDB without AOF, pause writes around it
-  (`CLIENT PAUSE <ms> WRITE`, then `SAVE`). Replicas aren't affected: a full sync builds
-  point-in-time per-shard images (the stream after them repeats every later write) and holds
-  cross-shard writes back while it starts them.
-- **Shards stream one after another.** The coordinating shard asks each shard in turn
-  (`ShardMessage::StreamRdbChunk`) to serialize its keyspace and send it to the writer in
-  ~4 MB pieces through a rendezvous channel, so the file layout is one shard after another and
-  memory stays at a few pieces rather than a whole shard.
-- **Serialization yields every ~1 ms.** `save_rdb_chunk_yielding` (`src/shard.rs`) serializes
+- **One point in time, without fork.** There is no fork and no MVCC; a save is a scan of each
+  shard's live table while that shard keeps serving clients, but against a copy-on-write image
+  (`AofImage`, `src/shard.rs`, the same one AOF rewrites and replica full syncs use). The
+  coordinating shard holds cross-shard writes back (`Router::pause_cross_shard_writes`), has
+  every shard start its image (`ShardMessage::StartSaveImage`), then lets them go: from then on,
+  every write path calls `shard::before_write` (or `connection::images_before_command`) first,
+  which writes the key's current state into the image if the scan hasn't reached it yet and
+  makes the scan skip it. A write spanning keys (`MULTI`/`EXEC`, `MSET`, `LMOVE`, `RENAME`) is in
+  the file whole or not at all, as with Redis's forked child. Gaps: keys evicted or deleted on
+  expiry during the save may be missing; `SWAPDB` during a save fails it. On a replica the images
+  start between batches of the master's stream; the replication history goes in the file only if
+  it didn't move while they started.
+- **Shards stream one after another.** The coordinating shard asks each shard in turn for the
+  next ~1 MB piece of its image (`ShardMessage::SaveImageStep`) and sends it to the writer
+  through a rendezvous channel, so the file layout is one shard after another and memory stays
+  at a few pieces (plus the pre-images of keys written meanwhile) rather than a whole shard.
+- **Serialization yields every ~1 ms.** Each image step (`AofImage::step`, `src/shard.rs`) serializes
   a few table segments at a time and yields to the shard's other tasks between steps, so a
   `BGSAVE` adds latency in ~1 ms slices instead of stalling a shard for its whole dataset. A
-  key moved by a segment split mid-save can be written twice; loading keeps the later copy.
-  Replica full syncs still serialize each shard in one non-yielding pass
-  (`ShardDb::save_rdb_chunk`), because the replication stream is cut right after serializing.
+  key moved by a segment split mid-save is written once (the image remembers which segment
+  patterns it wrote). Streamed replica full syncs use the same images; only replicas that can't
+  take `$EOF:` transfers get each shard serialized in one pass (`ShardDb::save_rdb_chunk`).
 - **NVMe-tiered keys are saved with their real value and type.** A `RudisValue::Tiered` entry
   is read back from the tier file (CRC- and type-checked) and its payload is written verbatim,
   before anything else for that key. If a tiered key is unreadable (I/O error or CRC mismatch),
@@ -98,10 +100,10 @@ is already in flight is rejected with an error rather than queued.
    attempts — blocked in practice by `is_saving` — would not collide).
 2. The 9-byte header `b"REDIS0011"` followed by a `SELECTDB` opcode pair (`0xFE, 0x00`) is
    written, and a running CRC64 accumulator is seeded from those bytes.
-3. The writer side runs on an `rdb-writer` thread; the coordinating shard asks each shard, in
-   shard-index order, to stream its keyspace (`ShardMessage::StreamRdbChunk`). Each shard runs
-   `save_rdb_chunk_yielding`: it serializes ~1 ms worth of table segments at a time (yielding to
-   its clients in between) and sends ~4 MB pieces to the writer through a rendezvous channel.
+3. The writer side runs on an `rdb-writer` thread. Every shard starts its point-in-time image
+   at one moment (see §1); then the coordinating shard asks each shard, in shard-index order,
+   for its image a step at a time (`ShardMessage::SaveImageStep`: ~1 ms of table segments, up
+   to ~1 MB) and passes the pieces to the writer through a rendezvous channel.
 4. The writer folds every piece into the CRC64 and writes it with a buffered writer.
 5. A single `0xFF` EOF opcode and the final 8-byte little-endian CRC64 are appended.
 6. `file.sync_all()` fsyncs the temp file's data and metadata.

@@ -183,6 +183,28 @@ pub struct MsetInFlight {
 
 const WRONGTYPE_ERR: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 /// Producer-side error when the RDB writer thread hung up; its own error wins.
+/// Removes a SAVE's images from every shard when the save ends early (an
+/// image left installed would keep taking pre-images of every write).
+struct SaveImagesGuard<'a> {
+    router: &'a Router,
+    armed: bool,
+}
+
+impl Drop for SaveImagesGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        crate::shard::take_image(crate::shard::ImageOwner::Save);
+        crate::shard::publish_after_image_change(self.router);
+        for (sid, sender) in self.router.senders.iter().enumerate() {
+            if sid != self.router.shard_id {
+                let _ = sender.send(ShardMessage::DropSaveImage);
+            }
+        }
+    }
+}
+
 const WRITER_GONE: &str = "rdb writer gone";
 
 /// Upper bound on keys one `check_auto_tier` call tries to spill; it can run
@@ -2567,6 +2589,7 @@ impl Router {
                 {
                     let mut db = self.local_db.borrow_mut();
                     for (k, v) in local_batch {
+                        crate::shard::before_write(&db, &k);
                         db.set(k, v, None);
                     }
                 }
@@ -2599,6 +2622,7 @@ impl Router {
             {
                 let mut db = self.local_db.borrow_mut();
                 for (k, v) in local_batch {
+                    crate::shard::before_write(&db, &k);
                     db.set(k, v, None);
                 }
             }
@@ -2782,6 +2806,7 @@ impl Router {
     /// (keyspace events, AOF/replication).
     pub fn del_local(&self, key: Bytes) -> bool {
         let mut db = self.local_db.borrow_mut();
+        crate::shard::before_write(&db, &key);
         let deleted = db.del(&key);
         if deleted {
             db.delete_document_local(&String::from_utf8_lossy(&key));
@@ -5577,15 +5602,9 @@ impl Router {
             })
             .map_err(|e| e.to_string())?;
 
-        // The replication history goes in only if the dataset matches it:
-        // the history did not move while the shards were serialized (on a
-        // replica, no batch of the master's stream was applied meanwhile).
-        let history_before = self.repl_history_for_save().await;
         let mut produced = self.produce_rdb_chunks(&chunk_tx).await;
-        if produced.is_ok()
-            && let Some((replid, offset, stream_db)) = history_before
-            && self.repl_history_for_save().await == Some((replid.clone(), offset, stream_db))
-        {
+        if let Ok(Some((replid, offset, stream_db))) = &produced {
+            let (replid, offset, stream_db) = (replid.clone(), *offset, *stream_db);
             let mut aux = Vec::new();
             crate::redis_rdb::write_repl_aux(&mut aux, &replid, offset, stream_db);
             if chunk_tx.send_async(Some(aux)).await.is_err() {
@@ -5610,24 +5629,18 @@ impl Router {
         }
     }
 
-    /// Stream every shard's keyspace, one shard after another, into `chunk_tx`.
-    /// The replication history an RDB saved now would carry (see
-    /// `ReplicationHub::saved_history`), read between batches of a
-    /// replica's master stream.
-    async fn repl_history_for_save(&self) -> Option<(String, u64, usize)> {
-        let hub = crate::replication::get_replication_hub(self.base_port);
-        let _apply = if hub.is_slave() {
-            Some(hub.lock_apply().await)
-        } else {
-            None
-        };
-        hub.saved_history()
-    }
-
+    /// Streams every shard's keyspace, one shard after another, into
+    /// `chunk_tx`, as it was at one point in time: every shard starts a
+    /// copy-on-write image (see [`crate::shard::AofImage`]) with cross-shard
+    /// writes held back, so a write spanning shards is in the file whole or
+    /// not at all, as with Redis's forked child. Returns the replication
+    /// history the file may carry (see `ReplicationHub::saved_history`):
+    /// only if it matches the images, i.e. it did not move while they
+    /// started (on a replica, no batch of the master's stream applies then).
     async fn produce_rdb_chunks(
         &self,
         chunk_tx: &flume::Sender<Option<Vec<u8>>>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<(String, u64, usize)>, String> {
         let stats_by_db = self.keyspace_stats_by_db().await;
         if !stats_by_db.is_empty() {
             let mut resize_buf = Vec::new();
@@ -5650,49 +5663,101 @@ impl Router {
                 return Err(WRITER_GONE.to_string());
             }
         }
-        match crate::shard::save_rdb_chunk_yielding(&self.local_db, chunk_tx).await {
-            Ok(true) => {}
-            Ok(false) => {
-                if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
-                    return Err("save aborted by FLUSHALL".to_string());
-                }
-                return Err(WRITER_GONE.to_string());
-            }
-            Err(e) => return Err(format!("shard {}: {}", self.shard_id, e)),
-        }
-
+        let history = self.start_save_images().await?;
+        let mut guard = SaveImagesGuard {
+            router: self,
+            armed: true,
+        };
         // Shards stream in turn (each finishes before the next starts), so
         // pieces from different shards never interleave.
-        for (sid, sender) in self.senders.iter().enumerate() {
-            if sid != self.shard_id {
+        for sid in 0..self.num_shards {
+            loop {
                 if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
                     return Err("save aborted by FLUSHALL".to_string());
                 }
-                let (done_tx, done_rx) = flume::bounded(1);
-                // A missing shard would silently drop its keys from the dump.
-                sender
-                    .send(ShardMessage::StreamRdbChunk {
-                        sink: chunk_tx.clone(),
-                        done: done_tx,
-                    })
-                    .map_err(|_| format!("shard {} is not reachable", sid))?;
-                match done_rx.recv_async().await {
-                    Ok(Ok(true)) => {}
-                    Ok(Ok(false)) => {
-                        if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
-                            return Err("save aborted by FLUSHALL".to_string());
-                        }
-                        return Err(WRITER_GONE.to_string());
-                    }
-                    Ok(Err(e)) => return Err(format!("shard {}: {}", sid, e)),
-                    Err(_) => return Err(format!("shard {} did not return its data", sid)),
+                let step = if sid == self.shard_id {
+                    let step = crate::shard::save_image_step(self);
+                    crate::mailbox::yield_now().await;
+                    step
+                } else {
+                    let (tx, rx) = flume::bounded(1);
+                    self.senders[sid]
+                        .send(ShardMessage::SaveImageStep { responder: tx })
+                        .map_err(|_| format!("shard {sid} is not reachable"))?;
+                    rx.recv_async()
+                        .await
+                        .unwrap_or_else(|_| Err(format!("shard {sid} did not return its data")))
+                };
+                let (piece, done) = step.map_err(|e| format!("shard {sid}: {e}"))?;
+                if !piece.is_empty() && chunk_tx.send_async(Some(piece)).await.is_err() {
+                    return Err(WRITER_GONE.to_string());
+                }
+                if done {
+                    break;
                 }
             }
         }
+        // Every shard removed its image with its last piece.
+        guard.armed = false;
         if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
             return Err("save aborted by FLUSHALL".to_string());
         }
-        Ok(())
+        Ok(history)
+    }
+
+    /// Starts every shard's SAVE image at one point (see
+    /// [`Self::produce_rdb_chunks`]); returns the replication history that
+    /// matches them, if any. On an error no image is left installed.
+    async fn start_save_images(&self) -> Result<Option<(String, u64, usize)>, String> {
+        let hub = crate::replication::get_replication_hub(self.base_port);
+        let apply = if hub.is_slave() {
+            Some(hub.lock_apply().await)
+        } else {
+            None
+        };
+        let history_before = hub.saved_history();
+        let paused = self.pause_cross_shard_writes().await;
+        let mut guard = SaveImagesGuard {
+            router: self,
+            armed: true,
+        };
+        let mut first_err = crate::shard::start_save_image(&self.local_db.borrow())
+            .err()
+            .map(|e| format!("shard {}: {}", self.shard_id, e));
+        let mut responders = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid == self.shard_id {
+                continue;
+            }
+            let (tx, rx) = flume::bounded(1);
+            if sender
+                .send(ShardMessage::StartSaveImage { responder: tx })
+                .is_ok()
+            {
+                responders.push((sid, rx));
+            } else {
+                first_err.get_or_insert(format!("shard {sid} is not reachable"));
+            }
+        }
+        for (sid, rx) in responders {
+            match rx.recv_async().await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(format!("shard {sid}: {e}"));
+                }
+                Err(_) => {
+                    first_err.get_or_insert(format!("shard {sid} did not start its image"));
+                }
+            }
+        }
+        drop(paused);
+        let history_after = hub.saved_history();
+        drop(apply);
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        guard.armed = false;
+        Ok(history_before.filter(|h| Some(h) == history_after.as_ref()))
     }
 
     /// Body of the `rdb-writer` thread: header, chunks, EOF + CRC64, fsync,

@@ -667,6 +667,7 @@ pub fn run_shard_worker(
                     ShardMessage::FastSet { descriptor } => {
                         crate::connection::CURRENT_DB.set(descriptor.db);
                         cross_shard_db.borrow_mut().select_db(descriptor.db);
+                        crate::shard::before_write(&cross_shard_db.borrow(), &descriptor.key);
                         crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Set {
                                     key: descriptor.key.clone(),
                                     value: descriptor.value.clone(),
@@ -691,6 +692,7 @@ pub fn run_shard_worker(
                         crate::connection::CURRENT_DB.set(db);
                         let mut sdb = cross_shard_db.borrow_mut();
                         sdb.select_db(db);
+                        crate::shard::before_write(&sdb, &key);
                         let deleted = sdb.del(&key);
                         if deleted {
                             sdb.delete_document_local(&String::from_utf8_lossy(&key));
@@ -715,6 +717,7 @@ pub fn run_shard_worker(
                             let mut sdb = cross_shard_db.borrow_mut();
                             sdb.select_db(db);
                             for k in keys {
+                                crate::shard::before_write(&sdb, &k);
                                 if sdb.del(&k) {
                                     count += 1;
                                     sdb.delete_document_local(&String::from_utf8_lossy(&k));
@@ -771,6 +774,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         crate::connection::CURRENT_DB.set(db);
                         let mut sdb = cross_shard_db.borrow_mut();
                         sdb.select_db(db);
+                        crate::shard::before_write(&sdb, &key);
                         let res = sdb.expire(&key, duration, opts);
                         drop(sdb);
                         if res {
@@ -792,6 +796,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         crate::connection::CURRENT_DB.set(db);
                         let mut sdb = cross_shard_db.borrow_mut();
                         sdb.select_db(db);
+                        crate::shard::before_write(&sdb, &key);
                         let res = sdb.persist(&key);
                         drop(sdb);
                         if res {
@@ -926,6 +931,12 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                 'item: {
                                     temp_buf.clear();
                                     db.hydrate_cmd_keys(cmd);
+                                    // The fast paths below write straight to the table:
+                                    // a snapshot image being built takes the keys'
+                                    // current state first.
+                                    if crate::shard::aof_image_active() {
+                                        crate::connection::images_before_command(&db, cmd);
+                                    }
                                     if !has_tracking && let Command::Get(ref key) = *cmd {
                                         match db.table.get_compact_with_hash(key.as_ref(), key_hash) {
                                             Ok(Some(resp)) => {
@@ -1577,6 +1588,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         {
                             let mut db = cross_shard_db.borrow_mut();
                             db.select_db(mset_db);
+                            for (k, _) in &pairs {
+                                crate::shard::before_write(&db, k);
+                            }
                             if cross_shard_aof.is_some() {
                                 for (k, v) in &pairs {
                                     db.set(k.clone(), v.clone(), None);
@@ -1669,6 +1683,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Mset(pairs.clone()));
                         {
                             let mut db = cross_shard_db.borrow_mut();
+                            for (k, _) in &pairs {
+                                crate::shard::before_write(&db, k);
+                            }
                             for (k, v) in pairs.drain(..) {
                                 db.set(k, v, None);
                             }
@@ -1787,12 +1804,15 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         crate::shard::take_image(crate::shard::ImageOwner::FullSync(replica));
                         crate::shard::publish_after_image_change(&cross_shard_router);
                     }
-                    ShardMessage::StreamRdbChunk { sink, done } => {
-                        let db = cross_shard_db.clone();
-                        monoio::spawn(async move {
-                            let res = crate::shard::save_rdb_chunk_yielding(&db, &sink).await;
-                            let _ = done.send(res);
-                        });
+                    ShardMessage::StartSaveImage { responder } => {
+                        let _ = responder.send(crate::shard::start_save_image(&cross_shard_db.borrow()));
+                    }
+                    ShardMessage::SaveImageStep { responder } => {
+                        let _ = responder.send(crate::shard::save_image_step(&cross_shard_router));
+                    }
+                    ShardMessage::DropSaveImage => {
+                        crate::shard::take_image(crate::shard::ImageOwner::Save);
+                        crate::shard::publish_after_image_change(&cross_shard_router);
                     }
                     ShardMessage::Publish {
                         channel,
@@ -2229,6 +2249,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         crate::connection::CURRENT_DB.set(db);
                         let mut sdb = cross_shard_db.borrow_mut();
                         sdb.select_db(db);
+                        crate::shard::before_write(&sdb, &key);
                         let should_del = match condition {
                             None => true,
                             Some(cond) => {

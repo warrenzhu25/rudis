@@ -75,12 +75,13 @@ This document summarizes the architectural, operational, and semantic difference
 ### Replication Backlog Without Replicas
 * As in Redis, a master keeps its backlog for `repl-backlog-ttl` seconds after its last replica leaves, then releases it (new replication id; later replicas full-sync). Every rudis shard appends each write to that one backlog (~2.5x SET throughput on 8 threads), so it is released as soon as it is unused for that long, and after a restart from an RDB a master keeps it only for 60 seconds (at most `repl-backlog-ttl`) unless a replica comes back: Redis keeps it for `repl-backlog-ttl` there too. Replicas returning within the window still continue with a partial resync. `INFO replication`'s `repl_backlog_active` shows the state.
 
-### Snapshots Are Per Key, Not One Moment
-* `SAVE`/`BGSAVE` don't fork: each shard's keys are written as they are when the scan reaches them
-  while clients keep writing. A write spanning keys that runs during a save can be half in the
-  RDB file. Redis's fork gives one moment. An AOF restart is exact; for an exact RDB without AOF,
-  `CLIENT PAUSE <ms> WRITE` around a `SAVE`. Full syncs to replicas are exact (see
-  [`rdbsave.md`](rdbsave.md)).
+### Snapshots Without fork()
+* `SAVE`/`BGSAVE` don't fork, but write one point in time like Redis's forked child: every shard
+  starts a copy-on-write image with cross-shard writes held back for that moment, and a key
+  written while the save runs is copied as it was first. A transaction or MSET spanning shards is
+  in the file whole or not at all. Keys evicted, or deleted on expiry, while the save runs may be
+  missing from the file (Redis's child still has them); a `SWAPDB` during a save fails it (the
+  next scheduled save retries).
 
 ### Turning AOF On at Runtime
 * `CONFIG SET appendonly yes` works as in Redis (writes logged at once, initial AOF written by a background rewrite, `SHUTDOWN` refused until it is done). Until then the writes go to `appendonly-<shard>.aof.incr` and no `appendonly-<shard>.aof` exists, so a crash in between never leaves an AOF without the dataset. Redis 7 tracks this in its multi-part AOF manifest, which rudis doesn't have.
