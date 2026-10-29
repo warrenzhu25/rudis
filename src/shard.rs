@@ -2326,7 +2326,7 @@ impl ShardDb {
         if db1 == db2 {
             return;
         }
-        poison_aof_image("SWAPDB ran during the rewrite");
+        images_swap_dbs(db1, db2);
         let saved = self.current_db;
         self.select_db(0);
         let max_idx = db1.max(db2);
@@ -4953,7 +4953,11 @@ const SYNC_IMAGE_BUF: usize = (1 << 20) + (256 << 10);
 
 /// An [`AofImage`]'s walk over one DB's table.
 struct DbWalk {
+    /// The database its keys were in when the image started (what the
+    /// image writes them under).
     db_idx: usize,
+    /// Where that table is now: SWAPDB moves it (see [`images_swap_dbs`]).
+    src: usize,
     epoch: u64,
     seg: usize,
     written: WrittenPatterns,
@@ -4995,6 +4999,7 @@ impl AofImage {
             if !table.is_empty() {
                 walks.push(DbWalk {
                     db_idx,
+                    src: db_idx,
                     epoch: table.layout_epoch(),
                     seg: 0,
                     written: WrittenPatterns::default(),
@@ -5130,7 +5135,7 @@ impl AofImage {
     ) -> Result<(), TieredReadError> {
         let w = &self.walks[self.cur];
         let db_idx = w.db_idx;
-        let Some(table) = db.table_for_db(db_idx) else {
+        let Some(table) = db.table_for_db(w.src) else {
             self.walks[self.cur].done = true;
             self.cur += 1;
             return Ok(());
@@ -5227,7 +5232,7 @@ impl AofImage {
         if self.poisoned.is_some() {
             return;
         }
-        let Some(wi) = self.walks.iter().position(|w| w.db_idx == db_idx) else {
+        let Some(wi) = self.walks.iter().position(|w| w.src == db_idx) else {
             // The DB was empty at the start: its keys are all newer.
             return;
         };
@@ -5241,7 +5246,7 @@ impl AofImage {
             return;
         }
         if let Some(entry) = table.peek_entry(key) {
-            self.select(db_idx);
+            self.select(self.walks[wi].db_idx);
             if let Err(e) = save(entry, &mut self.buf) {
                 self.poisoned = Some(e.to_string());
                 return;
@@ -5352,6 +5357,23 @@ pub fn with_aof_image<R>(f: impl FnOnce(&mut AofImage) -> R) -> Option<R> {
 #[inline(always)]
 pub fn aof_image_active() -> bool {
     IMAGES_ACTIVE.get()
+}
+
+/// SWAPDB `db1` `db2` on this shard: every image being built keeps writing
+/// each table's keys under the database it was in when the image started,
+/// reading them from where it is now.
+pub fn images_swap_dbs(db1: usize, db2: usize) {
+    if aof_image_active() {
+        for_each_image(|img| {
+            for w in &mut img.walks {
+                if w.src == db1 {
+                    w.src = db2;
+                } else if w.src == db2 {
+                    w.src = db1;
+                }
+            }
+        });
+    }
 }
 
 /// Makes every image being built unusable: its rewrite or full sync falls
@@ -5963,6 +5985,71 @@ mod tests {
             );
         }
         assert!(restored.get(b"born").is_none());
+    }
+
+    /// A SWAPDB while an image is written leaves it as of its start: each
+    /// table's keys under the database they were in then, with the values
+    /// they had then, whatever is written to them after the swap.
+    #[test]
+    fn save_image_follows_swapdb() {
+        let _g = SYNC_IMAGE_TEST_LOCK.lock();
+        let mut db = ShardDb::new(0);
+        for i in 0..2000 {
+            db.set(
+                Bytes::from(format!("a{i}")),
+                Bytes::from_static(b"old"),
+                None,
+            );
+        }
+        db.select_db(1);
+        for i in 0..2000 {
+            db.set(
+                Bytes::from(format!("b{i}")),
+                Bytes::from_static(b"old"),
+                None,
+            );
+        }
+        db.select_db(0);
+        start_save_image(&db).unwrap();
+        let (first, _) = with_image(ImageOwner::Save, |img| {
+            img.step(&db, Duration::ZERO, usize::MAX)
+        })
+        .unwrap()
+        .unwrap();
+        let mut chunk = first.unwrap_or_default();
+        db.swap_dbs(0, 1);
+        // DB 0 now holds the b keys, DB 1 the a keys: overwrite them all.
+        for (idx, prefix) in [(0usize, "b"), (1, "a")] {
+            db.select_db(idx);
+            crate::connection::CURRENT_DB.set(idx);
+            for i in 0..2000 {
+                let k = Bytes::from(format!("{prefix}{i}"));
+                before_write(&db, &k);
+                db.set(k, Bytes::from_static(b"new"), None);
+            }
+        }
+        db.select_db(0);
+        crate::connection::CURRENT_DB.set(0);
+        loop {
+            let (piece, done) = image_step(&db, ImageOwner::Save, None).unwrap();
+            chunk.extend(piece);
+            if done {
+                break;
+            }
+        }
+        let mut restored = ShardDb::new(0);
+        restored.restore_rdb_chunk(&chunk).unwrap();
+        for (idx, prefix) in [(0usize, "a"), (1, "b")] {
+            restored.select_db(idx);
+            assert_eq!(restored.dbsize(), 2000, "db {idx}");
+            for i in 0..2000 {
+                assert_eq!(
+                    restored.get(format!("{prefix}{i}").as_bytes()).as_deref(),
+                    Some(&b"old"[..]),
+                    "db {idx} {prefix}{i}"
+                );
+            }
+        }
     }
 
     /// Keys evicted while a SAVE image is written are in it, as in the

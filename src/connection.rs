@@ -11277,7 +11277,7 @@ fn aof_image_before_command(db: &ShardDb, cmd: &Command, local: impl Fn(&[u8]) -
         return;
     }
     if matches!(cmd, Command::Swapdb { .. }) {
-        crate::shard::poison_aof_image("SWAPDB ran during the rewrite");
+        // Each shard's images follow the swap (`shard::images_swap_dbs`).
         return;
     }
     for_each_cmd_key(cmd, |k| {

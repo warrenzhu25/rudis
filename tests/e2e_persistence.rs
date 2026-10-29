@@ -4946,3 +4946,69 @@ fn test_bgsave_keeps_keys_evicted_while_it_runs_e2e() {
     assert_eq!(resp_cmd_all(&mut c, &["EXISTS", "new:0"]), ":0\r\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A SWAPDB while a BGSAVE runs no longer fails the save: the file holds
+/// the databases as they were when it started.
+#[test]
+fn test_bgsave_survives_swapdb_while_it_runs_e2e() {
+    let port = 29997u16;
+    let dir = std::env::temp_dir().join(format!("rudis-pitswap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let ps = port.to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--save",
+        "",
+    ];
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s
+    };
+    let server = Kill(spawn_rudis_listening(&args, port));
+    let mut c = connect();
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DEBUG", "POPULATE", "300000"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd_all(&mut c, &["SELECT", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["SET", "one", "1"]), "+OK\r\n");
+    assert!(resp_cmd_all(&mut c, &["BGSAVE"]).starts_with("+Background saving started"));
+    // The save starts its images in the background (within a few ms).
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(resp_cmd_all(&mut c, &["SWAPDB", "0", "1"]), "+OK\r\n");
+    assert_eq!(
+        info_field_u64(&mut c, "persistence", "rdb_bgsave_in_progress"),
+        1,
+        "the save ended before the swap: the test proves nothing"
+    );
+    while info_field_u64(&mut c, "persistence", "rdb_bgsave_in_progress") != 0 {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "ok");
+    drop(server);
+
+    let _server = Kill(spawn_rudis_listening(&args, port));
+    let mut c = connect();
+    assert_eq!(resp_cmd_all(&mut c, &["DBSIZE"]), ":300000\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["EXISTS", "one"]), ":0\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["SELECT", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["DBSIZE"]), ":1\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["GET", "one"]), "$1\r\n1\r\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}

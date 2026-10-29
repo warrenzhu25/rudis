@@ -35,7 +35,8 @@ familiar with real Redis might expect, that is called out explicitly.
   the file whole or not at all, as with Redis's forked child. Eviction takes the same hook, so
   keys evicted during the save are in the file. A key deleted on expiry during the save isn't, which
   ends up the same as with Redis: loading drops expired keys, and with a replication history the
-  DEL is in the stream after the save's offset. Gap: `SWAPDB` during a save fails it. On a replica the images
+  DEL is in the stream after the save's offset. A `SWAPDB` during the save leaves each table's keys
+  under the database they were in when it started (`shard::images_swap_dbs`). On a replica the images
   start between batches of the master's stream; the replication history goes in the file only if
   it didn't move while they started.
 - **Shards stream one after another.** The coordinating shard asks each shard in turn for the
