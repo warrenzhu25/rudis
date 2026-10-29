@@ -98,7 +98,7 @@ struct StartupLoad {
     shards_done: usize,
     loaded: u64,
     /// Keys the RDB load dropped as already expired.
-    expired: Vec<Vec<u8>>,
+    expired: Vec<(usize, Vec<u8>)>,
 }
 
 /// `rdb_last_load_keys_expired` of INFO persistence, by base port.
@@ -131,7 +131,7 @@ fn note_startup_load(
     aof: bool,
     started: std::time::Instant,
     loaded: u64,
-    expired: Vec<Vec<u8>>,
+    expired: Vec<(usize, Vec<u8>)>,
 ) {
     let mut loads = STARTUP_LOADS.lock();
     let entry = loads.entry((base_port, aof)).or_insert(StartupLoad {

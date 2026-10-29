@@ -37134,3 +37134,78 @@ fn test_dual_channel_full_sync_under_writes_e2e() {
         resp_cmd_all(&mut m, &["DEBUG", "DIGEST"])
     );
 }
+
+/// A master restarted from its RDB drops the keys that expired meanwhile
+/// and tells the replicas resuming from it, in each key's database: the
+/// DELs went to whatever database the stream had selected, so a replica
+/// kept the expired keys of every other one (Redis's
+/// psync2-master-restart "with expire").
+#[test]
+fn test_expired_on_load_deletes_reach_replicas_in_their_db_e2e() {
+    let (mp, rp) = (29981u16, 29982u16);
+    let dir = std::env::temp_dir().join(format!("rudis-expload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let (ms, rs) = (mp.to_string(), rp.to_string());
+    let margs = ["--port", &ms, "--threads", "2", "--no-pin", "--dir", &ds];
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut master = Kill(spawn_rudis_listening(&margs, mp));
+    let _replica = Kill(spawn_rudis_listening(
+        &["--port", &rs, "--threads", "2", "--no-pin", "--save", ""],
+        rp,
+    ));
+    let connect = |port: u16| {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let mut r = connect(rp);
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut r);
+    let mut m = connect(mp);
+    assert_eq!(
+        resp_cmd_all(&mut m, &["DEBUG", "SET-ACTIVE-EXPIRE", "0"]),
+        "+OK\r\n"
+    );
+    for db in ["0", "5"] {
+        assert_eq!(resp_cmd_all(&mut m, &["SELECT", db]), "+OK\r\n");
+        for i in 0..10 {
+            let k = format!("e{i}");
+            assert_eq!(
+                resp_cmd_all(&mut m, &["SET", &k, "v", "PX", "100"]),
+                "+OK\r\n"
+            );
+        }
+    }
+    assert_eq!(resp_cmd_all(&mut m, &["WAIT", "1", "5000"]), ":1\r\n");
+    // Saved with the keys, which expire while the master is down.
+    let _ = m.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$4\r\nSAVE\r\n");
+    let _ = master.0.wait();
+    thread::sleep(Duration::from_millis(200));
+    master = Kill(spawn_rudis_listening(&margs, mp));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    for db in ["0", "5"] {
+        assert_eq!(resp_cmd_all(&mut r, &["SELECT", db]), "+OK\r\n");
+        while resp_cmd_all(&mut r, &["DBSIZE"]) != ":0\r\n" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the replica keeps the keys that expired in DB {db}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let stats = resp_cmd_all(&mut connect(mp), &["INFO", "stats"]);
+    assert!(stats.contains("sync_partial_ok:1"), "{stats}");
+    drop(master);
+    let _ = std::fs::remove_dir_all(&dir);
+}

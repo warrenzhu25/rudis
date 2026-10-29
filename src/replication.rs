@@ -1291,6 +1291,10 @@ impl ReplicationHub {
             }
             self.master_repl_offset.store(offset, Ordering::SeqCst);
             backlog.clear(offset);
+            // The replicas resuming from it have the database of the last
+            // SELECT before the save selected, not DB 0: the next write
+            // SELECTs its database whichever it is.
+            backlog.stream_db = usize::MAX;
         }
         // Like Redis, which creates the backlog at load time, so replicas
         // coming back continue with a partial resync even after writes
@@ -3699,7 +3703,7 @@ pub fn set_startup_replicaof(port: u16, value: &str) -> Result<(), String> {
 /// After a startup load: like Redis, a master that continues a saved
 /// replication history feeds a DEL for each key the load dropped as
 /// expired into its backlog, so replicas resuming from it drop them too.
-pub fn propagate_expired_on_load(port: u16, keys: &[Vec<u8>]) {
+pub fn propagate_expired_on_load(port: u16, keys: &[(usize, Vec<u8>)]) {
     if keys.is_empty() || has_startup_replicaof(port) {
         return;
     }
@@ -3707,12 +3711,16 @@ pub fn propagate_expired_on_load(port: u16, keys: &[Vec<u8>]) {
     if !hub.is_master() || hub.ids().replid2 == NULL_REPLID {
         return;
     }
-    for key in keys {
+    // Each DEL in its key's database (the stream SELECTs it).
+    let prev_db = crate::connection::CURRENT_DB.get();
+    for (db, key) in keys {
+        crate::connection::CURRENT_DB.set(*db);
         let mut cmd = format!("*2\r\n$3\r\nDEL\r\n${}\r\n", key.len()).into_bytes();
         cmd.extend_from_slice(key);
         cmd.extend_from_slice(b"\r\n");
         hub.propagate(&cmd);
     }
+    crate::connection::CURRENT_DB.set(prev_db);
 }
 
 /// Whether snapshots of the server on `port` keep keys that already
@@ -5991,6 +5999,27 @@ mod tests {
         let hub = ReplicationHub::new(19983);
         hub.restore_saved_history("short", 300, 0, true);
         assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 0);
+    }
+
+    /// A master restarted from its RDB SELECTs before its first write,
+    /// even to DB 0: the replicas resuming from it have the database of
+    /// the last SELECT before the save selected (the expired-on-load DELs
+    /// went to it). Each such DEL goes to its key's database.
+    #[test]
+    fn test_restored_master_selects_before_its_first_write() {
+        let saved = "5".repeat(40);
+        let hub = get_replication_hub(19970);
+        hub.restore_saved_history(&saved, 300, 5, false);
+        crate::connection::CURRENT_DB.set(0);
+        propagate_expired_on_load(19970, &[(0, b"a".to_vec()), (5, b"b".to_vec())]);
+        let (tx, _rx) = flume::unbounded();
+        let (_, diff, _) = hub.try_partial_resync(1, tx, &saved, 301).unwrap();
+        assert_eq!(
+            diff,
+            b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n*2\r\n$3\r\nDEL\r\n$1\r\na\r\n\
+              *2\r\n$6\r\nSELECT\r\n$1\r\n5\r\n*2\r\n$3\r\nDEL\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(crate::connection::CURRENT_DB.get(), 0, "restored");
     }
 
     /// A master restarted from its RDB keeps the backlog only for the

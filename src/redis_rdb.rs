@@ -1373,8 +1373,9 @@ fn note_repl_aux(key: &[u8], val: &[u8]) {
 }
 
 thread_local! {
-    /// While recording (a startup load), the keys dropped as expired.
-    static EXPIRED_ON_LOAD: std::cell::RefCell<Option<Vec<Vec<u8>>>> =
+    /// While recording (a startup load), the keys dropped as expired, with
+    /// their database.
+    static EXPIRED_ON_LOAD: std::cell::RefCell<Option<Vec<(usize, Vec<u8>)>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1385,14 +1386,14 @@ pub fn record_expired_on_load(on: bool) {
 }
 
 /// Stops recording and returns the keys recorded.
-pub fn take_expired_on_load() -> Vec<Vec<u8>> {
+pub fn take_expired_on_load() -> Vec<(usize, Vec<u8>)> {
     EXPIRED_ON_LOAD.with(|e| e.borrow_mut().take().unwrap_or_default())
 }
 
-fn note_expired_on_load(key: &[u8]) {
+fn note_expired_on_load(db: usize, key: &[u8]) {
     EXPIRED_ON_LOAD.with(|e| {
         if let Some(keys) = e.borrow_mut().as_mut() {
-            keys.push(key.to_vec());
+            keys.push((db, key.to_vec()));
         }
     });
 }
@@ -2182,7 +2183,7 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
                 let exp = expire_ms.take();
                 let expired = !ctx.keep_expired && exp.is_some_and(|ms| ms <= ctx.now_ms as i64);
                 if expired && ctx.owns(&key) {
-                    note_expired_on_load(&key);
+                    note_expired_on_load(dbid as usize, &key);
                 }
                 if !ctx.owns(&key) || (expired && !ctx.strict) {
                     skip_value(t, r)?;
