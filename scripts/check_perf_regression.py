@@ -12,7 +12,7 @@ Validates that:
    smoke benchmark verifying live throughput, p99 latency, and zero GET page-faults/op.
 6. With `--memtier`, starts `target/release/rudis` pinned like the throughput suite,
    measures SET/GET with memtier, and fails if either drops more than
-   `--max-drop-pct` below `benchmark_live_baseline.json` (machine-specific; updated only
+   `--max-drop-pct` below `docs/benchmarks/results/benchmark_live_baseline.json` (machine-specific; updated only
    with `--update-baseline`). Without `--live`/`--memtier`, checks 1-4 only re-read the
    stored counter file and say nothing about the current build.
 7. With `--memtier --baseline-rev REV` (or `--baseline-bin PATH`), measures this build
@@ -23,7 +23,7 @@ Validates that:
    sides alike, so this tracks real regressions far better than fixed numbers do. The
    baseline commit is built once in a temporary worktree and cached. If after the extra
    rounds either side's spread is still above 8% CV, or the baseline build runs below 75%
-   of `benchmark_live_baseline.json`, the host is too contended for a verdict: the gate
+   of `docs/benchmarks/results/benchmark_live_baseline.json`, the host is too contended for a verdict: the gate
    fails as INCONCLUSIVE (rerun later, or `--allow-noisy`). `--self-test` checks that
    classification on synthetic data.
 
@@ -43,7 +43,7 @@ import threading
 import time
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_FILE = os.path.join(REPO_DIR, "benchmark_perf_counters.json")
+DEFAULT_FILE = os.path.join(REPO_DIR, "docs", "benchmarks", "results", "benchmark_perf_counters.json")
 DEFAULT_BIN = os.path.join(REPO_DIR, "target", "release", "rudis")
 
 THROUGHPUT_FLOOR_OPS = 2_630_000.0
@@ -309,7 +309,7 @@ MEMTIER_WORKLOADS = {
     "GET": {"args": ["--ratio", "0:1", "-d", "1024", "--key-pattern", "R:R"], "populate": True},
 }
 MEMTIER_KEY_MAX = 64000
-DEFAULT_LIVE_BASELINE = os.path.join(REPO_DIR, "benchmark_live_baseline.json")
+DEFAULT_LIVE_BASELINE = os.path.join(REPO_DIR, "docs", "benchmarks", "results", "benchmark_live_baseline.json")
 # Launch-to-launch throughput spread on this host is 3-6% CV (see the RPUSH/SPOP A/B
 # in d12ae33); 12% keeps false failures rare while catching real regressions.
 DEFAULT_MAX_DROP_PCT = 12.0

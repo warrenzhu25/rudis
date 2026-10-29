@@ -290,9 +290,9 @@ def main():
 
         time.sleep(1.0)
 
-    with open("multi_command_results.json", "w") as f:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs/benchmarks/results", "multi_command_results.json"), "w") as f:
         json.dump(results, f, indent=2)
-    print("\nSaved raw results to multi_command_results.json")
+    print("\nSaved raw results to docs/benchmarks/results/multi_command_results.json")
 
 if __name__ == "__main__":
     main()

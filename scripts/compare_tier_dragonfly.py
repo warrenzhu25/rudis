@@ -182,9 +182,9 @@ def run_benchmark():
         "mix": rudis_mix,
     }
 
-    with open("tier_dragonfly_comparison.json", "w") as f:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs/benchmarks/results", "tier_dragonfly_comparison.json"), "w") as f:
         json.dump(results, f, indent=2)
-    print("\nBenchmark results saved to tier_dragonfly_comparison.json")
+    print("\nBenchmark results saved to docs/benchmarks/results/tier_dragonfly_comparison.json")
 
 if __name__ == "__main__":
     run_benchmark()

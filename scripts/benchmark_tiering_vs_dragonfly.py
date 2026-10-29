@@ -257,7 +257,7 @@ def main():
         print(f"{phase:<16} | {d_ops:>17,.0f} | {r_ops:>17,.0f} | {ratio:>5.2f}x ({pct:+.1f}%) | {r_p99:>6.2f} ms")
     print("=" * 95)
 
-    out_path = os.path.join(REPO_DIR, "tiered_benchmark_results.json")
+    out_path = os.path.join(REPO_DIR, "docs", "benchmarks", "results", "tiered_benchmark_results.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved full head-to-head results and telemetry to {out_path}")

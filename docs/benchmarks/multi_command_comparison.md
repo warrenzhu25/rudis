@@ -6,7 +6,7 @@ operations, at two server core counts (8 and 16 physical cores) with strict phys
 SMT sibling thread left idle).
 
 The authoritative benchmark harness is [`scripts/benchmark_common_commands_vs_dragonfly.py`](../../scripts/benchmark_common_commands_vs_dragonfly.py),
-and its raw output is persisted to [`benchmark_common_commands_results.json`](../../benchmark_common_commands_results.json)
+and its raw output is persisted to [`benchmark_common_commands_results.json`](results/benchmark_common_commands_results.json)
 at the repository root. All figures below are read directly from that file.
 
 ---

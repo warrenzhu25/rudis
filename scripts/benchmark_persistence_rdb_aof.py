@@ -392,9 +392,9 @@ def main():
     print("=" * 115)
 
     # Save to JSON
-    with open("benchmark_persistence_results.json", "w") as f:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs/benchmarks/results", "benchmark_persistence_results.json"), "w") as f:
         json.dump(results, f, indent=2)
-    print("\n[+] Full results written to benchmark_persistence_results.json")
+    print("\n[+] Full results written to docs/benchmarks/results/benchmark_persistence_results.json")
 
 
 if __name__ == "__main__":

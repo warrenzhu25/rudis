@@ -523,7 +523,7 @@ mod tests {
     fn test_perf_regression_gate_validates_throughput_and_latency_invariants() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let script = repo_root.join("scripts/check_perf_regression.py");
-        let default_json = repo_root.join("benchmark_perf_counters.json");
+        let default_json = repo_root.join("docs/benchmarks/results/benchmark_perf_counters.json");
 
         // 1. Committed baseline passes hardware counter, throughput, and latency gates.
         let ok_out = std::process::Command::new("python3")

@@ -112,8 +112,8 @@ Every commit to `main` must strictly adhere to the following four rules:
   cargo build --release && python3 scripts/check_perf_regression.py --memtier --baseline-rev HEAD
   ```
   **Run it as `scripts/gate.sh`**, which executes exactly these steps (plus `cargo test --test test_redis_rdb_compat`) under `set -euo pipefail`, so no step's failure can be masked by piping its output (a `clippy ... | tail` once hid a clippy error), and also runs `scripts/miri_smallhash.sh` / `scripts/miri_compact.sh` when `src/smallhash.rs` / `src/compact.rs` changed (their `unsafe` code is checked under Miri).
-  If the perf A/B reports **INCONCLUSIVE**, the host was too noisy (CV > 8% after the extra rounds) or too slow (baseline build under 75% of `benchmark_live_baseline.json`) to tell a regression from noise: rerun later; do not push on `--allow-noisy` unless the change cannot affect performance.
-  Without `--baseline-rev`, `--memtier` compares against the fixed numbers in `benchmark_live_baseline.json`, which drift with the host; prefer the A/B. Update that file only deliberately (`--memtier --update-baseline`, in its own commit), never to make a failing gate pass.
+  If the perf A/B reports **INCONCLUSIVE**, the host was too noisy (CV > 8% after the extra rounds) or too slow (baseline build under 75% of `docs/benchmarks/results/benchmark_live_baseline.json`) to tell a regression from noise: rerun later; do not push on `--allow-noisy` unless the change cannot affect performance.
+  Without `--baseline-rev`, `--memtier` compares against the fixed numbers in `docs/benchmarks/results/benchmark_live_baseline.json`, which drift with the host; prefer the A/B. Update that file only deliberately (`--memtier --update-baseline`, in its own commit), never to make a failing gate pass.
 * **Immediate Push Upon Green CI**:
   Once the CI suite passes cleanly, the commit must be pushed immediately to `origin main`:
   ```bash

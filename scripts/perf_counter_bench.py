@@ -375,7 +375,7 @@ def main():
 
     out = os.environ.get(
         "PERF_OUT_FILE",
-        os.path.join(REPO_DIR, "benchmark_perf_counters.json"),
+        os.path.join(REPO_DIR, "docs", "benchmarks", "results", "benchmark_perf_counters.json"),
     )
     baseline_path = out
 

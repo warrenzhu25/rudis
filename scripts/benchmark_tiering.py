@@ -280,9 +280,9 @@ def run_test():
         "info_final": info_final,
     }
 
-    with open("tiered_benchmark_results.json", "w") as f:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs/benchmarks/results", "tiered_benchmark_results.json"), "w") as f:
         json.dump(results, f, indent=2)
-    print("\nBenchmark results written to tiered_benchmark_results.json")
+    print("\nBenchmark results written to docs/benchmarks/results/tiered_benchmark_results.json")
 
 if __name__ == "__main__":
     run_test()

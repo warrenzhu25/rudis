@@ -762,7 +762,7 @@ def main():
     print("  Data Types: Strings, Hashes, Lists, Sets, ZSets, Keyspace      ")
     print("=================================================================")
 
-    out_file = os.path.join(REPO_DIR, "benchmark_common_commands_results.json")
+    out_file = os.path.join(REPO_DIR, "docs", "benchmarks", "results", "benchmark_common_commands_results.json")
     final_results = {}
     if os.path.exists(out_file):
         try:

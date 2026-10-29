@@ -137,9 +137,9 @@ def run_scaling_benchmark():
             "mix": res_mix,
         }
 
-    with open("tier_scaling_results.json", "w") as f:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs/benchmarks/results", "tier_scaling_results.json"), "w") as f:
         json.dump(results, f, indent=2)
-    print("\nScaling benchmark results saved to tier_scaling_results.json")
+    print("\nScaling benchmark results saved to docs/benchmarks/results/tier_scaling_results.json")
 
 if __name__ == "__main__":
     run_scaling_benchmark()
