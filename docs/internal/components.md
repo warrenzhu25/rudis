@@ -336,7 +336,7 @@ Rudis spills cold key value payloads to per-shard NVMe files when allocator memo
 
 ---
 
-## 08. Vector Search Engine — HNSW, Quantization, Vector Sets, Tiering & Semantic Cache
+## 08. Vector Search Engine
 
 > Full reference: [08_vector_engine.md](08_vector_engine.md) · Main source: `src/vector.rs`, `src/shard.rs`
 
@@ -370,7 +370,7 @@ Stores float embeddings and performs exact or approximate k-nearest-neighbour se
 
 ---
 
-## 09. RediSearch Full-Text Engine & Hybrid Vector Fusion
+## 09. RediSearch Full-Text Engine and Hybrid Vector Fusion
 
 > Full reference: [09_redisearch.md](09_redisearch.md) · Main source: `src/search.rs`, `src/router.rs`, `src/shard.rs`
 
@@ -405,7 +405,7 @@ Rudis provides RediSearch-compatible secondary indexing and hybrid search over H
 
 ---
 
-## 10. Kernel Bypass & Zero-Copy Networking
+## 10. Kernel Bypass and Zero-Copy Networking
 
 > Full reference: [10_kernel_bypass_xdp.md](10_kernel_bypass_xdp.md) · Main source: `src/xdp.rs`, `src/zerocopy.rs`, `Cargo.toml` (`xdp` feature)
 
@@ -440,7 +440,7 @@ Rudis provides an in-process simulation of Linux AF_XDP kernel bypass networking
 
 ---
 
-## 11. Redis Cluster Topology & Gossip Protocol
+## 11. Redis Cluster Topology and the Gossip Protocol
 
 > Full reference: [11_cluster_topology.md](11_cluster_topology.md) · Main source: `src/cluster.rs`, `src/connection.rs`, `src/router.rs`, `src/server.rs`
 
@@ -466,17 +466,17 @@ Rudis partitions the keyspace into 16,384 hash slots and participates in a Redis
 
 **Gotchas & open issues**
 - Lock acquisition order: Always acquire `my_slots` before acquiring `nodes` in `ClusterHub` to prevent deadlocks between bus thread updates and client routing checks ([§4.1](11_cluster_topology.md#41-the-hub)).
-- Default epoch-0 slot claim: An unconfigured node defaults to claiming all 16,384 slots at config epoch 0; because tie-breaking favours the current holder, two fresh nodes that MEET each other retain all slots without redirecting until slots are explicitly assigned via `ADDSLOTS` ([§17](11_cluster_topology.md#16-invariants--gotchas)).
-- Single-host limitation: Nodes always advertise `127.0.0.1` across bus frames, redirects, and introspection outputs; multi-host clusters and `cluster-announce-*` directives are currently unsupported ([§18](11_cluster_topology.md#17-limitations--not-implemented)).
-- Unauthenticated plaintext bus: The cluster bus uses unencrypted line-delimited plain text with no authentication or TLS, opening connections per tick and trusting incoming frames up to a 1 MiB line limit and 256 connection cap ([§6.1](11_cluster_topology.md#61-threads-and-framing), [§18](11_cluster_topology.md#17-limitations--not-implemented)).
-- Rebalance data movement asymmetry: `CLUSTER REBALANCE` executes key transfers only on the source node; running rebalance on the receiver only performs metadata updates, leaving the router in an `Importing` redirect loop ([§17](11_cluster_topology.md#16-invariants--gotchas)).
-- Incomplete slot migration on batch failure: In `execute_rebalance_plans`, if a key batch fails during migration, key transfers stop but the slot is still finalized (`SETSLOT NODE` and `Moved`), stranding unmoved keys on the source behind a `-MOVED` redirect ([§17](11_cluster_topology.md#16-invariants--gotchas)).
-- A refused `MFSTART` leaves the master paused: if writes do not settle within 1 s the master replies with an error, but its writers stay paused and `mf_paused` stays set until the 5 s pause expires ([§17](11_cluster_topology.md#16-invariants--gotchas)).
-- `cross-shard-strict` works per shard while cluster `CROSSSLOT` works per slot, so keys can share a shard without sharing a slot ([§17](11_cluster_topology.md#16-invariants--gotchas)).
+- Default epoch-0 slot claim: An unconfigured node defaults to claiming all 16,384 slots at config epoch 0; because tie-breaking favours the current holder, two fresh nodes that MEET each other retain all slots without redirecting until slots are explicitly assigned via `ADDSLOTS` ([§16](11_cluster_topology.md#16-invariants--gotchas)).
+- Single-host limitation: Nodes always advertise `127.0.0.1` across bus frames, redirects, and introspection outputs; multi-host clusters and `cluster-announce-*` directives are currently unsupported ([§17](11_cluster_topology.md#17-limitations--not-implemented)).
+- Unauthenticated plaintext bus: The cluster bus uses unencrypted line-delimited plain text with no authentication or TLS, opening connections per tick and trusting incoming frames up to a 1 MiB line limit and 256 connection cap ([§6.1](11_cluster_topology.md#61-threads-and-framing), [§17](11_cluster_topology.md#17-limitations--not-implemented)).
+- Rebalance data movement asymmetry: `CLUSTER REBALANCE` executes key transfers only on the source node; running rebalance on the receiver only performs metadata updates, leaving the router in an `Importing` redirect loop ([§16](11_cluster_topology.md#16-invariants--gotchas)).
+- Incomplete slot migration on batch failure: In `execute_rebalance_plans`, if a key batch fails during migration, key transfers stop but the slot is still finalized (`SETSLOT NODE` and `Moved`), stranding unmoved keys on the source behind a `-MOVED` redirect ([§16](11_cluster_topology.md#16-invariants--gotchas)).
+- A refused `MFSTART` leaves the master paused: if writes do not settle within 1 s the master replies with an error, but its writers stay paused and `mf_paused` stays set until the 5 s pause expires ([§16](11_cluster_topology.md#16-invariants--gotchas)).
+- `cross-shard-strict` works per shard while cluster `CROSSSLOT` works per slot, so keys can share a shard without sharing a slot ([§16](11_cluster_topology.md#16-invariants--gotchas)).
 
 ---
 
-## 12. CRDT Data Types & Manual Multi-Region Sync
+## 12. CRDT Data Types and Manual Multi-Region Sync
 
 > Full reference: [12_crdt_types.md](12_crdt_types.md) · Main source: `src/crdt.rs`, `src/connection.rs`, `src/router.rs`
 
@@ -510,7 +510,7 @@ Provides conflict-free replicated data types (`LWW-Register`, `OR-Set`, `PN-Coun
 
 ---
 
-## 13. Lua Scripting & Redis 7 Functions
+## 13. Lua Scripting and Redis 7 Functions
 
 > Full reference: [13_scripting_functions.md](13_scripting_functions.md) · Main source: `src/scripting.rs`, `src/connection.rs`
 
@@ -545,7 +545,7 @@ Executes ad-hoc Lua 5.4 scripts (`EVAL`, `EVALSHA`) and managed Redis 7 librarie
 
 ---
 
-## 14. Persistence (AOF, RDB snapshots) & Replication
+## 14. Persistence (AOF, RDB Snapshots) and Replication
 
 > Full reference: [14_persistence_replication.md](14_persistence_replication.md) · Main source: `src/aof.rs`, `src/replication.rs`, `src/snapshot.rs`, `src/redis_rdb.rs`, `src/shutdown.rs`
 
@@ -587,7 +587,7 @@ Rudis persists in-memory shard data across restarts and streams state to replica
 
 ---
 
-## 15. Security (ACL & network guards), Memory Allocator & TLS
+## 15. Security (ACL and Network Guards), Memory Allocator and TLS
 
 > Full reference: [15_security_tls.md](15_security_tls.md) · Main source: `src/acl.rs`, `src/netsec.rs`, `src/tls.rs`, `src/allocator.rs`
 
@@ -623,7 +623,7 @@ This subsystem provides Redis-compatible access control, network ingress guards,
 
 ---
 
-## 16. JSON Document Store & JSONPath Engine
+## 16. JSON Document Store and the JSONPath Engine
 
 > Full reference: [16_json_store.md](16_json_store.md) · Main source: `src/json.rs`, `src/connection.rs`
 
@@ -726,7 +726,7 @@ Provides memory-efficient approximate data structures: RedisBloom-compatible Blo
 
 ---
 
-## 19. Pub/Sub Messaging Hub
+## 19. The Pub/Sub Messaging Hub
 
 > Full reference: [19_pubsub.md](19_pubsub.md) · Main source: `src/pubsub.rs`, `src/router.rs`, `src/connection.rs`
 
@@ -760,7 +760,7 @@ Pub/Sub delivers fire-and-forget messages across exact channels, glob patterns, 
 
 ---
 
-## 20. Agent Memory, LLM Quota & Checkpoints
+## 20. Agent Memory, LLM Quota and Checkpoints
 
 > Full reference: [20_agent_memory.md](20_agent_memory.md) · Main source: `src/agent.rs`, `src/shard.rs`
 
@@ -796,7 +796,7 @@ Rudis provides four independent AI-native stores—agent memory sessions, slidin
 
 ---
 
-## 21. Built-in Model Context Protocol (MCP) Server
+## 21. The Built-in Model Context Protocol (MCP) Server
 
 > Full reference: [21_mcp_server.md](21_mcp_server.md) · Main source: `src/mcp.rs`, `src/connection.rs`
 
