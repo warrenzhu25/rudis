@@ -2062,6 +2062,96 @@ pub fn touch_watched_key_in_db(port: u16, db: usize, key: &[u8]) {
     }
 }
 
+/// The keys `client_id` watches, with their database.
+pub fn watched_keys_of(port: u16, client_id: u64) -> Vec<(usize, Bytes)> {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return Vec::new();
+    }
+    let port = node_port(port);
+    WATCHED_KEYS.read().get(&port).map_or_else(Vec::new, |pm| {
+        pm.iter()
+            .filter(|(_, clients)| clients.contains(&client_id))
+            .map(|(k, _)| k.clone())
+            .collect()
+    })
+}
+
+/// Lazily expires `key` in database `db`, as any access does (EXISTS): a
+/// key past its TTL is deleted now, which touches its watchers.
+async fn expire_if_needed(router: &Router, db: usize, key: &Bytes) {
+    let prev = CURRENT_DB.replace(db);
+    if router.target_shard(key) == router.shard_id {
+        let mut sdb = router.local_db.borrow_mut();
+        let selected = sdb.current_db;
+        sdb.select_db(db);
+        sdb.exists(key);
+        sdb.select_db(selected);
+    } else {
+        router.exists(key.clone()).await;
+    }
+    CURRENT_DB.set(prev);
+}
+
+/// SWAPDB `db1` `db2`, before it runs: as in Redis (and as FLUSHDB does),
+/// a watched key of either database is touched only if one of the two
+/// has it live, since swapping keys that don't exist or have expired
+/// changes nothing the client watched. Checking expires stale keys.
+async fn touch_live_watched_keys_on_swapdb(router: &Router, db1: usize, db2: usize) {
+    if db1 == db2 || !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let keys: Vec<(usize, Bytes)> = WATCHED_KEYS
+        .read()
+        .get(&node_port(router.port))
+        .map(|m| {
+            m.keys()
+                .filter(|(w_db, _)| *w_db == db1 || *w_db == db2)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    for (w_db, key) in keys {
+        let mut live = false;
+        for d in [db1, db2] {
+            let prev = CURRENT_DB.replace(d);
+            if router.target_shard(&key) == router.shard_id {
+                let mut sdb = router.local_db.borrow_mut();
+                let selected = sdb.current_db;
+                sdb.select_db(d);
+                live |= sdb.exists(&key);
+                sdb.select_db(selected);
+            } else {
+                live |= router.exists(key.clone()).await;
+            }
+            CURRENT_DB.set(prev);
+        }
+        if live {
+            touch_watched_key_in_db(router.port, w_db, &key);
+        }
+    }
+}
+
+/// WATCH: like Redis, a key already past its TTL counts as not existing:
+/// it is expired first (so deleting or emptying it later changes nothing
+/// the client watched), then watched.
+async fn watch_command(router: &Router, client_id: u64, keys: &[Bytes]) {
+    let db = CURRENT_DB.get();
+    for k in keys {
+        expire_if_needed(router, db, k).await;
+    }
+    watch_keys(router.port, client_id, keys);
+}
+
+/// Whether EXEC must fail for its WATCH: a watched key changed. A watched
+/// key that expired since the WATCH (still there, past its TTL) is expired
+/// first, which counts as a change, as in Redis.
+async fn watch_failed(router: &Router, client_id: u64) -> bool {
+    for (db, key) in watched_keys_of(router.port, client_id) {
+        expire_if_needed(router, db, &key).await;
+    }
+    is_watch_tainted(router.port, client_id)
+}
+
 pub fn touch_watched_keys_on_swapdb(port: u16, db1: usize, db2: usize) {
     if db1 == db2 || !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -5329,7 +5419,7 @@ async fn execute_tx_step(
                         b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
                     );
                     false
-                } else if is_watch_tainted(router.port, client_id) {
+                } else if watch_failed(router, client_id).await {
                     if let Some(ref addr_s) = monitor_addr {
                         broadcast_monitor(router.port, addr_s, &[Bytes::from_static(b"exec")]);
                     }
@@ -5509,7 +5599,7 @@ async fn execute_tx_step(
                         .tot_cmds
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                watch_keys(router.port, client_id, &keys);
+                watch_command(router, client_id, &keys).await;
                 out_buf.extend_from_slice(b"+OK\r\n");
                 false
             }
@@ -17822,7 +17912,7 @@ async fn execute_command_inner(
                 out.extend_from_slice(b"-ERR DB index is out of range\r\n");
             } else {
                 let (d1, d2) = (db1 as usize, db2 as usize);
-                touch_watched_keys_on_swapdb(router.port, d1, d2);
+                touch_live_watched_keys_on_swapdb(router, d1, d2).await;
                 router.swapdb(d1, d2).await;
                 notify_flush_invalidation(router.port, client_id);
                 out.extend_from_slice(b"+OK\r\n");
@@ -18464,7 +18554,7 @@ async fn execute_command_inner(
             false
         }
         Command::Watch(keys) => {
-            watch_keys(router.port, client_id, &keys);
+            watch_command(router, client_id, &keys).await;
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -22862,7 +22952,27 @@ pub fn execute_local_command(
                     return false;
                 }
                 let (d1, d2) = (*db1 as usize, *db2 as usize);
-                touch_watched_keys_on_swapdb(db.port, d1, d2);
+                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                    // As `touch_live_watched_keys_on_swapdb`.
+                    let keys: Vec<(usize, Bytes)> = WATCHED_KEYS
+                        .read()
+                        .get(&node_port(db.port))
+                        .map(|m| {
+                            m.keys()
+                                .filter(|(w, _)| *w == d1 || *w == d2)
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for (w_db, k) in keys {
+                        let live = [d1, d2].iter().any(|&d| {
+                            db.table_for_db(d).is_some() && db.table_for_db_mut(d).exists(&k)
+                        });
+                        if live {
+                            touch_watched_key_in_db(db.port, w_db, &k);
+                        }
+                    }
+                }
                 db.swap_dbs(d1, d2);
                 record_change!(cmd);
                 out.extend_from_slice(b"+OK\r\n");
@@ -30830,6 +30940,24 @@ mod tests {
         }
         unwatch_keys(port, 2);
         assert!(!WATCHED_KEYS.read().contains_key(&port));
+    }
+
+    /// EXEC expires a client's watched keys first: `watched_keys_of` lists
+    /// them with their database, and nobody else's.
+    #[test]
+    fn test_watched_keys_of_lists_a_clients_keys_with_their_db() {
+        let port = 65427;
+        CURRENT_DB.set(3);
+        watch_keys(port, 7, &[Bytes::from("a"), Bytes::from("b")]);
+        CURRENT_DB.set(0);
+        watch_keys(port, 8, &[Bytes::from("c")]);
+        let mut keys = watched_keys_of(port, 7);
+        keys.sort();
+        assert_eq!(keys, vec![(3, Bytes::from("a")), (3, Bytes::from("b"))]);
+        assert_eq!(watched_keys_of(port, 8), vec![(0, Bytes::from("c"))]);
+        unwatch_keys(port, 7);
+        unwatch_keys(port, 8);
+        assert!(watched_keys_of(port, 7).is_empty());
     }
 
     #[test]

@@ -13051,3 +13051,76 @@ fn test_config_set_appendonly_at_runtime_e2e() {
     let _ = server.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// WATCH and expired keys, as in Redis: a key already past its TTL when
+/// watched counts as not existing (deleting it, FLUSHDB or SWAPDB then
+/// change nothing watched), a watched key that expires before EXEC fails
+/// it, and FLUSHDB / SWAPDB touch only keys that exist live.
+#[test]
+fn test_watch_and_expired_keys_e2e() {
+    let port = 29983u16;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut r = |args: &[&str]| resp_cmd_all(&mut c, args);
+    assert_eq!(r(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]), "+OK\r\n");
+    let stale = |r: &mut dyn FnMut(&[&str]) -> String, key: &str| {
+        assert_eq!(r(&["SET", key, "v", "PX", "1"]), "+OK\r\n");
+        thread::sleep(Duration::from_millis(5));
+    };
+    let exec_ping = |r: &mut dyn FnMut(&[&str]) -> String| {
+        assert_eq!(r(&["MULTI"]), "+OK\r\n");
+        assert_eq!(r(&["PING"]), "+QUEUED\r\n");
+        r(&["EXEC"])
+    };
+    let ok = "*1\r\n+PONG\r\n";
+    let aborted = "*-1\r\n";
+
+    // A watched key that expires (still there) before EXEC fails it.
+    assert_eq!(r(&["SET", "w1", "1", "PX", "100"]), "+OK\r\n");
+    assert_eq!(r(&["WATCH", "w1"]), "+OK\r\n");
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(exec_ping(&mut r), aborted, "expired after WATCH");
+
+    // A stale key deleted after WATCH changes nothing watched.
+    stale(&mut r, "w2");
+    assert_eq!(r(&["WATCH", "w2"]), "+OK\r\n");
+    assert_eq!(r(&["EXISTS", "w2"]), ":0\r\n");
+    assert_eq!(exec_ping(&mut r), ok, "stale key deleted");
+
+    // FLUSHDB: stale or missing watched keys aren't touched, live ones are.
+    stale(&mut r, "w3");
+    assert_eq!(r(&["WATCH", "w3", "nokey"]), "+OK\r\n");
+    assert_eq!(r(&["FLUSHDB"]), "+OK\r\n");
+    assert_eq!(exec_ping(&mut r), ok, "FLUSHDB of stale/missing keys");
+    assert_eq!(r(&["SET", "w4", "1"]), "+OK\r\n");
+    assert_eq!(r(&["WATCH", "w4"]), "+OK\r\n");
+    assert_eq!(r(&["FLUSHDB"]), "+OK\r\n");
+    assert_eq!(exec_ping(&mut r), aborted, "FLUSHDB of a live key");
+
+    // SWAPDB: a missing key replaced by a stale one changes nothing, by a
+    // live one it does.
+    assert_eq!(r(&["SELECT", "1"]), "+OK\r\n");
+    stale(&mut r, "w5");
+    assert_eq!(r(&["SELECT", "0"]), "+OK\r\n");
+    assert_eq!(r(&["WATCH", "w5"]), "+OK\r\n");
+    assert_eq!(r(&["SWAPDB", "0", "1"]), "+OK\r\n");
+    assert_eq!(
+        exec_ping(&mut r),
+        ok,
+        "missing key swapped with a stale one"
+    );
+    assert_eq!(r(&["FLUSHALL"]), "+OK\r\n");
+    assert_eq!(r(&["SELECT", "1"]), "+OK\r\n");
+    assert_eq!(r(&["SET", "w6", "1"]), "+OK\r\n");
+    assert_eq!(r(&["SELECT", "0"]), "+OK\r\n");
+    assert_eq!(r(&["WATCH", "w6"]), "+OK\r\n");
+    assert_eq!(r(&["SWAPDB", "0", "1"]), "+OK\r\n");
+    assert_eq!(
+        exec_ping(&mut r),
+        aborted,
+        "missing key swapped with a live one"
+    );
+    assert_eq!(r(&["FLUSHALL"]), "+OK\r\n");
+    assert_eq!(r(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]), "+OK\r\n");
+}

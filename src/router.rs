@@ -4097,8 +4097,9 @@ impl Router {
     }
 
     pub async fn swapdb(&self, db1: usize, db2: usize) {
+        // The caller touched the watched keys it changes
+        // (`connection::touch_live_watched_keys_on_swapdb`).
         self.local_db.borrow_mut().swap_dbs(db1, db2);
-        crate::connection::touch_watched_keys_on_swapdb(self.port, db1, db2);
         self.log_mutation(|| Command::Swapdb {
             db1: db1 as i64,
             db2: db2 as i64,
