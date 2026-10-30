@@ -1544,6 +1544,32 @@ pub(crate) fn persistence_misconf(router: &Router) -> Option<String> {
     None
 }
 
+/// `replica-serve-stale-data`: whether a replica whose master link is
+/// down still serves its clients (yes, the Redis default); with no, only
+/// commands flagged `stale` (see `command_info::serves_stale`) are, the
+/// others get -MASTERDOWN.
+pub static REPLICA_SERVE_STALE_DATA: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// The -MASTERDOWN reply (without the leading `-`) when this server, a
+/// replica with `replica-serve-stale-data no` and its master link down,
+/// must refuse `cmd`; None otherwise.
+pub(crate) fn masterdown_refuses(router: &Router, cmd: &Command) -> Option<&'static [u8]> {
+    if REPLICA_SERVE_STALE_DATA.load(std::sync::atomic::Ordering::Relaxed)
+        || !crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let hub = crate::replication::cached_hub(router.base_port);
+    if !hub.is_slave()
+        || hub.can_serve_replicas()
+        || crate::command_info::serves_stale(acl_cmd_name(cmd))
+    {
+        return None;
+    }
+    Some(b"MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n")
+}
+
 pub static REPLICA_READ_ONLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -3752,6 +3778,9 @@ pub fn apply_config_value(
         "tcp-keepalive" => {
             TCP_KEEPALIVE_SECS.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
+        "replica-serve-stale-data" | "slave-serve-stale-data" => {
+            REPLICA_SERVE_STALE_DATA.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
+        }
         "replica-read-only" | "slave-read-only" => {
             REPLICA_READ_ONLY.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
         }
@@ -4043,7 +4072,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
-    let all_configs: [(&str, String); 99] = [
+    let all_configs: [(&str, String); 100] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
@@ -4240,6 +4269,15 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         ),
         ("replica-read-only", ro.to_string()),
         ("slave-read-only", ro.to_string()),
+        (
+            "replica-serve-stale-data",
+            if REPLICA_SERVE_STALE_DATA.load(std::sync::atomic::Ordering::Relaxed) {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
         ("replica-ignore-maxmemory", ignore_maxmem.to_string()),
         ("slave-ignore-maxmemory", ignore_maxmem.to_string()),
         ("replica-priority", replica_priority.clone()),
@@ -4318,6 +4356,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
             "busy-reply-threshold" | "lua-time-limit" => "lua-time-limit",
             "slaveof" | "replicaof" => "replicaof",
             "slave-read-only" | "replica-read-only" => "replica-read-only",
+            "slave-serve-stale-data" | "replica-serve-stale-data" => "replica-serve-stale-data",
             "slave-ignore-maxmemory" | "replica-ignore-maxmemory" => "replica-ignore-maxmemory",
             "slave-priority" | "replica-priority" => "replica-priority",
             "slave-announce-ip" | "replica-announce-ip" => "replica-announce-ip",
@@ -4449,6 +4488,8 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
             p_str.as_str(),
             "replica-read-only"
                 | "slave-read-only"
+                | "replica-serve-stale-data"
+                | "slave-serve-stale-data"
                 | "replica-ignore-maxmemory"
                 | "slave-ignore-maxmemory"
                 | "stop-writes-on-bgsave-error"
@@ -11735,6 +11776,14 @@ async fn execute_command_inner(
         && (cmd.is_write_command() || crate::aof::command_to_resp(&cmd).is_some())
     {
         out.extend_from_slice(err.as_bytes());
+        return false;
+    }
+
+    if !in_tx(client_id)
+        && let Some(reason) = masterdown_refuses(router, &cmd)
+    {
+        out.push(b'-');
+        out.extend_from_slice(reason);
         return false;
     }
 

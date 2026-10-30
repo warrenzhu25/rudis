@@ -63,6 +63,23 @@ fn lookup(name: &str) -> Option<usize> {
     crate::acl::command_index(name).filter(|&i| listed()[i])
 }
 
+/// Whether a replica whose master link is down serves `name` (a command,
+/// or `container|sub`) with `replica-serve-stale-data no`: Redis's `stale`
+/// command flag. A container command (CONFIG, CLIENT, ...) counts as one:
+/// its flags are on its subcommands.
+pub fn serves_stale(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let Some(i) = crate::acl::command_index(&name) else {
+        return false;
+    };
+    if subcommands(i).next().is_some() {
+        return true;
+    }
+    DOCS[i]
+        .as_ref()
+        .is_some_and(|d| d.info.windows(8).any(|w| w == b"+stale\r\n"))
+}
+
 fn bulk(out: &mut Vec<u8>, s: &[u8]) {
     out.extend_from_slice(format!("${}\r\n", s.len()).as_bytes());
     out.extend_from_slice(s);
@@ -254,6 +271,18 @@ pub fn write_list(out: &mut Vec<u8>, filter: Option<(&str, &str)>) {
 
 #[cfg(test)]
 mod tests {
+    /// Redis's `stale` flag: what a replica with its master link down
+    /// serves under `replica-serve-stale-data no`.
+    #[test]
+    fn test_serves_stale_follows_the_stale_flag() {
+        for name in ["info", "replicaof", "slaveof", "config", "client", "INFO"] {
+            assert!(super::serves_stale(name), "{name}");
+        }
+        for name in ["get", "set", "ping", "incr", "no-such-command"] {
+            assert!(!super::serves_stale(name), "{name}");
+        }
+    }
+
     use super::*;
 
     fn name_at(i: usize) -> &'static str {

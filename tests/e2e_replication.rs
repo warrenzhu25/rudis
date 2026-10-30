@@ -7190,3 +7190,48 @@ fn test_dual_channel_replica_buffer_stops_at_its_limit_e2e() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `replica-serve-stale-data no`: a replica whose master link is down
+/// refuses all but the commands Redis flags `stale` with -MASTERDOWN; with
+/// yes (the default) it serves them.
+#[test]
+fn test_replica_serve_stale_data_e2e() {
+    let port = 29984u16;
+    let ps = port.to_string();
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _server = Kill(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "2", "--no-pin", "--save", ""],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut r = |args: &[&str]| resp_cmd_all(&mut c, args);
+    assert_eq!(r(&["SET", "k", "v"]), "+OK\r\n");
+    assert_eq!(
+        r(&["CONFIG", "SET", "replica-serve-stale-data", "no"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        r(&["CONFIG", "GET", "replica-serve-stale-data"]),
+        "*2\r\n$24\r\nreplica-serve-stale-data\r\n$2\r\nno\r\n"
+    );
+    // A master that isn't there: the link stays down.
+    assert_eq!(r(&["REPLICAOF", "127.0.0.1", "1"]), "+OK\r\n");
+    let down =
+        "-MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n";
+    assert_eq!(r(&["GET", "k"]), down);
+    assert_eq!(r(&["PING"]), down);
+    assert!(r(&["INFO", "replication"]).contains("master_link_status:down"));
+    assert_eq!(
+        r(&["CONFIG", "SET", "replica-serve-stale-data", "yes"]),
+        "+OK\r\n"
+    );
+    assert_eq!(r(&["GET", "k"]), "$1\r\nv\r\n");
+    assert_eq!(r(&["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+}
