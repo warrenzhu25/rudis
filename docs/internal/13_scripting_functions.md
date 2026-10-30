@@ -69,6 +69,10 @@ Key ideas to keep in mind while reading:
 4. **Functions re-run their library on every `FCALL`.** `FUNCTION LOAD` runs the library once to
    validate it and record its function names; every `FCALL` re-runs the whole library in a new
    VM to obtain a callable closure for the requested function.
+5. **A running script is visible to other shards.** Each run is registered process-wide and
+   checked by an instruction hook, so a script past `busy-reply-threshold` makes the other
+   shards answer `-BUSY`, and `SCRIPT KILL` / `FUNCTION KILL` from another shard can end it
+   (§6.7).
 
 ---
 
@@ -131,13 +135,14 @@ Helpers over `FUNCTION_LIBS`: `list_functions()` (clones every library, in hash-
 
 ### 3.3 Per-thread script state
 
-Two `thread_local!` cells live in `scripting.rs`. Because each shard is one OS thread and a
+Three `thread_local!` cells live in `scripting.rs`. Because each shard is one OS thread and a
 script runs to completion without yielding, a thread-local is effectively "the currently running
 script on this shard".
 
 | Item | Type | Meaning |
 | :-- | :-- | :-- |
 | `SCRIPT_REDIRECT` | `Cell<ScriptRedirect>` | Redirect state machine for keyless scripts (§5.3). |
+| `CURRENT_SCRIPT` | `RefCell<Option<Arc<RunningScript>>>` | This thread's entry in the running-script registry (§3.4), so `redis.call` can flag a write on it. Set and cleared by `ScriptRunGuard`. |
 | `SCRIPT_RECORDED_ERROR` | `Cell<bool>` (pub) | Set when a command inside the script already counted an error in `INFO errorstats`; the dispatcher's error accounting then skips counting the script's own error a second time (it still counts the failed call). Reset to `false` at the start of `eval_script` / `call_function`. |
 
 ```rust
@@ -148,6 +153,37 @@ enum ScriptRedirect {
     To(usize),  // first command hit shard N: rerun there, fail every further command
 }
 ```
+
+### 3.4 Running-script registry
+
+While a shard runs a script it serves nothing else, so `SCRIPT KILL`, `FUNCTION KILL`, the
+`-BUSY` check and shutdown reach the script from *other* threads through a process-wide
+registry:
+
+```rust
+pub struct RunningScript {
+    port: u16,              // base (node) port of the server running it
+    is_eval: bool,          // EVAL/EVALSHA (SCRIPT KILL) or FCALL (FUNCTION KILL)
+    start: Instant,
+    killed: AtomicBool,     // set by SCRIPT KILL / FUNCTION KILL
+    wrote: AtomicBool,      // a write command ran: the script is now unkillable
+    busy: AtomicBool,       // ran past busy-reply-threshold
+}
+
+static RUNNING_SCRIPTS: LazyLock<Mutex<Vec<Arc<RunningScript>>>>;  // every running script
+static BUSY_SCRIPTS: AtomicUsize;                                  // how many have busy = true
+```
+
+| Item | Meaning |
+| :-- | :-- |
+| `RunningScript::port` | `connection::node_port(shard_port)`: every shard of one server maps to the same base port, so a kill on any shard finds the script. Several servers in one process (tests) stay apart. |
+| `RUNNING_SCRIPTS` | One entry per script currently running anywhere in the process (at most one per shard thread). |
+| `BUSY_SCRIPTS` | Fast path: while it is 0, `busy_script_reply` returns at once without locking the registry, so the per-command check costs one atomic load. |
+| `ScriptRunGuard` | RAII wrapper. `start(port, is_eval)` pushes a new entry and sets `CURRENT_SCRIPT`; `Drop` clears `CURRENT_SCRIPT`, removes the entry (by `Arc::ptr_eq`) and decrements `BUSY_SCRIPTS` if the run had been marked busy. |
+
+`eval_script` and `call_function` create the guard right after `Lua::new()` and keep it for
+the whole run (including, for `FCALL`, the re-run of the library). `FUNCTION LOAD` does not
+register; it has its own 500 ms timeout (§7.1). §6.7 describes how the registry is used.
 
 ---
 
@@ -306,7 +342,8 @@ scope ends before `eval_script` / `call_function` return). Each call goes throug
     `allows_oom()` is false, sum this shard's allocator-measured usage
     (`router::local_real_used`) with every other shard's published usage; above the limit →
     `OOM command not allowed when used memory > 'maxmemory'.`
-11. **Bookkeeping**: `record_cmd_stat`, `snapshot::note_write` for writes whose dirty count is not
+11. **Bookkeeping**: `record_cmd_stat`; for a write command `note_script_write` (sets the
+    running script's `wrote` flag, §6.7); `snapshot::note_write` for writes whose dirty count is not
     computed by change (`dirty_counted_on_change`), `inc_active_client_tot_cmds`, and — when
     `MONITOR` clients exist — a MONITOR line with source `lua`.
 12. **Execute**: `execute_local_command(&cmd, &mut db.borrow_mut(), &mut out, aof)`.
@@ -459,6 +496,92 @@ Nesting deeper than 1000 levels fails with `reached lua stack limit`. The public
   `unpack_one(s, offset)` and `unpack_limit(s, limit, offset)` (return the next offset, or -1 at
   end). Unsupported type bytes (e.g. bin/ext) decode as nil.
 
+### 6.7 Long-running scripts: `-BUSY`, `SCRIPT KILL`, `FUNCTION KILL`
+
+A script runs synchronously on its shard thread, so an endless loop (`EVAL "while true do end"
+0`) would hold that shard forever. Three pieces stop that: the registry (§3.4), an instruction
+hook inside the VM, and checks in the dispatcher of every other connection.
+
+**The hook** (`install_script_hook`, installed by `eval_script` / `call_function` right after
+registering the run). It is a *global* `mlua` hook — coroutines the script creates inherit it —
+that fires every `SCRIPT_HOOK_INSTRUCTIONS` (10,000) Lua instructions:
+
+1. If the run was stopped (`killed` is set, or `shutdown::is_shutting_down()`), replace the hook
+   with one that fires on **every line and every instruction** and always errors, then return the
+   error `ERR Script killed by user with SCRIPT KILL...` (or `...FUNCTION KILL...` for `FCALL`).
+   The re-armed hook means a `pcall` loop cannot catch the error and keep running: the next
+   instruction after the catch errors again.
+2. Otherwise, if the run is not yet busy, read `connection::busy_reply_threshold_ms()` (config
+   `busy-reply-threshold`, alias `lua-time-limit`, default 5000 ms; 0 disables). Once
+   `start.elapsed()` reaches it, `mark_busy` sets `busy`, increments `BUSY_SCRIPTS` and logs a
+   warning `Slow script detected: still in execution after N milliseconds. You can try killing
+   the script using the SCRIPT KILL command.`
+3. Continue.
+
+When the run fails, `error_or_killed` replaces the Lua error with the kill message if the run was
+stopped, because Lua may report a hook error raised inside a handler as "error in error
+handling".
+
+**`-BUSY` for other clients** (`scripting::busy_script_reply(port)`): returns `None` while
+`BUSY_SCRIPTS` is 0; otherwise looks for a busy entry with this server's base port and returns
+`-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.` (`FUNCTION
+KILL` for an `FCALL`). `connection.rs` calls it in three places:
+
+| Where | Effect |
+| :-- | :-- |
+| `execute_command_inner`, right after `wait_if_client_paused` | Any command not in `allowed_while_busy` gets `-BUSY`. |
+| Queuing a command inside `MULTI` | The command gets `-BUSY` (unless `allowed_while_busy`) and the transaction is flagged, so `EXEC` aborts. |
+| `EXEC` itself | The queue is discarded and the reply is `-EXECABORT Transaction discarded because of: BUSY …`; counted as a failed `EXEC` with error `EXECABORT`. |
+
+`allowed_while_busy` is the set Redis flags `allow-busy`: `AUTH`, `HELLO`, `CLIENT CACHING /
+GETNAME / GETREDIR / ID / NO-EVICT / NO-TOUCH / REPLY / SETINFO / SETNAME`, `DISCARD`,
+`FUNCTION KILL`, `FUNCTION STATS`, `MULTI`, `QUIT`, `REPLCONF`, `RESET`, `SCRIPT KILL`,
+`SELECT`, `SHUTDOWN`, `UNWATCH`, `WATCH`.
+
+**Killing** (`kill_running_script(port, is_eval)`, behind `SCRIPT KILL` (`is_eval = true`) and
+`FUNCTION KILL`). It finds the entry for this server's base port and answers:
+
+| Situation | Reply |
+| :-- | :-- |
+| No script running | `-NOTBUSY No scripts in execution right now.` |
+| The script already ran a write (`wrote`) | `-UNKILLABLE Sorry the script already executed write commands against the dataset. …` |
+| `SCRIPT KILL` for an `FCALL`, or `FUNCTION KILL` for an `EVAL` | The `-BUSY` reply naming the right kill command. |
+| Otherwise | Set `killed`, reply `+OK`; the hook ends the script at its next check. |
+
+The kill does not depend on `busy`: a script can be killed before it passes the threshold. Once
+a shutdown sets the process-wide shutdown flag, the hook stops the script whether or not it
+wrote, so the shard can drain (see §10 for when that flag is set).
+
+```mermaid
+sequenceDiagram
+    participant A as "Client A (shard 0)"
+    participant S0 as "Shard 0 thread"
+    participant B as "Client B (shard 1)"
+    participant S1 as "Shard 1 thread"
+    A->>S0: EVAL "while true do end" 0
+    Note over S0: ScriptRunGuard registers the run, hook every 10k instructions
+    Note over S0: elapsed >= busy-reply-threshold, mark_busy
+    B->>S1: PING
+    S1-->>B: -BUSY ... SCRIPT KILL or SHUTDOWN NOSAVE
+    B->>S1: SCRIPT KILL
+    Note over S1: kill_running_script sets killed
+    S1-->>B: +OK
+    Note over S0: next hook check returns the kill error
+    S0-->>A: -ERR Script killed by user with SCRIPT KILL...
+    Note over S0: guard drop unregisters, BUSY_SCRIPTS decremented
+```
+
+Worked example: with `busy-reply-threshold 100`, client A runs the endless `EVAL` above. About
+100 ms later the hook marks it busy; `PING` from a connection on another shard gets `-BUSY`,
+`FUNCTION KILL` gets `-BUSY` too (wrong kill command), `SCRIPT KILL` gets `+OK`, and A receives
+the "killed by user" error. Had the script first run `redis.call('SET','k','v')`, `SCRIPT KILL`
+would answer `-UNKILLABLE` and the script would run to its end.
+
+Connections served by the busy shard itself are not answered at all while the script runs —
+their thread is the one executing Lua — so the kill must come from a connection on another
+shard. A command whose key lives on the busy shard may also reach it through a cross-shard
+request and simply wait for the script instead of getting `-BUSY`.
+
 ---
 
 ## 7. Functions engine
@@ -521,8 +644,9 @@ rejected up front; `FCALL bump 1 k 5` increments `k`.
 3. Build `KEYS` and `ARGV` tables.
 4. Temporarily replace the `redis` global with a load proxy whose `register_function` does no
    validation and only captures (into the Lua registry) the closure whose name matches `name`.
-5. Re-run the whole `raw_code` (`ERR Failed to compile library: …` on error). There is no
-   instruction hook here.
+5. Re-run the whole `raw_code` (`ERR Failed to compile library: …` on error). This re-run is
+   already under the run's instruction hook (§6.7), so an endless loop in library top-level code
+   is killable with `FUNCTION KILL` and counts toward `busy-reply-threshold`.
 6. Restore the run-time `redis` table and switch `register_function` off (later calls raise
    `redis.register_function can only be called on FUNCTION LOAD command`).
 7. If no closure was captured → `ERR Function '<name>' registered but failed to capture`.
@@ -540,8 +664,8 @@ run-time globals (`math`, `io`, … are visible there even though they were hidd
 | `FUNCTION FLUSH` | Clears all libraries. If more than 64 functions were loaded, adds `functions + 1` to the `lazyfreed_objects` counter (`table::add_lazyfreed_objects`) for `INFO` compatibility; the clear itself is synchronous. |
 | `FUNCTION DUMP` | `dump_functions()`: `b"RUDFUNCv1\0"` (10 bytes) + CRC-16/XMODEM of the body (2 bytes, big-endian) + a JSON array of every `FunctionLib`. |
 | `FUNCTION RESTORE payload [policy]` | `restore_functions()`: checks magic, length ≥ 12 and CRC, deserialises the JSON (any failure → `ERR DUMP payload version or checksum are wrong`), then `merge_function_libs` (below). The code is **not** re-executed or re-validated. |
-| `FUNCTION STATS` | `running_script` is always null; `engines.LUA` reports `libraries_count` and `functions_count`. Uses RESP3 maps for RESP3 clients. |
-| `FUNCTION KILL`, `SCRIPT KILL` | `scripting::kill_running_script(port, is_eval)` looks up the running script in `RUNNING_SCRIPTS`: `-NOTBUSY` if none, `-UNKILLABLE` if it already wrote, `-BUSY` if the wrong kill command was used for its type, otherwise sets its kill flag and replies `+OK` (§9). |
+| `FUNCTION STATS` | `running_script` is always null, even while a script is registered in `RUNNING_SCRIPTS`; `engines.LUA` reports `libraries_count` and `functions_count`. Uses RESP3 maps for RESP3 clients. |
+| `FUNCTION KILL`, `SCRIPT KILL` | `scripting::kill_running_script(port, is_eval)` looks up the running script in `RUNNING_SCRIPTS`: `-NOTBUSY` if none, `-UNKILLABLE` if it already wrote, `-BUSY` if the wrong kill command was used for its type, otherwise sets its kill flag and replies `+OK` (§6.7). Both are `allow-busy`, so they are served while a script is busy. |
 
 `merge_function_libs(cache, libs, policy)`:
 
@@ -593,13 +717,18 @@ the global write lock (covered by `test_merge_function_libs_scales_linearly`).
 * **Keyless scripts are rerun, not migrated.** The redirect only works if the *first* command
   hits the foreign shard; any Lua computed before that runs twice. After a local first command
   the state is `Disarmed` and later foreign keys are errors.
-* **Long-running scripts.** `eval_script`/`call_function` register the run (`ScriptRunGuard`)
-  and install a count hook (`install_script_hook`, every `SCRIPT_HOOK_INSTRUCTIONS` = 10,000
-  instructions). Past `busy-reply-threshold` the script is marked busy and other connections get
-  `-BUSY` for commands not flagged `allow-busy`. When the kill flag is set (or a shutdown
-  starts) the hook fails the script. A script that already wrote (`redis.call` of a write) is
-  `-UNKILLABLE`. The script still blocks its own shard's reactor until it ends, so the kill has
-  to come from a connection on another shard.
+* **Long-running scripts** (§6.7). Every `EVAL`/`EVALSHA`/`FCALL` run is registered
+  (`ScriptRunGuard`) and watched by a global count hook every `SCRIPT_HOOK_INSTRUCTIONS`
+  (10,000) instructions. A tight loop of fewer instructions per check still reaches the hook, but
+  a single long C call (one huge `string.rep`, a big `redis.call`) is not interrupted until it
+  returns. Any new code path that runs Lua for a client must create a `ScriptRunGuard` and call
+  `install_script_hook`, or it is neither killable nor reported busy.
+* **`wrote` is set before the write executes.** `note_script_write` runs in the bookkeeping step
+  of `redis.call`, for every command classified as a write — even one that then fails — so such a
+  script is `-UNKILLABLE` from that point on.
+* **Registry entries are per server, not per shard.** `RunningScript::port` is the base port, so
+  `SCRIPT KILL` on any shard finds the script; `kill_running_script` and `busy_script_reply` act
+  on the first matching entry.
 * **Cross-shard waits from scripts are bounded.** `PUBLISH`/`SPUBLISH` inside a script use
   `publish_sync`/`spublish_sync`, which wait at most `SYNC_PUBLISH_COUNT_WAIT` (1 ms) for other
   shards' subscriber counts so two shards publishing to each other cannot deadlock; the returned
@@ -632,7 +761,14 @@ the global write lock (covered by `test_merge_function_libs_scales_linearly`).
 ## 10. Limitations / not implemented
 
 * A busy script cannot be preempted on its own shard: clients on that shard wait for it to
-  end; only connections on other shards see `-BUSY` and can issue `SCRIPT KILL`/`FUNCTION KILL`.
+  end, and so does any cross-shard request sent to that shard; only connections served by other
+  shards see `-BUSY` and can issue `SCRIPT KILL`/`FUNCTION KILL`. With a single shard
+  (`threads=1`) nothing can kill a running script.
+* The hook stops a script once `shutdown::request_shutdown()` has set the process-wide shutdown
+  flag, whether or not the script wrote. The `SHUTDOWN` handler sets that flag only at its end,
+  after the replica wait, the client quiesce and the optional save (`save_before_shutdown`), so
+  a script that wrote ends only with a shutdown that gets that far without the busy shard —
+  `SHUTDOWN NOSAVE`, as the `-BUSY`/`-UNKILLABLE` messages say — or by running to completion.
 * Sandbox gaps compared with Redis: in the `EVAL`/`FCALL` environment `io`, `package`
   (`require`), `coroutine`, stock `load`, `rawget`/`rawset` and `collectgarbage` remain
   reachable; only `dofile`, `loadfile`, `print` and most of `os` are removed. (`FUNCTION LOAD`
@@ -663,6 +799,7 @@ the global write lock (covered by `test_merge_function_libs_scales_linearly`).
 | `src/scripting.rs` | `FunctionDef`, `FunctionLib`, `FUNCTION_LIBS`, `list_functions`, `delete_function`, `flush_functions`, `count_functions`, `count_libraries`, `library_codes` | Function library registry. |
 | `src/scripting.rs` | `is_script_read_only`, `is_sha_read_only`, `is_function_read_only` | Flag-based read-only detection for dispatch/pausing. |
 | `src/scripting.rs` | `ScriptRedirect`, `SCRIPT_REDIRECT`, `arm_script_redirect`, `take_script_redirect`, `script_redirects`, `SCRIPT_RECORDED_ERROR` | Per-thread script state. |
+| `src/scripting.rs` | `RunningScript`, `RUNNING_SCRIPTS`, `BUSY_SCRIPTS`, `CURRENT_SCRIPT`, `ScriptRunGuard`, `note_script_write`, `SCRIPT_HOOK_INSTRUCTIONS`, `install_script_hook`, `busy_script_reply`, `kill_running_script` | Running-script registry, busy detection and `SCRIPT KILL`/`FUNCTION KILL`. |
 | `src/scripting.rs` | `eval_script`, `format_eval_error` | `EVAL`/`EVALSHA` engine and error formatting. |
 | `src/scripting.rs` | `load_function`, `create_load_redis_proxy`, `validate_library_or_function_name`, `is_valid_function_flag` | `FUNCTION LOAD`. |
 | `src/scripting.rs` | `call_function`, `format_lua_error` | `FCALL`. |
@@ -673,13 +810,17 @@ the global write lock (covered by `test_merge_function_libs_scales_linearly`).
 | `src/connection.rs` | `execute_command_inner` (`Eval`, `Evalsha`, `Fcall`, `Script*`, `Function*` arms), `keys_span_shards`, `SCRIPT_CROSS_SHARD_ERR` | Top-level dispatch and shard routing. |
 | `src/connection.rs` | `script_touches_non_local_key`, `script_non_local_target`, `SCRIPT_NON_LOCAL_KEY_ERR`, `acl_denied_in_context`, `CURRENT_AUTH_USER`, `for_each_cmd_key` | Helpers used by `redis.call`. |
 | `src/connection.rs` | `execute_local_command` (`FunctionLoad/Delete/Flush/Restore/Stats/Kill` arms), `should_pause_command` | Replica/AOF application of function changes; pause rules. |
+| `src/connection.rs` | `allowed_while_busy`, `busy_reply_threshold_ms` (`CONFIG_LUA_TIME_LIMIT`, config `busy-reply-threshold` / `lua-time-limit`), `node_port`, busy checks in `execute_command_inner` and the `MULTI`/`EXEC` path | `-BUSY` replies while a script is busy. |
 | `src/server.rs` | `run_shard_worker` (cross-shard request handling: `Eval`/`Evalsha`/`Fcall` branches) | Runs forwarded scripts on the owning shard. |
 | `src/resp.rs` | `build_command` (`EVAL*`, `SCRIPT`, `FUNCTION`, `FCALL*`), `Command::is_write_command`, `Command::allows_oom` | Parsing and top-level classification. |
 | `src/router.rs` | `Router::log_mutation`, `execute_remote`, `target_shard` | Logging function changes; forwarding. |
 | `src/aof.rs` | `apply_aof_command`, `replay_script` | Replaying verbatim scripts from legacy AOFs. |
 | `src/redis_rdb.rs` | `write_file_header` (`OP_FUNCTION2`), RDB loader `OP_FUNCTION2` arm | Function persistence in RDB. |
 | `src/allocator.rs` | `INFO memory` formatting | Script/function counters. |
-| `tests/e2e_scripting.rs` | `test_lua_scripting_engine_e2e`, `test_scripts_reject_keys_on_several_shards_e2e`, `test_script_access_to_non_local_key_is_rejected_e2e`, `test_keyless_script_runs_on_owner_of_first_key_e2e`, `test_script_redis_call_enforces_caller_acl_e2e`, `test_lua_publish_from_two_shards_does_not_deadlock_e2e`, `test_fcall_mutating_aof_persistence_and_replay_e2e`, `test_functions_survive_aof_rewrite_and_restart_e2e` | End-to-end coverage. |
+| `tests/e2e_scripting.rs` | `test_lua_scripting_engine_e2e`, `test_scripts_reject_keys_on_several_shards_e2e`, `test_script_access_to_non_local_key_is_rejected_e2e`, `test_keyless_script_runs_on_owner_of_first_key_e2e`, `test_lua_publish_from_two_shards_does_not_deadlock_e2e`, `test_script_kill_ends_endless_script_e2e` | End-to-end coverage of dispatch, sandbox and kill. |
+| `tests/e2e_tls.rs` | `test_script_redis_call_enforces_caller_acl_e2e` | `redis.call` under the caller's ACL. |
+| `tests/e2e_persistence.rs` | `test_fcall_mutating_aof_persistence_and_replay_e2e`, `test_functions_survive_aof_rewrite_and_restart_e2e` | Function persistence through AOF. |
+| `src/scripting.rs` (unit tests) | `test_script_kill_stops_an_endless_script`, `test_script_kill_is_not_swallowed_by_pcall`, `test_script_kill_stops_endless_coroutine`, `test_script_that_wrote_is_unkillable`, `test_script_kill_without_running_script_is_notbusy` | Hook and kill semantics. |
 
 ### How to verify changes
 
@@ -689,5 +830,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test --lib scripting -- --test-threads=1
 cargo test --test e2e_scripting script -- --test-threads=1
 cargo test --test e2e_scripting function -- --test-threads=1
+cargo test --test e2e_persistence fcall -- --test-threads=1
+cargo test --test e2e_persistence functions -- --test-threads=1
+cargo test --test e2e_tls test_script_redis_call_enforces_caller_acl_e2e
 scripts/run_redis_test_suite.sh   # includes unit/scripting and unit/functions (single shard)
 ```

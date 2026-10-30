@@ -425,6 +425,14 @@ Worked example: a 2-shard server receives `CRDT.MERGE` with a payload holding re
 builds part 0 = `[a]` and part 1 = `[b, c]`, sends them to shards 0 and 1, gets `:1` and `:2`,
 and replies `:3`. Shard 0 logs `CRDT.MERGE [a]` and shard 1 logs `CRDT.MERGE [b, c]`.
 
+The split only happens when the keyspace check before dispatch lets the command through. That
+check uses the payload's keys (`cmd_keys`, see below): in cluster mode a payload whose keys hash
+to different slots gets `-CROSSSLOT Keys in request don't hash to the same slot`, and with
+`cross-shard-strict yes` (config file, `--cross-shard-strict`, or `CONFIG SET`; default `no`) on
+a multi-shard server, a payload whose keys live on different shards gets the same error. So the
+worked example above runs only with `cross-shard-strict no`; keys that share a hash tag (such as
+`{doc}a`, `{doc}b`) always land on one shard and pass both checks.
+
 Inside Lua scripts, `execute_local_command` is reached without the router split. To keep foreign
 keys out, `for_each_cmd_key` yields every key in a `CRDT.MERGE` payload (via
 `for_each_payload_key`), so the standard non-local-key check (`script_touches_non_local_key`)
@@ -481,11 +489,14 @@ A replica receives all of a primary's shards on one stream. In the router's repl
 `__rudis_crdt_sync__`, type byte `13`, `payload_len:u32`, payload. Extended records are wrapped
 in a `rudis-ext` AUX field (`redis_rdb::write_ext_aux`) that Redis and Valkey skip.
 
-Every RDB image the server produces goes through this function: `SAVE`/`BGSAVE` (via
-`save_extended_rdb_chunk`), the point-in-time image streamed to a replica at full sync
-(`AofImage::start_chunk`), and the RDB preamble that a normal `BGREWRITEAOF` writes
+Every RDB image the server produces goes through this function: `SAVE`/`BGSAVE` (one
+point-in-time `AofImage::start_chunk` per shard, started by `start_save_image`), the point-in-time
+image streamed to a replica at full sync (`AofImage::start_chunk`), the one-pass
+`ShardDb::save_rdb_chunk` (via `save_extended_rdb_chunk`) behind `Router::generate_full_rdb` and
+`ShardMessage::SaveRdbChunk`, and the RDB preamble that a normal `BGREWRITEAOF` writes
 (`write_rewritten_aof` → `AofImage::start`). An `AofImage` takes the CRDT payload once, when the
-image starts; later CRDT writes reach the new AOF through its command tail.
+image starts; later CRDT writes reach the new AOF (or the replica) through the command stream that
+follows the image, and are not in a `SAVE`/`BGSAVE` file.
 
 On load (`load_legacy_records` in `src/table.rs`), a file holds one type-13 record per saved
 shard. Each loading shard decodes every record and merges only entries whose key maps to itself
@@ -589,7 +600,7 @@ included. See the gotcha about how these lines are routed in §9.
 | `src/resp.rs` | `Command::Crdt*`, `CRDT.*` arms of `build_command`, `is_family_read`, `EXPERIMENTAL_PREFIXES`, `is_experimental_command_name` | Parsing, read/write classification, experimental gate. |
 | `src/connection.rs` | CRDT arms of `execute_local_command`, `record_crdt_effect!`, `CrdtDump`/`CrdtMerge`/`CrdtGc` arms of `execute_command_inner`, `for_each_cmd_key`, `target_shard_of_cmd`, `get_cmd_name` | Execution, effect logging, fan-out, key reporting, naming. |
 | `src/router.rs` | `Router::split_crdt_payload`, `Router::execute_replica_command` CRDT arms, `Router::target_shard` | Per-shard payload splitting and replica apply. |
-| `src/shard.rs` | `ShardDb.crdt_store`, `crdt_*` wrappers, `save_extended_small_records`, `AofImage`, `flushdb`, `flushall` | Ownership, RDB/image save, flush. |
+| `src/shard.rs` | `ShardDb.crdt_store`, `crdt_*` wrappers, `save_extended_small_records`, `AofImage`, `start_save_image`, `flushdb`, `flushall` | Ownership, RDB/image save, flush. |
 | `src/table.rs` | `load_legacy_records` (type byte `13`) | RDB load with ownership filter. |
 | `src/aof.rs` | `command_to_resp` CRDT arms, `write_canonical_aof`, `split_rewritten_aof_to_shards`, `reshard_aof_dir` | What is logged; canonical snapshot and resharding. |
 | `src/replication.rs` | `log_shard_mutation` | Lazily builds a logged command and appends it to the AOF and replica stream. |

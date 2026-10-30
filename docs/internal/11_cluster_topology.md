@@ -277,6 +277,10 @@ messages use blocking `std::net::TcpStream`s opened per exchange (there are no p
 Input validation: slot lists go through `parse_slot_ranges` (reversed ranges or ranges past 16383
 are dropped, the rest merged); ports go through `bus_port` (rejects 0 and ports whose `+10000`
 overflows); the node table never grows past `MAX_CLUSTER_NODES` (1000) via MEET or gossip.
+Malformed frames (missing fields, non-numeric epochs or ports, binary junk) are ignored or refused
+with an error reply; they never add a node. `handle_cluster_bus_line` is `pub` (but `#[doc(hidden)]`) only so the `cluster_bus` fuzz
+target (`fuzz/fuzz_targets/cluster_bus.rs`) and `tests/test_fuzz_parsers.rs` can feed it arbitrary
+bytes: bus peers are unauthenticated, so applying any line must never panic.
 
 ### 6.2 Message reference
 
@@ -289,7 +293,7 @@ overflows); the node table never grows past `MAX_CLUSTER_NODES` (1000) via MEET 
 | `FAILOVER <id> <epoch> <slots>` | `cluster_failover` (manual failover) | Marks the sender a healthy master, then `claim_slots(sender, epoch, slots)`. | `+OK` |
 | `FAILOVER_ANNOUNCE <id> <epoch> <slots>` | election winner | Same as `FAILOVER`. Older claims (the failed master's) give way through `claim_slots`. | `+OK` |
 | `FAILOVER_AUTH_REQUEST <replica> <epoch> <master>` | election candidate | Vote rules in §9.1. | `+FAILOVER_AUTH_ACK <my_id> <epoch>` or `-ERR vote rejected` |
-| `MFSTART <replica>` | `manual_failover_start` | Only on a master: pauses writers for `MANUAL_FAILOVER_TIMEOUT_MS`, sets `mf_paused`. | `+MFOFFSET <master_repl_offset>` or `-ERR not a master` |
+| `MFSTART <replica>` | `manual_failover_start` | Only on a master: pauses writers for `MANUAL_FAILOVER_TIMEOUT_MS`, sets `mf_paused`, then waits (up to 1 s) until no already-admitted write is still running and every shard has streamed what it holds (`wait_writes_streamed_blocking`), and reads the offset. | `+MFOFFSET <master_repl_offset>`, `-ERR not a master`, or `-ERR writes did not settle for the manual failover` |
 | anything else | — | — | `-ERR unknown clusterbus command` |
 
 Slot lists are `start-end,start-end,...` (single slots as `s-s`). **Announce tokens**
@@ -487,6 +491,7 @@ sequenceDiagram
     Op->>R: CLUSTER FAILOVER
     R->>M: MFSTART replica-id (bus, 2 s timeout)
     M->>M: pause writers 5 s, mf_paused = true
+    M->>M: wait up to 1 s for admitted writes to finish and shards to stream
     M-->>R: +MFOFFSET offset
     R->>R: wait until own replication offset reaches it (5 ms polls, 5 s max)
     R->>R: stop replication link, make_master, epoch = current + 1, take slots
@@ -500,13 +505,23 @@ sequenceDiagram
   `manual_failover_start` (async, over the bus): the master pauses writers
   (`set_client_pause(MANUAL_FAILOVER_TIMEOUT_MS, write_only = true)`) and returns its replication
   offset; the replica waits until it has processed that much, or fails with
-  `-ERR Manual failover timed out` / `-ERR master did not answer the manual failover (use FORCE)`.
-  No acknowledged write is lost.
+  `-ERR Manual failover timed out` / `-ERR master did not answer the manual failover (use FORCE)` /
+  `-ERR master refused the manual failover: <master's reply>`.
+  No acknowledged write is lost: before reading its offset, the master waits until every write that
+  passed the pause gate just before it closed has finished (`connection::writes_running() == 0`)
+  and every shard has streamed the replication bytes it still holds
+  (`replication::wait_writes_streamed_blocking`, 100 µs polls, 1 s limit). Otherwise a write could be
+  acknowledged to its client yet missing from the offset the replica catches up to. If the writes
+  don't settle in 1 s, the master answers `-ERR writes did not settle for the manual failover`; the
+  operator can retry or use `FORCE`.
 - `FORCE` and `TAKEOVER` (treated the same) skip that step.
 - Then the replication link is stopped and `cluster_failover` runs: requires role `slave`
   (else `-ERR You should send CLUSTER FAILOVER to a replica`), `make_master()` first, new epoch =
   `current_epoch + 1`, takes the old master's slots, marks the old master as its replica, sends
   `FAILOVER` to every peer (200 ms connect, no reply), saves. No vote is held.
+- The standalone replication command `FAILOVER [TO host port] ...` (Component 14) is refused in
+  cluster mode with `-ERR FAILOVER not allowed in cluster mode.`, as in Redis; cluster nodes switch
+  roles only through `CLUSTER FAILOVER` or an election.
 
 ### 9.3 `CLUSTER REPLICATE <id>`
 
@@ -524,8 +539,14 @@ Order of checks in `execute_command_inner` (`src/connection.rs`) for each comman
 
 1. `ASKING` sets a one-shot flag and replies `+OK`. `is_asking` is true for the next command if the
    flag was set, or for `RESTORE-ASKING`. The flag is cleared either way.
-2. **CROSSSLOT** (cluster mode only): if the command has several keys in different slots →
-   `-CROSSSLOT Keys in request don't hash to the same slot`.
+2. **CROSSSLOT**: in cluster mode, if the command has several keys in different slots →
+   `-CROSSSLOT Keys in request don't hash to the same slot`. Outside cluster mode the same error is
+   given when `cross-shard-strict yes` is set (config file, `--cross-shard-strict`, `CONFIG SET`;
+   default `no`), the node has more than one shard, and the command's keys live on different shards
+   (`keys_on_several_shards`, using the free function `router::target_shard`: hash of the key's
+   hash tag, or the slot mapping if `HAS_ACTIVE_CLUSTER` is set). That opt-in lets a standalone
+   multi-shard node refuse the multi-key commands whose cross-shard atomicity is weaker than Redis's,
+   exactly as a cluster would; keys sharing a `{hash tag}` share a shard and keep working.
 3. Take the command's **primary key** (`cmd_primary_key`) and its slot; match
    `router.get_slot_state(slot)`:
    - `Moved(addr)` → `-MOVED <slot> <addr>`.
@@ -540,6 +561,11 @@ Order of checks in `execute_command_inner` (`src/connection.rs`) for each comman
        `-MOVED <slot> <peer ip>:<peer.port_for_slot(slot)>`; none → `-CLUSTERDOWN Hash slot not served`.
 
 `READONLY` / `READWRITE` set or clear `ClientInfo.readonly` on the connection.
+
+**Transactions.** At `EXEC`, if cluster mode is on and the queued commands' keys span more than one
+slot (`tx_has_cross_slot`) — or, outside cluster mode with `cross-shard-strict yes` and several
+shards, they span more than one shard — the transaction is discarded (queue cleared, WATCHes
+dropped) and the reply is `-CROSSSLOT Keys in request don't hash to the same slot`.
 
 **Worked example.** Node X (base 7000, 2 shards) serves 0-8191; node Y (base 7100, 2 shards)
 serves 8192-16383; X has learned `Y.shards = 2`.
@@ -558,8 +584,20 @@ slot that is not `Stable`, or (when peers are known) touches a slot this node do
 
 ## 11. Slot migration
 
-All data movement goes through `migrate_keys_to_node(router, keys, host, port, MigrateOpts)` in
-`src/connection.rs`, shared with the `MIGRATE` command.
+All data movement goes through
+`migrate_keys_to_node(router, keys, host, port, MigrateOpts, &mut conn)` in `src/connection.rs`,
+shared with the `MIGRATE` command. `conn: &mut Option<TcpStream>` carries the connection to the
+target across calls, because a slot moves in many batches:
+
+- `None` → the call opens a fresh connection; on full success it leaves the stream in `conn` for the
+  next batch;
+- after any error the stream is dropped (left `None`), so the next batch reconnects rather than
+  reading a half-consumed reply stream.
+
+Slot migration (`MIGRATE-SLOT`, `REBALANCE`, `RESHARD`) creates one `conn` per slot and drops it
+when the slot's keys are moved, so all batches of a slot share one TCP connection instead of paying
+a handshake per batch. `MIGRATE` passes a throwaway `&mut None`, so each `MIGRATE` uses its own
+connection.
 
 ### 11.1 `migrate_keys_to_node`
 
@@ -567,13 +605,19 @@ All data movement goes through `migrate_keys_to_node(router, keys, host, port, M
    `PEXPIRETIME` (absolute expiry in ms, `-1`/`-2` treated as none).
 2. Build one pipelined request: `ASKING`, then per key
    `RESTORE <key> <abs-expiry-ms or 0> <payload> [REPLACE] [ABSTTL]`.
-3. Connect to the target (`opts.timeout`), send, then read until one reply per command has arrived
-   (`take_simple_replies`), each read bounded by `opts.timeout`.
+3. Take the stream from `conn`, or connect to the target (`opts.timeout`); send, then read until one
+   reply per command has arrived (`take_simple_replies`), each read bounded by `opts.timeout`.
 4. For each key the target answered `+OK`: unless `copy`, delete it locally with
    `Router::del_if_unchanged(key, payload)` — deleted only if its current DUMP still equals what was
    sent, checked and deleted on the owning shard in one step.
 5. Any error reply → `Err("ERR Target instance replied with error: ...")`; I/O problems →
-   `IOERR ...`. Keys not confirmed stay on the source.
+   `IOERR ...`. Keys not confirmed stay on the source, and the connection is not handed back.
+   With no error, the stream goes back into `conn`.
+
+**Worked example.** A slot holding 1000 keys, moved by `MIGRATE-SLOT` (100 keys per batch): ten
+`migrate_keys_to_node` calls over **one** connection, then an eleventh `get_keys_in_slot` returns
+nothing and the connection is dropped. If batch 4 times out, its stream is dropped, the handler
+stops with `-ERR migration failed: IOERR ...`, and a retry opens a new connection.
 
 `DUMP` works from the tier record, so keys spilled to NVMe migrate too. Slot migration uses
 `copy = false`, `replace = true`, `timeout = SLOT_MIGRATION_TIMEOUT` (5 s).
@@ -584,8 +628,8 @@ Run on the source node:
 
 1. `Migrating(host:port)` locally, `sync_slot_tables`.
 2. Send `CLUSTER SETSLOT <slot> IMPORTING <my id>` to the target's client port (1 s timeouts).
-3. Repeat `get_keys_in_slot(slot, 100)` → `migrate_keys_to_node` until empty. On error reply
-   `-ERR migration failed: ...` and stop (the slot stays `Migrating`).
+3. Repeat `get_keys_in_slot(slot, 100)` → `migrate_keys_to_node` (all batches over one connection)
+   until empty. On error reply `-ERR migration failed: ...` and stop (the slot stays `Migrating`).
 4. Send `CLUSTER SETSLOT <slot> NODE myself` to the target.
 5. `Moved(host:port)` locally; `+OK`.
 
@@ -619,7 +663,8 @@ Syntax: `CLUSTER REBALANCE [<host> <port> [<slots>]] [WEIGHTS id=w ...] [SIMULAT
 2. Otherwise `execute_rebalance_plans(router, hub, plans, batch)` runs (batch = `PIPELINE`
    clamped to 1..1000; RESHARD uses 100) and replies with the number of plans it applied. Per plan:
    - **we are the source**: mark `migrating` (hub) and `Migrating` (router); `SETSLOT IMPORTING`
-     to the target; move keys in batches until the slot is empty or a batch fails; `SETSLOT NODE
+     to the target; move keys in batches of `batch` keys over one connection until the slot is
+     empty or a batch fails; `SETSLOT NODE
      myself` to the target; `Moved` locally; `assign_slot(slot, target)`; clear the hub state;
      `bump_config_epoch`; `refresh_peer(target)` (an immediate PING/PONG so both sides learn each
      other's new epoch).
@@ -737,6 +782,7 @@ found.
 | Election delay / loser back-off | 500 + rand(500) ms / 1000 + rand(1000) ms | `start_election` |
 | Vote request timeouts | 500 ms connect / 1000 ms I/O | `start_election` |
 | `MFSTART` exchange | 2 s | `manual_failover_start` |
+| `MFSTART` write-settle wait | 1 s (100 µs polls) | `handle_cluster_bus_line` → `wait_writes_streamed_blocking` |
 | `refresh_peer` exchange | 500 ms | after each rebalance plan |
 | Failure quorum / election majority | `n / 2 + 1` of masters serving slots | `failure_quorum`, `start_election` |
 | `SLOT_MIGRATION_TIMEOUT` | 5 s | `connection.rs` |
@@ -789,7 +835,19 @@ found.
   `Migrating`.
 - **Bus code runs on blocking OS threads**, outside the async runtime. It must not `await` or touch
   shard-local (`Rc`/`RefCell`) state; it reaches shards only through the hub and through
-  `take_follow` / pause flags.
+  `take_follow` / pause flags. That is why `MFSTART` uses the blocking
+  `wait_writes_streamed_blocking` (sleep-polling atomics) rather than the async
+  `wait_streams_flushed`.
+- **A refused `MFSTART` leaves the master paused.** The pause and `mf_paused` are set before the
+  write-settle wait; if that wait times out the master replies with an error but its writers stay
+  paused until the 5 s pause expires (or it steps down).
+- **Slot-migration connections are reused only after a clean exchange.** A stream goes back into
+  `conn` only when every reply of the batch was read; anything else drops it, so a batch never reads
+  a previous batch's leftover replies.
+- **`cross-shard-strict` is shard-based, cluster CROSSSLOT is slot-based.** Outside cluster mode
+  keys are normally placed by the hash of their hash tag, so two keys in different slots may still
+  share a shard and be accepted; in cluster mode any two different slots are refused even if one
+  shard serves both.
 
 ---
 
@@ -840,13 +898,17 @@ found.
 | `src/cluster.rs` | `compute_rebalance_plan`, `compute_reshard_plan`, `SlotMigrationPlan`, `RebalanceOptions` | Planning. |
 | `src/cluster.rs` | `dfly_cluster_config`, `dfly_slot_migration_status`, `dfly_migrate_init/flow/ack`, `ActiveMigration` | Dragonfly compatibility. |
 | `src/cluster.rs` | `parse_slot_ranges`, `compact_slots`, `remove_slots`, `slots_repr`, `bus_port`, constants | Helpers and limits. |
-| `src/connection.rs` | `execute_command_inner` (ASKING, CROSSSLOT, `SlotState` match, `Stable` branch) | Per-command redirect decision. |
-| `src/connection.rs` | `Command::Cluster` / `DflyCluster` / `DflyMigrate` arms, `Readonly` / `Readwrite` arms | Command handlers. |
-| `src/connection.rs` | `migrate_keys_to_node`, `MigrateOpts`, `take_simple_replies`, `execute_rebalance_plans`, `SLOT_MIGRATION_TIMEOUT` | Key migration. |
-| `src/connection.rs` | `apply_config_value` (`cluster-node-timeout`, `cluster-config-file`), `set_node_port`, `node_port`, `set_client_pause`, `unpause_clients` | Config, shard-port → node mapping, manual-failover pause. |
+| `src/connection.rs` | `execute_command_inner` (ASKING, CROSSSLOT / `cross_shard_strict`, `SlotState` match, `Stable` branch) | Per-command redirect decision. |
+| `src/connection.rs` | `cross_shard_strict`, `set_cross_shard_strict`, `keys_on_several_shards`, `tx_has_cross_slot`, EXEC arm | `cross-shard-strict` switch and the per-command / per-transaction CROSSSLOT checks. |
+| `src/connection.rs` | `Command::Cluster` / `DflyCluster` / `DflyMigrate` arms, `Readonly` / `Readwrite` arms, `Command::Failover` arm (refused in cluster mode) | Command handlers. |
+| `src/connection.rs` | `migrate_keys_to_node` (with its reusable `conn`), `MigrateOpts`, `take_simple_replies`, `execute_rebalance_plans`, `SLOT_MIGRATION_TIMEOUT` | Key migration. |
+| `src/connection.rs` | `apply_config_value` (`cluster-node-timeout`, `cluster-config-file`, `cross-shard-strict`), `set_node_port`, `node_port`, `set_client_pause`, `unpause_clients`, `writes_running` | Config, shard-port → node mapping, manual-failover pause and running-write count. |
+| `src/replication.rs` | `wait_writes_streamed_blocking`, `streams_flushed` | `MFSTART`'s write-settle wait. |
 | `src/router.rs` | `key_slot`, `slot_to_shard`, `Router::target_shard`, `target_shard_for_slot`, `get_slot_state`, `set_slot_state`, `set_slot_owner`, `sync_slot_tables`, `get_keys_in_slot`, `del_if_unchanged`, `Router::cluster_*` | Slot math, per-shard slot tables, passthroughs into the hub. |
 | `src/shard.rs` | `SlotState`, `ShardMessage::SetSlotState` / `SetSlotOwner` / `SlotBarrier` | Migration states and cross-shard propagation. |
 | `src/server.rs` | per-shard port binding, `start_cluster_bus` call, follow loop | Process wiring. |
-| `src/main.rs` | cluster setup block (`cluster-config-file`, `load_config`) | Startup. |
+| `src/main.rs` | cluster setup block (`cluster-config-file`, `load_config`), `--cross-shard-strict` | Startup. |
 | `src/resp.rs` | `ClusterSubcommand`, `SetSlotSubcommand`, `DflyClusterSubcommand`, `DflyMigrateSubcommand` | Command parsing (`REBALANCE` options, `FAILOVER FORCE` / `TAKEOVER`, `RESTORE-ASKING`). |
-| `src/cluster.rs` tests | e.g. `test_newer_claim_takes_slots_and_demotes_an_emptied_master`, `test_election_needs_data_and_a_majority_of_masters`, `test_peer_shards_give_single_hop_redirects`, `test_cluster_bus_rejects_hostile_frames`, `test_cluster_save_and_load_nodes_conf` | Executable specs of the behaviour above. |
+| `src/cluster.rs` tests | e.g. `test_newer_claim_takes_slots_and_demotes_an_emptied_master`, `test_election_needs_data_and_a_majority_of_masters`, `test_mfstart_pauses_a_masters_writers_until_it_steps_down`, `test_peer_shards_give_single_hop_redirects`, `test_cluster_bus_rejects_hostile_frames`, `test_malformed_bus_lines_are_ignored`, `test_cluster_save_and_load_nodes_conf` | Executable specs of the behaviour above. |
+| `tests/e2e_cluster.rs` | e.g. `test_cluster_mode_moved_redirection_and_per_shard_ports_e2e`, `test_cluster_master_failure_promotes_its_replica_e2e`, `test_cluster_manual_failover_loses_no_acknowledged_write_e2e`, `test_cluster_multi_exec_crossslot_e2e`, `test_slot_migration_reuses_one_connection_e2e`, `test_cluster_rebalance_pipeline_e2e` | End-to-end cluster tests (`cargo test --test e2e_cluster`). |
+| `tests/test_fuzz_parsers.rs`, `fuzz/fuzz_targets/cluster_bus.rs` | `test_fuzz_cluster_bus_lines`, `cluster_bus` target | Arbitrary bytes through `handle_cluster_bus_line`. |

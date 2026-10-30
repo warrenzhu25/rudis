@@ -6,7 +6,8 @@
 > `io_uring` primitives), `src/netsec.rs` (the *real* listener path, for contrast). Integration points:
 > `src/server.rs` (per-shard XDP poll task), `src/connection.rs` (`XDP.*` dispatch,
 > `target_shard_of_cmd`, `execute_local_command`), `src/resp.rs` (`XDP.*` parsing, experimental-command
-> gate), `src/acl_categories.rs`, `src/main.rs` / `src/config.rs` (`enable-experimental-commands`).
+> gate), `src/acl_categories.rs`, `src/main.rs` / `src/config.rs` (`enable-experimental-commands`),
+> `Cargo.toml` (the `xdp` cargo feature), `src/aof.rs` (`AofSlot`, read by the poll task).
 
 ---
 
@@ -24,7 +25,7 @@ one really is:
 
 | Piece | What it really is | Who uses it |
 | :--- | :--- | :--- |
-| `src/xdp.rs` | An **in-process simulation** of AF_XDP: UMEM, the four XSK rings, a CIDR filter, a per-IP rate limiter and a hand-written Ethernet/IPv4/TCP parser. No eBPF program, no AF_XDP socket, no NIC. | The experimental `XDP.*` commands, and one background task per shard that executes commands found in packets injected with `XDP.INJECT`. |
+| `src/xdp.rs` | An **in-process simulation** of AF_XDP: UMEM, the four XSK rings, a CIDR filter, a per-IP rate limiter and a hand-written Ethernet/IPv4/TCP parser. No eBPF program, no AF_XDP socket, no NIC. Compiled only with the `xdp` cargo feature (on by default). | The experimental `XDP.*` commands, and one background task per shard that executes commands found in packets injected with `XDP.INJECT`. |
 | `src/zerocopy.rs` | Real, correct wrappers around `SO_ZEROCOPY`, `send(..., MSG_ZEROCOPY)`, an `io_uring` `SendZc` builder and a page-aligned buffer pool for `io_uring` buffer registration. | Nobody — only its own unit tests. |
 | `src/netsec.rs` | The **real** network ingress path: `bind` parsing, `SO_REUSEPORT` listener creation, the port-in-use probe, and protected mode. | `main.rs` and every shard in `server.rs`. All real client traffic arrives here. |
 
@@ -59,7 +60,7 @@ flowchart TD
         EXEC --> TX["tx_burst: tx_ring + comp_ring (never drained)"]
     end
 
-    EXEC -.->|"mutates real keyspace + AOF"| DB["Shard database"]
+    EXEC -.->|"mutates real keyspace, AOF and replicas"| DB["Shard database"]
 ```
 
 Read the diagram as two worlds. The top box is how every real client reaches Rudis. The bottom box
@@ -70,6 +71,51 @@ command inside it is executed for real against the shard's database.
 ---
 
 ## 3. Enablement and access control
+
+Two independent switches control XDP: a **compile-time** cargo feature decides whether the engine
+exists in the binary at all, and a **runtime** flag decides whether clients may use the commands.
+
+```mermaid
+flowchart TD
+    C["Client sends XDP.RULE LIST"] --> G{"enable-experimental-commands?"}
+    G -->|"no"| U["Command::Unknown: unknown command error"]
+    G -->|"yes"| A{"ACL allows xdp?"}
+    A -->|"no"| N["NOPERM error"]
+    A -->|"yes"| F{"built with cargo feature xdp?"}
+    F -->|"no"| R["-ERR XDP is not compiled into this build (cargo feature xdp)"]
+    F -->|"yes"| E["Handler runs against GLOBAL_XDP_ENGINE"]
+```
+
+### 3.1 The `xdp` cargo feature
+
+`Cargo.toml` declares two optional experimental subsystems a production build can leave out:
+
+```toml
+[features]
+default = ["mcp", "xdp"]
+mcp = []
+xdp = []
+```
+
+- **Default build** (`cargo build --release`): `xdp` is on; everything in this document applies.
+- **`cargo build --release --no-default-features`**: the engine is not compiled.
+  - `src/xdp.rs` keeps only `XdpAction` (and its `Display`) outside the gate, because the parser's
+    `Command::XdpRuleAdd { action, .. }` variant needs it. Everything else — `XdpMode`, rules, rings,
+    UMEM, sockets, `XdpEngine`, `extract_transport_payload`, `GLOBAL_XDP_ENGINE` — lives in a private
+    `mod engine` marked `#[cfg(feature = "xdp")]` and is re-exported with `pub use engine::*`.
+  - `XDP.*` commands still **parse** (so the same `Command` variants exist in every build) and still
+    pass the experimental gate and ACL check, but every `Command::Xdp*` arm in
+    `execute_command_inner` collapses into one `#[cfg(not(feature = "xdp"))]` arm that replies
+    `-ERR XDP is not compiled into this build (cargo feature xdp)` — even with
+    `enable-experimental-commands yes`.
+  - No shard spawns the XDP poll task (§6.2); its block in `run_shard_worker` is
+    `#[cfg(feature = "xdp")]`.
+
+`MCP.*` follows the same pattern under the `mcp` feature. The other experimental families stay
+compiled in unconditionally, because their data lives in RDB and AOF files that a build without them
+could not load; XDP has no persisted state, so leaving it out is safe.
+
+### 3.2 The runtime gate
 
 The `XDP.*` commands belong to the **experimental command families**. They are off by default.
 
@@ -86,13 +132,17 @@ The `XDP.*` commands belong to the **experimental command families**. They are o
   (`connection::get_cmd_name`, which the ACL check `acl_cmd_name` falls back to), and the generated
   ACL table (`acl_categories.rs`) lists `xdp` in
   categories `@admin`, `@slow` and `@dangerous`. A user without those permissions cannot run them.
-- **Engine and poll tasks always exist.** The gate controls only the commands. The global engine is
-  created lazily on first use, and every shard always spawns its XDP poll task (§6.2); with
-  experimental commands disabled that task simply finds no socket and sleeps 200 ms between checks.
+- **Engine and poll tasks exist in every `xdp` build.** The runtime gate controls only the
+  commands. In a build with the `xdp` feature the global engine is created lazily on first use, and
+  every shard spawns its XDP poll task (§6.2); with experimental commands disabled that task simply
+  finds no socket and sleeps 200 ms between checks.
 
 ---
 
 ## 4. Data structures (`src/xdp.rs`)
+
+Apart from `XdpAction`, every type and function below is inside `mod engine` and exists only with the
+`xdp` cargo feature (§3.1).
 
 ### 4.1 `XdpAction` and `XdpMode`
 
@@ -363,9 +413,13 @@ normally; `base_port + shard_id` in cluster mode).
 
 A non-numeric `<queue_id>` for `XDP.SOCKET` / `XDP.INJECT` is silently treated as `0`.
 
+In a build without the `xdp` feature, all eight variants instead reply
+`-ERR XDP is not compiled into this build (cargo feature xdp)` (§3.1).
+
 ### 6.2 The per-shard poll task (`server.rs`, `run_shard_worker`)
 
-Every shard spawns one `monoio` task at startup that pretends to be the user-space half of AF_XDP:
+In builds with the `xdp` feature, every shard spawns one `monoio` task at startup that pretends to
+be the user-space half of AF_XDP:
 
 1. Each iteration, look up `xdp_engine.get_socket(shard_port, shard_id)`. It does **not** create
    the socket; a socket created later by a command is picked up on the next iteration.
@@ -381,8 +435,12 @@ Every shard spawns one `monoio` task at startup that pretends to be the user-spa
    single-key commands (`GET`, `SET`, `HSET`, `SADD`, single-key `DEL`/`EXISTS`, …) to the key's
    owner and returns `None` for everything else. `None` becomes the polling shard's own id.
 7. Execute: on the local shard via `connection::execute_local_command(&cmd, &mut db, &mut out,
-   aof)` — the real shard database, with AOF logging — or on another shard via
-   `Router::execute_remote(target_sid, cmd).await` (the normal cross-shard mailbox).
+   aof)` — the real shard database — or on another shard via
+   `Router::execute_remote(target_sid, cmd).await` (the normal cross-shard mailbox). `aof` is read
+   from the shard's `AofSlot` (`xdp_aof.get()`) for every command, so it is the writer in effect at
+   that moment: `CONFIG SET appendonly` turning AOF on or off is honoured immediately. Writes are
+   logged through `log_change`, which appends them to the AOF (when on) and propagates them to any
+   connected replicas.
 8. If there is a reply, `tx_burst(&[&out])` writes it into the same socket's `tx_ring` and
    `comp_ring`, where it stays forever.
 
@@ -398,8 +456,8 @@ Every shard spawns one `monoio` task at startup that pretends to be the user-spa
 4. `process_packet` sees `*` → no source IP → `Redirect` (`redirected_packets` += 1).
 5. `extract_transport_payload` returns the bytes unchanged; `parse_command` yields `SET a b`;
    `target_shard_of_cmd` gives shard 0.
-6. `execute_local_command` sets `a` = `b` and appends it to the AOF. `GET a` from any client now
-   returns `b`.
+6. `execute_local_command` sets `a` = `b`, appends it to the AOF if AOF is on, and sends it to any
+   replicas. `GET a` from any client now returns `b`.
 7. `+OK\r\n` is written to UMEM frame 0 and to `tx_ring`; `XDP.SOCKET 0` now reports `tx_len 1`.
 
 ### 6.3 Which socket does an injection reach?
@@ -524,7 +582,8 @@ None of this interacts with `xdp.rs` or `zerocopy.rs`.
 ## 9. Invariants & gotchas
 
 - **`XDP.INJECT` executes real commands.** A payload that parses and is classified `Pass` or
-  `Redirect` mutates the real keyspace and is written to the AOF. It runs through
+  `Redirect` mutates the real keyspace, is written to the AOF and is propagated to replicas. It runs
+  through
   `execute_local_command` directly, so it skips the per-connection checks a normal client goes
   through (ACL key/command permissions, auth, MULTI state) — only the `XDP.INJECT` call itself is
   ACL-checked. The database index used is whatever `connection::CURRENT_DB` holds on that shard
@@ -563,6 +622,11 @@ None of this interacts with `xdp.rs` or `zerocopy.rs`.
 - **One engine per process.** Rules, rate limiters, counters and sockets are shared by all shards,
   and by all servers started in the same process (unlike `netsec.rs` settings, which are keyed by
   port).
+- **Two gates, two different errors.** With experimental commands disabled, `XDP.*` is an unknown
+  command. With them enabled but the binary built without the `xdp` feature, the command is known,
+  ACL-checked, and refused with `-ERR XDP is not compiled into this build (cargo feature xdp)`.
+  Code that names any engine type (anything except `XdpAction`) must itself be
+  `#[cfg(feature = "xdp")]`, or `--no-default-features` builds stop compiling.
 
 ## 10. Limitations / not implemented
 
@@ -583,7 +647,9 @@ None of this interacts with `xdp.rs` or `zerocopy.rs`.
 
 | File | Key symbols | What they do |
 | :--- | :--- | :--- |
-| `src/xdp.rs` | `XdpAction`, `XdpMode` | Verdicts and attachment-mode labels. |
+| `src/xdp.rs` | `XdpAction` | Verdicts; the only item compiled without the `xdp` feature. |
+| `src/xdp.rs` | `mod engine` (`#[cfg(feature = "xdp")]`, `pub use engine::*`) | Holds everything below; absent from `--no-default-features` builds. |
+| `src/xdp.rs` | `XdpMode` | Attachment-mode labels. |
 | `src/xdp.rs` | `XdpRule`, `parse_cidr` | IPv4 CIDR filter entries and parsing. |
 | `src/xdp.rs` | `TokenBucket` | Per-source-IP rate limiter (1 token per packet). |
 | `src/xdp.rs` | `XdpDesc`, `XskRing<T>` | Descriptor and SPSC ring modelled on AF_XDP rings. |
@@ -592,18 +658,28 @@ None of this interacts with `xdp.rs` or `zerocopy.rs`.
 | `src/xdp.rs` | `XdpEngine` (`process_packet`, `add_rule`, `del_rule`, `list_rules`, `get_or_create_socket`, `get_socket`, `info`) | Process-wide engine: rules, limiter, socket registry, counters. |
 | `src/xdp.rs` | `extract_transport_payload` | Strips Ethernet/IPv4/TCP headers to get command bytes. |
 | `src/xdp.rs` | `GLOBAL_XDP_ENGINE`, `get_xdp_engine` | Singleton creation (mode picked from `/sys/class/net`) and access. |
-| `src/server.rs` | `run_shard_worker` (XDP poll task) | Drains the shard's socket, classifies, parses and executes injected commands. |
-| `src/connection.rs` | `Command::Xdp*` handlers, `get_cmd_name`, `target_shard_of_cmd`, `execute_local_command` | Command execution, ACL family name, routing and local execution reused by the poll task. |
+| `src/xdp.rs` | `feature_tests::test_xdp_commands_parse_in_every_build` | Checks `XDP.*` parses and `XdpAction` exists with or without the feature. |
+| `Cargo.toml` | `[features]` `default = ["mcp", "xdp"]`, `xdp = []` | Compile-time switch for the engine, handlers and poll task. |
+| `src/server.rs` | `run_shard_worker` (XDP poll task, `#[cfg(feature = "xdp")]`) | Drains the shard's socket, classifies, parses and executes injected commands. |
+| `src/aof.rs` | `AofSlot` | Shard's current AOF writer, read by the poll task per command. |
+| `src/connection.rs` | `Command::Xdp*` handlers (plus the `#[cfg(not(feature = "xdp"))]` refusal arm), `get_cmd_name`, `target_shard_of_cmd`, `execute_local_command`, `log_change` | Command execution, ACL family name, routing, local execution reused by the poll task, AOF/replica logging. |
 | `src/resp.rs` | `build_command` (`XDP.*` arms), `Command::Xdp*`, `EXPERIMENTAL_PREFIXES`, `is_experimental_command_name`, `set_experimental_commands`, `experimental_commands_enabled` | Parsing and the experimental-command gate. |
 | `src/acl_categories.rs` | `xdp` entry | ACL categories `@admin @slow @dangerous`. |
 | `src/config.rs`, `src/main.rs` | `enable_experimental_commands` | Config / CLI switch for the `XDP.*` commands. |
 | `src/zerocopy.rs` | `ZeroCopyStats`, `RegisteredBufferPool`, `ZeroCopyEngine` (`enable_so_zerocopy`, `send_zc`, `build_io_uring_send_zc`), `PAGE_SIZE`, `MSG_ZEROCOPY` | Unused zero-copy send and fixed-buffer primitives. |
 | `src/netsec.rs` | `parse_bind_spec`, `format_bind_spec`, `bind_reuseport_listener`, `bind_all`, `ensure_port_free`, `ensure_port_free_with_grace`, `protected_mode_denies`, `ProtectedAction` | The real listener path, port probe and protected mode. |
+| `tests/e2e_experimental.rs` | `test_af_xdp_ebpf_kernel_bypass_e2e`, `test_af_xdp_kernel_bypass_zero_copy_rings_e2e` (ignored without `xdp`), `test_mcp_and_xdp_follow_their_cargo_features_e2e` | End-to-end coverage of the commands, injection path and feature refusal. |
 
 ### How to verify changes
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
 cargo test --lib -- xdp:: zerocopy:: netsec::
+cargo test --lib --no-default-features -- xdp::
+cargo test --test e2e_experimental -- xdp
 ```
+
+CI and `scripts/gate.sh` run clippy without default features too; CI also runs the unit tests that
+way.

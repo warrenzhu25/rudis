@@ -428,7 +428,7 @@ does not → `-ERR could not decode requested zset member`.
 | Function (`src/connection.rs`) | Geo behaviour |
 | :--- | :--- |
 | `cmd_primary_key` | Returns the source `key` for all eight commands. |
-| `for_each_cmd_key` / `cmd_keys` | Reports `key` plus `store`/`storedist` for `GEORADIUS*`; `dest` and `key` for `GEOSEARCHSTORE`. Used for the cluster `CROSSSLOT` check and for `WATCH`/client-tracking invalidation when a change is recorded. |
+| `for_each_cmd_key` / `cmd_keys` | Reports `key` plus `store`/`storedist` for `GEORADIUS*`; `dest` and `key` for `GEOSEARCHSTORE`. Used for the cluster `CROSSSLOT` check, the `cross-shard-strict` check, and for `WATCH`/client-tracking invalidation when a change is recorded. |
 | `target_shard_of_cmd` | Routes all eight commands by the source `key` only. |
 | `get_cmd_name` | Command names for stats/slowlog; maps store-less `GEORADIUS*` to the `_RO` names. |
 
@@ -491,7 +491,11 @@ are one `zscore` hash lookup per member.
   local `ShardDb`. If the destination key hashes to a different shard, the result lands on the
   wrong shard and later direct reads of the destination (which route by its own slot) do not see
   it. In cluster mode this cannot happen because the `CROSSSLOT` check (gated on
-  `router.cluster_enabled`) rejects such commands. Using hash tags (e.g. `{geo}src` /
+  `router.cluster_enabled`) rejects such commands. Outside cluster mode, `cross-shard-strict yes`
+  (config file, `--cross-shard-strict`, or `CONFIG SET`; default `no`) makes
+  `execute_command_inner` refuse a command whose keys (`cmd_keys`) live on different shards with
+  the same `-CROSSSLOT Keys in request don't hash to the same slot` error, which closes this gap.
+  Using hash tags (e.g. `{geo}src` /
   `{geo}dst`) avoids the problem.
 - **`BYPOLYGON`** appears in the copied `COMMAND DOCS` metadata for `GEOSEARCH`/`GEOSEARCHSTORE`
   but is not parsed — it is a `syntax error`.

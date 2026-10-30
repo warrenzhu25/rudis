@@ -40,6 +40,13 @@ through the normal dispatcher, and the raw RESP reply is converted back to JSON.
 > The `MCP.` command family is **experimental** and is off by default. Unless the server runs
 > with `enable-experimental-commands yes` (config file) or `--enable-experimental-commands yes`
 > (CLI), `MCP.TOOLS`/`MCP.CALL`/`MCP.RPC` are parsed as unknown commands.
+>
+> MCP is also a **cargo feature**, `mcp`, on by default (`[features] default = ["mcp", "xdp"]` in
+> `Cargo.toml`). A `cargo build --release --no-default-features` build leaves `src/mcp.rs` out
+> (`#[cfg(feature = "mcp")] pub mod mcp;` in `src/lib.rs`). The three `Command` variants still
+> parse, but `execute_command_inner` answers all of them with
+> `-ERR MCP is not compiled into this build (cargo feature mcp)`, even with experimental commands
+> on.
 
 ---
 
@@ -397,6 +404,8 @@ Backing subsystems reached through the inner dispatch:
 ## 10. Limitations / not implemented
 
 - **Experimental gate**: disabled unless `enable-experimental-commands` is on.
+- **Cargo feature**: a build without the `mcp` feature refuses all three commands with
+  `-ERR MCP is not compiled into this build (cargo feature mcp)`.
 - **Transport**: only RESP-embedded; no native MCP stdio, HTTP or SSE transport.
 - **JSON-RPC subset**: only `initialize`, `ping`, `tools/list`, `tools/call`. No
   `resources/*`, `prompts/*`, `logging/*`, `completion/*` or `notifications/*`.
@@ -414,7 +423,10 @@ Backing subsystems reached through the inner dispatch:
   `test_resp_bytes_to_json_full_spectrum` covers each supported RESP prefix and
   `format_mcp_call_result`. The end-to-end test
   `test_mcp_protocol_tools_call_and_rpc_e2e` (`tests/e2e_experimental.rs`) covers `MCP.TOOLS`,
-  `MCP.CALL` for KV set/get, and `MCP.RPC` `initialize` plus `tools/call` for agent memory add/context.
+  `MCP.CALL` for KV set/get, and `MCP.RPC` `initialize` plus `tools/call` for agent memory add/context;
+  it is ignored in a build without the `mcp` feature, and so are the `mcp::tests` unit tests
+  (the module is not compiled). `test_mcp_and_xdp_follow_their_cargo_features_e2e` checks
+  either outcome: a tool list with the feature, the "cargo feature mcp" error without it.
 
 ---
 
@@ -431,8 +443,9 @@ Backing subsystems reached through the inner dispatch:
 | `src/resp.rs` | `Command::McpTools`, `Command::McpCall`, `Command::McpRpc` | Command variants. |
 | `src/resp.rs` | `build_command` (`"MCP.TOOLS"`, `"MCP.CALL"`, `"MCP.RPC"` arms) | Arity checks and argument capture. |
 | `src/resp.rs` | `EXPERIMENTAL_PREFIXES`, `is_experimental_command_name`, `set_experimental_commands` | Experimental gate covering the `MCP.` prefix. |
-| `src/connection.rs` | `execute_command_inner` (`Command::McpTools` / `McpCall` / `McpRpc` arms) | Reply formatting, JSON-RPC dispatch, recursive `execute_command` for tool calls. |
+| `src/connection.rs` | `execute_command_inner` (`Command::McpTools` / `McpCall` / `McpRpc` arms) | Reply formatting, JSON-RPC dispatch, recursive `execute_command` for tool calls; a `#[cfg(not(feature = "mcp"))]` arm refuses all three. |
 | `src/connection.rs` | `get_cmd_name` | Names all three variants `"MCP"`. |
 | `src/connection.rs` | `acl_denied` | Re-run for the inner planned command. |
 | `src/acl_categories.rs` | `COMMANDS` entry `mcp` | ACL categories `@admin @slow @dangerous`. |
-| `tests/e2e_experimental.rs` | `test_mcp_protocol_tools_call_and_rpc_e2e` | End-to-end coverage over a real connection. |
+| `tests/e2e_experimental.rs` | `test_mcp_protocol_tools_call_and_rpc_e2e`, `test_mcp_and_xdp_follow_their_cargo_features_e2e` | End-to-end coverage over a real connection; the cargo-feature switch. |
+| `Cargo.toml`, `src/lib.rs` | `[features]` `mcp` (default on), `#[cfg(feature = "mcp")] pub mod mcp` | Compile-time switch for the whole subsystem. |

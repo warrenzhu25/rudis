@@ -467,8 +467,9 @@ do not invalidate a `WATCH` on the quota key.
 
 ### 6.2 Snapshot records
 
-Snapshots (`ShardDb::save_rdb_chunk` for SAVE/BGSAVE and full-resync RDB generation, and the
-`AofImage` used by BGREWRITEAOF) write the agent stores in `save_extended_small_records`, inside
+Snapshots (the point-in-time `AofImage` that SAVE/BGSAVE, streamed full resyncs and BGREWRITEAOF
+build, and the one-pass `ShardDb::save_rdb_chunk` behind `Router::generate_full_rdb`) write the
+agent stores in `save_extended_small_records`, inside
 the `rudis-ext` AUX field that Redis/Valkey ignore. Each record is `key, type byte, payload`;
 integers are little-endian, byte strings are length-prefixed, optional strings have a presence
 byte.

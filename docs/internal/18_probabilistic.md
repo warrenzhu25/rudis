@@ -318,7 +318,9 @@ structure of that kind. If any check fails, the store is left untouched.
 
 - **Save**: `ShardDb::ext_item_keys` lists every extended key: JSON, Bloom, vector, Cuckoo, CMS,
   Top-K. `ShardDb::save_ext_item` writes each one as `[u32 key_len][key][tag][encode()]`. These
-  records go into a `rudis-ext` AUX field of the Redis-format RDB (`save_extended_rdb_chunk`).
+  records go into a `rudis-ext` AUX field of the Redis-format RDB (`save_extended_rdb_chunk` in a
+  one-pass `save_rdb_chunk`; `SAVE`/`BGSAVE` and streamed full syncs write the same records one
+  structure per step from a point-in-time `AofImage`).
   Real Redis and Valkey skip that field.
 - **Load**: `RudisTable::load_legacy_records` (in `src/table.rs`) handles tags 8/10/11/12 with
   the same validating `decode` functions. A structure is inserted only if
@@ -547,7 +549,9 @@ reached through thin `ShardDb` wrappers and answered by `execute_local_command`.
    keyspace event is emitted.
 
 **Cross-shard multi-key** (`src/connection.rs`): if the keys of a `PFCOUNT`/`PFMERGE` hash to
-different shards, cluster mode replies `-CROSSSLOT`. Otherwise the router fetches each key with
+different shards, cluster mode replies `-CROSSSLOT`, and so does a server running with
+`cross-shard-strict yes` (config file, `--cross-shard-strict`, or `CONFIG SET`; default `no`),
+which applies the same check by shard instead of by slot. Otherwise the router fetches each key with
 `router.get`, decodes and max-merges locally, and either computes the count or writes the
 result with `router.set`. That write is logged as a `SET` and fires `set` events.
 `router.get` returns nothing for a key of the wrong type, so on this path a list key is
@@ -658,11 +662,12 @@ Any other `PFDEBUG` subcommand gives `unknown subcommand for 'pfdebug' command`.
 - `src/aof.rs`: `test_probabilistic_writes_round_trip_through_aof_encoding`,
   `test_probabilistic_state_survives_aof_replay_and_rewrite`. `src/table.rs`:
   `test_load_rdb_validates_probabilistic_records`, `test_rudis_table_bitmaps_and_hll`.
-- `tests/e2e_experimental.rs`: `test_probabilistic_data_structures_e2e`,
-  `test_probabilistic_writes_survive_restart_through_the_aof_e2e`,
+- `tests/e2e_experimental.rs`: `test_probabilistic_data_structures_e2e`.
+  `tests/e2e_persistence.rs`: `test_probabilistic_writes_survive_restart_through_the_aof_e2e`,
   `test_probabilistic_writes_survive_aof_rewrite_and_restart_e2e`,
-  `test_restore_forged_payloads_are_refused_e2e`, `test_hostile_sizes_get_bounded_replies_e2e`,
-  `test_experimental_commands_off_by_default_e2e`, `test_bitmaps_and_hyperloglog_e2e`.
+  `test_restore_forged_payloads_are_refused_e2e`. `tests/e2e_commands.rs`:
+  `test_hostile_sizes_get_bounded_replies_e2e`, `test_experimental_commands_off_by_default_e2e`,
+  `test_bitmaps_and_hyperloglog_e2e`.
   `tests/test_redis_rdb_compat.rs` covers HLL import/export and `legacy_rudis_rdb_still_loads`.
 - `src/hll.rs` has no unit-test module. HLL behaviour is covered by the table and e2e tests above
   and by the ported Redis suite `tests/redis-tests/unit/hyperloglog.tcl`. None of these tests

@@ -431,7 +431,11 @@ no randomness or clocks. The test `test_json_writes_round_trip_through_aof_encod
 
 ## 7. `JSON.MGET` — batched cross-shard fan-out
 
-`JSON.MGET` is the only JSON command whose keys can live on different shards.
+`JSON.MGET` is the only JSON command whose keys can live on different shards. (With
+`cross-shard-strict yes` on a multi-shard server outside cluster mode, `execute_command_inner`
+refuses such a `JSON.MGET` up front with `-CROSSSLOT Keys in request don't hash to the same slot`,
+as cluster mode does for keys in different slots; the fan-out below then only ever sees keys
+of one shard.)
 `Router::json_mget(keys, path) -> Vec<Option<String>>`:
 
 1. Empty key list → empty result.
@@ -479,6 +483,11 @@ Valkey skip unknown AUX fields, so the file still loads there (without the JSON 
   filters, vector indexes, Cuckoo filters, CMS and Top-K) and calls `save_ext_item` for each, then
   wraps them with `redis_rdb::write_ext_aux`. A JSON record is:
   `u32 LE key_len | key | 0x07 | u32 LE json_len | compact JSON text`.
+  That one-pass writer serves `ShardDb::save_rdb_chunk`. `SAVE`/`BGSAVE` and streamed full syncs
+  instead build a point-in-time `shard::AofImage` per shard (`start_save_image` /
+  `start_sync_image`), which writes the same records with `save_ext_item`, one document per step,
+  and writes a document's state as of the image's start before the first command that changes it
+  (see §8.2).
 - **Load.** `redis_rdb` hands the `rudis-ext` blob to `table::load_legacy_ext`, which walks records
   in `load_legacy_records`. For type byte `7` it UTF-8-decodes and `serde_json`-parses the text and,
   if `router::target_shard(key, num_shards)` equals this shard, calls `json_store.insert_raw`.
