@@ -1,450 +1,693 @@
-# Component 13: Lua Scripting & Redis 7 Functions Engine — Implementation Reference
+# Component 13: Lua Scripting & Redis 7 Functions — Implementation Reference
 
-> **Source Files**: `src/scripting.rs` (739 lines)
 > **High-Level Design Spec**: [`docs/design/13_scripting_functions.md`](../design/13_scripting_functions.md)
 > **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
+> **Primary source**: `src/scripting.rs` (plus touchpoints in `src/connection.rs`, `src/resp.rs`,
+> `src/server.rs`, `src/aof.rs`, `src/redis_rdb.rs`, `src/router.rs`, `src/allocator.rs`)
 
 ---
 
-## 1. Module Inventory
+## 1. What this subsystem does
 
-`src/scripting.rs` in full — every symbol it defines (there are no `enum`/`trait`/`impl` blocks
-in this file; it is a flat collection of statics and free functions plus one plain struct):
+Redis clients can ship small Lua programs to the server and run them next to the data:
 
-| Kind | Item | Line | Notes |
-| :--- | :--- | :-: | :--- |
-| static | `SCRIPT_CACHE: LazyLock<RwLock<HashMap<String, String>>>` | 9 | SHA1 hex → raw script source |
-| fn | `sha1_hex(data: &[u8]) -> String` | 12 | hex-encodes a `sha1::Sha1` digest |
-| fn | `load_script(script: &[u8]) -> String` | 24 | inserts into `SCRIPT_CACHE`, returns SHA1 |
-| fn | `get_script(sha: &str) -> Option<String>` | 34 | lower-cases `sha` before lookup |
-| fn | `script_exists(shas: &[Bytes]) -> Vec<bool>` | 39 | |
-| fn | `flush_scripts()` | 49 | |
-| fn | `eval_script(script_content, keys, args, db, aof) -> Result<Vec<u8>, String>` | 53 | `EVAL`/`EVALSHA` engine, §3.1 |
-| fn | `resp_bytes_to_lua(lua, out: &[u8]) -> mlua::Result<Value>` | 214 | private; RESP→Lua top-level dispatch |
-| fn | `parse_resp_array_to_lua(lua, buf: &mut BytesMut) -> mlua::Result<Value>` | 262 | private; recursive `*N` array parser |
-| fn | `lua_val_to_resp(val, out: &mut Vec<u8>) -> Result<(), String>` | 342 | private; Lua→RESP, applied once to a script's final return value |
-| struct | `FunctionLib { name, engine, raw_code, functions }` | 394 | `#[derive(Clone, Debug)]` |
-| static | `FUNCTION_LIBS: LazyLock<RwLock<HashMap<String, FunctionLib>>>` | 401 | library name → `FunctionLib` |
-| fn | `load_function(code: &str, replace: bool) -> Result<String, String>` | 405 | `FUNCTION LOAD` engine, §3.4 |
-| fn | `call_function(func_name, keys, args, db, aof) -> Result<Vec<u8>, String>` | 481 | `FCALL` engine, §3.4 |
-| fn | `list_functions() -> Vec<FunctionLib>` | 597 | clones every entry out of `FUNCTION_LIBS` |
-| fn | `delete_function(lib_name: &str) -> bool` | 603 | |
-| fn | `flush_functions()` | 608 | |
+* **`EVAL script numkeys key… arg…`** runs a script once. **`EVALSHA sha1 …`** runs a script
+  that was cached earlier (by `EVAL` or `SCRIPT LOAD`), identified by the SHA-1 of its source.
+* **Redis 7 Functions**: `FUNCTION LOAD` installs a named *library* of Lua functions on the
+  server, and `FCALL name numkeys key… arg…` calls one of them. Libraries are listed, deleted,
+  flushed, dumped and restored with the other `FUNCTION` subcommands.
+* `_RO` variants (`EVAL_RO`, `EVALSHA_RO`, `FCALL_RO`) promise that the script does not write.
 
-`#[cfg(test)] mod tests` occupies lines 612–739 (three tests: basic EVAL/`redis.call` type
-coverage, `EVALSHA`/`FUNCTION` management round-trip, and `FCALL` mutating the AOF — see §6).
+Inside a script, `redis.call(...)` / `redis.pcall(...)` run ordinary Redis commands against
+the shard's data. Rudis embeds a real Lua 5.4 interpreter through the `mlua` crate
+(`mlua = { version = "0.12.1", features = ["lua54", "vendored"] }`; the Lua C source is
+compiled into the binary) and adds the Redis-specific environment around it: a sandboxed
+global table, the `redis` API table, and the `bit`, `cjson` and `cmsgpack` helper libraries
+that Redis scripts expect.
 
-**mlua**: `Cargo.toml` pins `mlua = { version = "0.12.1", features = ["lua54", "vendored"] }` —
-real Lua 5.4 compiled from vendored C source (no system Lua dependency), synchronous API only
-(no `async`/`send` feature enabled, consistent with the thread-per-core, no-cross-thread-Send
-architecture). `Lua::new()` is called with no feature flags restricting the standard library —
-see Gotcha 2.
-
-Both statics are **process-wide** `LazyLock<RwLock<..>>`, not per-shard: `SCRIPT_CACHE` and
-`FUNCTION_LIBS` are shared across every shard/thread in the process, so a script loaded via
-`SCRIPT LOAD`/`EVAL` on one shard's connection is immediately `EVALSHA`-able from a connection
-attached to a different shard, and likewise a `FUNCTION LOAD`ed library is callable from any
-shard. This is unlike almost everything else in Rudis (Components 04/05), which is strictly
-sharded with no implicit cross-shard state. The *execution* of a script, however, is always
-local to one shard's `ShardDb` (§3.1) — only the cached source/library text is global.
-
-`SCRIPT_CACHE` maps SHA1 to raw script **source text**, not compiled bytecode — the source is
-re-parsed by `mlua` on every `EVAL`/`EVALSHA` call, since a fresh `Lua::new()` VM is constructed
-per call. `FunctionLib` holds no persisted, ready-to-call closure; it records only which
-top-level function names a library's source registers, discovered by running the library once
-with a stubbed `redis.register_function` (§3.4).
+The hard part in Rudis — compared with single-threaded Redis — is that data is **sharded across
+threads** (Component 04). A script runs synchronously on one shard thread against that shard's
+`ShardDb`, so the dispatcher must make sure the script runs on the shard that owns its keys, and
+`redis.call` must refuse to touch keys owned by any other shard.
 
 ---
 
-## 2. `FunctionLib` Struct (verbatim, lines 394–399)
+## 2. Mental model
+
+```mermaid
+flowchart TD
+    C["Client: EVAL / EVALSHA / FCALL"] --> P["resp.rs build_command: Command::Eval / Evalsha / Fcall"]
+    P --> D["connection.rs execute_command_inner"]
+    D --> X{"declared KEYS span several shards?"}
+    X -- yes --> E1["-CROSSSLOT error"]
+    X -- no --> F{"owner of KEYS[1] is another shard?"}
+    F -- yes --> R["router.execute_remote: run there (server.rs mailbox handler)"]
+    F -- no --> A{"no KEYS declared?"}
+    A -- yes --> ARM["arm_script_redirect"]
+    A -- no --> RUN
+    ARM --> RUN["scripting.rs eval_script / call_function: fresh Lua VM"]
+    RUN --> RC["redis.call / redis.pcall: checks, then execute_local_command"]
+    RC --> DB[("this shard's ShardDb + AOF + replication")]
+    RUN --> T{"take_script_redirect returned a shard?"}
+    T -- yes --> R
+    T -- no --> OUT["reply to client"]
+```
+
+Key ideas to keep in mind while reading:
+
+1. **One fresh VM per call.** Every `EVAL`, `EVALSHA` and `FCALL` builds a new `mlua::Lua`
+   state, installs the sandbox, runs, converts the result to RESP, and drops the VM. Nothing Lua-
+   side survives between calls; there is no bytecode cache and no VM pool.
+2. **Caches hold source text, process-wide.** `SCRIPT_CACHE` (SHA-1 → source) and
+   `FUNCTION_LIBS` (library name → `FunctionLib`) are `LazyLock<parking_lot::RwLock<HashMap>>`
+   statics shared by every shard thread. A script loaded through one shard's connection is
+   immediately `EVALSHA`-able through any other; a function library is callable from every shard.
+   Only *execution* is per-shard.
+3. **`redis.call` is a real command.** It is parsed with the same `build_command` the wire uses
+   and executed with the same `execute_local_command` the shard uses for normal commands, so
+   each write is AOF-logged and replicated as its own command ("effects replication").
+4. **Functions re-run their library on every `FCALL`.** `FUNCTION LOAD` runs the library once to
+   validate it and record its function names; every `FCALL` re-runs the whole library in a new
+   VM to obtain a callable closure for the requested function.
+
+---
+
+## 3. Data structures
+
+### 3.1 Script cache
 
 ```rust
-#[derive(Clone, Debug)]
+static SCRIPT_CACHE: LazyLock<RwLock<HashMap<String, String>>>;  // lowercase sha1 hex -> source
+```
+
+* `load_script(bytes)` computes `sha1_hex(bytes)` (lowercase hex of a SHA-1 digest), stores the
+  source (lossily converted to UTF-8) and returns the SHA.
+* `get_script(sha)` and `script_exists(shas)` lowercase the SHA before lookup, so `EVALSHA` is
+  case-insensitive.
+* `flush_scripts()` clears it; `cached_scripts_count()` feeds `INFO`'s
+  `number_of_cached_scripts`.
+* There is no size cap or eviction: entries live until `SCRIPT FLUSH` or restart. The cache is
+  not persisted and `SCRIPT FLUSH` is not propagated to the AOF or replicas.
+
+### 3.2 Function libraries
+
+```rust
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FunctionDef {
+    pub name: String,
+    pub description: String,
+    pub flags: Vec<String>,      // subset of: no-writes, allow-oom, allow-stale,
+}                                //   no-cluster, allow-cross-slot-keys
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FunctionLib {
     pub name: String,
-    pub engine: String,     // always "LUA" — no other engine is ever registered
-    pub raw_code: String,   // library source with any "#!" shebang line rewritten to "--" comment
-    pub functions: Vec<String>, // function names discovered via a stubbed redis.register_function
+    pub engine: String,          // always "LUA"
+    pub raw_code: String,        // source with the "#!lua" line turned into a "--" comment
+    #[serde(default)]
+    pub original_code: String,   // source exactly as given to FUNCTION LOAD
+    pub functions: Vec<FunctionDef>,
 }
+
+static FUNCTION_LIBS: LazyLock<RwLock<HashMap<String, FunctionLib>>>;  // library name -> lib
 ```
 
-There is no field for a compiled/cached closure — every `FCALL` re-executes `raw_code` from
-scratch (§3.4, Gotcha 3).
+| Field | Type | Meaning |
+| :-- | :-- | :-- |
+| `FunctionLib::name` | `String` | Library name from `#!lua name=<lib>`; also the map key. Lookups compare case-insensitively. |
+| `FunctionLib::engine` | `String` | Always `"LUA"`; any other engine is rejected at load. |
+| `FunctionLib::raw_code` | `String` | What is actually executed (first line commented out). |
+| `FunctionLib::original_code` | `String` | Returned by `FUNCTION LIST WITHCODE` and written to RDB `FUNCTION2` records. |
+| `FunctionLib::functions` | `Vec<FunctionDef>` | Functions the library registered at load time. |
+| `FunctionDef::flags` | `Vec<String>` | Only `no-writes` changes behaviour (see §6.3); the others are accepted and stored. |
+
+There is no compiled closure stored anywhere: a `FunctionLib` is just text plus metadata.
+
+Helpers over `FUNCTION_LIBS`: `list_functions()` (clones every library, in hash-map order),
+`delete_function(name)` (case-insensitive), `flush_functions()`, `count_functions()`,
+`count_libraries()`, `is_function_read_only(name)` (true if that function carries `no-writes`),
+`library_codes()` (every non-empty `original_code`, sorted by library name, for RDB), and
+`dump_functions()` / `restore_functions()` (§7.3).
+
+### 3.3 Per-thread script state
+
+Two `thread_local!` cells live in `scripting.rs`. Because each shard is one OS thread and a
+script runs to completion without yielding, a thread-local is effectively "the currently running
+script on this shard".
+
+| Item | Type | Meaning |
+| :-- | :-- | :-- |
+| `SCRIPT_REDIRECT` | `Cell<ScriptRedirect>` | Redirect state machine for keyless scripts (§5.3). |
+| `SCRIPT_RECORDED_ERROR` | `Cell<bool>` (pub) | Set when a command inside the script already counted an error in `INFO errorstats`; the dispatcher's error accounting then skips counting the script's own error a second time (it still counts the failed call). Reset to `false` at the start of `eval_script` / `call_function`. |
+
+```rust
+enum ScriptRedirect {
+    Off,        // not a keyless script: normal non-local-key checks apply
+    Armed,      // keyless script, no command issued yet
+    Disarmed,   // first command was local; non-local keys are now errors
+    To(usize),  // first command hit shard N: rerun there, fail every further command
+}
+```
 
 ---
 
-## 3. Execution Algorithms
+## 4. Wire commands and their `Command` variants
 
-### 3.1 `EVAL`/`EVALSHA`: key-based cross-shard forwarding, then local execution
+Parsed in `src/resp.rs` (`build_command`):
 
-`Command::Eval`/`Command::Evalsha` are handled inside the giant async `execute_command` match in
-`src/connection.rs` (that match body spans lines 4906–12337; the `Eval` arm is at line 11146, the
-`Evalsha` arm at line 11174) — **not** inside `execute_local_command`. Each arm now does its own
-explicit first-key routing check:
+| Wire | Variant | Notes |
+| :-- | :-- | :-- |
+| `EVAL` / `EVAL_RO` | `Command::Eval { script, keys, args, read_only, auth_user }` | `numkeys` must be a non-negative integer ≤ remaining args (`ERR Number of keys can't be negative`, `ERR Number of keys can't be greater than number of args`). |
+| `EVALSHA` / `EVALSHA_RO` | `Command::Evalsha { sha, keys, args, read_only, auth_user }` | Same validation. Unknown SHA → `-NOSCRIPT No matching script. Please use EVAL.` |
+| `FCALL` / `FCALL_RO` | `Command::Fcall { function, keys, args, read_only, auth_user }` | A non-numeric `numkeys` gives `ERR Bad number of keys provided, please give a non negative number`. |
+| `SCRIPT LOAD` / `EXISTS` / `FLUSH` / `KILL` | `ScriptLoad`, `ScriptExists`, `ScriptFlush`, `ScriptKill` | `SCRIPT FLUSH` ignores any extra argument. `SCRIPT HELP` maps to `Command::Unknown("SCRIPT HELP")`. |
+| `FUNCTION LOAD [REPLACE] code` | `FunctionLoad { replace, code }` | Any option other than `REPLACE` → `ERR Unknown option given`. |
+| `FUNCTION LIST [WITHCODE] [LIBRARYNAME pat]` | `FunctionList { library_name_pattern, with_code }` | Pattern is a glob (`pubsub::glob_match`). |
+| `FUNCTION DELETE lib` | `FunctionDelete(String)` | |
+| `FUNCTION FLUSH [ASYNC\|SYNC]` | `FunctionFlush` | The mode is validated, then ignored. |
+| `FUNCTION DUMP` | `FunctionDump` | |
+| `FUNCTION RESTORE payload [FLUSH\|APPEND\|REPLACE]` | `FunctionRestore { payload, policy }` | Default policy `APPEND`. |
+| `FUNCTION STATS` / `KILL` | `FunctionStats`, `FunctionKill` | `FUNCTION HELP` → `Command::Unknown("FUNCTION HELP")`. |
 
-```rust
-Command::Eval { script, keys, args } => {
-    if let Some(first_key) = keys.first() {
-        let target = router.target_shard(first_key);
-        if target != router.shard_id {
-            let res = router.execute_remote(target, Command::Eval { script, keys, args }).await;
-            out.extend_from_slice(&res);
-            return false;
-        }
-    }
-    let script_str = String::from_utf8_lossy(&script);
-    crate::scripting::load_script(&script);
-    match crate::scripting::eval_script(&script_str, &keys, &args, &router.local_db, router.aof.as_deref()) {
-        Ok(resp) => out.extend_from_slice(&resp),
-        Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
-    }
-    false
-}
+`auth_user` is always empty when parsed from the wire. The dispatcher fills it with the
+connection's authenticated user before forwarding the command to another shard, so the remote
+shard checks `redis.call` against the **caller's** ACL (§6.2).
+
+The parser marks `_RO` with `read_only: true`; enforcement happens at execution time (§6.3).
+
+---
+
+## 5. Dispatch: getting the script to the right shard
+
+### 5.1 The dispatcher arms (`execute_command_inner` in `src/connection.rs`)
+
+`EVAL`, `EVALSHA` and `FCALL` share one shape:
+
+1. Compute the effective user (`auth_user` carried in the command, else the connection's user)
+   and store it in the thread-local `CURRENT_AUTH_USER`.
+2. **Cross-shard keys** — `keys_span_shards(keys, router.target_shard)`: if the declared keys
+   are owned by more than one shard, reply `-CROSSSLOT Keys in request don't hash to the same
+   slot` (`SCRIPT_CROSS_SHARD_ERR`) and stop. Clients use hash tags (`{user1}:a`, `{user1}:b`)
+   to co-locate keys.
+3. **Forward** — if `KEYS[1]` is owned by another shard, send the whole command (with
+   `auth_user` filled in) through `router.execute_remote` and relay its reply.
+4. Otherwise run locally:
+   * `EVAL` first calls `load_script` (every `EVAL` caches its source, so it becomes
+     `EVALSHA`-able immediately). `EVALSHA` looks up the source; missing → `NOSCRIPT`.
+   * If **no keys** were declared, call `arm_script_redirect()` (§5.3).
+   * Save `CURRENT_DB`, call `eval_script(..)` / `call_function(..)` with `&router.local_db`,
+     `router.aof.as_deref()` and `read_only`, then restore `CURRENT_DB` and `select_db` — a
+     `SELECT` inside the script does not leak into the connection.
+   * If `take_script_redirect()` returns a shard, **discard** the local result and re-execute the
+     same command on that shard with `execute_remote`.
+   * Otherwise write the result, or the error via `write_resp_err` (which keeps known prefixes
+     such as `ERR`, `NOPERM`, `OOM`, `NOREPLICAS`, `WRONGTYPE`, `NOSCRIPT` and prefixes anything
+     else with `ERR `).
+5. `FCALL` only: after success, call `notify_key_invalidation` for each declared key (RESP3
+   client-side caching, Component 02). `EVAL`/`EVALSHA` rely on the invalidation done inside
+   each `redis.call`.
+
+The receiving shard (the cross-shard request handling inside `run_shard_worker` in
+`src/server.rs`) runs forwarded
+`Eval`/`Evalsha`/`Fcall` directly: it sets `CURRENT_AUTH_USER` from the command's `auth_user`,
+releases its own `ShardDb` borrow, calls `eval_script` / `call_function` against its own
+database and AOF, and restores the selected DB. It never arms a redirect, so a script that was
+already redirected cannot bounce again.
+
+### 5.2 Worked example
+
+Two shards. `{u1}` hashes to shard 1, the client is attached to shard 0.
+
+```
+EVAL "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[2])" 2 {u1}:a {u1}:b hello
 ```
 
-`Evalsha` (line 11174) is byte-for-byte the same shape, substituting `get_script(&sha_str)` for
-the raw `script`. **This is a behavior change from earlier revisions of this document**: `EVAL`
-and `EVALSHA` now consult `KEYS[1]` via `router.target_shard(first_key)` and forward the entire
-command to the owning shard over the cross-shard mailbox (`execute_remote`, Component 04) when
-the first declared key does not belong to the local shard. If `keys` is empty, no forwarding
-check runs and the script executes on whichever shard the connection happens to be attached to.
+1. Both keys share the hash tag `{u1}` → same owner (shard 1), so no CROSSSLOT.
+2. `KEYS[1]` belongs to shard 1 ≠ 0 → `execute_remote(1, Eval{…, auth_user: "alice"})`.
+3. Shard 1's mailbox handler sets `CURRENT_AUTH_USER = "alice"`, caches the source, runs
+   `eval_script` against shard 1's `ShardDb`. `SET` passes the ACL and locality checks, is
+   executed and logged to shard 1's AOF / replication stream as a plain `SET`.
+4. The reply `$-1` (key `{u1}:b` does not exist → Lua `false` → nil bulk) travels back to shard
+   0 and on to the client.
 
-`target_shard_of_cmd` (`src/connection.rs:12338`) — the function that decides whether a command
-gets pre-routed to a different shard *before* even reaching this match arm (used by
-`server.rs:289`, `router.rs:3160`, `connection.rs:7397`) — still has **no** arm for
-`Command::Eval`/`Evalsha`/`Fcall` (verified: grepping its full body, lines 12338–12691, and the
-sibling `target_shard_and_hash_of_cmd`, lines 12692–12723, finds no match arm naming any of the
-three). So the only key-based routing scripts get is the ad-hoc check written inline in the
-`Eval`/`Evalsha` arms themselves — pre-dispatch routing infrastructure does not know about
-scripts at all.
+Had the keys been `a` and `b` without a tag, landing on different shards, step 1 would have
+replied `-CROSSSLOT` and nothing would have run.
 
-**`Fcall` has no equivalent check** (§3.4) — `FCALL` always executes on the connection's local
-shard regardless of its `KEYS` argument, even though `EVAL`/`EVALSHA` now forward. This is a
-real, verified asymmetry in the current source, not an oversight documented elsewhere: `Command::
-Fcall`'s handler (`connection.rs:11306`) calls `crate::scripting::call_function` directly against
-`router.local_db` with no `router.target_shard`/`execute_remote` step at all.
+### 5.3 Keyless scripts and the redirect state machine
 
-Every `EVAL` (not only an explicit `SCRIPT LOAD`) unconditionally caches its own source under its
-SHA1 via `load_script`, so a script becomes `EVALSHA`-able the moment it is first `EVAL`'d,
-matching real Redis semantics without a separate mandatory load step.
+A script that declares no keys (`EVAL "return redis.call('GET','x')" 0`) gives the dispatcher
+nothing to route on, so it runs on the client's shard. If its **first** command touches a key
+owned by another shard, nothing has happened yet, so the script can be safely rerun on that
+shard. `ScriptRedirect` implements this:
 
-### 3.2 `redis.call`/`redis.pcall`: real command execution, not a separate scripting table
+```mermaid
+stateDiagram-v2
+    Off --> Armed: arm_script_redirect (keys empty)
+    Armed --> To: first redis.call touches a non-local key
+    Armed --> Disarmed: first redis.call is local (or keyless)
+    To --> Off: take_script_redirect returns Some(shard)
+    Disarmed --> Off: take_script_redirect returns None
+    Armed --> Off: take_script_redirect (script issued no command)
+```
 
-Inside `eval_script` (`scripting.rs:87-169`), both closures:
+Algorithm (`script_redirects(cmd)`, called from `redis.call`/`redis.pcall` before executing):
 
-1. Convert the Lua `MultiValue` argument list to `Vec<Bytes>` — `Value::String`→raw bytes,
-   `Value::Integer`→decimal string bytes, `Value::Number`→decimal string bytes, `Value::Boolean`→
-   `b"1"`/`b"0"`, `Value::Nil`→empty `Bytes`; any other Lua value type is silently **dropped**
-   from the argument list (the `_ => {}` arm at line 97/134 — a table or function argument to
-   `redis.call` vanishes rather than erroring).
-2. Feed the resulting `Vec<Bytes>` to `crate::resp::build_command` (Component 03) — the exact
-   same parser real wire commands use.
-3. Run the resulting `Command` through `crate::connection::execute_local_command` (Component 02)
-   against `db_call.borrow_mut()` (the caller's `Rc<RefCell<ShardDb>>`).
-4. Convert the raw RESP `out: Vec<u8>` back to a Lua `Value` via `resp_bytes_to_lua`.
+1. `Off` or `Disarmed` → no redirect; the normal non-local check (§6.1) applies.
+2. `To(_)` → fail the command with `SCRIPT_NON_LOCAL_KEY_ERR` (no stats recorded).
+3. `Armed` → ask `connection::script_non_local_target(cmd)` for the shard of the first key the
+   command touches that this shard does not own. If there is one, switch to `To(shard)` and fail
+   the command; otherwise switch to `Disarmed` and let it run.
 
-`redis.call`/`redis.pcall` therefore issue real `Command` values against the real `ShardDb` —
-scripting is not a separate command-processing path. Because `execute_local_command` is the same
-function that appends to the AOF and propagates to replicas for an ordinary command (the
-`record_change!` macro defined at the top of `execute_local_command`, `connection.rs:12740`),
-**each write a script performs via `redis.call` is independently AOF-logged and replicated as its
-own constituent command** — Rudis propagates a script's *effects*, not its source text, matching
-modern Redis's default script-replication mode. `redis.pcall` differs only in that it intercepts
-a RESP error reply (`out.starts_with(b"-")`, line 158) and returns a Lua table `{err = "..."}`
-instead of raising a Lua error; `redis.call`'s equivalent error path instead returns the error
-straight from `execute_local_command`'s `out` into `resp_bytes_to_lua`, which turns a leading `-`
-byte into a genuine Lua error (`mlua::Error::RuntimeError`, `scripting.rs:229`) — matching Redis's
-`call` (raises) vs. `pcall` (returns an error table) distinction.
+After the script returns, the dispatcher calls `take_script_redirect()`, which resets the state
+to `Off` and returns the target shard if the state was `To`. The local result (usually the
+error raised by the failed first command) is thrown away and the command is rerun remotely.
+`script_non_local_target` and `script_touches_non_local_key` both return "local" when the server
+has a single shard.
 
-The `aof: Option<*const RefCell<AofWriter>>` capture (`aof_call`/`aof_pcall`, lines 86/121 and
-523) is a raw pointer specifically so the closure can satisfy `mlua::Lua::create_function`'s
-`'static` bound while still referencing a `RefCell` borrowed from the caller's stack;
-`unsafe { aof_call.map(|ptr| &*ptr) }` reconstitutes the reference at call time. This is sound
-only because the `Lua` instance (and every closure it holds) is dropped before `eval_script`/
-`call_function` returns and the borrow ends — a manual invariant enforced by function structure,
-not the type system.
+Example: `EVAL "local v = redis.call('GET','x'); return v" 0` on shard 0, `x` owned by shard 1 →
+state `Armed` → `GET x` is non-local → `To(1)`, `GET` fails → script ends with an error →
+`take_script_redirect()` = `Some(1)` → the dispatcher discards the error and reruns the `EVAL`
+on shard 1, which returns the value.
 
-`redis.status_reply(msg)`/`redis.error_reply(msg)` build `{ok = msg}`/`{err = msg}` tables
-directly (lines 171–191); `redis.sha1hex(s)` calls the same `sha1_hex` helper used for script
-cache keys (line 193). **That is the complete Redis API surface exposed to scripts** —
-`redis.call`, `redis.pcall`, `redis.status_reply`, `redis.error_reply`, `redis.sha1hex`, plus
-(inside `load_function`/`call_function` only) `redis.register_function`. There is no
-`redis.log`, `redis.setresp`, `redis.breakpoint`, `redis.debug`, `redis.replicate_commands`, or
-`redis.set_repl` — none of these identifiers appear anywhere in `src/scripting.rs`. A script that
-calls any of them gets a plain Lua "attempt to call a nil value" runtime error.
+---
 
-### 3.3 RESP ⇄ Lua value conversion
+## 6. Inside a script
 
-`resp_bytes_to_lua(lua, out: &[u8]) -> mlua::Result<Value>` (line 214) switches on `out[0]`:
+### 6.1 `redis.call` / `redis.pcall`
 
-| RESP prefix | Lua result |
+Both are created by `register_redis_module` with `mlua::Scope::create_function`, so the closures
+can borrow the caller's `Option<&RefCell<AofWriter>>` for exactly the duration of the run (the
+scope ends before `eval_script` / `call_function` return). Each call goes through these steps:
+
+1. **Arguments → bytes**: Lua strings as-is, integers and floats via `to_string()`. Anything else
+   (tables, booleans, nil, functions) → `ERR Lua redis lib command arguments must be strings or
+   integers`. No arguments → `ERR Please specify at least one argument for redis.call()`.
+2. **Parse** with `resp::build_command`. A parse error mentioning "wrong number of arguments"
+   becomes `ERR Wrong number of args calling Redis command from script`; other parse errors are
+   prefixed with `ERR `. `Command::Unknown` → `Unknown Redis command called from script`.
+3. **DEBUG gate** (`script_debug_denied`): `DEBUG` is allowed only when `enable-debug-command`
+   is `yes` for this port; `local` is not enough because a script has no client address.
+4. **ACL** (`script_acl_denied`): `connection::acl_denied_in_context(port, user, cmd,
+   Some(("lua", "eval")))` with the user from `CURRENT_AUTH_USER` (empty → `default`). Command,
+   key and channel permissions all apply. Denials surface as `NOPERM …` and are counted as
+   rejected calls.
+5. **Redirect** (`script_redirects`, §5.3).
+6. **Locality** (`connection::script_touches_non_local_key`): if any key of the command belongs to
+   another shard → `SCRIPT_NON_LOCAL_KEY_ERR` = `ERR Script attempted to access a non local key:
+   pass every key the script uses in KEYS, and use hash tags so they all map to one shard`.
+7. **Forbidden commands**: `CLUSTER`, `REPLICAOF`, `SHUTDOWN`, `SAVE`, `BGSAVE`,
+   `BGREWRITEAOF` → `ERR This Redis command is not allowed from script`.
+8. **min-replicas**: if `MIN_REPLICAS_TO_WRITE > 0`, the command is a write and
+   `not_enough_good_replicas(port)` → `NOREPLICAS Not enough good replicas to write.`
+9. **Read-only scripts**: if the script is read-only (§6.3) and the command is a write (or
+   `PUBLISH`, `SPUBLISH`, `PFCOUNT`) → `ERR Write commands are not allowed from read-only
+   scripts.`
+10. **maxmemory**: with `maxmemory > 0`, policy `noeviction`, and a write command whose
+    `allows_oom()` is false, sum this shard's allocator-measured usage
+    (`router::local_real_used`) with every other shard's published usage; above the limit →
+    `OOM command not allowed when used memory > 'maxmemory'.`
+11. **Bookkeeping**: `record_cmd_stat`, `snapshot::note_write` for writes whose dirty count is not
+    computed by change (`dirty_counted_on_change`), `inc_active_client_tot_cmds`, and — when
+    `MONITOR` clients exist — a MONITOR line with source `lua`.
+12. **Execute**: `execute_local_command(&cmd, &mut db.borrow_mut(), &mut out, aof)`.
+13. **Error reply** (`out` starts with `-`): count it (`record_failed_stat`,
+    `record_error_stat` by prefix), set `SCRIPT_RECORDED_ERROR`, rewrite "wrong number of
+    arguments" as above. `redis.call` raises a Lua error with the message; `redis.pcall` returns
+    `{err = "..."}`.
+14. **Success**: convert `out` to a Lua value with `resp_bytes_to_lua` (§6.5).
+
+`redis.pcall` performs the identical sequence but turns every failure from steps 1–10 into a
+returned `{err = "..."}` table instead of raising. Steps 4, 6, 9 and 10 also bump the rejected
+and error counters and set `SCRIPT_RECORDED_ERROR`.
+
+### 6.2 The script environment
+
+`setup_redis_lua_env` builds the environment for `EVAL`, `EVALSHA` and `FCALL`:
+
+1. `Lua::new()` — mlua's safe standard-library set: `coroutine`, `table`, `io`, `os`, `string`,
+   `utf8`, `math`, `package` (no `debug`).
+2. Copy every global into a private table `real_g`.
+3. Seed `math.randomseed` with wall-clock nanoseconds XOR a process-wide counter (so
+   `math.random` differs per call).
+4. Lua 5.1 compatibility shims: global `unpack` = `table.unpack`; `loadstring(code, name)` wraps
+   `load(code, name, "t")` (text chunks only).
+5. Remove `dofile`, `loadfile`, `print`; strip `os` down to `os.clock`.
+6. Register `bit`, `cjson`, `cmsgpack` (§6.6) and the `redis` table, each wrapped by
+   `make_table_readonly_proxy` (reads pass through, writes raise `Attempt to modify a readonly
+   table`, `pairs` and `#` work).
+7. Store `real_g` and the raw `redis` table in the Lua registry (`__real_G`, `__real_redis`).
+8. Run a Lua sandbox snippet that: replaces `getmetatable` so that `getmetatable(_G)` returns a
+   write-protected empty table and `getmetatable("s")` returns a read-only proxy of `string`;
+   replaces `setmetatable` so it refuses `_G`; empties `_G`; and gives `_G` a metatable whose
+   `__index` reads from `real_g` (unknown names raise `Script attempted to access nonexistent
+   global variable '<name>'`) and whose `__newindex` raises `Attempt to modify a readonly table`.
+   Scripts therefore cannot create globals; they must use `local`.
+
+`eval_script` then sets `KEYS` and `ARGV` (1-indexed tables of Lua strings) in `real_g`.
+`call_function` does **not** set them; the function receives them as its two parameters.
+
+The `redis` table available at run time:
+
+| Member | Behaviour |
 | :-- | :-- |
-| (empty `out`) | `Value::Nil` |
-| `+...\r\n` | table `{ok = "..."}` |
-| `-...\r\n` | **Lua error** (`mlua::Error::RuntimeError`) — this is what makes a failing `redis.call` raise; `redis.pcall` intercepts one level up before this function is reached |
-| `:N\r\n` | `Value::Integer` (falls back to `0` if the digits don't parse) |
-| `$-1\r\n` | `Value::Boolean(false)` |
-| `$N\r\n...` | `Value::String` (falls back to an empty Lua string if the length framing is inconsistent) |
-| `*N\r\n...` | delegated to `parse_resp_array_to_lua` |
-| anything else | `Value::Nil` |
+| `call`, `pcall` | §6.1. |
+| `setresp(n)` | Sets the script's protocol version (default 2). Only `3` changes behaviour (§6.5); the value is not validated. |
+| `status_reply(s)` | Returns `{ok = s}`. |
+| `error_reply(s)` | Returns `{err = s}` with CR/LF replaced by spaces (empty → `"ERR"`) and a `__tostring` metamethod. |
+| `sha1hex(s)` | Lowercase SHA-1 hex of a string argument; otherwise `ERR wrong number of arguments for redis.sha1hex()`. |
+| `log(level, msg)` | Accepted and **discarded** (no server log line). |
+| `LOG_DEBUG`/`LOG_VERBOSE`/`LOG_NOTICE`/`LOG_WARNING` | 0/1/2/3. |
+| `REDIS_VERSION`, `REDIS_VERSION_NUM` | `"7.2.0"`, `0x00070200`. |
+| `acl_check_cmd(cmd, ...)` | Parses the command and returns `1` if the caller's ACL allows it, `nil` otherwise; invalid commands raise `ERR Invalid command passed to redis.acl_check_cmd()`. |
 
-`parse_resp_array_to_lua` (line 262) is a **hand-rolled, recursive** RESP array parser operating
-on a `bytes::BytesMut` cursor (distinct from — and simpler than — the two-pass parser in
-`src/resp.rs`, Component 03): it walks `$`/`:`/`+`/`*` element prefixes one at a time, advancing
-the cursor with `Buf::advance`; a negative `$` length becomes `Value::Boolean(false)` (null bulk
-inside an array); an unrecognized element prefix `break`s out of the loop early, silently
-truncating the resulting Lua table short of `count` elements rather than erroring.
+`redis.register_function` is absent at run time; calling it from `EVAL` fails with
+`attempt to call field 'register_function' (a nil value)`.
 
-`lua_val_to_resp(&Value, &mut Vec<u8>)` (line 342) is the reverse mapping, applied **once**, to a
-script's final return value only (not to values returned mid-script):
+### 6.3 Read-only enforcement and script flags
 
-| Lua value | RESP written |
+A run is **read-only** when:
+
+* `EVAL`/`EVALSHA`: the command was an `_RO` variant, **or** the script's shebang declares
+  `flags=no-writes`.
+* `FCALL`: the command was `FCALL_RO` or the function has the `no-writes` flag. `FCALL_RO` of a
+  function **without** `no-writes` is rejected before running: `ERR Can not execute a script
+  with write flag using *_ro command.` (`EVAL_RO` of an unflagged script is not rejected up
+  front; only its writes fail.)
+
+`eval_script` parses an optional shebang on the first line (`#!lua flags=no-writes,allow-oom`):
+
+1. The engine must be `lua` (case-insensitive) → else `ERR Unexpected engine in script shebang`.
+2. Every further token must be `key=value` with key `flags` → else `ERR Unknown lua shebang
+   option: '<key>'`.
+3. Allowed flags: `no-writes`, `allow-oom`, `allow-stale`, `no-cluster` → else `ERR Unexpected
+   flag in script shebang: '<flag>'`.
+4. The shebang line is turned into a `--` comment before compiling.
+
+Top-level classification uses the flags without running the script:
+
+* `Command::is_write_command` (in `resp.rs`) treats `EVAL`/`EVALSHA` as a write only if the
+  script has a shebang whose first line does not contain `no-writes`; a script with no shebang is
+  classified as **not** a write. `FCALL` is a write unless `_RO` or the function is `no-writes`.
+* `Command::allows_oom` is true for `EVAL`/`EVALSHA` whose shebang line contains `allow-oom`.
+* `should_pause_command` (`CLIENT PAUSE WRITE`) pauses scripts unless they are `_RO` or flagged
+  read-only (`is_script_read_only`, `is_sha_read_only`, `is_function_read_only`) — so shebang-less
+  scripts are paused.
+
+### 6.4 Errors and how they are formatted
+
+* **EVAL/EVALSHA** run the compiled chunk (named `@user_script`) through a Lua `xpcall` whose
+  handler turns an error table into its `err` field. On failure, `format_eval_error` keeps the
+  first line, strips a `runtime error: ` prefix, returns `NOREPLICAS …`/`OOM …` messages
+  verbatim, rewrites nil-call messages to Redis's wording, prefixes `ERR ` unless the message
+  already starts with `ERR`, `NOSCRIPT`, `WRONGTYPE` or `NOPERM`, and appends
+  ` script: <sha>, on @user_script:1.` Compile errors go through `format_lua_error` instead
+  (no SHA suffix).
+* **FCALL** errors go through `format_lua_error` (first line, keep from `ERR `/`NOSCRIPT `/
+  `WRONGTYPE ` onward, rewrite nil-call messages, ensure an `ERR ` prefix). Missing function:
+  `ERR Function not found`.
+
+### 6.5 RESP ⇄ Lua conversion
+
+**Command reply → Lua** (`resp_bytes_to_lua`, used on every `redis.call` result):
+
+| RESP reply | Lua value |
 | :-- | :-- |
-| `nil` | `$-1\r\n` |
-| `true` | `:1\r\n` (via `write_resp_integer`, i.e. `:1\r\n`) |
-| `false` | `$-1\r\n` (Redis's false-means-nil-reply convention) |
-| `Integer`/`Number` | `:N\r\n` (a `Number` is truncated to `i64` via `as i64` — no fractional part is preserved) |
-| `String` | bulk string via `write_resp_bulk` |
-| `Table` with an `"ok"` string field | `+...\r\n` |
-| `Table` with an `"err"` string field | `-...\r\n` |
-| other `Table` | treated as a 1-indexed array, length from `t.raw_len()`, each element recursively converted |
-| any other `Value` variant (e.g. `Function`, `Thread`, `UserData`) | `$-1\r\n` (silently coerced to nil) |
+| empty output | `nil` |
+| `+OK` | `{ok = "OK"}` |
+| `-ERR …` | Lua error (only reached by `redis.call`; `pcall` intercepts earlier) |
+| `:n` | integer (0 if unparsable) |
+| `$-1` | `false` |
+| `$n …` | string |
+| `*n …` | table built by `parse_resp_array_to_lua`; nested `+`/`-` become `{ok=…}`/`{err=…}`, `$-1` → `false`, nested arrays recurse |
+| `*n …` from `HGETALL` when `setresp(3)` | map table (`parse_resp_array_to_map_lua`) with metatable field `__redis_proto_type = "map"` |
+| any other leading byte | `nil` |
 
-### 3.4 `FUNCTION LOAD`/`FCALL`: two-pass execution, no persistent function objects
+**Script result → RESP** (`lua_val_to_resp_with_depth`, applied once to the return value; "RESP3
+mode" means the client negotiated RESP3 (`CURRENT_CLIENT_RESP3`) **and** the script called
+`redis.setresp(3)`):
 
-```rust
-pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
-    // parse library name from a "#!lua name=<lib>" shebang or a "-- ... name=<lib>" line
-    // (default "default_lib" if no name= is found anywhere)
-    // reject if FUNCTION_LIBS already has lib_name and !replace
-    let lua = Lua::new();                     // discovery-only VM
-    // redis.register_function(name, fn) stubbed to push `name` into a Vec and discard `fn`
-    lua.load(&lua_code).exec()?;              // runs the library's top-level code once
-    FUNCTION_LIBS.write().unwrap().insert(lib_name.clone(), FunctionLib { name, engine: "LUA", raw_code, functions });
-    Ok(lib_name)
+| Lua value | RESP2 mode | RESP3 mode |
+| :-- | :-- | :-- |
+| `nil` | `$-1` | `_` |
+| `true` / `false` | `:1` / `$-1` | `#t` / `#f` |
+| integer | `:n` | `:n` |
+| float | `:n` (truncated) | `,n` |
+| string | bulk string | bulk string |
+| table with string `ok` | `+ok` | `+ok` |
+| table with string `err` | `-err` (CR/LF → spaces; empty or `"ERR"` → `"ERR "`) | same |
+| table with number `double` | bulk string of the number | `,n` |
+| map-tagged table | flat `*2n` array of key/value | `%n` map |
+| other table | array of `t[1..#t]` | same |
+| function, userdata, thread | `$-1` | `$-1` |
+
+Nesting deeper than 1000 levels fails with `reached lua stack limit`. The public
+`lua_val_to_resp(val, out)` is the RESP2 entry point.
+
+### 6.6 Helper libraries
+
+* **`bit`** (LuaBitOp-compatible, 32-bit): `tobit`, `tohex(x [, n])` (negative `n` = uppercase,
+  width clamped to 1..8), `bnot`, `band`, `bor`, `bxor`, `lshift`, `rshift`, `arshift`, `rol`,
+  `ror`, `bswap`. Shift counts are masked to 0–31.
+* **`cjson`**: `encode`, `decode` (via `serde_json`), `null` (a sentinel table whose
+  `tostring` is `"null"`), `decode_array_with_array_mt`, `encode_max_depth` /
+  `decode_max_depth` (defaults 1000 — state in `CJsonConfig`, per VM), `encode_invalid_numbers`
+  (NaN/Inf → `null` instead of an error), `encode_keep_buffer` (no-op). A table encodes as a JSON
+  array when its keys are exactly `1..#t`, else as an object; non-string/non-integer keys error.
+  Object key order is not preserved.
+* **`cmsgpack`**: `pack(...)` (concatenates each argument's encoding; map keys sorted by
+  descending string bytes; tables nested deeper than 16 encode as nil), `unpack(s)`,
+  `unpack_one(s, offset)` and `unpack_limit(s, limit, offset)` (return the next offset, or -1 at
+  end). Unsupported type bytes (e.g. bin/ext) decode as nil.
+
+---
+
+## 7. Functions engine
+
+### 7.1 `FUNCTION LOAD` — `load_function(code, replace)`
+
+1. **Metadata**: the first line must start with `#!` (`ERR Missing library metadata`). The
+   token after `#!` must be `lua` (case-insensitive; else `ERR Engine '<x>' not found`). Every
+   other whitespace token must be `name=<lib>` (quotes trimmed); repeats → `ERR Invalid metadata
+   value, name argument was given multiple times`; anything else → `ERR Invalid metadata value
+   given: <tok>`; none → `ERR Library name was not given`.
+2. **Name check**: `[A-Za-z0-9_]+` (`validate_library_or_function_name`).
+3. **Exists?** If a library with that name (case-insensitive) exists and `replace` is false →
+   `ERR Library '<lib>' already exists`.
+4. **Load-time sandbox**: a fresh `Lua::new()`; copy globals into `real_g`, add `unpack`,
+   then remove `math`, `os`, `getmetatable`, `setmetatable`, `load`, `loadstring`, `dofile`,
+   `loadfile`, `print`, `rawget`, `rawset`, `rawequal`, `collectgarbage`, `package`,
+   `coroutine`, `io`, `debug`. Add `bit`, `cjson`, `cmsgpack`. The `redis` global is a read-only
+   proxy (`create_load_redis_proxy`) exposing only `register_function`, `REDIS_VERSION`,
+   `REDIS_VERSION_NUM` and the `LOG_*` constants; `_G` is locked as in §6.2.
+5. **Timeout**: an instruction hook fires every 1000 VM instructions and aborts once 500 ms have
+   elapsed → `ERR FUNCTION LOAD timeout`.
+6. **Run** the library with its first line commented out. Errors → `ERR Error compiling
+   function: <first line of the Lua error>`.
+7. **`redis.register_function`** validates and records a `FunctionDef` (the closure is
+   discarded):
+   * `register_function(name, fn)` — `name` must be a valid name string, `fn` a function.
+   * `register_function{function_name=…, callback=…, description=…, flags={…}}` — unknown keys,
+     wrong types, invalid flags, or missing name/callback are errors.
+   * A name already registered in this library (case-insensitive) → `Function already exists in
+     the library`.
+8. **No functions** → `ERR No functions registered`.
+9. Under the write lock: if any registered name exists in a **different** library →
+   `ERR Function <f> already exists`; otherwise remove any old library with the same name
+   (case-insensitive) and insert the new `FunctionLib`.
+
+Example:
+
+```lua
+#!lua name=counters
+redis.register_function{
+  function_name = 'incr_ro_safe',
+  callback = function(keys, args) return redis.call('GET', keys[1]) end,
+  flags = { 'no-writes' },
 }
+redis.register_function('bump', function(keys, args)
+  return redis.call('INCRBY', keys[1], args[1])
+end)
 ```
 
-Library-name parsing (lines 408–424) scans every line of `code` for one starting with `#!lua` or
-`--`, then looks for a `name=` substring within it; the first match wins and the loop `break`s.
-If no line matches, the library name defaults to the literal string `"default_lib"`. Before
-executing anything, any line whose trimmed text starts with `#!` is rewritten to be prefixed with
-`--` (turning the shebang into a Lua comment, lines 452–462) — this rewritten `lua_code` is what
-gets stored as `raw_code` and is what's actually `lua.load()`ed both here and in `call_function`.
+`FUNCTION LOAD` returns `counters`. `FCALL_RO incr_ro_safe 1 k` works; `FCALL_RO bump 1 k 5` is
+rejected up front; `FCALL bump 1 k 5` increments `k`.
 
-`FUNCTION LOAD` runs the library's entire top-level source **once**, purely to discover which
-function names it registers via a stubbed `redis.register_function` that records the name and
-discards the closure (lines 439–447); the closures produced during this pass are thrown away
-entirely.
+### 7.2 `FCALL` — `call_function(name, keys, args, db, aof, read_only)`
 
-```rust
-pub fn call_function(func_name, keys, args, db, aof) -> Result<Vec<u8>, String> {
-    let lib = /* find the FunctionLib whose .functions contains func_name, or "ERR Function '..' not found" */;
-    let lua = Lua::new();                      // a second, fresh VM
-    // redis.call bound exactly as in eval_script (§3.2)
-    // redis.register_function(name, f) captures f into the Lua registry ONLY if name == func_name
-    lua.load(&lib.raw_code).exec()?;           // re-runs the ENTIRE library source again
-    let f: mlua::Function = lua.registry_value(&fn_key)?;   // the one closure that was captured
-    let res: Value = f.call((keys_tbl, argv_tbl))?;
-    lua_val_to_resp(&res, &mut out)?;
-    Ok(out)
-}
-```
+1. Find the library containing a function named `name` (case-insensitive) → else `ERR Function
+   not found`. Apply the `FCALL_RO` / `no-writes` rules (§6.3).
+2. Build a full run-time environment with `setup_redis_lua_env` (§6.2) — **not** the restricted
+   load-time one.
+3. Build `KEYS` and `ARGV` tables.
+4. Temporarily replace the `redis` global with a load proxy whose `register_function` does no
+   validation and only captures (into the Lua registry) the closure whose name matches `name`.
+5. Re-run the whole `raw_code` (`ERR Failed to compile library: …` on error). There is no
+   instruction hook here.
+6. Restore the run-time `redis` table and switch `register_function` off (later calls raise
+   `redis.register_function can only be called on FUNCTION LOAD command`).
+7. If no closure was captured → `ERR Function '<name>' registered but failed to capture`.
+8. Call the closure with `(keys, args)` and convert its result (§6.5).
 
-`FCALL` re-runs the **entire library source again**, in a second, fresh `Lua::new()` VM, this
-time with a real `redis.register_function` that captures the one closure matching the requested
-function name into the Lua registry (`create_registry_value`, line 560) and invokes it with
-`(KEYS, ARGV)` as two Lua tables (not spread arguments). Any other function names the library
-registers on this pass are matched against `target_name` and discarded if they don't equal it
-(the `if name == target_name` guard at line 559) — so a library with 5 functions still re-executes
-all of its top-level code on every single `FCALL` to any one of them, but only the requested
-closure survives. If the requested function name was never captured (e.g. the library's top-level
-code is conditional and didn't call `register_function` for it this time), `call_function` fails
-with `"ERR Function '{}' registered but failed to capture"`.
+So library top-level code runs once per `FUNCTION LOAD` and again on **every** `FCALL`, with the
+run-time globals (`math`, `io`, … are visible there even though they were hidden at load time).
 
-**Net effect**: a library's top-level code executes once at `FUNCTION LOAD` (name discovery, using
-a throwaway VM and a throwaway closure) and once **per `FCALL` call** (to obtain a callable
-closure, using another throwaway VM for everything except the one target closure) — there is no
-cached, ready-to-invoke function object retained between calls (Gotcha 3).
+### 7.3 Management commands
 
-`FCALL` passes `router.aof.as_deref()` through to `call_function` exactly as `EVAL`/`EVALSHA` pass
-it to `eval_script`, so writes performed via `FCALL` are AOF-logged and replicated the same way
-(verified: `Command::Fcall`'s handler in `connection.rs:11306` threads `router.aof.as_deref()`
-into `call_function`, and `test_fcall_with_aof_writer`, `scripting.rs:703-738`, asserts the
-resulting in-memory AOF buffer contains the constituent `SET` command, key, and value).
-`Command::Fcall`'s handler additionally calls `notify_key_invalidation` (`connection.rs:713`) for
-each declared `KEYS` entry after a successful call — RESP3 client-side-caching invalidation
-(Component 02). `EVAL`/`EVALSHA` do not do this explicitly at their own call sites; they rely on
-whatever invalidation `execute_local_command` performs internally for each individual
-`redis.call`.
+| Command | Behaviour |
+| :-- | :-- |
+| `FUNCTION LIST` | One entry per library: `library_name`, `engine`, `functions` (each `name`, `description`, `flags`), plus `library_code` (the original source) with `WITHCODE`. Optional `LIBRARYNAME` glob filter. Order is hash-map order. |
+| `FUNCTION DELETE lib` | Removes the library (case-insensitive) → `+OK`, else `ERR Library not found`. |
+| `FUNCTION FLUSH` | Clears all libraries. If more than 64 functions were loaded, adds `functions + 1` to the `lazyfreed_objects` counter (`table::add_lazyfreed_objects`) for `INFO` compatibility; the clear itself is synchronous. |
+| `FUNCTION DUMP` | `dump_functions()`: `b"RUDFUNCv1\0"` (10 bytes) + CRC-16/XMODEM of the body (2 bytes, big-endian) + a JSON array of every `FunctionLib`. |
+| `FUNCTION RESTORE payload [policy]` | `restore_functions()`: checks magic, length ≥ 12 and CRC, deserialises the JSON (any failure → `ERR DUMP payload version or checksum are wrong`), then `merge_function_libs` (below). The code is **not** re-executed or re-validated. |
+| `FUNCTION STATS` | `running_script` is always null; `engines.LUA` reports `libraries_count` and `functions_count`. Uses RESP3 maps for RESP3 clients. |
+| `FUNCTION KILL`, `SCRIPT KILL` | `scripting::kill_running_script(port, is_eval)` looks up the running script in `RUNNING_SCRIPTS`: `-NOTBUSY` if none, `-UNKILLABLE` if it already wrote, `-BUSY` if the wrong kill command was used for its type, otherwise sets its kill flag and replies `+OK` (§9). |
+
+`merge_function_libs(cache, libs, policy)`:
+
+* `FLUSH` — clear, then insert every restored library.
+* `APPEND` — fail with `ERR Library <l> already exists` or `ERR Function <f> already exists` if
+  any restored library or function name (case-insensitive) is already present; otherwise insert
+  all.
+* `REPLACE` — restored libraries replace same-named existing ones; fail with `ERR Function <f>
+  already exists` only if a restored function name clashes with a library that is being kept.
+
+Checks use lowercase name `HashSet`s so a large payload is processed in linear time while holding
+the global write lock (covered by `test_merge_function_libs_scales_linearly`).
 
 ---
 
-## 4. `FUNCTION`/`SCRIPT` Subcommand Coverage — what actually exists
+## 8. Persistence, replication and observability
 
-Parsed in `src/resp.rs`: `EVAL`/`EVAL_RO` (lines 5657–5679), `EVALSHA`/`EVALSHA_RO` (5680–5702),
-`SCRIPT LOAD`/`EXISTS`/`FLUSH` (5703–5731), `FUNCTION LOAD`/`LIST`/`FLUSH`/`STATS`/`KILL`/`DELETE`
-(10154–10192), `FCALL`/`FCALL_RO` (10193–10212). `EVAL_RO`/`EVALSHA_RO`/`FCALL_RO` parse to the
-exact same `Command::Eval`/`Evalsha`/`Fcall` variants as their non-`_RO` counterparts — there is
-no enforcement anywhere that a `_RO` variant's script is actually read-only; `redis.call('SET',
-...)` succeeds identically inside an `EVAL_RO` script (verified: no `_ro`/readonly flag exists on
-`Command::Eval`/`Evalsha`/`Fcall`, and neither `eval_script` nor `call_function` takes one).
-
-`FUNCTION LOAD` accepts an optional `REPLACE` keyword as `args[2]` (case-insensitive), shifting
-the code argument from index 2 to 3 (`resp.rs:10166-10174`). Any other `FUNCTION` subcommand falls
-through to `Command::Unknown(format!("FUNCTION {}", sub))` (line 10190).
-
-**`FUNCTION DUMP` and `FUNCTION RESTORE` do not exist anywhere in this codebase** — verified by
-grepping `FunctionDump`/`FunctionRestore` across `src/resp.rs` and `src/connection.rs`: zero
-matches. There is no `Command::FunctionDump`/`FunctionRestore` variant, no RESP subcommand
-parsing for `DUMP`/`RESTORE` under `FUNCTION`, and consequently no RDB/AOF persistence of loaded
-function libraries at all — `FUNCTION_LIBS` is purely in-memory and is lost on restart, with no
-serialization format defined anywhere for it (contrast `CrdtDump`/`CrdtMerge`, Component 12, which
-do have a real wire dump format).
-
-`FUNCTION STATS` (handled identically in two places — `connection.rs:11362` inside
-`execute_command`, and a byte-for-byte duplicate at `connection.rs:18817` inside
-`execute_local_command`) reports `running_script: nil` unconditionally — there is no tracking of
-an in-flight script anywhere in `scripting.rs`, so this field can never be non-nil. It reports
-`engines.LUA.libraries_count`/`functions_count` computed live from `list_functions()`.
-
-`SCRIPT KILL` and `FUNCTION KILL` call `scripting::kill_running_script(port, is_eval)`, which
-looks the server's running script up in `RUNNING_SCRIPTS` and replies `-NOTBUSY`, `-UNKILLABLE`
-(the script already wrote), `-BUSY` (wrong kill command for the script type) or `+OK` after
-setting the script's kill flag (see §6).
+* **Script effects**: every write issued through `redis.call` is logged by
+  `execute_local_command`'s change recording as its own command, to the AOF of the shard the
+  script ran on and to the replication stream. The script text is never logged.
+* **AOF replay of `EVAL`/`EVALSHA`** (`aof.rs` `apply_aof_command`): an AOF written by old Redis
+  versions can contain verbatim scripts; replay caches the source and runs it with
+  `eval_script` (no AOF writer, not read-only) through `replay_script`, which temporarily moves
+  the `ShardDb` into an `Rc<RefCell<_>>`.
+* **Function libraries**: `FUNCTION LOAD`, `DELETE`, `FLUSH` and `RESTORE` call
+  `router.log_mutation` on success (AOF + replication). `execute_local_command` also has arms for
+  these four, used when a replica applies them from its master or when the AOF is replayed (they
+  call the same `scripting.rs` functions and re-record the change).
+* **RDB**: `redis_rdb::write_file_header` emits one `FUNCTION2` record per `library_codes()`
+  entry in every RDB header Rudis writes. On load, `FUNCTION2` records are fed to
+  `load_function(code, true)` when the load context has `load_functions` set (shard 0 of a full
+  RDB load, and RDB preambles); a library that fails to load is skipped with a warning. Pre-GA
+  Redis 7.0 function records are skipped.
+* **Stats**: each inner command is counted in `INFO commandstats` and failed/rejected counters;
+  the outer `EVAL*`/`FCALL*` failure is counted as failed and, unless `SCRIPT_RECORDED_ERROR` is
+  set, in `errorstats`. `INFO memory` reports `number_of_cached_scripts`, `number_of_functions`,
+  `number_of_libraries` and `used_memory_vm_functions` (a synthetic `32768 + 256 × functions`).
+* **MONITOR** shows each inner command with source `lua`.
+* **Pipelines**: a pipeline batch containing `EVAL`/`EVALSHA`/`FCALL` is treated as containing
+  writes for AOF purposes, since script effects cannot be known up front.
 
 ---
 
-## 5. Execution Context Split: `execute_command` vs. `execute_local_command`
+## 9. Invariants & gotchas
 
-This is the most consequential structural fact about scripting dispatch and is easy to miss on a
-partial read, since the two functions are ~6,300 lines apart in the same file.
-
-* **`execute_command`** (`src/connection.rs:4906`, `async fn`, the per-connection top-level
-  dispatcher) has match arms for `Command::Eval`, `Evalsha`, `ScriptLoad`, `ScriptExists`,
-  `ScriptFlush`, `FunctionLoad`, `Fcall`, `FunctionList`, `FunctionDelete`, `FunctionFlush`,
-  `FunctionStats`, and `FunctionKill` (lines 11146–11394). This is the **only** place `EVAL`,
-  `EVALSHA`, `SCRIPT *`, `FUNCTION LOAD`, `FCALL`, `FUNCTION LIST`, `FUNCTION DELETE`, and
-  `FUNCTION FLUSH` are handled.
-* **`execute_local_command`** (`src/connection.rs:12734`, synchronous `fn`, called from inside
-  `redis.call`/`redis.pcall`, from AOF replay, and from cross-shard remote-command execution) has
-  match arms for only two of these: `FunctionStats` (line 18817) and `FunctionKill` (line 19033),
-  both textually identical to their `execute_command` counterparts. Every command not explicitly
-  matched falls through to `execute_local_command`'s final catch-all arm, `_ => false`
-  (`connection.rs:19041`), which writes **nothing** to `out` and returns `false` (not an error).
-
-**Consequence (verified, not inferred)**: a script that calls `redis.call('EVAL', ...)`,
-`redis.call('EVALSHA', ...)`, `redis.call('FCALL', ...)`, `redis.call('SCRIPT', 'LOAD', ...)`, or
-`redis.call('FUNCTION', 'LOAD', ...)` — i.e., any attempt at nested/recursive scripting from
-inside a running script — has its inner command parsed successfully by `build_command` (all five
-are valid `Command` variants) but then silently hits `execute_local_command`'s `_ => false` arm.
-`out` stays empty, so `resp_bytes_to_lua(lua, &[])` returns `Value::Nil` (its documented empty-
-input case, line 215–217) with **no error raised at all**. From the calling script's perspective,
-`redis.call('EVAL', "return 1", "0")` just silently returns `nil` instead of `1` — a
-correctness bug, not merely a missing feature, because no error surfaces to warn the script
-author.
-
----
-
-## 6. Concrete Numbers, Limits, and What's Absent
-
-* Long-running scripts: `eval_script`/`call_function` register the run (`ScriptRunGuard`) and
-  install a global count hook (`install_script_hook`, every `SCRIPT_HOOK_INSTRUCTIONS` = 10,000
-  instructions). The hook marks the script busy past `busy-reply-threshold`
-  (`connection::busy_reply_threshold_ms`), after which `execute_command_inner` answers non
-  `allow-busy` commands with `scripting::busy_script_reply`. When the kill flag is set (or a
-  shutdown starts), the hook fails the script and switches itself to fire on every line. `redis.call`/
-  `redis.pcall` of a write command sets `wrote`, which makes the script `-UNKILLABLE`. A script
-  still blocks its own shard's reactor until it ends; the kill has to come from a connection
-  on another shard.
-* No sandboxing: `Lua::new()` (used identically at `scripting.rs:60`, `434`, `498`) is `mlua`'s
-  default full-library constructor — scripts have unrestricted access to Lua's standard library
-  (`os`, `io`, `debug`, etc.), including `os.execute`, arbitrary file I/O via `io.open`, and so on.
-  There is no `sandbox` mode enabled and no custom globals table stripping.
-  (Gotcha 2)
-- The Redis-facing API surface is exactly 6 functions total: `redis.call`, `redis.pcall`,
-  `redis.status_reply`, `redis.error_reply`, `redis.sha1hex` (always available), plus
-  `redis.register_function` (only inside `load_function`/`call_function`'s bespoke `redis`
-  tables — not present during ordinary `EVAL`/`EVALSHA`, so calling `redis.register_function`
-  from a plain `EVAL` script raises a nil-call error).
-* `SCRIPT_CACHE`/`FUNCTION_LIBS` have no eviction policy and no size cap — entries live until
-  `SCRIPT FLUSH`/`FUNCTION FLUSH`/`FUNCTION DELETE`/process restart.
-* `EVAL`/`EVALSHA`/`FCALL` each rebuild `KEYS`/`ARGV` Lua tables and call
-  `redis.create_function` 3–5 times per invocation — there is no VM pooling; every call pays the
-  cost of `Lua::new()` plus re-`load()`ing the full script/library source (no bytecode caching —
-  §1).
-* The official Redis TCL test suites `tests/redis-tests/unit/scripting.tcl` and
-  `tests/redis-tests/unit/functions.tcl` are vendored in this repo but are **not** listed in
-  `scripts/run_redis_test_suite.sh`'s suite set — they are not run against Rudis as part of the
-  compatibility gate that other subsystems use (verified: grepping `scripting\|functions` against
-  that script finds nothing). Coverage for this subsystem instead comes from the three unit tests
-  in `scripting.rs:612-739` and the E2E tests in `tests/e2e_scripting.rs`
-  (`test_lua_scripting_engine_e2e`, line 3253; `test_fcall_mutating_aof_persistence_and_replay_e2e`,
-  line 5619).
+* **Single-shard execution.** A script only ever sees one shard's data. Declared keys must share
+  an owner (`CROSSSLOT` otherwise) and every key a script touches must be local
+  (`SCRIPT_NON_LOCAL_KEY_ERR` otherwise). Pass all keys in `KEYS` and use hash tags.
+* **Keyless scripts are rerun, not migrated.** The redirect only works if the *first* command
+  hits the foreign shard; any Lua computed before that runs twice. After a local first command
+  the state is `Disarmed` and later foreign keys are errors.
+* **Long-running scripts.** `eval_script`/`call_function` register the run (`ScriptRunGuard`)
+  and install a count hook (`install_script_hook`, every `SCRIPT_HOOK_INSTRUCTIONS` = 10,000
+  instructions). Past `busy-reply-threshold` the script is marked busy and other connections get
+  `-BUSY` for commands not flagged `allow-busy`. When the kill flag is set (or a shutdown
+  starts) the hook fails the script. A script that already wrote (`redis.call` of a write) is
+  `-UNKILLABLE`. The script still blocks its own shard's reactor until it ends, so the kill has
+  to come from a connection on another shard.
+* **Cross-shard waits from scripts are bounded.** `PUBLISH`/`SPUBLISH` inside a script use
+  `publish_sync`/`spublish_sync`, which wait at most `SYNC_PUBLISH_COUNT_WAIT` (1 ms) for other
+  shards' subscriber counts so two shards publishing to each other cannot deadlock; the returned
+  count can be short.
+* **The scope invariant.** `redis.call` closures borrow the AOF writer through
+  `Lua::scope`; nothing created inside the scope may outlive the call. `replay_script` relies on
+  this when it unwraps the `Rc` after the run.
+* **Thread-locals are the script context.** `CURRENT_AUTH_USER`, `SCRIPT_REDIRECT` and
+  `SCRIPT_RECORDED_ERROR` are per thread. Any new code path that runs scripts must set the
+  user and, if it arms a redirect, must call `take_script_redirect()` afterwards.
+* **`SELECT` inside a script is undone** by the dispatcher after the run.
+* **Nested scripting returns `nil`.** `execute_local_command` has no arm for `EVAL`, `EVALSHA`,
+  `FCALL`, `SCRIPT *`, `FUNCTION LIST` or `FUNCTION DUMP`, so `redis.call('EVAL', …)` produces
+  empty output and the script silently gets `nil`. By contrast `FUNCTION LOAD/DELETE/FLUSH/
+  RESTORE/STATS` do execute from a script (those arms exist for replication and AOF replay), and
+  `FUNCTION KILL` there replies `+OK`.
+* **`allow-oom` only affects the top level.** The in-script maxmemory check calls `allows_oom()`
+  on the *inner* command, which is false for ordinary writes, so an `allow-oom` script's writes
+  are still refused over the limit.
+* **Shebang-less scripts are "not writes" at the top level** (`is_write_command`), but each
+  inner write is still checked individually (OOM, min-replicas, read-only).
+* **Two read-only detectors.** `is_script_read_only` requires an exact `no-writes` token inside
+  `flags=`; `is_write_command`/`allows_oom` search the first line for the substring.
+* **`FUNCTION RESTORE` trusts its payload.** Libraries are inserted without re-running or
+  re-validating their code; a bad library only fails later, at `FCALL`.
+* **Functions see different globals at load and at call time** (§7.2).
 
 ---
 
-## 7. Cross-Component Interactions
+## 10. Limitations / not implemented
 
-- **`src/connection.rs`** (Component 02): owns all `SCRIPT_CACHE`/`FUNCTION_LIBS` mutation entry
-  points (inside `execute_command` only, §5); supplies `execute_local_command` for `redis.call`/
-  `redis.pcall`, `write_resp_integer`/`write_resp_bulk`/`write_resp_err` for RESP serialization,
-  and `notify_key_invalidation` for `FCALL`'s post-call cache invalidation.
-- **`src/resp.rs`** (Component 03): `build_command` is invoked from inside the `redis.call`/
-  `redis.pcall` closures to turn Lua-supplied arguments back into a real `Command`; also owns all
-  `EVAL`/`EVALSHA`/`SCRIPT`/`FUNCTION`/`FCALL` wire parsing (§4).
-- **`src/router.rs`/`src/shard.rs`** (Component 04): `router.target_shard`/`router.execute_remote`
-  are now consulted by `EVAL`/`EVALSHA` for first-key cross-shard forwarding (§3.1); `FCALL` does
-  not consult them. `src/table.rs` (Component 05) is mutated whenever a script's `redis.call`
-  performs a write, exactly as an ordinary client-issued command would.
-- **`src/aof.rs`/`src/replication.rs`**: every write a script performs is independently
-  AOF-appended and replica-propagated as its own constituent command, via the `record_change!`
-  macro inside `execute_local_command` (§3.2) — the script's own source text is never itself
-  written to the AOF or replication stream.
+* A busy script cannot be preempted on its own shard: clients on that shard wait for it to
+  end; only connections on other shards see `-BUSY` and can issue `SCRIPT KILL`/`FUNCTION KILL`.
+* Sandbox gaps compared with Redis: in the `EVAL`/`FCALL` environment `io`, `package`
+  (`require`), `coroutine`, stock `load`, `rawget`/`rawset` and `collectgarbage` remain
+  reachable; only `dofile`, `loadfile`, `print` and most of `os` are removed. (`FUNCTION LOAD`
+  removes far more, but only while loading.)
+* `redis.log` is a no-op; `redis.breakpoint`, `redis.debug`, `redis.replicate_commands`,
+  `redis.set_repl` and the `REPL_*` constants do not exist; `SCRIPT DEBUG` is not implemented.
+* `redis.setresp` accepts any value without validation; `resp_bytes_to_lua` understands only
+  RESP2 frame types (other leading bytes become `nil`).
+* The `allow-cross-slot-keys` flag is accepted for functions but rejected in `EVAL` shebangs;
+  `allow-stale` and `no-cluster` are accepted and ignored.
+* `FUNCTION DUMP` uses a Rudis-specific JSON payload (`RUDFUNCv1`), not Redis's binary format,
+  so dumps cannot be exchanged with Redis (RDB `FUNCTION2` records are compatible).
+* `FUNCTION FLUSH ASYNC` is synchronous; `FUNCTION STATS` never reports a running script.
+* No VM reuse or bytecode caching; every call pays for `Lua::new()`, the sandbox setup and
+  recompiling the script (and, for `FCALL`, re-running the library).
+* `SCRIPT_CACHE` is unbounded and neither persisted nor replicated.
+* The Redis TCL suites `unit/scripting` and `unit/functions` are part of
+  `scripts/run_redis_test_suite.sh`, but run against a **single-shard** server
+  (`threads=1`) because they use undeclared and cross-key access.
 
 ---
 
-## Contributor Gotchas & Debugging Guide
+## 11. Code map
 
-* **Gotcha 1 (routing asymmetry)**: `EVAL`/`EVALSHA` now forward to the shard owning `KEYS[1]`
-  when that differs from the connection's local shard (`connection.rs:11146-11203`); `FCALL` does
-  **not** — it always runs on the connection's local shard regardless of `KEYS`
-  (`connection.rs:11306-11328`). A script reached via `FCALL` silently reads/writes the wrong
-  shard's data for any key that doesn't belong to the connection's local shard; the equivalent
-  `EVAL`/`EVALSHA` call would instead transparently forward. `target_shard_of_cmd`
-  (`connection.rs:12338`), the general pre-dispatch shard router, has no awareness of any of the
-  three commands — the `EVAL`/`EVALSHA` forwarding is a one-off check written directly into their
-  own match arms.
-* **Gotcha 2**: there is no sandboxing — a script has full access to Lua's standard library
-  (`os`, `io`, `debug`, etc.) via `mlua::Lua::new()`'s defaults, and no execution-time or
-  only an instruction-count hook that serves `-BUSY` and `SCRIPT KILL`/`FUNCTION KILL` (§6).
-* **Gotcha 3**: `FCALL` re-executes a function library's entire top-level source on every call
-  (to re-discover/re-capture the requested closure) — library-level initialization code runs once
-  per `FCALL`, not once at load time (§3.4).
-* **Gotcha 4**: a script's writes are replicated/AOF-logged as their individual constituent
-  commands (effects replication), not as the script's source text.
-* **Gotcha 5 (nested scripting silently no-ops)**: `redis.call`/`redis.pcall` run through
-  `execute_local_command`, which has no match arm for `Eval`/`Evalsha`/`Fcall`/`ScriptLoad`/
-  `FunctionLoad` (only `FunctionStats`/`FunctionKill` are duplicated there). A script that issues
-  any of the other five via `redis.call` gets a silent Lua `nil` back with no error — see §5.
-* **Gotcha 6**: `FUNCTION DUMP`/`FUNCTION RESTORE` do not exist in this codebase at all (§4);
-  `FUNCTION_LIBS` has no persistence — loaded libraries are lost on every restart.
-* **Gotcha 7**: `EVAL_RO`/`EVALSHA_RO`/`FCALL_RO` are not actually read-only-enforced — they parse
-  to the same `Command` variants as their mutating counterparts and `redis.call('SET', ...)`
-  succeeds identically inside them (§4).
+| File | Key symbols | What they do |
+| :-- | :-- | :-- |
+| `src/scripting.rs` | `SCRIPT_CACHE`, `sha1_hex`, `load_script`, `get_script`, `script_exists`, `flush_scripts`, `cached_scripts_count` | Script cache. |
+| `src/scripting.rs` | `FunctionDef`, `FunctionLib`, `FUNCTION_LIBS`, `list_functions`, `delete_function`, `flush_functions`, `count_functions`, `count_libraries`, `library_codes` | Function library registry. |
+| `src/scripting.rs` | `is_script_read_only`, `is_sha_read_only`, `is_function_read_only` | Flag-based read-only detection for dispatch/pausing. |
+| `src/scripting.rs` | `ScriptRedirect`, `SCRIPT_REDIRECT`, `arm_script_redirect`, `take_script_redirect`, `script_redirects`, `SCRIPT_RECORDED_ERROR` | Per-thread script state. |
+| `src/scripting.rs` | `eval_script`, `format_eval_error` | `EVAL`/`EVALSHA` engine and error formatting. |
+| `src/scripting.rs` | `load_function`, `create_load_redis_proxy`, `validate_library_or_function_name`, `is_valid_function_flag` | `FUNCTION LOAD`. |
+| `src/scripting.rs` | `call_function`, `format_lua_error` | `FCALL`. |
+| `src/scripting.rs` | `dump_functions`, `restore_functions`, `merge_function_libs`, `function_names` | `FUNCTION DUMP`/`RESTORE`. |
+| `src/scripting.rs` | `setup_redis_lua_env`, `make_table_readonly_proxy`, `register_redis_module`, `script_acl_denied`, `script_debug_denied` | Sandbox, `redis` API, per-command checks. |
+| `src/scripting.rs` | `register_bit_module`, `register_cjson_module` (`CJsonConfig`, `json_val_to_lua`, `lua_val_to_json_str`), `register_cmsgpack_module` (`pack_lua_val`, `unpack_msgpack_val`) | Helper libraries. |
+| `src/scripting.rs` | `resp_bytes_to_lua`, `parse_resp_array_to_lua`, `parse_resp_array_to_map_lua`, `parse_resp_element`, `lua_val_to_resp`, `lua_val_to_resp_with_depth` | RESP ⇄ Lua conversion. |
+| `src/connection.rs` | `execute_command_inner` (`Eval`, `Evalsha`, `Fcall`, `Script*`, `Function*` arms), `keys_span_shards`, `SCRIPT_CROSS_SHARD_ERR` | Top-level dispatch and shard routing. |
+| `src/connection.rs` | `script_touches_non_local_key`, `script_non_local_target`, `SCRIPT_NON_LOCAL_KEY_ERR`, `acl_denied_in_context`, `CURRENT_AUTH_USER`, `for_each_cmd_key` | Helpers used by `redis.call`. |
+| `src/connection.rs` | `execute_local_command` (`FunctionLoad/Delete/Flush/Restore/Stats/Kill` arms), `should_pause_command` | Replica/AOF application of function changes; pause rules. |
+| `src/server.rs` | `run_shard_worker` (cross-shard request handling: `Eval`/`Evalsha`/`Fcall` branches) | Runs forwarded scripts on the owning shard. |
+| `src/resp.rs` | `build_command` (`EVAL*`, `SCRIPT`, `FUNCTION`, `FCALL*`), `Command::is_write_command`, `Command::allows_oom` | Parsing and top-level classification. |
+| `src/router.rs` | `Router::log_mutation`, `execute_remote`, `target_shard` | Logging function changes; forwarding. |
+| `src/aof.rs` | `apply_aof_command`, `replay_script` | Replaying verbatim scripts from legacy AOFs. |
+| `src/redis_rdb.rs` | `write_file_header` (`OP_FUNCTION2`), RDB loader `OP_FUNCTION2` arm | Function persistence in RDB. |
+| `src/allocator.rs` | `INFO memory` formatting | Script/function counters. |
+| `tests/e2e_scripting.rs` | `test_lua_scripting_engine_e2e`, `test_scripts_reject_keys_on_several_shards_e2e`, `test_script_access_to_non_local_key_is_rejected_e2e`, `test_keyless_script_runs_on_owner_of_first_key_e2e`, `test_script_redis_call_enforces_caller_acl_e2e`, `test_lua_publish_from_two_shards_does_not_deadlock_e2e`, `test_fcall_mutating_aof_persistence_and_replay_e2e`, `test_functions_survive_aof_rewrite_and_restart_e2e` | End-to-end coverage. |
 
-### How to Verify Changes
+### How to verify changes
+
 ```bash
-# 1. Format check
 cargo fmt --check
-
-# 2. Clippy verification with zero warnings
 cargo clippy --all-targets -- -D warnings
-
-# 3. Run unit tests
 cargo test --lib scripting -- --test-threads=1
-
-# 4. Run the scripting/functions E2E tests
-cargo test --test e2e_scripting test_lua_scripting_engine_e2e -- --test-threads=1
-cargo test --test e2e_persistence test_fcall_mutating_aof_persistence_and_replay_e2e -- --test-threads=1
+cargo test --test e2e_scripting script -- --test-threads=1
+cargo test --test e2e_scripting function -- --test-threads=1
+scripts/run_redis_test_suite.sh   # includes unit/scripting and unit/functions (single shard)
 ```

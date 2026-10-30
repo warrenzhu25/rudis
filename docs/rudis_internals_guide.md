@@ -3,7 +3,7 @@
 This document is a narrative, example-driven walkthrough of Rudis's architecture for
 contributors who want one self-contained read before diving into the per-subsystem
 documentation. **It intentionally stays at a conceptual level and defers exact struct layouts,
-algorithms, and source line references to the linked subsystem docs in
+algorithms, and source references to the linked subsystem docs in
 [`docs/design/`](design/) and [`docs/internal/`](internal/), which have been verified against
 the current source tree.** Where this document does state a concrete fact (a type name, a
 threshold, a file path), that fact has been checked against `src/` directly. Earlier revisions
@@ -320,6 +320,8 @@ and scheduling of that exchange is entirely outside Rudis today. Full detail:
 | **Geospatial** | [17_geospatial](design/17_geospatial.md) | [17_geospatial](internal/17_geospatial.md) | `src/geo.rs` |
 | **Probabilistic Structures** | [18_probabilistic](design/18_probabilistic.md) | [18_probabilistic](internal/18_probabilistic.md) | `src/probabilistic.rs` |
 | **Pub/Sub** | [19_pubsub](design/19_pubsub.md) | [19_pubsub](internal/19_pubsub.md) | `src/pubsub.rs` |
+| **Agent Memory & LLM Quota** | [20_agent_memory](design/20_agent_memory.md) | [20_agent_memory](internal/20_agent_memory.md) | `src/agent.rs` |
+| **MCP Server** | [21_mcp_server](design/21_mcp_server.md) | [21_mcp_server](internal/21_mcp_server.md) | `src/mcp.rs` |
 
 For RDB/AOF persistence specifically (what triggers a save, why it isn't `io_uring`-accelerated,
 and the known `save N M` and tiered-value serialization gaps), see [`docs/rdbsave.md`](rdbsave.md)

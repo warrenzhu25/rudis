@@ -23,8 +23,8 @@ agents must uphold when touching this codebase.
 * **[Rudis Internals Guide](rudis_internals_guide.md)**: a narrative, example-driven tour of the same subsystems for contributors who want a single self-contained read before diving into the per-subsystem docs below.
 
 ### Subsystem Specifications & Implementation References
-* **[Subsystem Design Specifications](design/README.md)**: high-level architectural design and rationale ("why") across all 19 subsystems ([consolidated guide](design/components.md)).
-* **[Subsystem Implementation & Code References](internal/README.md)**: concrete data structures, algorithms, and source line references in `src/` ([consolidated guide](internal/components.md)).
+* **[Subsystem Design Specifications](design/README.md)**: high-level architectural design and rationale ("why") across all 21 subsystems ([consolidated guide](design/components.md)).
+* **[Subsystem Implementation & Code References](internal/README.md)**: concrete data structures, algorithms, and code references (by file and symbol) in `src/`, for all 21 subsystems ([consolidated guide](internal/components.md)).
 
 ### Benchmarks
 * **[Comprehensive Performance Guide](benchmarks/comprehensive_performance_guide.md)**: AMD EPYC benchmark results, throughput, latency distributions, and profiling methodology — includes an explicit data-provenance note on which figures are reproducible from committed data versus illustrative of methodology only.

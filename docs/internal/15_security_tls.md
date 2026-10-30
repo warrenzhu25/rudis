@@ -1,771 +1,745 @@
-# Component 15: Security, Memory Allocator & TLS (Implementation Deep-Dive & Code Reference)
+# Component 15: Security (ACL & network guards), Memory Allocator & TLS
 
-> **Source Files**: `src/acl.rs` (443 lines), `src/allocator.rs` (344 lines), `src/tls.rs` (346 lines)
-> **High-Level Design Spec**: [`docs/design/15_security_tls.md`](../design/15_security_tls.md)
-> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
->
-> This revision re-verifies every claim against current source. The previously-documented
-> `requirepass` enforcement gap is **now fixed**. The old kTLS plaintext-bypass note is
-> **obsolete**: kTLS is not implemented and its partial scaffolding (`enable_ktls`,
-> `is_ktls_active`, kTLS read/write branches) has been removed (§5.3). TLS clients now run the
-> same generic client loop as plaintext clients (§5.4). Several
-> new findings are documented below (§6) that were not present in the prior pass.
+> **Source files**: `src/acl.rs`, `src/acl_categories.rs`, `src/netsec.rs`, `src/tls.rs`,
+> `src/transport.rs`, `src/allocator.rs` (plus the enforcement call sites in `src/connection.rs`,
+> `src/server.rs`, `src/main.rs`, `src/config.rs`, `src/scripting.rs`)
+> **High-level design spec**: [`docs/design/15_security_tls.md`](../design/15_security_tls.md)
+> **Consolidated implementation spec**: [`docs/internal/components.md`](components.md)
 
 ---
 
-## 1. Source Module Map & Responsibilities
+## 1. What this subsystem does
 
-| File | Role | Key Items |
+Rudis is a Redis-compatible server, so it has to give operators the same access controls Redis
+does. This component covers four loosely related jobs:
+
+1. **Who may connect and what they may do** — Redis-style **ACLs** (Access Control Lists): named
+   users with SHA-256-hashed passwords, per-user command permissions (by command, subcommand or
+   *category* such as `@read`), key-pattern permissions with read/write granularity, and Pub/Sub
+   channel permissions. `AUTH`, `HELLO … AUTH`, `ACL …`, `requirepass`, `aclfile`, `ACL LOG` and
+   the `acl_access_denied_*` stats all live here.
+2. **Network guards** (`netsec.rs`) — the `bind` address list, **protected mode** (refuse
+   non-loopback clients while the default user has no password), the "port already in use" probe,
+   and the `enable-debug-command` / `enable-module-command` gates.
+3. **TLS** — an optional second listener (`tls-port`) that terminates TLS in userspace with
+   `rustls`, optionally verifying client certificates (mTLS), and then runs exactly the same
+   connection loop as plaintext clients.
+4. **Allocator telemetry and helpers** — jemalloc is the process's global allocator;
+   `allocator.rs` reads its statistics for `INFO memory`, `MEMORY STATS/DOCTOR/MALLOC-STATS`,
+   exposes cheap per-thread byte counters used by `maxmemory` accounting, and hosts a small
+   per-shard object pool (`SmallCollectionArena`) used by the keyspace table.
+
+Users of this component: every client connection (auth + per-command checks), the config loader
+and `CONFIG GET/SET/REWRITE`, the shard accept loops, Lua scripting (scripts are ACL-checked as the
+calling user), and the memory/eviction subsystem (allocator counters).
+
+---
+
+## 2. Mental model
+
+```mermaid
+flowchart TD
+    subgraph Accept["Shard accept loops (server.rs)"]
+        P["plain listener: shard port"]
+        T["TLS listener: tls-port"]
+    end
+    T -->|"TlsSession::handshake_monoio (10 s timeout)"| TT["TlsTransport"]
+    P --> PT["PlainTransport"]
+    TT --> PM{"protected_mode_denies?"}
+    PT --> PM
+    PM -->|"yes"| DEN["-DENIED reply, close"]
+    PM -->|"no"| HC["handle_client generic loop (connection.rs)"]
+    HC --> BOOT["authenticated = !is_auth_required_for_default()"]
+    BOOT --> EX["execute_command"]
+    EX --> G1["protected_command_denied (DEBUG / MODULE)"]
+    G1 --> G2{"authenticated?"}
+    G2 -->|"no, and not AUTH/HELLO/QUIT"| NOAUTH["-NOAUTH"]
+    G2 -->|"yes"| G3["acl_denied: command, keys, channels"]
+    G3 -->|"denied"| NOPERM["-NOPERM + ACL LOG entry + stat"]
+    G3 -->|"allowed"| RUN["run command"]
+    G3 -.reads.-> ACL[("PORT_ACLS: port to Arc RwLock AclManager")]
+    BOOT -.reads.-> ACL
+    CFG["requirepass / user directives / aclfile / ACL SETUSER"] -.writes.-> ACL
+```
+
+Key ideas to hold in your head:
+
+- **One ACL table per server, looked up by port.** `PORT_ACLS` maps a port number to a shared
+  `Arc<RwLock<AclManager>>`. In cluster mode every shard listens on `base_port + shard_id`, so each
+  shard aliases its port to the base port's table (`share_acl_with_port`). Plain and TLS
+  connections on a shard use the same `Router`, hence the same `router.port`, hence the same
+  table — there is no separate "TLS ACL".
+- **Free when unused.** `HAS_CUSTOM_ACL` is a process-wide flag. While it is `false` and the
+  connection is the `default` user, the per-command ACL check returns immediately without taking
+  any lock.
+- **The command table is generated.** `acl_categories.rs` is a generated, sorted table of 469
+  commands/subcommands with category bitmasks, key-permission flags and a `NO_AUTH` flag; ACL
+  permission state is a bitset indexed by that table.
+- **TLS is just another transport.** After the handshake, a `TlsTransport` implements the same
+  `ClientTransport` trait as `PlainTransport`, so `handle_client<T>` is monomorphized for both and
+  TLS clients get pipelining, MULTI/EXEC, Pub/Sub, limits, CLIENT KILL, etc.
+
+---
+
+## 3. ACL data model (`src/acl.rs`, `src/acl_categories.rs`)
+
+### 3.1 Process-wide statics and the per-port registry
+
+| Item | Type | Meaning |
 | :--- | :--- | :--- |
-| `src/acl.rs` | Per-port ACL registry, password hashing, `AUTH`/`ACL *` logic | `AclUser`, `AclManager`, `PORT_ACLS`, `HAS_CUSTOM_ACL`, `hash_password*` |
-| `src/allocator.rs` | jemalloc telemetry for `INFO`, plus an unrelated small-collection object-pool arena | `AllocatorStats`, `get_allocator_stats`, `format_memory_info`, `SmallCollectionArena` |
-| `src/tls.rs` | rustls-backed TLS (userspace only — no kTLS), self-signed cert generation, `TlsSession` handshake, `TlsTransport` (the TLS `ClientTransport` impl) | `TlsSession`, `TlsTransport`, `generate_self_signed_cert`, `create_server_config` |
-| `src/transport.rs` | Transport trait the generic client loop is monomorphized over; plaintext impl; out-of-band push target | `ClientTransport`, `PlainTransport`, `PushTarget` |
+| `HAS_CUSTOM_ACL` | `AtomicBool` | Set `true` (never reset) by `set_user`, `load_user_from_declaration`, `load_from_aclfile`, `del_user`, and by `set_requirepass` with a non-empty password. Fast-path switch for every ACL check. |
+| `PORT_ACLS` | `LazyLock<Mutex<HashMap<u16, Arc<RwLock<AclManager>>>>>` | Registry of ACL tables keyed by listening port (parking_lot locks). |
+| `get_acl_for_port(port)` | fn | Returns the table for `port`, creating a fresh `AclManager::new()` on first use. |
+| `share_acl_with_port(port, base_port)` | fn | Makes `port` resolve to `base_port`'s table (overwriting any table created earlier for `port`). No-op when equal. Called by every shard at startup. |
 
-`src/allocator.rs` is really two unrelated modules sharing a file: lines 1–89 are jemalloc
-telemetry; lines 91–344 are `SmallCollectionArena`, a per-shard free-list pool for `List`/`Hash`/
-`Set`/`ZSet` collections used by `src/table.rs` (Component 05) — it has nothing to do with the
-system allocator and is not mentioned in the module's own doc comment grouping, but it lives in
-this file and is covered in §4.
+Because the map is process-global, several in-process test servers on different ports each get
+their own table; but `HAS_CUSTOM_ACL` is shared, so once any server customizes ACLs, every server
+pays the (cheap) lookup cost.
+
+### 3.2 The generated command table (`acl_categories.rs`)
+
+`acl_categories.rs` is produced by `scripts/gen_acl_categories.py` from the Valkey command JSON
+files plus Rudis-only commands (`agent`, `bf`, `cf`, `cms`, `mcp`, `xdp`, …). Do not edit it by
+hand.
+
+```rust
+pub const CATEGORIES: &[&str] = &["keyspace", "read", "write", "set", "sortedset", "list",
+    "hash", "string", "bitmap", "hyperloglog", "geo", "stream", "pubsub", "admin", "fast",
+    "slow", "blocking", "dangerous", "connection", "transaction", "scripting"]; // bit i = CATEGORIES[i]
+
+pub struct CmdInfo {
+    pub name: &'static str,     // lowercase; subcommands are "parent|sub"
+    pub cats: u32,              // category bitmask
+    pub key_flags: u8,          // bit0 = needs read (%R), bit1 = needs write (%W)
+    pub no_auth: bool,          // NO_AUTH flag: exempt from command ACLs
+    pub parent: Option<u16>,    // index of the container, for subcommands
+    pub subs: (u16, u16),       // index range of this container's subcommands (empty otherwise)
+}
+pub const NUM_COMMANDS: usize = 469;
+pub const WORDS: usize = 8;     // 8 x 64 bits >= 469 commands
+pub static COMMANDS: [CmdInfo; NUM_COMMANDS] = [ /* sorted by name */ ];
+```
+
+Because `COMMANDS` is sorted and a container's subcommands sort directly after it
+(`"acl"`, `"acl|cat"`, …, `"acl|whoami"`), a container's subcommands form one contiguous index
+range — that is what `subs` records. Only four commands carry `no_auth`: `auth`, `hello`, `quit`,
+`reset`.
+
+Helpers in `acl.rs`:
+
+- `command_index(name)` — case-insensitive binary search of `COMMANDS` by name (`"get"`,
+  `"config|set"`).
+- `commands_in_category(cat)` — all command names whose `cats` contain that category bit (used by
+  `ACL CAT <category>`); `None` for an unknown category.
+- `CommandSet([u64; WORDS])` — one bit per `COMMANDS` entry; the user's effective permission set.
+
+### 3.3 `AclUser`
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `name` | `String` | Username (no spaces or NUL allowed). |
+| `enabled` | `bool` | `on` / `off`. A disabled user cannot authenticate. |
+| `password_hashes` | `Vec<String>` | `"#<64 lowercase hex>"` SHA-256 digests only. Plaintext is never stored. |
+| `nopass` | `bool` | Any password is accepted. |
+| `all_commands` | `bool` | Redis `allcommands`: set by `+@all`, cleared by any later removal. Also grants commands absent from the table. |
+| `commands` (private) | `CommandSet` | Effective per-command permission bits. |
+| `cmd_base_all` (private) | `bool` | Whether the rule history starts from `+@all` or `-@all` (for `ACL LIST`/`GETUSER` output). |
+| `cmd_rules` (private) | `Vec<CmdRuleEntry>` | Ordered, compacted history of category / command / first-arg rules, used to render a replayable rule string. |
+| `first_arg_rules` (private) | `Vec<(usize, String)>` | Allowed first arguments, e.g. `+select|0` → `(idx("select"), "0")`. |
+| `all_keys` | `bool` | `allkeys` / `~*`. |
+| `key_patterns` | `Vec<KeyPattern>` | `{ pattern: String, perm: u8 }` with `perm` ⊆ `KEY_READ (1) | KEY_WRITE (2)`. |
+| `all_channels` | `bool` | `allchannels` / `&*`. |
+| `channel_patterns` | `Vec<String>` | `&<glob>` Pub/Sub channel patterns. |
+| `sanitize_payload` | `bool` | `sanitize-payload` (default) / `skip-sanitize-payload`. Stored and displayed only (see §10). |
+
+`CmdRuleEntry` is `Category { allow, name } | Command { allow, idx } | FirstArg { parent_idx, arg }`.
+
+Two constructors:
+
+- `AclUser::new_default()` — the built-in `default` user: `on nopass ~* &* +@all`
+  (`enabled`, `nopass`, `all_commands`, full `CommandSet`, `all_keys`, `all_channels`).
+- `AclUser::new_empty_with_pubsub(name, all_channels_default)` — a brand-new user:
+  `off`, no passwords and not `nopass`, `-@all`, no keys, and channel access taken from
+  `acl-pubsub-default` (`false` = `resetchannels`, the Redis 7 default).
+
+### 3.4 `AclManager`
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `users` | `HashMap<String, AclUser>` | Always contains `default`. |
+| `requirepass` | `Option<String>` | The plaintext `requirepass` value, kept only so `CONFIG GET requirepass` / `CONFIG REWRITE` can echo it, as Redis does. ACL commands never expose it. |
+| `acl_pubsub_default_all` | `bool` | `acl-pubsub-default` (`allchannels` = `true`). Default `false`. |
+| `aclfile` | `Option<PathBuf>` | `aclfile` path, if configured. |
+| `acllog_max_len` | `usize` | `acllog-max-len`, default 128. 0 disables logging. |
+| `acl_log` | `VecDeque<AclLogEntry>` | `ACL LOG` ring, newest first. |
+| `next_log_entry_id` | `u64` | Monotonic `entry-id` counter. |
 
 ---
 
-## 2. Component Architecture & Data Flow
+## 4. Authentication
 
-```
-AUTH user pass  /  HELLO ... AUTH user pass  /  ACL SETUSER|GETUSER|LIST|USERS|DELUSER|WHOAMI|CAT
-                                   │
-     PORT_ACLS: Mutex<HashMap<u16 port, Arc<RwLock<AclManager>>>>   (acl.rs:7-8, process-global)
-                                   │
-          get_acl_for_port(port) → creates-on-first-use, same Arc shared by every shard
-          thread and by both the plain and TLS accept loops for that port (same `router.port`)
-                                   │
-                    AclManager { users: HashMap<String, AclUser> }
-                                   │
-     check_auth(username, password) -> Result<String, &'static str>   (§3.3)
-     nopass ⇒ instant success; else plaintext match OR any of 4 hash-comparison forms
-                                   │
-     connection bootstraps `authenticated` from is_auth_required_for_default() (§3.4);
-     on every subsequent command: NOAUTH gate, then (if HAS_CUSTOM_ACL or non-default user)
-     can_execute_command(name) && can_access_key(key) for EVERY key the command touches (§3.5)
+### 4.1 Password hashing
 
+There is exactly one scheme, matching Redis: `hash_password_sha256(p)` returns `"#"` followed by
+the lowercase hex SHA-256 of `p` (65 characters, unsalted — so hashes are portable between
+Redis-compatible servers). A `#<hash>` rule body is validated by `parse_password_hash`: exactly 64
+hex digits (upper case accepted, normalized to lower case), otherwise an error.
 
-requirepass (config file OR CONFIG SET) ──► directly primes the "default" AclUser (§3.6)
-     main.rs:137-153 (startup)  and  connection.rs CONFIG SET requirepass (~6686-6703)
-     both: clear passwords/hashes, push plaintext + SHA-256 hash, nopass=false,
-     HAS_CUSTOM_ACL=true  — FIXED: no longer silently ignored (§6 "Status" notes)
+### 4.2 `check_auth(username, password)`
 
+1. Look up `username` (or `default` when `None`). Missing user → `WRONGPASS`.
+2. Disabled user → `WRONGPASS` (the same message, so usernames are not probeable).
+3. `nopass` → success immediately.
+4. Compute `hash_password_sha256(password)` and compare it against every stored hash with
+   `ct_eq` (constant-time byte equality, so timing does not leak a matching prefix).
+5. Match → `Ok(username)`; otherwise `Err("WRONGPASS invalid username-password pair or user is disabled.")`.
 
-INFO command (memory section)
-                                   │
-     allocator::format_memory_info(used_mem, max_mem, cooled_keys, tiered_keys)
-                                   │
-     allocator::get_allocator_stats()  →  tikv_jemalloc_ctl::stats::{allocated,active,
-     resident,metadata,mapped}  (real reads against the process's global jemalloc allocator)
+A stored hash is **never** accepted as a password itself: sending `#<hash>` or the bare hex as the
+`AUTH` argument fails (unit test `test_acl_passwords_stored_hashed_and_hash_not_accepted`).
 
+### 4.3 When does a connection start authenticated?
 
---tls-port listener (server.rs, spawned per shard, parallel SO_REUSEPORT socket)
-                                   │
-     TlsSession::new(rustls ServerConfig) → handshake_monoio()  (10 s handshake timeout)
-     (genuine async rustls handshake loop driven over monoio AsyncReadRent/AsyncWriteRentExt)
-                                   │
-     no kTLS: userspace rustls only (enable_ktls / is_ktls_active removed, §5.3)
-                                   │
-     TlsTransport → handle_client<TlsTransport>(): the SAME generic client loop as
-     handle_connection() → handle_client<PlainTransport>() (squashing, MULTI/EXEC, Pub/Sub,
-     CLIENT KILL/LIST, limits, stats); MONITOR/tracking pushes arrive via PushTarget::Queue
-     and are encrypted by the owning connection (§5.4)
-```
-
----
-
-## 3. ACL System — Exact Structures & Algorithms (`src/acl.rs`)
-
-### 3.1 Module-level statics (acl.rs:1-15)
+`is_auth_required_for_default()` mirrors Redis `authRequired()`: auth is required unless the
+`default` user exists, is enabled **and** is `nopass`. The generic connection loop
+(`handle_client` in `connection.rs`, shared by plain and TLS) starts with:
 
 ```rust
-pub static HAS_CUSTOM_ACL: AtomicBool = AtomicBool::new(false);
-
-pub static PORT_ACLS: LazyLock<Mutex<HashMap<u16, Arc<RwLock<AclManager>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-pub fn get_acl_for_port(port: u16) -> Arc<RwLock<AclManager>> {
-    let mut map = PORT_ACLS.lock().unwrap();
-    map.entry(port)
-        .or_insert_with(|| Arc::new(RwLock::new(AclManager::new())))
-        .clone()
-}
-```
-
-`HAS_CUSTOM_ACL` is a single process-wide flag (not per-port) — it is set `true` the first time
-*any* port's `AclManager::set_user`/`del_user` runs, or the first time `requirepass` is primed
-(main.rs or `CONFIG SET requirepass`). It is read as a fast-path short-circuit before taking the
-per-port `RwLock` on the hot command-execution path (§3.5) — once true, it stays true for the
-life of the process (never reset to `false`).
-
-`PORT_ACLS` is keyed by listening **port number**, not by "plain vs. TLS". Since the TLS accept
-loop on a shard reuses the *same* `Router` (and therefore the same `router.port`, the shard's
-plain port — see server.rs:228-240) as the plain accept loop, `get_acl_for_port(router.port)`
-resolves to the **identical** `AclManager` for TLS and plain connections on that shard. There is
-no separate "TLS ACL" — `requirepass`/ACL rules protect both listeners uniformly.
-
-### 3.2 Password hashing — three functions, one dead branch (acl.rs:17-58)
-
-```rust
-pub fn hash_password(password: &str) -> String {               // legacy
-    // SHA1("rudis_acl_salt_v1:" + password), formatted "#<40-hex>"
-}
-
-/// Standard Redis SHA-256 hash (#<64-hex>)
-pub fn hash_password_sha256(password: &str) -> String {
-    // ring::digest::digest(SHA256, password.as_bytes()), formatted "#<64-hex>"
-    // UNSALTED — matches real Redis's ACL password-hash format exactly.
-}
-
-/// Modern per-user salted SHA-256 password hash
-pub fn hash_password_salted(username: &str, password: &str) -> String {
-    // ring::digest::digest(SHA256, "<username>:<password>"), formatted "#<64-hex>"
-}
-```
-
-Three distinct schemes exist:
-1. **`hash_password`** — legacy SHA1 (160-bit / 40 hex chars) with one hardcoded global salt
-   string `"rudis_acl_salt_v1:"` shared by every user and every Rudis instance. Still computed
-   and still checked in `check_auth` for backward compatibility, and still one of the two hashes
-   `set_user`'s `>password` rule writes into `password_hashes` (acl.rs:304-307).
-2. **`hash_password_sha256`** — **this is the real Redis-compatible scheme**: unsalted
-   `SHA256(password)`, 256-bit / 64 hex chars, `#`-prefixed. Re-verified: Redis's actual ACL
-   password hash is unsalted SHA-256 for exactly this reason (so `ACL GETUSER`'s hash output is
-   portable/comparable across installs), and this implementation matches it precisely. This is
-   the hash `set_user`'s `>password` rule writes first (acl.rs:300-303) and the one `main.rs`'s
-   `requirepass` priming and `CONFIG SET requirepass` both use.
-3. **`hash_password_salted`** — a third, per-user-salted SHA-256 variant
-   (`SHA256(username + ":" + password)`). **This function is dead on the write side**: it is
-   `grep`-confirmed to have exactly two references in the whole codebase — its own definition
-   (acl.rs:45) and a single call site inside `check_auth` (acl.rs:216) that computes it on every
-   auth attempt and compares it against stored hashes. Nothing anywhere (`set_user`, `main.rs`,
-   `CONFIG SET requirepass`) ever *stores* a hash in this format, so the comparison can never
-   succeed — it is pure wasted work on every `AUTH`/`HELLO AUTH`/pipeline auth check.
-
-### 3.3 `AclUser` / `AclManager` — exact struct layout (acl.rs:60-199)
-
-```rust
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AclUser {
-    pub name: String,
-    pub enabled: bool,
-    pub passwords: Vec<String>,                           // plaintext, still populated
-    pub password_hashes: Vec<String>,                      // "#<hex>" entries, multiple schemes mixed
-    pub nopass: bool,
-    pub all_commands: bool,
-    pub allowed_commands: hashbrown::HashSet<String>,       // used only when all_commands == false
-    pub disallowed_commands: hashbrown::HashSet<String>,    // used only when all_commands == true
-    pub all_keys: bool,
-    pub allowed_key_patterns: Vec<String>,                  // used only when all_keys == false
-}
-
-pub struct AclManager {
-    pub users: HashMap<String, AclUser>,
-}
-```
-
-`AclUser::new_default()` (acl.rs:75-88) seeds the `"default"` user with `enabled: true,
-nopass: true, all_commands: true, all_keys: true` and all collections empty — a fully
-unrestricted user. `AclManager::new()` (acl.rs:195-199) inserts exactly this one `"default"`
-entry; it is the *only* user that exists until an `ACL SETUSER` call (or `requirepass` priming,
-which mutates this same default user in place) adds more.
-
-`set_user`'s fallback-insert path for a brand-new non-default username (acl.rs:271-282) seeds
-the opposite defaults: `enabled: false, nopass: false, all_commands: false, all_keys: false` —
-i.e. a freshly-created user via `ACL SETUSER newuser <rules>` starts fully locked down
-(disabled, no commands, no keys) until the rule tokens in the same call grant something.
-
-### 3.4 `check_auth` — exact matching algorithm (acl.rs:201-233)
-
-```rust
-pub fn check_auth(&self, username: Option<&str>, password: &str) -> Result<String, &'static str> {
-    let user_name = username.unwrap_or("default");
-    if let Some(user) = self.users.get(user_name) {
-        if !user.enabled { return Err("WRONGPASS User is disabled"); }
-        if user.nopass { return Ok(user_name.to_string()); }          // short-circuit, no hashing at all
-        let legacy_sha1 = hash_password(password);
-        let sha256 = hash_password_sha256(password);
-        let salted = hash_password_salted(user_name, password);       // computed but never matches (§3.2)
-        if user.passwords.iter().any(|p| p == password)
-            || user.password_hashes.iter().any(|h| {
-                h == &sha256
-                    || h == &salted
-                    || h == &legacy_sha1
-                    || (h.starts_with('#') && h[1..] == sha256[1..])  // tolerates a bare-hex stored hash
-                    || h == password                                   // lets a pre-hashed `#...` ACL entry
-            })                                                         // be compared verbatim against input
-        {
-            Ok(user_name.to_string())
-        } else {
-            Err("WRONGPASS invalid username-password pair or user is disabled.")
-        }
-    } else {
-        Err("WRONGPASS invalid username-password pair or user is disabled.")
-    }
-}
-```
-
-The `h == password` arm is what makes Redis's real `ACL SETUSER user #<precomputed-sha256-hash>`
-syntax work: the client's `AUTH` password argument is compared directly against the stored
-`#<hex>` string without the server needing to know in advance whether the stored value is a
-hash or literal text.
-
-`is_auth_required_for_default` (acl.rs:235-241):
-
-```rust
-pub fn is_auth_required_for_default(&self) -> bool {
-    if let Some(user) = self.users.get("default") {
-        !user.nopass && (!user.passwords.is_empty() || !user.password_hashes.is_empty())
-    } else {
-        false
-    }
-}
-```
-
-### 3.5 Connection-level enforcement
-
-**Bootstrap** (the generic `handle_client` loop in `connection.rs`, shared by plaintext and TLS
-connections — one code site for both):
-
-```rust
-let mut authenticated = !crate::acl::get_acl_for_port(router.port)
-    .read().unwrap().is_auth_required_for_default();
+let mut authenticated = !get_acl_for_port(router.port).read().is_auth_required_for_default();
 let mut auth_user = "default".to_string();
 ```
 
-**Per-command gate** (`execute_command`, connection.rs:4990-5026):
+`RESET` (in all its code paths: normal, inside MULTI, Pub/Sub mode) re-derives `authenticated`
+with the same function and switches back to `default`.
 
-```rust
-if !*authenticated && !matches!(cmd, Command::Auth{..} | Command::Hello{..} | Command::Quit) {
-    out.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
-    return false;
-}
+### 4.4 `AUTH` and `HELLO … AUTH`
 
-if *authenticated
-    && (crate::acl::HAS_CUSTOM_ACL.load(Ordering::Relaxed) || auth_user != "default")
-{
-    let acl = crate::acl::get_acl_for_port(router.port);
-    let acl_guard = acl.read().unwrap();
-    if let Some(user) = acl_guard.get_user(auth_user) {
-        if !user.can_execute_command(cmd_name) { /* -NOPERM, return false */ }
-        for key in cmd_keys(&cmd) {                 // ALL keys the command touches, not just one
-            if !user.can_access_key(key) { /* -NOPERM, return false */ }
-        }
-    }
-}
-```
+- `AUTH [user] pass` → `check_auth`. On success sets `authenticated = true`, `auth_user`, and
+  updates the global client registry entry (so `CLIENT LIST` shows `user=`, and `ACL DELUSER`
+  can find the connection). On failure records an `Auth` denial (context `toplevel` or `multi`,
+  object `AUTH`) and replies `-WRONGPASS …`.
+- `HELLO proto AUTH user pass` does the same (denial recorded with command `hello`). `HELLO`
+  without `AUTH` on an unauthenticated connection that requires auth gets
+  `-NOAUTH HELLO must be called with the client already authenticated, …`.
 
-The ACL check is skipped entirely (fast path) unless `HAS_CUSTOM_ACL` is set process-wide or the
-current connection authenticated as a non-default user — this means a deployment that never
-touches ACL/`requirepass` pays zero `RwLock`/hashing cost per command. `cmd_keys` (connection.rs:
-3443-3448) walks `for_each_cmd_key` and collects **every** key referenced by the command (not
-just a single "primary" key — this supersedes an older single-key `cmd_primary_key` helper, which
-still exists at connection.rs:2778 but is now used only for routing/hashing, not for ACL).
+### 4.5 `requirepass`
 
-`AclUser::can_execute_command`/`can_access_key` (acl.rs:90-121):
+`AclManager::set_requirepass(pass)` is the single implementation used by both the config file
+(`main.rs`, before shards start) and `CONFIG SET requirepass`:
 
-```rust
-pub fn can_execute_command(&self, cmd_name: &str) -> bool {
-    let name = cmd_name.to_lowercase();
-    if matches!(name.as_str(), "ping"|"reset"|"quit"|"auth"|"hello") { return true; }  // always allowed
-    if self.all_commands { !self.disallowed_commands.contains(&name) }
-    else { self.allowed_commands.contains(&name) }
-}
+1. Clear the default user's hashes.
+2. Empty `pass` → default user becomes `nopass`; `requirepass = None`.
+3. Otherwise push `hash_password_sha256(pass)`, set `nopass = false`, set `HAS_CUSTOM_ACL`, and
+   remember the plaintext in `requirepass`.
 
-pub fn can_access_key(&self, key: &[u8]) -> bool {
-    if self.all_keys { return true; }
-    let key_str = String::from_utf8_lossy(key);
-    for pat in &self.allowed_key_patterns {
-        if pat == "*" { return true; }
-        if let Some(prefix) = pat.strip_suffix('*') {
-            if key_str.starts_with(prefix) { return true; }
-        } else if key_str == *pat { return true; }
-    }
-    false
-}
-```
+Worked example: `rudis --requirepass s3cret`, then a client connects. `is_auth_required_for_default`
+is `true` (default user not `nopass`), so `authenticated = false`; `GET k` returns `-NOAUTH`;
+`AUTH s3cret` hashes the input, matches the stored digest, and the connection proceeds as
+`default`.
 
-Only bare prefix-glob (`foo*`) or exact-match key patterns are real; no general glob engine
-(no mid-string `*`, no `?`/`[abc]` classes as real Redis ACL supports).
+---
 
-**Pipeline/squash path** (`execute_commands_squashed`-style batch entry, connection.rs:19120-19166)
-performs the *identical* `can_execute_command`/`for_each_cmd_key`+`can_access_key` checks per
-queued command while deciding squash-eligibility; any command an ACL would deny forces
-`can_squash = false` for the whole batch, and that command then falls through to the ordinary
-sequential `execute_command` path where the real `-NOPERM` fires — pipelining cannot bypass ACL.
+## 5. Authorization: rules and checks
 
-**`Command::Reset`** (connection.rs:9405-9424) recomputes `authenticated` with a **different,
-narrower** formula than `is_auth_required_for_default`:
+### 5.1 `ACL SETUSER` rule grammar (`apply_rule_with_pubsub` / `apply_prefixed_rule`)
 
-```rust
-let default_requires_auth = acl.read().unwrap().get_user("default")
-    .map(|u| !u.passwords.is_empty())
-    .unwrap_or(false);
-*authenticated = !default_requires_auth;
-```
+`AclManager::set_user(name, rules)` clones the existing user (or creates
+`new_empty_with_pubsub`), applies every rule in order, and only then stores the result — so a bad
+rule leaves the user untouched (or uncreated). All errors have the form
+`Error in ACL SETUSER modifier '<rule>': <reason>`. Usernames containing a space or NUL are
+rejected.
 
-This checks only `passwords.is_empty()` — it ignores `nopass` and `password_hashes` entirely. A
-default user configured with only a pre-hashed password (`ACL SETUSER default #<hash>`, leaving
-`passwords` empty while `password_hashes` is non-empty) would, per `is_auth_required_for_default`,
-require re-authentication after `RESET`, but this inline check instead sets `authenticated = true`
-unconditionally in that case — see §6 for the implication.
-
-### 3.6 `requirepass` integration — FIXED, no longer silent
-
-**Startup** (`main.rs:137-153`, runs once before any shard thread is spawned):
-
-```rust
-if let Some(ref pass) = server_config.requirepass {
-    let acl = rudis::acl::get_acl_for_port(port);
-    let mut acl_guard = acl.write().unwrap();
-    if let Some(user) = acl_guard.get_user_mut("default") {
-        user.passwords.clear();
-        user.password_hashes.clear();
-        if !pass.is_empty() {
-            user.passwords.push(pass.clone());
-            let h = rudis::acl::hash_password_sha256(pass);
-            user.password_hashes.push(h);
-            user.nopass = false;
-            rudis::acl::HAS_CUSTOM_ACL.store(true, Ordering::Release);
-        } else {
-            user.nopass = true;
-        }
-    }
-}
-```
-
-**Runtime** (`CONFIG SET requirepass`, connection.rs:6686-6703) performs the byte-for-byte
-identical sequence against the live `AclManager` for `router.port`. Because
-`get_acl_for_port(port)` is called *before* any shard worker starts (main.rs runs this prior to
-spawning shard threads at line 155+), and `PORT_ACLS` is a single process-global map, every
-shard's later `get_acl_for_port(router.port)` call resolves to this same already-primed
-`AclManager` — the default user's password and `HAS_CUSTOM_ACL=true` are visible to every shard
-from the first connection onward. `CONFIG GET requirepass` / `CONFIG GET *` (connection.rs:6412-
-6425, 6477-6483) read back `user.passwords.first()` (plaintext) for display, defaulting to `""`
-when unset.
-
-**This closes the gap the previous doc pass documented**: setting `requirepass` (config file or
-`CONFIG SET`) now reliably flips `nopass = false` and `HAS_CUSTOM_ACL = true` on the default user,
-so `is_auth_required_for_default()` returns `true` and every new connection (plain or TLS, same
-`router.port`) starts with `authenticated = false` and must `AUTH`/`HELLO AUTH`. See §6 "Status
-of previously-reported issues" for the verification trail.
-
-### 3.7 `ACL SETUSER` rule-token parser (acl.rs:266-356)
-
-Full token table, in parse order:
-
-| Token | Effect |
+| Rule (case-insensitive keywords) | Effect |
 | :--- | :--- |
-| `on` / `off` | `enabled = true` / `false` |
-| `nopass` | `nopass=true`, clears `passwords` and `password_hashes` |
-| `-nopass` | `nopass=false` only (does not touch stored passwords) |
-| `>password` | `nopass=false`; pushes plaintext to `passwords` (dedup) **and** pushes both `hash_password_sha256(p)` and `hash_password(p)` (legacy SHA1) to `password_hashes` (dedup each) |
-| `#hexhash` | `nopass=false`; pushes `"#<hexhash>"` verbatim to `password_hashes` (dedup) — for pre-hashed credentials |
-| `<password` | removes `password` from `passwords`; also removes its legacy-SHA1 hash from `password_hashes` (does **not** remove a matching SHA-256 hash) |
-| `!hexhash` | removes `"#<hexhash>"` (or bare `hexhash`) from `password_hashes` |
-| `+@all` / `+all` | `all_commands=true`, clears `disallowed_commands` |
-| `-@all` / `-all` | `all_commands=false`, clears `allowed_commands` |
-| `+cmd` | if `all_commands`: remove `cmd` from `disallowed_commands`; else: add to `allowed_commands` |
-| `-cmd` | if `all_commands`: add `cmd` to `disallowed_commands`; else: remove from `allowed_commands` |
-| `~*` / `allkeys` | `all_keys=true`, clears `allowed_key_patterns` |
-| `resetkeys` | `all_keys=false`, clears `allowed_key_patterns` |
-| `~pattern` | `all_keys=false`; pushes `pattern` to `allowed_key_patterns` (dedup) |
-| anything else (e.g. `+@read`, `-@write`, `&channel:*`) | **silently accepted and ignored** — no error returned, no state change |
+| `on` / `off` | enable / disable |
+| `nopass` | `nopass = true`, clear hashes |
+| `resetpass` | `nopass = false`, clear hashes |
+| `>pw` | `nopass = false`, add `sha256(pw)` (dedup) |
+| `<pw` | remove `sha256(pw)` |
+| `#hex` | `nopass = false`, add validated hash |
+| `!hex` | remove validated hash |
+| `allkeys` / `~*` | `all_keys = true`, clear patterns |
+| `resetkeys` | `all_keys = false`, clear patterns |
+| `~pat` | add pattern with read+write |
+| `%R~pat`, `%W~pat`, `%RW~pat` | add pattern with those permissions; repeating a pattern ORs permissions in. Adding any pattern while `all_keys` is set is an error. |
+| `allchannels` / `&*` | `all_channels = true`, clear patterns |
+| `resetchannels` | `all_channels = false`, clear patterns |
+| `&pat` | add channel glob (error while `all_channels`) |
+| `allcommands` / `+@all` | full `CommandSet`, `all_commands = true`, reset rule history |
+| `nocommands` / `-@all` | empty `CommandSet`, `all_commands = false`, reset rule history |
+| `+@cat` / `-@cat` | set/clear every command whose `cats` has that bit (unknown category → error) |
+| `+cmd` / `-cmd` | set/clear that command; a container rule cascades to all its subcommands (`+config` grants `config|get`, `config|set`, …) |
+| `+container|sub` / `-container|sub` | precise subcommand rule (it is its own table entry) |
+| `+cmd|arg` | **first-arg rule**, only for plain commands without subcommands (e.g. `+select|0`, `+debug|object`) |
+| `sanitize-payload` / `skip-sanitize-payload` | set `sanitize_payload` |
+| `clearselectors` | accepted, no-op (selectors don't exist) |
+| `reset` | back to `new_empty_with_pubsub` (keeps name) |
+| `(…)` | error: `Selectors are not supported` |
+| `+cont|sub|arg` | error: `Allowing first-arg of a subcommand is not supported` |
+| unknown `+x` / `-x` / `-nopass` etc. | error: `Unknown command or category name in ACL` |
+| anything else | error: `Syntax error` |
 
-So `ACL SETUSER bob on >pw -@all +get ~user:*` genuinely produces a user restricted to `GET`
-(plus the always-allowed `PING`/`RESET`/`QUIT`/`AUTH`/`HELLO`) against `user:*`-prefixed keys —
-verified by `test_acl_command_and_key_enforcement` (acl.rs:417-442). But `+@read`/`-@write`
-category tokens and `&channel:*` pub/sub ACL tokens remain unimplemented and are dropped without
-any error surfaced to the caller — a deployment can issue `ACL SETUSER x +@read` expecting
-category-level read access and get a user that can execute **nothing** (since `all_commands`
-defaults `false` for new users and no bare command names were ever added).
+Any removal (`-cmd`, `-@cat`) clears `all_commands`, as in Redis: from then on commands that are
+not in the table are denied.
 
-### 3.8 `ACL` subcommand mechanics (connection.rs:7815-7906, `resp.rs:202-213`)
+### 5.2 Command check: `can_execute_command_with_first_arg(name, first_arg)`
 
-```rust
-pub enum AclSubcommand { List, Users, GetUser(String), SetUser{username,rules}, DelUser(Vec<String>), WhoAmI, Cat }
-```
+1. `command_index(name)`; if the name is not in the table → allowed only if `all_commands`.
+2. If the entry is `no_auth` (`auth`/`hello`/`quit`/`reset`) or the user has `all_commands` → allow.
+   Note `PING` is *not* exempt — a `-@all +get` user cannot `PING`.
+3. Leaf command (empty `subs`): allowed if its bit is set; otherwise, if a first argument was
+   supplied, allowed if a matching first-arg rule exists (case-insensitive).
+4. Bare container name (the caller could not resolve a subcommand): allowed only if **every**
+   subcommand bit is set, ignoring `…|help`.
 
-- **`WHOAMI`** — returns the connection's `auth_user` string (not re-derived from the ACL table).
-- **`USERS`** — `AclManager::users()`: sorted list of all usernames.
-- **`LIST`** — `AclManager::list()`: each user rendered via `to_acl_list_line` (acl.rs:142-181),
-  sorted. Format: `user <name> on|off nopass|>pw1 >pw2 ... #hash1 ...  +@all -cmd1 -cmd2 | -@all +cmd1 ...  ~* | ~pat1 ~pat2 ...  &*` — note the line **always** ends with a hardcoded `&*` regardless of actual channel permissions (there are none), and when not `nopass`, both plaintext (`>pw`) and any hash not identical to a plaintext entry are listed.
-- **`GETUSER <name>`** — returns a flat 8-element RESP array (4 key/value pairs: `flags`,
-  `passwords`, `commands`, `keys`). `commands` is reduced to just `"+@all"` or `"-@all"` (the
-  actual `allowed_commands`/`disallowed_commands` sets are **not** exposed), and `keys` is either
-  `"~*"` or an **empty string** (the actual `allowed_key_patterns` list is likewise not exposed).
-  There is no `channels` or `selectors` field at all (real Redis `ACL GETUSER` includes both).
-- **`SETUSER <name> <rules...>`** — see §3.7; always returns `+OK` (rules are parsed best-effort,
-  `Result<(), String>` is in practice always `Ok(())` — no token ever produces an `Err`).
-- **`DELUSER <names...>`** — `AclManager::del_user` (acl.rs:358-367): explicitly refuses to
-  remove `"default"` (silently skipped, not counted), removes every other named user, returns the
-  count actually removed. Also sets `HAS_CUSTOM_ACL = true`.
-- **`CAT`** — returns a **hardcoded static list of 21 category name strings**
-  (`keyspace, read, write, set, sortedset, list, hash, string, bitmap, hyperloglog, geo, stream,
-  pubsub, admin, fast, slow, blocking, dangerous, connection, transaction, scripting`). These
-  names are not derived from any real per-command category metadata and have no relationship to
-  `can_execute_command`'s enforcement (which only understands bare command names) — `ACL CAT`
-  exists purely for client-compatibility discovery, not as a basis for `+@category` rules.
+The connection layer resolves names with `acl_cmd_name(cmd)` (e.g. `Command::Acl(SetUser)` →
+`"acl|setuser"`), and `acl_first_arg(cmd)` supplies the first argument only for `SELECT` and
+`DEBUG`.
 
----
+Worked example: `ACL SETUSER bob on >pw -@all +@read -memory|usage +client|setname ~app:*`.
+`GET app:1` → `get` is in `@read` ✓, key matches ✓. `SET app:1 v` → `set` is `@write` ✗ →
+`-NOPERM this user has no permissions to run the 'set' command`. `CLIENT SETNAME x` ✓,
+`CLIENT KILL …` ✗ (only that subcommand was granted).
 
-## 4. Memory Allocator (`src/allocator.rs`)
+### 5.3 Key check: `can_access_key(key, need)`
 
-### 4.1 Confirmed: jemalloc is the real global allocator
+`need` comes from `acl_key_perm(cmd)`: the command's `key_flags` from the table, except `SET`
+without `GET` needs only `KEY_WRITE`, and commands missing from the table need both. A key is
+allowed if `all_keys`, or if **one single** pattern both glob-matches the key
+(`pubsub::glob_match`, full Redis glob: `*`, `?`, `[…]`) and grants every bit in `need`.
+`need == 0` (e.g. `EXISTS`) just requires a match. Every key of the command is checked
+(`cmd_keys`), not just the first.
 
-```rust
-// src/lib.rs:39-40
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-```
+### 5.4 Channel check: `can_access_channel(channel, is_pattern)`
 
-This is the **only** `#[global_allocator]` attribute in the crate (`rg` found exactly one match).
-`Cargo.toml` also lists `mimalloc = { version = "0.1.52", default-features = false }` as a
-dependency (line 15) and `tikv-jemallocator`/`tikv-jemalloc-ctl` (lines 21-22, both with
-`"stats"` feature). **`mimalloc` is never referenced anywhere in `src/`** (`rg -n mimalloc src/`
-finds zero hits outside `Cargo.toml`) — it is a dead/vestigial dependency, pulled in but unused.
-This re-confirms (correcting an earlier stale doc claim) that **jemalloc, via
-`tikv-jemallocator::Jemalloc`, is the actual process-wide allocator**; mimalloc is not wired up
-anywhere.
+Used for `SUBSCRIBE`, `SSUBSCRIBE`, `PUBLISH`, `SPUBLISH` (glob-match the channel against the
+user's patterns) and `PSUBSCRIBE` (the pattern must **equal** one of the user's patterns
+literally, Redis `ACLCheckChannelAgainstList`). `acl_first_denied_channel` returns the first
+offending channel.
 
-### 4.2 `AllocatorStats` and `get_allocator_stats` (allocator.rs:3-36)
+### 5.5 Where the checks run (`connection.rs`)
 
-```rust
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AllocatorStats {
-    pub allocated: usize,
-    pub active: usize,
-    pub resident: usize,
-    pub metadata: usize,
-    pub mapped: usize,
-    pub fragmentation_ratio: f64,
-}
-
-pub fn get_allocator_stats() -> AllocatorStats {
-    let _ = tikv_jemalloc_ctl::epoch::advance();                 // refresh jemalloc's cached stats epoch
-    let allocated = tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0);
-    let active    = tikv_jemalloc_ctl::stats::active::read().unwrap_or(0);
-    let resident  = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0);
-    let metadata  = tikv_jemalloc_ctl::stats::metadata::read().unwrap_or(0);
-    let mapped    = tikv_jemalloc_ctl::stats::mapped::read().unwrap_or(0);
-    let fragmentation_ratio = if allocated > 0 { resident as f64 / allocated as f64 } else { 1.0 };
-    AllocatorStats { allocated, active, resident, metadata, mapped, fragmentation_ratio }
-}
-```
-
-All five byte counters are real `tikv_jemalloc_ctl::stats::*` MIB reads against the live
-jemalloc instance (not estimates). `fragmentation_ratio` is **not** a native jemalloc stat — it
-is locally derived as `resident / allocated` (capped-below at `1.0` when nothing is allocated
-yet; it can legitimately be `< 1.0` is impossible by construction since `resident >= allocated`
-in jemalloc's accounting, so this ratio is always `>= 1.0` in practice, "1.00" meaning no
-fragmentation overhead).
-
-### 4.3 `format_memory_info` → `INFO` memory section field mapping (allocator.rs:39-89)
-
-| `INFO` field | Source |
-| :--- | :--- |
-| `used_memory` / `used_memory_human` | the `used_mem` parameter passed in by the caller (a separately tracked estimate, see Component 05), **not** a jemalloc stat |
-| `used_memory_rss` / `used_memory_rss_human` | `stats.resident` if nonzero, else falls back to `used_mem` |
-| `maxmemory` / `maxmemory_human` | the `max_mem` parameter (config-driven, not allocator-driven) |
-| `mem_fragmentation_ratio` | `stats.fragmentation_ratio` (resident/allocated) if `stats.allocated > 0`, else hardcoded `1.00` |
-| `mem_allocator` | **hardcoded literal `"libc"`** — see §6, this is stale/incorrect given jemalloc is the real allocator |
-| `allocator_allocated` / `allocator_active` / `allocator_resident` / `allocator_metadata` / `allocator_mapped` | direct `stats.*` passthrough, i.e. real jemalloc numbers |
-| `cooled_keys` / `tiered_keys` | passed-through parameters from the tiering subsystem (Component 07), unrelated to the allocator |
-
-`format_memory_info`'s only real call site is `crate::allocator::format_memory_info(...)` inside
-`INFO`'s handler in `connection.rs`. There is no heap-profiling/dump capability exposed anywhere
-(`tikv-jemalloc-ctl`'s profiling hooks beyond the `stats` feature are not used) — this module is
-read-only aggregate-stats, not a diagnostic/dump tool.
-
-### 4.4 `SmallCollectionArena` — per-shard object pool, unrelated to jemalloc (allocator.rs:91-344)
-
-```rust
-pub const MAX_ARENA_POOLED: usize = 1024;
-
-#[derive(Debug, Default)]
-pub struct SmallCollectionArena {
-    list_pool: Vec<VecDeque<Bytes>>,
-    hash_pool: Vec<Vec<(Bytes, Bytes)>>,
-    set_pool: Vec<Vec<crate::table::SmallSetEntry>>,
-    zset_pool: Vec<Vec<(crate::table::OrderedScore, Bytes)>>,
-    pub allocations_saved: u64,
-    pub recycles_count: u64,
-}
-```
-
-Each collection type gets its own free-list `Vec` pool, pre-allocated with `Vec::with_capacity(128)`
-slots in `SmallCollectionArena::new()`. The pattern is identical across all four types:
-
-- `acquire_*(min_cap)`: pop a pooled container if one exists (increment `allocations_saved`),
-  `reserve` it up to `min_cap` if its existing capacity is smaller; otherwise allocate fresh with
-  `Vec/VecDeque::with_capacity(min_cap.max(16 or 8))`.
-- `recycle_*(container)`: `clear()` the container's contents, then push it back onto the pool
-  **only if** its capacity is `<= 512` *and* the pool is below `MAX_ARENA_POOLED` (1024) entries
-  (increment `recycles_count`); otherwise the container is dropped normally (oversized or
-  pool-full containers are not retained, bounding worst-case memory held by the pool).
-- `pool_stats() -> (usize, usize, usize, usize)`: current `(list, hash, set, zset)` pool lengths,
-  for introspection/tests.
-
-**Integration**: `RudisTable` (Component 05, `table.rs:2423`) embeds
-`arena: crate::allocator::SmallCollectionArena` as a plain field (one arena per shard's table,
-not shared/locked). Call sites recycle a collection's backing storage when it empties out to zero
-members (e.g. `LPOP` draining a list to empty, `SREM` draining a set to empty) and re-acquire from
-the pool on the next `LPUSH`/`HSET`/`SADD`/`ZADD` that recreates the same key or a different key
-of the same shape — e.g. `table.rs:6614` (`LPUSH`-family `acquire_list`), `table.rs:6692`
-(another list push path), `table.rs:4834`/`4982` (`HSET`-family `acquire_small_hash`),
-`table.rs:7950`/`8013` (`SADD`-family `acquire_small_set`), `table.rs:9506` (`ZADD`-family
-`acquire_small_zset`), and `table.rs:2677-2686` (the four `recycle_*` calls on delete-to-empty).
-The goal is eliminating allocator round-trips for the classic "push one item, pop one item"
-churn pattern on small collections — it has no interaction with jemalloc stats or `INFO` at all.
-
----
-
-## 5. TLS (`src/tls.rs`) — rustls handshake, self-signed certs, and `TlsTransport` (no kTLS)
-
-### 5.1 Certificate provisioning
-
-```rust
-pub fn generate_self_signed_cert(subject_alt_names: Vec<String>) -> Result<(Vec<u8>, Vec<u8>), String>
-```
-Uses `rcgen` (`rcgen = "0.14.10"`): builds `CertificateParams` from the given SANs, sets CN
-`"Rudis In-Memory Dev Cert"` and O `"Rudis Server"`, generates an `rcgen::KeyPair`, self-signs,
-and returns `(cert_der, key_der)` as raw DER bytes. Called from `main.rs:189-193` with
-`vec!["localhost", "127.0.0.1"]` whenever `--tls-port` is set but `--tls-cert-file`/
-`--tls-key-file` are **not both** provided (main.rs:182-197) — i.e. this is the automatic
-dev-cert fallback, generated fresh in memory on every process start (not cached to disk).
-
-```rust
-pub fn create_server_config(cert_der: &[u8], key_der: &[u8]) -> Result<Arc<ServerConfig>, String>
-```
-Wraps the DER bytes in `rustls::pki_types::{CertificateDer, PrivateKeyDer}` and builds a
-`rustls::ServerConfig` via `.with_no_client_auth().with_single_cert(...)` — no mTLS/client-cert
-verification is supported (server-only TLS).
-
-```rust
-pub fn load_certs_and_key_from_files(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>, String>
-```
-Reads both files and decodes them with `rustls::pki_types::pem::PemObject` when they contain a
-`-----BEGIN ` marker: every `CERTIFICATE` block of the cert file becomes the served chain (leaf
-first, e.g. certbot's `fullchain.pem`), and the key file may hold a PKCS#8, PKCS#1 (RSA) or SEC1
-(EC) key. Files without a PEM marker are still accepted as one raw DER certificate and a DER key,
-which was the only format that worked before (see §6). Errors name the offending file, and
-`main.rs` aborts startup on them.
-
-### 5.2 `TlsSession` and the handshake
-
-`TlsSession` wraps a `rustls::ServerConnection`. (It used to also carry an `is_ktls_active: bool`
-that was always `false`; that field is gone — see §5.3.)
-
-The async handshake driver `handshake_monoio` is the one wired into `server.rs`'s TLS accept loop,
-bounded by a 10 s handshake timeout. It runs the standard rustls handshake loop — `while
-conn.is_handshaking() { write_tls while wants_write; read_tls + process_new_packets when
-wants_read }` — then flushes any trailing handshake/ticket frames, driven over
-`monoio::net::TcpStream` using `AsyncReadRent`/`AsyncWriteRentExt`. It is a correct async
-adaptation of the loop — the handshake itself is real and correctly negotiates a session.
-
-### 5.3 kTLS — not implemented (scaffolding removed)
-
-Earlier revisions of `tls.rs` carried partial kTLS scaffolding: an `enable_ktls(raw_fd)` that only
-issued `setsockopt(IPPROTO_TCP, TCP_ULP, "tls")` (attaching the kernel TLS ULP, with **no**
-`setsockopt(SOL_TLS, TLS_TX/TLS_RX, ...)` key install), called after every handshake with its
-result discarded; an `is_ktls_active` flag hard-forced to `false`; and raw-socket kTLS branches in
-`read_plaintext`/`write_plaintext` that could therefore never run. (Before commit `8c39a2f` the flag
-was set from `enable_ktls`'s success, which produced the old plaintext-bypass bug; that bug note is
-now obsolete because the whole code path is gone.)
-
-All of that has been **deleted**. TLS is userspace `rustls` only. Real kTLS was judged not worth it
-for Rudis: it would need `rustls`'s `dangerous_extract_secrets` plus per-cipher-suite
-`SOL_TLS` `TLS_TX`/`TLS_RX` key installation, RX-side handling of TLS 1.3 control records
-(`recvmsg` with a record-type cmsg for KeyUpdate / NewSessionTicket / alerts), and the `tls` kernel
-module — and since Rudis does not use `sendfile`, it would mostly just move the crypto cost into the
-kernel. It is also not testable in this project's CI. Removing it is preferable to keeping inert
-scaffolding that reads like a working feature.
-
-### 5.4 Wiring into the server (server.rs / main.rs / connection.rs / transport.rs)
-
-- `main.rs:182-204` builds the `rustls::ServerConfig` once at startup (via
-  `load_certs_and_key_from_files` or `generate_self_signed_cert`+`create_server_config`) and
-  wraps it in `TlsWorkerConfig { tls_port, server_config }`, passed down to every
-  shard worker.
-- `server.rs:101-127` conditionally opens a **second** `SO_REUSEPORT`/`SO_REUSEADDR` socket on
-  `tls_cfg.tls_port`, parallel to the shard's plain listener, when `tls_config` is `Some`.
-- `server.rs` spawns a dedicated accept loop for that listener (polled with a 200ms
-  timeout against `crate::shutdown::is_shutting_down()`, same pattern as the plain accept loop).
-  Each accepted TLS client gets `client_id = ((shard_id as u64) << 48) | 0x8000_0000_0000 + n` —
-  the `0x8000_0000_0000` bit flags it as a TLS-origin client ID, disjoint from plain client IDs on
-  the same shard. Per connection: `TlsSession::new(server_config.clone())` →
-  `session.handshake_monoio(&mut stream)` (10 s timeout) → on success the session is wrapped in a
-  `TlsTransport` and handed to the generic client loop.
-- There is no separate TLS client loop any more (the old `handle_tls_connection` was deleted).
-  `handle_client<T: ClientTransport>` in `connection.rs` is generic over the trait in
-  `src/transport.rs` and monomorphized for `PlainTransport` and `TlsTransport` (no `dyn`, so the
-  plaintext path is unchanged). TLS clients therefore get the full plaintext feature set: pipeline
-  squashing (`execute_commands_squashed`), `MULTI`/`EXEC` pipelining, Pub/Sub mode (generic
-  `run_pubsub_loop` over a split transport; the rustls session is shared between reader and writer
-  task via `Rc<RefCell>`), `CLIENT KILL`/`CLIENT LIST` via the global client registry,
-  output-buffer limits, `omem`/`qbuf`/pipeline stats, protocol-error close, shutdown drain, idle
-  timeout, max-clients, and the same `authenticated`/`auth_user` bootstrap (§3.5).
-- Out-of-band pushes (`MONITOR` lines, client-tracking invalidations) produced on other threads go
-  through `transport::PushTarget`: `Fd(RawFd)` for plaintext (non-blocking `libc::send` on the fd,
-  as before) and `Queue` (bounded flume channel, 4096) for TLS, drained and encrypted by the owning
-  connection. Previously these were raw `libc::send`s on the fd, which injected plaintext into a
-  TLS `MONITOR` client's stream.
-- Two rustls usage bugs were fixed along the way: ciphertext left over beyond one `read_tls` call
-  (~4 KiB) used to be silently dropped (pipelines larger than ~4 KiB per read lost commands), and
-  replies larger than 64 KiB failed on rustls's default send-buffer limit.
-- Replication links (`PSYNC`/`SYNC`/`DFLY FLOW`) remain plaintext-port only; on the TLS port they get
-  `-ERR replication links are only supported on the plaintext port` and the connection is closed.
-
----
-
-## 6. Status of Previously-Reported Issues (Re-Verified Against Current Source)
-
-| Issue | Prior status | Current status |
+| Path | Function | Notes |
 | :--- | :--- | :--- |
-| `requirepass` config/`CONFIG SET` not enforced (default user stayed `nopass: true`, `HAS_CUSTOM_ACL` never set) | Verified gap | **FIXED.** `main.rs:137-153` and `CONFIG SET requirepass` (connection.rs:6686-6703) both now clear+repopulate `passwords`/`password_hashes`, flip `nopass=false`, and set `HAS_CUSTOM_ACL=true`. `is_auth_required_for_default()` correctly returns `true` afterward, and both plain and TLS connections (same `router.port` → same `AclManager`) bootstrap `authenticated=false`. Traced to commit `002086a feat(security): synchronize requirepass ACL enforcement and implement salted SHA-256 password hashing`. |
-| kTLS `TCP_ULP`-success treated as "encryption active", causing silent plaintext after a real handshake | Verified CRITICAL bug | **OBSOLETE — code removed.** First neutralized in commit `8c39a2f` (result discarded, `is_ktls_active` forced `false`); now `enable_ktls`, `is_ktls_active`, and the kTLS read/write branches are deleted entirely. kTLS is not implemented; all `--tls-port` traffic goes through userspace rustls (§5.3). |
-| TLS clients ran a separate, feature-poor loop (`handle_tls_connection`: no pipeline squashing, no output-buffer limits, etc.); MONITOR/tracking pushes were written as plaintext onto TLS sockets; >~4 KiB leftover ciphertext per read dropped; >64 KiB replies failed | Gap / bugs | **FIXED.** TLS clients run the generic `handle_client<TlsTransport>` loop; pushes go through `PushTarget::Queue` and are encrypted by the owning connection; both rustls buffering bugs fixed (§5.4). |
-| Password hashing scheme / unsalted-SHA-256 compatibility with real Redis | To re-verify | **Confirmed**: `hash_password_sha256` (acl.rs:33-42) is unsalted `SHA256(password)`, `#`-prefixed 64-hex — matches real Redis's ACL hash format exactly. (A separate legacy fixed-salt SHA1 scheme and a dead per-user-salted SHA-256 scheme also exist in the same file — see §3.2 — but the SHA-256 unsalted form is the one actually written by `requirepass`/`ACL SETUSER >password`.) |
-| Allocator is jemalloc, not mimalloc | To re-verify | **Confirmed**: `src/lib.rs:39-40` sets `#[global_allocator] = tikv_jemallocator::Jemalloc`. `mimalloc` remains in `Cargo.toml` as a dependency but has zero references anywhere in `src/` — dead/unused. |
+| Every command in `execute_command` | `protected_command_denied`, then NOAUTH gate, then `acl_denied` | NOAUTH lets only `AUTH`, `HELLO`, `QUIT` through. |
+| `acl_denied` → `acl_denied_in_context` | command → keys → channels | Returns early (`None`) when `!HAS_CUSTOM_ACL && auth_user == "default"`. A user missing from the table (deleted mid-session) also returns `None` — such connections are killed by `ACL DELUSER`/`ACL LOAD` instead. |
+| Queueing inside `MULTI` | `acl_denied_in_context(.., Some(("multi", name)))` | A denied command gets its NOPERM immediately and aborts the later `EXEC`. At `EXEC` time denial messages use Redis's "ACLs rules changed between the moment the transaction was accumulated and the EXEC call…" wording. |
+| Mode-switch commands (`SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE`, `PSYNC`, `SYNC`, `DFLY FLOW`) | `mode_switch_denied` | These bypass `execute_command`, so they get their own NOAUTH + command + channel gate. |
+| Pipeline squashing | `acl_check_user_cmd` | When a custom ACL is active or the user isn't `default`, any command the user may not run makes the batch non-squashable; it then runs sequentially and the real NOPERM fires there. Pipelining cannot bypass ACLs. |
+| Lua scripts | `scripting::script_acl_denied` | Calls `acl_denied_in_context` as the calling user with context `("lua", "eval")`. |
+| Client-side tracking | `can_tracker_read_key` | Invalidations are only tracked for keys the user may read. |
+| `ACL DRYRUN` | `acl_check_user_cmd` | Same checks, no log entry or stat. |
 
-### New findings from this pass
+### 5.6 Denials: `ACL LOG` and stats
 
-- **`load_certs_and_key_from_files` failed on real PEM certs** (tls.rs:54-74). **FIXED:** PEM
-  chains and keys are now decoded (§5.1), covered by unit tests and an e2e test that starts the
-  binary with PEM files. Original finding:
-  The function reads the raw bytes of `--tls-cert-file`/`--tls-key-file` and passes them straight
-  to `create_server_config` as DER — there is no PEM decoding anywhere in the crate (`rg` for
-  `pem`/`rustls-pemfile` in `Cargo.toml`/`src/tls.rs` finds nothing). Real-world cert/key files
-  (from `certbot`, `openssl`, etc.) are almost always PEM-encoded text
-  (`-----BEGIN CERTIFICATE-----...`), which rustls will reject as invalid DER when
-  `ServerConfig::builder()...with_single_cert(...)` tries to parse it, surfacing as
-  `Err("Failed to create rustls ServerConfig: ...")` from `create_server_config`, which `main.rs:
-  185-187`'s `.expect("Failed to load TLS cert/key files")` turns into a startup panic. In
-  practice, `--tls-cert-file`/`--tls-key-file` only work today if the files happen to contain raw
-  DER bytes, not the PEM format the flag names and doc comments imply; the self-signed in-memory
-  fallback path (no cert/key files given) is unaffected since it already produces raw DER.
-- **`mem_allocator:libc` is a hardcoded, incorrect `INFO` field** (allocator.rs:66). Despite
-  every `allocator_*` field in the same `INFO` block being real `tikv-jemalloc-ctl` data, the
-  `mem_allocator` field itself is a string literal `"libc"`, not `"jemalloc"` — any tooling that
-  branches on this field (e.g. Redis-compatible monitoring that picks jemalloc-specific behavior
-  based on `mem_allocator`) will be misled.
-- **`hash_password_salted` is dead on the write path** (acl.rs:45-58, 216). Computed on every
-  `check_auth` call but never stored by any code path — wasted SHA-256 computation per
-  authentication attempt with zero behavioral effect (see §3.2).
-- **`Command::Reset`'s re-auth check diverges from `is_auth_required_for_default`** (connection.rs:
-  9414-9421). It only inspects `passwords.is_empty()`, ignoring `nopass` and `password_hashes`.
-  A default user secured solely via a pre-hashed credential (`ACL SETUSER default #<hash>`, empty
-  `passwords`) would be required to re-authenticate by `is_auth_required_for_default()`'s logic,
-  but `RESET` would instead leave the connection `authenticated = true` as `"default"` — a minor
-  but real inconsistency between two "is the default user open" computations that should agree.
-- **`ACL GETUSER` exposes far less detail than it stores** (connection.rs:7839-7865). The real
-  `allowed_commands`/`disallowed_commands` sets and `allowed_key_patterns` list are collapsed to
-  just `"+@all"`/`"-@all"` and `"~*"`/`""` respectively — an operator cannot see which specific
-  commands/key-patterns a restricted user actually has via `GETUSER`; `ACL LIST`'s
-  `to_acl_list_line` output (§3.8) is the only place the granular rule set is visible.
-- **`ACL CAT`'s category list is cosmetic** (connection.rs:7877-7905) — 21 hardcoded strings with
-  no link to real command metadata or to the `+@category`/`-@category` tokens that `ACL SETUSER`
-  silently ignores (§3.7). A client that lists categories via `ACL CAT` and then tries to use one
-  in `ACL SETUSER +@read` will see the rule accepted (`+OK`) but have no actual effect.
+`record_acl_denial(port, reason, context, object, username, cmd)`:
+
+1. Bumps one of `Stat::AclAccessDeniedAuth/Cmd/Key/Channel`, reported in `INFO stats` as
+   `acl_access_denied_auth/cmd/key/channel`.
+2. Calls `AclManager::add_log_entry`. If an entry with the same
+   `(reason, context, object, username)` exists, it is removed, its `count` incremented,
+   `timestamp_last_updated` and `client_info` refreshed, and it is moved to the front. Otherwise
+   old entries are popped from the back until there is room for `acllog_max_len`, and a new entry
+   with the next `entry_id` is pushed to the front.
+
+`AclDeniedReason` is `Auth | Command | Key | Channel` (rendered `auth`, `command`, `key`,
+`channel`). Contexts used: `toplevel`, `multi`, `lua`.
 
 ---
 
-## 7. Cross-Component Interactions
+## 6. `ACL` subcommands
 
-- **`src/connection.rs`**: hosts essentially all ACL/TLS *behavior* — `AUTH`/`HELLO AUTH`/`RESET`/
-  `ACL *` command handlers, the per-command and squash-path enforcement gates (§3.5), `CONFIG
-  GET/SET requirepass` (§3.6), and the single generic client loop `handle_client<T:
-  ClientTransport>` that serves both plain and TLS connections (§5.4). `allocator::format_memory_info`
-  is called from `INFO`'s handler.
-- **`src/server.rs`** (Component 01): conditionally binds the second `SO_REUSEPORT` TLS listener
-  per shard and spawns its dedicated accept loop (§5.4), parallel to everything it already does
-  for the plain listener.
-- **`src/main.rs`**: parses `--tls-port`/`--tls-cert-file`/`--tls-key-file`, builds the shared
-  `rustls::ServerConfig` once before any shard thread starts, and primes the default ACL user
-  from `--requirepass`/config-file `requirepass` (§3.6) — also before any shard thread starts, so
-  every shard observes a consistently-initialized `AclManager` from its very first connection.
-- **`src/table.rs`** (Component 05): embeds `SmallCollectionArena` as `RudisTable.arena` (§4.4) —
-  the only consumer of that half of `allocator.rs`; unrelated to jemalloc stats.
-- **`src/tiering.rs`** (Component 07): does **not** call `allocator::get_allocator_stats()` —
-  tiering's memory-pressure decisions use a separately tracked `used_memory` estimate on
-  `RudisTable`, not live jemalloc RSS figures.
+| Subcommand | Behaviour |
+| :--- | :--- |
+| `WHOAMI` | The connection's `auth_user`. |
+| `USERS` | Sorted usernames. |
+| `LIST` | Sorted `to_acl_list_line()` per user: `user <name> on|off nopass|#hash… sanitize-payload|skip-sanitize-payload [keys] &*|resetchannels &pat… <commands>`. The commands part is `commands_rule_string()` (`+@all`/`-@all` followed by the compacted rule history). Lines are replayable through `ACL SETUSER` (unit test `test_acl_list_line_round_trips`). |
+| `GETUSER <name>` | 10-element map: `flags` (`on/off`, `nopass`, `allkeys`, `allchannels`, `allcommands`, `sanitize-payload`/`skip-sanitize-payload`), `passwords` (hex digests without `#`), `commands`, `keys` (`~*` or `~p`/`%R~p`/`%W~p` list), `channels` (`&*` or `&p` list). Unknown user → null. No `selectors` field. |
+| `SETUSER <name> rules…` | §5.1; `+OK` or `-ERR <message>`. Does not disconnect existing sessions. |
+| `DELUSER <names…>` | Errors if any name is empty or `default`. Otherwise deletes, returns the count, and kills every connection on this port authenticated as a deleted user (the calling connection is closed after the reply). |
+| `CAT [category]` | Without argument: the 21 `CATEGORIES`. With one: the table's commands in it, or `-ERR Unknown category`. |
+| `GENPASS [bits]` | `genpass_hex`: 1..=4096 bits (default 256 → 64 hex chars), from `ring::rand::SystemRandom`. |
+| `DRYRUN <user> <cmd> [args…]` | Parses the command and runs `acl_check_user_cmd`; `+OK` or a bulk string `This user has no permissions to …`. If the arguments don't parse, it still checks command (and subcommand / first-arg) permission. |
+| `LOG [count]` / `LOG RESET` | Entries newest first: `count`, `reason`, `context`, `object`, `username`, `age-seconds`, `client-info`, `entry-id`, `timestamp-created`, `timestamp-last-updated` (ms). RESP3 clients get maps. |
+| `SAVE` | Writes `list()` lines to `aclfile`; error if no `aclfile` configured. |
+| `LOAD` | `load_from_aclfile()` (below), then kills connections whose user no longer exists or is disabled. |
+| `HELP` | Help text. |
+
+### 6.1 Users from configuration: `user` directives and `aclfile`
+
+- `user <name> rules…` lines in the config file are collected into `ServerConfig.users`
+  (duplicates are a config error) and applied at startup with `load_user_from_declaration`,
+  which starts every user — including `default` — from `new_empty_with_pubsub`, as Redis does.
+- `aclfile <path>` (relative paths resolve against `dir`) is loaded at startup by
+  `load_from_aclfile`; failures abort startup. The loader:
+  1. Skips blank and `#` lines; every other line must be `user <name> …` (else
+     `<path>:<line>: Unrecognized ACL file line …`).
+  2. Rejects duplicate users.
+  3. Builds each user from `new_empty_with_pubsub` + rules, prefixing errors with `<path>:<line>:`.
+  4. If `default` was not mentioned, inserts `new_default()`.
+  5. Replaces `users` wholesale only if everything succeeded (atomic).
+- `CONFIG REWRITE` emits `requirepass` from `AclManager.requirepass`, and, when
+  `HAS_CUSTOM_ACL` is set and no `aclfile` is configured, replaces all `user` lines with the
+  current `ACL LIST` output.
+- `rename-command` is rejected as a fatal config error: silently keeping a command the operator
+  meant to disable would be a security hole; use ACL rules instead.
+
+ACL-related `CONFIG SET` keys: `requirepass`, `acllog-max-len`, `acl-pubsub-default`
+(`allchannels` | `resetchannels`), `aclfile`.
+
+---
+
+## 7. Network guards (`src/netsec.rs`)
+
+### 7.1 `bind`
+
+`parse_bind_spec` reads a Redis-style list: IPv4/IPv6 addresses (brackets allowed), `*` = all
+IPv4, `::*` = all IPv6, a leading `-` marks an address optional; duplicates collapse.
+`DEFAULT_BIND = "* -::*"`. `format_bind_spec` renders it back for `CONFIG GET bind`.
+`set_bind_addrs` / `bind_addrs` keep the list per base port.
+
+`bind_reuseport_listener(ip, port, backlog)` creates one non-blocking socket with
+`SO_REUSEPORT` + `SO_REUSEADDR`, `IPV6_V6ONLY` for IPv6 (so `::` doesn't collide with `*`),
+512 KiB socket buffers. `bind_all` binds every address, skipping failed optional ones and failing
+on a required one or if nothing bound. Every shard calls `bind_all` for its plain port and, if
+TLS is configured, for `tls-port` — `SO_REUSEPORT` lets the kernel spread connections across
+shards.
+
+### 7.2 Port-in-use probe
+
+Because shard sockets use `SO_REUSEPORT`, binding to a port another process (same user) already
+listens on would silently *join* it. `ensure_port_free` therefore binds a probe socket **without**
+`SO_REUSEPORT` (Linux refuses with `EADDRINUSE` while anything listens there) and reports Redis's
+`Could not create server TCP listening socket …: bind: Address already in use`.
+`ensure_port_free_with_grace` retries every 20 ms for a grace period (3 s from `main.rs`) because
+an abruptly killed predecessor's io_uring rings can keep its listeners alive briefly. `main.rs`
+probes the base port (or every shard port in cluster mode), `tls-port`, and the cluster bus port
+before starting shards.
+
+### 7.3 Protected mode
+
+`protected_mode_denies(port, peer)` is `true` when protected mode is on for the base port
+(default on; `protected-mode` config / `CONFIG SET`), the peer is not loopback (IPv4 loopback,
+`::1`, or IPv4-mapped loopback), and the `default` user is `nopass`. Both accept loops check it:
+the plain loop before starting the client, the TLS loop after the handshake (so the
+`-DENIED Running in protected mode …` reply is sent encrypted), then close.
+
+### 7.4 `enable-debug-command` / `enable-module-command`
+
+`ProtectedAction` is `No` (default) | `Yes` | `Local`. `allows(peer)` is true for `Yes`, false for
+`No`, and for `Local` only when the peer is a known loopback address (a script has no peer, so
+only `Yes` allows `DEBUG` from Lua). `protected_command_denied` runs before the auth checks in
+`execute_command` for `DEBUG` and `MODULE …`, replying with Redis's
+`-ERR DEBUG command not allowed. …` text. Settings are per base port; they are read from the
+config file / command line (Redis refuses them in `CONFIG SET`).
 
 ---
 
-## 8. Future Improvements
+## 8. TLS (`src/tls.rs`, `src/transport.rs`)
 
-- **Medium — remove plaintext password storage now that hashing exists** (§3.2, §3.7).
-  `ACL SETUSER user >password` (and `requirepass`) still push the plaintext into
-  `AclUser.passwords` in addition to hashing it — the hashing machinery exists but the plaintext
-  exposure it should close (credentials sitting in process memory / reachable via a core dump,
-  echoed back verbatim by `CONFIG GET requirepass`/`ACL LIST`) remains.
-- **Medium — delete or wire up `hash_password_salted`** (§3.2, §6). It is pure dead weight on the
-  hot `check_auth` path today; either start writing hashes in this format from `set_user`/
-  `requirepass`, or remove the function and its per-call computation entirely.
-- **Medium — replace the legacy fixed-salt SHA1 scheme with per-user-salted work-factored
-  hashing.** `hash_password`'s hardcoded global salt (`"rudis_acl_salt_v1:"`) plus a fast,
-  non-work-factored hash (SHA1) offers little resistance to offline brute force; real Redis
-  accepts this tradeoff by documenting SHA-256 as fast-but-standard, but a slow KDF
-  (Argon2id/bcrypt/scrypt) would be meaningfully stronger if credential confidentiality under a
-  memory/disk compromise matters for a given deployment.
-- **Low — reconcile `Command::Reset`'s auth-required check with `is_auth_required_for_default`**
-  (§6) so both computations agree in every configuration, not just the common
-  plaintext-password-set case.
-- **Low — fix `mem_allocator:libc`** to report `"jemalloc"` (§6), and consider removing the
-  unused `mimalloc` dependency from `Cargo.toml` to avoid confusing future readers the way the
-  prior documentation pass was apparently misled.
-- **Low — extend `ACL SETUSER`/`ACL CAT`/`ACL GETUSER` to be internally consistent**: either
-  implement `+@category`/`&channel` tokens for real, or have `ACL SETUSER` reject unrecognized
-  rule tokens with an error instead of silently accepting them (§3.7, §6); and have `GETUSER`
-  expose the real `allowed_commands`/`disallowed_commands`/`allowed_key_patterns` detail that
-  `ACL LIST` already renders, rather than the collapsed all-or-nothing summary it returns today.
-- **Low — expose jemalloc heap-profiling/dump capability**, not just aggregate stats (§4.2), if
-  production memory-leak/fragmentation debugging ever becomes a need —
-  `tikv-jemalloc-ctl` supports profiling hooks beyond the `stats` feature currently used.
+### 8.1 Configuration and certificate loading
 
----
----
+| Setting | Where | Meaning |
+| :--- | :--- | :--- |
+| `tls-port` | CLI `--tls-port`, config | Enables the TLS listener on every shard. Fixed at startup. |
+| `tls-cert-file`, `tls-key-file` | CLI, config, `CONFIG SET` | Server certificate chain and private key. |
+| `tls-ca-cert-file` | config, `CONFIG SET` | CA roots used to verify client certificates. |
+| `tls-auth-clients` | config, `CONFIG SET` | `TlsAuthClients`: `yes`/`true`/`1` (default), `no`/`false`/`0`, `optional`. |
 
-## Contributor Gotchas, Invariants & Debugging Guide
+Loading functions:
 
-* **Gotcha 1**: `AclManager` is keyed by **port number** in a single process-global `PORT_ACLS`
-  map, not per-connection-type — a shard's plain and TLS listeners share one `AclManager` because
-  they share one `Router`/`router.port`. There is no way today to give the TLS listener a
-  different ACL policy than the plain listener on the same port pair.
-* **Gotcha 2**: `check_auth` short-circuits to `Ok` immediately when `user.nopass` is `true`,
-  before touching `passwords`/`password_hashes` at all — a user with `nopass` set has those
-  fields effectively ignored for authentication purposes even if populated.
-* **Gotcha 3**: `HAS_CUSTOM_ACL` is a one-way latch for the whole process (never reset to
-  `false`) — once any port primes `requirepass` or runs `ACL SETUSER`/`DELUSER`, the per-command
-  ACL check (§3.5) stays "on" for every port for the rest of the process lifetime, even a port
-  that never configured its own ACL.
-* **Gotcha 4**: `SmallCollectionArena` (allocator.rs §4.4) is unrelated to jemalloc — don't
-  expect `pool_stats()`/`allocations_saved` to show up in jemalloc `INFO` fields; it is a
-  hand-rolled free-list pool that sits *above* jemalloc, reducing calls into it.
-* **Gotcha 5**: kTLS is deliberately **not implemented** (§5.3) — the old `enable_ktls`/
-  `is_ktls_active` scaffolding was removed rather than left inert. Re-adding kTLS means a full
-  implementation (`dangerous_extract_secrets`, `SOL_TLS` `TLS_TX`/`TLS_RX` key install per cipher
-  suite, RX control-record handling via `recvmsg` cmsgs), not just a `TCP_ULP` attach — a partial
-  version is exactly what produced the old plaintext-bypass bug. Likewise, never `libc::send`
-  directly on a TLS client's fd: deliver out-of-band data through `PushTarget` (§5.4).
-* **Gotcha 6**: `--tls-cert-file`/`--tls-key-file` take PEM (a chain is allowed) or raw DER. Any
-  other content is a startup error, not a fallback to the self-signed certificate.
+- `load_certs_from_file(path)` — if the bytes contain `-----BEGIN ` (`is_pem`), every
+  `CERTIFICATE` block becomes the chain (leaf first, e.g. certbot's `fullchain.pem`); an empty
+  result is an error. Otherwise the whole file is one DER certificate.
+- `load_key_from_file(path)` — PEM (PKCS#8, PKCS#1 RSA or SEC1 EC via `PrivateKeyDer::from_pem_slice`)
+  or raw DER. Errors name the file.
+- `load_server_config_from_files(cert, key, ca, auth_clients)` → `server_config_from`.
+- `server_config_from(certs, key, ca_certs, auth_clients)`:
+  1. If a CA list is present **and** mode is `Yes` or `Optional`: build a `RootCertStore`, a
+     `WebPkiClientVerifier` (with `allow_unauthenticated()` for `Optional`), and
+     `with_client_cert_verifier(..)`.
+  2. Otherwise `with_no_client_auth()`.
+  3. `with_single_cert(certs, key)`.
+- `generate_self_signed_cert(sans)` — `rcgen` certificate with CN `Rudis In-Memory Dev Cert`,
+  O `Rudis Server`, returned as DER; `create_server_config(cert_der, key_der)` wraps it without
+  client auth.
 
-### How to Verify Changes
-```bash
-# 1. Format check
-cargo fmt --check
+Startup (`main.rs`): the TLS runtime state is seeded from config; if `tls-port` is set, the
+`ServerConfig` comes from the files when both cert and key are given (failure panics with
+`Failed to load TLS cert/key/CA files`), else from a fresh in-memory self-signed certificate for
+`localhost` / `127.0.0.1`. The result is stored in the runtime state and wrapped in
+`TlsWorkerConfig { tls_port, server_config }` for every shard.
 
-# 2. Clippy verification with zero warnings
-cargo clippy --all-targets -- -D warnings
+### 8.2 Runtime reconfiguration
 
-# 3. Run unit tests (acl.rs: test_acl_salted_password_hashing, test_acl_command_and_key_enforcement;
-#    allocator.rs: test_small_collection_arena_lifecycle, test_collection_arena_rudis_table_integration;
-#    tls.rs: test_tls_cert_generation_and_config, test_tls_worker_config)
-cargo test --lib -- --test-threads=1
+`TlsRuntimeState { cert_file, key_file, ca_cert_file, auth_clients, server_config }` lives in the
+per-base-port registry `TLS_RUNTIMES` (`get_tls_runtime(base_port)`). `CONFIG SET tls-…` updates
+the field and calls `rebuild_server_config()`, which reloads from files when both cert and key
+are set; on error the old value is restored and the command fails with
+`Unable to update TLS configuration: …`. Each new TLS connection asks
+`active_tls_server_config(base_port)` first and falls back to the startup config — so certificate
+rotation and mTLS changes apply to new connections without restart; existing sessions keep their
+keys.
+
+### 8.3 Accepting a TLS client
+
+Step by step (`server.rs`, TLS accept loop on each shard):
+
+1. Accept; set `TCP_NODELAY` and keepalive.
+2. Assign a client id: a per-shard counter starting at `(shard_id << 48) | (1 << 46) | 1`.
+   Bit 46 keeps TLS ids disjoint from plain ids (`(shard_id << 48) + n`) and from adopted
+   connections (bit 47).
+3. `TlsSession::new(active config)` wraps a `rustls::ServerConnection`.
+4. `handshake_monoio(&mut stream)` under `TLS_HANDSHAKE_TIMEOUT` (10 s): while handshaking,
+   write everything rustls wants to write; when it wants to read, read up to 4 KiB and feed
+   **all** of it to `read_tls` + `process_new_packets` (a client may pipeline its first request
+   right behind `Finished`; that plaintext stays buffered in rustls). Finally flush trailing
+   records (e.g. session tickets). Handshake errors and timeouts are logged at `verbose` level so
+   port scanners don't flood the log.
+5. Wrap as `TlsTransport::new(stream, session)` (lifts rustls's 64 KiB send-buffer limit,
+   creates the push queue).
+6. Protected-mode check (§7.3).
+7. `connection::handle_client(transport, …)` — the generic loop.
+
+The whole per-connection task runs under `catch_unwind_async`; a panic is counted and logged as
+`Panic isolated in TLS client connection id=…`.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Shard TLS accept task
+    participant R as rustls ServerConnection
+    participant L as handle_client loop
+    C->>S: TCP connect to tls-port
+    S->>R: TlsSession::new(active_tls_server_config)
+    loop until handshake done (10 s max)
+        R-->>C: write_tls records
+        C->>S: ClientHello / Finished (+ maybe first request)
+        S->>R: read_tls + process_new_packets
+    end
+    S->>L: TlsTransport (protected-mode check first)
+    C->>L: encrypted RESP
+    L->>R: decrypt_into (loop until all ciphertext consumed)
+    L->>R: encrypt_into reply
+    R-->>C: TLS records
 ```
+
+### 8.4 `TlsTransport` internals
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `stream` | `monoio::net::TcpStream` | The socket. |
+| `conn` | `rustls::ServerConnection` | Session state. |
+| `fd` | `RawFd` | For non-blocking `send`/`recv` fast paths. |
+| `wire_in` / `wire_out` | `Vec<u8>` | Reused ciphertext buffers (capacity `READ_BUFFER_SIZE`). |
+| `check_buffered` | `bool` | First read drains plaintext that arrived with the handshake. |
+| `push_tx` / `push_rx` | flume bounded channel (`PUSH_QUEUE_CAPACITY` = 4096) | Out-of-band messages from other threads. |
+| `canceller` | `monoio Canceller` | Cancels an idle read when a push arrives. |
+
+Key routines:
+
+- `decrypt_into(conn, wire, buf)` — loops `read_tls` → `process_new_packets` → `drain_plaintext`
+  until **all** of `wire` is consumed (`read_tls` takes only a few KiB per call and rustls buffers
+  at most 16 KiB of plaintext). Returns bytes appended and whether the peer sent `close_notify`.
+- `encrypt_into(conn, plain, wire)` — `writer().write_all(plain)` then drain `write_tls` into
+  `wire` (also picks up alerts / key-update responses).
+- `read_plain` — drain early plaintext once; then loop: encrypt queued pushes, `send_wire`,
+  `read_wire`, `absorb` (decrypt + queue any TLS responses). If a read filled the buffer it also
+  drains whatever else is already in the socket (`read_ready_plain`, `MSG_DONTWAIT` `recv`) so a
+  large pipeline is decrypted in one go.
+- `read_wire` — while any `MONITOR` or client-tracking client exists, races the socket read
+  against the push queue with `monoio::select!`; a push cancels the read, is encrypted into
+  `wire_out`, and `None` tells the caller to flush and re-read.
+- `send_wire` — tries one non-blocking `libc::send`; any remainder goes through io_uring
+  `write_all`, reporting the pending bytes as output-buffer memory (`omem`) meanwhile.
+- `read_ready` (trait) — a corrupt record shuts the socket down so the next read fails.
+- `into_split` (Pub/Sub mode) — splits the TCP stream; the `ServerConnection` is shared between
+  `TlsReadHalf` and `TlsWriteHalf` as `Rc<RefCell<…>>` (single-threaded shard, never borrowed
+  across an await). A spawned task forwards queued pushes into the Pub/Sub writer channel. When
+  the reader sees rustls wanting to write (e.g. a key update), it sends an empty message so the
+  writer task flushes.
+- `into_tcp_stream` always fails: features that take over the raw socket (replication `PSYNC`,
+  `SYNC`, `DFLY FLOW`) reply `-ERR replication links are only supported on the plaintext port`.
+
+### 8.5 Out-of-band pushes: `PushTarget`
+
+`MONITOR` lines and tracking invalidations are produced on other threads. Each client registers a
+`PushTarget`: `Fd(RawFd)` for plaintext (non-blocking `send` straight to the socket, dropped if
+the socket buffer is full) or `Queue(flume::Sender<Bytes>)` for TLS (bounded `try_send`, dropped
+if full). The TLS connection encrypts queued messages itself; writing raw bytes to a TLS socket
+would corrupt the stream.
+
+---
+
+## 9. Memory allocator (`src/allocator.rs`)
+
+### 9.1 jemalloc is the global allocator
+
+`src/lib.rs` declares `#[global_allocator] static GLOBAL: tikv_jemallocator::Jemalloc`. The
+`tikv-jemallocator` crate is built with `stats` and `background_threads_runtime_support`;
+`tikv-jemalloc-ctl` with `stats` and `use_std`.
+
+### 9.2 Background purge thread
+
+`set_background_thread(on)` / `background_thread_enabled()` wrap jemalloc's `background_thread`
+control. `main.rs` turns it on at startup (Redis default `jemalloc-bg-thread yes`) so an idle
+server returns freed pages to the OS on jemalloc's decay schedule instead of keeping peak RSS
+after `DEL`/`FLUSHALL`. `CONFIG SET jemalloc-bg-thread yes|no` (or the config directive) toggles it.
+
+### 9.3 Statistics
+
+`AllocatorStats { allocated, active, resident, metadata, mapped, fragmentation_ratio }`.
+`get_allocator_stats()` advances jemalloc's stats epoch, reads the five byte counters (0 on
+error), and computes `fragmentation_ratio = resident / allocated` (1.0 when nothing is allocated).
+
+### 9.4 Per-thread counters for `maxmemory` accounting
+
+- `thread_net_bytes()` — this thread's cumulative allocated minus deallocated bytes, read from
+  jemalloc's thread-local `allocatedp` / `deallocatedp` pointers (two plain loads, about 1 ns, cached
+  in a `thread_local!`). Memory freed by another thread stays charged to the allocator, so only
+  the sum over threads is a total, but the delta across a stretch of code on one thread is exact.
+  `router::local_real_parts` publishes it per shard when real accounting is enabled.
+- `global_allocated()` — process-wide `stats.allocated` after an epoch advance (about 15 µs: cron
+  only). Used by `Router::calibrate_real_memory` and `SnapshotEvictionPause` to set the
+  "unattributed" remainder so shard nets plus it equal the global figure (only when this is the
+  sole server in the process).
+- `flush_thread_cache()` — returns objects parked in this thread's jemalloc cache (tcache) to the
+  arena by toggling `thread.tcache.enabled` off and on. Called after RDB loads and AOF replay:
+  otherwise ~1.5 MB of freed load buffers per shard thread would count as allocated, and
+  `maxmemory` eviction would wrongly evict after a restart near the limit.
+
+### 9.5 `INFO memory` (`format_memory_info`)
+
+| Field | Source |
+| :--- | :--- |
+| `used_memory(_human)` | Caller's `used_mem` (the server's own accounting, see Component 05/07). |
+| `used_memory_rss(_human)` | jemalloc `resident`, or `used_mem` if 0. |
+| `maxmemory(_human)` | Caller's `max_mem`. |
+| `mem_not_counted_for_evict` | Constant 0. |
+| `mem_fragmentation_ratio` | `rss / used_mem` (Redis semantics), 1.00 when `used_mem` is 0. |
+| `mem_allocator` | `jemalloc`. |
+| `allocator_allocated/active/resident/metadata/mapped` | jemalloc stats. |
+| `cooled_keys`, `tiered_keys` | Tiering counters passed in. |
+| `number_of_cached_scripts`, `number_of_functions`, `number_of_libraries`, `used_memory_vm_functions` | Scripting subsystem (`used_memory_vm_functions` is an estimate: 32768 + 256 per function). |
+| `lazyfree_pending_objects` / `lazyfreed_objects` | 0 / `table::get_lazyfreed_objects()`. |
+
+### 9.6 `MEMORY STATS`, `MEMORY DOCTOR`, `MEMORY MALLOC-STATS`
+
+`MemoryReport { breakdown: table::MemoryBreakdown, used, maxmemory, alloc: AllocatorStats }`;
+`untracked() = allocated − used` (saturating): memory the allocator holds that `used_memory`
+(and so eviction) does not see.
+
+`format_memory_stats` writes a flat RESP2 map of 18 pairs: `total.allocated`, `used_memory`,
+`maxmemory`, `keys.count`, `keys.bytes-per-key`, `dataset.bytes`, `overhead.hashtable.main`,
+`allocator.allocated/active/resident`, `rudis.dataset.exact.bytes`,
+`rudis.dataset.counter.bytes`, `rudis.hashtable.exact.bytes`, `rudis.untracked.bytes`,
+`rudis.free-arena.bytes`, and float strings `dataset.percentage`,
+`allocator-fragmentation.ratio` (active/allocated), `fragmentation` (resident/used).
+
+`memory_doctor` reports (Redis's "Sam" wording) any of:
+
+1. High fragmentation: resident > 100 MB and > 1.4 × used.
+2. Resident exceeds `maxmemory` by more than 20%.
+3. Accounting drift: incremental dataset or table estimate differs from the recomputed exact
+   value by more than 2% + 1 MB.
+4. Untracked memory > 64 MB and > 10% of used.
+
+`malloc_stats()` returns jemalloc's own `stats_print` report for `MEMORY MALLOC-STATS`.
+
+### 9.7 `SmallCollectionArena`
+
+A per-table free-list pool (field `RudisTable.arena`, one per shard table, no locking) that sits
+*above* jemalloc to avoid allocator round-trips for "push one, pop one" churn. `MAX_ARENA_POOLED`
+= 1024 per pool.
+
+| Collection | Acquire | Recycle |
+| :--- | :--- | :--- |
+| List (`packedlist::PackedList`) | pop a pooled list or `PackedList::new()` (capacity hint ignored) | `clear()`, keep if pool < 1024 |
+| Small hash (`smallhash::SmallHash`) | always `SmallHash::new()` — **not pooled**: it is one exactly sized allocation reallocated on each insert, so recycling saves nothing | dropped |
+| Small set (`Vec<table::SmallSetEntry>`) | pooled `Vec` reserved to `min_cap`, or `with_capacity(max(min_cap, 8))` | `clear()`, keep if capacity ≤ 512 and pool < 1024 |
+| Small sorted set (`Vec<(OrderedScore, CompactKey)>`) | pooled or `with_capacity(max(min_cap, 16))` | `clear()`, keep if capacity ≤ 512 and pool < 1024 |
+
+Counters: `allocations_saved` (pool hits), `recycles_count` (containers kept). `pool_stats()`
+returns `(list, 0, set, zset)` pool lengths — the hash slot is always 0. The table recycles a
+value's storage when a key is deleted/emptied and acquires on `LPUSH`/`RPUSH`, `HSET`, `SADD`,
+`ZADD` creating a new key.
+
+---
+
+## 10. Invariants & gotchas
+
+- **ACL lookup uses `router.port`, protected mode and TLS runtime use `base_port`.** In cluster
+  mode these differ; it works because `share_acl_with_port` aliases every shard port to the base
+  table. A new code path that calls `get_acl_for_port` with some other port gets a fresh,
+  open `default nopass` table.
+- **`HAS_CUSTOM_ACL` is a one-way latch** for the whole process. Never add per-command work that
+  isn't guarded by it, or the zero-cost fast path disappears.
+- **Command checks need the resolved name.** Use `acl_cmd_name` (which resolves `container|sub`),
+  not the display name; an unresolved container is only allowed if all its subcommands are.
+- **`PING` is not ACL-exempt**; only `NO_AUTH` commands (`auth`, `hello`, `quit`, `reset`) are.
+  The NOAUTH gate before authentication is separate and allows only `AUTH`, `HELLO`, `QUIT`.
+- **SETUSER is atomic, DELUSER/LOAD disconnect, SETUSER does not.** Changing a logged-in user's
+  rules takes effect on its next command (each check re-reads the table), but disabling a user
+  with `off` does not kick its existing sessions.
+- **Never write to a TLS client's fd directly.** Use the transport or `PushTarget`.
+- **`TlsTransport` must consume all ciphertext per read** (`decrypt_into` loops); dropping the
+  remainder would silently lose pipelined commands.
+- **Default `tls-auth-clients` is `yes`, but without `tls-ca-cert-file` no client certificate is
+  requested** — `server_config_from` falls back to `with_no_client_auth()`. This differs from
+  Redis, which requires a CA in that case.
+- **`thread_net_bytes` is only meaningful as a delta on one thread or summed across threads.**
+
+## 11. Limitations / not implemented
+
+- **ACL selectors** (`(…)` rules, Redis 7) are rejected; `clearselectors` is a no-op.
+- **First-arg rules** work only for plain commands; `ACL GETUSER` has no `selectors` field.
+- **`sanitize-payload` / `skip-sanitize-payload`** are stored and displayed but nothing consults
+  them (there is no RESTORE deep-sanitization switch).
+- **`ACL LOG` aggregation has no time window** (Redis only merges entries within 60 s), and the
+  `client-info` field is synthetic (`addr=127.0.0.1:0 laddr=127.0.0.1:6379 …` with the real id,
+  db, command and user).
+- **Client certificates do not map to ACL users** (`tls-auth-clients-user` is accepted as a known
+  Redis directive but not implemented); an mTLS client still authenticates as `default` or via
+  `AUTH`.
+- **`tls-port` cannot change at runtime**, there is no TLS on the replication link or cluster bus,
+  and no TLS protocol/cipher configuration (rustls defaults apply).
+- **No kernel TLS (kTLS) offload.** Deliberately: it would need rustls secret extraction,
+  per-cipher `setsockopt(SOL_TLS, TLS_TX/TLS_RX)` key installation, out-of-band handling of TLS 1.3
+  control records on receive, and the `tls` kernel module; Rudis doesn't use `sendfile`, so it
+  would mostly move the same AES-GCM work into the kernel.
+- **`genpass_hex` fallback**: if the system RNG fails, it falls back to bytes derived from the
+  current time — not cryptographically strong (practically unreachable on Linux).
+- **No jemalloc heap profiling**; only aggregate stats and the `stats_print` report.
+
+---
+
+## 12. Code map
+
+| File | Key symbols | What they do |
+| :--- | :--- | :--- |
+| `src/acl.rs` | `HAS_CUSTOM_ACL`, `PORT_ACLS`, `get_acl_for_port`, `share_acl_with_port` | Global fast-path flag and per-port ACL table registry (cluster shard aliasing). |
+| | `hash_password_sha256`, `parse_password_hash`, `ct_eq` | Redis SHA-256 password hashes, `#hash` validation, constant-time compare. |
+| | `command_index`, `commands_in_category`, `CommandSet` | Lookups into the generated command table; per-user permission bitset. |
+| | `AclUser` (`new_default`, `new_empty_with_pubsub`, `apply_rule_with_pubsub`, `can_execute_command_with_first_arg`, `can_access_key`, `can_access_channel`, `to_acl_list_line`, `commands_rule_string`, `keys_rule_string`, `channels_rule_string`, `flags`) | User model, rule parser, permission checks, ACL LIST/GETUSER rendering. |
+| | `KeyPattern`, `KEY_READ`, `KEY_WRITE` | `%R~`/`%W~` key permissions. |
+| | `AclManager` (`check_auth`, `is_auth_required_for_default`, `set_requirepass`, `set_user`, `del_user`, `load_user_from_declaration`, `load_from_aclfile`, `save_to_aclfile`, `add_log_entry`) | Server-wide user table, auth, config integration, ACL LOG. |
+| | `AclDeniedReason`, `AclLogEntry`, `genpass_hex` | ACL LOG model; `ACL GENPASS`. |
+| `src/acl_categories.rs` | `CATEGORIES`, `CmdInfo`, `COMMANDS`, `NUM_COMMANDS`, `WORDS` | Generated (by `scripts/gen_acl_categories.py`) command/category/key-flag table. |
+| `src/connection.rs` | `acl_cmd_name`, `acl_key_perm`, `acl_first_arg`, `acl_denied`, `acl_denied_in_context`, `acl_check_user_cmd`, `acl_first_denied_channel`, `mode_switch_denied`, `record_acl_denial`, `protected_command_denied`, `can_tracker_read_key` | Enforcement call sites; `AUTH`/`HELLO`/`RESET`/`ACL` handlers; `CONFIG SET` for ACL, TLS, protected-mode and jemalloc keys; `REPLICATION_NEEDS_PLAINTEXT`. |
+| `src/scripting.rs` | `script_acl_denied` | ACL checks for commands issued from Lua. |
+| `src/config.rs` | `ServerConfig.{requirepass, users, tls_*}`, `user` / `rename-command` directives, `CONFIG REWRITE` user lines | Config-file side of ACL and TLS. |
+| `src/netsec.rs` | `parse_bind_spec`, `format_bind_spec`, `bind_addrs`, `bind_reuseport_listener`, `bind_all` | `bind` handling and `SO_REUSEPORT` listeners. |
+| | `ensure_port_free`, `ensure_port_free_with_grace` | Refuse to start on a busy port. |
+| | `protected_mode`, `protected_mode_denies`, `PROTECTED_MODE_DENIED` | Protected mode. |
+| | `ProtectedAction`, `enable_debug_command`, `enable_module_command`, `DEBUG_COMMAND_NOT_ALLOWED`, `MODULE_COMMAND_NOT_ALLOWED` | DEBUG/MODULE gates. |
+| `src/tls.rs` | `generate_self_signed_cert`, `create_server_config`, `load_certs_from_file`, `load_key_from_file`, `load_server_config_from_files`, `server_config_from`, `TlsAuthClients` | Certificates, keys, mTLS verifier, rustls `ServerConfig`. |
+| | `TlsSession::handshake_monoio` | Async server handshake. |
+| | `TlsTransport`, `TlsReadHalf`, `TlsWriteHalf`, `decrypt_into`, `encrypt_into` | TLS `ClientTransport` implementation. |
+| | `TlsWorkerConfig`, `TlsRuntimeState`, `get_tls_runtime`, `active_tls_server_config` | Startup config for shards and runtime-reloadable config. |
+| `src/transport.rs` | `ClientTransport`, `TransportRead`, `TransportWrite`, `PlainTransport`, `PushTarget`, `PUSH_QUEUE_CAPACITY` | Transport abstraction shared by plain and TLS clients. |
+| `src/server.rs` | TLS accept loop, `TLS_HANDSHAKE_TIMEOUT`, `share_acl_with_port` call | Per-shard listeners, handshake, protected-mode check. |
+| `src/main.rs` | requirepass / aclfile / user loading, TLS config build, `set_background_thread(true)`, port probes | Startup wiring. |
+| `src/allocator.rs` | `AllocatorStats`, `get_allocator_stats`, `set_background_thread`, `background_thread_enabled` | jemalloc stats and purge thread. |
+| | `thread_net_bytes`, `global_allocated`, `flush_thread_cache` | Counters and tcache flush for `maxmemory` accounting. |
+| | `format_memory_info`, `MemoryReport`, `format_memory_stats`, `memory_doctor`, `malloc_stats` | `INFO memory`, `MEMORY STATS/DOCTOR/MALLOC-STATS`. |
+| | `SmallCollectionArena`, `MAX_ARENA_POOLED` | Per-table container pool used by `RudisTable`. |
+| `src/lib.rs` | `#[global_allocator] GLOBAL` | Installs jemalloc. |

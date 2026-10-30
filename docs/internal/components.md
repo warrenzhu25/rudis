@@ -1,1048 +1,793 @@
-# Rudis Subsystem Implementation Deep-Dive & Code Reference
+# Rudis Internals: Consolidated Implementation Overview
 
-This document provides a concise, implementation-focused summary for all 21 core subsystems of **Rudis**:
-the concrete Rust data structures, the key algorithm or workflow, and the most important findings from this
-session's source-verification pass against the current codebase (the source nearly doubled in size during
-this pass — several large files, notably `src/connection.rs`, `src/resp.rs`, `src/vector.rs`, `src/search.rs`,
-and `src/table.rs`, roughly doubled, and two brand-new subsystems — Agent Memory and the MCP Server — were
-added as Components 20 and 21).
+This document is a one-stop overview of how Rudis is built. Each numbered section below
+summarises one subsystem (what it does, its key structures and algorithms, and the gotchas worth
+knowing) and links to the full per-subsystem reference in this directory, which covers the same
+material in depth and can be read without opening the source. For the index of those documents
+and a suggested reading order, see [README.md](README.md). For design rationale ("why"), see
+[`docs/design/`](../design/).
 
-Each entry links to its full per-subsystem document under `docs/internal/`, which carries complete
-struct layouts, step-by-step algorithm walkthroughs, and source line references. This document is a rollup for
-orientation, not a replacement — read the linked document for exhaustive code-level depth, and see
-[`docs/design/components.md`](../design/components.md) for architectural rationale and invariants.
+## The system in one picture
 
----
+Rudis is a Redis-compatible server built as a **shared-nothing, thread-per-core** engine. At
+startup `main.rs` parses a redis-server-compatible command line/config, builds a lock-free
+**mesh** of SPSC rings between every pair of shards, and starts one pinned OS thread per shard.
+Each shard thread runs its own monoio event loop (io_uring, with an epoll fallback), owns its own slice of the keyspace
+(`ShardDb`), and accepts connections on its own `SO_REUSEPORT` listener for each `bind` address.
 
-## Subsystem Index
+A request is handled entirely on the thread that accepted the connection until it needs a key
+owned by another shard; then it is shipped over the mesh as a `ShardMessage` and the reply comes
+back through shared-memory descriptors or a pooled channel.
 
-- [01. Reactor Runtime & Server Lifecycle](#component-01-reactor-runtime--server-lifecycle) (`src/main.rs, src/server.rs`)
-- [02. Connection Lifecycle & Command Execution](#component-02-connection-lifecycle--command-execution) (`src/connection.rs`)
-- [03. RESP Protocol Engine & Command Parser](#component-03-resp-protocol-engine--command-parser) (`src/resp.rs`)
-- [04. Sharding Architecture & Cross-Core Mesh](#component-04-sharding-architecture--cross-core-mesh) (`src/router.rs, src/shard.rs, src/mailbox.rs`)
-- [05. Storage Engine & Compact Encodings](#component-05-storage-engine--compact-encodings) (`src/table.rs`)
-- [06. Blocking Operations & The Reactive Event Hub](#component-06-blocking-operations--the-reactive-event-hub) (`src/block.rs`)
-- [07. NVMe SSD Tiered Storage Engine](#component-07-nvme-ssd-tiered-storage-engine) (`src/tiering.rs, src/tiering/`)
-- [08. Vector Search Engine: HNSW, Redis 8 Vector Sets & NVMe Tiering](#component-08-vector-search-engine-hnsw-redis-8-vector-sets--nvme-tiering) (`src/vector.rs`)
-- [09. RediSearch Full-Text Engine & Hybrid Vector Fusion](#component-09-redisearch-full-text-engine--hybrid-vector-fusion) (`src/search.rs`)
-- [10. Kernel Bypass & Zero-Copy Networking](#component-10-kernel-bypass--zero-copy-networking) (`src/xdp.rs, src/zerocopy.rs`)
-- [11. Redis Cluster Topology & Gossip Protocol](#component-11-redis-cluster-topology--gossip-protocol) (`src/cluster.rs`)
-- [12. CRDT Data Types & Manual Multi-Region Sync](#component-12-crdt-data-types--manual-multi-region-sync) (`src/crdt.rs`)
-- [13. Lua Scripting & Redis 7 Functions Engine](#component-13-lua-scripting--redis-7-functions-engine) (`src/scripting.rs`)
-- [14. Persistence & Replication Engines](#component-14-persistence--replication-engines) (`src/replication.rs, src/aof.rs`)
-- [15. Security, Memory Allocator & TLS](#component-15-security-memory-allocator--tls) (`src/acl.rs, src/allocator.rs, src/tls.rs`)
-- [16. JSON Document Store & JSONPath Engine](#component-16-json-document-store--jsonpath-engine) (`src/json.rs`)
-- [17. Geospatial Commands](#component-17-geospatial-commands) (`src/geo.rs`)
-- [18. Probabilistic Data Structures](#component-18-probabilistic-data-structures) (`src/probabilistic.rs, src/hll.rs`)
-- [19. Pub/Sub Messaging Hub](#component-19-pubsub-messaging-hub) (`src/pubsub.rs`)
-- [20. Agent Memory, LLM Quota & Checkpoints](#component-20-agent-memory-llm-quota--checkpoints) (`src/agent.rs`)
-- [21. MCP Server](#component-21-mcp-server) (`src/mcp.rs`)
+```mermaid
+flowchart TD
+    C["Client (RESP2/3, inline, memcached; plain or TLS)"] --> L["SO_REUSEPORT listener per bind address (01, 15)"]
+    L -->|"protected mode, conn_balance hand-off"| CL["Per-connection loop: handle_client_loop (02)"]
+    CL --> P["RESP parser + build_command -> Command (03)"]
+    P --> G["Gate sequence: ACL, cluster MOVED/ASK, LOADING, MISCONF, OOM, pause (02, 11, 15)"]
+    G --> X{"Execution strategy (02)"}
+    X -->|"pipeline"| SQ["Squashed per-shard batches"]
+    X -->|"single / MULTI-EXEC / blocking"| EC["execute_command"]
+    SQ --> R["Router: key -> slot -> shard (04)"]
+    EC --> R
+    R -->|"local key"| DB["ShardDb on this thread (05)"]
+    R -->|"remote key"| M["Mesh: SPSC rings + Doorbell (04)"]
+    M --> RDB["ShardDb on owner shard (05)"]
+    DB --> EXT["Data-type engines: lists/hash/set/zset/streams (05), geo (17), JSON (16), vector (08), search (09), probabilistic (18), CRDT (12), agent stores (20)"]
+    RDB --> EXT
+    EXT --> T["NVMe tier for cold values (07)"]
+    EXT --> BH["BlockHub wakes blocked waiters (06)"]
+    EXT --> PR["AOF + replication stream (14)"]
+    EXT --> PS["Pub/Sub, keyspace notifications, tracking (19)"]
+    DB --> RP["Reply bytes"]
+    RDB -->|"FastGet/Batch descriptors"| RP
+    RP --> CL
+    LUA["Lua scripts / FUNCTION (13)"] -.->|"redis.call"| EC
+    MCP["MCP tools (21)"] -.->|"plan_tool_command"| EC
+    CB["Cluster bus thread: gossip, failover (11)"] -.-> G
+    XDP["Simulated XDP poll task (10)"] -.-> EC
+```
 
----
+Reading the diagram: the solid path is the normal command path; the dotted entries are
+alternative ways a `Command` gets into the same executor. Numbers in parentheses are the
+section (and per-subsystem doc) that covers each box.
 
-## Component 01: Reactor Runtime & Server Lifecycle
+### Cross-cutting conventions
 
-**Source files:** `src/main.rs` (278 lines: process entry, OS tuning, config/ACL priming, thread spawn) ·
-`src/server.rs` (2,079 lines: `run_shard_worker`, the per-shard event loop)
-
-**Key data structures.** `Args`/`RudisConfig` (CLI + config-file merge, now including
-`tiered_upload_threshold`); `AofConfig{enabled, dir, fsync_every_sec}` and `Option<TlsWorkerConfig>`, each
-cloned once per shard; `ShardMessage` — grew from "60+" to **66 variants** (new: `RemoveClientPubSub`,
-sharded-pubsub variants, `Scan`/`Keys`/`RandomKey`/`ExpireTime`/`Delex`,
-`InitSearchIndex`/`DropSearchIndex`/`SearchQuery`); `CatchUnwind`/`catch_unwind_async` (a hand-rolled `Future`
-combinator wrapping every `poll()` in `std::panic::catch_unwind`); `mailbox::create_shard_mesh` builds an N×N
-matrix of `SpscQueue<ShardMessage>` rings (capacity 256) plus a per-shard doorbell `flume` channel and
-`sleeping` `AtomicBool`.
-
-**Key algorithm / workflow.** `main.rs` disables THP, parses config, primes the default ACL user's password
-from `requirepass` *before any shard starts* (new — see Component 15), computes `num_shards =
-threads.unwrap_or(num_cores.min(8))` via a cgroup/taskset-aware `get_process_affinity_cores` (calls
-`sched_getaffinity` directly, not just `core_affinity::get_core_ids()`), builds the shard mesh, and spawns one
-OS thread per shard running `run_shard_worker`. Each shard thread pins its core, builds a
-`monoio::RuntimeBuilder<FusionDriver>`, opens a `SO_REUSEPORT` listener (and a second one on `--tls-port`),
-restores from RDB or replays AOF, opens its tiering manager, calls `connection::set_current_router`
-(populating a thread-local `CURRENT_ROUTER` used by `notify_keyspace_event`), spawns three periodic tasks
-(100ms expire / 20ms auto-tier / 2s tiering GC) plus an AF_XDP ingress loop, spawns the cross-shard receiver
-loop, then enters the TLS and plain accept loops. The cross-shard receiver drains up to 64 queued messages per
-wakeup via `try_recv()` before yielding back to `recv_async().await`.
-
-**Notable implementation detail.** `ShardMessage::Batch`'s handler (`server.rs`) contains a `let needs_async =
-false;` that is never reassigned — a ~340-line duplicate async fast-path dispatcher is permanently dead code;
-only the `else` branch (synchronous dispatch, with tiered-GET misses deferred to a follow-up
-`monoio::spawn`) ever runs. Connection rebalancing (`conn_balance.rs`) reserves a least-loaded shard via a
-single `compare_exchange`, bounded to 4 retries, tracking up to 256 shards — measured data in the module's own
-doc comment shows 64 connections over 16 shards without this fix would run at ~51.9% of ideal capacity due to
-`SO_REUSEPORT` hashing skew.
-
-**Verified findings.** New: **the TLS accept loop never calls `conn_balance::register_conn`/`claim_owner`/
-`unregister_conn`** — TLS connections are never rebalanced off an overloaded shard, and because they don't
-increment `CONN_COUNTS`, their presence silently skews the plain-TCP accept loop's least-loaded-shard
-calculation (a TLS-heavy shard looks artificially idle). Re-verified, still true: graceful shutdown does not
-drain in-flight work or run an automatic `SAVE`/`BGSAVE` — only the AOF writer gets a final flush+fsync; the
-cross-shard receiver, periodic tasks, AF_XDP loop, and TLS accept loop are simply dropped with the runtime.
-`agent.rs`/`mcp.rs` (Components 20/21) need **zero** special startup wiring — their state lives as plain
-`HashMap` fields on `ShardDb`, populated lazily, and their commands are parsed/dispatched exactly like any
-other Redis command with no separate listener or task.
-
-**Full documentation:** [`docs/internal/01_reactor_runtime.md`](01_reactor_runtime.md)
+- **Everything is per shard.** Each shard owns its key table, side stores (JSON, probabilistic,
+  CRDT, agent memory, vector sets, search partitions), AOF file, tier file and blocking-waiter
+  registry. Cross-shard work goes through the mesh, never through shared locks on data.
+- **Experimental families are gated.** The command prefixes in `EXPERIMENTAL_PREFIXES`
+  (`JSON.`, `BF.`, `CF.`, `CMS.`, `TOPK.`, `FT.`, `SEMANTIC.`, `CRDT.`, `LLM.`, `MCP.`, `XDP.`)
+  parse as unknown commands unless `enable-experimental-commands` is on (off by default).
+  `AGENT.*` and the Redis 8 vector-set commands (`VADD`, `VSIM`, ...) are not gated.
+- **Cluster mode uses per-shard ports.** In cluster mode shard *N* listens on `base_port + N`
+  and redirects are single-hop; node-wide registries (WATCH, MONITOR, ACL, CLIENT KILL,
+  pub/sub presence) are keyed by the base port.
+- **Writes are logged once.** A mutating command calls `record_change!`, which invalidates
+  WATCH/tracking and hands the encoded bytes to both the shard's AOF and the replication stream.
 
 ---
 
-## Component 02: Connection Lifecycle & Command Execution
+## 01. Reactor Runtime & Server Lifecycle
 
-**Source files:** `src/connection.rs` (20,971 lines — roughly doubled since the previous revision) · reply
-mailbox primitives in `src/mailbox.rs`
+> Full reference: [01_reactor_runtime.md](01_reactor_runtime.md) · Main source: `src/main.rs`, `src/server.rs`, `src/shutdown.rs`, `src/conn_balance.rs`, `src/netsec.rs`, `src/transport.rs`
 
-**Key data structures.** `ClientInfo` (new fields: `lib_name`/`lib_ver` from `CLIENT SETINFO`,
-`reply_mode`); `WATCHED_KEYS`/`CLIENT_WATCH_TAINTED`/`TRACKING_CLIENTS` (per-port static maps, gated by
-fast-path `AtomicBool`s); `CMD_STATS`/`ERROR_STATS`/`FAILED_CMD_STATS` (global maps, the latter two new, fed
-by a new `ErrorStatTracker` RAII guard); `ConnScratch` (pooled per-reactor-thread scratch buffers, up to 32
-instances; its `results_pool` field is now dead weight — `execute_commands_squashed` only ever does `let _ =
-results_pool;`); **`BatchResponder`** (`src/mailbox.rs`) — materially redesigned since the prior revision:
-`state: CachePadded<AtomicU8>` (`BATCH_IDLE/RUNNING/SLEEPING/COMPLETED`) plus `responses_ptr:
-AtomicPtr<CompactResp>` that writes reply payloads **directly into the caller's pre-allocated `responses:
-Vec<CompactResp>`** via raw pointer, not a second handed-back `Vec`.
+Rudis implements a shared-nothing, thread-per-core architecture where each keyspace shard runs on a dedicated OS thread hosting a single-threaded async monoio runtime (io_uring with epoll fallback). This subsystem bootstraps the process, parses redis-server-compatible CLI/config options, binds `SO_REUSEPORT` listeners, spawns pinned shard threads, accepts incoming client connections, balances connections across shards, isolates panics, drives background maintenance, and coordinates graceful quiesce-and-drain shutdowns.
 
-**Key algorithm / workflow.** `execute_command` runs an RAII-guarded, eight-gate sequence (slowlog + new
-`ErrorStatTracker` → NOAUTH → ACL → ASKING → CROSSSLOT → cluster redirection → READONLY → OOM), checking
-**every** key of a command via `cmd_keys`/`for_each_cmd_key`, not just the primary key.
-`execute_commands_squashed`'s inline write fast paths (`SET`, `INCRBY`, `DEL`, `HSET`, `SADD`, `ZADD`,
-`LPUSH`, `LPOP`, `RPOP`) are gated on "no AOF and no connected replica" (plus per-command extra gates: no
-keyspace-notify flags for `SET`, no active search index for `DEL`/`HSET`, no blocked waiters for
-`ZADD`/`LPUSH`). Cross-shard batch harvest spins up to 256 iterations on a `pending_mask: u64` before falling
-back to `responder.wait_take().await`.
+**Key structures**
+- `Args` — CLI flags parsed via clap with support for redis-server directive rewriting and CLI overrides.
+- `ShardSender` / `ShardReceiver` — Endpoints of the N×N cross-shard mailbox mesh backed by SPSC queues (capacity 64, self-ring 16) with overflow `VecDeque` fallback and atomic `Doorbell` wakeups.
+- `CONN_COUNTS` — Process-global array of 256 `AtomicUsize` tracking active client connections per shard for accept-time rebalancing.
+- `INFLIGHT` — Global array of 256 cache-padded per-shard atomic counters tracking running command batches for shutdown quiescing.
+- `PlainTransport` — Client transport wrapper around a raw stream renting `BytesMut` directly to io_uring with a 16 KiB spare read threshold.
+- `CatchUnwind` — Future wrapper executing each poll inside `std::panic::catch_unwind` to prevent task panics from crashing shard runtime threads.
+- `TlsWorkerConfig` — TLS configuration containing certificate, key, and rustls server configuration (or self-signed fallback) distributed to shard workers.
+- `SystemSanityReport` — OS check results inspecting overcommit memory, somaxconn, max open files, and transparent huge pages.
 
-**Notable implementation detail — a previously-flagged gap is now fixed; a new one of the same class has
-appeared.** The prior revision's finding that the squashed `SET` fast path skipped
-`touch_watched_key`/`notify_key_invalidation` is **confirmed fixed** — `SET` now calls both, matching its
-sibling fast paths, on both the local and remote-shard (`server.rs`) sides. However, the harvest loop's
-`pending_mask: u64` (bit = `1u64 << target_shard`) is only correct for `num_shards <= 64`; for more than 64
-shards, high-numbered shard bits alias back onto bits 0-63 via unchecked shift wraparound, which can make the
-harvest loop treat a still-outstanding batch as already-collected — the same bug class the prior revision
-flagged (and which was fixed) in `MGET`/`MSET` scatter-gather has reappeared here in a different mechanism.
+**Key algorithms**
+- Connection rebalancing ([§6](01_reactor_runtime.md#6-accepting-connections)) — `claim_owner` scans up to 4 times for the strictly least-loaded shard in `CONN_COUNTS`, atomically reserves the slot via CAS, and hands off the connection fd via `ShardMessage::AdoptConnection` without re-registering on adoption.
+- Connection accept loop ([§6](01_reactor_runtime.md#6-accepting-connections)) — `accept_until_shutdown` retains a pinned accept future across 200 ms timeout checks against the shutdown flag to prevent dropping kernel-completed io_uring accepts.
+- Cross-shard message dispatch ([§5](01_reactor_runtime.md#5-the-shard-worker-run_shard_worker-serverrs)) — Drains up to 64 `ShardMessage`s back-to-back using non-async `try_recv`, flushes appended AOF bytes via `aof_write_after_mailbox`, and yields cooperative execution to local client tasks.
+- Pipeline batch execution ([§5](01_reactor_runtime.md#5-the-shard-worker-run_shard_worker-serverrs)) — Remote shards process grouped commands via `ShardMessage::Batch`, executing fast paths when tracking, AOF, replication, and notifications are inactive, while deferring tiered keys to asynchronous NVMe cold reads.
+- Two-phase shutdown coordination ([§7](01_reactor_runtime.md#7-shutdown)) — Quiesces new command batches via per-shard `INFLIGHT` counters (up to 2 s), performs optional RDB/AOF persistence, broadcasts `shutdown(SHUT_RD)` to drain client sockets (up to 2 s), and synchronizes shard exits across a 3 s barrier.
+- Port collision probe ([§3](01_reactor_runtime.md#3-process-startup-mainrs)) — Binds a probe socket with `SO_REUSEADDR` but without `SO_REUSEPORT` (retrying for up to 3 seconds) to detect lingering or competing listeners before shards bind with `SO_REUSEPORT`.
 
-**Verified findings.** `CLIENT REPLY OFF`/`SKIP` is tracked (`ClientInfo.reply_mode`) but never consulted
-anywhere else — replies are written unconditionally regardless of mode. `CLIENT KILL`/`PAUSE`/`UNPAUSE`/
-`NO-TOUCH`/`CACHING` remain accepted-but-inert `+OK` stubs. TLS connections now run the same generic
-`handle_client<T: ClientTransport>` loop as plaintext connections (the separate `handle_tls_connection` loop
-was deleted), so they take the pipeline-squashing fast path too. A newly-discovered dead-code duplicate: two separate `else if` arms in
-the squashed fast-path chain match `Command::IncrBy` under the identical guard condition; the second is
-unreachable. Live cluster slot migration (`migrate_keys_to_node`/`execute_rebalance_plans`, now documented as
-living in `connection.rs` rather than `router.rs`) is a real DUMP-and-replay-as-write-commands protocol,
-batched 100 keys at a time — see Components 07/11 for its tiered-value data-loss interaction.
-
-**Full documentation:** [`docs/internal/02_connection_lifecycle.md`](02_connection_lifecycle.md)
+**Gotchas & open issues**
+- `save` rules are empty by default, so SIGTERM or shutdown without explicit save points or `SHUTDOWN SAVE` will not write an RDB snapshot.
+- TLS connections bypass connection rebalancing entirely, running strictly on the accepting shard and remaining invisible to the `CONN_COUNTS` census.
+- `ShardDb` is strictly thread-local (`Rc<RefCell<ShardDb>>`); holding `borrow_mut()` across an `.await` boundary causes runtime panics.
+- Fatal errors during startup RDB restore or AOF replay immediately terminate the entire process with exit code 1 to protect existing persisted data.
+- Shard worker threads require 32 MiB stack size (`SHARD_THREAD_STACK_SIZE`) to accommodate deep async futures and embedded Lua execution.
+- Connection rebalancing occurs only at accept time; long-lived connections are never migrated dynamically across shards.
 
 ---
 
-## Component 03: RESP Protocol Engine & Command Parser
+## 02. Connection Lifecycle & Command Execution
 
-**Source files:** `src/resp.rs` (14,357 lines — roughly doubled since the previous revision: was 9,155 lines
-/ 108 `Command` variants / ~6,470-line `build_command`)
+> Full reference: [02_connection_lifecycle.md](02_connection_lifecycle.md) · Main source: `src/connection.rs`, `src/server.rs`, `src/transport.rs`
 
-**Key data structures.** `pub enum Command` — grew from **108 to 369 variants** (~1,435 lines), spanning 30
-section-comment groups including entirely new families: hash-field TTLs (`HEXPIRE`/`HTTL`/`HGETEX`/
-`HSETEX`), stream claim/delete (`XCLAIM`/`XAUTOCLAIM`/`XDELEX`/`XACKDEL`), Redis 8 Vector Sets (14 `V*`
-variants), CRDT multi-region (10), Redis 7 Functions, RedisJSON (16), Geospatial (8), Probabilistic (22),
-full-text search (10), AF_XDP control (8), Dragonfly extensions (7), and the entire AI-native surface —
-semantic cache, agent memory, LLM quota, agent checkpoint/tool, and MCP (21 variants total). `build_command`
-is now a ~10,719-line, 346-arm match (up from ~6,470 lines) covering 373 distinct command-name string
-literals.
+Every client connection is handled as a dedicated reactor task on a CPU-pinned thread-per-core shard. It sits at the entry point of the server, responsible for accepting sockets, balancing connections across shards, parsing RESP2/RESP3 or Memcached commands, applying security and cluster routing gates, executing commands locally or squashing cross-shard batches via lock-free mailboxes, and writing buffered replies under AOF durability barriers.
 
-**Key algorithm / workflow.** `parse_command` dispatches on the first byte (`*` → `parse_resp_array`, else
-Memcached-storage-then-inline). `parse_resp_array` is two-pass: pass one proves frame completeness and — new
-— **enforces `proto-max-bulk-len`** per argument (rejecting an over-length bulk string at parse time, default
-512 MiB); pass two either fast-paths ≤16-arg frames directly from cached offsets (now **20** fast-pathed
-command names, up from 17: `UNLINK`/`READONLY`/`READWRITE` added) or falls through to `build_command`.
+**Key structures**
+- `ClientInfo` — Shard-local registry entry in `client_registry` holding per-connection state, protocol version (`is_resp3`), selected database (`db`), output/query buffer metrics (`omem`, `qbuf_len`), tracking inbox, and raw socket descriptor.
+- `GlobalClientEntry` — Node-wide registry entry in `GLOBAL_CLIENTS` enabling cross-shard operations such as `CLIENT KILL`, tracking invalidations, and MONITOR fan-out.
+- `ClientScope` / `WithCurrentDb` — Future and execution adapters that swap thread-locals (`CURRENT_DB`, `CURRENT_CLIENT_ID`, `CLIENT_NO_TOUCH`, ACL user) on every poll to prevent context leakage across interleaved async connection tasks.
+- `ConnScratch` — Pooled per-connection scratch buffers (up to 32 per thread) with 128 KiB inbound buffer, 64 KiB outbound buffer, and preallocated cross-shard batch vectors.
+- `CompactResp` — Reply slot enum storing inline payloads up to 30 bytes (`Small`), heap vectors (`Big`), zero-copy bytes (`Bulk`), or static constants (`OK`, `NULL`, `INT_0`).
+- `BatchResponder` — Shared-memory cross-shard mailbox with a lock-free atomic state machine (`BATCH_IDLE` → `RUNNING` → `SLEEPING` → `COMPLETED`) and `Doorbell` wakeups.
+- `BufferLimit` — Output buffer limits (`hard_limit`, `soft_limit`, `soft_seconds`) configured per client class (`Normal` defaults to unlimited, `Slave` to 256/64 MiB/60 s, `Pubsub` to 32/8 MiB/60 s).
 
-**Notable implementation detail — three real wire-protocol gotchas, all newly documented.** (1)
-`Command::Unlink` is **never constructed by the parser** — a client-sent `UNLINK` is normalized to
-`Command::Del` identically to `DEL`; the only constructor of `Command::Unlink` is `table.rs`'s lazy-expiry
-path, purely to name the command differently in AOF/replication output. (2) `VADD` has two unrelated argument
-grammars (Redis 8 Vector Sets vs. Rudis-native legacy) selected by content-sniffing whether `args[2]`
-uppercases to `REDUCE`/`FP32`/`VALUES` — not by any explicit flag, so a legacy element literally named
-`reduce`/`fp32`/`values` would misparse. (3) `FT.HYBRID` has **no `Command` variant of its own** — it
-string-concatenates its text and vector sub-queries into one combined query string and constructs a plain
-`Command::FtSearch`, with no validation that the resulting string is well-formed.
+**Key algorithms**
+- *Connection accept & balancing* — Reactor shards accept connections via `SO_REUSEPORT`; non-cluster plaintext connections query a global census (`CONN_COUNTS`) and hand off to the least-loaded shard via `into_raw_fd` and `ShardMessage::AdoptConnection` ([§3.1](02_connection_lifecycle.md#31-plaintext-accept-accept_loop)).
+- *Client event loop* — Reads socket input into `ConnScratch`, parses up to 1024 commands or 1 MiB per batch, enforces query buffer limits, gates commands, invokes the execution engine, drains tracking invalidations, and flushes output ([§5.2](02_connection_lifecycle.md#52-each-iteration)).
+- *Command gating* — Sequentially validates protected commands, replica write quorums (`-NOREPLICAS`), authentication (`-NOAUTH`), ACLs, cluster slot ownership (`-MOVED`/`-ASK`), loading state, persistence errors (`-MISCONF`), replica read-only rules, and memory limits ([§7.2](02_connection_lifecycle.md#72-gate-sequence)).
+- *Pipeline squashing* — Partitions multi-command pipelines by target shard, executes local commands inline or via fast paths, dispatches parallel `ShardMessage::Batch` messages using pooled `BatchResponder` mailboxes, and writes replies in exact pipeline order ([§9](02_connection_lifecycle.md#9-pipeline-squashing-execute_commands_squashed)).
+- *Multi-shard transactions* — `EXEC` checks watched keys and cluster slot sharing, acquires VLL cross-shard transaction locks in sorted shard order to prevent deadlocks, suppresses `BlockHub` wakeups, and runs queued commands atomically ([§7.5](02_connection_lifecycle.md#75-transactions-execute_tx_step)).
+- *Blocking operations* — Attempts initial resolution across shards, registers waiters with `BlockHub`, installs `BlockedClientGuard`, and polls socket closure every 20 ms via `MSG_PEEK` until unblocked or timed out ([§7.6](02_connection_lifecycle.md#76-blocking-commands)).
+- *AOF reply barrier* — Under `appendfsync always`, synchronizes every shard's AOF if writes occurred; for standard AOF configurations, calls `write_aof_through` on write commands before sending replies to clients ([§5.4](02_connection_lifecycle.md#54-aof-reply-barrier)).
 
-**Verified findings.** The previously-flagged gap — no `proto-max-bulk-len`-equivalent cap — **is now fixed**
-(enforced in `parse_resp_array` pass 1, exposed via `CONFIG GET/SET proto-max-bulk-len`, also reused to bound
-`SETBIT`/`BITFIELD` offsets). Still open: no cap on the RESP array **element count** itself (`*N\r\n`'s `N`)
-— a client streaming ~2 billion tiny empty-bulk arguments could still force a `Vec<Bytes>` of that size in the
-general (`num_args > 16`) path before `build_command` rejects the command name. The error-reply prefix
-whitelist grew from 7 to 9 recognized codes (`NOGROUP`, `INVALIDOBJ` added). No cross-shard
-mailbox/routing/WATCH logic exists in this file — confirmed still entirely in `connection.rs`/`router.rs`/
-`shard.rs`.
-
-**Full documentation:** [`docs/internal/03_resp_engine.md`](03_resp_engine.md)
+**Gotchas & open issues**
+- Enabling `CLIENT TRACKING`, `MONITOR`, `CLIENT PAUSE`, or active blocked waiters disables pipeline squashing node-wide or shard-wide, falling back to sequential execution ([§6](02_connection_lifecycle.md#6-execution-strategies)).
+- Write fast paths bypass AOF logging, replica streams, and keyspace notifications; any of these active requires dispatching through `execute_local_command` ([§9.2](02_connection_lifecycle.md#92-phase-1--walk-the-pipeline)).
+- Outstanding remote shards during squashing are tracked in a 64-bit mask (`1u64 << target_shard`), which would alias if the server is configured with more than 64 shard threads ([§16](02_connection_lifecycle.md#16-limitations--not-implemented)).
+- Replication streaming over TLS is rejected (`into_tcp_stream` fails), and TLS connections bypass cross-shard accept load balancing ([§3.2](02_connection_lifecycle.md#32-tls-accept), [§8](02_connection_lifecycle.md#8-mode-switches)).
+- `CLIENT REPLY OFF` suppresses successful command responses but does not suppress gate errors returned prior to command dispatch ([§7.4](02_connection_lifecycle.md#74-epilogue)).
+- Single-target command dispatch sleeps 2 ms whenever blocked waiters exist before execution to let woken clients reply first, injecting latency for concurrent operations ([§7.3](02_connection_lifecycle.md#73-dispatch)).
 
 ---
 
-## Component 04: Sharding Architecture & Cross-Core Mesh
+## 03. RESP Protocol Engine & Command Parser
 
-**Source files:** `src/router.rs` (4,483 lines: `Router`, key routing, per-command methods, descriptor/channel
-pooling) · `src/shard.rs` (4,137 lines: `ShardDb`, `ShardMessage`, `CompactResp`, `SlotState`) ·
-`src/mailbox.rs` (931 lines: lock-free SPSC cross-shard transport, shard mesh, shared-memory reply
-descriptors)
+> Full reference: [03_resp_engine.md](03_resp_engine.md) · Main source: `src/resp.rs`, `src/connection.rs`
 
-**Key data structures.** `Router` (21 fields, including `slot_states: Rc<RefCell<HashMap<u16, SlotState>>>`
-(sparse, absent ⇒ `Stable`) and `slot_owners: Rc<RefCell<Vec<usize>>>` (dense, 16,384 entries)). `ShardMessage`
-— 66 variants (Component 01). `CompactResp` grew to 5 variants (`Small`, `Big`, `Bulk`, `Array1Bulk`,
-`RawBytes`). `ShardDb` — 238 `pub` methods, five new fields (`semantic_caches`, `agent_memories`,
-`llm_quotas`, `agent_checkpoints`, `agent_tools`) backing the AI-native agent runtime. `mailbox.rs`:
-`CachePadded<T>`, `SpscQueue<T>` (lock-free ring + mutex-guarded overflow `VecDeque`, capacity 256),
-`ShardSender`/`ShardReceiver` with a `target_sleeping`/`sleeping` "sleeping flag," `FastGetDescriptor`/
-`FastSetDescriptor` (plain `AtomicBool`), `ScatterMgetDescriptor`/`ScatterMsetDescriptor` (3-state
-`DESC_RUNNING`/`DESC_COMPLETED`/`DESC_SLEEPING` handshake), `BatchResponder` (4-state handshake plus
-`responses_ptr: AtomicPtr<CompactResp>` direct-write, Component 02).
+The RESP protocol engine parses incoming client byte streams, AOF replay files, and replication feeds into strongly typed `Command` variants before routing or execution. It acts as the front door of the server, multiplexing RESP arrays, memcached text storage commands, and inline text commands on the same port without performing reply encoding or protocol version negotiation.
 
-**Key algorithm / workflow.** Standalone mode routes `fxhash::hash64(hash_tag) % num_shards`; cluster mode
-computes CRC16/XMODEM slot then `slot_to_shard(slot, n) = (slot*n)/16384` (contiguous ranges, not modulo).
-`MGET`/`MSET` use shared-memory scatter-gather (`begin_mget_resp`/`finish_mget_resp`, `begin_mset`/
-`finish_mset`): remote shards write results directly into disjoint slice slots and call `finish_shard()` (only
-the last-to-finish shard pays a `flume` notify, and only if the waiter parked). `execute_remote` was rewritten
-to use `BatchResponder.prepare(&mut slot as *mut _)` instead of a serialized results-vec. The sleeping-flag
-fast path on `ShardSender::send` skips `flume::try_send` entirely unless `target_sleeping == true`.
+**Key structures**
+- `Command` — Enum with ~380 variants representing every supported command; compile-time asserted to ≤ 184 bytes by boxing large options (such as `SearchOptions` and `ZRangeOpts`).
+- `SmallVec<[Bytes; 1]>` — Inline 1-slot vector used for single-key operations (`DEL`, `EXISTS`, `HSET`, `SADD`, etc.) to eliminate heap allocations on hot paths.
+- `PROTO_MAX_BULK_LEN` — `AtomicUsize` defaulting to 512 MiB; dynamically caps bulk string lengths, memcached data payloads, and bitfield offsets.
+- `DETACH_FRAME_MAX` — 64 KiB threshold; frames or arguments at or below this size are copied into dedicated allocations rather than sliced from the read buffer to prevent pinning large socket buffers.
+- `TRUSTED_INPUT` — Thread-local boolean that bypasses bulk length limits during internal operations like AOF replay, rewrite splitting, and replica stream ingestion.
+- `EXPERIMENTAL_COMMANDS` — `AtomicBool` gating non-Redis module prefixes (`JSON.`, `FT.`, `SEMANTIC.`, `LLM.`, `MCP.`, `XDP.`, etc.) unless enabled at startup.
+- `SetCondition` / `ClusterSubcommand` / `ClientSubcommand` — Strongly typed auxiliary enums representing multi-verb options and conditional flags carried inside `Command` variants.
 
-**Notable implementation detail.** `Router`'s own methods were consolidated onto dynamic `self.target_shard`/
-`self.target_shard_and_hash` routing almost everywhere — the prior revision's "static vs. dynamic Router
-routing" finding is now fixed **except for** `Router::del` (`router.rs:1619`), the sole remaining
-static-routing call site; since `del_keys` delegates single-key deletes to `self.del`, a single-key `DEL` can
-target a different shard than a multi-key `DEL` on the same key during live migration.
+**Key algorithms**
+- `parse_command` loops over the read buffer, routing to RESP array parsing, memcached storage sniffing, or inline tokenizing while skipping empty frames without recursion ([§4.1](03_resp_engine.md#41-parse_command-the-entry-point)).
+- `find_newline` scans for `\n` while treating an optional preceding `\r` as part of the terminator, allowing header lines to accept both CRLF and bare LF ([§4.2](03_resp_engine.md#42-line-endings-find_newline--find_newline_at)).
+- `parse_resp_array` runs a non-consuming validation pass (pass 1) over argument headers and CRLF terminators before consuming bytes, ensuring complete frames and split-invariance ([§4.3](03_resp_engine.md#43-parse_resp_array-two-passes-then-fast-path-or-generic-path)).
+- Array fast path intercepts small frames (≤ 16 arguments) by command name length, slicing arguments directly from the frame and bypassing constructor overhead for common shapes like `GET`, `SET`, and `INCR` ([§4.3](03_resp_engine.md#43-parse_resp_array-two-passes-then-fast-path-or-generic-path)).
+- `parse_memcached_storage_command` inspects the first CRLF line for storage verbs (`set`, `add`, `replace`), validates byte size against limits, and returns a tri-state result distinguishing between incomplete data and inline fallthrough ([§4.5](03_resp_engine.md#45-parse_memcached_storage_command)).
+- `build_command` matches uppercased command names across ~350 arms, validating counted argument bounds against hard vector and repetition limits before variant instantiation ([§4.6](03_resp_engine.md#46-build_command-the-constructor)).
+- Classification helpers (`allows_oom`, `is_write_command`) inspect shebang flags for Lua scripts and consult a thread-cached ACL table to categorize write operations ([§4.8](03_resp_engine.md#48-command-classification-on-impl-command)).
 
-**Verified findings.** The disagreement moved, not disappeared: `src/connection.rs`'s `target_shard_of_cmd`/
-`target_shard_and_hash_of_cmd` (used by the squashed-pipeline hot path) are built entirely on the **static**
-free functions, never `Router::slot_owners`; the squash-eligibility gate (`can_squash`) checks `SlotState`/
-cluster-bus ownership but never `slot_owners`, so a slot reassigned via `Router::set_slot_owner` (which clears
-`SlotState`, leaving it `Stable`) can cause a squashed pipeline to execute against a stale shard with **no
-`-MOVED` redirect**. `CompactResp::RawBytes` and the legacy `ShardMessage::Get`/`Set`/`Mget`/`Mset` variants
-are fully implemented but never constructed in production (only in `#[cfg(test)]`). `execute_remote`'s
-`responses_ptr` points at a bare stack local with no `ConnScratch`-style strong-count/`is_idle()` guard — sound
-today but undocumented as an invariant. `check_slot_redirection` remains defined but never called. The prior
-"MGET/MSET invisible to redirection" finding is now fixed (`cmd_primary_key` gained `Mget`/`Mset` arms).
-`Router::del_keys` still allocates one fresh `flume::bounded(1)` per remote shard rather than using the pooled
-scatter-gather path. `FastGetDescriptor`/`FastSetDescriptor` never got the Parker-handshake treatment — they
-still unconditionally `try_send` on every `finish()`.
-
-**Full documentation:** [`docs/internal/04_sharding_mesh.md`](04_sharding_mesh.md)
+**Gotchas & open issues**
+- Framing errors (`Protocol error:`) leave the buffer untouched and require closing the connection, whereas command syntax errors consume the frame and return `-ERR` ([§8](03_resp_engine.md#8-invariants--gotchas)).
+- Memcached storage sniffing precedes inline parsing, causing inline commands matching `set|add|replace <key> <num> <num> <num>` to stall waiting for a payload chunk ([§8](03_resp_engine.md#8-invariants--gotchas)).
+- `VADD` dynamically sniffs `args[2]`; literal member names matching `REDUCE`, `FP32`, or `VALUES` trigger Redis 8 Vector Set parsing rather than Rudis native syntax ([§5](03_resp_engine.md#5-notable-command-grammars)).
+- `AUTH` and `HELLO AUTH` convert passwords via `String::from_utf8_lossy`, which mutates arbitrary binary passwords before reaching ACL checks ([§8](03_resp_engine.md#8-invariants--gotchas)).
+- Fast-path parsing and `build_command` are separate implementations; semantic or option changes made to one must be manually kept in sync with the other ([§8](03_resp_engine.md#8-invariants--gotchas)).
+- `Command::MemcachedGet` and `Command::MemcachedQuit` are never produced by the parser; single-key memcached `get` becomes Redis `Get`, and `quit` maps to Redis `Quit` ([§9](03_resp_engine.md#9-limitations--not-implemented)).
+- RESP3 input syntax (e.g., maps `%`, sets `~`, pushes `>`) is not parsed; only RESP arrays, inline text, and memcached commands are accepted ([§9](03_resp_engine.md#9-limitations--not-implemented)).
 
 ---
 
-## Component 05: Storage Engine & Compact Encodings
+## 04. Sharding Architecture & Cross-Core Mesh
 
-**Source file:** `src/table.rs` (16,925 lines, 349 `pub fn`) — the entire thread-local storage engine:
-`RudisFlatTable` (extendible-hashing directory + `Vec<RawSegment>`), the per-shard façade `RudisTable`, every
-`RudisValue` compact/full encoding, key- and hash-field-level TTL bookkeeping, NVMe-tiering hooks,
-cluster-slot counting, small-collection arena.
+> Full reference: [04_sharding_mesh.md](04_sharding_mesh.md) · Main source: `src/router.rs`, `src/mailbox.rs`, `src/shard.rs`, `src/server.rs`, `src/connection.rs`
 
-**Key data structures.** `RawSegment`: fixed-capacity SwissTable-style segment, `ctrl: Vec<u8>` +
-`slots: Vec<Option<RudisEntry>>`, `capacity` (power of two up to `SEG_CAP = 1024`), `local_depth: u8`, plus a
-4-slot (`STASH_CAP`) DashTable-style overflow stash. `RudisFlatTable`: `segments: Vec<RawSegment>`,
-`directory: Vec<u32>` (len `2^global_depth`), `global_depth: u8`, `slot_counts: Box<[u32; 16384]>`.
-`RudisEntry{key: Bytes, val: RudisValue, expire_at: Option<Instant>}`, verified by unit test at 88 bytes
-(`RudisValue` is 40 bytes). `RudisValue` is an 11-variant enum (`String`, `Int`, `SmallHash`, `Hash`, `List`,
-`Set`, `ZSet`, `HyperLogLog`, `Stream`, `Tiered`, `Cooled`); the four collection variants are boxed to keep the
-type at 40 bytes.
+Rudis partitions the database across threads (default `min(cores, 8)`), pinning each shard to a core running an independent `monoio` event loop and an un-mutexed `ShardDb`. When a client connection lands on a shard that does not own the requested key, this subsystem resolves key ownership, dispatches work orders across a full mesh of lock-free ring buffers, and returns responses via shared-memory descriptors, direct slot writes, or pooled channels without mutex contention.
 
-**Key algorithm / workflow.** Lookup: `mix_hash(fxhash::hash64(key))` → directory index → segment → a
-triangular SIMD probe (`GROUP_SIZE=16`-byte groups via `_mm_cmpeq_epi8`/`_mm_movemask_epi8`, scalar fallback
-on non-x86_64) walks the segment, falling into the 4-slot stash after 2 groups (32 slots) are exhausted.
-Insert: `find_or_prepare_insert` checks `growth_left == 0`; a genuinely new key triggers
-`split_or_grow_segment`, a four-way decision tree: (1) tombstone-dominated (<50% live) → in-place compact; (2)
-sub-`SEG_CAP` and full → double in place; (3) at `SEG_CAP` and full → a real extendible-hashing split into two
-1024-slot segments (directory doubled only if the segment's `local_depth` equals `global_depth`); (4) loop
-repeats if the target segment is still full. Every split/grow touches at most ~1,024-2,048 entries regardless
-of total table size.
+**Key structures**
+- `Router` — Per-shard routing and dispatch state holding shard identifiers, the local `ShardDb`, mesh senders, slot ownership/migration tables, and pre-allocated descriptor pools.
+- `ShardDb` — Core data container owned exclusively by one worker thread, holding the active `RudisTable`, inactive logical databases swapped via `SELECT`, AI state, and tiering references.
+- `SpscQueue<T>` — Lock-free single-producer single-consumer ring buffer with a power-of-two capacity (64 for cross-core, 16 for loopback) and a mutex-protected overflow queue ensuring strict FIFO delivery.
+- `Doorbell` — Lock-light wake-up primitive using an atomic state (`IDLE`, `WAITING`, `RUNG`) and an optional parked `Waker` to eliminate channel overhead when unparking receivers.
+- `ShardSender` / `ShardReceiver` — Endpoints of the inter-shard mesh using cache-padded sleeping flags and memory fences for a Dekker handshake that avoids wake-up loss when posting work.
+- `FastGetDescriptor` / `FastSetDescriptor` — Reusable shared-memory structures for remote single-key reads and writes, signaling completion via an embedded `Doorbell` and pooled up to a cap of 64.
+- `BatchResponder` — Four-state handshake object (`IDLE`, `RUNNING`, `SLEEPING`, `COMPLETED`) allowing remote shards to write `CompactResp` replies directly into the caller's pre-allocated response vector.
+- `CompactResp` — Compact representation of command replies stored inline up to 30 bytes (`Small`) without heap allocation, or referencing a 256 KiB thread-local reply slab for unpacked string data.
 
-**Notable implementation detail — `table.rs`'s hash table was rebuilt twice, and the first rebuild is now dead
-code.** Commit `e244128` ("progressive incremental table rehashing for latency spike elimination") first added
-a real cooperative rehash protocol to the old flat single-array table — an `old_table` field, `rehash_step(n)`
-migrating n buckets per call, `migrate_key_if_in_old` checking the old array on miss — the classic "rehash a
-little on every operation" design. Commit `4713691` ("implement Dragonfly-style extendible hashing directory")
-then **replaced the entire flat-array + `old_table` design** with the segmented directory structure above,
-because a segment split now costs O(1,024) worst-case regardless of table size, eliminating the need for
-incremental spreading. Commit `b3d3362` kept `is_rehashing` (always `false`), `rehash_step` (always
-`false`/no-op), `finish_rehash`, `migrate_key_if_in_old`, and `RudisTable::prepare_key_lookup` as **no-op
-stubs rather than deleting them** — verified by grep to be called nowhere outside `table.rs`: pure vestigial
-API surface from the superseded design, currently unreachable dead code. There is no "incremental rehashing
-feature" today in the sense of a multi-call cooperative protocol — the thing that made it unnecessary is the
-extendible-hashing segment cap.
+**Key algorithms**
+- Key routing and slot mapping ([§3](04_sharding_mesh.md#3-key-routing)) — Keys are partitioned by extracting `{...}` hash tags; cluster mode maps the CRC16 slot to shards via contiguous ranges (`slot * n / 16384`), while standalone mode hashes with FxHash and mixes via splitmix64 before taking modulo `n`.
+- Single-key remote dispatch ([§7.1](04_sharding_mesh.md#71-single-key-operations)) — The router checks key ownership; local keys execute immediately against `ShardDb`, while remote keys acquire a pooled descriptor (`FastGet`/`FastSet`), push an SPSC message, spin up to `cross-shard-spin` times, and park on a `Doorbell` until the owning shard writes the result.
+- Scatter-gather `MGET` and `MSET` ([§7.2](04_sharding_mesh.md#72-single-command-mget--scatter-gather)) — Multi-key operations partition keys by destination shard, execute local sub-batches immediately, and dispatch `ScatterMget`/`ScatterMset` messages across the mesh; an atomic pending counter triggers a wake-up only when the final remote shard completes.
+- Squashed pipeline execution ([§7.6](04_sharding_mesh.md#76-squashed-pipelines-srcconnectionrs)) — Pipelined commands are batched per target shard and folded with sub-slots for multi-key commands; remote shards execute items in FIFO order and write `CompactResp` values directly into the requester's buffer through a `BatchResponder` pointer.
+- Mailbox message draining ([§5.6](04_sharding_mesh.md#56-the-receive-loop-srcserverrs)) — Each shard's cross-shard worker drains incoming rings round-robin up to a burst limit of 64 messages, flushes pending AOF bytes to the kernel, and yields cooperatively before sleeping.
+- Cross-shard transactions and renames ([§7.10](04_sharding_mesh.md#710-cross-shard-transaction-locks)) — Multi-shard `EXEC` and cross-shard key moves acquire advisory per-shard locks in ascending shard order to eliminate deadlocks, releasing them in reverse order upon completion.
+- Broadcast fan-out and barriers ([§7.7](04_sharding_mesh.md#77-broadcast-operations), [§7.9](04_sharding_mesh.md#79-cluster-redirection-and-slot-table-propagation)) — Commands like `FLUSHALL` and cluster slot updates broadcast messages across all rings; slot changes follow with a `SlotBarrier` round trip on every ring to ensure preceding updates take effect.
 
-**Verified findings.** A source comment claims a full segment is "~48KB, L1/L2 cache resident" — the actual
-size is **≈89.4 KiB** (`(1024+4)*88` bytes), off by ~1.9x, a stale comment never updated after `RudisEntry`
-shrank to 88B. `RudisValue::HyperLogLog(Box<[u8;16384]>)` is now **legacy-read-only**: live `PFADD` always
-creates sparse `RudisValue::String` via `hll_create_sparse_empty`; the only live construction site for the
-dense variant is `RESTORE` deserializing a legacy DUMP payload (type tag 5) — see Component 18 for the
-resulting byte-leak bug. `ZRANK`/`ZREVRANK` remain O(n) in both `Small` and `Full` ZSet forms (no
-order-statistics structure), while `ZRANGEBYSCORE` is genuinely O(log n + k) via `BTreeSet::range`. Eviction
-(`try_evict_one_key`) has no real LRU: `allkeys-lru`/`volatile-lru` just take the first sampled occupied slot —
-indistinguishable from `allkeys-random`. `RudisTable::sample_cursor` is now shared by three independent
-samplers (key-TTL expiry, hash-field-TTL expiry, eviction); `spill_cursor` (tiering) remains independent.
-`slot_counts` cluster-slot counting only stays correct while `HAS_ACTIVE_CLUSTER` is true at mutation time.
-
-**Full documentation:** [`docs/internal/05_storage_engine.md`](05_storage_engine.md)
+**Gotchas & open issues**
+- Lifetime of direct batch memory ([§8](04_sharding_mesh.md#8-invariants--gotchas)) — The caller's response buffer backing `BatchResponder` must never resize, move, or drop while remote shards are executing, as remote workers write directly via raw pointers.
+- Strong-count pool validation ([§8](04_sharding_mesh.md#8-invariants--gotchas)) — Descriptors and responders can only be returned to pools or reused when `Arc::strong_count == 1` and all remote references are dropped to prevent late writes from corrupting new requests.
+- Advisory transaction locks ([§7.10](04_sharding_mesh.md#710-cross-shard-transaction-locks), [§9](04_sharding_mesh.md#9-limitations--not-implemented)) — Per-shard transaction locks only serialize multi-shard `EXEC` and key moves against each other; ordinary concurrent single-key commands bypass them entirely.
+- Static vs dynamic routing divergence ([§9](04_sharding_mesh.md#9-limitations--not-implemented)) — Some paths (AOF loading, replica playback, and generic fallback commands) route via static functions, which do not reflect dynamic `slot_owners` assignments outside cluster mode.
+- 64-shard pipeline limitation ([§9](04_sharding_mesh.md#9-limitations--not-implemented)) — The squashed pipeline dispatcher tracks pending shard batches using a single `u64` bitmask, assuming the process does not exceed 64 shards.
+- Standalone key remapping ([§8](04_sharding_mesh.md#8-invariants--gotchas)) — Standalone mode places keys by hashing directly to shard IDs without slots, meaning changing thread count reshuffles the entire keyspace.
 
 ---
 
-## Component 06: Blocking Operations & The Reactive Event Hub
+## 05. Storage Engine & Compact Encodings
 
-**Source files:** `src/block.rs` (765 lines: `BlockHub` waiter registry, pop/notify algorithms — no async
-code, no command parsing) · plus call sites in `src/connection.rs`, `src/server.rs`, `src/router.rs`,
-`src/shard.rs`, `src/replication.rs` (`wait_replicas`, a separate mechanism)
+> Full reference: [05_storage_engine.md](05_storage_engine.md) · Main source: `src/table.rs`, `src/compact.rs`
 
-**Key data structures.** `BlockHub{list_waiters, zset_waiters: HashMap<Bytes, VecDeque<_>> (FIFO per key),
-stream_waiters: HashMap<Bytes, Vec<StreamWaiter>> (not FIFO), blocked_clients, blocked_zset_clients,
-paused_count, pending_notifies}`. `PORT_BLOCK_HUBS: LazyLock<Mutex<HashMap<u16, Arc<Mutex<BlockHub>>>>>` —
-exactly one `BlockHub` per listening port, not per shard, shared by all shard threads. `WaiterOp::Movem` (new,
-backs `BLMOVEM`); `ZSetWaiter.is_zmpop`/`.count` generalize the old single-element waiter to also cover
-`BZMPOP`.
+Each shard owns an in-memory, thread-local hash table with no locks that holds that shard's slice of the keyspace, one table per logical database. In the request path, the connection (or, for remote keys, the owning shard's mailbox worker) invokes `RudisTable` methods (`get_with_hash`, `set_extended_with_hash`, collection mutations, etc.) directly. Beyond request execution, persistence (RDB/AOF), replication logging, NVMe cold storage tiering, active expiry, and cluster slot migration interact directly with `RudisTable` and its underlying extendible-hashing directory and compact byte-packed data representations.
 
-**Key algorithm / workflow.** Blocking commands always check-then-register: try local/remote non-blocking pop
-first, only register a waiter if truly empty, avoiding a lost-push race. `notify_list`/`notify_zset` run
-entirely under the hub's `Mutex` lock using the caller's local `RudisTable`, popping on the waiter's behalf
-after the triggering write already landed. Cross-shard wakeup works because there is only **one**
-process-wide hub per port: registration and notification both lock the same `Arc<Mutex<BlockHub>>` regardless
-of which shard thread calls. `MULTI`/`EXEC` pauses the hub (writes call `add_pending_notify` instead of
-notifying immediately), then `resume()` dispatches each pending key either locally or via
-`ShardMessage::NotifyList` to the owning shard.
+**Key structures**
+- `RudisTable` — Per-shard storage engine holding the database's `RudisFlatTable`, active sampling cursors (`sample_cursor`, `spill_cursor`), memory counters (`data_bytes`, `num_expires`), per-hash-field TTL deadlines (`hash_field_expires`), recycled container pools (`SmallCollectionArena`), and dropped NVMe tier extents (`dropped_tier`).
+- `RudisFlatTable` — Extendible hash table over directory-addressed `RawSegment` instances; uses a power-of-two directory vector of segment IDs (`directory`, length 2^global_depth), incremental heap/structure size accumulators, and an optional 64 KiB cluster slot key counter (`slot_counts`).
+- `RawSegment` — Open-addressing SwissTable-like segment containing a 16-byte-mirrored control array (`ctrl`), a 1028-entry slot-to-arena mapping (`slot_idx`, 2 bytes each, marking unoccupied slots as `NO_ENTRY` = `u16::MAX`), a 4-slot overflow stash, an access tracking vector (`last_access`, 2 bytes each), and a dense entry arena (`entries`) holding up to 1024 main entries plus 4 stash entries.
+- `RudisEntry` — Exactly 40-byte storage unit consisting of a 24-byte `CompactKey` and a 16-byte `RudisValue`; whole-key expiration deadlines live packed directly inside the key enum rather than in a separate entry field.
+- `CompactKey` — 24-byte enum storing inline keys up to 23 bytes without TTL (`Inline` / `Inline23`), inline keys up to 18 bytes with a 40-bit millisecond-packed deadline (`InlineTtl` / `InlineTtl18`), or boxed byte slices with nanosecond `Expiry` timestamps (`Heap` / `HeapTtl`).
+- `RudisValue` — 16-byte enum holding inline integers (`Int`), inline/heap-packed/shared strings (`String(CompactStr)`), 8-byte pointer small hashes (`SmallHash`), or boxed representations for large hashes (`PackedHash`), lists (`PackedList`), sets (`RudisSet`), sorted sets (`RudisZSet`), streams (`RudisStream`), legacy HyperLogLogs, and NVMe tiered pointers (`Tiered` / `Cooled`).
+- `CompactStr` — 16-byte value string supporting 0–15 byte inline strings, 7-bit ASCII packing for 16–17 bytes (and 25–255 byte heap allocations), 6-bit packing for 18–20 byte strings in a 64-character alphabet, 5-bit packing for 21–24 byte strings in a 32-character alphabet, raw heap allocations, and refcounted zero-copy `Shared(Box<Bytes>)` for strings >= 256 bytes (`SHARE_MIN`) after first read.
+- `PageStore<H>` — Shared packed-entry heap for `PackedHash`, `PackedSet`, and `ZIndex` (`RudisZSet`); manages entries packed into 4096-byte pages (`PAGE_BYTES`) with dead-entry bit tracking, handle-widening (`u32` to `u64`), and half-dead page compaction.
 
-**Notable implementation detail.** `WAIT`/`WAITAOF` are **not** part of `BlockHub` at all — `wait_replicas`
-(`replication.rs:687-712`) is a pure poll loop, re-checking replica ACK offsets every 5ms via
-`monoio::time::sleep`, with no waiter registration or `flume` channel. `XREADGROUP ... CLAIM` is the one
-blocking command that is not purely event-driven: it re-registers its stream waiter every iteration, layered
-on top of the push-based `notify_stream` wakeup.
+**Key algorithms**
+- Key lookup and probing: Hashes a key using `fxhash::hash64` and avalanches it with `mix_hash`; bits 10 and up index the directory to locate a `RawSegment`, where SIMD-style 16-byte group comparisons probe 7-bit fingerprints, prefetch `slot_idx` into the dense arena, verify keys via `fast_slice_eq`, step triangularly across groups, and fall back to the 4-slot stash after two group misses.
+- Extendible segment splitting and growth: When inserting into a segment with `growth_left == 0`, the table purges tombstones if live entries are under half capacity, doubles capacity in place up to 1024 slots, or splits a full 1024-slot segment by doubling the directory if local depth equals global depth and redistributing entries between two segments based on bit `10 + local_depth`.
+- Background directory shrinking and buddy merging: The shard cron periodically scans for buddy segment pairs at the same local depth whose combined items do not exceed `MERGE_MAX_ITEMS` (256), merges them into the higher segment ID while placing a `HOLE_DEPTH` placeholder at the lower ID to preserve `SCAN` cursor correctness, and halves the directory once full depth is no longer required.
+- Active and passive key expiry: Read and write paths lazily check `num_expires > 0` before checking deadlines and removing expired keys via `expire_slot` (which notifies tracking, emits keyspace events, logs `DEL` replication commands, and queues NVMe extents to `dropped_tier`), while a 100 ms shard cron cycle scans up to 512 positional slots from `sample_cursor` to eagerly reap up to 20 expired whole-key TTLs and 8 hash keys with expired fields.
+- Sampling-based memory eviction: When shard memory exceeds its share of `maxmemory`, `try_evict_one_key_with` scans positional slots starting from `sample_cursor`, samples up to 10 eligible candidates (evaluating nearest deadline for TTL policies, idle time wrapped to 16 bits for LRU, or decayed logarithmic counter for LFU), and evicts the highest-ranked entry while updating `data_bytes` and replication logs.
+- Collection threshold promotion and page compaction: Collections start in compact forms (`SmallHash`, or small `Vec` for sets and sorted sets) and permanently promote to page-backed representations (`PackedHash`, `PackedSet`, `ZIndex`) when element counts or sizes exceed thresholds (e.g., 512 entries or 64 bytes for hashes, 64 entries for sets); when individual 4 KiB `PageStore` pages become at least 50% dead, live handles are re-indexed and packed entries are slid down in place.
+- HyperLogLog register updates: `PFADD` operates directly on Redis-compatible 16-byte `HYLL` blobs stored in `RudisValue::String`, decoding all 16,384 6-bit registers, computing MurmurHash64A candidate register values, and re-encoding to sparse run-length format if registers remain <= 32 and payload fits in 3,000 bytes (`HLL_SPARSE_MAX_BYTES`), otherwise falling back to dense 12,304-byte representation and invalidating cached cardinality.
 
-**Verified findings.** `notify_stream` (`block.rs:601`) calls `std::thread::sleep(1ms)` **synchronously**
-between each of N woken waiters to stagger a thundering herd — since Rudis is a thread-per-core async reactor,
-this genuinely **blocks the entire owning shard's OS thread for up to `(N-1)`ms on a hot stream**, violating
-the non-blocking-reactor invariant used everywhere else; flagged in the per-subsystem doc as "the single most
-actionable finding in this file." `has_blocked_waiters`'s `port` parameter is unused —
-`TOTAL_BLOCKED_WAITERS` is one process-wide `AtomicUsize` despite `PORT_BLOCK_HUBS` being keyed by port, and
-`sync_atomic_waiters_count` does an unconditional absolute `store` — harmless with one port per process but a
-real missed-wakeup hazard with multiple `BlockHub`s in one process. `BLMOVE`/`BLMOVEM` satisfy only one waiter
-per push event (unlike `BLPOP`/`BLMPOP`/`BZPOPMIN`/`BZMPOP`, which drain while data is available). `CLIENT
-UNBLOCK` does not actually work for `XREAD`/`XREADGROUP BLOCK` — the stream channel's zero-payload `Sender<()>`
-can't distinguish real data from a forced unblock, so the client just spuriously re-polls. `CLIENT KILL` is a
-complete no-op (`+OK` only). The `ZADD` fast-path block-hub-skip bug was already fixed in commit `3607df7`.
-
-**Full documentation:** [`docs/internal/06_blocking_hub.md`](06_blocking_hub.md)
+**Gotchas & open issues**
+- Key lookups require raw hashes: Probing methods in `RudisFlatTable` require the raw key hash and execute `mix_hash` internally; callers must never pass a pre-mixed hash, or directory and segment slot selection will degrade.
+- Short-lived global index validity: Positional indexes (`seg_id << 11 | slot`) are immediately invalidated by any insert that causes segment splits or rebuilds, as well as by `shrink_step`, `defrag`, or `clear`; callers must re-find entries rather than cache indexes across operations.
+- Expiry suppression during pause and replication: Key expiration is suspended during `CLIENT PAUSE`, write replay (AOF loading and replication stream application), and on read-only replicas; read paths hide expired keys, but actual entry reclamation and AOF `DEL` generation are deferred until master commands arrive.
+- Eviction sampling anomalies: TTL eviction policies (`volatile-ttl`, `allkeys-ttl`) do not increment the candidate counter during sampling, causing them to scan up to the entire positional cursor bound (`cursor_bound()`) on every eviction; additionally, random eviction policies select the 10th eligible slot sequentially from the shared cursor rather than picking true random keys.
+- Irreversible collection promotion and partial cron maintenance: Collections promoted to `PackedHash`, `PackedSet`, or `ZIndex` never demote back to small vector or inline formats even if all elements are deleted; furthermore, periodic `shrink_step` and `trim_arena_step` maintenance only runs on the active selected database, leaving other databases uncompacted unless explicitly targeted by `active_defrag` or `FLUSHDB`.
+- 16-bit LRU clock wrap: The access tracking clock records coarse monotonic time truncated to 16 bits in seconds, which wraps after ~18.2 hours of idleness and can cause extremely stale keys to be treated as newly accessed during LRU eviction.
 
 ---
 
-## Component 07: NVMe SSD Tiered Storage Engine
+## 06. Blocking Operations & the Reactive Event Hub
 
-**Source files:** `src/tiering.rs` (1,082 lines) — integration in `src/router.rs`, `src/table.rs`,
-`src/shard.rs`/`src/server.rs`, `src/connection.rs`, `src/aof.rs`
+> Full reference: [06_blocking_hub.md](06_blocking_hub.md) · Main source: `src/block.rs`, `src/connection.rs`, `src/shard.rs`
 
-**Key data structures.** `TieredPointer{file_id: u32 (== shard_id), offset: u64, length: u32, value_type: u8}`
-(17 logical bytes, 24 bytes in RAM after alignment padding); `ShardTierManager{file, current_offset:
-Cell<u64>, preallocated_len: Cell<u64>, stats: Arc<TieringStats>, op_manager: Rc<OpManager>, small_bins:
-RefCell<SmallBinsManager>, is_direct_io, free_pages: RefCell<Vec<u64>>, free_extents:
-RefCell<Vec<(u64,u64)>>}` — the last two fields are new; `TieringStats` has 21 `AtomicU64` fields including
-`offload_threshold_pct` (default 60, live) and `upload_threshold_pct` (default 80, still reported but never
-consumed).
+The blocking hub coordinates Redis commands that suspend execution until data becomes available (`BLPOP`, `BRPOP`, `BLMPOP`, `BLMOVE`, `BLMOVEM`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `XREAD [BLOCK]`, and `XREADGROUP [BLOCK]`). When a fast non-blocking lookup returns empty, the connection registers a waiter in a per-port registry and waits on a bounded flume channel; write operations (`LPUSH`, `ZADD`, `XADD`, etc.) notify the hub, which immediately serves matching waiters on the key owner's thread under the hub lock, writes and replicates the resulting mutations, and delivers results through the channel.
 
-**Key algorithm/workflow.** `stash_record` packs records < `SMALL_VALUE_LIMIT` (2048 bytes) into a shared 4KB
-`ActiveBin`, else writes a standalone page-aligned extent. Checksum is now `xxh3_64` (SIMD), replacing the old
-bit-by-bit CRC64. `allocate_page`/`allocate_extent` now check `free_pages`/`free_extents` **first** before
-growing `current_offset`. `check_auto_tier` spills Hot keys in 64-key slices down to a 5%-headroom target
-(changed from a single 256-key shot to exactly `shard_max_mem`).
+**Key structures**
+- `BlockHub` — Per-port registry protected by a `parking_lot::Mutex`, mapping `(usize, Bytes)` (db index, key) to list, zset, and stream waiter queues, plus reverse maps of blocked client IDs to `flume::Sender` channels.
+- `TOTAL_BLOCKED_WAITERS` — Global `AtomicUsize` tracking the sum of active waiters, paused counts, and blocked clients across all hubs; provides a lock-free fast exit for write fast paths.
+- `WaiterOp` — Enum defining whether a list waiter performs a `Pop` (`BLPOP`/`BRPOP`/`BLMPOP`), a single `Move` (`BLMOVE`/`BRPOPLPUSH`), or a multi-element `Movem` (`BLMOVEM`).
+- `ListWaiter` / `ZSetWaiter` — Waiter records containing `client_id`, target `key`, operation parameters, and `flume::Sender` channels (`bounded(1)`) for sending popped elements or unblock errors.
+- `StreamWaiter` — Waiter record storing `client_id`, target `key`, a rewritten non-blocking `Command` with concrete stream IDs, client RESP3 mode, and the reply sender.
+- `BlockedListResult` / `BlockedStreamResult` — Typed payloads delivered over waiter channels: popped values, unblock reasons (`Timeout`, `Error`, `WrongType`), or stream query responses (`Data`, `Error`, `CrossShard`).
+- `BlockedClientGuard` — RAII guard created at connection registration that unregisters all waiters for a client ID upon drop (handling timeouts, cancellations, errors, and disconnects).
 
-**Notable implementation detail — the free-space-reuse bug is FIXED.** Commit `8d899a1` added
-`free_pages`/`free_extents` free lists, populated by `on_key_deleted` and a new `on_key_overwritten` hook
-(threaded through `set_extended_with_hash` and both squashed-pipeline SET fast paths), and consumed by
-`allocate_page`/`allocate_extent` — the previously-documented unbounded logical-file-growth bug is resolved
-and covered by `test_free_extent_and_page_reuse`. Residual: `free_extents` is first-fit, not best-fit, so
-fragmentation is bounded but not eliminated. Free lists are **not persisted** across restart or `TIER
-SNAPSHOT` — they always start empty.
+**Key algorithms**
+- **Serve list and sorted-set waiters** ([§5](06_blocking_hub.md#5-algorithms)): On write, the owner shard walks the key's FIFO queue under the hub lock, popping elements directly from the shard table, appending the non-blocking pop to the shard AOF/replica stream, and sending results via flume until the key is exhausted.
+- **Serve stream waiters** ([§5.3](06_blocking_hub.md#53-notify_streamdb-key--serve-stream-waiters)): Visits all waiters on the modified stream key concurrently, re-executing each stored `XREAD`/`XREADGROUP` against the shard database using the client's RESP protocol and propagating group state updates.
+- **Command life cycle & post-registration recheck** ([§5.5](06_blocking_hub.md#55-the-blocking-side-a-commands-life-cycle)): Handlers execute a non-blocking attempt first; if empty, they register waiters on the hub and immediately execute `recheck_blocking_keys` (locally or via `ShardMessage::NotifyList`) to eliminate lost wakeups from writes racing between lookup and registration.
+- **Cross-shard moves**: In standalone mode, cross-shard `BLMOVE` registers a pop with suppressed replication on the source shard, moves popped elements across shards at the connection layer, and replicates the logical `LMOVE`; cross-shard `BLMOVEM` returns `-CROSSSLOT`.
+- **Wait loop and disconnect detection** ([§5.6](06_blocking_hub.md#56-waiting-timeouts-and-disconnect-detection)): Connections await channel notifications in 20 ms slices; on each timeout tick, the thread performs a non-blocking `libc::poll` on the socket file descriptor to cleanly abort and unregister if the client disconnected.
+- **Transaction deferral (MULTI/EXEC)** ([§6](06_blocking_hub.md#6-multiexec-deferred-notification)): `EXEC` calls `hub.pause()` before running queued commands, causing write hooks to buffer modified keys in `pending_notifies`; an `ExecCleanup` guard invokes `resume()` to notify owner shards of all buffered keys in batch.
+- **Unblocking without data** ([§7](06_blocking_hub.md#7-releasing-waiters-without-data)): Clients are released via deadline expiry, `CLIENT UNBLOCK`, socket disconnects, non-list move destinations (`WRONGTYPE`), or role change to replica (`unblock_writers` sends error to write-capable waiters).
 
-**Verified findings.** `upload_threshold_pct` remains fully configured/reported but never read anywhere —
-dead config, unchanged from prior pass. **Critical, confirmed in two independently hand-duplicated copies:**
-cluster slot migration (`MIGRATE` command handler, `connection.rs:10908-10909`, and `migrate_keys_to_node`
-used by `CLUSTER SETSLOT`/`REBALANCE`/`RESHARD`, `connection.rs:3711`) both have an empty match arm for
-`RudisValue::Tiered`/`Cooled`, serializing nothing — but `Cooled` is actually safe (`get_entry` unwraps it to
-its RAM copy), so only pure `Tiered` (fully disk-resident) keys are affected. `Router::dump_key` calls
-`ensure_loaded`, which silently returns `false` without loading when `is_memory_constrained()` is true. Both
-migration paths then **unconditionally delete** the source key regardless of whether anything was written to
-the destination — **silent data loss for fully-tiered keys migrated while the source shard is under memory
-pressure** (also flagged independently in Component 11's own doc). New: RDB snapshot (`ShardDb::
-save_rdb_chunk`) silently omits a `Tiered` entry entirely (no key or value bytes) if `read_ptr_sync` fails,
-potentially leaving an orphaned expire-opcode in the RDB stream. New: `O_DIRECT` mode page-aligns offsets/
-lengths but never uses aligned buffer allocation (no `posix_memalign`) — correctness depends entirely on
-`monoio`'s internal buffer handling.
-
-**Full documentation:** [`docs/internal/07_nvme_tiering.md`](07_nvme_tiering.md)
+**Gotchas & open issues**
+- **Owner thread execution invariant**: Notifications must run on the thread that owns the key's shard so table access and AOF/replica logging remain local; non-owner threads must forward via `ShardMessage::NotifyList`.
+- **List waiter duplicate-key starvation/deadlock**: Because `notify_list` lacks client deduplication within a single call, listing the same key multiple times (e.g. `BLPOP q q 0`) followed by a multi-element push can cause `send` to block on a full `bounded(1)` channel.
+- **Single-move notification limit**: `notify_list` serves at most one `Move`/`Movem` waiter per write notification, requiring subsequent writes or rechecks to unblock remaining chained move waiters.
+- **Global `has_blocked_waiters` check**: The `TOTAL_BLOCKED_WAITERS` atomic check ignores the `port` argument, forcing writes on unblocked server instances in the same process to take slower lock paths if any waiter exists on another port.
+- **`CLAIM` slice polling latency**: `XREADGROUP ... CLAIM min-idle` polls pending entry eligibility in 1–50 ms slices rather than reactive event notification, introducing up to ~50 ms latency before claiming idle entries.
+- **Bypass of `BlockHub` for `WAIT`/`WAITAOF`**: Replication wait commands do not use `BlockHub`; `wait_acks` polls replica acknowledgements (timeout `0` waits forever, as in Redis), and `WAITAOF` counts only AOF-fsynced copies.
+- **Expired keys and WATCH invalidation**: `notify_list` and `notify_zset` touch watched keys via `touch_watched_key` to break active `WATCH` transactions before serving, but immediately abort without serving if the target key is logically expired.
 
 ---
 
-## Component 08: Vector Search Engine: HNSW, Redis 8 Vector Sets & NVMe Tiering
+## 07. NVMe SSD Tiered Storage Engine
 
-**Source files:** `src/vector.rs` (3,305 lines, grown from ~1,378)
+> Full reference: [07_nvme_tiering.md](07_nvme_tiering.md) · Main source: `src/tiering.rs`, `src/router.rs`
 
-**Key data structures.** `HnswIndex{name, dim, metric, m=16, m0=32, ef_construction=64, ef_search=32, ml,
-entry_point, max_layer, nodes: Vec<Option<HnswNode>>, free_ids, key_to_id, pq_quantizer:
-Option<ProductQuantizer>, pq_trained, quant: VQuant, attributes: HashMap<Bytes,String>, projection:
-Option<Vec<f32>>, is_redis_vset: bool, tier_path: Option<PathBuf>, rng_state}`; `HnswNode{vector: Vec<f32>
-(empty if tiered), quantized: Option<QuantizedVector>, binary: Option<Vec<u64>>, pq: Option<PQVector>,
-neighbors: Vec<Vec<usize>>}`; `FlatIndex` (exact brute-force, structure-of-arrays); `VectorFieldIndex::
-{Flat,Hnsw}` (used identically by Redis 8 Vector Sets, RediSearch VECTOR fields, `SemanticCache`, and
-agent-memory recall — four independent owners of the same two types); `SemanticCache{namespace, index:
-HnswIndex (always Cosine), entries, hits, misses, tokens_saved}` — genuinely defined in `vector.rs`, **no
-separate `semcache.rs` file exists**. There is also **no `RudisValue::VectorSet` enum variant and no
-`VectorSetValue` wrapper struct** — Redis 8 Vector Sets are just `HnswIndex` instances in
-`ShardDb.vector_indexes`, distinguished by the `is_redis_vset: bool` flag.
+Rudis spills cold key value payloads to per-shard NVMe files when allocator memory exceeds `maxmemory` under `maxmemory-policy noeviction`, leaving compact 16-byte pointer variants in the shard table. Sitting between client command routing and the in-memory data store, commands transparently hydrate tiered values via synchronous preads before execution, while single `GET` commands either stream cold strings asynchronously or promote keys back to memory depending on node-wide memory pressure.
 
-**Key algorithm/workflow — corrects an earlier "brute-force KNN" characterization.** Vector KNN search is now
-**genuine HNSW**: real graph construction (`add_quantized_ext`, Malkov & Yashunin Algorithm-4 diversity-aware
-neighbor selection with `keepPrunedConnections=true`), real bounded best-first `search_layer`/
-`search_layer_filtered` beam search, and real delete-time graph repair with former-neighbor reconnection plus
-node-slot reuse via `free_ids`. SIMD distance kernels (`dot_product`/`l2_distance_sq`/`cosine_distance`)
-three-tier dispatch AVX-512 → AVX2+FMA → portable scalar (no NEON path). Three independent compression tiers
-exist: SQ8 (75% reduction, asymmetric ADC via precomputed sums), 1-bit binary/Hamming (96.9% reduction, zero
-training), and Product Quantization (now a real k-means++ seeded + Lloyd's-iteration trainer, replacing the
-old deterministic-basis-only codebook).
+**Key structures**
+- `RudisValue::Tiered` / `RudisValue::Cooled` — Heap-boxed 16-byte enum variants holding disk-only pointers or write-through cached values, charged a flat 24 bytes (plus payload for `Cooled`) in memory accounting.
+- `TieredPointer` — 17-byte record pointer (`file_id: u32`, `offset: u64`, `length: u32`, `value_type: u8`) referencing an on-disk record prefixed by `b"TIER"` with a 21-byte header and xxHash64 checksum.
+- `ShardTierManager` — Per-shard single-threaded manager controlling the shard's local file (`tier_shard_<id>.db`), file allocation cursor in 64 MiB increments via `fallocate`, small-bin packing, and extent reuse.
+- `SmallBinsManager` — Packs small records (<2,048 bytes) into 4 KiB pages (`ActiveBin`), tracking per-page active record counts and buffering unwritten pages in `flushing` memory until io_uring writes land.
+- `OpManager` — Handles per-shard I/O concurrency, coalescing concurrent reads to identical 4 KiB pages via `flume` channels and applying backpressure (returning `WouldBlock`) when in-flight writes exceed 16 MiB.
+- `TieringStats` — Server-wide atomic statistics and memory tracking block keyed by base port, aggregating allocator usage (`real_used_total`), offload/upload thresholds (default 60% and 80%), and 18 operational counters.
+- `dropped_tier` — Per-table queue of `(TieredPointer, bool)` entries tracking disk extents freed by overwrites, deletions, expiration, or eviction until `drain_dropped_tier` reclaims them.
 
-**Notable implementation detail.** `HnswIndex::new` seeds its private xorshift64 PRNG with the fixed constant
-`0x853c49e6748fea9b` every time — deterministic across restarts, not OS entropy. NVMe `.vtier` disk spilling
-for the HNSW graph itself is a separate, ad-hoc append-only file sharing nothing with `ShardTierManager`
-(Component 07) — spilled bytes are never reclaimed on delete/reinsert.
+**Key algorithms**
+- **Disk allocation & SmallBins** — Records below 2,048 bytes pack into 4 KiB pages flushed when full, while larger records allocate first-fit extents from `free_extents` or grow the file in 64 MiB steps via `fallocate` ([§4.2](07_nvme_tiering.md#42-allocating-disk-space), [§4.3](07_nvme_tiering.md#43-stashing-a-value-stash_record)).
+- **Automatic tiering loop** — Triggered after writes, via a 20 ms cron, or at the OOM gate, auto-tiering first decommits `Cooled` values without I/O, then round-robin scans hot table entries (skipping values <64 bytes) to spill up to 1,024 victim keys until reaching 5% headroom ([§4.10](07_nvme_tiering.md#410-automatic-tiering-under-maxmemory)).
+- **Async & coalesced reading** — Small-bin reads check unwritten memory buffers (`active_bin` or `flushing`) first, falling back to coalescing concurrent 4 KiB page reads through `OpManager`, while large records issue direct async reads ([§4.4](07_nvme_tiering.md#44-reading-a-record-back)).
+- **GET path & cold streaming** — When reading a `Tiered` key, if node memory is constrained (at or above `offload_threshold_pct`, default 60%), string values are streamed directly to the client leaving the key cold; otherwise, the value is promoted to `Cooled` in RAM ([§4.6](07_nvme_tiering.md#46-the-get-path)).
+- **Command hydration** — Non-GET commands invoke `hydrate_cmd_keys` before execution, synchronously reading the record via blocking `pread` on the shard thread, deserializing the payload into a hot value, and queuing the stale disk pointer in `dropped_tier` ([§4.7](07_nvme_tiering.md#47-hydration-making-tiered-keys-answer-every-command-sharddb-srcshardrs)).
+- **Space reclamation & GC** — Overwritten or deleted keys enqueue pointers to `dropped_tier`; large extents punch filesystem holes (`FALLOC_FL_PUNCH_HOLE`) immediately, while 4 KiB small-bin pages are punched and returned to `free_pages` by a 2-second background GC loop once their live record count reaches zero ([§4.8](07_nvme_tiering.md#48-freeing-disk-space-when-a-key-goes-away), [§4.9](07_nvme_tiering.md#49-garbage-collection-run_gc)).
+- **Reflink snapshots** — `TIER SNAPSHOT` flushes active small-bins, calls `sync_all`, and creates copy-on-write file snapshots via `ioctl(FICLONE)` (falling back to `copy_file_range`) alongside a manifest metadata file ([§4.12](07_nvme_tiering.md#412-snapshots-tier-snapshot-dir)).
 
-**Verified findings.** `enable_pq(m)` does not retroactively PQ-encode existing vectors — only elements
-inserted after with `quantize_pq=true` get real codes. **`vsim_ext`'s rerank heuristic is inverted**: `rerank
-= (quant == NoQuant)`, meaning quantized (`Q8`/`Bin`) Redis-8 Vector Sets — the ones that actually need an
-exact-distance rerank pass — never get it, while already-exact `NoQuant` sets rerank pointlessly. `VSIM`/
-`VLINKS` similarity-score formula (`(1 - dist/2).clamp(0,1)`) assumes a Cosine `[0,2]` distance range
-regardless of the index's actual metric — meaningless/clamped output for `L2`/`IP` indexes. PQ silently drops
-trailing dimensions when `dim % m != 0`. PQ's `compute_distance_with_vec` rebuilds the full `m×256` ADC table
-from scratch on every single candidate (no shared per-query table). `VSIM ... FILTER` string literals don't
-decode escape sequences (`\n` becomes literal `n`). `HnswIndex` still lives entirely inside one shard with no
-cross-shard `ShardMessage` support.
-
-**Full documentation:** [`docs/internal/08_vector_engine.md`](08_vector_engine.md)
+**Gotchas & open issues**
+- **Synchronous hydration under memory pressure** — Non-GET operations and RDB/AOF saves block the shard thread with synchronous `pread` calls to bring tiered values into RAM regardless of memory limits ([§4.7](07_nvme_tiering.md#47-hydration-making-tiered-keys-answer-every-command-sharddb-srcshardrs), [§6](07_nvme_tiering.md#6-invariants--gotchas)).
+- **RENAME over tiered destination double-free** — Renaming onto an existing tiered or cooled destination queues the old destination pointer in `dropped_tier` while also invoking `on_key_overwritten`, risking a double-free on the next queue drain ([§6](07_nvme_tiering.md#6-invariants--gotchas)).
+- **Pipelined GET on tiered keys returning WRONGTYPE** — Batch and squashed-pipeline GET handlers check `RudisTable::get_compact_with_hash`, which returns `WRONGTYPE` for `Tiered` enum variants instead of `Ok(None)`, causing pipelined cold reads to fail ([§7](07_nvme_tiering.md#7-limitations--not-implemented)).
+- **Round-robin victim selection** — Auto-tiering selects spill victims via a round-robin table cursor with no LRU/LFU frequency tracking, risking eviction of hot keys ([§4.10](07_nvme_tiering.md#410-automatic-tiering-under-maxmemory), [§7](07_nvme_tiering.md#7-limitations--not-implemented)).
+- **Volatile disk lifecycle** — Tier files are truncated on startup and `FLUSHALL` (`flock` protected), and snapshots are write-only with no recovery mechanism; persistence relies entirely on RDB/AOF storing hydrated values ([§4.1](07_nvme_tiering.md#41-opening-the-tier-file-shardtiermanageropen), [§6](07_nvme_tiering.md#6-invariants--gotchas)).
+- **Unused upload threshold** — The configuration setting `tiered-upload-threshold` (default 80%) is parsed, stored, and reported in `TIER INFO`, but is not referenced by any execution logic ([§5.2](07_nvme_tiering.md#52-configuration), [§7](07_nvme_tiering.md#7-limitations--not-implemented)).
+- **Direct I/O misalignment** — `RUDIS_DIRECT_IO` falls back silently on error, but memory buffers lack 4 KiB address alignment and large reads request unaligned lengths, causing direct I/O to fail with `EINVAL` on strict filesystems ([§7](07_nvme_tiering.md#7-limitations--not-implemented)).
 
 ---
 
-## Component 09: RediSearch Full-Text Engine & Hybrid Vector Fusion
+## 08. Vector Search Engine — HNSW, Quantization, Vector Sets, Tiering & Semantic Cache
 
-**Source files:** `src/search.rs` (4,117 lines, grown from ~2,488)
+> Full reference: [08_vector_engine.md](08_vector_engine.md) · Main source: `src/vector.rs`, `src/shard.rs`
 
-**Key data structures.** `pub type DocId = u32`; `InvertedIndex{schema, inverted: HashMap<String,
-Vec<Posting>>, numeric_trees: HashMap<String,RangeTree>, key_to_id, id_to_meta, vector_indices:
-HashMap<String, VectorFieldIndex>, next_doc_id, free_ids, total_docs, total_terms, indexing_failures}`;
-`Posting{doc_id,term_freq}` (8 bytes); `DocMeta{key, doc_len (whole-document), fields, numeric_fields,
-tag_fields, vector_fields: HashMap<String,Vec<f32>>, multi_vector_fields: HashMap<String,Vec<Vec<f32>>>,
-terms}`; `RangeTree{entries: BTreeMap<OrderedF64,Vec<DocId>>}` (genuine O(log N + K) range queries).
+Stores float embeddings and performs exact or approximate k-nearest-neighbour search across Redis 8 Vector Sets (`VADD`/`VSIM`), RediSearch `VECTOR` fields, LLM semantic caches (`SEMANTIC.*`), and agent episodic memory. Shard worker threads execute vector commands directly within their single-threaded `ShardDb` state, routing distance calculations to SIMD kernels (AVX-512, AVX2+FMA, or portable) and traversing in-memory graphs or scanning contiguous arrays.
 
-**Key algorithm/workflow — reverses a prior finding.** `InvertedIndex.vector_indices: HashMap<String,
-VectorFieldIndex>` now holds **real** `FlatIndex`/`HnswIndex` instances built by `build_vector_index`, and
-`knn_search` genuinely traverses the HNSW graph via `HnswIndex::search_filtered` — this corrects the earlier
-characterization of vector fields as a brute-force linear scan over `DocMeta.vector_fields`. A
-RediSearch-accurate "ADHOC_BF" heuristic (`KNN_ADHOC_BF_RATIO = 0.1`) falls back to brute force only when the
-pre-filter candidate set is small or the index is `FLAT`. Each index still exists in **two independent
-copies**: a per-shard partition (`ShardDb.search_indices`, what real `FT.SEARCH`/`FT.AGGREGATE`
-scatter-gather against) and a process-wide mirror (`static SEARCH_INDICES`) read only by `FT.INFO`/`FT._LIST`
-and as a defensive fallback — confirming the prior finding unchanged. Hybrid RRF/Linear fusion runs at two
-layers: within a shard's `execute_search`, and again, more coarsely, in `Router::ft_search`, which issues
-**two full independent cross-shard scatters** (BM25-only AST, then KNN-only AST) and fuses the merged results
-client-side — roughly double the cross-shard messages of a plain query.
+**Key structures**
+- `HnswIndex` — Hierarchical Navigable Small World graph for ANN search; stores `nodes: Vec<Option<HnswNode>>`, adjacency lists up to layer 16, LIFO `free_ids`, and optional random projection matrix capped at 16M floats (`MAX_PROJECTION_ENTRIES`).
+- `HnswNode` — Individual graph element holding a key `Bytes`, full-precision `Vec<f32>` (emptied if tiered), optional SQ8 `QuantizedVector`, 1-bit `binary` signs, `pq` codes, and per-layer neighbor lists.
+- `FlatIndex` — Structure-of-arrays exact vector store for RediSearch `FLAT` fields; stores contiguous `f32` vectors up to `MAX_VECTOR_DIM` (65,536) with swap-remove deletion.
+- `VectorFieldIndex` — Two-arm enum (`Flat` or `Hnsw`) wrapping vector indices for RediSearch fields, abstracting KNN search, range queries, and memory reporting.
+- `QuantizedVector` — 8-bit scalar quantization (SQ8) storing `min_val`, `scale`, `data: Vec<u8>`, and precalculated sum terms, enabling asymmetric distances without dequantization (the full `f32` vector is still kept in RAM unless the set is `TIERED`).
+- `ProductQuantizer` — Subspace quantizer splitting vectors into `m` sub-vectors mapped to 256 centroids, trained via deterministic furthest-first k-means and evaluated using asymmetric distance computation (ADC) tables.
+- `SemanticCache` — Cosine-based `HnswIndex` and metadata map per namespace; caches LLM prompt/response pairs with TTLs, tracks token savings, and purges expired entries lazily on access.
 
-**Notable implementation detail.** `bm25_score` is textbook Okapi BM25 (k1=1.2, b=0.75, with a 0.0001 IDF
-floor) using one whole-document `doc_len`; `FieldType::Text.weight` is parsed by `FT.CREATE` but confirmed (by
-grep) never read in scoring. `QueryAst::Exact` remains dead code — `parse_query` never constructs it.
-Multi-vector chunk fields (`\x00`-separated chunk keys) work only for JSON-indexed documents;
-`add_hash_document` never produces more than one chunk per field.
+**Key algorithms**
+- Distance SIMD dispatch — Runtime feature detection chooses between AVX-512F (32 lanes/iter with FMA), AVX2+FMA (16 lanes/iter), or portable unrolled chunks; fused kernels compute asymmetric SQ8-to-f32 distances directly without unpacking.
+- HNSW insertion & repair — Assigns levels via xorshift64 capped at 16, greedily descends to the target level, connects up to `m`/`m0` neighbors via Malkov & Yashunin's Algorithm 4 diversity heuristic, and eagerly repairs neighbor sets on `remove`.
+- Top-k beam search — Traverses layers 1..max greedily, runs bounded best-first search on layer 0 with capacity `ef`, evaluates optional filter expressions during traversal, and optionally reranks candidates using full-precision vectors.
+- `.vtier` disk spilling — Appends full `f32` vectors into an unmanaged temp file `{temp_dir}/rudis-vtier-{pid}-{uid}.bin`, clears in-RAM `vector`, keeps SQ8 codes in memory for graph navigation, and reads exact vectors back via positional pread during rerank.
+- Expression filter evaluation — Evaluates `VSIM ... FILTER` expressions dynamically via recursive descent against element JSON attributes during traversal, rejecting invalid JSON or missing attributes without disconnecting the search path.
+- Semantic cache lookup & expiration — Purges expired entries lazily on access, runs cosine search with threshold gating, updates token savings counters on hits, and supports scoping filters.
 
-**Verified findings.** **`FT.ADD` documents are invisible to `FT.SEARCH`/`FT.AGGREGATE`** once an index
-exists on every shard: `FT.ADD` writes only the global mirror, but queries read per-shard partitions — a
-real, user-visible count/result mismatch (and `FT.ADD` can never index vectors, always passing `vectors:
-None`). `VECTOR` schema-level `EPSILON`/`BLOCK_SIZE`, `DIALECT`, and `TIMEOUT` are all parsed, validated, and
-stored but never read/enforced anywhere — dead configuration, confirmed by grep. `CASESENSITIVE` `TAG` fields
-are unqueryable: indexing respects case, but `parse_query`'s tag branch unconditionally lowercases query
-literals, so a mixed-case tag value can never match. `WITHSCORES` and the KNN-distance `YIELD_DISTANCE_AS`
-field use inconsistent numeric formatting (`{:.6}` vs. shortest-round-trip `Display`). `FT.DROPINDEX ... DD`
-parses but discards the flag — underlying keys are never deleted. `Prefix` and `TagFilter` remain full
-O(vocabulary)/O(N) scans; only `Term` and numeric `RangeTree` queries are sub-linear.
-
-**Full documentation:** [`docs/internal/09_redisearch.md`](09_redisearch.md)
+**Gotchas & open issues**
+- Quantized sets (`Q8`/`BIN`) never get full-precision reranking in `VSIM`, and their full `f32` vectors remain in RAM unless `TIERED` is explicitly specified.
+- Deleting the `entry_point` requires an O(N) full-graph scan to elect the node with the highest layer, and slot IDs are reused LIFO without graph compaction.
+- The `.vtier` spill file is append-only, never truncated, compacted, or deleted when indices are dropped, and opens a new file handle on every write or rerank read.
+- The PQ distance table is rebuilt for every visited candidate inside `dist_to_node` rather than once per query, and auto-training never encodes pre-existing nodes without `pq` codes.
+- Projection matrices from `REDUCE` and runtime `EF` settings are lost during snapshot (RDB) and AOF recovery, preventing subsequent inserts at the original input dimension.
+- Similarity scores in `VSIM` (`clamp(1 - dist/2, 0, 1)`) assume a distance range of `[0, 2]`, producing distorted scores for legacy indexes using `L2` or `IP`.
+- Filter string literals are decoded byte-by-byte as Latin-1, causing non-ASCII literals to fail equality checks against valid JSON strings.
 
 ---
 
-## Component 10: Kernel Bypass & Zero-Copy Networking
+## 09. RediSearch Full-Text Engine & Hybrid Vector Fusion
 
-**Source files:** `src/xdp.rs` (706 lines — in-process simulation of AF_XDP UMEM/rings/XSK sockets, a CIDR
-rule engine, a per-source-IP token-bucket rate limiter, manual Ethernet/IPv4/TCP parsing) · `src/zerocopy.rs`
-(352 lines — real, standalone `MSG_ZEROCOPY`/`io_uring` primitives, unwired)
+> Full reference: [09_redisearch.md](09_redisearch.md) · Main source: `src/search.rs`, `src/router.rs`, `src/shard.rs`
 
-**Key data structures.** `XdpAction{Pass,Drop,Redirect,Tx}`; `XdpMode{Driver,Skb,Simulated}` (`Driver` is
-never constructed anywhere); `XdpRule{id, action, cidr, network, netmask}` scanned linearly, first-match-wins;
-`TokenBucket{tokens, capacity, refill_rate, last_update}` — default `capacity=50_000.0`,
-`refill_rate=100_000.0` tokens/sec, 1 token/packet, created lazily per source IP and **never evicted**;
-`XskRing<T>{producer, consumer, mask, entries: Vec<RwLock<T>>}` (per-slot `RwLock`, not true lock-free SPSC);
-`XskUmem{frame_size:2048 fixed, num_frames, frames}` — 128 frames (Simulated) vs **4096 frames (Skb, the
-practical default on real Linux hosts)** = 8 MiB UMEM per shard; `UmemFrame` struct is declared but **never
-constructed or referenced anywhere in the crate** (dead code); `XskSocket{rx_ring, fill_ring, tx_ring,
-comp_ring, umem, rx_packets, tx_packets}`.
+Rudis provides RediSearch-compatible secondary indexing and hybrid search over HASH and JSON keys. Queries arrive via commands like `FT.SEARCH`, `FT.HYBRID`, and `FT.AGGREGATE`; the coordinating shard parses the query AST and executes scatter/gather requests across shard threads, evaluating BM25 text relevance, numeric range trees, and vector nearest neighbours before fusing or aggregating the merged results.
 
-**Flagged finding — `XdpEngine` is a process-wide singleton enabling cross-shard packet injection.**
-`GLOBAL_XDP_ENGINE: LazyLock<Arc<XdpEngine>>` (xdp.rs:586) is constructed once at startup; `get_xdp_engine()`
-clones that one `Arc` — "every shard, and every client connection, shares exactly one `XdpEngine`, including
-its `sockets` registry." The doc states explicitly: "a connection accepted on shard B can inject a packet
-into the ring polled by shard A's background task, simply by calling `XDP.INJECT <queue_id=A> <payload>` —
-nothing ties the issuing connection's shard to the `queue_id` argument." `sockets: RwLock<HashMap<(u16,u32),
-Arc<XskSocket>>>` is keyed by `(port, queue_id)`, not per-shard-exclusive, since the engine itself is shared.
+**Key structures**
+- `InvertedIndex` — the core search index holding term postings, numeric trees, document metadata, and backing FLAT or HNSW vector indices; maintained in lock-free per-shard partitions (`ShardDb.search_indices`) and a process-wide `SEARCH_INDICES` mirror.
+- `IndexSchema` — defines index name, target key type (`HASH` or `JSON`), key prefixes, and field definitions (`Text`, `Numeric`, `Tag`, `Vector`).
+- `SchemaField` — schema field holding identifier (raw field name or JSONPath), alias (derived or explicit), and field configuration (`FieldType`).
+- `Posting` — compact 8-byte entry storing `doc_id: u32` and `term_freq: u32` in an unsorted postings vector per term.
+- `DocMeta` — per-document metadata keyed by dense `DocId`, tracking the raw document key, total text token count (`doc_len`), raw fields, numeric values, tag sets, vector chunks, and indexed terms for fast deletion.
+- `RangeTree` — numeric index wrapping `BTreeMap<OrderedF64, Vec<DocId>>` for O(log N + K) range queries with inclusive bounds.
+- `QueryAst` — enum representing parsed query expressions (`Term`, `Prefix`, `NumericRange`, `TagFilter`, `And`, `Or`, `Not`, `KnnVector`, `VectorRange`, `MatchAll`).
+- `SearchOptions` — execution parameters parsed from `FT.SEARCH`, specifying pagination (`LIMIT`), sort field and direction, field projections (`RETURN`), runtime parameters (`PARAMS`), and fusion weights (`RRF` or `LINEAR`).
 
-**Key algorithm / workflow.** Every shard's `run_shard_worker` spawns a background task polling its own
-`XskSocket` (`queue_id = shard_id`): `rx_burst` → `process_packet` (CIDR rule scan → rate limit →
-unconditional `Redirect` fallback, ignoring the destination port despite a comment claiming otherwise) →
-`extract_transport_payload` → `resp::parse_command` → `target_shard_of_cmd` (explicit whitelist of single-key
-commands, catch-all defaults to **local** execution) → real execution via `execute_local_command`/
-`Router::execute_remote` against actual shard state, with AOF logging → response written to `tx_burst`. The
-only producer of `rx_ring` entries in the whole codebase is `XskSocket::inject_rx`, called exclusively by
-`XDP.INJECT`.
+**Key algorithms**
+- Query parsing and parameter resolution ([§6](09_redisearch.md#6-query-language--parse_query)) — splits query strings into terms, ranges, tag filters, and KNN suffixes (`=>[KNN k @field $vec]`), resolving `$param` references against runtime `PARAMS`.
+- BM25 text scoring ([§7.1](09_redisearch.md#71-bm25-scoring)) — scores term hits using Okapi BM25 (k1 = 1.2, b = 0.75) with inverse document frequency based on vocabulary posting counts and document length normalized by average document length.
+- Vector nearest-neighbour search ([§7.2](09_redisearch.md#72-knn-search--knn_search)) — dispatches KNN/radius queries to FLAT or HNSW indices in `src/vector.rs`, dynamically falling back to brute force if pre-filter cardinality is <= 10% of index size.
+- Hybrid fusion ([§9](09_redisearch.md#9-hybrid-fusion)) — executes text and vector subqueries across shards, combining ranks via Reciprocal Rank Fusion (default k = 60) or normalized linear score weighting (alpha * text + beta * vector).
+- Distributed scatter/gather ([§10.1](09_redisearch.md#101-routerft_search-non-hybrid)) — the router broadcasts `ShardMessage::SearchQuery` to all shards requesting candidates up to `offset + limit`, then merges, sorts, deduplicates, and paginates the final response.
+- Aggregation pipeline ([§10.2](09_redisearch.md#102-ftaggregate--routerft_aggregate--execute_aggregate_pipeline)) — coordinates single-shard execution of sequential `FILTER`, `APPLY`, `GROUPBY` (with `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `SORTBY`, and `LIMIT` stages over up to 100,000 search hits.
+- Document lifecycle & deletion ([§4](09_redisearch.md#4-indexing)) — writes intercept `HSET`/`JSON.SET`/`DEL` to update both shard partitions and global mirror; document removal iterates only the terms recorded in `DocMeta.terms` (O(terms in doc)).
 
-**Notable implementation detail.** `src/main.rs` has zero references to either module; no Cargo feature gates
-either file — both compile unconditionally on every build/platform. Neither module performs real kernel
-bypass; a `/sys/class/net`-existence check selects `Skb` mode in practice, which only changes `XDP.INFO`
-output and memory footprint, not real AF_XDP wiring. `zerocopy.rs`'s `send_zc`/`RegisteredBufferPool`/
-`enable_so_zerocopy` are real, correct syscall wrappers but have **zero callers outside their own
-`#[cfg(test)]` module**, and even if wired up, `send_zc` never polls `MSG_ERRQUEUE` for completion.
-
-**Verified findings.** `target_shard_of_cmd`'s silent local-execution fallback is a correctness trap for
-`XDP.INJECT`-driven multi-key or non-whitelisted commands. `rate_limiters` grows unbounded (one `TokenBucket`
-per IP ever seen). `XDP.RULEADD`/`RULEDEL`/`RULELIST` are not separate commands — they're subcommands of one
-`XDP.RULE ADD|DEL|LIST`.
-
-**Full documentation:** [`docs/internal/10_kernel_bypass_xdp.md`](10_kernel_bypass_xdp.md)
+**Gotchas & open issues**
+- Dual-copy divergence: `FT.SEARCH` queries per-shard partitions, while `FT.INFO` and `FT._LIST` inspect the global mirror; commands like `FT.ADD` or in-place JSON operations (`JSON.NUMINCRBY`) mutate only the mirror.
+- Non-hooked mutations: `HDEL`, `HINCRBY`, TTL expiration, eviction, and `FLUSHDB`/`FLUSHALL` do not trigger index updates, leaving orphaned postings until keys are rewritten or rebuilt.
+- Schema aliasing quirks: JSON text fields defined with `AS` are indexed under both identifier and alias, doubling term frequency counts and document length.
+- Query behavior surprises: `FieldScope` (`@field:term`) only verifies field existence rather than confining matching terms to that field; all query terms undergo stemming regardless of field `NOSTEM` flags; `SORTBY` only works on numeric fields.
+- Index reload & memory overhead: Every document is indexed twice (partition + mirror), doubling memory usage; definitions alone are persisted in AOF/RDB (`EXT_TYPE_SEARCH_INDEX`), with documents re-indexed on startup.
+- `FT.DROPINDEX [DD]` drops indices across shards and writes AOF records, but the `DD` flag never deletes underlying keys.
 
 ---
 
-## Component 11: Redis Cluster Topology & Gossip Protocol
+## 10. Kernel Bypass & Zero-Copy Networking
 
-**Source files:** `src/cluster.rs` (2,306 lines — gossip bus, `ClusterHub`, election, migration
-**planning**) · cross-referenced `src/router.rs`, `src/shard.rs`, `src/mailbox.rs`; migration **execution**
-lives in `src/connection.rs` (`migrate_keys_to_node:3449`, `execute_rebalance_plans:3735`).
+> Full reference: [10_kernel_bypass_xdp.md](10_kernel_bypass_xdp.md) · Main source: `src/xdp.rs`, `src/zerocopy.rs`
 
-**Key data structures.** `ClusterNodeInfo{id, ip, port, cport, flags, master_id, ping_sent, pong_recv,
-config_epoch, link_state, slots:Vec<(u16,u16)>}`; `ActiveMigration` (DFLYMIGRATE bookkeeping only);
-`SlotMigrationPlan{slot, source_node_id, source_addr, target_node_id, target_addr}`;
-`RebalanceOptions{weights, simulate, threshold=1.25, pipeline:usize (parsed then discarded), target_host_port}`;
-`ClusterHub{port, cport=port+10000, nodes, my_slots:Vec<(u16,u16)> default [(0,16383)], pfail_reports,
-active_migration, slot_states: HashMap<u16,(String,String)>, cluster_enabled, num_shards}`.
-`generate_node_id` builds a 40-hex string from two `fxhash::hash64` calls over port+time-ns — same length as
-real Redis node IDs but not collision-resistant.
+Rudis provides an in-process simulation of Linux AF_XDP kernel bypass networking alongside zero-copy sending wrappers, but no real client traffic ever uses kernel bypass. Real client connections arrive via standard `SO_REUSEPORT` TCP listeners managed by `src/netsec.rs`. The simulated XDP subsystem serves as an administrative packet classification and command injection harness gated behind experimental commands (`enable-experimental-commands`), allowing synthetic frames injected via `XDP.INJECT` to traverse simulated UMEM and ring buffers before extracting inner payloads that execute directly against shard state and the AOF.
 
-**Slot-migration data-loss finding (this doc's framing, cross-referenced with Component 07).** "**New —
-silent data loss for tiered (NVMe-spilled) keys during migration under memory pressure.**"
-`migrate_keys_to_node`'s per-type match contains `RudisValue::Tiered(_) | RudisValue::Cooled { .. } => {}` —
-**an empty match arm** (`connection.rs:3711`) — that serializes nothing to the wire for a key still in
-tiered/cooled representation. `router.dump_key` calls `ensure_loaded(key)` first, but `ensure_loaded` returns
-`false` immediately, without loading anything, if `is_memory_constrained()` (over per-shard `maxmemory`) is
-true. Because the source-side deletion loop unconditionally removes every key `dump_key` returned regardless
-of whether it produced output, the doc concludes: "A slot migration performed while a node is over its
-configured `maxmemory` can silently drop tiered keys." Applies uniformly to `CLUSTER SETSLOT ... MIGRATING`,
-`CLUSTER REBALANCE`, and `CLUSTER RESHARD` (same `migrate_keys_to_node` path).
+**Key structures**
+- `XdpEngine` — Process-wide singleton managing CIDR rules (`RwLock<Vec<XdpRule>>`), per-source IPv4 rate limiters (`RwLock<HashMap<u32, TokenBucket>>`), atomic traffic counters, and a shared `(port, queue_id)` socket table; defaults to `XdpMode::Skb` if `/sys/class/net` exists.
+- `XskUmem` — Simulated user-space packet memory containing fixed-size frames (frame size 2048 bytes; 4096 frames in `Skb` mode, 128 in `Simulated`), where individual frame byte buffers are lazily allocated on first write.
+- `XskRing<T>` — Generic SPSC circular ring buffer with power-of-two capacity (up to 4096 entries) and atomic producer/consumer indices, guarding each slot with an `RwLock<T>`.
+- `XskSocket` — Simulated AF_XDP socket binding a queue ID to private `XskUmem` memory and four `XskRing` rings: `fill_ring` (free frame indexes), `rx_ring` (received packets), `tx_ring` (transmitted replies), and `comp_ring` (completed transmit frames).
+- `XdpRule` — IPv4 CIDR filter rule holding pre-masked network and netmask values along with an `XdpAction` verdict (`Pass`, `Drop`, `Redirect`, or `Tx`), evaluated sequentially.
+- `TokenBucket` — Per-IPv4 address rate limiter tracking burst capacity (default 50,000 tokens) and refill rate (default 100,000 tokens/s), where each classified packet consumes 1 token.
+- `RegisteredBufferPool` — Unused page-aligned buffer allocator in `src/zerocopy.rs` providing a fixed pool of registered 64 KiB slots with pre-built `libc::iovec` arrays for `io_uring` fixed-buffer transmission.
+- `ZeroCopyEngine` — Unused zero-copy transmit harness wrapping `SO_ZEROCOPY` socket enablement, `libc::send` with `MSG_ZEROCOPY` fallback on `ENOBUFS`, and `io_uring::opcode::SendZc` preparation.
 
-**Key algorithm / workflow.** Gossip tick every 500ms (`cluster_bus_tick`) opens a fresh TCP connection per
-peer, re-sends full node-table state each time (no incremental gossip). PFAIL→FAIL escalation requires
-silence > 5000ms then quorum `(total_masters/2)+1`. Election (`start_election`) is the one genuine
-quorum-vote mechanism; `CLUSTER FAILOVER FORCE` bypasses the vote entirely. Rebalance planning uses
-largest-remainder apportionment (`compute_rebalance_plan`); migration execution is real DUMP-and-replay over
-live write commands, batched at exactly 100 keys per round trip, sequential/unpipelined.
+**Key algorithms**
+- `XdpEngine::process_packet` packet classification: Increments byte and packet counters, inspects frame headers for Ethernet or bare IPv4 source addresses, checks matching CIDR rules sequentially, tests the source IP's `TokenBucket`, and defaults to `Redirect` if no rule or rate limit drops the frame.
+- `extract_transport_payload` payload extraction: Strips Ethernet and IPv4/TCP headers using declared IHL and TCP data offset fields, passing through raw RESP or inline text payloads intact so inner commands can be parsed by `resp::parse_command`.
+- `XskSocket::inject_rx` frame ingestion: Triggered by `XDP.INJECT`, this pops a free frame index from `fill_ring`, writes up to 2048 payload bytes into UMEM, and pushes an `XdpDesc` to `rx_ring`, returning the frame to `fill_ring` if `rx_ring` is full.
+- Per-shard background poll loop: Each shard runs a periodic background task (5 ms interval when experimental commands are enabled, 200 ms when disabled) that calls `rx_burst` to drain up to 32 descriptors, returns frame indexes to `fill_ring`, classifies each frame, and executes `Pass` or `Redirect` payloads.
+- Injected command execution: Parsed commands evaluate their target shard via `target_shard_of_cmd`; single-key commands route to the key's owning shard via cross-shard messaging, while others execute directly on the polling shard's database with AOF persistence, pushing generated RESP replies into `tx_ring` and `comp_ring`.
+- `ZeroCopyEngine::send_zc` zero-copy transmission: For buffers at or above 4096 bytes (`PAGE_SIZE`), issues `libc::send` with `MSG_ZEROCOPY | MSG_NOSIGNAL`, automatically falling back to standard `MSG_NOSIGNAL` copy transmission if the call errors or exhausts buffer limits (`ENOBUFS`).
 
-**Notable implementation details / new findings this revision.** `Router::check_slot_redirection`
-duplicates the inline `SlotState` match in `connection.rs::execute_command` but is **never called anywhere**
-— dead code (re-confirmed from Component 04). `CLUSTER ADDSLOTS`/`ADDSLOTSRANGE` update `ClusterHub`
-bookkeeping (`my_slots`) but **never touch `Router::slot_owners`** — real command routing is unaffected by a
-manually-declared, non-default slot assignment until each slot is walked through an actual `CLUSTER SETSLOT
-... NODE` migration. The migration path's final `CLUSTER SETSLOT <slot> NODE myself` step calls
-`router.set_slot_owner`, which is identified as "exactly the trigger condition" for Component 04's
-squashed-pipeline stale-routing bug — cluster.rs's migration algorithm is "correct in isolation" but this
-handshake step arms that separately-documented routing bug.
-
-**Verified findings.** `CLUSTER REBALANCE ... PIPELINE n` is parsed into `RebalanceOptions.pipeline` then
-discarded — the handler hardcodes `16`, and batch size is separately hardcoded to 100 — "two separate no-ops
-stacked on the same option." Cluster-bus messages have no auth/integrity/framing. `DFLYMIGRATE`/
-`DFLYCLUSTER` status commands transfer no real data (bookkeeping-only, unlike the real `MIGRATE`/`CLUSTER
-SETSLOT` path).
-
-**Full documentation:** [`docs/internal/11_cluster_topology.md`](11_cluster_topology.md)
+**Gotchas & open issues**
+- `XDP.INJECT` bypasses client connection controls: Injected commands execute directly via `execute_local_command` against the shard database and AOF using the thread's current database index, bypassing per-connection ACL rules, authentication, and MULTI transaction state.
+- Inline text can trigger false IPv4 classification: Any payload of 20 or more bytes starting with an ASCII byte whose top nibble is 4 (such as uppercase letters `A`–`O`, including `GET`) is parsed as an IPv4 header, subjecting text commands to unexpected CIDR matching and rate limiting.
+- Transmit rings leak and never drain: Responses pushed to `tx_ring` and `comp_ring` by shard workers are never read or transmitted out to network interfaces, causing `tx_ring` to fill permanently after 4096 replies in `Skb` mode and silently discard subsequent replies.
+- SPSC ring concurrency hazard: `XskRing` uses atomic index increments without compare-and-swap, so concurrent `XDP.INJECT` commands across multiple connection threads targeting the same queue ID can race on `fill_ring` and `rx_ring`, leading to dropped packets or duplicate frame assignments.
+- Oversized frame truncation: UMEM frames are fixed at 2048 bytes; injected payloads exceeding this threshold are silently truncated on write, causing transport payload parsing to fail and drop the frame without error or counter increments.
+- Zero-copy networking primitives are unused: The primitives in `src/zerocopy.rs` are not connected to any network listeners or client streams, contain no `MSG_ERRQUEUE` completion reader for kernel page release, and never register buffers with active `io_uring` rings.
 
 ---
 
-## Component 12: CRDT Data Types & Manual Multi-Region Sync
+## 11. Redis Cluster Topology & Gossip Protocol
 
-**Source files:** `src/crdt.rs` (685 lines) — `HlcTimestamp`/`HybridLogicalClock`, `LwwRegister`, `OrSet`,
-`PnCounter`, `CrdtStore`; plus touchpoints in `src/shard.rs`, `src/resp.rs`, `src/connection.rs`, `src/aof.rs`
+> Full reference: [11_cluster_topology.md](11_cluster_topology.md) · Main source: `src/cluster.rs`, `src/connection.rs`, `src/router.rs`, `src/server.rs`
 
-**Key data structures.** `HlcTimestamp{physical_ms:u64, logical:u32, node_id:u16}` (lexicographic Ord);
-`LwwRegister{value:Bytes, timestamp, tombstone}`; `OrSet{elements:HashMap<Bytes, HashSet<HlcTimestamp>>,
-tombstones:HashSet<HlcTimestamp>}`; `PnCounter{p:HashMap<u16,i64>, n:HashMap<u16,i64>}` — entries never
-removed, only grows; `CrdtStore{clock, registers, sets, counters}`, one per `ShardDb`. `HlcTimestamp.node_id`
-is the server's **listening port**, not per-shard or per-cluster identity — every shard in one Rudis process
-generates HLC timestamps under the identical `node_id`, since all shard workers share one `port` under
-`SO_REUSEPORT`.
+Rudis partitions the keyspace into 16,384 hash slots and participates in a Redis Cluster by maintaining cluster membership, gossiping node health, electing replacement masters, and redirecting clients. On the client request path, every incoming keyed command first checks for multi-slot violations (`-CROSSSLOT`), inspects migration state (`-ASK` / `-MOVED`), confirms whether the local node serves the slot, and forwards to the owning local shard port or returns a `-MOVED` redirect to a peer shard before executing.
 
-**AOF/replication coverage finding (as flagged).** Re-verified — **zero coverage for any `CRDT.*`
-mutation.** CRDT writes go through `record_change!(cmd)`, which unconditionally bumps `DIRTY_CHANGES` and
-touches `WATCH`ed keys, but AOF-append/replica-propagate are gated behind `crate::aof::command_to_resp`
-returning `Some(bytes)`. `command_to_resp` (`src/aof.rs`) has literally zero match arms for `Command::Crdt*`
-— confirmed via `rg -n "Crdt" src/aof.rs` returning zero matches — falling through to `_ => None`.
-Concretely: for every `CRDT.SET`/`DEL`/`INCRBY`/`SADD`/`SREM`/`MERGE`, nothing is ever written to the AOF and
-nothing is sent over the replication stream; `rewrite_shard_aof` (BGREWRITEAOF compaction) also never reads
-`db.crdt_store` at all. What *does* capture CRDT state: RDB snapshots — `ShardDb::save_rdb_chunk` embeds the
-entire `export_sync_payload()` as an extended record (type byte `13`), used by `SAVE`/`BGSAVE`,
-`generate_full_rdb` (PSYNC full resync), and `DEBUG RELOAD`; `restore_rdb_chunk` decodes it back via
-`merge_sync_payload` but discards the `Result` (`let _ = ...`) — a corrupt record is silently swallowed.
-Consequence: if AOF is the authoritative recovery source, CRDT state is lost on restart regardless of how
-recently `CRDT.SET` etc. were called; replication only carries CRDT state at the moment of a full PSYNC
-resync, with no further CRDT write ever reaching the replica afterward.
+**Key structures**
+- `ClusterHub` — Singleton `Arc` per base port managing node identity, configuration epochs, slot claims (`my_slots` vector of merged ranges), peer table (`nodes` mapping up to 1000 nodes), failure reports, and `nodes.conf` persistence.
+- `ClusterNodeInfo` — Metadata for one peer, storing its 40-character hex node ID, IP, client/bus ports, role flags, health state (`FailState`), shard count (`shards`), heartbeat timestamps, config epoch, and assigned slot ranges.
+- `FailState` — Three-state health enum (`Ok`, `PFail`, `Fail`) tracking physical node reachability independently from logical master or replica roles.
+- `SlotState` — Per-shard router enum (`Stable`, `Migrating(addr)`, `Importing(src)`, `Moved(addr)`) tracking live slot migrations to answer `-ASK` or `-MOVED` redirects during key transfers.
+- `SlotMigrationPlan` — Represents a planned slot movement (`slot`, source/target node IDs, and IP:port addresses) generated during cluster rebalancing or resharding.
+- `RebalanceOptions` — User configuration for cluster rebalancing, holding per-node target weights, simulation flags, an imbalance threshold percentage (default 1.25%), and migration pipeline batch sizes (clamped 1–1000, default 16).
+- `ClusterCheckReport` — Summary produced by `CLUSTER CHECK` detailing cluster validation results, total assigned slots, open slots, duplicate slot assignments, and migrating/importing states.
 
-**Key algorithm / workflow.** `HybridLogicalClock::now`/`update` are lock-free CAS retry loops with no
-skew-bound check, so a badly-skewed remote timestamp can permanently push the local HLC ahead of wall-clock
-time. Per-type merges: `LwwRegister::merge` (later HLC wins outright), `PnCounter::merge` (component-wise max
-per node_id on `p`/`n`), `OrSet::merge` (union tags/tombstones, drop tombstoned tags, add-wins semantics).
-`export_sync_payload`/`merge_sync_payload` form a hand-rolled, uncompressed, unversioned, checksum-free wire
-format serializing the **entire** store on every call — nothing inside Rudis schedules, transports, or
-discovers peers for it; sync is entirely operator/external-script driven via `CRDT.DUMP`/`CRDT.MERGE`.
+**Key algorithms**
+- `cluster_bus_tick` heartbeat and failure detection ([§7](11_cluster_topology.md#7-heartbeats-and-failure-detection)): Every 500 ms, a background thread pings known peers in parallel batches of 64 over raw TCP to exchange slot claims and gossip payloads. If a peer misses heartbeats past `node_timeout_ms` (default 5000 ms), it is marked `PFail`; once a majority quorum of slot-serving masters agree, it is marked `Fail` and broadcast to all peers.
+- `claim_slots` conflict resolution ([§8.2](11_cluster_topology.md#82-claim_slots--the-conflict-rule)): Incoming heartbeat and failover frames compare the sender's config epoch against current owners; higher epochs take conflicting slots, with ties awarded to the incumbent holder. If an active master loses all its slots to a higher-epoch peer, it automatically demotes itself to a replica of that peer.
+- `start_election` automatic failover ([§9.1](11_cluster_topology.md#91-automatic-election-start_election)): When a replica detects its master is `Fail` and holds master data (`holds_master_data`), it delays 500–1000 ms, increments `current_epoch`, and requests votes (`FAILOVER_AUTH_REQUEST`) from all slot-serving masters. Upon securing a strict majority of votes, it detaches from replication, becomes master at the new epoch, assumes the failed master's slots, and broadcasts `FAILOVER_ANNOUNCE`.
+- Manual failover ([§9.2](11_cluster_topology.md#92-manual-failover-cluster-failover-forcetakeover)): Without `FORCE`, a replica sends `MFSTART` to pause master writers for up to 5000 ms, waits for its local replication offset to match the master's offset, then transitions to master without an election. `FORCE` or `TAKEOVER` immediately promotes the replica and claims the master's slots without pausing writers or waiting for offset synchronization.
+- Per-command routing and redirection ([§10](11_cluster_topology.md#10-request-routing-and-redirects)): Keyed commands verify that multi-key requests share the same hash slot before evaluating router migration states and `my_slots`. Unserved slots yield `-MOVED` to the peer's specific shard port, migrating keys absent locally trigger `-ASK`, and requests hitting the wrong local core return `-MOVED` to the internal shard port (`base_port + shard_id`).
+- `migrate_keys_to_node` slot migration ([§11](11_cluster_topology.md#11-slot-migration)): The source node sets local state to `Migrating`, sets the target to `Importing`, and migrates keys in batches using pipelined `DUMP`/`RESTORE` with atomic `del_if_unchanged` deletions. Once empty, `CLUSTER SETSLOT <slot> NODE myself` on the target bumps its config epoch, while the source marks the slot `Moved`.
+- `compute_rebalance_plan` rebalance planning ([§12](11_cluster_topology.md#12-rebalance-planning-pure-functions)): Evaluates cluster-wide master allocations against configured weights and a threshold percentage (default 1.25%), iteratively pairing the most over-allocated donor with the most under-allocated receiver to generate slot migration plans summing to 16,384 slots.
 
-**Notable implementation detail / bug.** `merge_sync_payload`'s bounds checking is incomplete: it checks
-`offset + 4 > data.len()` only before each item's leading length field, not before subsequent fixed-width
-reads — a malformed or truncated payload passed to `CRDT.MERGE` can panic the shard thread rather than
-returning a clean `Err`. `CRDT.GC` has no automatic scheduler despite a doc-comment default of 24h TTL;
-tombstones and `PnCounter` node-id entries grow unbounded.
-
-**Full documentation:** [`docs/internal/12_crdt_types.md`](12_crdt_types.md)
+**Gotchas & open issues**
+- Lock acquisition order: Always acquire `my_slots` before acquiring `nodes` in `ClusterHub` to prevent deadlocks between bus thread updates and client routing checks ([§4.1](11_cluster_topology.md#41-clusterhub--the-nodes-whole-cluster-state)).
+- Default epoch-0 slot claim: An unconfigured node defaults to claiming all 16,384 slots at config epoch 0; because tie-breaking favours the current holder, two fresh nodes that MEET each other retain all slots without redirecting until slots are explicitly assigned via `ADDSLOTS` ([§17](11_cluster_topology.md#17-invariants--gotchas)).
+- Single-host limitation: Nodes always advertise `127.0.0.1` across bus frames, redirects, and introspection outputs; multi-host clusters and `cluster-announce-*` directives are currently unsupported ([§18](11_cluster_topology.md#18-limitations--not-implemented)).
+- Unauthenticated plaintext bus: The cluster bus uses unencrypted line-delimited plain text with no authentication or TLS, opening connections per tick and trusting incoming frames up to a 1 MiB line limit and 256 connection cap ([§6.1](11_cluster_topology.md#61-threads-and-framing), [§18](11_cluster_topology.md#18-limitations--not-implemented)).
+- Rebalance data movement asymmetry: `CLUSTER REBALANCE` executes key transfers only on the source node; running rebalance on the receiver only performs metadata updates, leaving the router in an `Importing` redirect loop ([§17](11_cluster_topology.md#17-invariants--gotchas)).
+- Incomplete slot migration on batch failure: In `execute_rebalance_plans`, if a key batch fails during migration, key transfers stop but the slot is still finalized (`SETSLOT NODE` and `Moved`), stranding unmoved keys on the source behind a `-MOVED` redirect ([§17](11_cluster_topology.md#17-invariants--gotchas)).
 
 ---
 
-## Component 13: Lua Scripting & Redis 7 Functions Engine
+## 12. CRDT Data Types & Manual Multi-Region Sync
 
-**Source files:** `src/scripting.rs` (739 lines — flat statics/free-functions, no enums/traits/impls)
+> Full reference: [12_crdt_types.md](12_crdt_types.md) · Main source: `src/crdt.rs`, `src/connection.rs`, `src/router.rs`
 
-**Key data structures.** `SCRIPT_CACHE: LazyLock<RwLock<HashMap<String, String>>>` (SHA1 hex → raw source)
-and `FUNCTION_LIBS: LazyLock<RwLock<HashMap<String, FunctionLib>>>` are both **process-wide**, not per-shard
-— a script loaded or a library `FUNCTION LOAD`ed on one shard's connection is immediately usable from any
-other shard, unlike almost everything else in Rudis. `FunctionLib{name, engine: "LUA", raw_code, functions:
-Vec<String>}` holds no compiled/cached closure — only source text and discovered function names. `mlua =
-"0.12.1"` with `lua54`/`vendored` features (real Lua 5.4, synchronous only); `Lua::new()` uses no sandboxing
-feature flags.
+Provides conflict-free replicated data types (`LWW-Register`, `OR-Set`, `PN-Counter`) under the experimental `CRDT.*` family to support multi-region deployments. Shards maintain their own isolated store alongside the keyspace; single-key operations execute directly on the owning shard, whereas whole-store commands (`CRDT.DUMP`, `CRDT.MERGE`, `CRDT.GC`) fan out across all shards via the connection router.
 
-**Key algorithm / workflow.** `EVAL`/`EVALSHA` each do their own first-key routing check: if `KEYS[1]`'s shard
-differs from the local shard, the whole command is forwarded via `router.target_shard`/`execute_remote` — a
-documented behavior change from earlier revisions. `FCALL` has **no such check** and always runs locally
-regardless of `KEYS` — a real, verified routing asymmetry; `target_shard_of_cmd` has no arm for
-`Eval`/`Evalsha`/`Fcall` at all. `redis.call`/`redis.pcall` convert Lua args to `Vec<Bytes>`, build a real
-`Command` via `crate::resp::build_command`, and run it through `execute_local_command` — so every script write
-is independently AOF-logged/replicated as its own constituent command (effects replication). `FUNCTION
-LOAD`/`FCALL` each re-run the **entire library source** in a fresh `Lua::new()` VM — once at load (discovery
-only, closures discarded) and once per `FCALL` (to re-capture the one needed closure) — there is no persisted
-callable object.
+**Key structures**
+- `HybridLogicalClock` — Monotonic clock holding atomic physical ms and logical counters; clamps remote timestamps to `MAX_REMOTE_CLOCK_AHEAD_MS` (1 hour) ahead of local wall time.
+- `HlcTimestamp` — 14-byte wire layout (`physical_ms: u64`, `logical: u32`, `node_id: u16`) ordered lexicographically for LWW resolution and set element tagging.
+- `LwwRegister` — Holds `value: Bytes`, `timestamp: HlcTimestamp`, and `tombstone: bool`; preserves old byte values upon deletion markers.
+- `OrSet` — Observed-Remove set containing `elements: HashMap<Bytes, HashSet<HlcTimestamp>>` and `tombstones: HashSet<HlcTimestamp>`, where an element is present if any tag remains un-tombstoned.
+- `PnCounter` — Positive-Negative counter tracking per-node totals in `p` and `n` (`HashMap<u16, i64>`), clamping the net sum to `i64` and rejecting overflow via `PN_OVERFLOW`.
+- `CrdtStore` — Per-shard container on `ShardDb` holding private `clock`, `registers`, `sets`, and `counters` isolated from `RudisTable` and logical database selection.
+- `CrdtEntry` — Enum over register, counter, and set entries with 1-byte type discriminators (`1`, `2`, `3`) used for encoding and decoding binary sync blobs.
 
-**Notable implementation detail.** The Redis-facing API surface is exactly 6 functions: `redis.call`,
-`redis.pcall`, `redis.status_reply`, `redis.error_reply`, `redis.sha1hex`, plus `redis.register_function`
-(load/call context only) — no `redis.log`, `setresp`, `breakpoint`, `replicate_commands`, or `set_repl` exist
-anywhere. An instruction-count hook enforces `busy-reply-threshold` (`-BUSY` from other shards) and lets
-`SCRIPT KILL`/`FUNCTION KILL` stop a script that has not written. `FUNCTION DUMP`/`FUNCTION RESTORE` do not exist at all — `FUNCTION_LIBS` has no persistence and is
-lost on every restart.
+**Key algorithms**
+- **Timestamp generation and tracking** — `HybridLogicalClock::now` advances local wall time or increments the logical counter, while `update` clamps remote timestamps to 1 hour ahead and advances the clock past all merged entries ([§4.1](12_crdt_types.md#41-hlc-generating-a-local-timestamp-hybridlogicalclocknow)).
+- **LWW-Register write and merge** — Local `CRDT.SET` unconditionally replaces the register with a newly stamped timestamp, while `LwwRegister::merge` adopts remote state only if the incoming timestamp is strictly greater.
+- **OR-Set add, remove, and merge** — `CRDT.SADD` stamps and inserts a unique tag per member, `CRDT.SREM` moves all current tags to tombstones, and `merge` unions all tags and tombstones so concurrent adds survive removals ([§4.4](12_crdt_types.md#44-or-set)).
+- **PN-Counter increment and merge** — `CRDT.INCRBY` updates the local node's slot in `p` or `n` using checked arithmetic, and `merge` computes per-node maxima across both maps independently ([§4.5](12_crdt_types.md#45-pn-counter)).
+- **Whole-store dump and router-split merge** — `CRDT.DUMP` concatenates raw payloads across shards; `CRDT.MERGE` validates the full binary blob upfront and re-encodes per-shard sub-payloads routed by key hash ([§6.3](12_crdt_types.md#63-whole-store-commands-router-fan-out)).
+- **Effect logging for durability** — Mutating commands bypass standard command logging and invoke `record_crdt_effect!`, writing deterministic `CRDT.MERGE` payload fragments or absolute-cutoff `CRDT.GC` records to AOF and replication streams ([§7.1](12_crdt_types.md#71-logging-writes-as-effects)).
+- **Tombstone pruning** — `CRDT.GC` evaluates an absolute unix millisecond cutoff from a TTL (default 24 hours) or `BEFORE` argument, discarding expired register tombstones and set tombstone tags across all shards.
 
-**Verified findings.** `EVAL_RO`/`EVALSHA_RO`/`FCALL_RO` parse to the identical `Command` variants as their
-mutating counterparts — no read-only enforcement exists; `redis.call('SET', ...)` succeeds inside an `_RO`
-script. A genuine correctness bug: `execute_local_command` (the function `redis.call` runs through) has no
-match arm for `Eval`/`Evalsha`/`Fcall`/`ScriptLoad`/`FunctionLoad` — so nested scripting
-(`redis.call('EVAL', ...)` from inside a script) silently falls through to the catch-all, producing Lua `nil`
-with **no error raised**. No sandboxing: full Lua stdlib access (`os`, `io`, `debug`) via `mlua::Lua::new()`
-defaults, so `os.execute`/`io.open` are reachable from any script.
-
-**Full documentation:** [`docs/internal/13_scripting_functions.md`](13_scripting_functions.md)
+**Gotchas & open issues**
+- **Node ID collision on default ports** — `node_id` defaults to the listening port (`ShardDb::new(port)`); cross-region nodes sharing the same port collide on counter slots, causing `merge` to take the maximum rather than summing.
+- **Local writes overwrite future-dated state** — Because remote timestamps are clamped to one hour ahead, a subsequent local write stamps a smaller timestamp yet still overwrites local state, diverging until the next merge.
+- **Memory growth on re-adds and counters** — `CRDT.SADD` appends a new timestamp tag on every call even if the member already exists, and counter node maps never shrink; only `CRDT.GC` reclaims set tombstones.
+- **Premature GC causes resurrection** — Pruning tombstones with `CRDT.GC` before all peer nodes have merged deletions permits older active replicas to resurrect deleted registers and elements.
+- **Resharding routes canonical merges by payload** — `split_rewritten_aof_to_shards` hashes the first argument (the binary payload bytes) instead of the underlying key, misplacing single-key canonical `CRDT.MERGE` entries into non-owning shards.
+- **Single ACL category and key visibility** — All `CRDT.*` commands map to the single ACL command `crdt` requiring both read and write permissions, preventing granular permission checks between read-only and mutating commands.
 
 ---
 
-## Component 14: Persistence & Replication Engines
+## 13. Lua Scripting & Redis 7 Functions
 
-**Source files:** `src/replication.rs` (1,404 lines) · `src/aof.rs` (3,066 lines, ~doubled since last
-revision) · RDB save/load in `src/router.rs`/`src/shard.rs`/`src/table.rs` · PSYNC/DFLY-FLOW handlers in
-`src/connection.rs`
+> Full reference: [13_scripting_functions.md](13_scripting_functions.md) · Main source: `src/scripting.rs`, `src/connection.rs`
 
-**Key data structures.** `AofWriter{buffer, spare_buffer, file, path, offset}` and `AofConfig{enabled, dir,
-fsync_every_sec}` (unchanged shape). `ReplicationHub{role, backlog: RwLock<ReplicationBacklog>, replicas:
-RwLock<HashMap<u64, Arc<ConnectedReplica>>>, shard_flows, ...}`; `ReplicationBacklog` is a genuine fixed 1MB
-(hardcoded) ring buffer. `command_to_resp(cmd: &Command) -> Option<Vec<u8>>` (`aof.rs`) is now an
-**81-command, ~1,770-line match** — the single gate deciding what gets AOF-appended and replica-propagated,
-used by both `record_mutation` and the `record_change!` macro.
+Executes ad-hoc Lua 5.4 scripts (`EVAL`, `EVALSHA`) and managed Redis 7 libraries (`FCALL`) via an embedded `mlua` runtime. In the request path, the connection dispatcher validates declared keys, rejects multi-shard keys with `-CROSSSLOT`, routes execution to the shard owning `KEYS[1]`, or runs locally on a freshly instantiated Lua VM whose nested `redis.call` invocations execute synchronously against that shard's `ShardDb`.
 
-**Key algorithm / workflow.** `command_to_resp` grew to cover hash-field TTL (`Hexpire`/`Hpersist`/
-`Hgetex`/`Hsetex`), vector sets (`Vadd`/`Vdel`/`Vsetattr`), semantic cache, agent runtime, extended streams,
-`Copy`/`Unlink`/`Bitfield`/`Msetex`/`Zrangestore`. `BGREWRITEAOF` (`rewrite_shard_aof`) streams through a
-64KB `BufWriter` and now covers JSON, vector-set, semantic-cache, and agent-runtime state in addition to the
-base table/HLL/streams — but **never touches probabilistic structures (Bloom/Cuckoo/CMS/TopK) or CRDT
-state**, consistent with those families having no AOF support at all.
+**Key structures**
+- `SCRIPT_CACHE`: Process-wide `LazyLock<RwLock<HashMap<String, String>>>` caching script source code by lowercase SHA-1 digest for `EVALSHA`.
+- `FunctionLib`: Registered library struct holding `name`, engine (`"LUA"`), `raw_code` (shebang commented out), `original_code` for RDB persistence, and a `Vec<FunctionDef>`.
+- `FUNCTION_LIBS`: Process-wide `LazyLock<RwLock<HashMap<String, FunctionLib>>>` mapping case-insensitive library names to `FunctionLib` definitions shared across shards.
+- `FunctionDef`: Metadata for a registered function, storing its name, description, and execution flags (`no-writes`, `allow-oom`, `allow-stale`, `no-cluster`, `allow-cross-slot-keys`).
+- `ScriptRedirect`: Thread-local state machine enum (`Off`, `Armed`, `Disarmed`, `To(usize)`) tracking transparent shard redirection for keyless scripts ([§5.3](13_scripting_functions.md#53-keyless-scripts-and-the-redirect-state-machine)).
+- `SCRIPT_RECORDED_ERROR`: Thread-local `Cell<bool>` set when an inner command records an error in `INFO errorstats`, preventing double counting by the outer script runner.
+- `CJsonConfig`: Per-VM configuration struct controlling `cjson` limits, defaulting `encode_max_depth` and `decode_max_depth` to 1000.
 
-**Notable implementation detail — the `RudisValue::Tiered` zero-byte bug is RESOLVED at the production path,
-but survives as dead code.** `ShardDb::save_rdb_chunk` (the only production-called RDB codec) and
-`rewrite_shard_aof` now hydrate `Tiered(ptr)` entries via `tier_manager.read_ptr_sync` and write them as
-normal `String` payloads (commit `7c7061e`). But `RudisTable::save_rdb_chunk`/`restore_rdb_chunk`
-(`table.rs`) are a second, **dead** (zero callers anywhere, confirmed by grep) implementation that still
-contains the old `RudisValue::Tiered(_) => {}` zero-byte bug — confusing for anyone who greps
-`save_rdb_chunk` and lands in `table.rs` first. RDB is now a 19-tag format (type bytes 0-18, up from 14
-previously) — tags 15-18 (semantic cache, agent memory, agent checkpoints, agent tool leases) are new.
+**Key algorithms**
+- **Script dispatch and routing**: The dispatcher checks declared keys via `keys_span_shards`; if keys span multiple shards it returns `-CROSSSLOT`, and if `KEYS[1]` belongs to another shard it forwards the command via `router.execute_remote` carrying `CURRENT_AUTH_USER` to enforce caller ACLs ([§5.1](13_scripting_functions.md#51-the-dispatcher-arms-execute_command_inner-in-srcconnectionrs)).
+- **Keyless script redirection**: When a script declares zero keys, the dispatcher enters `Armed` state; if the first `redis.call` targets a foreign shard, the command fails, transitions to `To(shard)`, and the dispatcher discards the error to rerun the script remotely.
+- **Fresh VM isolation and sandboxing**: Every `EVAL` or `FCALL` creates a new `mlua::Lua` runtime, replaces standard globals with a locked, read-only `_G` metatable, and registers read-only proxies for `redis`, `bit`, `cjson`, and `cmsgpack` without VM reuse.
+- **In-script command execution (`redis.call`)**: Inner commands are parsed via `resp::build_command`, checked against caller ACLs, debug gating, read-only script rules, min-replicas, and memory limits, then executed locally against `ShardDb` with individual mutation logging to AOF and replication.
+- **Library registration (`FUNCTION LOAD`)**: A temporary VM executes the library under a 500 ms instruction-count hook (checking every 1000 instructions) to capture `redis.register_function` definitions before saving the source to `FUNCTION_LIBS` ([§7.1](13_scripting_functions.md#71-function-load--load_functioncode-replace)).
+- **Function execution (`FCALL`)**: Locates the library in `FUNCTION_LIBS`, checks `no-writes` compliance if invoked via `FCALL_RO`, re-runs the library's full source in a fresh VM to capture the target closure, and calls it with `(keys, args)` ([§7.2](13_scripting_functions.md#72-fcall--call_functionname-keys-args-db-aof-read_only)).
+- **RESP ⇄ Lua type conversion**: Translates Redis replies to Lua types (`+OK` to `{ok="OK"}`, `$-1` to `false`, arrays to tables) and converts script returns back into RESP2 or RESP3 byte sequences up to a 1000-level recursion limit ([§6.5](13_scripting_functions.md#65-resp--lua-conversion)).
 
-**Verified findings — AOF/replication coverage.** `command_to_resp` has **no arm for any `JSON.*`,
-`BF.*`/`CF.*`/`CMS.*`/`TOPK.*`, or `CRDT.*` command** (confirmed via grep returning zero hits for each).
-`record_change!`'s AOF/replicate branch therefore never fires for these families — `DIRTY_CHANGES`/WATCH
-invalidation still work, but the mutation is **never AOF-appended and never propagated to a live replica**.
-These types persist only via point-in-time RDB snapshot (and for JSON only, also via `BGREWRITEAOF`
-compaction); any live write after the last save/rewrite is lost on restart or invisible to a connected
-replica. Vector-set/semantic-cache/agent-runtime commands are **not** affected — they have explicit
-`command_to_resp` arms. Two determinism gaps: `Spop` re-encodes the input `count` (safe only because
-`RudisSet`'s hasher is unseeded/deterministic, unlike real Redis which rewrites to `SREM`); `Xautoclaim`
-re-encodes original filter params rather than resolved claim IDs, non-deterministic across replay since
-`min_idle_time` is evaluated against differing wall-clock "now". `WaitAof`'s `numlocal` is accepted but
-ignored. `save N M` is parsed into `extra_directives` and never scheduled anywhere (confirms the previously
-documented gap). RDB save remains forkless, uses blocking `std::fs` inside an async fn, and CRC64 is a plain
-byte-at-a-time table lookup (no SIMD).
-
-**Full documentation:** [`docs/internal/14_persistence_replication.md`](14_persistence_replication.md)
+**Gotchas & open issues**
+- **Single-shard execution constraint**: Scripts execute synchronously on a single shard thread and cannot access keys across shards; undeclared or non-local key access terminates with a script error ([§9](13_scripting_functions.md#9-invariants--gotchas)).
+- **No VM pooling or bytecode caching**: Every `EVAL` and `FCALL` constructs a fresh `mlua::Lua` VM and recompiles source text (with `FCALL` re-executing library top-level code on every call), paying instantiation overhead on each invocation.
+- **Long-running scripts**: An instruction-count hook marks a script busy past `busy-reply-threshold` (other shards' clients get `-BUSY`); `SCRIPT KILL`/`FUNCTION KILL` stop a script that has not written, otherwise `-UNKILLABLE`. The script's own shard stays blocked until it ends.
+- **Script effect replication**: Only inner mutating commands issued via `redis.call` are recorded to AOF and replication streams; script source text and `SCRIPT FLUSH` are never written to the AOF.
+- **Top-level vs. inner `allow-oom` handling**: Declaring `flags=allow-oom` in a script shebang only bypasses top-level gating; individual inner write commands without inherent OOM exemption are still rejected when `maxmemory` is reached.
+- **Function dump format divergence**: `FUNCTION DUMP` emits a proprietary `RUDFUNCv1` CRC-checked JSON payload incompatible with Redis binary dumps, though RDB `FUNCTION2` records remain compatible.
 
 ---
 
-## Component 15: Security, Memory Allocator & TLS
+## 14. Persistence (AOF, RDB snapshots) & Replication
 
-**Source files:** `src/acl.rs` (443 lines) · `src/allocator.rs` (344 lines — jemalloc telemetry plus an
-unrelated `SmallCollectionArena`) · `src/tls.rs` (346 lines)
+> Full reference: [14_persistence_replication.md](14_persistence_replication.md) · Main source: `src/aof.rs`, `src/replication.rs`, `src/snapshot.rs`, `src/redis_rdb.rs`
 
-**Key data structures.** `PORT_ACLS: LazyLock<Mutex<HashMap<u16, Arc<RwLock<AclManager>>>>>` keyed by **port
-number**, process-global — the TLS accept loop reuses the same `router.port` as the plain loop, so plain and
-TLS connections on a shard share one identical `AclManager`. `HAS_CUSTOM_ACL: AtomicBool` is a one-way latch
-for the whole process, never reset. `AclUser{name, enabled, passwords, password_hashes, nopass, all_commands,
-allowed_commands, disallowed_commands, all_keys, allowed_key_patterns}`. `AllocatorStats{allocated, active,
-resident, metadata, mapped, fragmentation_ratio}` from real `tikv_jemalloc_ctl::stats::*` reads.
-`TlsSession` wraps a `rustls::ServerConnection` (the former `is_ktls_active` flag is gone — kTLS is not
-implemented); after the handshake it is wrapped in `TlsTransport`, the `ClientTransport` impl that lets TLS
-clients run the shared generic `handle_client` loop (`src/transport.rs` holds the trait, `PlainTransport`, and
-`PushTarget`).
+Rudis persists in-memory shard data across restarts and streams state to replicas by canonicalizing every mutation into RESP wire commands through a single shared encoder. In the request path, mutating commands execute locally on their owning shard thread, invoke `record_change!`, write RESP bytes into a per-shard AOF buffer, and forward identical bytes to the server's replication hub before returning client replies under configured fsync barriers.
 
-**Key algorithm / workflow.** `check_auth` computes **three** hash forms (`hash_password` legacy SHA1 with a
-hardcoded global salt, `hash_password_sha256` — unsalted, matching real Redis exactly, `hash_password_salted`
-— per-user salted SHA-256, dead on the write side since nothing ever stores a hash in that format) and
-compares against stored `password_hashes`, plus a verbatim `h == password` arm for pre-hashed `ACL SETUSER
-user #<hash>` syntax. `ACL SETUSER`'s rule-token parser handles `on/off`, `nopass`, `>password`, `#hexhash`,
-`+@all`/`-@all`, `+cmd`/`-cmd`, `~*`/`allkeys`/`~pattern` — but `+@category`/`-@category` tokens and
-`&channel:*` are **silently accepted and ignored**, always returning `+OK`. `ACL GETUSER` collapses real
-command/key-pattern detail to just `"+@all"`/`"-@all"` and `"~*"`/`""`.
+**Key structures**
+- `AofWriter` — Per-shard append buffer and file handle managing monotonic byte offsets, group commits, and async flushes (`appendfsync` every 5 ms / ~1 s sync).
+- `ReplicationHub` — Per-server central state holding the active `ReplicationRole`, PSYNC2 `ReplIds`, stream offsets, connected replicas, and synchronization channels.
+- `ReplicationBacklog` — Circular ring buffer (default 1 MB, minimum 16 KB, 3600 s TTL) protected by a write lock that establishes total byte ordering for partial resyncs.
+- `ConnectedReplica` — Master-side tracking for a replica client, including output buffers bounded by replica client limits, ACK offsets, lag timestamps, and full-sync cut tracking.
+- `FullSyncCut` — Coordination barrier with per-shard atomic flags and a pre-buffer that captures mutations during forkless shard serialization to stitch a consistent stream.
+- `AofImage` — Point-in-time RDB image of a shard built incrementally in 1 ms steps; uses pre-write traps (`before_write`) to preserve key states before mutation.
+- `SnapshotState` — Server-wide tracking across 256 cache-line-striped atomic write counters (`WRITES`), save schedules (`save <secs> <changes>`), and failure flags.
+- `ReplIds` — Replication history identifiers holding the current 40-hex-character ID, secondary ID (`replid2`), and the offset boundary for PSYNC2 negotiations.
 
-**Notable implementation detail.** jemalloc (`tikv_jemallocator::Jemalloc`) is confirmed the sole
-`#[global_allocator]`; `mimalloc` remains in `Cargo.toml` but has zero references in `src/` — dead
-dependency. `INFO`'s `mem_allocator` field is a **hardcoded literal `"libc"`** despite every other
-`allocator_*` field being real jemalloc data.
+**Key algorithms**
+- *Write logging and propagation*: Mutating commands on a shard invoke `aof::encode_command` to serialize canonicalized RESP bytes (rewriting relative TTLs to absolute timestamps and random selections to explicit deletions) directly into `AofWriter`, synchronously delivering identical bytes to `ReplicationHub`.
+- *AOF live rewrite*: Shards incrementally stream serialized RDB chunks in 1 ms slices while trapping incoming writes to unvisited keys into the image, catch up unapplied tail logs from `/proc/self/fd/`, and atomically rename temp files over `appendonly-<shard>.aof`.
+- *Startup replay and resharding*: Shards memory-map their respective AOF files using `mmap` and `MADV_SEQUENTIAL`, load any RDB preamble, and parse the RESP tail in 8 MB chunks; if shard counts changed, `reshard_aof_dir` replays and splits canonical records before worker startup.
+- *RDB fuzzy snapshotting*: `BGSAVE` and shutdown saves sequentially stream per-shard table chunks into a background writer thread over a rendezvous channel (`flume::bounded(0)`), streaming Redis version 11 records and encoding unsupported data types into the `rudis-ext` AUX field.
+- *Streamed full resync (`$EOF:`)*: Masters initialize an `AofImage` per shard, arm `FullSyncCut` flags, stream RDB chunks in 1 ms intervals without buffering the full dataset in RAM, and release buffered post-cut changes only after the replica's initial `REPLCONF ACK`.
+- *PSYNC2 resync and promotion*: Replicas request `PSYNC <replid> <offset+1>`; if the offset falls within backlog bounds and valid history IDs, the master responds `+CONTINUE` with the backlog diff, while failover shifts the old history ID to `replid2` and drops sub-replicas.
+- *Replica execution loop*: Replicas spool incoming full-sync RDBs to disk before memory-mapping and loading into shards, then apply incoming stream batches under an apply token while mirroring identical raw bytes to sub-replicas.
 
-**Verified findings — the four flagged questions.** (a) **`requirepass` priming is FIXED.** `main.rs` and
-`CONFIG SET requirepass` both clear+repopulate `passwords`/`password_hashes`, push the SHA-256 hash, set
-`nopass=false` and `HAS_CUSTOM_ACL=true`; `is_auth_required_for_default()` now correctly returns `true` and
-both plain/TLS connections bootstrap `authenticated=false` — traced to commit `002086a`, closing a gap a
-prior revision explicitly documented. (b) **kTLS is not implemented; the old kTLS plaintext-bypass note is
-obsolete.** The partial `enable_ktls` (a `TCP_ULP` attach with no `SOL_TLS` `TLS_TX`/`TLS_RX` key install),
-the `is_ktls_active` flag, and the never-taken kTLS branches in `read_plaintext`/`write_plaintext` have been
-deleted outright, so every `--tls-port` connection uses userspace rustls and the buggy code path no longer
-exists. (c) **TLS cert loading does
-NOT do PEM decoding and will likely panic on real PEM files.** `load_certs_and_key_from_files` reads raw file
-bytes and passes them directly to `create_server_config` as if already DER — no `pem`/`rustls-pemfile`
-dependency exists anywhere, despite the function's own doc comment claiming PEM support. Real
-`certbot`/`openssl` PEM output will fail rustls's DER parse, surfacing as a startup `.expect()` panic; only
-the self-signed in-memory fallback (already raw DER) is unaffected. (d) **The TLS accept loop does not use
-`conn_balance`** — confirmed independently by this doc and by Component 01's own direct finding; no
-connection-balancing hookup exists for the TLS listener.
-
-Other findings: `Command::Reset`'s re-auth check diverges from `is_auth_required_for_default` — it only
-inspects `passwords.is_empty()`, ignoring `nopass`/`password_hashes`, so a default user secured only via a
-pre-hashed credential would incorrectly stay `authenticated=true` after `RESET`.
-
-**Full documentation:** [`docs/internal/15_security_tls.md`](15_security_tls.md)
+**Gotchas & open issues**
+- Writes reach persistence and replication only if handled by `encode_command`; non-deterministic operations must log deterministic effects (e.g., `SPOP` logs `SREM`, CRDTs log `CRDT.MERGE`).
+- Experimental command families (`JSON.`, `BF.`, `FT.`, etc.) are gated behind `enable-experimental-commands`; an AOF containing them causes fatal errors on restart if the flag is disabled.
+- Snapshots created via `SAVE`/`BGSAVE` are fuzzy and lack fork isolation; only full-sync transfers and live AOF rewrites provide point-in-time consistency.
+- Replicas never expire keys locally; they hide expired keys from readers until the master explicitly delivers a replicated `DEL` or `HDEL`.
+- Unreadable tiered values spilled to NVMe abort saves, rewrites, and full syncs with errors rather than dropping data.
+- Configuration directives for diskless syncing and compression (`repl-diskless-load`, `rdbcompression`, `aof-use-rdb-preamble`) are ignored; snapshots always use preambles and disk spools.
 
 ---
 
-## Component 16: JSON Document Store & JSONPath Engine
+## 15. Security (ACL & network guards), Memory Allocator & TLS
 
-**Source files:** `src/json.rs` (991 lines) · `Command::Json*` wiring in `src/resp.rs`/`src/connection.rs`/
-`src/router.rs`/`src/shard.rs`/`src/table.rs`/`src/aof.rs`/`src/search.rs`
+> Full reference: [15_security_tls.md](15_security_tls.md) · Main source: `src/acl.rs`, `src/netsec.rs`, `src/tls.rs`, `src/allocator.rs`
 
-**Key data structures.** `JsonStore{docs: HashMap<Bytes, Value>}` — documents are plain `serde_json::Value`,
-never a `RudisValue` variant, so they're invisible to `GET`/`TYPE`/`OBJECT ENCODING`. `PathSegment{Root,
-Field(String), Index(isize), Wildcard, Slice{start,end}}` — no filter-expression (`?(@.price<N)`) support
-anywhere.
+This subsystem provides Redis-compatible access control, network ingress guards, userspace TLS termination, and memory allocator telemetry. At connection accept, network guards verify bind and protected-mode rules, and optional TLS terminates using rustls before wrapping into the unified client transport. On the request path, a process-wide flag (`HAS_CUSTOM_ACL`) lets the `default` user skip ACL lookups entirely until any custom ACL or `requirepass` is configured; otherwise commands pass through NOAUTH gating, command category and subcommand validation, key pattern matching, and channel authorization before reaching execution. Memory telemetry and eviction accounting leverage jemalloc runtime hooks and per-shard collection recycling pools.
 
-**Key algorithm/workflow.** `query_json_path`/`query_json_path_mut` are hand-duplicated breadth-first
-segment-fan-out functions over a `Vec` of current matches. `set_json_path` walks parent segments,
-auto-vivifying: if an intermediate node is the wrong type it is **silently destroyed and replaced** with an
-empty container — no type-check error. `delete_json_path`'s wildcard-last-segment clears the whole container
-rather than deleting elements individually; `Slice` as a last segment is unhandled and silently deletes
-nothing. Mutators split into two groups with inconsistent semantics: `NUMINCRBY`/`NUMMULTBY`/`STRAPPEND`/
-`ARRAPPEND`/`TOGGLE`/`CLEAR` act on **every** matched node, while `TYPE`/`STRLEN`/`ARRLEN`/`OBJKEYS`/
-`OBJLEN`/`ARRPOP` act on **only the first** match.
+**Key structures**
+- `AclManager` — Server-wide ACL registry mapped per listening port in `PORT_ACLS`, managing `AclUser` entries, plaintext `requirepass`, an `acl_log` ring buffer (default capacity 128 via `acllog_max_len`), and pubsub channel defaults.
+- `AclUser` — User authorization profile holding enabled status, SHA-256 password digests (`#<64-hex>`), effective permission bits (`CommandSet`, 8 × `u64` words covering 469 commands), key patterns (`KeyPattern` with `KEY_READ`/`KEY_WRITE` flags), and pubsub channel globs.
+- `COMMANDS` / `CmdInfo` — Static 469-entry table generated from command JSON specs, encoding category bitmasks (21 `CATEGORIES` bits), read/write key permission flags, subcommand index ranges, and the `no_auth` exemption list (`auth`, `hello`, `quit`, `reset`).
+- `CommandSet` — Compact bitset (`[u64; 8]`) representing effective per-command permissions indexed by `COMMANDS`, supporting fast bitwise operations for category expansion and privilege checks.
+- `TlsTransport` — Unified transport wrapping a `monoio::net::TcpStream` and `rustls::ServerConnection`, managing reused ciphertext buffers, early plaintext drainage, and a bounded push channel (`flume`, capacity 4096) for out-of-band monitoring and tracking invalidations.
+- `TlsRuntimeState` — Per-base-port runtime container in `TLS_RUNTIMES` holding certificate chains, private keys, client CA roots, and the active `rustls::ServerConfig`, enabling runtime certificate rotation without server restart.
+- `ProtectedAction` — Action permission enum (`No`, `Yes`, `Local`) controlling execution of sensitive commands (`enable-debug-command`, `enable-module-command`), restricting `Local` operations strictly to loopback peers.
+- `AllocatorStats` / `SmallCollectionArena` — jemalloc memory telemetry wrapper (allocated, active, resident, mapped, metadata bytes) alongside a per-shard lockless container pool (`RudisTable.arena`, capacity 1024) recycling lists, small sets, and small sorted sets.
 
-**Verified findings — `JSON.NUMMULTBY` multi-match handling (flagged check, stale-doc correction).**
-`JSON.NUMMULTBY` now has its **own** standalone `JsonStore` method, `json_nummultby`, structurally identical
-to `json_numincrby` but multiplying, and it correctly handles multi-match wildcard paths — confirmed by an
-in-file unit test asserting `"[20,50,100]"` for `$.items[*].price` doubled from `[10,25,50]`. This reverses an
-earlier characterization: a prior revision composed `JSON.NUMMULTBY` from two separate `json_numincrby` calls
-(read-then-apply-delta), which broke on multi-match wildcard paths because the intermediate read returned a
-bracketed multi-value string that couldn't parse as `f64` — that composition no longer exists, fixed as part
-of commit `784ccb4`.
+**Key algorithms**
+- Authentication & fast-path gate ([§4](15_security_tls.md#4-authentication)) — Connections start unauthenticated if `requirepass` is set or the default user lacks `nopass`; if `HAS_CUSTOM_ACL` is false and the session runs as `default`, per-command ACL checks return immediately without taking locks, while `AUTH` verifies passwords against stored SHA-256 digests via constant-time comparisons.
+- Hierarchical authorization ([§5](15_security_tls.md#5-authorization-rules-and-checks)) — Command execution checks against `COMMANDS`, allowing `NO_AUTH` or `all_commands` immediately, validating specific subcommand bits or container aggregates, and matching first-arg rules for `SELECT`/`DEBUG`; keys demand single-pattern coverage for read/write flags, while channels match globs or literal `PSUBSCRIBE` entries.
+- TLS handshake & pipeline ingestion ([§8](15_security_tls.md#8-tls-srctlsrs-srctransportrs)) — `TlsSession::handshake_monoio` drives non-blocking handshakes under a 10 s timeout; `decrypt_into` repeatedly loops `read_tls`, packet processing, and plaintext draining until all buffered ciphertext is consumed, ensuring pipelined requests arriving behind `Finished` are not lost.
+- Port in-use probing & protected mode ([§7](15_security_tls.md#7-network-guards-srcnetsecrs)) — Startup binds probe sockets without `SO_REUSEPORT` across plain, TLS, and cluster bus ports with a 3 s retry grace period to prevent silently joining zombie sockets; non-loopback connections are rejected with `-DENIED` if protected mode is active and the default user has no password.
+- Dynamic ACL reloads & session revocation ([§6](15_security_tls.md#6-acl-subcommands)) — `load_from_aclfile` performs atomic whole-table configuration swaps from disk, while `ACL DELUSER` and `ACL LOAD` forcefully disconnect active sessions whose identities were removed or disabled.
+- Maxmemory accounting & thread cache purge ([§9](15_security_tls.md#9-memory-allocator-srcallocatorrs)) — Shards read thread-local jemalloc `allocatedp` and `deallocatedp` pointers with sub-nanosecond overhead to track net memory deltas between cron calibrations; post-restore paths invoke `flush_thread_cache` to clear transient thread-cache allocations and prevent premature memory eviction.
+- Out-of-band push multiplexing ([§8.5](15_security_tls.md#85-out-of-band-pushes-pushtarget)) — Clients register either raw socket descriptors (plaintext) or bounded flume queues (TLS, capacity 4096) via `PushTarget`; TLS readers race socket reads against this queue to multiplex asynchronous monitor lines and tracking invalidations without stream corruption.
 
-**Verified findings — `JsonStore` RDB persistence (flagged check, reverses a prior finding).** JSON
-documents **do** survive RDB. `save_extended_rdb_chunk` unconditionally writes every `json_store` entry with
-extended-record type tag `7`, called unconditionally from `save_rdb_chunk`; two independent restore paths
-(`table.rs::load_rdb`/`load_rdb_bytes` and `shard.rs::restore_rdb_chunk`'s tag-7 branch) both decode and
-restore it. This covers both on-disk `SAVE`/`BGSAVE`+restart and a replica's initial full-resync snapshot
-(commit `63437cb`) — reversing a prior finding that JSON had "no relationship" to RDB. However, AOF append and
-incremental replication remain **completely absent** — `aof::command_to_resp` has zero `Json*` arms, so no
-JSON mutation is replayed from AOF or propagated incrementally to replicas, even though `record_change!`
-still increments `DIRTY_CHANGES` and fires `WATCH` correctly (see Component 14).
-
-**Other gaps.** No recursive descent despite a misleading in-code comment — `$..name` silently degrades to
-`$.name` (single-level). `JSON.ARRINSERT`, `ARRTRIM`, `MERGE`, `DEBUG`, `RESP` don't exist anywhere. `JSON.MGET`
-is now properly bucketed/parallel-fanned-out per shard via `Router::json_mget` (fixed since last pass,
-replacing a prior sequential-per-key gap).
-
-**Full documentation:** [`docs/internal/16_json_store.md`](16_json_store.md)
+**Gotchas & open issues**
+- `HAS_CUSTOM_ACL` is a process-wide one-way latch: once set by user modifications or `requirepass`, every server instance in the process permanently incurs the ACL lookup path ([§3.1](15_security_tls.md#31-process-wide-statics-and-the-per-port-registry)).
+- `PING` is not ACL-exempt: while the pre-authentication NOAUTH gate allows `AUTH`, `HELLO`, and `QUIT`, `PING` requires explicit command authorization ([§5.2](15_security_tls.md#52-command-check-can_execute_command_with_first_argname-first_arg)).
+- Port lookup divergence: ACL tables use `router.port` (aliased across cluster shards to the base port via `share_acl_with_port`), whereas protected mode and TLS runtimes key directly on `base_port` ([§10](15_security_tls.md#10-invariants--gotchas)).
+- Client certificate verification defaults to `tls-auth-clients yes`, but silently disables client auth when `tls-ca-cert-file` is missing rather than rejecting connections ([§10](15_security_tls.md#10-invariants--gotchas)).
+- Modifying or disabling users via `ACL SETUSER` takes effect on subsequent commands but preserves existing connections, whereas `ACL DELUSER` and `ACL LOAD` terminate affected sessions ([§10](15_security_tls.md#10-invariants--gotchas)).
+- ACL selectors (`(...)` syntax) and first-arg rules on subcommands (`+cont|sub|arg`) are unsupported, while `sanitize-payload` is parsed and stored but has no effect on restore logic ([§11](15_security_tls.md#11-limitations--not-implemented)).
+- TLS is restricted to client connections: neither replication links (`PSYNC`/`SYNC`) nor cluster bus communication support TLS, and `tls-port` cannot be dynamically reconfigured ([§11](15_security_tls.md#11-limitations--not-implemented)).
 
 ---
 
-## Component 17: Geospatial Commands
+## 16. JSON Document Store & JSONPath Engine
 
-**Source files:** `src/geo.rs` (569 lines — pure algorithm/helper module, no command dispatch) ·
-`Command::Geo*` wiring in `src/connection.rs`/`src/resp.rs`
+> Full reference: [16_json_store.md](16_json_store.md) · Main source: `src/json.rs`, `src/connection.rs`
 
-**Key data structures.** `GeoHashBits{bits:u64, step:u8}` and `GeoHashArea{min_lon,max_lon,min_lat,max_lat}`
-— a variable-precision interleaved geohash grid, distinct from the fixed-26-bit-per-axis codec used for the
-ZSET storage score. `GeoSearchShape{Radius{radius_m}, Box{width_m,height_m}}`. A "geo set" is literally a
-`RudisZSet` whose scores are 52-bit Z-order/Morton geohash integers reinterpreted as `f64` — no dedicated geo
-storage structure exists.
+Rudis provides a RedisJSON-compatible API for storing, reading, and mutating structured JSON documents via JSONPath expressions. In the request path, JSON commands are gated behind `enable-experimental-commands yes` in `build_command`, routed by key to the owning shard thread without locks, evaluated directly against that shard's dedicated `JsonStore` outside the main keyspace table, and on successful write propagate to AOF/replicas and trigger RediSearch re-indexing; multi-key reads (`JSON.MGET`) scatter-gather concurrently across shards via router mailboxes.
 
-**Key algorithm/workflow.** Commit `375b237` replaced an earlier custom "power-of-two-cell interval
-decomposition" algorithm with a line-for-line port of real Redis's `geohash.c`: bit-twiddling neighbor
-stepping, a doubling-radius step-estimation loop with high-latitude precision correction, and
-`calculate_search_areas` (center cell + up to 8 neighbors, trimmed to those overlapping the query box — at
-most 9 cells, always). Each cell maps to a `[min_score,max_score)` ZSET range, letting `execute_geo_query`
-issue a real ordered range query per cell — for `Full`-backed (`BTreeSet`) ZSets this is `O(9*(log n + k))`,
-superseding a prior `O(N)` finding that applied only to the now-removed implementation. Final shape membership
-uses exact spherical geometry (Haversine) for both `Radius` and `Box`; the only approximation (flat-Earth
-`cos(lat)`-style) sizes the candidate-cell search box, never decides final membership, so pruning cannot
-produce false positives.
+**Key structures**
+- `JsonStore` — per-shard document table holding `hashbrown::HashMap<Bytes, serde_json::Value>` outside the main keyspace table; one per shard, not per logical database (counted under DB 0 in keyspace stats).
+- `PathSegment` — enum representing parsed path tokens: `Root`, `Field(String)`, `Index(isize)`, `Wildcard`, and `Slice { start: Option<isize>, end: Option<isize> }`.
+- `Command::Json*` — 16 RESP command variants in `src/resp.rs` representing JSON operations; read-only variants are marked in `Command::is_family_read`, while write variants trigger invalidation and AOF/replica logging.
+- `ShardMessage::JsonMget` — mailbox request variant carrying `Vec<(usize, Bytes)>` (reply position and key), a JSONPath string, and a `flume::Sender` reply channel for cross-shard fan-out.
+- `MAX_SET_INDEX_GAP` — constant `1 << 16` (65,536) in `src/json.rs` capping the maximum null-padding count when indexing beyond the end of an array in `set_json_path`.
+- `TYPE_JSON` — extended type tag constant (100) in `src/digest.rs` used to hash JSON documents during `DEBUG DIGEST` calculations.
 
-**Flagged finding — `GEORADIUS STORE`/`GEOSEARCHSTORE` can write to an invisible key on a different shard.**
-A new, previously undocumented correctness bug: `GEORADIUS ... STORE`/`STOREDIST` and `GEOSEARCHSTORE` write
-their destination key on the shard that owns the **source** key, not the shard owning the destination's hash
-slot. Rudis always partitions the keyspace by CRC16 hash slot regardless of whether `CLUSTER` mode is
-enabled. The `CROSSSLOT` check exists but is gated behind `router.cluster_enabled`, which is **false by
-default** in standalone mode. Shard dispatch (`cmd_primary_key`, `target_shard_of_cmd`) extracts only the
-source key, ignoring `store`/`storedist`/`dest` entirely, and the handler calls `db.zadd(store_dest, ...)`
-directly against the local `ShardDb` of whichever shard owns the source key — no cross-shard forwarding. Net
-effect: in standalone multi-shard mode (the default on multi-core machines), if the destination key hashes to
-a different shard than the source, the write silently lands on the wrong shard's local keyspace partition; a
-later direct lookup of the destination routes to the correct shard by its own hash slot and finds nothing —
-the result is invisible except through further STORE-based commands that happen to route through the source
-shard. In `CLUSTER` mode this is masked by the `CROSSSLOT` rejection. The suggested fix mirrors
-`ZRANGESTORE`, which correctly keys shard routing on `dst`.
+**Key algorithms**
+- **Path parsing (`parse_json_path`)**: Character-scans the path into `PathSegment`s, normalizing `$` and `.` prefixes to `Root`, parsing bracketed indices, slices, or quoted fields without escapes, and falling back to a literal field on unrecognized syntax without returning errors.
+- **Path querying (`query_json_path` / `query_json_path_mut`)**: Evaluates segments breadth-first starting from `root`, expanding `Field` against objects, clamped/negative `Index` or `Slice` against arrays, and `Wildcard` against all children while skipping mismatched types.
+- **Path mutation (`set_json_path`)**: Evaluates existence against NX/XX predicates, auto-vivifies missing intermediate objects (`{}`) or arrays (`[]`) while silently overwriting conflicting scalar types, and appends at most `MAX_SET_INDEX_GAP` nulls when padding arrays ([§4.4](16_json_store.md#44-setting-set_json_path)).
+- **Path deletion (`delete_json_path`)**: Queries all matching parent containers via `query_json_path_mut` and removes target fields or shifted array indices, while wildcard targets (`*`) clear the entire parent container.
+- **Multi-key fan-out (`Router::json_mget`)**: Groups keys by owning shard, evaluates local keys directly, fans out one batched `ShardMessage::JsonMget` per remote shard over bounded flume channels, and scatters replies back into the ordered result array in ~1 round-trip ([§7](16_json_store.md#7-jsonmget--batched-cross-shard-fan-out)).
+- **Change recording and propagation**: On non-empty or successful writes, `record_change!` invalidates client tracking / `WATCH` keys, streams commands to connected replicas, and appends to the shard's AOF buffer.
+- **Snapshot persistence & restore**: Emits JSON documents as extended AUX records in `rudis-ext` (type byte `0x07`) during RDB saves; on load, records are parsed and restored via `insert_raw` filtered by shard key ownership ([§8.1](16_json_store.md#81-rdb-snapshots)).
 
-**Other findings.** `EARTH_RADIUS_IN_METERS = 6372797.560856` (matches real Redis's `D_R`, not WGS84). Mile
-conversion is `1609.34`, confirmed to match real Redis's own table exactly — a prior doc's claim of
-`1609.344` was wrong and is corrected. `GEOADD`'s type-check is delegated entirely to `ZADD` (no explicit
-`WRONGTYPE` check, unlike the other 7 geo commands) — a plain `ZADD` can silently corrupt a geo set, with
-later geo commands decoding garbage coordinates.
-
-**Full documentation:** [`docs/internal/17_geospatial.md`](17_geospatial.md)
+**Gotchas & open issues**
+- **Separate keyspace outside logical databases**: Documents are stored in `JsonStore`, invisible to core commands (`GET`, `DEL`, `KEYS`, `SCAN`, `EXPIRE`); `SELECT` has no effect, and `FLUSHDB` only clears JSON documents when run on database 0 (though `FLUSHALL` always clears it).
+- **Destructive auto-vivification**: `JSON.SET` replaces any existing non-container value encountered along the path with an empty object or array without returning an error.
+- **Partial mutations on error lack persistence & indexing**: If a multi-match mutation fails midway (e.g. `NUMINCRBY` hitting a non-number), earlier modified nodes remain in memory, but because the command returns `Err`, `record_change!` and RediSearch re-indexing are skipped.
+- **First-match vs all-match asymmetry**: Getters (`JSON.TYPE`, `STRLEN`, `ARRLEN`, `OBJKEYS`, `OBJLEN`) and `ARRPOP` operate only on the first matching node, whereas mutators (`NUMINCRBY`, `ARRAPPEND`, `TOGGLE`, `CLEAR`, `DEL`) apply to all matches.
+- **Formatting and type subtleties**: Arithmetic mutations cast via `f64`, losing integer precision above 2^53 and serializing with float decimals; `STRAPPEND` appends raw bytes verbatim without unquoting; and `JSON.GET` returns an array rather than a raw value if the path string contains `*` or `:` ([§5.2](16_json_store.md#52-json_get-and-the-raw-vs-array-rule)).
+- **Unsupported JSONPath syntax fails silently**: Recursive descent (`$..x`) collapses to direct child lookups (`$.x`), filter expressions (`?(...)`) match nothing, and bracket unions or slice steps are not supported.
+- **Experimental command gate & missing commands**: JSON commands are gated under `enable-experimental-commands yes` (default `no`); commands like `JSON.ARRINSERT`, `JSON.ARRINDEX`, `JSON.ARRTRIM`, `JSON.MERGE`, and `JSON.MSET` are not implemented and return unknown-command errors.
 
 ---
 
-## Component 18: Probabilistic Data Structures
+## 17. Geospatial Commands
 
-**Source files:** `src/probabilistic.rs` (417 lines: `BloomFilter`, `CuckooFilter`, `CountMinSketch`,
-`TopK`, `ProbabilisticStore`) · `src/hll.rs` (348 lines, brand-new standalone module: `murmur_hash_64a`,
-`hll_pat_len`, `hll_validate`, `hll_decode_registers`, `hll_encode_sparse`/`hll_encode_dense`,
-`hll_compute_card`, `hll_count`, `hll_add`, `hll_merge`) · `src/table.rs` (`Db::pfadd`/`pfcount`/`pfmerge`,
-legacy `RudisValue::HyperLogLog`)
+> Full reference: [17_geospatial.md](17_geospatial.md) · Main source: `src/geo.rs`, `src/connection.rs`
 
-**Key data structures.** `ProbabilisticStore{bloom_filters, cuckoo_filters, cms_sketches, topk_trackers:
-HashMap<Bytes,_>}`, a separate per-shard field outside the main `RudisTable` keyspace — these are **not**
-`RudisValue` variants. HLL is the opposite: a `PFADD`-created key is an ordinary `RudisValue::String` holding
-real Redis `"HYLL"`-magic byte-format data (`HLL_HDR_SIZE=16`, `HLL_REGISTERS=16384`, `HLL_DENSE_SIZE=16304`,
-`HLL_SPARSE_MAX_BYTES=3000`), fully subject to `EXPIRE`/`DEL`/`RENAME`/`DUMP`/`RESTORE`/replication/generic
-string ops.
+Rudis provides Earth coordinate storage and proximity searching (`GEOADD`, `GEODIST`, `GEOPOS`, `GEOHASH`, `GEORADIUS`, `GEOSEARCH`, and store variants) backed entirely by standard sorted sets without a dedicated data type. Commands parsed in `src/resp.rs` route by source key to the owning shard thread in `src/connection.rs`, which queries the underlying sorted set via score ranges and filters candidates geometrically in `src/geo.rs`.
 
-**Flagged finding (a) — legacy `RudisValue::HyperLogLog` and a confirmed RESTORE byte-leak bug.**
-`RudisValue::HyperLogLog(Box<[u8;16384]>)` is only ever *constructed* via `RESTORE` of a `DUMP` payload with
-type byte `5` — it is legacy-only; every `PFADD`-created key today goes through the new `src/hll.rs` byte
-format instead (Component 05). `PFADD` on an existing legacy value mutates the register array in place
-without ever producing a `"HYLL"` blob. **Confirmed real bug:** once a legacy value exists, `GET`/
-`get_with_hash`/`write_get_resp` return the **raw, unwrapped 16384-byte register array with no `"HYLL"`
-header**, and replication/`MIGRATE` propagation encodes it the same way as `SET key <raw bytes>`. Any
-subsequent `PF*` command against that leaked value then fails validation since it doesn't start with
-`"HYLL"`. Cross-shard `PFCOUNT`/`PFMERGE` fan-out has no legacy-variant handling at all.
+**Key structures**
+- `GeoHashBits` — Variable-precision search cell storing a `bits: u64` interleaved coordinate index and `step: u8` (1..=26 bits per axis; smaller step means coarser cell) [§5.1](17_geospatial.md#51-data-structures).
+- `GeoHashArea` — Bounding rectangle of a grid cell defined by `min_lon`, `max_lon`, `min_lat`, and `max_lat` in degrees.
+- `GeoSearchShape` — Target query shape, either `Radius { radius_m: f64 }` or `Box { width_m: f64, height_m: f64 }` (full dimensions in metres).
+- `GeoItemResult` — Intermediate search hit carrying the member key, distance in metres and optional user unit, raw 52-bit geohash score, and decoded `(lon, lat)` coordinates.
+- `GeoUnit` — Unit enum (`Meters`, `Kilometers`, `Miles`, `Feet`) handling conversions to and from metres (using `1609.34` metres per mile).
+- `RudisZSet` — The underlying sorted-set substrate (`Small` array up to 64 members, `Full` `ZIndex` beyond), storing 52-bit interleaved geohashes exactly within 53-bit `f64` significands [§9](17_geospatial.md#9-storage-substrate-and-complexity).
+- `ZRangeOpts` — Query options specifying half-open score ranges (`min_inc: true`, `max_inc: false`) passed to `ShardDb::zrange` to retrieve candidate members.
 
-**Flagged finding (b) — PFCOUNT estimator.** `hll_compute_card` is re-verified as the **classic/original
-Flajolet et al. (2007) estimator**: raw harmonic-mean `α·m²/Σ2^-M[i]` (`ALPHA=0.7213475204444817`,
-`M=16384.0`), linear counting for small cardinalities, and the large-range correction — explicitly **not**
-the modern histogram/bias-corrected estimator real Redis adopted in 4.0+. For identical register state,
-`PFCOUNT` produces a numerically different estimate than modern Redis.
+**Key algorithms**
+- `encode_geohash` / `decode_geohash`: Projects coordinates onto Mercator limits (`[-180, 180]` lon, `[-85.05112878, 85.05112878]` lat) and interleaves 26 bits per axis into a 52-bit integer score whose reverse decoding returns the cell center [§4.1](17_geospatial.md#41-storage-hash-encode_geohash--decode_geohash).
+- `geohash_to_base32`: Decodes the Mercator score back to coordinates, re-encodes them against standard `[-90, 90]` latitude into 52 bits, and emits 11 base32 characters (the 11th character is always `'0'`) [§4.2](17_geospatial.md#42-geohash-strings-geohash_to_base32).
+- Precision selection: `geohash_estimate_steps_by_radius` repeatedly doubles the query radius until reaching half the Earth circumference (`MERCATOR_MAX`), then adjusts `step` down by 2 (plus latitude pole penalties) to select bounding cell granularity [§5.3](17_geospatial.md#53-choosing-precision-geohash_estimate_steps_by_radiusrange_m-lat).
+- Grid movement: `geohash_move_x` and `geohash_move_y` step one cell horizontally or vertically directly on the interleaved bit patterns using bitmask carry ripples without decoding [§5.2](17_geospatial.md#52-cell-helpers).
+- Candidate cell collection: `calculate_search_areas` derives an approximate query bounding box, generates the center cell plus up to 8 neighbors using bit-twiddling moves, expands precision once if coverage is deficient, and trims exterior cells [§5.5](17_geospatial.md#55-candidate-cells-calculate_search_areasshape-lon-lat---vecgeohashbits).
+- Search execution: `execute_geo_query` maps each unique search cell to a half-open score range `[bits << shift, (bits + 1) << shift)`, scans candidate members with `zrange BYSCORE`, de-duplicates them via a `seen` set, and terminates early on `COUNT ... ANY` [§6](17_geospatial.md#6-running-a-search-execute_geo_query).
+- Exact filtering: `geo_within_shape` decodes each candidate score and tests exact spherical membership using haversine distance for radius queries or meridian/parallel distance checks for bounding boxes [§6.1](17_geospatial.md#61-exact-membership-geo_within_shapeshape-score-lon-lat---optionlon-lat-dist_m).
 
-**Flagged finding (c) — RDB persistence.** Bloom/Cuckoo/CMS/Top-K: real, verified, unchanged —
-`save_extended_rdb_chunk` serializes `bloom_filters` (tag 8), `cuckoo_filters` (tag 10), `cms_sketches` (tag
-11), `topk_trackers` (tag 12), with matching load-path reconstruction; these survive `SAVE`/restart like
-ordinary keys. HyperLogLog: no dedicated RDB tag needed — since a `PFADD`-created key is a plain
-`RudisValue::String`, it rides the generic string-key RDB path.
-
-**Other verified findings.** Cuckoo filter eviction (`MAX_KICKS=500`) is fully deterministic from the
-fingerprint, not RNG-driven, despite informal "random kicks" terminology. Count-Min Sketch uses the standard
-non-conservative update rule. Top-K eviction is an O(k) linear scan, not a heap. `hll_merge` is **dead code**
-— `table.rs::pfmerge` and the cross-shard `PFMERGE` path both reimplement identical decode/max/re-encode logic
-manually instead of calling it. Every mutating `PFADD`/`PFMERGE` pays a full O(16384) decode+re-encode rather
-than real Redis's in-place sparse-opcode patching. `PFDEBUG SIMD`/`PFSELFTEST` are pure RESP stubs — no SIMD
-code exists.
-
-**Full documentation:** [`docs/internal/18_probabilistic.md`](18_probabilistic.md)
+**Gotchas & open issues**
+- Standalone multi-shard cross-slot stores: `GEORADIUS ... STORE` and `GEOSEARCHSTORE` route strictly by source key and write locally to the source shard; if the destination key hashes to a different shard, it becomes inaccessible unless cluster mode is active (which rejects cross-slot keys) or hash tags align them [§11](17_geospatial.md#11-limitations--not-implemented).
+- Non-standard latitude bounds: Input latitudes must strictly fall within `[-85.05112878, 85.05112878]` (Web-Mercator limits); coordinates outside this range are rejected at parse time and during encoding.
+- Differing geohash representations: Stored ZSET scores use Mercator-clipped geohash bits, whereas `GEOHASH` wire output re-projects to standard `[-90, 90]` latitude base32, so integer scores and text geohashes cannot be matched bit-for-bit.
+- Half-open score bounds: Cell score ranges must use `min_inc: true` and `max_inc: false` so that adjacent grid cells neither overlap nor leave gaps in the score space.
+- Asymmetric propagation: `GEOADD` and `GEOSEARCHSTORE` propagate as whole commands to replicas and AOF, whereas `GEORADIUS ... STORE/STOREDIST` propagates decomposed `DEL` and `ZADD` mutations because it lacks an AOF command serializer [§7.5](17_geospatial.md#75-georadius-key-lon-lat-radius-unit-options-and-georadius_ro).
+- Metadata discrepancy: Redis `COMMAND DOCS` metadata reports `BYPOLYGON` support for `GEOSEARCH`, but parsing treats `BYPOLYGON` as a syntax error [§11](17_geospatial.md#11-limitations--not-implemented).
 
 ---
 
-## Component 19: Pub/Sub Messaging Hub
+## 18. Probabilistic Data Structures
 
-**Source files:** `src/pubsub.rs` (987 lines — hub, presence table, glob matcher, RESP frame builders) ·
-cross-shard routing and CRC16 sharded-channel slot resolution in `src/router.rs` · per-connection state
-machine in `src/connection.rs` · inter-shard wire protocol in `src/shard.rs`
+> Full reference: [18_probabilistic.md](18_probabilistic.md) · Main source: `src/probabilistic.rs`, `src/hll.rs`
 
-**Key data structures.** `PubSubHub` (one per shard, owned by `Router.pubsub: Rc<RefCell<PubSubHub>>`):
-`channels`/`patterns`/`shard_channels` plus reverse indices (`client_channels`/`client_patterns`/
-`client_shard_channels`) so disconnect cleanup is O(subscriptions held), not O(all registered state).
-`ShardedPresenceTable`: `channel_stripes: [[AtomicU64; 4]; 16]` and `pattern_presence: [AtomicU64; 4]` (one
-instance per listening port), widened from a single `AtomicU64`/stripe (64-shard ceiling) to 4 words/stripe
-(256-shard ceiling) in commit `3adc495`.
+Provides memory-efficient approximate data structures: RedisBloom-compatible Bloom filters, Cuckoo filters, Count-Min sketches, and Space-Saving Top-K trackers residing in a per-shard side store outside the main keyspace, plus core Redis-compatible HyperLogLog strings stored directly in the main keyspace. Requests are routed by key hash to the owning shard; RedisBloom commands require `enable-experimental-commands yes` and manipulate the shard's `ProbabilisticStore`, whereas `PF*` commands manipulate ordinary string keys decoded and encoded via the `hll` codec.
 
-**Key algorithm/workflow.** Local delivery (`PubSubHub::publish`) runs two passes: exact-channel
-(O(subscribers)) and pattern (O(total registered patterns) — every pattern glob-matched against every
-published channel, no prefix trie). Delivery uses `flume::Sender::try_send` (non-blocking); a full queue
-drops the message for that subscriber silently — at-most-once delivery. Cross-shard fan-out
-(`Router::publish`) delivers locally first, then consults `is_shard_interested` per remote shard candidate and
-dispatches all `ShardMessage::Publish` sends before awaiting any reply. Sharded Pub/Sub (`SPUBLISH`/
-`SSUBSCRIBE`) instead routes by CRC16/XMODEM slot (identical functions to ordinary key routing) directly to
-the one owning shard — no presence-table consultation.
+**Key structures**
+- `ProbabilisticStore` — per-shard container holding four maps (`bloom_filters`, `cuckoo_filters`, `cms_sketches`, `topk_trackers`) indexed by `Bytes` key, stored outside the main keyspace and scoped per shard rather than per database.
+- `BloomFilter` — bit array with `bits: Vec<u64>`, `count: usize`, and `num_hashes` (1–30) using Kirsch–Mitzenmacher double-hashing, capped at `MAX_SKETCH_BYTES = 512 MiB` and defaulting to 1000 items at 1% error (9586 bits, 7 hashes).
+- `CuckooFilter` — fingerprint-based filter supporting deletions via `buckets: Vec<[u16; 4]>` (power-of-two bucket count, ≥ 4) with 16-bit fingerprints and deterministic victim eviction chains up to `MAX_KICKS = 500`.
+- `CountMinSketch` — 2D frequency table (`table: Vec<Vec<u64>>`) of `depth` rows (1–16) by `width` columns (≥ 4) with saturating counter updates and Kirsch–Mitzenmacher hashing, defaulting to `2000 × 5` (80 KB).
+- `TopK` — frequency tracker using the Space-Saving algorithm with `items: HashMap<Bytes, u64>` capped at `k` items (default 50), evicting the minimum-count item on collision with ties broken by ascending byte order.
+- `HyperLogLog` (byte payload) — Redis-compatible 16-byte header (`HYLL` magic, 1-byte encoding, 8-byte cached cardinality with MSB stale flag) followed by either a 12288-byte dense array (`HLL_DENSE_SIZE = 12304`) of 16384 6-bit registers or an opcode-compressed sparse stream capped at `HLL_SPARSE_MAX_BYTES = 3000`.
+- `RudisValue::HyperLogLog` — legacy heap-allocated register array `Box<[u8; 16384]>` from type tag 5 (snapshots/tiering/restore), still understood by `PF*` commands; `GET` returns its raw registers (see gotchas).
 
-**Notable implementation detail — reverses a prior finding.** `glob_match` was rewritten in commit `3ffffce`
-from a simplified two-pointer `*`/`?`-only matcher into a full recursive port of Redis's `stringmatchlen`, now
-supporting `[abc]` membership, `[^abc]` negation, `[a-z]` ranges, and `\`-escapes — the complete real-Redis
-glob grammar. It is case-sensitive only and guards recursion depth from `*`-backtracking at `nesting > 1000`.
-**This directly reverses the prior rollup doc's claim that bracket classes are unsupported — now false.**
+**Key algorithms**
+- *Kirsch–Mitzenmacher Hashing*: Bloom filters and Count-Min sketches generate two 64-bit FNV-1a hashes `(h1, h2)` via `double_hash` and compute the `i`-th index as `(h1 + i * h2) mod size`, avoiding independent hash calculations while remaining strictly deterministic.
+- *Cuckoo Kicking*: If both candidate buckets `i1` and `i2 = (i1 ^ hash(fp)) mod num_buckets` are full, an eviction chain alternates buckets via partial-key cuckoo hashing for up to 500 deterministic swaps; if still unresolved, the last victim is dropped and an error is returned.
+- *Space-Saving Top-K*: When full, `TopK::add` performs an O(k) linear scan for the minimum counter, breaking ties deterministically by lowest byte-order key, evicts it, and admits the new item with the evicted count plus increment.
+- *HyperLogLog Cardinality Estimation*: `PFCOUNT` returns cached cardinality if the MSB is clear; otherwise it decodes all 16384 registers, evaluates Ertl's estimator using iterative series `hll_sigma` and `hll_tau`, and caches the result in-place.
+- *Sparse-to-Dense HLL Transition*: Empty HLLs start as an 18-byte sparse stream; `hll_add` decodes registers, updates the maximum rank, and re-encodes, automatically demoting to 12304-byte dense format whenever any register exceeds 32 or sparse length exceeds 3000 bytes.
+- *Cross-Shard Fan-Out*: For multi-key `PFCOUNT` or `PFMERGE` across shards, cluster mode returns `-CROSSSLOT`, whereas non-cluster mode fetches registers via `router.get`, computes register-wise maximums locally, and writes back merged state via `router.set`.
+- *State Persistence & Replication*: Changes are recorded as issued commands to AOF and replicas (deterministic FNV-1a and eviction rules guarantee identical replays); canonical AOF rewrites export side-store state via binary `*.RESTORE` commands, while RDB saves them as `rudis-ext` tags 8, 10, 11, and 12.
 
-**Verified findings.** For shard IDs ≥ 256, presence-table add/remove calls are silent no-ops while
-`is_shard_interested` unconditionally returns `true` (safe fail-open, zero pruning benefit above 256 shards).
-Once a connection issues `SUBSCRIBE`/`PSUBSCRIBE`/`SSUBSCRIBE`, it is permanently handed to `run_pubsub_loop`
-and can never return to normal command execution, even after unsubscribing from everything — unlike real
-Redis; every command other than the subscribe-mode allowlist is rejected, and RESP3 does not relax this. No
-persistence/replay anywhere — an undeliverable message is simply gone. The per-subsystem doc was checked
-directly for the "`notify_stream` blocking 1ms sleep" finding flagged for cross-verification: **no such
-mention exists anywhere in `19_pubsub.md`** — that finding belongs to Component 06 (`BlockHub::notify_stream`,
-`src/block.rs`, see above), not to this pub/sub subsystem; the two are easy to conflate by name but are
-different functions in different files.
-
-**Full documentation:** [`docs/internal/19_pubsub.md`](19_pubsub.md)
+**Gotchas & open issues**
+- Side-store structures are scoped per-shard, not per-database (`SELECT` is ignored), and are completely invisible to generic key commands (`DEL`, `EXPIRE`, `TYPE`, `SCAN`), memory accounting, and eviction.
+- A full Cuckoo filter drops the last evicted fingerprint after 500 kicks and fails with double-prefixed `-ERR ERR Cuckoo filter is full`, permanently losing an existing item and causing subsequent false negatives.
+- Overwrite semantics are inconsistent across families: `BF.RESERVE` and `CF.RESERVE` reject existing keys, but `CMS.INITBYDIM`, `CMS.INITBYPROB`, and `TOPK.RESERVE` silently wipe and replace existing sketches.
+- Non-cluster cross-shard `PFCOUNT` and `PFMERGE` fetch source keys via `router.get`, which silently drops keys of the wrong type as missing rather than returning `WRONGTYPE`, and logs cross-shard `PFMERGE` writes as `SET`.
+- Legacy `RudisValue::HyperLogLog` values leak unadorned 16384-byte raw register slices without the `HYLL` header through `GET` and canonical AOF rewrites, which `PF*` commands subsequently reject as `ERR_WRONGTYPE`.
+- Decoded structures from `*.RESTORE` bypass constructor bounds clamping (allowing Bloom hashes up to 64 or non-power-of-two Cuckoo bucket counts, which breaks alternate bucket reversibility).
+- `BF.INFO` `count` is approximate because it only tracks `add` operations that flipped at least one clear bit, ignoring additions where all hashed bits were already set.
 
 ---
 
-## Component 20: Agent Memory, LLM Quota & Checkpoints
+## 19. Pub/Sub Messaging Hub
 
-**Source files:** `src/agent.rs` (802 lines) · touchpoints in `src/resp.rs`, `src/connection.rs`,
-`src/shard.rs`, `src/aof.rs`
+> Full reference: [19_pubsub.md](19_pubsub.md) · Main source: `src/pubsub.rs`, `src/router.rs`, `src/connection.rs`
 
-**Key data structures.** Four independent types, no shared base: `AgentMemorySession{session_id, turns:
-Vec<AgentTurn>, id_to_pos, index: Option<HnswIndex>, next_turn_id, active_tokens, compactions}` with
-`AgentTurn{id, role, content, tokens, meta, compacted}` (no length/count cap on `content` or `turns`);
-`LlmQuotaBucket{requests: VecDeque<(Instant,u64)>, reservations: HashMap<u64,(Instant,u64)>,
-next_reservation_id, window_ms}` (default 60,000ms); `AgentCheckpointThread{nodes: HashMap<Bytes,
-AgentCheckpointNode>, order, head_step_id, next_seq}` with `AgentCheckpointNode{step_id, parent_id, seq,
-timestamp_ms, state, metadata}`; `AgentToolRegistry{calls: HashMap<Bytes, ToolCallEntry>}` with
-`ToolCallEntry{input, output, attempt, lease_until, expire_at}` and `ToolClaimState::{Claimed, InProgress,
-Completed}`. All four live as `ShardDb` fields (`agent_memories`, `llm_quotas`, `agent_checkpoints`,
-`agent_tools`), never as `RudisValue` — invisible to `EXPIRE`/`TYPE`/`OBJECT ENCODING`/`KEYS`. Every command
-in this subsystem is single-key, single-shard, routed by the normal CRC16 mechanism — unlike CRDT, nothing
-here fans out across shards.
+Pub/Sub delivers fire-and-forget messages across exact channels, glob patterns, and slot-routed shard channels without keyspace persistence. In Rudis's thread-per-core architecture, client connections transition permanently into a dedicated subscribed-mode loop upon executing a subscription command, bypassing the normal request loop. When publishing, the publisher's shard performs local delivery, consults a node-wide lock-free presence table to broadcast cross-shard messages only to shards hosting listeners, and pushes frames directly into subscribers' byte-bounded outgoing queues.
 
-**Key algorithm/workflow.** `AgentMemorySession::context` does a greedy knapsack-by-recency scan (newest-
-first, stops at the first turn that would overflow `max_tokens`, even if an older smaller one would fit) then
-an episodic-recall pass via `HnswIndex::search_filtered` with an in-graph filter excluding ids already
-selected for the working window — but a *compacted* turn (moved out of the working window, never deleted) is
-always eligible for recall, since compaction intentionally never prunes the HNSW index (lossy for the prompt
-budget, not for retrieval). `compact` flips the oldest N active turns to `compacted: true`, splices in one
-summary turn, and fully rebuilds `id_to_pos` from scratch every call — O(total_turns). `LlmQuotaBucket::
-reserve` is a dual-limit admission check (RPM AND TPM both required) using a two-phase reserve-then-settle
-pattern so a caller knows *before* paying for an LLM call whether it would exceed quota; `window_ms` is not
-fixed at bucket creation — any `reserve` call with an explicit `WINDOW` argument silently overwrites it for
-all future calls. `AgentToolRegistry::claim` is a three-state lease machine (`CLAIMED`/`IN_PROGRESS`/
-`COMPLETED`) specifically designed so a caller that retries a call whose previous attempt already finished
-gets the original cached result instead of re-executing a possibly non-idempotent side effect.
+**Key structures**
+- `PubSubHub` — Per-shard subscription registry holding `hashbrown` maps for exact channels, glob patterns, locally owned shard channels, reverse indices (`client_channels`, `client_patterns`, `client_shard_channels`), client delivery handles (`clients`), RESP3 status (`client_resp3`), and stripe/pattern subscription reference counts.
+- `SubscriberTx` — Clonable delivery handle containing an unbounded `flume::Sender<Bytes>` drained by the connection's writer task and an `Arc<SubscriberState>` tracking queued byte backlog and soft-limit timestamps.
+- `SubscriberState` — Shared synchronization state within `SubscriberTx` containing `queued: AtomicUsize` (backlog bytes), `soft_since_ms: AtomicU64` (timestamp when soft limit was first exceeded), `closing: AtomicBool`, client port, and client ID.
+- `ShardedPresenceTable` — Node-wide interest bitmask shared via `Arc` (keyed by base port in `PRESENCE_TABLES`), holding 16 channel stripe masks (`channel_stripes: [[AtomicU64; 4]; 16]`) and a pattern mask (`pattern_presence: [AtomicU64; 4]`) covering up to 256 shard IDs.
+- `BufferLimit` — Pub/Sub client output-buffer limit (`client-output-buffer-limit pubsub`), defaulting to 32 MiB hard, 8 MiB soft for 60 seconds (`PUBSUB_BUFFER_LIMIT = BufferLimit::new(33554432, 8388608, 60)`).
+- `CURRENT_COMMAND_CLIENT_ID` & `DEFERRED_SELF_PUBSUB` — Thread-locals storing the active client ID and queued frames during `run_pubsub_loop` execution to guarantee a publishing subscriber receives its command reply before self-published messages.
+- `PubsubCleanup` — Drop guard in `run_pubsub_loop` ensuring that when a connection terminates for any reason, local subscriptions are cleared, presence bits are updated, and `ShardMessage::RemoveClientPubSub` is broadcast before socket fd reuse.
 
-**Verified findings — the three flagged questions.** (a) **`LLM.QUOTA.*` state has zero persistence**,
-confirmed three independent ways: the dispatch arms never call `record_change!`; `aof::command_to_resp` has
-zero `Llm*` match arms (no AOF, no BGREWRITEAOF resnapshot); and `save_extended_rdb_chunk` has explicit RDB
-record types for semantic caches (15), agent memory (16), checkpoints (17), and tool registries (18) but
-**no section or record type for `llm_quotas` at all** — a restart, failover, or `DEBUG RELOAD` silently
-resets every quota bucket to empty. (b) **Checkpoint timestamps are non-deterministic across replicas**:
-`AgentCheckpointNode.timestamp_ms` is not a field of the RESP command — it is computed via
-`SystemTime::now()` inside `put()` at execution time, so AOF replay or a replica re-executing the original
-command bytes computes its own `timestamp_ms` that will not match what the primary originally stored/
-returned (`seq` and all other fields do replay deterministically). (c) Other gaps: the episodic-memory HNSW
-index is hard-coded to `VectorMetric::Cosine` with no per-session choice; `AgentToolRegistry` has no `DEL`/
-`CLEAR`/`EXPIRE` command — a `COMPLETE` with no `TTL` caches forever; `estimate_tokens` is a crude
-`content.len().div_ceil(4).max(1)` heuristic that undercounts CJK text. By contrast, `agent_memories`/
-`agent_checkpoints`/`agent_tools` (unlike `llm_quotas`) **do** have full RDB (types 16/17/18) + AOF coverage
-and correctly survive restart/replication.
+**Key algorithms**
+- **Cross-shard publish fan-out ([§4.5](19_pubsub.md#45-cross-shard-operations-srcrouterrs)):** `Router::publish` executes local delivery, queries `ShardedPresenceTable::is_shard_interested` per peer shard (always contacting shard IDs ≥ 256), dispatches `ShardMessage::Publish` using pooled response channels (up to 64 pairs), and aggregates reply counts.
+- **Local delivery & pattern matching ([§4.1](19_pubsub.md#41-glob_match--pattern-matching), [§4.2](19_pubsub.md#42-pubsubhubpublish--local-delivery)):** `PubSubHub::publish` looks up exact subscribers and scans all registered patterns via `glob_match` (recursive, case-sensitive matching with a 1000-frame depth guard), lazily formatting RESP2 (`*3`/`*4`) or RESP3 (`>3`/`>4`) frames and dispatching to `SubscriberTx::deliver`.
+- **Output-buffer limit enforcement ([§4.3](19_pubsub.md#43-subscribertxdeliver--output-buffer-limit)):** `SubscriberTx::deliver` atomically tracks queued backlog; if the hard limit or soft limit duration is breached, it flags the client closing and calls `close_client_over_output_limit` to terminate the socket via `shutdown(SHUT_RDWR)`.
+- **Sharded Pub/Sub routing ([§4.5](19_pubsub.md#45-cross-shard-operations-srcrouterrs)):** `SSUBSCRIBE` and `SPUBLISH` compute the CRC16 hash slot (`key_slot`) and route to the owner shard; remote subscriptions transfer cloned `SubscriberTx` handles so owning shards push `smessage` frames directly without cluster-wide fan-out.
+- **Subscribed connection loop ([§6](19_pubsub.md#6-connection-lifecycle-subscribed-mode-srcconnectionrs)):** On detecting a subscription command in `handle_client`, the connection validates auth/ACL, migrates into `run_pubsub_loop`, and spawns a writer task that coalesces outbound frames into write batches up to 256 KiB (`WRITE_BATCH`).
+- **Synchronous script execution ([§4.5](19_pubsub.md#45-cross-shard-operations-srcrouterrs)):** Lua scripts running `PUBLISH` or `SPUBLISH` invoke `publish_sync` or `spublish_sync`, polling peer shard responses in `collect_publish_counts` for up to `SYNC_PUBLISH_COUNT_WAIT` (1 ms) to prevent inter-shard deadlocks while shard threads are occupied.
+- **Presence maintenance & cleanup ([§4.6](19_pubsub.md#46-subscribe--unsubscribe-bookkeeping-and-cleanup)):** Hubs flip bits in `ShardedPresenceTable` only on 0 ↔ 1 transitions of local stripe or pattern counts; socket closure triggers `PubsubCleanup` to clear local registries, zero presence bits, and broadcast `ShardMessage::RemoveClientPubSub`.
 
-**Full documentation:** [`docs/internal/20_agent_memory.md`](20_agent_memory.md)
+**Gotchas & open issues**
+- **Sticky subscribed mode:** Connections that enter `run_pubsub_loop` never return to the normal request processing loop, even if all subscriptions are removed or the client uses RESP3.
+- **Pattern presence amplification:** A single pattern subscription on any shard sets that shard's bit in `pattern_presence`, forcing all future node-wide `PUBLISH` calls to contact that shard for every channel.
+- **Standalone script `SPUBLISH` slot mismatch:** In standalone multi-shard configurations, synchronous `spublish_sync` in Lua scripts routes via FxHash (`Router::target_shard`), whereas `ssubscribe` routes via CRC16 cluster slot (`target_shard_for_slot`), causing script publishes to miss subscribers.
+- **Command reply limit bypass:** `SubscriberTx::send` enqueues command replies without enforcing buffer limits; accumulated replies can push total queued bytes over the limit, causing subsequent published messages to trigger client disconnection.
+- **No cross-node redirection:** Sharded Pub/Sub relies solely on local slot-to-shard mapping and does not issue cluster `-MOVED` redirects if a shard channel's slot belongs to a remote cluster node.
+- **Remote shard self-delivery ordering:** `DEFERRED_SELF_PUBSUB` only buffers local shard deliveries; publishing via `SPUBLISH` to a shard channel hosted on a remote shard may deliver `smessage` before the `:N` command reply.
 
 ---
 
-## Component 21: MCP Server
+## 20. Agent Memory, LLM Quota & Checkpoints
 
-**Source files:** `src/mcp.rs` (748 lines, full module) · wire parsing in `src/resp.rs` · handler dispatch in
-`src/connection.rs`
+> Full reference: [20_agent_memory.md](20_agent_memory.md) · Main source: `src/agent.rs`, `src/shard.rs`
 
-**Key data structures.** `McpToolDef{name: &'static str, description: &'static str, input_schema:
-serde_json::Value}`. `builtin_mcp_tools()` returns exactly **11** fixed tools (`rudis_kv_get`,
-`rudis_kv_set`, `rudis_semantic_set`, `rudis_semantic_get`, `rudis_vector_add`, `rudis_vector_search`,
-`rudis_agent_memory_add`, `rudis_agent_memory_context`, `rudis_agent_checkpoint_put`,
-`rudis_agent_checkpoint_get`, `rudis_ft_search`). `tools_list_json()` is a pure derived view feeding both
-`MCP.TOOLS` and `MCP.RPC {"tools/list"}`, so the two surfaces can't drift from each other. Three `Command`
-variants: `McpTools`, `McpCall{tool, args_json}`, `McpRpc(Bytes)`. `mcp.rs` imports no `crate::agent`/
-`crate::vector`/`crate::table` — it only constructs `Command` values.
+Rudis provides four independent AI-native stores—agent memory sessions, sliding-window LLM quota governors, checkpoint DAG threads, and idempotent tool registries—keyed by standard Redis keys and stored in per-shard hash maps on `ShardDb`. Commands route synchronously to the key's owning shard thread for lock-free processing; mutating `AGENT.*` commands propagate to AOF and replicas, while RDB snapshots serialize all four stores using extended records.
 
-**Key algorithm/workflow.** `plan_tool_command(tool, args)` translates a tool name + JSON args into a native
-`Command` via a flat `match` (e.g. `rudis_vector_search` → `Command::Vsim{target: VsimTarget::Vector(vector),
-count: count.max(1), ...}` — count 0 silently bumped to 1, never rejected, no upper bound). `MCP.CALL`/
-`MCP.RPC`'s `tools/call` both re-enter `execute_command` recursively (`Box::pin`) with the same `router`/
-`client_id`/`authenticated`/`auth_user` state as the outer call — the only subsystem in this doc series where
-a command handler re-enters the top-level dispatcher rather than calling `execute_local_command` directly
-(contrast Component 13's `redis.call`, which bypasses the ACL gate). This means a tool call inherits real
-per-command/per-key ACL enforcement, correct cross-shard routing, and normal AOF/replication behavior for
-free, at the cost of one extra recursive `execute_command` frame (its own ACL check, command-stat increment,
-and slowlog entry run a second time — one MCP tool call shows up as two distinct executions in
-`COMMAND.STATS`/`SLOWLOG`).
+**Key structures**
+- `AgentMemorySession` — chronological conversation history in `turns: Vec<AgentTurn>`, turn ID lookup `id_to_pos`, and optional `HnswIndex` (M=16, `ef_construction`=64, `ef_search`=32, Cosine metric) tracking `active_tokens`.
+- `AgentTurn` — message unit holding per-session sequential `id` (starts at 1), `role`, `content`, `tokens` (caller-supplied or 4-bytes/token heuristic), optional `meta`, and `compacted` flag.
+- `AgentEpisodeHit` — recall search result containing turn identifiers, role, content, caller metadata, and Cosine similarity `score` clamped to `[0, 1]`.
+- `LlmQuotaBucket` — dual-rate governor holding settled calls `(Instant, tokens)` in a `VecDeque`, active reservations in a `HashMap`, and `window_ms` (default 60,000 ms); limits (`rpm`, `tpm`) are passed per call rather than stored.
+- `AgentCheckpointThread` — parent-pointer execution tree with `nodes` map, insertion-order tracking `order`, `head_step_id`, and sequential counter `next_seq` (starts at 1).
+- `AgentCheckpointNode` — checkpoint record containing `step_id`, unvalidated `parent_id`, thread sequence number `seq`, wall-clock timestamp `timestamp_ms`, payload `state`, and optional `metadata`.
+- `AgentToolRegistry` — map of `call_id` to internal `ToolCallEntry` tracking leases and cached outputs.
+- `ToolCallEntry` — entry holding optional invocation `input`, completed `output`, attempt counter `attempt`, active lease deadline `lease_until`, and cache TTL `expire_at`.
 
-**Notable implementation detail.** `MCP.RPC` implements only 4 JSON-RPC 2.0 methods (`initialize`, `ping`,
-`tools/list`, `tools/call`; anything else returns `-32601 Method not found`) — no `resources/*`, `prompts/*`,
-or batch-request support. `initialize`'s `protocolVersion`/`serverInfo` are hardcoded literal constants, not
-derived from the actual build. Tool-level failures (unknown tool, missing argument, failing underlying
-command) never produce a RESP `-ERR`/JSON-RPC transport error — only a malformed outer payload does; failures
-come back as a successful envelope with `"isError": true`, matching MCP convention.
+**Key algorithms**
+- **Turn ingestion ([§4.1](20_agent_memory.md#41-agentmemorysessionadd))**: Appends an `AgentTurn` with auto-incremented `next_turn_id` and token counts (caller-provided or `ceil(bytes / 4)` heuristic), initializing and inserting into `HnswIndex` on the first vector.
+- **Context retrieval ([§4.2](20_agent_memory.md#42-agentmemorysessioncontext))**: Scans uncompacted `turns` newest-to-oldest until `max_tokens` (default 2048) is exceeded, then optionally queries `HnswIndex::search_filtered` for `recall_k` episodes while filtering out any turn IDs already selected in the recent window.
+- **Turn compaction ([§4.3](20_agent_memory.md#43-agentmemorysessioncompact))**: When active turns exceed `keep_recent`, flags the oldest active turns as compacted, deducts their tokens from `active_tokens`, optionally embeds the summary in HNSW, inserts a `system` summary before kept turns, and rebuilds `id_to_pos`.
+- **Quota reservation ([§4.5](20_agent_memory.md#45-llmquotabucketreserve))**: Evicts entries older than `window_ms`, checks whether active count `< rpm` and committed plus estimated tokens `<= tpm`, and either registers a reservation ID or returns `retry_after_ms` based on the oldest active entry.
+- **Quota settlement ([§4.6](20_agent_memory.md#46-llmquotabucketsettle-and-info))**: Evicts expired entries, removes the reservation ID, appends `(reservation_time, actual_tokens)` to settled requests, and returns `(true, actual - estimated)` or `(false, 0)` if missing/expired.
+- **Checkpoint history traversal ([§4.7](20_agent_memory.md#47-checkpoints-put-get-history))**: Starting from head or target step, walks reverse chronological parent pointers up to `limit` (default 50) nodes with cycle detection, returning nodes in leaf-to-root order.
+- **Tool claiming ([§4.8](20_agent_memory.md#48-tool-leases-claim-and-complete))**: Checks entry state to return cached output if already completed, returns remaining lease milliseconds if active, or increments `attempt` and grants a new lease of `ttl_ms` (default 30,000 ms).
+- **Tool completion ([§4.8](20_agent_memory.md#48-tool-leases-claim-and-complete))**: Stores result `output`, clears any active lease, and sets result cache lifetime `expire_at` (`ttl_ms`, or cached indefinitely if omitted) without verifying caller ownership.
 
-**Verified findings.** The tool catalog (`builtin_mcp_tools()`) and the tool planner (`plan_tool_command`) are
-two independently hand-written descriptions of the same contract with at least one confirmed drift instance:
-`rudis_semantic_set`'s published schema omits a `tokens` property that `plan_tool_command` reads anyway, and
-`rudis_vector_add`'s schema exposes far fewer fields than `Command::Vadd` actually has. `get_req_str` reports
-the identical "missing required string argument" message for both an absent field and a present-but-
-wrong-typed field, masking type errors as missing-field errors. Roughly half of the related `Command` surface
-has no MCP tool at all — no delete/flush/info variants for semantic cache or agent memory, no checkpoint
-history, no tool-lease claim/complete, no LLM quota tools, and only 2 of the ~12 Vector-Set commands are
-exposed. **Stale-doc correction**: an earlier combined `20_ai_native_runtime.md` doc pair described `mcp.rs`
-as exposing 8 different tools and functions (`mcp_tool_definitions()`, `execute_mcp_tool()`,
-`handle_mcp_rpc()`) — none of those names exist anywhere in the current source (verified by grep, zero
-matches); that document described a superseded shape of the module, now replaced by this document plus
-Component 20.
+**Gotchas & open issues**
+- **Isolation & command bypass**: Agent stores ignore standard key commands (`DEL`, `EXISTS`, `TYPE`, `SCAN`), are shared across logical databases without `SELECT` isolation, and clear only on `FLUSHALL` or `FLUSHDB` executed in DB 0.
+- **Asymmetric durability**: Mutating `AGENT.*` commands propagate to AOF and live replicas via `record_change!`, but `LLM.QUOTA.*` commands are never logged or replicated; snapshots save all four stores via extended RDB records 16, 17, 18, and 21.
+- **Out-of-order quota eviction**: Settle attaches the reservation's start timestamp; if settled out of order, older entries behind newer ones stall FIFO eviction until younger entries expire, briefly over-counting usage.
+- **Fixed embedding dimension**: The first vector passed to a session via `ADD` or `COMPACT` permanently locks its `HnswIndex` dimension; subsequent mismatched vectors or query vectors return errors.
+- **Replay drift & rewrite loss**: Replaying AOF commands re-stamps checkpoint wall-clock times and restarts tool leases/TTLs; canonical AOF rewrite renumbers IDs, resets attempt counts, and drops quota buckets entirely.
+- **No granular eviction**: Sessions grow indefinitely until `AGENT.MEM.CLEAR` deletes the whole key, checkpoints cannot be deleted individually, and expired tool entries are only pruned lazily upon subsequent claims.
 
-**Full documentation:** [`docs/internal/21_mcp_server.md`](21_mcp_server.md)
+---
+
+## 21. Built-in Model Context Protocol (MCP) Server
+
+> Full reference: [21_mcp_server.md](21_mcp_server.md) · Main source: `src/mcp.rs`, `src/connection.rs`
+
+The built-in MCP server exposes Rudis subsystems—key-value storage, vector sets, semantic caching, agent memory, and full-text search—to LLM agents as Model Context Protocol tools without needing an external adapter process. Operating directly over RESP connections via `MCP.TOOLS`, `MCP.CALL`, and `MCP.RPC`, it sits between the connection parser and top-level command dispatch, parsing JSON tool arguments, translating them into native `Command` variants, and converting the resulting RESP replies back into standard MCP JSON envelopes.
+
+**Key structures**
+- `McpToolDef` — static metadata describing a registered tool, holding `name: &'static str`, `description: &'static str`, and `input_schema: serde_json::Value` (defining the 11 built-in tools).
+- `Command::McpTools` — argument-less command variant parsed from `MCP.TOOLS` that formats and emits the full 11-tool catalog as a flat RESP array.
+- `Command::McpCall` — command variant holding `{ tool: String, args_json: Bytes }` parsed from `MCP.CALL`, carrying the tool name and raw JSON argument string.
+- `Command::McpRpc` — command variant wrapping a raw JSON-RPC 2.0 payload bulk string (`Bytes`) received via `MCP.RPC`.
+- `SearchOptions` — full-text search configuration struct boxed into `Command::FtSearch` during planning, applying a default `limit` of 10.
+- `SetCondition` — conditional execution enum (`SetCondition::None`) hardcoded when planning `rudis_kv_set` commands.
+
+**Key algorithms**
+- Tool command planning ([§6](21_mcp_server.md#6-the-planner-plan_tool_command)): `plan_tool_command` matches the tool identifier against the 11 catalog entries, validates arguments with `get_req_str` and `parse_f32_vec`, and populates concrete `Command` fields (e.g. mapping `rudis_kv_get` to `Command::Get`) before touching storage.
+- Recursive tool command execution ([§5.2](21_mcp_server.md#52-mcpcall-tool-args_json), [§8](21_mcp_server.md#8-interaction-with-the-rest-of-the-server)): Inside `execute_command_inner`, a planned command is dispatched recursively via `Box::pin(execute_command(...))` using an isolated `sub_out` buffer, evaluating full ACLs, cluster slot ownership, and replica read-only gates under the caller's session context.
+- RESP frame to JSON parsing ([§7.1](21_mcp_server.md#71-parse_resp_frame--resp_bytes_to_json)): `parse_resp_frame` recursively decodes RESP2 and RESP3 frames (simple strings, errors, integers, floats, nulls, arrays, and maps) into `serde_json::Value`; if any unrecognized prefix is encountered, `resp_bytes_to_json` falls back to capturing the raw bytes as text with `is_error` set to false.
+- Result envelope formatting ([§7.2](21_mcp_server.md#72-format_mcp_call_result)): `format_mcp_call_result` packages parsed output into an MCP JSON object containing a single `content` text item, a `structuredContent` payload, and an `isError` flag marked true if the inner command failed or any error frame was present.
+- JSON-RPC 2.0 dispatching ([§5.3](21_mcp_server.md#53-mcprpc-json_rpc_request)): Handled in `MCP.RPC`, which parses JSON envelopes and routes `initialize` (returning protocol `2024-11-05` and server `rudis-mcp 0.1.0`), `ping`, `tools/list`, and `tools/call`, returning JSON-RPC error codes `-32700` for parse failures or `-32601` for unknown methods.
+- Catalog publishing ([§4](21_mcp_server.md#4-the-11-tool-catalog), [§5.1](21_mcp_server.md#51-mcptools)): `builtin_mcp_tools` constructs the static catalog, serialized either as flat RESP key-value arrays (`MCP.TOOLS`) or transformed with `tools_list_json` to `inputSchema` objects inside `{"tools": [...]}` (`MCP.RPC tools/list`).
+
+**Gotchas & open issues**
+- Experimental feature gate: All `MCP.*` commands are disabled by default and rejected as unknown unless the server is started with `enable-experimental-commands yes`.
+- Schema and planner divergence ([§9](21_mcp_server.md#9-invariants--gotchas)): Catalog schemas and planner code are maintained separately without automated cross-checks; `rudis_semantic_get` advertises an unused `k` parameter, while `rudis_semantic_set` accepts an unadvertised `tokens` parameter.
+- In-band error reporting: Inner command errors and planning failures do not produce RESP-level protocol errors or JSON-RPC `error` objects; they return successful outer envelopes with `isError: true`.
+- Raw text parser fallback: Unrecognized RESP3 wire types cause `resp_bytes_to_json` to return the complete raw response buffer as unparsed text with `isError: false`.
+- Arity and parameter clamping: Argument validation applies hardcoded floors such as `px.max(1)` (0 ms becomes 1 ms) and `count.max(1)`, while batch JSON-RPC requests and notifications are unsupported.
+- Double accounting: Recursive dispatch causes both the outer `MCP` command and the inner translated command to be independently billed to client statistics, slowlog entries, and MONITOR streams.
+- Fixed protocol identity: MCP `initialize` reports hardcoded protocol version `2024-11-05`, server name `rudis-mcp`, server version `0.1.0`, and `tools.listChanged: false` regardless of build configuration.

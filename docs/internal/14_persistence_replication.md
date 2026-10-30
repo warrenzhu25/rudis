@@ -1,649 +1,793 @@
-# Component 14: Persistence & Replication Engines (Implementation Deep-Dive & Code Reference)
+# Component 14: Persistence (AOF, RDB snapshots) & Replication
 
-> **Source Files**: `src/replication.rs` (1,404 lines), `src/aof.rs` (3,066 lines — roughly doubled since the last
-> revision of this document, almost entirely inside `command_to_resp` and `rewrite_shard_aof`), plus the RDB
-> save/load machinery in `src/router.rs`, `src/shard.rs`, `src/table.rs`, and the PSYNC/DFLY-FLOW wire handlers in
-> `src/connection.rs`.
-> **High-Level Design Spec**: [`docs/design/14_persistence_replication.md`](../design/14_persistence_replication.md)
-> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
-
-Every claim below was re-verified directly against the current source (2026-09-30) rather than carried forward
-from a prior revision of this document. Several sections correct or update earlier findings — each correction is
-called out explicitly where it occurs.
+> **Source files**: `src/aof.rs`, `src/replication.rs`, `src/snapshot.rs`, `src/redis_rdb.rs`, plus the
+> pieces of `src/router.rs` (save/rewrite/full-sync orchestration), `src/shard.rs` (per-shard RDB
+> serialization, `AofImage`), `src/table.rs` (RDB loading entry point, CRC64, legacy format),
+> `src/connection.rs` (`log_change`, master-side (P)SYNC handlers, `WAIT`, `REPLCONF`) and `src/server.rs`
+> (startup load, AOF flusher, save/rewrite cron).
+> **High-level design spec**: [`docs/design/14_persistence_replication.md`](../design/14_persistence_replication.md)
+> **Consolidated implementation spec**: [`docs/internal/components.md`](components.md)
 
 ---
 
-## 1. Source Module Map & Responsibilities
+## 1. What this subsystem does
 
-| File | Subsystem Role | Key Functions / Structs |
+Rudis keeps its whole dataset in memory, split across shard threads. This subsystem makes that data
+survive a restart and keeps copies of it on other servers:
+
+- **AOF (append-only file)**: every change is written, as a Redis command, to a per-shard log file
+  `appendonly-<shard>.aof`. On restart each shard replays its file. Periodically (or on `BGREWRITEAOF`)
+  the log is compacted into a snapshot plus a short tail.
+- **RDB snapshots**: `SAVE`, `BGSAVE`, the `save <secs> <changes>` schedule and shutdown write the whole
+  dataset to one file (`dump.rdb` by default) in the **Redis/Valkey RDB format**, so the file loads in
+  Redis 7.x / Valkey 8 too. Rudis also loads RDB files written by Redis (versions 1–12) and Valkey.
+- **Replication**: a server can be a **master** that streams every change to **replicas**, Redis-style
+  (`REPLICAOF`, `PSYNC`, PSYNC2 replication ids, partial resync from a backlog, `WAIT`,
+  `min-replicas-to-write`). A replica can itself serve sub-replicas (chained replication). A
+  Dragonfly-style per-shard `DFLY FLOW` stream exists on the master side only.
+
+Users: every client write (through the AOF and replication hooks), operators (`SAVE`, `BGSAVE`,
+`BGREWRITEAOF`, `REPLICAOF`, `INFO persistence/replication`, `ROLE`, `WAIT`), cluster failover (which
+promotes replicas), and startup.
+
+The single most important idea: **one encoder decides what a change looks like on the wire**.
+`aof::encode_command` turns a `Command` into RESP bytes; the AOF and the replication stream both get
+exactly those bytes. A change the encoder can't express reaches neither.
+
+---
+
+## 2. Mental model
+
+```mermaid
+flowchart TD
+    W["Client write, e.g. SET k v"] --> X["execute_local_command on the owning shard"]
+    X --> L["log_change / record_change! macro"]
+    L --> E["AofWriter::append_command: encode_command into the AOF buffer"]
+    E --> B["Shard AOF buffer"]
+    B --> F1["Reply barrier: write_aof_through (everysec/no) or sync_aof (always)"]
+    B --> F2["5 ms flusher task: pwrite, fsync every ~1 s"]
+    F1 --> D["appendonly-N.aof"]
+    F2 --> D
+    E -- "same bytes" --> P["propagate_shard_bytes"]
+    P --> H["ReplicationHub::deliver / append_stream"]
+    H --> BL["ReplicationBacklog ring buffer"]
+    H --> R1["ConnectedReplica pending buffer, writer task, socket"]
+    H --> R2["ShardReplicaFlow queues (DFLY FLOW)"]
+    R1 --> RW["Replica: run_replica_worker applies stream, feeds own backlog and sub-replicas"]
+```
+
+Two more pictures to keep in mind:
+
+- **Offsets.** The replication stream is one byte sequence per replication *history*. Each byte has an
+  offset; `master_repl_offset` is the offset of the last byte. A replica that has applied up to offset
+  `N` asks for `N+1`. If the master still has byte `N+1` in its backlog and the history id matches, it
+  answers `+CONTINUE` and sends the missing bytes (**partial resync**); otherwise `+FULLRESYNC` and an
+  RDB (**full resync**).
+- **No fork.** Redis forks a child to get a point-in-time copy for snapshots. Rudis has no fork;
+  instead shards serialize themselves cooperatively, a few milliseconds at a time between commands, and
+  a few tricks (stream "cuts", pre-images) make the result consistent where it has to be.
+
+---
+
+## 3. The write path: from a command to bytes
+
+### 3.1 `encode_command` / `command_to_resp` (aof.rs)
+
+`encode_command(cmd, buf) -> bool` appends the RESP encoding of a changed command to `buf`, or appends
+nothing and returns `false` if the command has no encoding. `command_to_resp(cmd)` is the allocating
+wrapper (`Option<Vec<u8>>`). Internally `encode_command_inner` is one large `match` over `Command`
+variants with an explicit arm for every write it supports and `_ => None` at the end.
+
+The encoder does not always log the command as typed. It rewrites commands whose replay would not
+reproduce the same state:
+
+| Command as issued | What is logged | Why |
 | :--- | :--- | :--- |
-| `src/replication.rs` | Replication hub, ring-buffer backlog, PSYNC/`SYNC`/DFLY-FLOW state, `WAIT`/`WAITAOF` polling, replica worker | `ReplicationHub`, `ReplicationBacklog`, `ConnectedReplica`, `ShardReplicaFlow`, `run_replica_worker`, `record_mutation`, `wait_replicas` |
-| `src/aof.rs` | AOF writer, RESP re-encoding (`command_to_resp`), replay, rewrite/compaction | `AofWriter`, `AofConfig`, `command_to_resp`, `replay_aof`, `rewrite_shard_aof` |
-| `src/router.rs` | RDB save/load orchestration across shards, `is_saving` guard, atomic-rename write path | `Router::save_rdb`/`bgsave`/`bgrewriteaof`/`perform_save_rdb`/`generate_full_rdb`/`restore_rdb_bytes` |
-| `src/shard.rs` | Per-shard RDB chunk serialization (base table **and** all AI-native/search/probabilistic side-stores) | `ShardDb::save_rdb_chunk`, `save_extended_rdb_chunk`, `restore_ai_native_rdb_record` |
-| `src/table.rs` | Per-key value payload codec (`serialize_val_payload`/`deserialize_val_payload`), the single production RDB-blob parser (`load_rdb_bytes`), CRC64 | `RudisValue`, `crc64`/`crc64_update`, `load_rdb`/`load_rdb_bytes` |
-| `src/connection.rs` | Master-side PSYNC/`SYNC`/DFLY-FLOW stream handlers, `WAIT`/`WAITAOF` command dispatch, the `record_change!` macro that gates AOF+replication for every mutating command handler | `run_master_replica_stream`, `run_shard_replication_flow`, `record_change!` |
+| `SET k v EX 10`, `SET ... PX` | `SET k v PXAT <unix-ms>` | Absolute deadline, so downtime between write and replay doesn't extend the TTL |
+| `EXPIRE` / `PEXPIRE` / `EXPIREAT` family | `PEXPIREAT k <unix-ms>` | Same (helper `unix_ms_after`) |
+| `INCR`, `DECR`, `INCRBY`, `DECRBY` | The same verb as sent (`IncrName` tracks it) | Matches Redis's stream |
+| `SPOP k [n]` | One `SREM k m1 m2 ...` per ≤1024 popped members (issued by the `SPOP` handler) | Popped members are chosen at random |
+| `XCLAIM` / `XAUTOCLAIM` | One `XCLAIM` per claimed or dropped entry, `XGROUP CREATECONSUMER`, and `XGROUP SETID` when needed (`connection::stream_claim_propagation`) | Idle-time filters depend on wall-clock time |
+| `BRPOPLPUSH` / `BLMOVE` | `RPOPLPUSH` / `LMOVE` | Replicas must not block |
+| `CRDT.SET/DEL/INCRBY/SADD/SREM` | `CRDT.MERGE <payload>` of the effect (see §3.4) | HLC timestamps and node ids differ on replay |
+| Key expired by the server | `DEL k` (`replication::log_expired_key`) | Replicas and replays never expire keys themselves |
+| Hash field expired (`HEXPIRE`) | `HDEL k f...` (`replication::log_expired_fields`) | Same, for fields |
+| `HGETDEL` | `HDEL` | Only the deletion matters |
+
+Two fast paths avoid allocations: `AofWriter::append_command` special-cases a plain `SET` without TTL
+(`encode_plain_set`), and most arms write straight into the target buffer using `push_len` / `push_bulk`
+instead of `format!`.
+
+Families covered (non-exhaustive): strings, bitmaps/`BITFIELD` (read-only bitfields return `None`),
+hashes incl. field TTL commands, lists, sets, sorted sets, HyperLogLog, streams incl. consumer-group
+state, `COPY`/`MOVE`/`RENAME`/`RESTORE`, `FLUSHDB`/`FLUSHALL`/`SWAPDB`, `FUNCTION LOAD/DELETE/FLUSH/RESTORE`,
+`SORT ... STORE`, `*STORE` set/zset ops, geo `*STORE`, `FT.CREATE/ALTER/DROPINDEX`, `JSON.*` writes,
+`BF/CF/CMS/TOPK` writes and `*.RESTORE`, vector sets (`VADD`/`VREM`/`VSETATTR`), `SEMANTIC.*`,
+`AGENT.*`, `CRDT.MERGE`/`CRDT.GC`.
+
+**Coverage is test-enforced.** A unit test in `aof.rs` walks the write commands and fails when one is
+neither encoded nor listed in its `PROPAGATED_ELSEWHERE` / `NOT_PROPAGATED` / `NOT_IMPLEMENTED` tables.
+At runtime, a change that can't be encoded calls `aof::note_unpropagated`, which counts it (INFO
+persistence `unpropagated_changes`) and logs one warning per command name.
+
+### 3.2 `log_change` and `record_change!` (connection.rs)
+
+Every mutating handler in `execute_local_command` calls the `record_change!` macro after applying its
+change. The macro does key invalidation for `WATCH`/client tracking, then calls `log_change`:
+
+1. `need_rep = replication::has_connected_replicas(port)` (a relaxed atomic load when replication was
+   never activated).
+2. If the shard has an AOF writer: `AofWriter::append_command(cmd)` encodes **directly into the AOF
+   buffer** and returns where the bytes start. If `need_rep`, those same bytes
+   (`w.buffer()[start..]`) go to `propagate_shard_bytes(port, shard_id, ..)`.
+3. Without an AOF but with replicas: `command_to_resp` and propagate.
+4. Unencodable → `note_unpropagated` (unless the caller passed `warn = false`).
+
+`replication::log_shard_mutation(port, shard_id, aof, make)` is the equivalent for code outside the
+macro (expiry DELs, CRDT effects); `make` builds the command only if there is somewhere to log to. It
+must run on the shard that owns the data, right after the change, so the AOF, the stream and full-sync
+snapshots all see each shard's changes in apply order.
+
+### 3.3 Multi-DB: `SELECT` injection
+
+Logged commands don't carry their DB. Both sinks inject `SELECT`:
+
+- `AofWriter` remembers `current_db`; when `connection::CURRENT_DB` differs it first emits
+  `*2 SELECT <db>` (`emit_select_db`).
+- `ReplicationHub::append_stream` remembers `backlog.stream_db` and prefixes `SELECT <db>` when it
+  changes. `usize::MAX` means "unknown", forcing a `SELECT` before the next command (set after full
+  syncs, promotions and skipped deliveries).
+
+### 3.4 CRDT writes are logged by effect
+
+`CRDT.SET/DEL/INCRBY/SADD/SREM` return `None` from the encoder. Their handler uses
+`record_crdt_effect!`, which still runs `record_change!` (for invalidation, with `warn = false`) and then
+logs `CRDT.MERGE <payload>` holding only the changed state (the register incl. a delete tombstone, the
+whole PN-counter, the added tags, or the tombstoned tags). Merging is idempotent and deterministic, so
+replays and replicas reach the master's state. On a replica (which receives every shard on one stream)
+`Router::execute_replica_command` re-splits a `CRDT.MERGE` by owning shard (`split_crdt_payload`) and
+applies `CRDT.GC <cutoff>` to every shard.
+
+### 3.5 Experimental families and replay
+
+`JSON.`, `BF.`, `CF.`, `CMS.`, `TOPK.`, `FT.`, `SEMANTIC.`, `CRDT.`, `LLM.`, `MCP.`, `XDP.` commands are
+parsed only with `enable-experimental-commands` on (`resp::is_experimental_command_name`); otherwise the
+parser returns `Command::Unknown`. AOF replay treats an unknown command as a fatal error ("Unknown
+command '...' reading the append only file"), so **an AOF containing logged experimental writes does not
+load if the server restarts with the flag off.**
 
 ---
 
-## 2. Data Flow Overview
+## 4. The AOF
 
-```
-                         Write Command (e.g. SET k v)
-                                      │
-                                      ▼
-                    Local ShardDb / RudisTable mutation (instant, in-thread)
-                                      │
-                                      ▼
-        record_change!(cmd) macro (connection.rs) / record_mutation() [replication.rs]
-                                      │
-                    command_to_resp(cmd) → RESP bytes        [aof.rs]
-                         │                        │
-                    Some(bytes)                  None  ──────────────►  NOT written to AOF,
-                         │                                               NOT propagated to replicas
-                         ▼                        ▼                      (see §3.9 — CRDT.* writes
-              AofWriter::append (if Some)   ReplicationHub::propagate    return None here and log a
-                         │                    (per port/shard)           CRDT.MERGE of their effect)
-              5ms flush task in server.rs          │
-              (write_all_at + ~1s fsync)            ├─► backlog.append (1MB ring buffer)
-                                                     ├─► every ConnectedReplica.sender.send (PSYNC path)
-                                                     └─► every ShardReplicaFlow.sender.send  (DFLY FLOW path)
+### 4.1 Files and layout
 
-        ── PSYNC / SYNC reconnect (rudis replica, or any Redis/Valkey-protocol client) ──
-        run_replica_worker: PING → REPLCONF listening-port → REPLCONF capa psync2
-                            → PSYNC <cached_replid> <cached_offset>  (or "? -1" if none cached)
-                                      │
-                     hub.try_partial_resync(replid, offset)?  [master, connection.rs]
-                ┌─────────yes──────────┐              ┌─────────no───────────┐
-                ▼                      ▼               ▼                     ▼
-     "+CONTINUE <replid>\r\n"   backlog.get_diff()   "+FULLRESYNC id off\r\n" generate_full_rdb()
-                └──────────┬───────────┘              └──────────┬───────────┘
-                           ▼                                     ▼
-             apply just the missing bytes            router.restore_rdb_bytes(rdb)
-                           └───────────────┬─────────────────────┘
-                                            ▼
-                            then apply the live command stream
-        (old-style `SYNC` — no PSYNC negotiation — is also accepted: master sends
-         "$<len>\r\n<rdb>" directly, followed by a literal "SELECT 0" command, no
-         FULLRESYNC preamble)
+- One file per shard: `<dir>/appendonly-<shard>.aof`. A shard replays only its own file.
+- `appendonly.shards` (`AOF_SHARDS_MANIFEST`) records the shard count and routing (`hash` for standalone
+  key hashing, `slots` for cluster CRC16 slots), plus `ext_crc` after importing Redis AOF files.
+- A file is either pure RESP commands, or — after any rewrite — an **RDB preamble** (a full Redis-format
+  RDB image incl. `OP_EOF` and CRC64) followed by a RESP tail. Replay detects the preamble by the
+  `REDIS` magic. This matches Redis's `aof-use-rdb-preamble yes` (rudis always writes preambles; the
+  directive is ignored).
 
-        ── DFLY FLOW (Dragonfly-protocol client; NOT what rudis's own replica sends) ──
-        REPLCONF capa dragonfly → master replies replid/"SYNC1"/num_shards/version/0
-        one TCP connection PER SHARD: "DFLY FLOW <replid> <sync_id> <shard_id> [<lsn>]"
-        run_shard_replication_flow: "+OK FLOW <shard_id>\r\n$<len>\r\n<this shard's RDB chunk>\r\n"
-                                      then this shard's live mutation stream
-```
-
-### 2.1 `AofWriter` and `AofConfig` (`src/aof.rs:7-164`)
+### 4.2 `AofWriter` (aof.rs)
 
 ```rust
-#[derive(Clone, Debug)]
-pub struct AofConfig {
-    pub enabled: bool,
-    pub dir: PathBuf,
-    pub fsync_every_sec: bool,
-}
-
 pub struct AofWriter {
-    buffer: Vec<u8>,
-    spare_buffer: Option<Vec<u8>>,   // recycled buffer to avoid a fresh allocation every flush
-    file: Option<std::rc::Rc<monoio::fs::File>>,
+    buffer: Vec<u8>,                 // appended, not yet handed to the kernel
+    spare_buffer: Option<Vec<u8>>,   // recycled flush buffer (kept if <= 4 MB)
+    file: Option<Rc<monoio::fs::File>>,
     path: PathBuf,
-    offset: u64,
+    offset: u64,                     // file offset of buffer[0]
+    current_db: usize,               // DB the file's tail is in (for SELECT injection)
+    inflight: usize,                 // chunks taken by take_flush_chunk, write not finished
+    durable: u64,                    // everything before this offset is fsynced
+    appended_total: u64,             // monotonic byte count, survives rewrites
+    progress: Arc<AofProgress>,      // shared with connections (appended/written/write_error)
 }
 ```
 
-This struct is byte-for-byte unchanged from the prior revision of this document. `AofWriter::open` (line 33)
-creates the directory if needed, opens the file with `monoio::fs::OpenOptions::new().create(true).write(true)`,
-and reads the existing file's length via `metadata()` to initialize `offset` — re-opening an existing AOF on
-restart resumes appending at the correct byte position rather than truncating it. Both `buffer` and any freshly
-allocated `spare_buffer` start at 64KB capacity (`Vec::with_capacity(65536)`).
+`AofProgress { appended, written, write_error }` is published per `(port, shard)` (`aof_progress`), so a
+connection on any thread can tell whether a shard's appended bytes reached the kernel.
 
-`take_flush_chunk` (line 86) swaps the live `buffer` out for either a previously recycled buffer (`spare_buffer`)
-or a fresh 64KB-capacity `Vec`, returning the drained chunk plus the file handle and the byte offset it should be
-written at; `recycle_chunk` (line 78) gives a drained, cleared buffer back for reuse as long as its capacity is at
-most 4MB (preventing one abnormally large write from permanently inflating the buffer pool). `flush()`/`sync()`
-call `take_flush_chunk` once and await the write (and, for `sync()`, an `fsync`) inline. `flush_rc` (line 114) is
-a `Rc<RefCell<Self>>`-taking convenience wrapper around the same logic — it exists in the current codebase but,
-per a full-repo grep, its only callers today are two of `aof.rs`'s own unit tests; the production 5ms flush task
-in `server.rs` (§3.2) calls `take_flush_chunk` directly rather than through `flush_rc`.
+Key operations:
 
-**`appendfsync everysec`/`no` are supported; `always` is rejected.** The config directive sets
-`RudisConfig.appendfsync_every_sec`, which seeds `AofConfig.fsync_every_sec`; the flusher reads a per-port
-live flag (`aof::fsync_every_sec_flag`) so `CONFIG SET appendfsync` applies at runtime. `always` fails config
-loading and `CONFIG SET` because the background flusher can't fsync before replying. AOF
-durability is therefore still a fixed Redis `everysec`-like policy (background flush every 5ms, `fsync` roughly
-every 1 second, §3.2); per-write synchronous `fsync` ("always") and no periodic `fsync` ("no") remain unreachable
-through configuration.
+| Method | What it does |
+| :--- | :--- |
+| `open(path)` | Creates dir and file, resumes at the current file length |
+| `append` / `append_command` | Adds bytes (after a `SELECT` if needed), bumps `appended_total` and `AOF_APPENDS` (only while some server runs `appendfsync always`) |
+| `write_pending_sync` | Blocking `pwrite` of the whole buffer at `offset` when nothing is in flight; on error the buffer stays for a retry |
+| `take_flush_chunk` / `chunk_written` | Hands the buffer out for an async `write_all_at`; a failed chunk is put back in front of the buffer so it is retried, not dropped |
+| `write_through(aof)` | Group commit to the kernel (no fsync): returns once `progress.written >= appended_total` as of the call |
+| `sync_durable(aof)` | Group commit with `sync_data`: returns at once if an earlier fsync already covered the target offset |
+| `swap_after_rewrite` / `swap_after_live_rewrite` | Re-points the writer at a freshly renamed file |
 
-### 2.2 `ReplicationHub`, `ReplicationRole`, `ReplicationBacklog`, `ConnectedReplica`, `ShardReplicaFlow` (`src/replication.rs:5-139`)
+### 4.3 When AOF bytes hit the disk (`appendfsync`)
+
+`appendfsync` accepts `always`, `everysec` (default) and `no`, at startup and via `CONFIG SET`
+(`aof::set_appendfsync`). Flags are per port: `fsync_every_sec_flag(port)` and `fsync_always_flag(port)`;
+the process-wide `APPENDFSYNC_ALWAYS_ANY` keeps the hot path to one relaxed load when nobody uses
+`always`.
+
+1. **Every write, before the reply** (`connection.rs`, per command batch):
+   - `everysec` / `no`: if the batch wrote, `Router::write_aof_through` makes every shard's appended
+     bytes reach the kernel before replying. Its own shard writes directly; other shards normally write
+     when their mailbox empties, so it yields for up to ~50 µs and then sends `ShardMessage::WriteAof`
+     to stragglers. Effect: a process crash (`kill -9`) loses no acknowledged write; only an OS crash can
+     lose up to ~1 s.
+   - `always`: if `AOF_APPENDS` moved during the batch, `Router::sync_aof` fsyncs every shard's AOF
+     (`ShardMessage::SyncAof`, `sync_durable`) before replying.
+2. **Background flusher** (`server::run_shard_worker`): a task wakes every **5 ms**; outside `always`
+   it does `write_pending_sync`, otherwise an async chunk write. Every **200th** tick (~1 s) it calls
+   `sync_data` if the everysec flag is set. Under `no`, rudis never fsyncs on its own.
+
+**Write errors** (e.g. `ENOSPC`) set `AofProgress::write_error`; while any shard of the server is in
+error, `aof_write_misconf` makes write commands fail with `-MISCONF Errors writing to the AOF file: ...`
+(checked in `connection::persistence_misconf`). The first successful write clears it and logs "AOF
+write error looks solved".
+
+### 4.4 Replay at startup (`replay_aof`)
+
+`server::run_shard_worker` replays `appendonly-<shard>.aof` when `appendonly yes` (and then does **not**
+load the RDB — the AOF is authoritative, as in Redis). `replay_aof_inner`:
+
+1. Maps the file read-only (`aof::MappedFile`, `mmap` + `MADV_SEQUENTIAL`) instead of reading it into a
+   heap buffer — page cache isn't counted against `maxmemory` and is reclaimable.
+2. Sets `connection::ReplayingWrites` so nothing expires during the load.
+3. If the file starts with `REDIS`, loads the preamble with `redis_rdb::load_rdb_preamble` (keeping keys
+   whose deadline already passed, so a later `PERSIST` in the tail still finds them) and rebuilds search
+   indexes.
+4. Parses the tail **8 MB at a time** (`TAIL_CHUNK`) with `resp::parse_command_trusted` (which ignores
+   `proto-max-bulk-len`: the file holds data accepted earlier, maybe under a higher limit). Skips
+   `#TS:` annotations from Redis 7. Anything not starting with `*` is corruption.
+5. `MULTI`…`EXEC` blocks are queued and applied at `EXEC`; `DISCARD` drops them.
+6. Each command goes through `apply_aof_command`: `EVAL`/`EVALSHA` (as old Redis AOFs log them) run the
+   script; everything else runs through `execute_local_command` with no AOF (nothing is re-logged).
+7. Errors: an incomplete last command or an unfinished `MULTI` at EOF is truncated away (file
+   `set_len`) when `aof-load-truncated yes` (default), else an error. A malformed command in the middle,
+   or an unknown command, is always an error → the server refuses to start.
+8. Finally `allocator::flush_thread_cache` returns the replay's freed buffers.
+
+### 4.5 Resharding and importing Redis AOFs (`reshard_aof_dir`)
+
+Called once from `main.rs` before the shards start:
+
+1. Removes temp files of interrupted rewrites (`appendonly-*.aof.tmp.*`).
+2. If `appendonly.reshard-in-progress` (`AOF_RESHARD_MARKER`) exists, a previous swap was interrupted:
+   refuse to start, naming the backup dir to restore from.
+3. **Redis AOF import**: if a Redis 7 multi-part manifest (`appendonlydir/appendonly.aof.manifest` or
+   `appendonly.aof.manifest`) or a single `appendonly.aof` is present and its CRC differs from the
+   recorded `ext_crc`, replay those files (base, then incrementals in `seq` order; only the newest may
+   be truncated) into one in-memory `ShardDb`, write canonical commands, split them by owner shard, and
+   swap them in. Refuses if non-empty rudis files exist that weren't imported from them.
+4. **Shard-count change** (e.g. restarting with a different `--threads`, or switching cluster mode):
+   replay every old file into one `ShardDb`, `rewrite_shard_aof_canonical`, split by owner
+   (`split_rewritten_aof_to_shards`; `FT.CREATE` goes to every shard), and swap.
+5. `swap_in_staged_aof`: write the marker, move old files into a backup dir
+   (`aof-reshard-backup-<old>to<new>-<ms>` or `aof-import-backup-<ms>`), move staged files in, write the
+   manifest last, delete the marker.
+
+Canonical form (`write_canonical_aof`) is one command per key or structure: search index definitions
+first, then per-DB key writes (`SET ... PXAT`, `HSET`, `RPUSH`, `SADD`, `ZADD`, `XADD` + group state,
+...), then JSON, vector sets, semantic caches, agent memory/checkpoints/tools, `*.RESTORE` for
+probabilistic structures, and one `CRDT.MERGE` per CRDT item. It exists because RDB preambles can't be
+split by key owner; normal rewrites don't use it.
+
+### 4.6 AOF rewrite (`BGREWRITEAOF`, automatic)
+
+**Trigger.** `Router::bgrewriteaof` takes the server-wide save lock (`is_saving`, a `compare_exchange`;
+shared with `SAVE`/`BGSAVE`), marks `AofRewriteState::begin` before replying, and spawns
+`perform_rewrite_aof`. The cron in `server.rs` (every 100 ms, on shard 0) starts one automatically once
+a second when `auto_rewrite_due(percentage, min_size, current, base)` says so: total AOF size >
+`auto-aof-rewrite-min-size` (default 64 MB) and grown by ≥ `auto-aof-rewrite-percentage` (default 100%)
+over the size after the last rewrite. After 3 consecutive failures, automatic rewrites back off: 60 s,
+doubling per further failure, capped at 1 h (`aof_rewrite_retry_delay_secs`). Manual rewrites are never
+delayed.
+
+**Order.** `rewrite_all_shard_aofs` first `sync_aof()`s, rewrites the local shard, then sends
+`ShardMessage::RewriteAof` to the other shards **one at a time** to avoid concurrent I/O and memory
+spikes. On success the new total size becomes the growth base.
+
+**Per shard: `rewrite_shard_aof_live`** — a forkless incremental rewrite:
+
+1. **Start (synchronous).** Build an `AofImage` (a point-in-time RDB image of the shard, built lazily),
+   install it on the thread, and record a `RewriteMark { file_pos, logical, db }`: where in the old AOF
+   the tail after this instant starts.
+2. **Build.** Loop: `img.step(db, RDB_SAVE_STEP /*1 ms*/, IMAGE_FLUSH_BYTES /*4 MB*/)` serializes a few
+   table segments, sends finished pieces to an `aof-rewrite` thread (`spawn_image_writer`, which writes
+   to `appendonly-<n>.aof.tmp.<pid>_live<k>`, computes the CRC64 and fsyncs), then yields to the shard's
+   other work.
+3. **Staying point-in-time.** While the image is installed, every command first calls
+   `aof_image_before_command` → `shard::before_write`: the first write to a key the walk hasn't reached
+   writes that key's *unchanged* state into the image, and the walk skips it later. Changes an image
+   can't follow (`SWAPDB`, a full resync replacing the dataset) call `poison_aof_image`, and the rewrite
+   falls back to one blocking pass (`rewrite_and_swap_shard_aof`, counted in `LIVE_REWRITE_FALLBACKS`).
+4. **Catch up** (`catch_up_and_swap`). Re-open the live AOF through `/proc/self/fd/<fd>`, emit a
+   `SELECT` if the mark's DB isn't 0, then copy what the old file received since the mark, 4 MB
+   (`TAIL_COPY_BYTES`) per step between commands, until less than 1 MB (`TAIL_SYNC_BYTES`) remains.
+5. **Switch (synchronous).** With no chunk in flight: write the writer's pending buffer, copy the last
+   bytes, fsync, `rename` over `appendonly-<n>.aof`, fsync the directory (`sync_parent_dir`), and
+   `swap_after_live_rewrite`. No command runs in between, so no write is lost or doubled.
+
+The resulting file = RDB image of the shard at the start + every command logged since. The image holds
+everything a snapshot holds, function libraries included.
+
+The blocking variant `rewrite_shard_aof` (used for fallbacks and right after a replica loads a full
+sync) writes the same image in one pass, via `write_rewritten_aof` and `ImageFileWriter`
+(1 MB `BufWriter` + running CRC64).
+
+**Example.** A shard holds `a=1`. Rewrite starts (mark at file offset 1000). A client runs
+`APPEND a x` before the walk reaches `a`: `before_write` writes `a=1` into the image first, then
+`APPEND a x` is logged to the old file at offset 1000+. Catch-up copies that `APPEND` after the image.
+Replay: load `a=1`, apply `APPEND a x` → `a=1x`, the same as memory.
+
+---
+
+## 5. RDB snapshots
+
+### 5.1 Format (`redis_rdb.rs`)
+
+Rudis writes **RDB version 11** (`RDB_VERSION`, Redis 7.0–7.2 / Valkey 7.2–8.1) and reads versions 1–12
+(`MAX_RDB_VERSION`). A file:
+
+```
+"REDIS0011"
+AUX redis-ver=7.2.4, redis-bits=64, ctime, used-mem, aof-base=0, rudis-ver   (write_file_header)
+OP_FUNCTION2 <library code> ...                                              (function libraries)
+SELECTDB 0
+[RESIZEDB per DB]                                    (SAVE/BGSAVE only)
+records: [OP_EXPIRETIME_MS <u64 ms>] <type byte> <key> <value> ...
+AUX "rudis-ext" <legacy-format records>              (state Redis can't encode)
+[SELECTDB n ... records for DBs 1..n] [SELECTDB 0]
+AUX repl-stream-db, repl-id, repl-offset             (write_repl_aux, when known)
+OP_EOF (0xFF), CRC64 (u64 LE)
+```
+
+Values use plain (non-compact) Redis types: strings as `RDB_TYPE_STRING` (integer-encoded when they fit
+32 bits, never LZF-compressed), lists `TYPE_LIST`, sets `TYPE_SET`, sorted sets `TYPE_ZSET_2`, hashes
+`TYPE_HASH`, HyperLogLogs as dense `HYLL` strings, streams as `TYPE_STREAM_LISTPACKS_3` (incl. groups,
+PEL, consumers). On read, all compact encodings (ziplist, listpack, intset, zipmap, quicklist, LZF
+strings, Redis 7.4 hash-field-TTL types) are decoded; module data (`OP_MODULE_AUX`, module types) is
+rejected.
+
+**`rudis-ext` AUX field.** State with no Redis encoding is written as rudis **legacy-format records**
+(`[u32 LE key len][key][type byte][payload]`) inside an AUX field named `rudis-ext` (`EXT_AUX_KEY`).
+Redis/Valkey skip unknown AUX fields, so the file still loads there (without that state).
+
+| Legacy type byte | Contents | Source |
+| :-: | :--- | :--- |
+| 7 | JSON document (serialized text) | `json_store` |
+| 8 / 10 / 11 / 12 | Bloom / Cuckoo / Count-Min Sketch / Top-K | `probabilistic_store` |
+| 9 | Vector-set node (index, metric, raw f32 vector, flags, quantization, M, attributes) | `vector_indexes` |
+| 13 | CRDT state of the whole shard, under key `__rudis_crdt_sync__` | `crdt_store.export_sync_payload()` |
+| 14 | Hash field deadlines (incl. already-passed ones) | `hash_field_expires` |
+| 15 | Semantic cache (dim, counters, entries with vectors) | `semantic_caches` |
+| 16 / 17 / 18 | Agent memory session / checkpoint thread / tool-call registry | `agent_memories`, `agent_checkpoints`, `agent_tools` |
+| 19 | Stream IDMP / XNACK state (`EXT_TYPE_STREAM_EXTRAS`) | streams with `stream_has_extras` |
+| 20 | Search index definition as its canonical `FT.CREATE` (`EXT_TYPE_SEARCH_INDEX`) | `search_indices` |
+| 21 | LLM quota bucket | `llm_quotas` |
+
+Search-indexed documents are ordinary keys; indexes are rebuilt after the load
+(`rebuild_search_indices`). Loading tag 13 merges only the keys the loading shard owns.
+
+`DUMP` payloads use the same value encoding plus the RDB version and CRC64 (`dump_value`); streams with
+extras are dumped in the legacy format so cross-shard moves keep that state.
+
+### 5.2 Per-shard serialization (shard.rs)
+
+`ShardDb::save_rdb_chunk(buf)` writes one shard's records **without** file header or EOF: DB 0's
+entries, then `save_extended_rdb_chunk` (the `rudis-ext` field), then other DBs after their
+`SELECTDB`. Details:
+
+- **Tiered values** (spilled to NVMe, `RudisValue::Tiered`) are read back with `hydrate_tiered` and
+  written in their real type. If the read fails, the save **fails** (`TieredReadError`); keys are never
+  silently dropped. After a restore they are ordinary hot keys.
+- **Expired keys** are skipped unless `replication::snapshots_keep_expired(port)` (a master with an
+  active backlog keeps them, because their `DEL` may not have been propagated yet; the load then drops
+  them and `propagate_expired_on_load` feeds the `DEL`s into the backlog).
+- `RudisTable::save_rdb_chunk` / `restore_rdb_chunk` in `table.rs` are the old legacy-format codec,
+  kept for loading old files and exercised only by tests.
+
+### 5.3 SAVE, BGSAVE, the `save` schedule, shutdown
+
+All four funnel into `Router::perform_save_rdb(dirty_before)`:
+
+1. Take `is_saving` (server-wide, `snapshot::is_saving(port)`), call `SnapshotState::begin` (returns the
+   change count it will cover), `sync_aof()`.
+2. `write_rdb_file`: spawn an `rdb-writer` thread that receives pieces through a **rendezvous channel**
+   (`flume::bounded(0)`), writes them through a 1 MB `BufWriter` to `temp-<pid>-<n>.rdb`, keeps a
+   running CRC64, appends `OP_EOF` + CRC, fsyncs, renames over `dbfilename` (default `dump.rdb`), and
+   fsyncs the directory. CRC and disk I/O stay off the shard threads.
+3. `produce_rdb_chunks`: send `RESIZEDB` hints, then stream the local shard with
+   `shard::save_rdb_chunk_yielding` (1 ms steps, ~4 MB pieces, yielding between steps), then each other
+   shard in turn via `ShardMessage::StreamRdbChunk`. Shards never interleave.
+4. Replication AUX fields are appended only if `repl_history_for_save()` returns the same value before
+   and after serializing (on a replica, read under the apply token, §6.6), i.e. the data matches that
+   history.
+5. Clear `is_saving`, then `SnapshotState::finish(dirty_before, ok)`.
+
+`FLUSHALL` during a save sets `connection::RDB_BGSAVE_ABORTED`; the save fails with "save aborted by
+FLUSHALL".
+
+**`snapshot.rs` bookkeeping** (keyed by base port):
+
+| Item | Meaning |
+| :--- | :--- |
+| `SnapshotState` | `last_save_unix`, `last_attempt_unix`, `dirty_at_last_save`, `last_save_ok`, `in_progress` (LASTSAVE, INFO) |
+| `note_write` / `note_changes(n)` | Change counter, sharded over 256 cache-line-aligned slots (`WRITES`) so shards don't contend |
+| `save_due(points, now)` | `save_point_reached`: some point has ≥`changes` writes and ≥`secs` since the last success; after a failure wait `SAVE_RETRY_DELAY_SECS` (5 s) |
+| `any_save_failing` / `SAVES_FAILING` | Drives `stop-writes-on-bgsave-error`: with save points set, writes get `-MISCONF ... unable to persist to disk` |
+| `AofRewriteState` | Rewrite in-progress/last status, count, consecutive failures, `base_size` |
+
+The cron in `server.rs` checks every 100 ms (skipping while a save or rewrite runs) and calls
+`bgsave()` when `save_due`. `save_before_shutdown` (SHUTDOWN and SIGTERM) first quiesces clients, waits
+for a running BGSAVE, then `save_rdb`; on failure the server keeps running.
+
+**Consistency.** A `SAVE`/`BGSAVE` is a **fuzzy snapshot**: shards are serialized one after another,
+and within a shard keys are written as they are when their segment is reached. Every key that exists
+for the whole save is written; a key moved by a segment split is written once (`WrittenPatterns` skips
+already-covered segments).
+
+### 5.4 Loading an RDB
+
+- **Startup** (`server.rs`, only when AOF is off): every shard maps the same file
+  (`table::load_rdb` → `load_rdb_bytes`) and keeps only the keys it owns (`LoadCtx::owns`). Shard 0
+  loads function libraries and, if `repl-id`/`repl-offset` AUX fields are present, calls
+  `ReplicationHub::restore_saved_history` (§6.7).
+- **Format detection** (`redis_rdb::classify`): a file starting `REDIS0011` + `SELECTDB 0` with no AUX
+  fields is *ambiguous* (Redis format, or an older rudis legacy file). It is loaded as Redis format in
+  strict mode (empty keys/collections are errors) and, on failure, flushed and loaded as legacy format.
+- CRC64 is verified (a stored 0 means "no checksum"); data after `OP_EOF` is an error; keys in a DB ≥
+  `databases` are an error.
+- Already-expired keys are dropped and recorded (`record_expired_on_load`) for INFO and
+  `propagate_expired_on_load`.
+
+---
+
+## 6. Replication
+
+### 6.1 Core types (replication.rs)
 
 ```rust
 pub enum ReplicationRole {
-    Master { replid: String, replid2: String, second_offset: i64 },
-    Slave {
-        master_host: String,
-        master_port: u16,
-        link_status: String,          // "connecting" | "up" | "down"
-        master_repl_offset: u64,
-        master_replid: String,
-        sync_in_progress: bool,
-    },
+    Master,
+    Slave { master_host: String, master_port: u16,
+            link_status: String /* "up" | "down" */, sync_in_progress: bool },
 }
-
-pub struct ReplicationHub {
-    pub port: u16,
-    pub role: RwLock<ReplicationRole>,
-    pub master_replid: String,
-    pub master_repl_offset: AtomicU64,
-    pub is_slave_atomic: AtomicBool,
-    pub has_replicas: AtomicBool,
-    pub backlog_active: AtomicBool,          // keeps the backlog live even with zero replicas
-    pub backlog: RwLock<ReplicationBacklog>,
-    pub replicas: RwLock<HashMap<u64, Arc<ConnectedReplica>>>,   // PSYNC/SYNC sessions
-    pub cancel_sync: RwLock<Option<flume::Sender<()>>>,
-    pub shard_flows: RwLock<HashMap<usize, HashMap<u64, Arc<ShardReplicaFlow>>>>, // DFLY FLOW sessions
-    pub has_shard_flows: AtomicBool,
-}
-
-pub struct ReplicationBacklog {
-    pub buffer: Vec<u8>,       // fixed size: max_size bytes, allocated once
-    pub write_idx: usize,      // next write position, wraps modulo max_size
-    pub len: usize,            // logical bytes currently retained (<= max_size)
-    pub max_size: usize,       // 1MB, hardcoded in ReplicationHub::new (line 164)
-    pub first_byte_offset: u64,
-}
-
-pub struct ConnectedReplica {
-    pub id: u64,
-    pub sender: flume::Sender<Vec<u8>>,
-    pub listening_port: AtomicU64,
-    pub ack_offset: AtomicU64,
-    pub last_ack_time: AtomicU64,
-}
-
-pub struct ShardReplicaFlow {
-    pub client_id: u64,
-    pub shard_id: usize,
-    pub sender: flume::Sender<Vec<u8>>,
-    pub lsn: AtomicU64,        // per-flow byte counter, incremented by every propagated write
-    pub ack_lsn: AtomicU64,
+pub struct ReplIds {
+    pub replid: String,       // current history id (a replica's == its master's)
+    pub replid2: String,      // previous history, NULL_REPLID ("000...0") if none
+    pub second_offset: i64,   // first offset replid2 does NOT cover, -1 if none
 }
 ```
 
-All five struct definitions and the 1MB (`1024 * 1024`) backlog constant (`ReplicationHub::new`, line 164) are
-unchanged from the prior revision of this document — `replication.rs` grew by only ~46 lines overall (1,358 →
-1,404), and every field above was re-diffed against the current file.
+Replication ids are 40 hex chars from `new_replid()` (fxhash of time, a sequence number and the pid —
+unique, not cryptographic). The id and offset are **not** part of the role: masters and replicas both
+have a history (PSYNC2), and a replica adopts its master's.
 
-`replid` (both the hub's own `master_replid` and the one stored per-role) is still generated via
-`fxhash::hash64` over the port and the current timestamp in nanoseconds, formatted as a 40-hex-character string
-(`format!("{:016x}{:016x}{:08x}", h1, h2, port)`, `ReplicationHub::new`, lines 143-150) — a real, practically-unique
-identifier, but not cryptographically derived the way Redis's own run-id generation is.
+`ReplicationHub` — one per server (`get_replication_hub(port)`), the important fields:
 
-**`ReplicationBacklog` is still a genuine fixed-capacity ring buffer** (`append`/`get_diff`, lines 67-123):
-`ReplicationBacklog::new(max_size)` preallocates `vec![0u8; max_size]` once; `append` writes at `write_idx` with
-wraparound via two `copy_from_slice` calls when needed, and `first_byte_offset` is recomputed from the current
-master offset and retained length after every append.
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `role` | `RwLock<ReplicationRole>` | Master or replica of `host:port` |
+| `ids` | `RwLock<ReplIds>` | History ids; changed only under the backlog lock |
+| `master_repl_offset` | `AtomicU64` | Offset of the last stream byte |
+| `backlog` | `RwLock<ReplicationBacklog>` | Ring buffer; **its write lock orders everything** |
+| `replicas` | `RwLock<HashMap<u64, Arc<ConnectedReplica>>>` | PSYNC/SYNC replicas by client id |
+| `shard_flows` | `RwLock<HashMap<usize, HashMap<u64, Arc<ShardReplicaFlow>>>>` | DFLY FLOW sessions |
+| `is_slave_atomic`, `has_replicas`, `backlog_active`, `replication_active`, `has_shard_flows` | `AtomicBool` | Hot-path flags |
+| `cached_master` | `AtomicBool` | "We hold a history we can ask to continue" (Redis's cached master) |
+| `psync_holes` | `Mutex<Vec<(u64,u64)>>` | Offset ranges where partial resync would be wrong (§6.4) |
+| `apply_token` | bounded(1) channel | Held while a replica applies a batch or a snapshot is taken (§6.6) |
+| `cancel_sync`, `sync_conn`, `worker_exit` | — | Stop/interrupt/await the replica worker |
+| `loading` | `AtomicBool` | Loading a full sync: data commands get `-LOADING` (`is_loading`) |
+| `pending_peers` | `Mutex<HashMap<u64, PendingPeer>>` | `REPLCONF` details seen before PSYNC (port, ip, `capa eof`); capped at 4096 |
+| `no_replicas_since` | `AtomicU64` | Start of the `repl-backlog-ttl` countdown |
+| `replica_selected_db` | `AtomicUsize` | DB of the incoming stream (kept across `+CONTINUE`) |
+| `suppress_propagation` | `AtomicUsize` | Cross-shard composite ops propagate one logical command |
+| `replica_priority`, `announce_ip`, `announce_port`, `last_master_io_secs` | — | `replica-priority`, `replica-announce-*`, INFO |
 
-**`propagate` still backlogs independently of whether any replica is currently connected** (`backlog_active` vs.
-`has_replicas`, lines 394-454) — this is what makes partial resync work for a replica that fully disconnected and
-later reconnects within the 1MB window.
+Process-wide switches: `HAS_ACTIVE_REPLICATION` (false until a replica, a flow or a history activates
+replication — then `propagate_*_bytes` is a single relaxed load), and the thread-local
+`PROPAGATION_SUPPRESSED` (`SuppressPropagation` guard, used e.g. by `DEBUG LOADAOF`).
 
-**`propagate` still reaches both PSYNC/`SYNC` replicas and DFLY-FLOW sessions in one call**; `propagate_shard`
-(the shard-scoped variant used when the caller knows which shard produced the mutation) only fans out to
-`ShardReplicaFlow`s registered for that specific `shard_id`, but still appends to the one shared backlog and still
-fans out to every `ConnectedReplica` regardless of shard (lines 456-512) — replicas receive the interleaved,
-globally-ordered mutation stream from every shard on one PSYNC connection; DFLY-FLOW clients receive one
-shard-scoped stream per TCP connection.
+### 6.2 The backlog (`ReplicationBacklog`)
+
+| Field | Meaning |
+| :--- | :--- |
+| `buffer` | Ring storage; grows on demand up to `max_size` before wrapping |
+| `write_idx` | Next write position |
+| `len` | Bytes retained (≤ `max_size`) |
+| `max_size` | `repl-backlog-size`, default 1 MB, minimum 16 KB; `set_repl_backlog_size` resizes live keeping the newest history |
+| `first_byte_offset` | Offset of the oldest retained byte |
+| `stream_db` | DB the stream last `SELECT`ed (`usize::MAX` = unknown) |
+
+`can_partial_sync(target, current)` is true when `target <= current+1` and either the backlog is empty
+and `target == current+1`, or `target >= first_byte_offset`. `get_diff` copies `current+1-target` bytes
+out of the ring. `repl-backlog-ttl` (default 3600 s, 0 = never): once no replica has been connected for
+that long, the backlog is cleared at the next partial-resync attempt.
+
+The backlog is fed even with no replica connected (`backlog_active`), so a replica that reconnects
+within the window resyncs partially.
+
+### 6.3 Delivering a change (`deliver` / `append_stream`)
+
+`propagate(bytes)` / `propagate_shard(shard, bytes)` → `deliver`:
+
+1. Return unless this server is a master (replicas never forward their own writes).
+2. `append_stream(shard, bytes, from_master=false)` under the **backlog write lock**:
+   1. Re-check the role (role switches take the same lock).
+   2. Prefix `SELECT` if the command's DB ≠ `stream_db` (not for `PING` or an explicit `SELECT`).
+   3. `master_repl_offset += len`; append to the backlog.
+   4. For each replica, by its `delivery(shard)`: `Send` → `append_pending` (its output buffer);
+      `Buffer` → `append_pre` (full-sync cut, §6.4); `Skip` → nothing.
+3. After releasing the lock: wake each replica's writer task (a data-less message on `sender`; wakeups
+   coalesce through `wake_queued`), drop the link of overflowed replicas, remove dead ones.
+4. DFLY flows of that shard (or all, for `propagate`) get `try_send` on a bounded(4096) queue; a full
+   queue drops the flow's socket instead of blocking the shard.
+
+Because offset, backlog and every replica buffer are updated under one lock, every replica and the
+backlog see the same byte order — an offset names the same byte for all of them.
+
+**`ConnectedReplica`** holds `pending` (bytes not yet taken by the writer), `inflight` (bytes being
+written), `ack_offset`, `last_ack_time`, `listening_port`, `ip` / `announced_ip`, `full_sync:
+Option<FullSyncCut>`, and flags `overflowed` / `disconnected`. Its buffers are checked against
+`client-output-buffer-limit replica` (hard limit, or soft limit for N seconds; checked only above
+64 KB): breaking it sets `overflowed` and the link is dropped (`drop_link` = `shutdown(2)` on the
+registered fd). Replica buffers are counted in `shard::SYNC_IMAGE_BYTES` and excluded from `maxmemory`.
+
+Masters PING replicas every `repl-ping-replica-period` (default 10 s) through the stream
+(`ensure_pinger`).
+
+### 6.4 Full resync on the master: the stream cut
+
+Without a fork, each shard serializes at a different moment, yet the replica needs "snapshot + exactly
+the changes after it". `FullSyncCut` solves this:
+
+```rust
+pub struct FullSyncCut {
+    armed: Vec<AtomicBool>,   // one per shard: has this shard serialized yet?
+    all_armed: AtomicBool,    // snapshot phase over
+    pre: Mutex<Vec<u8>>,      // changes from armed shards, sent right after the snapshot
+}
+```
+
+Algorithm (`register_full_sync_replica`, `arm_full_sync`, `finish_full_sync`):
+
+1. Register the replica with a cut **before** any shard serializes (refused with `-NOMASTERLINK` on a
+   replica whose own link is down).
+2. Each shard serializes its part and, on its own thread in the same step, arms its flag. Since a
+   shard applies and replicates its changes on its own thread, everything it replicated before arming
+   is in its snapshot and everything after is not.
+3. Meanwhile `delivery()` routes a change from a not-yet-armed shard to `Skip` (it's in the snapshot),
+   from an armed shard to `Buffer` (into `pre`), and from an unknown shard (`propagate`, e.g. PING) to
+   `Buffer`.
+4. `finish_full_sync`: take `pre`, set `all_armed`, and announce offset
+   `start = master_repl_offset - pre.len()`. The replica receives snapshot, then `pre`, then the live
+   stream, so its offset matches the master's.
+5. `pre` was ordered differently from the backlog, so `[start, offset)` is recorded in `psync_holes`;
+   `try_partial_resync` refuses offsets inside a hole.
+
+**Worked example (2 shards).** Offset is 500. Replica R registers. Shard 1 serializes and arms. A
+client writes `SET b 1` (shard 1, 30 bytes) → offset 530, buffered in `pre`. A client writes `SET a 1`
+(shard 0, 30 bytes) → offset 560, skipped for R (shard 0 not armed; it will be in shard 0's snapshot).
+Shard 0 serializes (`a` included) and arms. `finish_full_sync` returns `start = 560 - 30 = 530`.
+R gets `+FULLRESYNC <id> 530`, the snapshot, then `pre` (`SET b 1`), reaching offset 560 —
+consistent. A later `PSYNC <id> 531..559` would be wrong (R's bytes there differ from the backlog's),
+hence the hole `[530, 560)`.
+
+**Two transports** (`connection::run_master_replica_stream`):
+
+- **Streamed (`$EOF:`), when the replica sent `REPLCONF capa eof`** (rudis replicas always do) —
+  `stream_full_sync`:
+  1. Every shard starts a point-in-time `AofImage` in "chunk" mode and arms its cut in the same step
+     (`shard::start_sync_image`, `ShardMessage::StartSyncImage`). Then `finish_full_sync`, so the offset
+     is known up front.
+  2. Send `+FULLRESYNC <replid> <offset>\r\n$EOF:<40-char mark>\r\n` and the RDB header.
+  3. For each shard in turn, `sync_image_step` produces ≤1 MB pieces in ~1 ms steps between that
+     shard's commands; they are written to the socket as produced (buffers are recycled back to the
+     shard). No shard stops for more than a step, and the snapshot is never whole in memory.
+  4. Send repl AUX fields, `OP_EOF`, CRC64 and the mark. The `pre` bytes and everything queued since are
+     sent **only after the replica's first `REPLCONF ACK`**: a replica detects the end by the mark being
+     the last bytes of a read, so nothing may follow it until it acks.
+- **Buffered (`$<len>`)** — `snapshot_for_replica` → `Router::generate_full_rdb(Some(id))`: each shard
+  serializes in one go (`save_rdb_chunk` + `arm_full_sync`), all chunks are concatenated in memory, then
+  `+FULLRESYNC <replid> <offset>\r\n$<len>\r\n<rdb><pre>` is sent. Eviction is paused
+  (`SnapshotEvictionPause`) meanwhile. Used for replicas without `capa eof`, and for legacy `SYNC`, which
+  gets `$<len>\r\n<rdb><pre>` with no preamble.
+
+Either way a serialization failure (e.g. unreadable tiered value) aborts with `-ERR full sync failed:
+...` — a replica never gets a partial dataset.
+
+### 6.5 Partial resync on the master (`try_partial_resync`)
+
+`PSYNC <replid> <offset>` where `offset` is the next byte wanted:
+
+1. `offset < 1` → full resync. Take the backlog write lock (held until the replica is registered, so no
+   change slips between diff and live stream).
+2. Refuse if we can't serve replicas (a replica with its link down → `-NOMASTERLINK`) or the id doesn't
+   match: `replid == ids.replid`, or `replid == ids.replid2 && offset <= second_offset`.
+3. Apply `repl-backlog-ttl`; refuse if `!can_partial_sync` or the offset is in a psync hole.
+4. Register the replica, reply `+CONTINUE <current replid>\r\n` + `get_diff` bytes.
+
+### 6.6 The replica side (`start_replica_sync`, `run_replica_worker`)
+
+`REPLICAOF host port` (or `replicaof` in the config, started after boot via `take_startup_replicaof`)
+calls `start_replica_sync`:
+
+1. `stop_sync` any previous worker. Under the backlog lock: if we were a master with history
+   (offset > 0 or a `replid2`), set `cached_master` so we ask the new master to continue *our* history
+   (a demoted master rejoining its promoted replica can resync partially). Switch role to
+   `Slave { link_status: "down", sync_in_progress: true }`. Our own replicas stay connected.
+2. Unblock clients blocked in `BLPOP` & co. (they would change data the master doesn't know about).
+3. Spawn the worker under `supervise_replica_worker`: it waits for the previous worker to exit
+   (`worker_exit`), and restarts the worker 1 s after a panic (after `forget_master_history`).
+
+`run_replica_worker` is a hand-rolled RESP client inside a `'reconnect_loop`. Every failure marks the
+link `down` and retries after **50 ms** (1 s after `AUTH` or load failures), logging at most one attempt
+per second; the master address is re-resolved each attempt (DNS names that move). Handshake replies time
+out after 60 s (`REPL_HANDSHAKE_TIMEOUT`); lines longer than 64 KB (`MAX_REPL_LINE`) drop the link.
+
+1. `PING` (accepts `+PONG` or `-NOAUTH`), then `AUTH [masteruser] masterauth` if configured.
+2. `REPLCONF listening-port <replica-announce-port or own port>`, optionally `REPLCONF ip-address`.
+3. `REPLCONF capa eof capa psync2`.
+4. `PSYNC <replid> <offset+1>` if `psync_request()` has a cached master, else `PSYNC ? -1`.
+5. `+CONTINUE [id]` → `continue_with_master`: if the id changed, the old one becomes `replid2` (valid to
+   the current offset + 1) and sub-replicas are disconnected to learn the new id.
+   `-NOMASTERLINK` / `-LOADING` → retry later, keeping our history.
+6. `+FULLRESYNC <id> <offset>` →
+   1. Clear `cached_master` (if this sync fails, the next is full too).
+   2. Read the `$<len>` or `$EOF:<mark>` header (`take_rdb_header`, skipping bare `\n` keepalives).
+   3. Spool the RDB to `<dir>/temp-repl-<port>-<pid>.rdb` (`RdbSpool`: exact length, or up to the mark,
+      holding back the last 39 bytes in case they start the mark), then `mmap` it and unlink the file
+      (the replica never needs the dataset twice in RAM).
+   4. `attach_to_new_master` (drop sub-replicas, clear backlog), then `Router::restore_rdb_bytes` under
+      a `LoadingGuard`: every shard flushes and loads its part (`ShardDb::load_full_sync_rdb`); if any
+      shard fails, all are emptied, `forget_master_history` runs, and the sync retries. When AOF is on,
+      each shard rewrites its AOF from the loaded data right away, so a restart doesn't replay the
+      pre-sync AOF.
+   5. `finish_full_resync(id, offset)`: adopt the master's id and offset, empty backlog, set
+      `cached_master`.
+7. Mark the link `up`. The stream DB starts at the RDB's `repl-stream-db` (full) or the remembered one
+   (partial).
+8. **Streaming loop.** A separate task owns the socket's write half and sends `REPLCONF ACK <applied>`
+   at once, then every second and immediately on `REPLCONF GETACK`. For each read:
+   1. Take the **apply token** (`lock_apply`), so snapshots on this replica see whole batches.
+   2. Parse commands with `parse_command_trusted`, advancing `current_offset` by bytes consumed.
+      `PING` is ignored; `REPLCONF GETACK` flushes pending work, then acks; everything else goes to
+      `Router::apply_replica_command_batched`: commands for the local shard apply at once
+      (`apply_replicated_command`, which runs under `ReplayingWrites` and logs error replies as
+      "== CRITICAL =="), commands for other shards are batched per shard and sent with one
+      `ShardMessage::ExecuteReplicaCmds` each, multi-shard commands flush the batch first.
+   3. Flush the batch, then `feed_from_master(raw bytes)`: the exact bytes processed go to our own
+      backlog and sub-replicas, unchanged, so a chain shares one offset space.
+   4. A protocol error drops the link (resume from what was applied) rather than skipping bytes.
+
+Replicas apply with their AOF writer, so a replica's AOF logs the master's changes. A replica's own
+local writes (if writable) are never fed to sub-replicas.
+
+**Expiry on replicas.** Replicas and replays never expire keys themselves (`REPLAYING_WRITES`); the
+master's `DEL` does. On a read-only replica, `hide_expired_keys()` makes reads treat an expired key as
+missing while it stays in memory until the `DEL` arrives.
+
+### 6.7 History changes (PSYNC2)
+
+| Event | Method | Effect |
+| :--- | :--- | :--- |
+| Promotion (`REPLICAOF NO ONE`, failover) | `make_master` | `shift_replid_locked`: old id → `replid2` (valid to offset+1), new id; sub-replicas disconnected; backlog TTL counts from now |
+| `DEBUG CHANGE-REPL-ID` | `change_replid` | New id, no `replid2` |
+| Failed/interrupted sync or worker panic | `forget_master_history` | Link down, new id, empty backlog, no cached master, sub-replicas dropped |
+| Restart with RDB holding `repl-id`/`repl-offset` | `restore_saved_history` | With `replicaof` configured: continue that history with the master; as a master: it becomes `replid2`, so old replicas can resync partially |
+| RDB save | `saved_history` | AUX fields written: a master's own history, a replica's only while it has a cached master |
+
+### 6.8 WAIT, WAITAOF, min-replicas, acks
+
+- `REPLCONF ACK <off>` → `update_replica_ack`; acks beyond `master_repl_offset` are ignored.
+- `WAIT` and `WAITAOF` share `wait_acks`: it captures the master offset at call time and polls
+  (1 ms, then 10 ms after 100 ms; `REPLCONF GETACK *` once a second while short) until enough copies
+  are acknowledged or the timeout passes. A timeout of 0 waits forever, as in Redis.
+- `WAIT n timeout` replies with the number of replicas whose `ack_offset` reached the target.
+- `WAITAOF numlocal numreplicas timeout` counts only AOF-fsynced copies:
+  - **local**: each shard's `AofProgress` tracks `fsynced`, the appended bytes an fsync covered.
+    The local copy counts once every shard's `fsynced` reaches what it had appended when `WAITAOF`
+    ran: at once under `appendfsync always`, at the next fsync under `everysec`, never under `no`.
+  - **replicas**: a replica with AOF on appends `FACK <offset>` to its `REPLCONF ACK` once the AOF
+    bytes up to that applied offset are fsynced. A replica without AOF sends no `FACK`
+    (`ConnectedReplica::aof_acks` false) and never counts.
+  - `numlocal` without AOF, and `WAITAOF` on a replica, are refused with Redis's errors.
+- `min-replicas-to-write N` / `min-replicas-max-lag S` (default 10): on a master, writes fail with
+  `-NOREPLICAS` unless `good_replicas(S) >= N` (online replicas that acked within `S` seconds).
+- `ROLE` and `INFO replication` are computed on demand (`format_role_resp`, `format_info_replication`):
+  role, `connected_slaves`, `slaveN:ip=,port=,state=online|wait_bgsave,offset=,lag=`, `master_replid`,
+  `master_replid2`, `master_repl_offset`, `second_repl_offset`, backlog size/first byte/histlen; on a
+  replica also link status, `master_last_io_seconds_ago`, sync-in-progress, `slave_repl_offset`,
+  priority and read-only.
+
+### 6.9 DFLY FLOW (Dragonfly-style, master side only)
+
+`REPLCONF capa dragonfly` replies `*5 [replid, "SYNC1", num_shards, 1, 0]`. The client then opens one
+connection per shard with `DFLY FLOW <replid> <sync_id> <shard> [lsn]`;
+`run_shard_replication_flow` replies `+OK FLOW <shard>\r\n$<len>\r\n<shard chunk>\r\n` and streams that
+shard's changes (`ShardReplicaFlow.lsn` counts bytes; `REPLCONF ACK` updates `ack_lsn`).
 
 ---
 
-## 3. Execution Algorithms & Code Logic
+## 7. Invariants & gotchas
 
-### 3.1 `command_to_resp` is still the entire AOF-and-replication write-path gate — and it is now an ~1,770-line, 81-command match statement (`src/aof.rs:166-1937`)
-
-```rust
-pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
-    match cmd {
-        Command::Set { .. } => { /* ... */ Some(buf) }
-        // ... 80 more explicit arms ...
-        _ => None,
-    }
-}
-```
-
-This function alone accounts for almost all of `aof.rs`'s growth from ~1,482 to 3,066 lines. A full enumeration
-of every `Command::` arm currently present (81 distinct variants, via `rg -o 'Command::[A-Za-z0-9_]+' | sort -u`)
-shows the set has grown well beyond the string/hash/list/set/zset/stream/bitops core covered by the previous
-revision of this document, to include:
-
-- **Hash field TTL (Redis 7.4/Valkey 8)**: `Hexpire` (→ `HPEXPIRE`/`HPEXPIREAT`), `Hpersist`, `Hgetex`, `Hsetex`.
-- **Vector sets (Redis 8 `VADD`/`VREM`/`VSETATTR`)**: `Vadd` (re-encoded with `Q8`/`BIN`/`M`/`EF`/`ATTR`/`CAS`/
-  `SETATTR`/`PQ`/`TIERED` option flags preserved), `Vdel` (→ `VREM`), `Vsetattr`.
-- **Semantic cache (`SEMANTIC.*`)**: `SemanticSet`, `SemanticDel`, `SemanticFlush`.
-- **Agent runtime (`AGENT.*`)**: `AgentMemAdd`, `AgentMemClear`, `AgentMemCompact`, `AgentCheckpointPut`,
-  `AgentToolClaim`, `AgentToolComplete`.
-- **Streams, extended**: `Xclaim`, `Xautoclaim`, `Xnack`, `Xidmprecord`, `XgroupSetId` (in addition to the
-  previously-covered `Xadd`/`Xdel`/`Xtrim`/`XgroupCreate`/`XgroupDestroy`/`Xack`).
-- **Misc newer commands**: `Copy`, `Unlink`, `Bitfield` (readonly bitfields are explicitly excluded — `if
-  *readonly { return None; }` — but a mixed GET+SET/INCRBY bitfield is fully re-encoded including an `OVERFLOW`
-  directive only when it changes between ops), `Msetex`, `Zrangestore`.
-
-This function is still the *only* thing that decides what gets logged and replicated: any command not matched
-here falls through to `_ => None` (line 1936), and both `record_mutation` (§3.4, used by `Router`'s own local
-write paths) and the `record_change!` macro (§3.8, used by essentially every command handler in `connection.rs`)
-gate both AOF append and propagation on this same `Some`.
-
-**Newly-confirmed correctness gap — `Command::Spop` re-encodes the *input* `count`, not the popped members, but
-this is safe.** `RudisSet::pop` (`src/table.rs:880-892`) is deterministic given identical set contents and
-history: the `Small` variant pops from the tail of a `Vec`, and the `Full` variant removes
-`s.iter().next()` from a `hashbrown::HashSet<Bytes, FxBuildHasher>` — `FxHash` is *not* randomized per process
-(unlike `std::collections::HashSet`'s default `SipHash`), so two processes that replayed the exact same mutation
-history land on the exact same set contents and the exact same iteration order. Replaying literal `SPOP key
-[count]` on a replica or during AOF replay therefore reproduces the same result as the master. This was checked
-specifically because it is the classic Redis pitfall (real Redis rewrites `SPOP` into `SREM` of the actual
-popped members for exactly this reason) — rudis gets away with the simpler re-encoding only because of the
-FxHash choice, and this is a fragile invariant a future `RudisSet` backend change could silently break.
-
-**Newly-found correctness gap — `Command::Xautoclaim` is genuinely non-deterministic when replicated/persisted
-as itself.** Unlike `Spop`, `XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]`
-(`src/aof.rs:1533-1562`) is re-encoded with the *original filter parameters* (`min_idle_time`, `start` cursor,
-`count`) rather than the resolved list of claimed message IDs it actually produced on the master. Because
-`min_idle_time` is evaluated against wall-clock "now" at the moment of execution, and AOF replay / PSYNC replica
-application happens at a different wall-clock time than the original master execution, a replica or a replayed
-AOF can legitimately compute a *different* idle-time-based claim set (different messages claimed, different next
-cursor) than what the master actually claimed. Real Redis avoids this specific pitfall by propagating `XAUTOCLAIM`
-as one or more explicit `XCLAIM` commands carrying the resolved IDs; rudis does not do this today. `Xclaim`
-itself (explicit ID list) is unaffected — it is fully deterministic.
-
-`replay_aof` (`src/aof.rs:1940-1963`) is still the mirror image on startup: it reads the entire AOF file into
-memory with one `std::fs::read`, then parses and replays every command through the exact same
-`execute_local_command` used for live traffic — there is no separate "restore format"; the AOF file is literal
-RESP commands.
-
-### 3.2 The 5ms/~1s flush-and-fsync cadence is still driven from `src/server.rs`, not from `aof.rs`
-
-`server.rs:174-193` is unchanged: a periodic task spawned in `run_shard_worker` calls `take_flush_chunk` every
-5ms via `monoio::time::sleep(Duration::from_millis(5))`, and if it returns `Some`, does `file.write_all_at(chunk,
-offset)`, recycles the returned buffer via `recycle_chunk`, and calls `sync_data()` (fsync) on the 200th tick out
-of every 200 (`ticker.is_multiple_of(200)`) — ≈ once per second — only when `fsync_every_sec` is set (which, per
-§2.1, is always `true` in practice today).
-
-### 3.3 `BGREWRITEAOF` / AOF compaction (`rewrite_shard_aof`, `perform_rewrite_aof`) — the `RudisValue::Tiered` zero-byte bug is now fixed at this layer
-
-`Router::bgrewriteaof` (`router.rs:3051-3064`) guards against concurrent saves/rewrites with a
-`compare_exchange` on `is_saving` (the same flag `bgsave`/`save_rdb` use — RDB save and AOF rewrite cannot run
-concurrently on one shard's router), then spawns `perform_rewrite_aof` (`router.rs:3066-3097`) as a background
-task. `perform_rewrite_aof`:
-
-1. `sync_aof()`s the local shard first, so no buffered-but-unflushed write is lost.
-2. Calls `rewrite_shard_aof` (`aof.rs:1965-2570`, ~605 lines) on the local `ShardDb`. It iterates every live
-   (non-expired) table entry and, for each one, writes a canonical RESP command that reconstructs it —
-   `SET ... [PX <remaining-ms>]` for strings/ints, `HSET` for hashes, `RPUSH` for lists, `SADD` for sets, `ZADD`
-   for sorted sets, one `SET` per HyperLogLog register blob, one `XADD` per stream entry — followed by a
-   `PEXPIRE` for any non-string key with a TTL. All of this is written through a 64KB
-   `std::io::BufWriter` directly to a per-attempt temp file (`appendonly-<shard>.aof.tmp.<pid>_<counter>`), so at
-   most 64KB of the rewritten output is buffered at any instant regardless of dataset size.
-   - **`RudisValue::Tiered` entries are now hydrated, not skipped** (lines 2004-2016): for each `Tiered(ptr)`
-     entry, `rewrite_shard_aof` calls `tier_manager.read_ptr_sync(*ptr)` synchronously, re-materializes the value
-     as `RudisValue::String(Bytes::from(raw))`, and writes a normal `SET` line for it. If the tier read fails, the
-     key is silently dropped from the rewritten AOF (`continue`) rather than writing a placeholder — a live
-     dataset with an NVMe-tier read failure during rewrite loses that key from the AOF, but this is a narrow edge
-     case (a read failure against local NVMe), not the systemic zero-byte bug this corrects.
-   - It also now covers strictly more value families than a prior revision of this document recorded:
-     JSON documents (re-emitted as `JSON.SET key $ <json>`, via `db.json_store.iter()`), vector-set index entries
-     (`db.vector_indexes`), semantic caches (`db.semantic_caches`), agent memory sessions (`db.agent_memories`),
-     agent checkpoint threads (`db.agent_checkpoints`), and agent tool-call registries (`db.agent_tools`) are all
-     snapshotted directly from live `ShardDb` state into the rewritten file, each via its own hand-written
-     serialization block, **not** by going through `command_to_resp`.
-   - Probabilistic structures (Bloom, Cuckoo, Count-Min Sketch, Top-K) are rewritten as one
-     `BF.RESTORE`/`CF.RESTORE`/`CMS.RESTORE`/`TOPK.RESTORE <key> <payload>` per structure; the payload is the
-     same per-entry encoding the RDB uses (tags 8/10/11/12), since a filter or sketch can't be rebuilt from user
-     commands.
-   - CRDT state is rewritten as one `CRDT.MERGE <payload>` per register, counter and set
-     (`CrdtStore::export_entry_payloads`, tombstones included) — the same form live CRDT writes are logged in
-     (§3.9).
-3. `fsync`s the temp file, atomically `rename`s it over the live `appendonly-<shard>.aof`, and `fsync`s the
-   containing directory (`sync_parent_dir`, `aof.rs:2571-2583`) so the rename survives a crash before the
-   directory entry is durable.
-4. Calls `AofWriter::reopen_after_rewrite`, which re-opens the (now-compacted) file, resets `offset` to its new
-   length, and flushes any writes buffered in the live `AofWriter` between step 1 and this point at the correct
-   offset, so no write in flight during the rewrite is dropped.
-5. Sends `ShardMessage::RewriteAof` to every other shard in turn (sequentially — "remote shards rewritten
-   sequentially one-by-one to eliminate concurrent multi-shard I/O and memory spikes", per the source comment at
-   `router.rs:3077`) and sums up the rewritten-key counts.
-
-### 3.4 `record_mutation`, `propagate`, `propagate_bytes` (`replication.rs:687-745`)
-
-```rust
-pub fn record_mutation(
-    port: u16,
-    aof: Option<&std::cell::RefCell<crate::aof::AofWriter>>,
-    cmd: &crate::resp::Command,
-) {
-    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-        if let Some(aof) = aof {
-            aof.borrow_mut().append(&bytes);
-        }
-        propagate_bytes(port, &bytes);
-    }
-}
-```
-
-`propagate_bytes`/`propagate_shard_bytes` still short-circuit on the process-wide `HAS_ACTIVE_REPLICATION:
-AtomicBool` before even looking up the hub, so the cost of this call on a node with replication never activated
-is a single relaxed atomic load. `record_mutation` is the shared helper used by `Router`'s own per-op local
-branches; the far more common call site today is the `record_change!` macro in `connection.rs` (§3.8), which
-almost every mutating command handler invokes and which inlines the identical `command_to_resp` → AOF-append →
-propagate sequence directly (`connection.rs:12740-12761`).
-
-### 3.5 Partial resync: master side (`try_partial_resync`) and replica side (`run_replica_worker`) — unchanged behavior, with one new detail (50ms reconnect backoff)
-
-Master side, `run_master_replica_stream` (`src/connection.rs:2597-2695`, entered when a connection sends `PSYNC`
-or the legacy `SYNC`):
-
-```rust
-let is_sync = matches!(&psync_cmd, Command::Sync);
-if !is_sync {
-    let partial = hub.try_partial_resync(client_id, write_tx.clone(), req_replid, req_offset);
-    if let Some((replid, diff, _repl)) = partial {
-        // "+CONTINUE <replid>\r\n" + diff bytes
-    } else {
-        let rdb = router.generate_full_rdb().await;
-        // "+FULLRESYNC <replid> <offset>\r\n$<len>\r\n" + rdb bytes
-    }
-} else {
-    // legacy SYNC: no negotiation at all.
-    let rdb = router.generate_full_rdb().await;
-    // "$<len>\r\n" + rdb bytes + "*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n"
-}
-```
-
-The plain `SYNC` command (old-style Redis replication, no replid/offset negotiation) is accepted alongside
-`PSYNC`: it always performs a full resync and injects a literal `SELECT 0` immediately after the RDB bytes so a
-generic Redis-protocol client that expects the classic `SYNC` framing gets a syntactically valid stream.
-
-`ReplicationHub::try_partial_resync` (`replication.rs:314-392`) is otherwise unchanged from the prior revision:
-it checks the requested replid against the master's own current replid (or its previous `replid2`, gated by
-`second_offset >= 0` and `req_offset <= second_offset`, for the "I was just promoted" case), then asks
-`ReplicationBacklog::can_partial_sync`/`get_diff` whether `target_offset = req_offset + 1` still falls inside the
-retained 1MB ring-buffer window.
-
-Replica side, `run_replica_worker` (`src/replication.rs:802-1175`) — a hand-rolled RESP handshake inside a
-`'reconnect_loop`, using a `send_and_expect_line!` macro, not the shared `Router`/connection machinery — performs
-PING → REPLCONF listening-port → REPLCONF capa psync2 → PSYNC (cached replid/offset if available, else `? -1`) →
-(FULLRESYNC: read `$<len>\r\n` + that many RDB bytes + `router.restore_rdb_bytes`, or CONTINUE: nothing further to
-read before the live stream) → mark link "up" → stream loop (`REPLCONF GETACK` → reply with `REPLCONF ACK
-<offset>`; `PING` is a keepalive no-op; everything else → `router.execute_replica_command`). Every failure branch
-(connect failure, a handshake line that doesn't match the expected prefix, a stream read returning `Ok(0)`/`Err`)
-sets `link_status = "down"` and retries the whole `'reconnect_loop` after a **50ms** sleep
-(`monoio::time::sleep(Duration::from_millis(50))`), unless `cancel_rx` has fired, in which case the worker exits
-for good. `master_replid`/`master_repl_offset` remain cached in the hub's `ReplicationRole::Slave` state across
-reconnects (keyed to the same `master_host`/`master_port`), so reconnect attempts against the same master
-genuinely exercise `+CONTINUE` when the disconnect was brief enough to stay inside the 1MB backlog window.
-
-### 3.6 The Dragonfly-compatible `DFLY FLOW` path (master side only) — unchanged
-
-A client sending `REPLCONF capa dragonfly` still receives, verbatim:
-
-```rust
-// connection.rs:6080-6092
-"*5\r\n${replid.len()}\r\n{replid}\r\n$5\r\nSYNC1\r\n:{num_shards}\r\n:1\r\n:0\r\n"
-```
-
-`"SYNC1"` is still a **hardcoded literal string**, not a freshly generated per-session token, and the trailing
-`:0` is still a plain integer rather than a 40-character lineage-id bulk string. The client is expected to open
-one TCP connection per shard and send `DFLY FLOW <master_replid> <sync_id> <shard_id> [<lsn>]`;
-`run_shard_replication_flow` (`connection.rs:2697-2776`) fetches that shard's RDB chunk (locally, or via
-`ShardMessage::SaveRdbChunk` if the shard isn't local), replies `+OK FLOW {shard_id}\r\n${len}\r\n<chunk>\r\n`,
-then spawns a writer task draining `ShardReplicaFlow`'s `write_rx` onto the socket while a reader loop watches
-only for `REPLCONF ACK <offset>` to update `ack_lsn`. `_lsn` (the requested resume point) is still accepted on
-the wire but not used — the parameter is literally named `_lsn` in the function signature — every `DFLY FLOW`
-session still receives this shard's full RDB chunk regardless of what `lsn` it presents. `run_replica_worker`
-(rudis's own replica implementation) still never sends `REPLCONF capa dragonfly` or `DFLY FLOW`; this path is
-reachable only by an external Dragonfly-protocol client.
-
-### 3.7 `INFO replication` / `ROLE` are still computed fresh on every call, and `DFLY FLOW` sessions still aren't reflected in either
-
-`format_info_replication` and `format_role_resp` (`replication.rs:514-635`) both take a fresh read-lock on `role`
-and load the relevant atomics on every call. Both still only enumerate `self.replicas` (PSYNC/`SYNC` sessions);
-neither iterates `self.shard_flows`, so `DFLY FLOW` clients are invisible to `connected_slaves`/`ROLE`'s replica
-list.
-
-### 3.8 `WAIT` / `WAITAOF` (`replication.rs` `wait_acks`, `connection.rs` `Command::Wait`/`Command::WaitAof`)
-
-Both poll until enough copies are acknowledged or the timeout passes (0 = forever); see
-`06_blocking_hub.md` §6.10. `WAIT` counts replicas whose `ack_offset` reached the master offset taken at call
-time. `WAITAOF` counts only copies fsynced to an AOF:
-
-- **local**: each shard's `AofProgress` tracks `fsynced`, the appended bytes an fsync covered (the everysec
-  fsync, `AofWriter::sync_durable`, or a rewrite swapping in a synced file). The local copy counts once every
-  shard's `fsynced` reaches what it had appended when `WAITAOF` ran — at once under `appendfsync always`, at the
-  next fsync under `everysec`, never under `no`.
-- **replicas**: a replica with AOF on appends `FACK <offset>` to its `REPLCONF ACK`: the applied offset whose
-  AOF bytes are fsynced (its ack task snapshots every shard's appended bytes with the offset, and reports it once
-  those are fsynced, checking every 100 ms while one is pending). A replica without AOF sends no `FACK`
-  (`ConnectedReplica::aof_acks` false) and never counts.
-- `numlocal` without AOF, and `WAITAOF` on a replica, are refused with Redis's errors.
-
-### 3.9 Live AOF and replication coverage of the experimental families — JSON.*, probabilistic and CRDT.* covered
-
-Every mutating command handler in `connection.rs` that wants AOF+replication effects calls the `record_change!`
-macro, which appends `crate::aof::command_to_resp(cmd)` to the AOF and propagates it to replicas — but only if
-`command_to_resp` has an arm for that command; otherwise the write is silently neither logged nor replicated.
-
-- **JSON.\*** (fixed in `2636a26`): SET, DEL, CLEAR, NUMINCRBY, NUMMULTBY, STRAPPEND, ARRAPPEND, ARRPOP and
-  TOGGLE are encoded as issued; replaying them in order rebuilds the same document. `BGREWRITEAOF` re-emits each
-  document as `JSON.SET key $ <json>`.
-- **`BF.*`/`CF.*`/`CMS.*`/`TOPK.*`** (fixed in `a52f9d2`): every write is encoded as issued. Replay is
-  deterministic: the hashes are fixed-seed and Top-K breaks count ties by the smallest item instead of hash-map
-  order. A `CF.ADD`/`CF.ADDNX` that fails with "filter is full" has already moved fingerprints, so it is logged
-  too. `BGREWRITEAOF` emits one `*.RESTORE` per structure (§3.3).
-- **`CRDT.*`**: logged by effect, not as issued. `CRDT.SET`/`DEL`/`INCRBY`/`SADD`/`SREM` stamp wall-clock HLC
-  timestamps and count per node id, so replaying them would not rebuild the same state; `command_to_resp`
-  returns `None` for them and the handler instead logs (via `log_shard_mutation`, on the shard that owns the
-  key) a `CRDT.MERGE <payload>` of just the change: the key's register (incl. a `DEL` tombstone), its whole
-  PN-counter, the added member's tags, or the tags an `SREM` tombstoned. Merging is idempotent and
-  deterministic, so replay and replicas reach exactly the master's state, and merging advances their HLC
-  past every replayed timestamp. A client `CRDT.MERGE` is validated, split by owning shard
-  (`Router::split_crdt_payload`) and each part merged and logged as issued on its shard; a malformed payload
-  is an error that applies nothing. `CRDT.GC [ttl]` resolves one absolute cutoff for all shards and each
-  shard that pruned something logs `CRDT.GC BEFORE <unix-ms>`, so a later replay prunes exactly the same
-  tombstones. Since a replica receives all shards on one stream, `execute_replica_command` re-splits
-  `CRDT.MERGE` by shard and applies `CRDT.GC` to every shard. `BGREWRITEAOF` snapshots CRDT state (§3.3).
-  `for_each_cmd_key` reports a `CRDT.MERGE`'s payload keys, so a script (which runs on one shard) gets the
-  usual non-local-key error for a payload spanning shards, and WATCH/tracking/ACL key checks see them.
-  Loading an RDB (tag 13 holds every shard's CRDT state in one record) merges only the keys the loading
-  shard owns.
-
-Vector-set (`VADD`/`VREM`/`VSETATTR`), semantic-cache (`SEMANTIC.*`) and agent-runtime (`AGENT.*`) commands have
-explicit `command_to_resp` arms and are AOF-logged and replicated live.
-
-The experimental families are parsed only when `enable-experimental-commands` is on, and that includes AOF
-replay: restarting with it off turns their logged writes into unknown commands, which are skipped.
-
-### 3.10 RDB save format — the "14-tag" record format is now (at least) 19 tags, and the `RudisValue::Tiered` zero-byte bug is fixed at the live code path but survives as dead code
-
-`ShardDb::save_rdb_chunk` (`src/shard.rs:2274-2318`) — the function every production caller actually invokes
-(`Router::perform_save_rdb`, `Router::generate_full_rdb`, `run_shard_replication_flow`, and the cross-shard
-`ShardMessage::SaveRdbChunk` responder all call `ShardDb::save_rdb_chunk`, never `RudisTable::save_rdb_chunk`) —
-writes, per live table entry: an optional `0xFC` `EXPIRETIME_MS` opcode + 8-byte unix-ms expiry, then
-`key_len:u32 | key_bytes`, then the value payload. For `RudisValue::Tiered(ptr)` specifically, it reads the
-record back via `self.tier_manager.read_ptr_sync(*ptr)` *before* writing anything for the entry and, because the
-record already holds the value in `serialize_val_payload` form, writes that payload verbatim (after checking its
-type tag against `ptr.value_type`), so tiered hashes, lists, sets and zsets keep their type. A failed read skips
-the whole entry and logs an error, rather than leaving a dangling `0xFC` opcode. (History: the code once wrote
-zero bytes for `Tiered`, then re-wrapped the encoded payload as a `String`, corrupting every spilled key.) After
-restore, a previously-tiered key comes back as a regular hot entry of its original type — tiering state itself is
-not round-tripped, only the value.
-
-It then calls `save_extended_rdb_chunk` (`shard.rs:2320-2656`), which appends one additional tagged record per
-entry in each of these `ShardDb` side-stores, using the **same** `key_len:u32 | key_bytes | type_byte | ...`
-framing as the base table:
-
-| Type byte | Contents | Source field |
-| :-: | :--- | :--- |
-| 0 | String/Int payload (incl. hydrated `Tiered`/`Cooled`) | `RudisTable::serialize_val_payload` |
-| 1 | List | ″ |
-| 2 | Set | ″ |
-| 3 | ZSet | ″ |
-| 4 | Hash / SmallHash | ″ |
-| 5 | HyperLogLog (16,384-byte register array, written raw) | ″ |
-| 6 | Stream (entries, groups, PEL, consumers, idempotency dedup ledger) | ″ |
-| 7 | JSON document (`serde_json::Value` serialized to a UTF-8 string) | `db.json_store` |
-| 8 | Bloom filter (capacity, error_rate, num_bits, num_hashes, count, raw bit words) | `db.probabilistic_store.bloom_filters` |
-| 9 | Vector-set node (index name, metric, raw `f32` vector, quant/PQ/tiered flags, attribute JSON) | `db.vector_indexes` |
-| 10 | Cuckoo filter (capacity, buckets, fingerprints) | `db.probabilistic_store.cuckoo_filters` |
-| 11 | Count-Min Sketch (width, depth, total_count, full table) | `db.probabilistic_store.cms_sketches` |
-| 12 | Top-K tracker (k, item→count map) | `db.probabilistic_store.topk_trackers` |
-| 13 | CRDT sync payload (one record under a synthetic `__rudis_crdt_sync__` key) | `db.crdt_store.export_sync_payload()` |
-| 14 | Hash field expirations (Redis 7.4/Valkey 8 `HEXPIRE`) | `db.table.hash_field_expires` |
-| 15 | Semantic cache (dim, hit/miss/tokens-saved/evicted counters, entries w/ vectors) | `db.semantic_caches` |
-| 16 | Agent memory session (turns, tokens, compaction count, per-turn embeddings) | `db.agent_memories` |
-| 17 | Agent DAG checkpoint thread (ordered nodes, parent links, state blobs) | `db.agent_checkpoints` |
-| 18 | Agent tool-call registry (leases, inputs/outputs, attempt counts) | `db.agent_tools` |
-
-That is 19 distinct record shapes (type bytes 0–18) plus the 4 framing opcodes `0xFC`/`0xFD`/`0xFE`/`0xFF` —
-strictly more than the 14-tag count recorded by a prior revision of this document; tags 15–18 (semantic cache,
-agent memory, agent checkpoints, agent tool leases) did not exist at that time.
-
-**Dead code found**: `RudisTable::save_rdb_chunk` (`table.rs:13181-13235`) and `RudisTable::restore_rdb_chunk`
-(`table.rs:13237+`) are a second, older, self-contained implementation of the base-table (tags 0/14 only)
-serialize/restore pair. A repo-wide grep confirms **neither is called from anywhere** — not production code, not
-even a unit test. `RudisTable::save_rdb_chunk`'s value serialization still calls into
-`serialize_val_payload`/`RudisValue::Tiered(_) => {}` (table.rs:12545) directly, without the hydration
-`ShardDb::save_rdb_chunk` performs — meaning the *old, broken, zero-byte-Tiered* behavior technically still
-exists in the tree, just in unreachable code. This is confusing for a reader who greps for `save_rdb_chunk` and
-lands in `table.rs` first; the live implementation is exclusively the `ShardDb` one in `shard.rs`.
-
-**Load side**: the single production RDB-blob parser is `table::load_rdb_bytes` (`table.rs:14454-14968`, called
-by both `Router::restore_rdb_bytes` for full-resync restore and by the startup restore path in `server.rs`). It
-handles the `0xFC`/`0xFD`/`0xFE`/`0xFF` opcodes and type bytes 0–14 inline, and delegates type bytes 15–18 to
-`ShardDb::restore_ai_native_rdb_record` (`shard.rs:3022+`) — so the full 19-tag format round-trips correctly
-through the one production code path. `ShardDb::restore_rdb_chunk` (`shard.rs:2659+`) is a second, self-contained
-restore implementation that *is* exercised — but only by `aof.rs`'s own unit tests
-(`test_rdb_and_aof_vector_set_persistence`, `test_rdb_and_aof_ai_native_state_persistence`,
-`test_rdb_and_aof_hash_field_expiration_persistence`) and by one test in `shard.rs` itself — never by the
-production restore path.
-
-### 3.11 RDB save mechanics: still forkless, still blocking `std::fs`, still no CRC64 SIMD, `save N M` is still parsed but never scheduled
-
-`Router::perform_save_rdb` (`router.rs:3221-3280`) is unchanged in shape from the prior revision: it opens a temp
-file with **blocking** `std::fs::File::create`/`write_all`/`sync_all` (not `monoio`'s async file I/O) inside an
-`async fn`, writes the `"REDIS0011"` + `[0xFE, 0x00]` header, then streams the local shard's chunk followed by
-every remote shard's chunk fetched one at a time via `ShardMessage::SaveRdbChunk` — "only one shard ever holds a
-serialized chunk in memory at any time" per the source comment (`router.rs:3245-3246`) — computing the CRC64
-incrementally (`crc64_update`) as each chunk arrives, then `fsync`s the file, atomically `rename`s it over
-`dump.rdb`, and `fsync`s the containing directory via `sync_parent_dir`. There is still no `libc::fork()` call
-anywhere in the repo (`rg "libc::fork"` — zero matches); this remains a genuinely forkless engine that trades
-Redis's copy-on-write fork isolation for one-shard-at-a-time bounded memory instead. `generate_full_rdb`
-(`router.rs:3099-3130`, used for PSYNC/`SYNC` full resync) is a related but distinct code path: it accumulates
-**all** shard chunks into one in-memory `Vec<u8>` (not written incrementally to a file) before returning it, since
-the whole blob needs to go out as one RESP bulk reply to the connecting replica.
-
-`crc64`/`crc64_update` (`table.rs:14409-14439`) remain a plain 256-entry lookup-table, byte-at-a-time
-implementation (`CRC64_TAB[((crc ^ byte) & 0xFF) as usize] ^ (crc >> 8)`, one byte per loop iteration) — no
-SIMD/hardware-CRC path exists anywhere in the crate for this.
-
-`save N M` is still not scheduled. `config.rs` parses the `save` directive only into a generic
-`extra_directives: HashMap<String, String>` catch-all (confirmed by `config.rs:425`'s own unit test asserting
-`cfg.extra_directives.get("save") == Some("900 1")`), and a repo-wide grep of `extra_directives` shows it is read
-back only by that same test — nothing in `main.rs`, `server.rs`, or `router.rs` consumes it to schedule a
-periodic `bgsave`. A configured `save 900 1` directive is accepted at startup and then has no effect.
+- **Encode or lose it.** A write reaches the AOF and replicas only through `encode_command` (or an
+  explicit `log_shard_mutation`). New write commands need an encoder arm (or an entry in the coverage
+  test's lists). If replaying the command would not reproduce the state (randomness, wall-clock,
+  node ids), log its *effect* instead, as `SPOP`, `XAUTOCLAIM` and `CRDT.*` do.
+- **Log on the owning shard, right after the change.** Per-shard order is what makes the AOF, the
+  stream cut and the AOF-image pre-images correct.
+- **The backlog write lock orders the stream.** Offset updates, backlog appends, replica registration,
+  arming and role/id changes all happen under it. Wake writers only after releasing it.
+- **Offsets mean "next byte wanted".** PSYNC carries `applied + 1`; `second_offset` is "first offset
+  `replid2` does not cover".
+- **Nothing may follow an `$EOF:` mark until the replica acks.**
+- **A replica never serves (P)SYNC while its own link is down** (`can_serve_replicas`), and never loads
+  a partial dataset: failed full-sync loads empty every shard.
+- **Snapshots are fuzzy; full syncs and rewrites are point-in-time.** `SAVE`/`BGSAVE` walk shards
+  without pre-images; full syncs arm a cut per shard; live AOF rewrites use pre-images. Don't reuse
+  `save_rdb_chunk_yielding` for a full sync.
+- **Saves and rewrites exclude each other** through one server-wide `is_saving` flag.
+- **Tiered-value read failures fail the save/rewrite/sync** instead of dropping keys.
+- **`MappedFile` safety:** a mapped load file must not be truncated while mapped (the AOF writer only
+  appends after loading).
+- **Experimental-command AOFs need the flag at restart** (§3.5).
+- Changing `--threads` or cluster mode with AOF on triggers a reshard at startup; keep the backup dir it
+  names until the server runs.
 
 ---
 
-## 4. Cross-Component Interactions
+## 8. Limitations / not implemented
 
-- **`src/router.rs`** (Component 04): `save_rdb`/`bgsave`/`bgrewriteaof`/`perform_rewrite_aof`/`generate_full_rdb`/
-  `restore_rdb_bytes`/`perform_save_rdb` drive the RDB side of a full resync or manual snapshot, delegating to
-  `ShardDb::save_rdb_chunk`/`table::load_rdb_bytes` per shard; `is_saving` (a single `AtomicBool`) is shared
-  between `BGSAVE` and `BGREWRITEAOF`, so the two cannot run concurrently on one router.
-- **`src/connection.rs`** (Component 02): owns `run_master_replica_stream` (PSYNC/`SYNC`, §3.5) and
-  `run_shard_replication_flow` (DFLY FLOW, §3.6); the `record_change!` macro (§3.8/§3.9) is the actual call site
-  most mutating command handlers use to reach both AOF and replication.
-- **`src/server.rs`** (Component 01): spawns the 5ms/~1s AOF flush-and-fsync task and performs AOF replay and RDB
-  restore on startup; also performs the final flush+fsync on shutdown.
-- **`src/shard.rs`/`src/table.rs`** (Component 05): `ShardDb::save_rdb_chunk`/`save_extended_rdb_chunk`/
-  `restore_ai_native_rdb_record` plus `table::load_rdb_bytes`/`serialize_val_payload`/`deserialize_val_payload`
-  are the actual RDB chunk codec; `aof.rs`/`router.rs` only stitch chunks together and move bytes over the wire
-  or to disk.
-
----
-
-## 5. Known Bugs & Limitations (re-verified against current source)
-
-- **RESOLVED — JSON.\*, `BF.*`/`CF.*`/`CMS.*`/`TOPK.*` and `CRDT.*` writes are AOF-logged and replicated
-  live**, and `BGREWRITEAOF` snapshots all of them (§3.3, §3.9). CRDT writes are logged as a `CRDT.MERGE` of
-  their effect.
-- **NEW — `XAUTOCLAIM` is replicated/persisted as its original wall-clock-relative filter, not as its resolved
-  claim set** (§3.1): a replica or an AOF replay can independently compute a different set of claimed messages
-  than what the master actually claimed, because `min_idle_time` is re-evaluated against a different "now".
-- **NEW — `WAITAOF`'s `numlocal` parameter is accepted but ignored**; it calls the same replica-ack-polling logic
-  as `WAIT` and always reports a hardcoded local-fsync count of `1` (§3.8), regardless of whether AOF is enabled
-  or caught up.
-- **NEW — `RudisTable::save_rdb_chunk`/`restore_rdb_chunk` (`table.rs`) are dead code** that still contains the
-  old zero-byte `RudisValue::Tiered` bug; the live path (`ShardDb::save_rdb_chunk`/`shard.rs`) fixed it via
-  hydration, but a reader who finds the `table.rs` functions first would see stale, broken behavior (§3.10).
-- **RESOLVED — the `RudisValue::Tiered` zero-byte RDB/AOF-rewrite serialization bug**, for the code path actually
-  used in production (§3.10, §3.3): both `ShardDb::save_rdb_chunk` and `rewrite_shard_aof` now hydrate tiered
-  values via `tier_manager.read_ptr_sync` before serializing them as `String` payloads.
-- **RESOLVED — AOF rewrite and compaction via `BGREWRITEAOF`** now additionally covers JSON, vector-set,
-  semantic-cache, agent-runtime, probabilistic and CRDT state (previously it covered only the base table + HLL +
-  streams) (§3.3).
-- **STILL OPEN — `save N M` is parsed into a generic `extra_directives` map and never scheduled** (§3.11): no
-  periodic-save mechanism exists anywhere in the codebase.
-- **STILL OPEN — RDB save uses blocking `std::fs` calls inside an `async fn`, and there is no `fork()`-based
-  isolation anywhere** (§3.11): the forkless design bounds memory by streaming one shard's chunk at a time rather
-  than by copy-on-write page sharing.
-- **STILL OPEN — CRC64 is a plain byte-at-a-time table lookup, no SIMD/hardware-CRC path** (§3.11).
-- **STILL OPEN — `DFLY FLOW`'s `lsn` parameter is accepted but unused for resuming a partial per-flow sync**
-  (§3.6); every flow session receives a fresh full RDB chunk for its shard.
-- **STILL OPEN — `DFLY FLOW` sessions are not reflected in `INFO replication`/`ROLE`** (§3.7).
-- **STILL OPEN — the 1MB `ReplicationBacklog` size and the AOF flush/fsync cadence remain compile-time
-  constants**; `appendfsync everysec`/`no` are configurable but `always` is rejected (§2.1).
-- **STILL OPEN — `replid` is derived from `fxhash` over port+timestamp**, not a cryptographically-derived run-id
-  (§2.2).
+- **DFLY FLOW is partial**: the `lsn` argument is accepted but unused (every flow gets the full shard
+  chunk), `"SYNC1"` is a fixed token, flows don't appear in `INFO replication`/`ROLE`, flows don't take
+  part in the full-sync cut, and rudis's own replica never uses this protocol.
+- **No fork-based isolation**; `SAVE`/`BGSAVE` produce fuzzy snapshots (§5.3).
+- **CRC64** is a byte-at-a-time table lookup (`table::crc64_update`); no hardware CRC path.
+- **Diskless load and related tuning directives** (`repl-diskless-load`, `repl-diskless-sync*`,
+  `aof-use-rdb-preamble`, `rdbcompression`, `rdbchecksum`, `appendfilename`, `appenddirname`, ...) are
+  known Redis directive names (`config::REDIS_CONFIG_NAMES`) that rudis does not implement: a config file
+  may contain them and they are ignored with a warning. Behaviour is fixed: replicas always spool the
+  RDB to disk, rudis-to-rudis full syncs stream with `$EOF:`, rewrites always use an RDB preamble, RDB
+  strings are never compressed, AOF files are always `appendonly-<shard>.aof` in `dir`.
+- **Module data** in Redis RDB files is rejected; Redis 7.0 RC function records are skipped.
+- **Replication ids** are fxhash-derived, not cryptographically random.
+- The AOF flush cadence (5 ms) and fsync tick (~1 s) are constants.
 
 ---
 
-## Contributor Gotchas, Invariants & Debugging Guide
+## 9. Code map
 
-* **Gotcha 1**: `BGSAVE`/full resync stream shard RDB chunks sequentially, one shard at a time, to keep peak
-  memory bounded — do not change this to a concurrent fan-out without re-checking the memory-bound rationale
-  (`router.rs:3245-3246`).
-* **Gotcha 2**: `BGREWRITEAOF` uses a 64KB `BufWriter` to stream the rewritten AOF file without allocating a
-  large heap buffer for the whole dataset — keep new value types' rewrite logic writing through that same
-  buffered writer rather than building an intermediate `Vec` (`aof.rs:1993`).
-* **Gotcha 3**: A write command is invisible to both AOF and
-  replication unless it has an explicit arm in `command_to_resp` (§3.1) or its handler logs an equivalent
-  command itself (the `CRDT.*` writes log a `CRDT.MERGE` of their effect, §3.9). Adding a new mutating command
-  requires one of the two, or it will silently not persist or replicate live. If replaying the command would
-  not reproduce the state (wall-clock or node-dependent effects), log its effect instead.
-* **Gotcha 4**: `DFLY FLOW` is a master-side-only capability today; do not assume rudis-to-rudis replication ever
-  uses it — `run_replica_worker` only speaks `PSYNC`/`SYNC`.
-* **Gotcha 5**: `ReplicationBacklog`'s 1MB size is a compile-time constant (`ReplicationHub::new`); a write burst
-  larger than that between a replica's disconnect and reconnect will force a full resync.
-* **Gotcha 6 (new)**: If you are implementing persistence/replication for a new random or time-relative command
-  (anything like `XAUTOCLAIM`, `SPOP`, `RANDOMKEY`-adjacent operations), re-encoding the *input* command is only
-  safe if the operation's outcome is a pure function of already-replicated state plus deterministic, unseeded
-  hashing (verify against `RudisSet`'s `FxBuildHasher`-based determinism, §3.1) — if the outcome depends on
-  wall-clock time (like `XAUTOCLAIM`'s `min_idle_time`) or a seeded RNG, re-encode the *resolved result* instead.
-* **Gotcha 7 (new)**: There are two independent RDB chunk codecs in the tree — the live one (`ShardDb::
-  save_rdb_chunk`/`save_extended_rdb_chunk`/`restore_ai_native_rdb_record` in `shard.rs`, plus `table::
-  load_rdb_bytes` for parsing) and a dead, unreachable one (`RudisTable::save_rdb_chunk`/`restore_rdb_chunk` in
-  `table.rs`). Do not edit the `table.rs` pair expecting it to affect production behavior; grep for callers before
-  trusting either implementation (§3.10).
-
-### How to Verify Changes
-```bash
-# 1. Format check
-cargo fmt --check
-
-# 2. Clippy verification with zero warnings
-cargo clippy --all-targets -- -D warnings
-
-# 3. Run unit tests
-cargo test --lib -- --test-threads=1
-```
+| File | Key symbols | What they do |
+| :--- | :--- | :--- |
+| `src/aof.rs` | `encode_command`, `command_to_resp`, `note_unpropagated` | Command → RESP for AOF and replicas; coverage accounting |
+| | `AofWriter`, `AofProgress`, `aof_write_misconf` | Buffered per-shard AOF, group commit, write-error `-MISCONF` |
+| | `set_appendfsync`, `appendfsync_is_always`, `APPENDFSYNC_ALWAYS_ANY`, `AOF_APPENDS` | fsync policy flags |
+| | `replay_aof`, `MappedFile`, `apply_aof_command` | Startup replay (RDB preamble + RESP tail) |
+| | `rewrite_shard_aof_live`, `catch_up_and_swap`, `rewrite_shard_aof`, `ImageFileWriter` | Non-blocking and blocking AOF rewrite |
+| | `auto_rewrite_due`, `AutoRewriteConfig`, `aof_files_size` | `auto-aof-rewrite-*` |
+| | `reshard_aof_dir`, `import_external_aof`, `write_canonical_aof`, `split_rewritten_aof_to_shards` | Shard-count changes, Redis AOF import |
+| `src/snapshot.rs` | `SnapshotState`, `note_write`, `save_due`, `any_save_failing` | Save schedule and status |
+| | `AofRewriteState`, `aof_rewrite_retry_delay_secs`, `is_saving` | Rewrite status/back-off, save lock |
+| `src/redis_rdb.rs` | `write_file_header`, `write_record`, `write_ext_aux`, `write_repl_aux`, `dump_value` | RDB/DUMP writer |
+| | `load_file`, `load_chunk`, `load_rdb_preamble`, `load_records`, `decode_value`, `classify` | RDB reader |
+| `src/shard.rs` | `ShardDb::save_rdb_chunk`, `save_extended_rdb_chunk`, `save_rdb_chunk_yielding` | Per-shard serialization |
+| | `AofImage`, `before_write`, `poison_aof_image`, `start_sync_image`, `sync_image_step`, `SYNC_IMAGE_BYTES` | Point-in-time images for rewrites and streamed syncs |
+| | `ShardDb::load_full_sync_rdb` | Replica-side load + AOF rewrite |
+| `src/table.rs` | `load_rdb`, `load_rdb_bytes`, `load_legacy_ext`, `crc64`, `crc64_update` | Load entry point, legacy format, checksum |
+| `src/router.rs` | `save_rdb`, `bgsave`, `perform_save_rdb`, `rdb_writer`, `bgrewriteaof`, `perform_rewrite_aof` | Snapshot and rewrite orchestration |
+| | `generate_full_rdb`, `restore_rdb_bytes`, `apply_replica_command_batched`, `execute_replica_command` | Full-sync build/load, applying the master's stream |
+| | `write_aof_through`, `sync_aof`, `save_before_shutdown` | Reply barriers, shutdown save |
+| `src/replication.rs` | `ReplicationHub`, `ReplIds`, `ReplicationBacklog`, `ConnectedReplica`, `FullSyncCut`, `ShardReplicaFlow` | Replication state |
+| | `deliver`, `append_stream`, `feed_from_master`, `propagate_bytes`, `propagate_shard_bytes`, `log_shard_mutation` | Stream delivery |
+| | `try_partial_resync`, `register_full_sync_replica`, `arm_full_sync`, `finish_full_sync` | Master-side sync |
+| | `start_replica_sync`, `run_replica_worker`, `RdbSpool`, `make_master`, `restore_saved_history` | Replica side and history |
+| | `wait_replicas`, `good_replicas`, `format_info_replication`, `format_role_resp` | WAIT, min-replicas, INFO/ROLE |
+| `src/connection.rs` | `log_change`, `record_change!`, `stream_claim_propagation`, `persistence_misconf` | Write-path logging, MISCONF |
+| | `run_master_replica_stream`, `stream_full_sync`, `snapshot_for_replica`, `run_shard_replication_flow` | Master-side (P)SYNC and DFLY FLOW |
+| | `Command::Replconf` / `Wait` / `WaitAof` handlers, `not_enough_good_replicas` | REPLCONF, WAIT, NOREPLICAS |
+| `src/server.rs` | `run_shard_worker` (startup load, AOF flusher), save/auto-rewrite cron | Startup and background tasks |
+| `src/main.rs` | call to `aof::reshard_aof_dir` | Pre-start AOF layout fix-up |

@@ -1,310 +1,163 @@
-# Component 09: RediSearch Full-Text Engine & Hybrid Vector Fusion (Implementation Deep-Dive & Code Reference)
+# Component 09: RediSearch Full-Text Engine & Hybrid Vector Fusion
 
-> **Source Files**: `src/search.rs` (4,117 lines — engine logic is lines 1–3035; lines 3037–4117 are `#[cfg(test)] mod tests` with 14 test functions)
-> **High-Level Design Spec**: [`docs/design/09_redisearch.md`](../design/09_redisearch.md)
-> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
-
-This document was rewritten from scratch against the current source. The file grew from ~2,488 to 4,117 lines since the previous pass; the biggest change is that `InvertedIndex` now owns **real** `FlatIndex`/`HnswIndex` vector indices per vector field (`vector_indices: HashMap<String, VectorFieldIndex>`) instead of doing a brute-force linear scan over `DocMeta.vector_fields` — KNN queries now genuinely traverse HNSW graphs (with an ad-hoc brute-force fallback), and a full RRF/Linear hybrid-fusion layer, `VECTOR_RANGE` queries, multi-vector (JSON chunk) fields, `FT.ALTER`, `FT._LIST`, and `FT.PROFILE` were added. See §0 for a commit-by-commit summary.
+> **High-level design**: [`docs/design/09_redisearch.md`](../design/09_redisearch.md)
+> **Consolidated implementation spec**: [`components.md`](components.md)
+> **Main source**: `src/search.rs` (engine), with glue in `src/router.rs`, `src/shard.rs`, `src/server.rs`, `src/connection.rs`, `src/resp.rs`, `src/aof.rs`, `src/table.rs`, `src/vector.rs`.
 
 ---
 
-## 0. What Landed Since The Last Pass (`git log --oneline -- src/search.rs`)
+## 1. What this subsystem does
 
-```
-c22d300 feat(search): add FT.HYBRID (RRF/Linear), FT.ALTER, FT._LIST, FT.PROFILE, and multi-vector JSON chunks
-8f52a3a feat(search): FT.CREATE backfill, FT.INFO vector stats, and DIALECT/TIMEOUT options
-647efc9 feat(search): support @field:[VECTOR_RANGE radius $blob] queries and $YIELD_DISTANCE_AS
-cd3e6e5 feat(search): wire Reciprocal Rank Fusion (RRF) and WITHSCORES into FT.SEARCH
-5099d5b feat(search): pre-filtered hybrid KNN (ad-hoc brute force + filtered HNSW traversal)
-8ff96f4 feat(search): full KNN clause with $K, EF_RUNTIME, AS alias and distance-ordered results
-f0ce2a9 feat(search): full FT.CREATE VECTOR attributes, FLAT index, TYPE-aware decoding and binary-safe HASH ingest
-784ccb4 feat(search): multi-match json_nummultby and HNSW vector index integration in RediSearch
-b8320b8 feat(search): FT.AGGREGATE execution pipeline with GROUPBY, REDUCE, APPLY, SORTBY, and LIMIT
-0b2c1ed feat(search): balanced RangeTree for O(log N + K) numeric indexing and search
-5a8b4b4 feat(search): shard-local InvertedIndex and parallel scatter-gather FT.SEARCH with top-K heap merging
-a29ab71 refactor(search): dense 32-bit DocId indexing and term-directed O(1) document deletion
-26ca813 feat(search): implement secondary indexing over RedisJSON with JSONPath extraction and field aliases
-b000092 feat: implement RediSearch full-text search and AF_XDP eBPF kernel bypass engine
-```
+Rudis implements a RediSearch-compatible secondary index over ordinary **HASH** and **RedisJSON** keys. A client defines an index once (`FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA title TEXT price NUMERIC tags TAG emb VECTOR HNSW ...`), keeps writing keys with normal commands (`HSET`, `JSON.SET`, `DEL`, ...), and then queries them with:
 
-**Not found**: despite `src/mcp.rs` introducing an "AI-Native Agent Runtime, Semantic Cache & MCP Server" subsystem (Component 20 — `SemanticCache` lives in `src/vector.rs`, `AgentMemoryBank`/MCP server in `src/agent.rs`/`src/mcp.rs`), `search.rs` itself has **no** semantic-cache or vector-set (`VADD`/`VSIM`/`VCARD`) code. The only cross-reference is `src/mcp.rs` importing `crate::search::SearchOptions` to expose one MCP tool, `rudis_ft_search` (§5.9) — a thin wrapper that builds a `Command::FtSearch` with only `index`/`query`/`limit` (no filters, sort, or scoring knobs exposed to the LLM agent).
+- **`FT.SEARCH`** – full-text search (BM25 ranking), numeric ranges, tag filters, boolean combinations, vector **KNN** (k nearest neighbours) and **`VECTOR_RANGE`** (all vectors within a radius), and **hybrid** text+vector search with score fusion.
+- **`FT.HYBRID`** – a convenience front-end that builds a hybrid `FT.SEARCH`.
+- **`FT.AGGREGATE`** – a small analytics pipeline (`GROUPBY`/`REDUCE`, `APPLY`, `FILTER`, `SORTBY`, `LIMIT`) over the matching documents.
+- Admin/introspection: `FT.INFO`, `FT._LIST`, `FT.ALTER`, `FT.DROPINDEX`, `FT.EXPLAIN`, `FT.PROFILE`, legacy `FT.ADD`.
+
+Users are application developers doing product search, RAG retrieval (vector + keyword), and filtering; the MCP server (Component 20) also exposes `FT.SEARCH` to LLM agents as the `rudis_ft_search` tool.
+
+The engine is an in-memory **inverted index** (term → list of documents containing it), a **B-tree numeric index**, a per-field **vector index** (FLAT brute force or HNSW graph from `src/vector.rs`), and a hand-written query parser/evaluator. Only index *definitions* are persisted; documents are re-indexed from the keyspace on load.
 
 ---
 
-## 1. Source Module Map & Responsibilities
+## 2. Mental model
 
-| File | Subsystem Role | Key Functions / Structs |
-| :--- | :--- | :--- |
-| `src/search.rs` | Index data structures, tokenization, query parsing/evaluation, BM25 scoring, KNN/VECTOR_RANGE, RRF/Linear fusion, aggregation pipeline | `InvertedIndex`, `IndexSchema`, `QueryAst`, `AggregateOptions`, `bm25_score`, `parse_query`, `execute_search`, `reciprocal_rank_fusion`, `linear_score_fusion` |
-| `src/shard.rs` | Per-shard index partition (`ShardDb.search_indices`) and its local indexing/query hooks | `ShardDb::init_search_index`, `ShardDb::reindex_hash_local`, `ShardDb::delete_document_local`, `ShardDb::index_json_document_local` |
-| `src/router.rs` | Cross-shard scatter/gather for `FT.SEARCH`/`FT.AGGREGATE`, hybrid RRF/Linear orchestration, index create/alter/drop broadcast | `Router::ft_search`, `Router::ft_aggregate`, `Router::create_search_index`, `Router::alter_search_index` |
-| `src/resp.rs` | `FT.*` argument parsing into the structs below | `"FT.CREATE"`, `"FT.SEARCH"`, `"FT.AGGREGATE"`, `"FT.ALTER"`, `"FT.PROFILE"`, `"FT.HYBRID"`, `"FT._LIST"` arms (lines 11199–12223) |
-| `src/connection.rs` | `FT.*` command dispatch, `HSET`/`JSON.SET`/delete indexing hooks | `Command::FtCreate/FtSearch/FtAggregate/FtInfo/FtDropIndex/FtExplain/FtAdd/FtList/FtAlter/FtProfile` arms (lines 11395–~11900), `reindex_hash_for_search` |
-| `src/server.rs` | Remote-shard handler for cross-shard `SearchQuery`/`InitSearchIndex`/`DropSearchIndex` messages | `ShardMessage::SearchQuery`/`InitSearchIndex`/`DropSearchIndex` arms (~line 1636) |
-| `src/vector.rs` | `FlatIndex`, `HnswIndex`, `VectorFieldIndex` enum, and the SIMD `compute_distance`/`cosine_distance`/`l2_distance_sq`/`dot_product` kernels this file calls directly (Component 08) | `VectorFieldIndex::{search_filtered, range_filtered}`, `compute_distance` |
-| `src/mcp.rs` | Exposes `FT.SEARCH` as the `rudis_ft_search` MCP tool (Component 20) | `"rudis_ft_search"` tool-call arm (line 429) |
+Every index exists in **two copies**:
+
+1. **Per-shard partitions** – `ShardDb.search_indices: HashMap<String, InvertedIndex>`. Each shard thread owns the index entries for the keys *it* owns. No locking (a `ShardDb` is confined to its shard thread). **`FT.SEARCH` and `FT.AGGREGATE` read these**, by scatter/gather across shards.
+2. **The global mirror** – a process-wide registry `SEARCH_INDICES` in `src/search.rs` (`RwLock<HashMap<String, Arc<RwLock<InvertedIndex>>>>`, `parking_lot` locks). Every write hook indexes documents here too, so it holds the union of all shards. **`FT.INFO`, `FT._LIST` and `FT.ADD` use only the mirror**; `FT.SEARCH` falls back to it only when the local shard has no partition with that name.
+
+```mermaid
+flowchart TD
+    W["HSET / JSON.SET / DEL on shard S"] --> L["ShardDb::reindex_hash_local / index_json_document_local / delete_document_local"]
+    W --> G["search::index_document_hook / index_json_document_hook / delete_document_hook"]
+    L --> P["Shard S partition: ShardDb.search_indices"]
+    G --> M["Global mirror: SEARCH_INDICES"]
+
+    Q["FT.SEARCH on any shard"] --> R["Router::ft_search"]
+    R -->|"local execute_search"| P
+    R -->|"ShardMessage::SearchQuery to every other shard"| P2["Other shards' partitions"]
+    R --> MERGE["Merge, sort by score or sort_val, re-paginate"]
+    MERGE --> C["Client reply"]
+
+    I["FT.INFO / FT._LIST / FT.ADD"] --> M
+```
+
+Inside one `InvertedIndex`, a query string is parsed into a `QueryAst` tree, the tree is evaluated into a `HashMap<DocId, score>`, the candidates are sorted (by BM25 score, by vector distance, or by a numeric `SORTBY` field), paginated, and turned into `SearchHit`s.
+
+```mermaid
+flowchart LR
+    S["query string"] --> PQ["parse_query"] --> AST["QueryAst"]
+    AST --> EV["evaluate_ast"]
+    EV --> T["Term / Prefix: inverted lists + bm25_score"]
+    EV --> N["NumericRange: RangeTree"]
+    EV --> TG["TagFilter: scan of DocMeta.tag_fields"]
+    EV --> V["KnnVector / VectorRange: knn_search / vector_range_search"]
+    T --> SC["HashMap DocId to score"]
+    N --> SC
+    TG --> SC
+    V --> SC
+    SC --> SORT["execute_search: sort, paginate, build SearchHit"]
+```
 
 ---
 
-## 2. Component Architecture & Data Structures
+## 3. Data structures
 
-```
-     Raw Document: HSET "doc:1" title "Rust Systems" body "Distributed io_uring" emb <32 raw bytes>
-                                    │
-                    reindex_hash_for_search() (src/connection.rs:12724)
-                                    │
-                  ┌─────────────────┴──────────────────┐
-                  ▼                                     ▼
-     db.reindex_hash_local(key)              crate::search::index_document_hook(key, raw)
-     → ShardDb.search_indices[*]             → global SEARCH_INDICES[*] mirror
-     (THIS shard's partition only,            (every index, process-wide, RwLock-protected)
-      no lock — shard-thread-confined)
-                  │                                     │
-                  └──────────────┬──────────────────────┘
-                                 ▼           add_hash_document() → decode_vector() per VECTOR field,
-                                             tokenize_text()+simple_stem() per TEXT field, …
-                  ┌───────────────────┬───────────────────┬────────────────────┐
-                  ▼                   ▼                   ▼                    ▼
-            Text Fields          Tag Fields          Numeric Fields      Vector Fields
-       ["rust","system"]      {"tech","db"}              99.5          Vec<f32> (+ chunks)
-        (stemmed)                                                             │
-                  │                   │                   │                    ▼
-                  ▼                   ▼                   ▼         vector_indices[alias]:
-     inverted: HashMap<String,   tag_fields on       numeric_trees:   VectorFieldIndex::Flat|Hnsw
-       Vec<Posting>>             each DocMeta       HashMap<String,   (actual FlatIndex / HnswIndex
-     "rust"->[Posting{…}]                            RangeTree>        from src/vector.rs — see §2.4)
-```
+### 3.1 Schema: `FieldType`, `SchemaField`, `IndexSchema`
 
-### 2.1 Real Data Structures (`src/search.rs`)
+A schema field has an **identifier** (the HASH field name, or a JSONPath such as `$.title`) and an **alias** (the name given with `AS`; defaults to the identifier, and for a JSONPath without `AS` the parser derives it by stripping `$.` and a trailing `.*`/`[*]`, so `$.title` becomes `title`).
 
 ```rust
-pub type DocId = u32;                                                          // line 5
-
-pub enum FieldType {                                                           // lines 8-27
-    Text { weight: f64, sortable: bool, nostem: bool },
+pub enum FieldType {
+    Text    { weight: f64, sortable: bool, nostem: bool },
     Numeric { sortable: bool },
-    Tag { separator: char, casesensitive: bool },
-    Vector { dim: usize, distance_metric: String, algorithm: String, attrs: VectorFieldAttrs },
+    Tag     { separator: char, casesensitive: bool },
+    Vector  { dim: usize, distance_metric: String, algorithm: String, attrs: VectorFieldAttrs },
 }
-
-pub enum VectorDataType {                                                      // lines 31-39
-    Float32 /* default */, Float64, Float16, BFloat16, Int8, Uint8,
-}
-impl VectorDataType {
-    pub fn elem_size(&self) -> usize { /* 8, 4, 2, 2, 1, 1 bytes respectively */ }
-}
-
-pub struct VectorFieldAttrs {                                                  // lines 77-85
-    pub data_type: VectorDataType,   // default Float32
-    pub m: usize,                    // default 16       (HNSW)
-    pub ef_construction: usize,      // default 200      (HNSW)
-    pub ef_runtime: usize,           // default 10       (HNSW)
-    pub initial_cap: usize,          // default 1024     (FLAT + HNSW)
-    pub epsilon: f64,                // default 0.01     (parsed, UNUSED — see §6)
-    pub block_size: usize,           // default 1024     (parsed, UNUSED — see §6)
-}
-
-pub struct SchemaField {                                                       // lines 248-253
-    pub identifier: String, // e.g. "$.title" (JSON path) or "title" (hash field)
-    pub alias: String,      // the name queries/results use (via FT.CREATE ... AS <alias>)
-    pub field_type: FieldType,
-}
-
-pub struct IndexSchema {                                                       // lines 255-262
+pub struct SchemaField { pub identifier: String, pub alias: String, pub field_type: FieldType }
+pub struct IndexSchema {
     pub name: String,
-    pub on_type: String,                      // "HASH" or "JSON"
-    pub prefixes: Vec<String>,
-    pub fields: HashMap<String, FieldType>,   // identifier AND alias both map here (O(1) lookup)
-    pub schema_fields: Vec<SchemaField>,      // ordered, for FT.INFO/introspection
+    pub on_type: String,                    // "HASH" or "JSON"
+    pub prefixes: Vec<String>,              // empty = every key of that type
+    pub fields: HashMap<String, FieldType>, // keyed by BOTH alias and identifier
+    pub schema_fields: Vec<SchemaField>,    // ordered list (FT.INFO, persistence)
 }
+```
 
-pub struct Posting { pub doc_id: DocId, pub term_freq: u32 }                    // lines 264-268, 8 bytes
+`IndexSchema` helpers used by persistence:
 
-pub struct DocMeta {                                                           // lines 270-280
+| Function | Purpose |
+| :--- | :--- |
+| `IndexSchema::ft_create_args` / free fn `ft_create_args` | Produces the **canonical** `FT.CREATE name ON <type> [PREFIX n ...] SCHEMA ...` argv. Every field is written as `identifier AS alias <type> ...`; vector fields always list `TYPE`, `DIM`, `DISTANCE_METRIC`, `INITIAL_CAP` plus `M`/`EF_CONSTRUCTION`/`EF_RUNTIME`/`EPSILON` (HNSW) or `BLOCK_SIZE` (FLAT). It must parse back to the same schema. |
+| `ft_alter_args` | Canonical `FT.ALTER name SCHEMA ADD ...` argv. |
+| `IndexSchema::same_definition` | Equality on name, `on_type` (case-insensitive), prefixes and `schema_fields`. Used by `ensure_search_index`. |
+| `merge_schema_fields` | Applies `FT.ALTER ... SCHEMA ADD`: a new field whose alias **or** identifier matches an existing one replaces it; otherwise it is appended. |
+
+### 3.2 Vector field attributes
+
+`VectorFieldAttrs` holds the tuning knobs from `FT.CREATE ... VECTOR <algo> <nargs> ...`:
+
+| Field | Type | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `data_type` | `VectorDataType` | `Float32` | Element type: `Float32`, `Float64`, `Float16`, `BFloat16`, `Int8`, `Uint8` (`elem_size` = 4, 8, 2, 2, 1, 1 bytes). |
+| `m` | `usize` | 16 | HNSW max neighbours per node (capped at `vector::MAX_HNSW_M` = 4096 by the parser). |
+| `ef_construction` | `usize` | 200 | HNSW build-time beam width. |
+| `ef_runtime` | `usize` | 10 | HNSW default query beam width. |
+| `initial_cap` | `usize` | 1024 | Pre-allocated capacity (FLAT). |
+| `epsilon` | `f64` | 0.01 | Stored and echoed, **never read** (see §11). |
+| `block_size` | `usize` | 1024 | Stored and echoed, **never read**. |
+
+`DIM` must be in `1..=vector::MAX_VECTOR_DIM` (65,536) and `DISTANCE_METRIC` one of `L2`, `IP`, `COSINE` (`FT.CREATE` enforces both and requires `TYPE`).
+
+### 3.3 Per-document state: `DocId`, `Posting`, `DocMeta`
+
+Documents are identified internally by a dense **`DocId` (`u32`)** rather than their key string, so posting lists stay compact. IDs start at 1 and freed IDs are recycled.
+
+```rust
+pub struct Posting { pub doc_id: DocId, pub term_freq: u32 }   // 8 bytes
+pub struct DocMeta {
     pub key: Bytes,
-    pub doc_len: usize,                                    // whole-document token count, not per-field
-    pub fields: HashMap<String, String>,
+    pub doc_len: usize,                                    // token count across ALL text fields
+    pub fields: HashMap<String, String>,                   // raw field values (returned by FT.SEARCH)
     pub numeric_fields: HashMap<String, f64>,
     pub tag_fields: HashMap<String, HashSet<String>>,
-    pub vector_fields: HashMap<String, Vec<f32>>,          // first/only vector per field
-    pub multi_vector_fields: HashMap<String, Vec<Vec<f32>>>, // NEW: all chunks, chunk 0 == vector_fields entry
-    pub terms: Vec<String>,                                // drives O(terms-in-doc) deletion
-}
-
-pub struct OrderedF64(pub f64);  // total_cmp-based Ord/PartialOrd so f64 can key a BTreeMap  (lines 282-299)
-
-pub struct RangeTree {                                                         // lines 303-306
-    pub entries: std::collections::BTreeMap<OrderedF64, Vec<DocId>>,
-    pub total_entries: usize,
-}
-
-pub struct InvertedIndex {                                                     // lines 373-392
-    pub schema: Option<IndexSchema>,
-    pub inverted: HashMap<String, Vec<Posting>>,                   // term -> postings
-    pub numeric_trees: HashMap<String, RangeTree>,                 // numeric field -> balanced tree
-    pub key_to_id: HashMap<Bytes, DocId>,                          // document key -> dense id
-    pub id_to_meta: HashMap<DocId, DocMeta>,                       // dense id -> metadata
-    pub vector_indices: HashMap<String, crate::vector::VectorFieldIndex>,  // NEW: real FLAT/HNSW indices
-    pub next_doc_id: DocId,
-    pub free_ids: Vec<DocId>,                                      // recycled ids from deleted documents
-    pub total_docs: usize,
-    pub total_terms: usize,
-    pub indexing_failures: usize,                                  // NEW: hash_indexing_failures (FT.INFO)
+    pub vector_fields: HashMap<String, Vec<f32>>,          // primary vector per vector field (keyed by alias)
+    pub multi_vector_fields: HashMap<String, Vec<Vec<f32>>>, // all chunks; chunk 0 == primary
+    pub terms: Vec<String>,                                // terms this doc contributed (for deletion)
 }
 ```
 
-**§2.1 re-verification of the prior pass's two central claims:**
-1. **Dense `u32` `DocId` with a free-list** — still true, unchanged (`next_doc_id`/`free_ids`, lines 386–387, recycled in `add_document` line 898 and pushed back in `remove_document` line 969).
-2. **Per-shard partitioning, not one global lock** — still true, but the mechanism is now fully visible: `ShardDb.search_indices: HashMap<String, InvertedIndex>` (`src/shard.rs:621`, plain owned `InvertedIndex`, **no** `Arc`/`RwLock`, because `ShardDb` is thread-confined to its shard's core) is what real `FT.SEARCH`/`FT.AGGREGATE` query. A **separate, fully independent** process-wide mirror, `static SEARCH_INDICES: RwLock<HashMap<String, Arc<RwLock<InvertedIndex>>>>` (line 1028), duplicates every document via a **double write** on every mutation — see §2.3. This is the same two-copy design as before; what changed is that `vector_indices` is now part of what gets duplicated in both copies.
+### 3.4 Numeric index: `RangeTree`
 
-### 2.2 `VectorFieldAttrs` / `VectorDataType` — binary-safe, typed vector decoding (new)
+`RangeTree` is a `BTreeMap<OrderedF64, Vec<DocId>>` plus a `total_entries` counter. `OrderedF64` wraps `f64` with a `total_cmp`-based `Ord`, so floats can be B-tree keys. Each bucket holds the sorted list of documents with exactly that value.
 
-`decode_vector(bytes, data_type, dim)` (line 231) is the single entry point used by both HASH and JSON ingestion:
+- `add` / `remove`: B-tree lookup, then `binary_search` inside the bucket; empty buckets are deleted.
+- `range(min, max)`: `BTreeMap::range(min..=max)` — **O(log N + K)** (inclusive bounds). Returns empty when either bound is NaN or `min > max` (a NaN bound would otherwise panic `BTreeMap::range`).
+- `min()` / `max()`: first/last key.
 
-```rust
-pub fn decode_vector(bytes: &[u8], data_type: VectorDataType, dim: usize) -> Option<Vec<f32>> {
-    let text = parse_vector_text(bytes);              // only succeeds if EVERY byte is ASCII
-                                                        // digit/'.'/','/'-'/'+'/'e'/'E'/'['/']'/whitespace
-    let v = match text {
-        Some(t) if dim == 0 || t.len() == dim => t,    // prefer the text parse when it's plausible
-        _ => {
-            if dim != 0 && bytes.len() != dim * data_type.elem_size() { return None; }
-            decode_typed_blob(bytes, data_type)?       // binary little-endian per TYPE
-        }
-    };
-    if (dim != 0 && v.len() != dim) || v.iter().any(|x| !x.is_finite()) { return None; }
-    Some(v)
-}
-```
+### 3.5 The index: `InvertedIndex`
 
-`decode_typed_blob` (line 168) handles all six `VectorDataType` variants: `FLOAT32`/`FLOAT64` via `f32/f64::from_le_bytes`, `FLOAT16`/`BFLOAT16` via hand-written `f16_to_f32`/bit-shift conversions (lines 102–165), `INT8`/`UINT8` via a direct byte-to-float cast. Because `parse_vector_text` rejects any byte string containing a non-ASCII-numeric byte, a genuine binary blob (effectively random bytes) almost never round-trips as text — this **resolves** the prior pass's "4-byte ambiguity" finding about the older `parse_vector_blob`-only decoder (still present at line 633, but now only used as a `FLOAT32`/`dim=0` fallback inside `extract_json_fields` for JSON string-encoded vectors, not the primary decode path).
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `schema` | `Option<IndexSchema>` | The definition (always `Some` when built via `InvertedIndex::new`). |
+| `inverted` | `HashMap<String, Vec<Posting>>` | Term → postings (unsorted, appended on insert). |
+| `numeric_trees` | `HashMap<String, RangeTree>` | Numeric field name → tree. |
+| `key_to_id` | `HashMap<Bytes, DocId>` | Document key → dense id. |
+| `id_to_meta` | `HashMap<DocId, DocMeta>` | Dense id → metadata. |
+| `vector_indices` | `HashMap<String, vector::VectorFieldIndex>` | Vector field **alias** → FLAT or HNSW index. |
+| `next_doc_id` | `DocId` | Next fresh id (starts at 1). |
+| `free_ids` | `Vec<DocId>` | Recycled ids from deleted documents. |
+| `total_docs` | `usize` | Document count. |
+| `total_terms` | `usize` | Sum of `doc_len` over all docs (for average document length). |
+| `indexing_failures` | `usize` | Documents rejected for bad vectors (`hash_indexing_failures` in `FT.INFO`). |
 
-### 2.3 Two Storage Copies, One Query Path — Precisely (confirmed unchanged in shape)
+`VectorFieldIndex` (in `src/vector.rs`) is an enum over `FlatIndex` and `HnswIndex` with `add`, `remove`, `search(query, k, ef)`, `search_filtered(query, k, ef, filter)`, `range_filtered(query, radius, epsilon, filter)`, `metric`, `dim`, `len`, `memory_usage`. Vector entries are keyed by **`Bytes` document key**, not `DocId`; extra chunks use the key `"<doc_key>\x00<chunk_idx>"`.
 
-`Router::ft_search` (`src/router.rs:2675`) is the real entry point:
+`build_vector_index` creates the backing index from a `FieldType::Vector`: `FLAT` → `FlatIndex::new(name, dim, metric, initial_cap)`, anything else → `HnswIndex::with_params(name, dim, metric, m, ef_construction, ef_runtime)`. `InvertedIndex::new` builds one per vector field up front; if `dim` is 0 (only possible for schemas built in code, not via `FT.CREATE`), it is built lazily on the first document using that vector's length.
 
-```rust
-pub async fn ft_search(&self, index: &str, ast: &QueryAst, opts: &SearchOptions) -> (usize, Vec<SearchHit>) {
-    // ... hybrid RRF/Linear short-circuit, see §4.8 ...
-    let (local_total, local_hits) = {
-        let db = self.local_db.borrow();
-        if let Some(idx) = db.search_indices.get(index) {
-            crate::search::execute_search(idx, ast, &scatter_opts)             // per-shard partition
-        } else if let Some(idx_arc) = crate::search::get_search_index(index) {
-            crate::search::execute_search(&idx_arc.read().unwrap(), ast, &scatter_opts)  // fallback: mirror
-        } else { (0, Vec::new()) }
-    };
-    if self.num_shards > 1 {
-        for (sid, sender) in self.senders.iter().enumerate() {
-            if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
-                sender.send(ShardMessage::SearchQuery { index, ast: Box::new(ast.clone()),
-                                                          options: Box::new(scatter_opts.clone()), responder: tx });
-                pending.push(rx);
-            }
-        }
-        for rx in pending { /* recv_async, accumulate all_hits/all_totals */ }
-    }
-    // merge-sort by sortby or score desc, re-paginate by offset/limit
-}
-```
-
-Every remote shard answers `ShardMessage::SearchQuery` by querying **only its own local partition** — `db.search_indices.get(&index)` in `src/server.rs`'s shard-message loop (~line 1651) — and never consults the mirror. The local-shard mirror fallback (`get_search_index`) fires only if this shard's own `search_indices` map is missing the index entirely, which does not happen in normal operation because `create_search_index` synchronously broadcasts `ShardMessage::InitSearchIndex` to **every** shard before returning (§5). With a single shard (`num_shards == 1`), the scatter loop never runs at all — the whole cross-shard path is skipped.
-
-`FT.INFO` (`Command::FtInfo`, `src/connection.rs:11482`) always reads the **mirror** directly via `get_search_index`, never a shard's local partition — it reports process-wide `num_docs`/`num_terms`/`hash_indexing_failures`/`vector_index_sz_mb` without any scatter/gather, because the mirror already has every document (in principle — see the `FT.ADD` divergence in §6).
-
-### 2.4 Vector indices are now real `FlatIndex`/`HnswIndex`, not a brute-force scan (prior-pass finding now reversed)
-
-`build_vector_index` (line 642) constructs the concrete backing index from a schema's `VECTOR` field at index-creation time (`InvertedIndex::new`, lines 693–698) **and** lazily the first time a document with that vector field is added if the index wasn't pre-built (lines 914–923, using the first document's vector length as a dimension hint when `DIM` was `0`):
-
-```rust
-fn build_vector_index(index_name: &str, ftype: &FieldType, dim_hint: usize) -> Option<VectorFieldIndex> {
-    let FieldType::Vector { dim, distance_metric, algorithm, attrs } = ftype else { return None };
-    let dim = if *dim == 0 { dim_hint } else { *dim };
-    let metric = metric_from_str(distance_metric);
-    Some(if algorithm.eq_ignore_ascii_case("FLAT") {
-        VectorFieldIndex::Flat(FlatIndex::new(index_name.to_string(), dim, metric, attrs.initial_cap))
-    } else {
-        VectorFieldIndex::Hnsw(HnswIndex::with_params(index_name.to_string(), dim, metric,
-                                                       attrs.m, attrs.ef_construction, attrs.ef_runtime))
-    })
-}
-```
-
-`InvertedIndex.vector_indices: HashMap<String, VectorFieldIndex>` is keyed by the field's **alias**. `VectorFieldIndex` (`src/vector.rs:2655`) is a thin enum dispatch over `FlatIndex`/`HnswIndex`, exposing `.search_filtered(query, k, ef_runtime, filter)`, `.range_filtered(query, radius, epsilon, filter)`, `.add`, `.remove`, `.metric()`, `.len()`, `.dim()`, `.memory_usage()`. Real ANN traversal (`HnswIndex::search_filtered`) is used whenever there is no candidate-set filter, or the filtered candidate set is large enough (§4.5's `KNN_ADHOC_BF_RATIO` heuristic); `FlatIndex` is always brute-force-exact regardless.
-
----
-
-## 3. Indexing Algorithms
-
-### 3.1 Tokenization — `tokenize_text` / `simple_stem` (lines 593–630, unchanged)
-
-```rust
-pub fn tokenize_text(text: &str, stem: bool) -> Vec<String> {
-    for raw in text.split(|c: char| !c.is_alphanumeric()) {
-        let lower = raw.to_ascii_lowercase();
-        if ENGLISH_STOP_WORDS.contains(lower.as_str()) { continue; }   // ~120-word fixed English stop list
-        tokens.push(if stem { simple_stem(&lower) } else { lower });
-    }
-}
-pub fn simple_stem(word: &str) -> String {
-    // -ing (len>5) strip 3; -ies (len>4) -> "y"; -es (len>4) strip 2;
-    // -ed (len>3) strip 2; trailing -s (len>3, not -ss) strip 1; else unchanged
-}
-```
-
-This same pipeline runs at index time (`add_document`) and query time (`parse_query`'s bare-word branch, and `parse_knn_clause`/etc. do not tokenize), so stored and queried terms are normalized identically. Not a real Porter/Snowball stemmer — five hand-written suffix rules.
-
-### 3.2 Indexing a HASH document — `add_hash_document` → `add_document` (lines 732–957)
-
-`add_hash_document(key, raw: &[(Bytes, Bytes)])` is the **binary-safe** entry point used for `HSET`/`HMSET` (added in `f0ce2a9`): for every `(field, value)` pair, if the field matches a schema `VECTOR` field's identifier/alias it is decoded via `decode_vector` with that field's declared `TYPE`/`DIM` — a decode failure sets `failed = true`, and the **whole document is rejected** (all other fields discarded too) and `indexing_failures` incremented (lines 748–763); otherwise the raw bytes are lossily converted to `String` (`String::from_utf8_lossy`) for text/numeric/tag processing. `add_document` then does the real work:
-
-1. For each `VECTOR` schema field, resolve the vector from the caller-supplied `vectors` map (preferred) or by decoding the field's string value (lines 808–822); a dimension mismatch on an **extra chunk** (`field#1`, `field#2`, …) rejects the whole document (lines 832–835, `indexing_failures += 1`).
-2. For `TEXT` fields: `tokenize_text` → accumulate `term_positions: HashMap<String, u32>` (term frequency) and `doc_len`.
-3. For `NUMERIC`: `f64::parse` into `numeric_fields`.
-4. For `TAG`: split on `separator`, trim, lower-case unless `casesensitive`, into a `HashSet<String>`.
-5. Fields **not declared in the schema** (except the literal JSON-root marker `"$"`) are still indexed as stemmed text — an untyped fallback (lines 888–895).
-6. Allocate/reuse a `DocId` from `free_ids` or `next_doc_id` (line 898).
-7. Push a `Posting { doc_id, term_freq }` per term into `self.inverted` (lines 904–912).
-8. For each vector field: lazily build the `VectorFieldIndex` if missing (using this doc's vector length as the dim hint), call `vi.add(key_bytes.clone(), vec.clone())` for the primary vector, then for every extra chunk `vi.add(Bytes::from(format!("{}\x00{}", doc_id_str, chunk_idx)), chunk_vec)` — **chunk keys use a `\x00` (NUL) separator between the document key and the chunk index** (lines 914–933).
-9. Insert each numeric value into `self.numeric_trees[field].add(doc_id, value)` (lines 935–940).
-10. Store `DocMeta` and bump `total_docs`/`total_terms`.
-
-Re-indexing an existing key (`key_to_id.contains_key`) first calls `remove_document` (full remove-then-readd, line 794–796).
-
-**Multi-vector chunks are JSON-only in practice.** `add_document`'s chunk-detection loop (lines 826–838) looks for extra vectors under the keys `"{alias}#{chunk_idx}"`/`"{identifier}#{chunk_idx}"` inside the `vectors` map passed in. `extract_json_fields` (§3.3) populates exactly these keys when a JSONPath (e.g. `$.chunks[*].emb`) matches multiple array elements. **`add_hash_document`, however, only ever inserts a single `sf.alias -> vec` entry into its `vectors` map** (line 750) — it never scans raw HASH fields for a `field#1`/`field#2` naming convention. So a `HSET`-ingested document can never produce more than one chunk per vector field, even though the storage/query-side dedup machinery (§4.6) is fully format-agnostic.
-
-### 3.3 Indexing a JSON document — `extract_json_fields` (lines 1100–1238)
-
-Walks `schema.schema_fields`, resolves each field's JSONPath via `crate::json::parse_json_path`/`query_json_path`, and for `Vector` fields collects **every** matched value as a candidate vector (`serde_json::Value::Array` → `f32` components, or `String` → `parse_vector_blob`). The **first** matched vector becomes the field's primary value (`extracted_vectors[alias]`); every **subsequent** match becomes a numbered chunk (`extracted_vectors["{alias}#{chunk_idx}"]`, lines 1212–1215) — this is what backs true multi-vector JSON chunk fields. The full JSON document is also always stored verbatim under the `"$"` key (line 1109).
-
-### 3.4 Deleting a document — `remove_document` (lines 959–1004, unchanged in shape)
-
-`O(terms in that document)`, not a full vocabulary scan, because `DocMeta.terms` records exactly which terms the document contributed. Also now cleans up `vector_indices`: for each vector field, `hnsw.remove(&meta.key)` for the primary vector plus `hnsw.remove(&format!("{}\x00{}", key, chunk_idx))` for every recorded chunk (lines 992–1001).
-
-### 3.5 BM25 Scoring — `bm25_score` (lines 1006–1024, formula unchanged, re-verified)
-
-```rust
-pub fn bm25_score(&self, term: &str, posting: &Posting, doc_len: usize) -> f64 {
-    let n = self.inverted.get(term).map(|v| v.len()).unwrap_or(0);
-    if n == 0 || self.total_docs == 0 { return 0.0; }
-    let idf = ((self.total_docs as f64 - n as f64 + 0.5) / (n as f64 + 0.5) + 1.0).ln();
-    if idf <= 0.0 { return 0.0001; }                          // floor, not in the classic formula
-    let (k1, b) = (1.2, 0.75);
-    let avgdl = self.avg_doc_len().max(1.0);
-    let freq = posting.term_freq as f64;
-    let tf = (freq * (k1 + 1.0)) / (freq + k1 * (1.0 - b + b * (doc_len as f64 / avgdl)));
-    idf * tf
-}
-```
-
-$k_1=1.2$, $b=0.75$, textbook Okapi BM25 IDF smoothing. `doc_len` is the whole document's combined token count across every indexed text field (not per-field). **`FieldType::Text.weight` is accepted and stored by `FT.CREATE`/`FT.ALTER` but is never read anywhere in `bm25_score`, `add_document`, or any caller** — re-verified still true; the per-field weight is pure metadata, only echoed back by `FT.INFO`.
-
----
-
-## 4. Query Pipeline
-
-### 4.1 `QueryAst` (lines 1270–1314)
+### 3.6 Query and result types
 
 ```rust
 pub enum QueryAst {
@@ -313,232 +166,422 @@ pub enum QueryAst {
     NumericRange { field: String, min: f64, max: f64 },
     TagFilter { field: String, tags: Vec<String> },
     And(Vec<QueryAst>), Or(Vec<QueryAst>), Not(Box<QueryAst>),
-    KnnVector { field: String, k: usize, query_vec: Vec<f32>, param_name: String,
+    KnnVector { field, k: usize, query_vec: Vec<f32>, param_name: String,
                 k_param: Option<String>, ef_runtime: Option<String>, yield_as: Option<String> },
-    VectorRange { field: String, radius: f32, radius_param: Option<String>, param_name: String,
+    VectorRange { field, radius: f32, radius_param: Option<String>, param_name: String,
                   epsilon: Option<String>, yield_as: Option<String> },
     MatchAll,
 }
 ```
 
-`KnnVector`/`VectorRange` now carry `$param`-style deferred references (`k_param`, `radius_param`, `ef_runtime`, `epsilon` are all `Option<String>` holding either a literal or a `$name`) resolved at **execution** time against `SearchOptions.params` via `resolve_usize_param`/`resolve_f32_param`/`resolve_str_param` (lines 1386–1405) — these try both the bare name and a `$`-prefixed name as map keys.
+`k_param`, `ef_runtime`, `radius_param` and `epsilon` hold either a literal or a `$name` reference, resolved at **execution** time against `PARAMS` by `resolve_usize_param` / `resolve_f32_param` / `resolve_str_param` (a `$name` is looked up as `name`, then as `$name`). Useful `QueryAst` methods:
 
-`QueryAst::Exact` is still **defined and handled in `evaluate_ast`, but `parse_query` never constructs it** — a quoted phrase like `"rust systems"` is parsed as an `And` of individually stemmed terms (line 1677–1692), not a distinguished phrase match. Confirmed still dead code from the parser's side.
+- `knn_clause()` – finds the first `KnnVector`/`VectorRange` node (descending into `And`, `Or`, `FieldScope`).
+- `knn_k(opts)` – effective K of the KNN clause (`$K` resolved).
+- `knn_score_field()` – name of the distance field in results: the `AS`/`YIELD_DISTANCE_AS` alias, else `__<field>_score`.
+- `as_hybrid_rrf()` – if the AST is an `And` containing a vector clause **and** at least one non-`MatchAll` sibling, returns `(text_part, vector_part)` for fusion.
 
-### 4.2 Parser — `parse_query` (lines 1548–1704)
+`SearchOptions` (parsed from `FT.SEARCH` arguments):
 
-Hand-written, single-pass over whitespace-split tokens (with ad-hoc bracket/brace re-joining for multi-token clauses). Recognizes, in dispatch order:
+| Field | Type | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `offset`, `limit` | `usize` | 0, 10 | `LIMIT off n`. |
+| `nocontent` | `bool` | false | Return ids only. |
+| `withscores` | `bool` | false | Include score after each id. |
+| `rrf_k` | `Option<f64>` | None | RRF fusion constant (enables hybrid RRF). |
+| `linear_weights` | `Option<(f64, f64)>` | None | `(alpha, beta)` for linear fusion. |
+| `sortby` | `Option<(String, bool)>` | None | `(field, ascending)`. |
+| `return_fields` | `Option<Vec<String>>` | None | `RETURN n f...`. |
+| `params` | `HashMap<String, Vec<u8>>` | empty | `PARAMS n name value ...` (binary-safe values). |
+| `dialect` | `Option<u32>` | None | Validated `1..=4`, never read. |
+| `timeout_ms` | `Option<u64>` | None | Parsed, never read. |
 
-- `base=>[KNN <k|$K> @field [$param] [EF_RUNTIME e] [AS alias]]` — hybrid vector suffix (`parse_knn_clause`, lines 1433–1488, also accepts the legacy `=>{$YIELD_DISTANCE_AS: alias; $EF_RUNTIME: n}` attribute-block syntax).
-- `@field:[VECTOR_RANGE <radius|$param> $blob [EPSILON e] [AS alias]]` — range vector query (`parse_vector_range_clause`, lines 1492–1546).
-- `@field:[min max]` — numeric range (falls back to `NEG_INFINITY`/`INFINITY` on unparsable bound).
-- `@field:{tag1|tag2|...}` — tag filter; **tags are always lowercased at parse time** (line 1647, `.to_ascii_lowercase()`) regardless of the field's `CASESENSITIVE` schema attribute — see §6.
-- `@field:...` — recursive `FieldScope` sub-query.
-- `word1 | word2` — top-level `Or` (only recognized as a bare `|` token, splits the remaining query into left/right).
-- `word*` — `Prefix`.
-- `-term` — `Not` (recursive).
-- bare word(s) — `tokenize_text(..., stem=true)`; multiple sub-tokens (e.g. from punctuation splitting inside one arg) become an `And` of `Term`s.
-
-`strip_outer_parens` (line 1407) strips one layer of balanced parentheses before parsing, so `(foo bar)=>[KNN ...]` and `*=>[KNN ...]` both work as the base of a hybrid query.
-
-### 4.3 `evaluate_ast` — recursive AST walk to `HashMap<DocId, f64>` (lines 1747–1930)
-
-- `MatchAll` → every `id_to_meta` key, score `1.0`.
-- `Term`/`Prefix`/`Exact` → postings lookup (`Prefix` scans **every** term in `self.inverted`, i.e. `O(vocabulary size)`), scored via `bm25_score`, summed on duplicate prefix matches.
-- `FieldScope` → evaluates `inner`, then filters to docs that actually have that field present.
-- `NumericRange` → `get_numeric_tree` (§4.4) range scan if a tree exists for the field (trying both the bare name and a `$.`-stripped/prefixed variant), else a full `O(N)` linear scan fallback.
-- `TagFilter` → `O(N)` linear scan of all docs' `tag_fields` (no inverted tag index — every tag query is a full scan).
-- `And` → **hybrid pre-filtering**: if one sub-AST is a `KnnVector`/`VectorRange`, the *other* sub-ASTs are evaluated first as a `filter: HashMap<DocId, f64>`, and the vector clause is evaluated **restricted to that filter** (§4.5) — this is RediSearch's "pre-filtered hybrid KNN". Otherwise, plain set intersection with additive score accumulation, short-circuiting once the running set is empty.
-- `Or` → union with additive score accumulation.
-- `Not` → full-index-minus-excluded-set.
-- `KnnVector`/`VectorRange` (top-level, no filter) → `knn_search`/`vector_range_search` with `filter: None`.
-
-### 4.4 `RangeTree` — balanced numeric range index (lines 303–371, algorithm re-verified unchanged)
-
-`BTreeMap<OrderedF64, Vec<DocId>>` (values grouped by exact numeric value, since ties are common). `add`/`remove` do a `binary_search` within the per-value `Vec<DocId>` bucket (`O(log bucket_size)`) plus a `BTreeMap` insert/lookup (`O(log distinct_values)`). `range(min, max)` does `self.entries.range(OrderedF64(min)..=OrderedF64(max))`, a genuine **O(log N + K)** B-tree range scan (`K` = number of matching doc-value pairs) — this is the "Dragonfly-inspired" RangeTree the doc comment (line 301) references, and it's a real balanced-tree range query, not a linear scan. `OrderedF64` wraps `f64` with `total_cmp`-based `Ord` so NaN/±0.0 order consistently as a BTreeMap key.
-
-### 4.5 KNN search — `knn_search` (lines 2070–2174)
-
-```rust
-const KNN_ADHOC_BF_RATIO: f64 = 0.1;   // line 1934
-
-// (vi_opt, filter) dispatch:
-(None, None)        => brute_force(all doc ids)                           // FLAT-less field: scan DocMeta
-(None, Some(f))      => brute_force(f.keys())
-(Some(vi), None)     => dedup_min_distance(vi.search(query, k_fetch, ef))          // full ANN/FLAT search
-(Some(vi), Some(f))  => {
-    let small = f.len() as f64 <= (vi.len() as f64 * 0.1).max(k as f64);
-    if small || matches!(vi, VectorFieldIndex::Flat(_)) {
-        brute_force(f.keys())                                            // ADHOC_BF: filtered set too small
-    } else {
-        let found = dedup_min_distance(vi.search_filtered(query, k_fetch, ef, Some(&pred)));
-        if found.len() < k.min(f.len()) { brute_force(f.keys()) }        // traversal starved: fall back exact
-        else { found }
-    }
-}
-```
-
-This is RediSearch's real "ADHOC_BF" heuristic: when the pre-filter set is smaller than `10%` of the index (or at least `k`), or the index is a `FLAT` (always-exact) index, brute-force over just the filtered candidates beats a filtered graph traversal; otherwise it does a real filtered `HnswIndex::search_filtered` traversal, with a starvation fallback to brute force if the traversal returns fewer than `min(k, filter_size)` results (a poorly-connected filtered region of the graph). `k_fetch` is `k * 4` when any document has more than one indexed chunk for the field (`has_multi_chunks`, lines 2109–2118), over-fetching so that deduplicating multiple chunks down to one hit per parent document (`dedup_min_distance`, lines 1978–1993 — keeps the **minimum** distance per `DocId`) still yields `k` distinct documents.
-
-Vector index key → `DocId` resolution (`resolve_vec_key_doc_id`, lines 1943–1953) first tries an exact `key_to_id` lookup, then strips at the first `\x00` byte to recover the parent document's key for chunk keys.
-
-### 4.6 `VECTOR_RANGE` search — `vector_range_search` (lines 1995–2068)
-
-Structurally identical dispatch to KNN (`vi.range_filtered(query, radius, epsilon, filter)` vs. brute force with a `d <= radius` predicate), but no `k` truncation — returns every match within `radius`. `distance_to_similarity` (lines 1936–1941) converts a raw distance to a `(0,1]`-ish similarity score for ranking: `Cosine → (1.0 - dist).max(0.0)`, all other metrics (`L2`, `IP`) → `1.0 / (1.0 + dist.max(0.0))`.
-
-### 4.7 `execute_search` — the non-hybrid, single-AST path (lines 2260–2418)
-
-1. Short-circuits into the RRF/Linear hybrid path (§4.8) if `opts.rrf_k`/`opts.linear_weights` is set **and** `ast.as_hybrid_rrf()` recognizes the AST shape (an `And` containing exactly one `KnnVector`/`VectorRange` plus at least one other non-`MatchAll` clause). **If the option is set but the AST doesn't match that shape (e.g. a pure-KNN query with `RRF` tacked on, or no vector clause at all), the RRF/Linear option is silently ignored** and the normal scoring path below runs instead.
-2. `evaluate_ast` → candidate scores.
-3. `knn_distances` (lines 2208–2252) computes the exact vector distance for every candidate (not just the KNN winners) when the AST has a KNN/VECTOR_RANGE clause, for sorting/`YIELD_DISTANCE_AS` purposes.
-4. Sort: by KNN distance ascending if the query has a vector clause and no conflicting explicit `SORTBY` (`sort_by_knn`), else by `SORTBY` field (numeric, defaults to `NEG_INFINITY` if missing/unparsable), else BM25 descending.
-5. Paginate (`offset`/`limit`), then build `SearchHit`s: when sorting by KNN distance the reported `score` is **`-distance`** (line 2373, so descending-score merge across shards still produces nearest-first order) and, if the caller also passed an explicit `SORTBY`, `sort_val` additionally carries the raw distance. The KNN distance field is injected into `fields` under its `AS`/`$YIELD_DISTANCE_AS` alias or the default `"__{field}_score"` (`format_distance`, lines 2254–2258, uses `format!("{}", d)` — shortest round-trip `Display`, **different formatting** from the `WITHSCORES` path which always uses `format!("{:.6}", score)`, §6).
-
-### 4.8 Reciprocal Rank Fusion & Linear Fusion (lines 2420–2546)
-
-```rust
-pub fn reciprocal_rank_fusion(bm25_hits: &[SearchHit], vector_hits: &[SearchHit], k: f64) -> Vec<SearchHit> {
-    // for each list, for each hit at rank r (0-based): score += 1.0 / (k + r as f64 + 1.0)
-    // summed per doc_id across both lists, sorted descending
-}
-```
-
-Textbook RRF, `k` caller-supplied (`FT.SEARCH RRF <k>` / `SCORER RRF K <k>`, default `60.0`). `linear_score_fusion(bm25_hits, vector_hits, alpha, beta)`: min-max normalizes each list's scores to `[0,1]` independently (`(score - min) / (max - min)`, or `1.0` if the list has zero span), converting vector "scores" (which arrive as `-distance <= 0.0` from `execute_search`, line 2373) back to a `(0,1]` similarity via `1.0/(1.0 + (-score))` first, then computes `alpha * norm_bm25 + beta * norm_vec` per document (missing from one list contributes `0` from that list only). Both fusion functions merge each side's `fields` map, preferring whichever side's field value was seen first (`or_insert_with`), with `linear_score_fusion` additionally back-filling any field present in the vector-side hit but missing from the (first-seen) merged row (lines 2519–2526).
-
-**Orchestration is two layers deep**: `execute_search` runs the hybrid fusion **within a single shard's index** (used by the per-shard/remote-shard scatter targets), while `Router::ft_search` (`src/router.rs:2681`) runs an **independent, coarser** hybrid path: it detects the same `as_hybrid_rrf()` shape, then recursively calls `self.ft_search` **twice** — once for the BM25-only sub-AST, once for the KNN/VectorRange-only sub-AST, each with its own full scatter-gather across all shards (`limit = max(offset+limit, knn_k, 100)`, `rrf_k`/`linear_weights` cleared on the recursive calls to avoid infinite hybrid-detection) — and fuses the two **already-merged, cross-shard** hit lists client-side on the coordinating shard. **This means a hybrid `FT.SEARCH`/`FT.HYBRID` query issues roughly double the cross-shard messages of a plain query** (two independent `(N-1)`-shard scatters instead of one).
-
-### 4.9 `FT.AGGREGATE` pipeline — `execute_aggregate_pipeline` (lines 2846–3034)
-
-```rust
-pub enum Reducer { Count{alias}, Sum{field,alias}, Avg{field,alias}, Min{field,alias}, Max{field,alias} }
-pub struct GroupByStage { pub fields: Vec<String>, pub reducers: Vec<Reducer> }
-pub struct ApplyStage   { pub expr: String, pub alias: String }
-pub struct SortByStage  { pub fields: Vec<(String, bool)>, pub max: Option<usize> }
-pub enum AggregateStage { Group(GroupByStage), Apply(ApplyStage), Sort(SortByStage), Limit{offset,num}, Filter(String) }
-pub type AggregateRow = Vec<(String, String)>;   // ordered key/value pairs, not a HashMap
-```
-
-`Router::ft_aggregate` (`src/router.rs:2808`) first calls `parse_query`, then `self.ft_search` with `SearchOptions { limit: 100_000, offset: 0, sortby: None, return_fields: options.load_fields, .. }` — i.e. it fetches up to **100,000** matching rows via the normal cross-shard scatter/gather (§2.3), fully merged, **before** running any pipeline stage. `execute_aggregate_pipeline` then runs **single-threaded, on the coordinating shard only** — there is no per-stage distribution; `GROUPBY`/`REDUCE`/`APPLY`/`SORTBY`/`FILTER`/`LIMIT` all operate on the in-memory `Vec<AggregateRow>` sequentially, in the order the stages appeared in the command:
-
-- **`Filter`**: `evaluate_filter` (lines 2800–2844) — a 3-token `@field op value` comparator (`==`/`=`, `!=`, `>`, `>=`, `<`, `<=`), numeric if both sides parse as `f64`, else lexicographic string comparison. No `&&`/`||` boolean composition.
-- **`Apply`**: `evaluate_expr` — a small recursive-descent arithmetic parser/evaluator (`tokenize_expr`/`parse_expr_addition`/`parse_expr_multiplication`/`parse_expr_primary`, lines 2615–2798) supporting `+ - * /`, parens, unary minus, numeric literals, and `@field` references (missing/unparsable fields evaluate to `0.0`, not an error). On a parse error, falls back to copying `@expr`'s own value verbatim if `expr` is itself a bare field reference. Numeric results are formatted as an integer string if `fract() == 0.0`, else `{:.4}` trimmed of trailing zeros.
-- **`Group`**: buckets rows into a `HashMap<Vec<String>, Vec<AggregateRow>>` keyed by the group-by fields' string values, then computes each reducer over each bucket (`Sum`/`Avg`/`Min`/`Max` skip non-numeric values silently; `Min`/`Max` on an empty numeric set emit `"0"`).
-- **`Sort`**: stable multi-key sort (numeric if both sides parse, else `str::cmp`), optional `max` truncation.
-- **`Limit`**: `skip(offset).take(num)`.
+`SearchHit { doc_id: String, score: f64, sort_val: Option<f64>, fields: HashMap<String, String> }` is what shards return and the router merges.
 
 ---
 
-## 5. Cross-Shard Scatter/Gather — Exact Mechanism
+## 4. Indexing
 
-| Operation | Mechanism |
+### 4.1 Tokenization and stemming
+
+`tokenize_text(text, stem)`:
+
+1. Split on every non-alphanumeric character.
+2. ASCII-lowercase each piece; drop empty pieces and words in `ENGLISH_STOP_WORDS` (a fixed English list: articles, pronouns, auxiliaries, contractions such as `you're`).
+3. If `stem`, apply `simple_stem`.
+
+`simple_stem` is five suffix rules, checked in order (not Porter/Snowball):
+
+| Rule | Example |
 | :--- | :--- |
-| `FT.CREATE` | `Router::create_search_index` (router.rs:2560): registers in the global mirror first, backfills+initializes the **local** shard's partition (`ShardDb::init_search_index`, scanning that shard's own `RudisTable`/`JsonStore` entries and matching `PREFIX`es), then broadcasts `ShardMessage::InitSearchIndex { schema }` to every other shard via `flume::bounded(1)` request/response, awaiting each `rx.recv_async()` before returning `Ok(())` — **synchronous fan-out**, so once `FT.CREATE` returns, every shard has an initialized (possibly backfilled) local partition. |
-| `FT.ALTER` | `Router::alter_search_index` (router.rs:2619): merges new fields into the existing schema, calls `crate::search::reset_search_index` (replaces the **mirror** with a brand-new empty `InvertedIndex`, discarding its prior contents), re-initializes the **local** shard via `init_search_index` — which re-backfills matching documents from *that shard's own* local table/JSON store AND pushes each one into the now-empty mirror (`shard.rs:686-690/705-709/724-728`) — then broadcasts `ShardMessage::InitSearchIndex` with the merged schema to every other shard, each of which does the same local-backfill-plus-mirror-push for its own slice of the keyspace. Net effect: the mirror ends up fully reconstructed from every shard's local data once all broadcasts complete, not permanently emptied — but it is briefly incomplete (only the initiating shard's documents) while the broadcast is in flight. |
-| `FT.SEARCH`/`FT.HYBRID` | `Router::ft_search` (§2.3): query local partition, scatter `ShardMessage::SearchQuery` to every other shard (skipped entirely if `num_shards == 1`), gather, merge-sort, re-paginate. Hybrid (RRF/Linear) queries do this **twice** (§4.8). |
-| `FT.AGGREGATE` | One `ft_search` scatter/gather (limit 100,000, no pagination) then a fully local, single-shard pipeline (§4.9) — **not** distributed. |
-| `FT.DROPINDEX` | `Router::drop_search_index`: drops local partition, broadcasts `ShardMessage::DropSearchIndex { name }` to every other shard, then drops the global mirror entry (`crate::search::drop_search_index`). |
-| `FT.INFO`/`FT._LIST` | No scatter/gather — reads the global mirror directly (`get_search_index`/`list_search_indices`), which every shard's writes keep in sync via the double-write in §2.3/§6. |
-| `FT.ADD` | **No scatter/gather, no local-shard write at all** — writes directly (and only) to the global mirror via `get_search_index` (`connection.rs:11623-11627`). See §6 for the consequence. |
+| length > 5 and ends `ing` → drop 3 | `running` → `runn`, `indexing` → `index` |
+| length > 4 and ends `ies` → replace with `y` | `studies` → `study` |
+| length > 4 and ends `es` → drop 2 | `boxes` → `box` |
+| length > 3 and ends `ed` → drop 2 | `played` → `play` |
+| length > 3, ends `s` but not `ss` → drop 1 | `cats` → `cat`, `class` unchanged |
 
-All inter-shard messages use the same `flume::bounded(1)` request/oneshot-response pattern as the rest of the router (Component 04's `ShardMessage` mesh) — a query message plus a dedicated response channel per remote shard, awaited concurrently (one `rx` per shard, not sequentially).
+The same function runs at index time and for bare query words, so they normally agree.
 
----
+### 4.2 Indexing a HASH document
 
-## 6. Known Bugs, Limitations & Dead Code (verified by reading, not carried over from memory)
+Entry point: `InvertedIndex::add_hash_document(key, raw: &[(Bytes, Bytes)])`, which receives the full `HGETALL` of the key (binary-safe).
 
-1. **`FT.ADD` documents are invisible to `FT.SEARCH`/`FT.AGGREGATE` once the index exists on every shard.** `Command::FtAdd` (`connection.rs:11617-11631`) calls `idx_arc.write().unwrap().add_document(...)` **only** on the global mirror (`crate::search::get_search_index`). But `Router::ft_search` only falls back to the mirror when the querying shard's **own** `search_indices` map lacks the index (§2.3) — and after `FT.CREATE`, every shard always has a local entry. So a document added purely via legacy `FT.ADD` is counted in `FT.INFO`'s `num_docs` (which reads the mirror) but **never returned by `FT.SEARCH`/`FT.AGGREGATE`** (which read the per-shard partitions) — a real, user-visible count/result mismatch. `FT.ADD` also always passes `vectors: None` (line 11626), so it can never index vector fields even when it does work.
-2. **`FieldType::Text.weight` (`WEIGHT` attribute) is parsed and stored (`FT.CREATE`/`FT.ALTER`, and echoed by `FT.INFO`) but never read by `bm25_score` or anywhere in the scoring path** — re-verified still true. All text fields contribute to relevance identically regardless of declared weight.
-3. **`VECTOR ... EPSILON <e>` (schema-level default) and `VECTOR FLAT ... BLOCK_SIZE <n>` are parsed into `VectorFieldAttrs.epsilon`/`.block_size` (`resp.rs:11387-11403`) but never read anywhere in `search.rs` or `vector.rs`** — dead configuration. Only the **per-query** `$EPSILON` inside a `VECTOR_RANGE ... => {$EPSILON: ...}` clause has any effect (§4.6).
-4. **`DIALECT` is range-validated (`1..=4`) and stored in `SearchOptions.dialect`, but the field is never read anywhere after being set** (`grep` confirms the only reference to `.dialect` in the whole crate is the assignment at `resp.rs:11592`) — pure validate-and-discard; there is only one query-parsing behavior regardless of declared dialect.
-5. **`TIMEOUT <ms>` is parsed into `SearchOptions.timeout_ms` but the value is explicitly discarded at the one place it's pattern-matched** (`connection.rs:10604`, `timeout_ms: _`) — no query timeout is ever enforced; a pathological query (e.g. a `Prefix` scan over a huge vocabulary, or `TagFilter`'s full linear scan) runs to completion regardless of the requested timeout.
-6. **`TAG` query matching ignores the schema's `CASESENSITIVE` attribute on the query side.** Indexing (`add_document`, lines 869-885) respects `casesensitive` (stores tags with original case when set). But `parse_query`'s tag-filter branch **always** lowercases the query's tag literals (line 1647, unconditional `.to_ascii_lowercase()`), so a `CASESENSITIVE` tag field that actually contains mixed-case values (e.g. `"Books"`) can **never** be matched by `@field:{Books}` — it is silently lowercased to `"books"` before the `HashSet::contains` check and will never match unless the original tag happened to already be lowercase.
-7. **Multi-vector (chunked) fields only work for JSON-indexed documents** (§3.2/§3.3) — `extract_json_fields` produces the `"{alias}#{n}"` extra-chunk keys that `add_document` looks for, but `add_hash_document` never does, so a HASH document's vector field is always exactly one chunk regardless of how many raw `field#N` HASH fields are set.
-8. **`QueryAst::Exact` is still dead code** — defined and handled in `evaluate_ast`, never constructed by `parse_query`; quoted phrases are parsed as an `And` of stemmed terms, not an exact/positional phrase match (re-verified unchanged from the prior pass).
-9. **Hybrid RRF/Linear silently no-ops if the AST doesn't have the expected shape.** If a caller sets `RRF`/`LINEAR`/`SCORER` on `FT.SEARCH` but the query string doesn't parse into an `And` containing exactly one KNN/VECTOR_RANGE clause plus at least one other clause (`as_hybrid_rrf`, lines 1360-1382), the fusion option is dropped and the plain BM25/KNN-sort path runs instead — no error is returned.
-10. **`FT.EXPLAIN` returns the `Debug`-formatted `QueryAst`**, not a real, human-oriented query execution plan (iterator tree, estimated cardinalities, etc.) — `connection.rs:11611-11615`, `format!("{:?}", ast)`.
-11. **`FT.DROPINDEX ... DD`** (which in real RediSearch also deletes the indexed documents themselves) **parses the `DD` flag but discards it** (`Command::FtDropIndex { index, dd: _ }`, `connection.rs:11604`) — only the index metadata/postings are dropped; underlying keys are never touched.
-12. **`WITHSCORES` and `YIELD_DISTANCE_AS` use different, inconsistent numeric formatting**: `FT.SEARCH`/`FT.PROFILE`'s score output is always `format!("{:.6}", score)` (fixed 6 decimals), while the KNN distance field injected via `format_distance` (line 2255) uses `format!("{}", d)` (shortest round-trip `Display`, e.g. `"0"` not `"0.000000"`).
-13. **`Prefix` and `TagFilter` are both full scans** — `Prefix` is `O(vocabulary size)` over `self.inverted`, `TagFilter` is `O(N documents)` over `id_to_meta` — there is no trie/prefix index for terms and no inverted tag index; only exact `Term` lookups and numeric `RangeTree` queries are sub-linear.
-14. **Double indexing cost persists**: every document write still pays full tokenization/posting-list/vector-index cost twice — once into the per-shard partition, once into the process-wide mirror (§2.3) — unchanged from the prior pass's finding.
+1. For each `(field, value)`: if the field name matches a `VECTOR` schema field's identifier or alias, decode it with `decode_vector(value, TYPE, DIM)`. Success puts the vector into a `vectors` map under the alias; failure marks the document as failed.
+2. Every value (including vector blobs) is also stored lossily as a UTF-8 `String` in a field map.
+3. If any vector failed: remove any previous version of the document from the index, increment `indexing_failures`, and stop — **the whole document is rejected**.
+4. Otherwise call `add_document(key, fields, Some(vectors))`.
 
----
+`decode_vector(bytes, data_type, dim)`:
 
-## 7. `FT.*` / `SEARCH.*` Command Surface (verified against `src/resp.rs` lines 11199–12223 and `src/connection.rs`)
+1. Try a **text** parse (`parse_vector_text`) — only if every byte is an ASCII digit, `.`, `,`, `-`, `+`, `e`, `E`, `[`, `]` or whitespace; accepts `"1,2,3"` and `"[1, 2, 3]"`. Use it if `dim == 0` or it has exactly `dim` components.
+2. Otherwise require `bytes.len() == dim * elem_size` and decode a **little-endian binary blob** via `decode_typed_blob` (`f32/f64::from_le_bytes`, IEEE half-precision via `f16_to_f32`, bfloat16 by shifting into the high half of an `f32`, `i8`/`u8` cast directly).
+3. Reject if the length differs from `dim` or any component is not finite.
 
-| Command | Parsed Syntax | Notes |
+Example: `HSET doc:1 emb <16 bytes>` for a `TYPE FLOAT32 DIM 4` field. The bytes are not all ASCII-numeric, so the text parse fails; 16 == 4 × 4, so they decode as four `f32`s.
+
+### 4.3 `add_document` — the common indexing core
+
+`add_document(key, fields: HashMap<String,String>, vectors: Option<HashMap<String, Vec<f32>>>)` is shared by HASH, JSON and `FT.ADD`:
+
+1. If the key is already indexed, `remove_document` it first (re-index = remove + add).
+2. **Vectors first.** For each `VECTOR` schema field, take the vector from `vectors` (by alias, then identifier), else decode the field's string value. If it has the right dimension, also collect extra chunks `"<alias>#1"`, `"<alias>#2"`, … (or `"<identifier>#n"`) from `vectors` until one is missing. A wrong dimension on the primary or any chunk increments `indexing_failures` and **rejects the document** (note the old version was already removed in step 1).
+3. For each field: look up its type in `schema.fields` (keyed by alias and identifier):
+   - `TEXT` → `tokenize_text(value, !nostem)`, add to per-term frequency map and `doc_len`.
+   - `NUMERIC` → `trim().parse::<f64>()`; unparsable values are silently skipped.
+   - `TAG` → split on `separator`, trim, drop empties, lowercase unless `casesensitive`, store as a set.
+   - `VECTOR` → nothing here (handled in step 2).
+   - **Not in the schema** (and not the JSON `"$"` key) → indexed as stemmed text anyway (untyped fallback).
+4. Allocate a `DocId` (`free_ids.pop()` or `next_doc_id++`).
+5. Append `Posting { doc_id, term_freq }` to each term's list; remember the terms in `DocMeta.terms`.
+6. For each vector field: build the vector index if missing, `add(key, primary)`, then `add("<key>\x00<i>", chunk_i)` for each extra chunk.
+7. Insert each numeric value into `numeric_trees[field]`.
+8. Store `DocMeta`, update `key_to_id`, `total_docs`, `total_terms`.
+
+### 4.4 Indexing a JSON document
+
+`extract_json_fields(schema, root)` turns a JSON value into the `(fields, vectors)` pair for `add_document`:
+
+1. Always stores the whole document serialized under the key `"$"` (so it is returned by `FT.SEARCH` unless `RETURN` is used; it is not tokenized).
+2. For each schema field, parse its identifier as a JSONPath (`json::parse_json_path`) and evaluate it (`json::query_json_path`). No match → skip.
+3. By type:
+   - `TEXT`: strings, numbers, bools, and array elements are joined with spaces.
+   - `NUMERIC`: the first match, as a JSON number or numeric string.
+   - `TAG`: strings / array elements joined with the field's separator.
+   - `VECTOR`: every match that is a numeric array (or a string decodable by `parse_vector_blob`, i.e. `decode_vector` as FLOAT32 with any dim) becomes a candidate. The first is the primary vector (stored under alias and identifier); later ones become chunks `"<alias>#1"`, `"<alias>#2"`, … The primary is also stored as a comma-joined string field.
+4. Each value is stored under the alias **and**, if different, the identifier.
+
+**Multi-vector (chunked) fields** come from a JSONPath that matches several arrays, e.g. `$.chunks[*].emb`: a document with three chunk embeddings gets one primary vector and two chunks in the vector index, all mapping back to the same `DocId`.
+
+### 4.5 Removing a document
+
+`remove_document(key)` costs O(terms in the document), not O(vocabulary):
+
+1. Remove `key_to_id[key]`, take the `DocMeta`, decrement counters, push the id onto `free_ids`.
+2. For each term in `DocMeta.terms`, `retain` the postings without this id; drop empty lists.
+3. Remove each numeric value from its `RangeTree`; drop empty trees.
+4. Remove the primary vector and every `"<key>\x00<i>"` chunk from each vector index.
+
+### 4.6 Which writes update the indexes
+
+| Trigger | Per-shard partition | Global mirror |
 | :--- | :--- | :--- |
-| `FT.CREATE` | `<index> [ON HASH\|JSON] [PREFIX n p1 ...] SCHEMA (<id> [AS <alias>] TEXT [WEIGHT w] [SORTABLE] [NOSTEM] \| NUMERIC [SORTABLE] \| TAG [SEPARATOR c] [CASESENSITIVE] \| VECTOR <FLAT\|HNSW> <n_args> TYPE <FLOAT32\|FLOAT64\|FLOAT16\|BFLOAT16\|INT8\|UINT8> DIM n DISTANCE_METRIC <L2\|IP\|COSINE> [INITIAL_CAP c] [BLOCK_SIZE b (FLAT)] [M m (HNSW)] [EF_CONSTRUCTION efc (HNSW)] [EF_RUNTIME efr (HNSW)] [EPSILON e (HNSW)])+` | `TYPE`/`DIM`/`DISTANCE_METRIC` are mandatory for `VECTOR` (returns an error if missing); backfills all matching existing keys on all shards (§5). |
-| `FT.SEARCH` | `<index> <query> [NOCONTENT] [WITHSCORES] [RRF [k]] [LINEAR [a b]] [SCORER RRF\|LINEAR ...] [LIMIT off n] [SORTBY field [ASC\|DESC]] [RETURN n f1 ...] [PARAMS n k v ...] [DIALECT 1-4] [TIMEOUT ms]` | `RRF`/`LINEAR`/`SCORER` set `SearchOptions.rrf_k`/`.linear_weights`; effective only if the query AST matches a hybrid shape (§6 item 9). |
-| `FT.HYBRID` | `<index> <text_query> <vector_query> [RRF [k]] [LINEAR [a b]] [SCORER RRF\|LINEAR ...] [LIMIT off n] [RETURN n f1 ...] [PARAMS n k v ...] [WITHSCORES] [NOCONTENT] [DIALECT] [TIMEOUT]` | **Syntactic sugar, not a distinct execution path**: stitches `text_query` and `vector_query` into one combined query string (`"({text})=>{vec_tail}"`) and returns a `Command::FtSearch` with `rrf_k: Some(60.0)` by default — reuses `FT.SEARCH`'s exact hybrid-fusion code (§4.8). |
-| `FT.AGGREGATE` | `<index> <query> [LOAD n @f1 ...] [GROUPBY n @f1 ... [REDUCE COUNT\|SUM\|AVG\|MIN\|MAX n args [AS alias]]...] [APPLY expr AS alias] [SORTBY n @f1 [ASC\|DESC] ... ] [LIMIT off n] [FILTER expr] [DIALECT] [TIMEOUT]` | Stages execute in command order (§4.9); scatter/gather happens once, before any stage (§5). |
-| `FT.ALTER` | `<index> SCHEMA ADD (<id> [AS <alias>] <type>...)+` | Merges fields into the schema, rebuilds+backfills all copies (§5). |
-| `FT._LIST` | *(no args)* | `Command::FtList` → sorted `list_search_indices()` from the mirror. |
-| `FT.PROFILE` | `<index> SEARCH [LIMITED] QUERY <query> [NOCONTENT] [WITHSCORES] [LIMIT off n] [PARAMS n k v ...] [DIALECT] [TIMEOUT]` | Returns a 2-element RESP array `[search_results, profile_details]`; timing is wall-clock `Instant::now()` deltas around `parse_query` and `Router::ft_search` (parse time and total time, both formatted as seconds with 6 decimals) plus the `Debug`-formatted AST — not a real per-iterator profile. |
-| `FT.INFO` | `<index>` | Reads the mirror only (§2.3); reports `num_docs`, `num_terms` (`inverted.len()`, i.e. distinct terms), `total_inverted_index_blocks` (actually `total_terms`, the sum of all doc lengths — a naming mismatch with real RediSearch's field), `vector_index_sz_mb` (`Σ VectorFieldIndex::memory_usage()`), `hash_indexing_failures`, per-attribute detail including live `num_vectors`/`dim` for `VECTOR` fields. |
-| `FT.DROPINDEX` | `<index> [DD]` | `DD` parsed but ignored (§6 item 11). |
-| `FT.EXPLAIN` | `<index> <query>` | Returns `Debug`-formatted `QueryAst` (§6 item 10); `<index>` argument is accepted but unused. |
-| `FT.ADD` | `<index> <doc_id> <score> FIELDS f1 v1 ...` | Legacy single-document add; mirror-only write, no vectors (§6 item 1). |
+| `HSET`, `HMSET` (via `reindex_hash_for_search`: re-reads `HGETALL`, re-indexes or deletes if the hash is now empty) | yes | yes |
+| `JSON.SET`, `JSON.DEL` | yes | yes |
+| `JSON.NUMINCRBY`, `JSON.NUMMULTBY`, `JSON.STRAPPEND`, `JSON.ARRAPPEND`, `JSON.ARRPOP`, `JSON.TOGGLE`, `JSON.CLEAR` | **no** | yes |
+| `DEL` / `UNLINK` (local and cross-shard paths, `Router::del_local`, `ShardMessage::Del`) | yes | yes |
+| `FT.ADD` | **no** | yes |
+| `FT.CREATE` / `FT.ALTER` backfill (`ShardDb::init_search_index`) | yes | yes |
+| `HDEL`, `HINCRBY`, key expiry, eviction, `FLUSHDB`/`FLUSHALL` | **no** | **no** |
 
-`VECTOR` fields are backed by `InvertedIndex.vector_indices: HashMap<String, VectorFieldIndex>` wrapping either `FlatIndex` or `HnswIndex` from `src/vector.rs` (§2.4). Multi-vector JSON chunk arrays index each chunk under `<doc_key>\x00<chunk_idx>` in the vector index and deduplicate to the parent document by minimum distance across chunks during KNN/`VECTOR_RANGE` evaluation (§3.2, §4.5).
+HASH hooks only run when `db.has_search_indices() || search::has_active_search_indices()` (the latter is an atomic counter, `SEARCH_INDICES_COUNT`, so it is cheap when no index exists). While any index exists, several write fast paths in `src/server.rs` and `src/connection.rs` (single-key `DEL`/`UNLINK`, `HDEL` batching) are disabled so the slow path with hooks runs.
 
 ---
 
-## 8. Cross-Component Interactions
+## 5. Index lifecycle across shards
 
-- **`src/connection.rs`**: `Command::FtCreate/FtSearch/FtAggregate/FtInfo/FtDropIndex/FtExplain/FtAdd/FtList/FtAlter/FtProfile` arms call the corresponding `Router`/global-registry functions (§5/§7). `HSET`/`HMSET` and root-path `JSON.SET` call `reindex_hash_for_search`/`index_json_document_local`+`index_json_document_hook` after a successful write, gated by `db.has_search_indices() || crate::search::has_active_search_indices()` so the check is cheap (an atomic load, `SEARCH_INDICES_COUNT`) when no index exists anywhere.
-- **`src/router.rs`**: `create_search_index`/`alter_search_index`/`drop_search_index` keep the per-shard/mirror duality in sync at schema-change time (§5); `ft_search`/`ft_aggregate` are the real cross-shard query paths (§2.3/§4.9).
-- **`src/shard.rs`**: owns the per-shard `search_indices: HashMap<String, InvertedIndex>` and the `init_search_index`/`reindex_hash_local`/`delete_document_local`/`index_json_document_local` methods that mutate it directly with no locking (shard-thread-confined) — `init_search_index` also mirrors every backfilled document into the global registry (§2.3).
-- **`src/resp.rs`**: parses every `FT.*` grammar in §7 into the real `IndexSchema`/`FieldType`/`VectorFieldAttrs`/`SearchOptions`/`AggregateOptions` values from §2/§4.9, including `PARAMS`, keyed by the bare parameter name with no `$` prefix (`resolve_str_param` tries both bare and `$`-prefixed forms, so either convention on the query-string side works).
-- **`src/vector.rs`** (Component 08): supplies `VectorFieldIndex`/`FlatIndex`/`HnswIndex` (now genuinely owned per vector field, §2.4) and the SIMD `compute_distance`/`cosine_distance`/`l2_distance_sq`/`dot_product` kernels called directly by the brute-force branches of `knn_search`/`vector_range_search`/`min_doc_vector_distance` (via `crate::vector::compute_distance`, runtime-dispatched to AVX-512 → AVX2+FMA → portable). `HnswIndex`'s own ANN traversal is now genuinely reused here too (not independent, as the prior pass found) — see §2.4's reversal of that finding.
-- **`src/json.rs`**: JSONPath parsing/querying (`parse_json_path`/`query_json_path`) backs `extract_json_fields` (§3.3); nested objects/arrays that aren't the matched leaf value are stringified via `.to_string()`, not recursively flattened into dotted-path fields.
-- **`src/mcp.rs`** (Component 20): the `rudis_ft_search` MCP tool (line 429) is a minimal wrapper over `Command::FtSearch` — `index`/`query`/`limit` only, `SearchOptions::default()` otherwise (no `RETURN`, `SORTBY`, `RRF`, or `PARAMS` exposed to MCP callers).
+### 5.1 `FT.CREATE` — `Router::create_search_index`
+
+1. Fail with `Index already exists: <name>` if the local partition or the mirror has the name (`Router::has_search_index`).
+2. Register an empty index in the mirror (`search::create_search_index`).
+3. `ShardDb::init_search_index(schema)` on the local shard: build a fresh `InvertedIndex`, scan this shard's **current DB** table (non-expired keys matching a prefix; `HGETALL` each) for HASH indexes, or its `json_store` for JSON indexes, and index each document into both the new partition and the mirror. Documents that were in a previous partition of the same name but are not found by the scan are carried over.
+4. Log the command (`log_mutation`) to this shard's AOF and the replication stream.
+5. Send `ShardMessage::InitSearchIndex { schema, aof_record, responder }` to each other shard **one at a time**, awaiting each reply. Each shard runs `init_search_index` on its own keys and appends `aof_record` (the canonical `FT.CREATE` RESP) to its own AOF.
+
+When `FT.CREATE` returns `+OK`, every shard has a backfilled partition.
+
+### 5.2 `FT.ALTER` — `Router::alter_search_index`
+
+1. Load the current schema (local partition, else mirror; `Unknown Index name` if neither).
+2. `merge_schema_fields` with the new fields.
+3. `search::reset_search_index` replaces the mirror entry with an **empty** index.
+4. Local `init_search_index(merged)` (rebuild + backfill into partition and mirror), log, then broadcast `InitSearchIndex` with the merged schema to every other shard.
+
+While the broadcast runs, the mirror only contains documents from shards that have finished.
+
+### 5.3 `FT.DROPINDEX` — `Router::drop_search_index`
+
+Drop the local partition, send `ShardMessage::DropSearchIndex` to every other shard (each appends the AOF record only if it had the index and replies whether it dropped), then drop the mirror entry. Returns `Unknown Index name` if no shard had it; logs the command only on success. The `DD` flag is carried into the AOF record but **no keys are deleted**.
+
+### 5.4 Persistence, replication and reload
+
+Only definitions are persisted; documents are ordinary keys and are re-indexed on load.
+
+- **AOF**: `aof::command_to_resp` encodes `FT.CREATE` (canonical form via `search::ft_create_args`), `FT.ALTER` (`ft_alter_args`) and `FT.DROPINDEX [DD]`. Every shard's AOF holds the definitions because each shard replays only its own file. On replay (`execute_local_command`), `FT.CREATE` → `ShardDb::define_search_index` (`ensure_search_index` in the mirror, discard any stale partition, `init_search_index`), `FT.ALTER` → `ShardDb::alter_search_index`, `FT.DROPINDEX` → drop locally and in the mirror. An AOF rewrite emits one `FT.CREATE` per index **before** any key, so replaying the keys re-indexes them; AOF resharding copies the definitions into every new file.
+- **RDB**: each shard writes one `EXT_TYPE_SEARCH_INDEX` (= 20) extension record per index: the index name plus the canonical `FT.CREATE` RESP. On load (`table::load_rdb_bytes`), the record is parsed back with `resp::parse_command` and an empty `InvertedIndex` is inserted into `search_indices`; after the whole file is loaded, `ShardDb::rebuild_search_indices` re-defines every index (switching to DB 0) and backfills. AOF files with an RDB preamble and `restore_rdb_chunk` also call `rebuild_search_indices`.
+- **Reload safety**: before parallel reloads (full sync, `DEBUG LOADAOF`), `Router::forget_global_search_indices` drops this server's names from the mirror, and each loading shard clears its partitions. Each shard then calls `ensure_search_index`, which keeps an existing mirror entry with the same definition, so all shards backfill into one shared mirror without stale documents.
+- **Replication**: a replica applies `FT.CREATE`/`FT.ALTER`/`FT.DROPINDEX` from the master through the router (`execute_cross_shard_replica_command`), so they reach all shards.
+- `FT.ADD` is not persisted or replicated.
 
 ---
 
-## 9. Concrete Numbers
+## 6. Query language — `parse_query`
 
-| Quantity | Value | Source |
+The parser is hand-written and works on whitespace-split words. It first strips one layer of balanced outer parentheses (`strip_outer_parens`); `*` or an empty string is `MatchAll`.
+
+**KNN suffix.** If the string contains `=>[KNN`, it splits there. The part before (parens stripped; `*` or empty → `MatchAll`) is parsed recursively as the base; `parse_knn_clause` parses `K @field $param [EF_RUNTIME e] [AS alias | YIELD_DISTANCE_AS alias]`, plus a legacy trailing block `=>{$YIELD_DISTANCE_AS: d; $EF_RUNTIME: 20}`. K can be a literal or `$name` (default 10). Result: `And([base, KnnVector])`.
+
+Otherwise each word is handled in order:
+
+| Syntax | AST | Notes |
 | :--- | :--- | :--- |
-| `DocId` width | `u32` | line 5 |
-| `Posting` size | 8 bytes (`DocId` + `u32` term_freq) | lines 264–268 |
-| BM25 `k1` / `b` | `1.2` / `0.75` | line 1017–1018 |
-| BM25 IDF floor | `0.0001` (when `idf <= 0.0`) | line 1014 |
-| Default RRF `k` | `60.0` | `resp.rs` RRF/HYBRID default, `SearchOptions.rrf_k` |
-| Default linear `(alpha, beta)` | `(0.5, 0.5)` | `resp.rs` LINEAR default |
-| `KNN_ADHOC_BF_RATIO` | `0.1` (10% of index size threshold for ADHOC brute force) | line 1934 |
-| KNN chunk over-fetch multiplier | `k * 4` when multi-chunk vectors present | lines 2114-2118 |
-| `VectorFieldAttrs` defaults | `m=16, ef_construction=200, ef_runtime=10, initial_cap=1024, epsilon=0.01, block_size=1024` | lines 87-98 |
-| `FT.AGGREGATE` internal fetch cap | `100_000` hits before pipeline stages run | `router.rs:2816` |
-| `DIALECT` accepted range | `1..=4` (validated, otherwise unused — §6) | `resp.rs:11589` |
-| `RangeTree` range query complexity | `O(log N + K)` | §4.4, `BTreeMap::range` |
-| `Prefix` query complexity | `O(vocabulary size)` | §6 item 13 |
-| `TagFilter` query complexity | `O(N documents)` | §6 item 13 |
-| Document removal complexity | `O(terms in that document)` | §3.4 |
-| `src/search.rs` total / engine / test lines | 4,117 / ~3,035 (lines 1–3035) / ~1,080 (lines 3037–4117, 14 `#[test]` fns) | `wc -l`, `grep -c '#\[test\]'` |
+| `-x` | `Not(parse_query(x))` | |
+| `@f:[VECTOR_RANGE r $blob ...]` | `VectorRange` | `r` literal or `$name`; optional `EPSILON e`, `AS`/`YIELD_DISTANCE_AS alias`, or a trailing `=>{$EPSILON: ..; $YIELD_DISTANCE_AS: ..}` block. Words are re-joined until `]` (and `}` for the block). |
+| `@f:[min max]` | `NumericRange` | Inclusive. An unparsable bound becomes −∞ / +∞, so exclusive `(10` syntax is not supported. |
+| `@f:{a \| b}` | `TagFilter` | Tags are trimmed and **always lowercased**. |
+| `@f:rest` | `FieldScope { f, parse_query(rest) }` | |
+| `\|` (a standalone word) | `Or([left, right])` | Everything before is the left side (one term or an `And`), everything after is parsed recursively as the right side. |
+| `word*` | `Prefix(lowercased word)` | Not stemmed. |
+| other | `Term` / `And` of `Term`s | Surrounding quotes stripped, then `tokenize_text(word, stem = true)`; several tokens become an `And`; if everything was a stop word, `Term(simple_stem(word))`. |
 
----
+Several top-level items become `And(items)`. `QueryAst::Exact` exists and is evaluated, but the parser never produces it: a quoted phrase `"rust systems"` is just two terms.
 
-## Contributor Gotchas, Invariants & Debugging Guide
+**Example.** `@title:rust @price:[10 100] -@tag:{old}=>[KNN 5 @emb $vec AS dist]` parses as:
 
-* **Gotcha 1**: Document IDs are dense `u32` integers (`DocId`, recycled via `free_ids`), not the document's own string key — postings, the numeric range tree, and vector storage are all keyed by this dense id (vector storage uses the document's *string* key plus a `\x00<chunk_idx>` suffix for chunks, not the `DocId`, since `VectorFieldIndex` is keyed by `Bytes`). `DocMeta.terms` makes per-document deletion `O(terms in that document)` (§3.4).
-* **Gotcha 2**: Numeric-field queries are served by a `BTreeMap`-backed `RangeTree`, giving genuine `O(log N + K)` range queries (§4.4) — but `TagFilter` and `Prefix` are still full scans (§6 item 13); do not assume every query type is sub-linear.
-* **Gotcha 3**: Every index exists in **two independent copies** — a per-shard partition that real `FT.SEARCH`/`FT.AGGREGATE` scatter/gather across, and a process-wide mirror that only `FT.INFO`/`FT._LIST` (and, defensively, a shard missing its own local copy) read from (§2.3). `FT.ADD` is the one command that writes **only** the mirror, making its documents invisible to `FT.SEARCH` once the index exists everywhere (§6 item 1) — do not use `FT.ADD` in tests that also assert `FT.SEARCH` results.
-* **Gotcha 4**: KNN/`VECTOR_RANGE` now hit a real `HnswIndex`/`FlatIndex` (§2.4), not a brute-force scan over every document — but pre-filtered hybrid queries can still silently fall back to brute force over the filtered set (`KNN_ADHOC_BF_RATIO`, §4.5); if you're benchmarking filtered KNN, check which branch actually ran.
-* **Gotcha 5**: `WEIGHT`, schema-level `EPSILON`, `BLOCK_SIZE`, `DIALECT`, and `TIMEOUT` are all accepted and stored but have **zero effect on behavior** (§6 items 2-5) — do not assume setting them changes anything; only per-query `$EPSILON` in a `VECTOR_RANGE` clause is live.
-* **Gotcha 6**: `CASESENSITIVE` `TAG` fields cannot be correctly queried — the query parser always lowercases tag literals (§6 item 6). If you need case-sensitive tag matching today, you'll need to fix `parse_query`'s tag branch to look up the field's schema `casesensitive` flag before lowercasing.
-
-### How to Verify Changes
-```bash
-# 1. Format check
-cargo fmt --check
-
-# 2. Clippy verification with zero warnings
-cargo clippy --all-targets -- -D warnings
-
-# 3. Run search.rs's own unit tests (14 tests covering BM25/CRUD, RRF, KNN+params,
-#    multi-vector chunk dedup, and linear fusion)
-cargo test --lib search:: -- --test-threads=1
-
-# 4. Run the full unit suite
-cargo test --lib -- --test-threads=1
 ```
+And([
+  And([ FieldScope{title, Term("rust")}, NumericRange{price, 10, 100}, Not(TagFilter{tag, ["old"]}) ]),
+  KnnVector{ field: "emb", k: 5, param_name: "vec", yield_as: Some("dist"), .. }
+])
+```
+
+---
+
+## 7. Query evaluation — `evaluate_ast`
+
+`evaluate_ast(index, ast, opts) -> HashMap<DocId, f64>` walks the tree recursively:
+
+| Node | Behaviour | Cost |
+| :--- | :--- | :--- |
+| `MatchAll` | every document, score 1.0 | O(N) |
+| `Term(t)` / `Exact(t)` | postings of `t`, each scored with `bm25_score` | O(postings) |
+| `Prefix(p)` | every term in the vocabulary starting with `p`; BM25 scores summed per doc | O(vocabulary) |
+| `FieldScope{f, inner}` | evaluate `inner` over the **whole** document, then keep documents that **have** field `f` (or `f` without `$.`) | inner + O(hits) |
+| `NumericRange` | `RangeTree::range` if a tree exists (`get_numeric_tree` tries `f`, then with `$.` removed or added); otherwise linear scan; score 1.0 | O(log N + K) |
+| `TagFilter` | scan every document's `tag_fields[f]`, match if any tag is present; score 1.0 | O(N) |
+| `And` without vector clause | intersect left to right, adding scores; stops early once empty | |
+| `And` with a vector clause | **pre-filtered hybrid**: intersect the non-`MatchAll` siblings into a filter set, then run the vector clause restricted to it (§7.2). If there are no siblings, run it unfiltered. | |
+| `Or` | union, adding scores | |
+| `Not(x)` | every document not matched by `x`, score 1.0 | O(N) |
+| `KnnVector` / `VectorRange` (top level) | `knn_search` / `vector_range_search` with no filter | |
+
+### 7.1 BM25 scoring
+
+BM25 ("Best Matching 25") ranks a document by how often a query term appears in it, discounted for common terms and long documents. `bm25_score(term, posting, doc_len)`:
+
+```
+n     = number of documents containing term
+idf   = ln( (N − n + 0.5) / (n + 0.5) + 1 )        // returns 0.0001 if idf <= 0
+avgdl = max(total_terms / total_docs, 1.0)
+tf    = f·(k1 + 1) / ( f + k1·(1 − b + b·doc_len/avgdl) ),   k1 = 1.2, b = 0.75
+score = idf · tf
+```
+
+`doc_len` is the document's total token count over all text fields. Worked example: 3 documents, the term occurs once in one document of average length → `idf = ln(2.5/1.5 + 1) ≈ 0.981`, `tf = 2.2 / 2.2 = 1.0`, score ≈ 0.981. A multi-term query adds the scores of each term (via `And`). The `WEIGHT` of a text field is **not** used.
+
+### 7.2 KNN search — `knn_search`
+
+1. Resolve the query vector (`knn_query_vector`): an inline vector if present, else `PARAMS[param_name]` decoded with the field's `TYPE`/`DIM` (`decode_vector`). An empty vector or K = 0 returns nothing.
+2. Resolve K (`$K` allowed, default 10) and optional `EF_RUNTIME`.
+3. Resolve the field (`resolve_vector_field` accepts alias, identifier, or `$.`-prefixed path) and its metric.
+4. `k_fetch = 4·K` if any document has more than one chunk for this field, else K (over-fetch so chunk de-duplication still yields K documents).
+5. Dispatch on (vector index present?, filter present?):
+
+| Index | Filter | Strategy |
+| :--- | :--- | :--- |
+| none | none / some | Brute force over all / filtered docs using `min_doc_vector_distance` (minimum over all chunks), sort, keep K. |
+| yes | none | `vi.search(query, k_fetch, ef)`; map keys back to `DocId` (`resolve_vec_key_doc_id` strips `\x00<chunk>`); keep min distance per doc (`dedup_min_distance`); keep K. |
+| yes | some | If `|filter| <= max(0.1 · vi.len(), K)` (`KNN_ADHOC_BF_RATIO` = 0.1) **or** the index is FLAT → brute force over the filter set. Otherwise `vi.search_filtered` with a predicate "key's doc is in the filter"; if it returns fewer than `min(K, |filter|)` docs (the graph traversal starved), fall back to brute force. |
+
+6. Return `DocId → distance_to_similarity(metric, d)`: COSINE → `max(1 − d, 0)`; L2 and IP → `1 / (1 + max(d, 0))`.
+
+Distances come from `vector::compute_distance`: L2 is Euclidean (square root of squared L2), IP is `−dot`, COSINE is cosine distance.
+
+### 7.3 `VECTOR_RANGE` search — `vector_range_search`
+
+Same resolution and dispatch, but no K: brute force keeps documents whose minimum chunk distance is `<= radius`; with an index it calls `vi.range_filtered(query, radius, epsilon, filter)` and de-duplicates by document. The per-query `EPSILON` only affects HNSW (which defaults to 0.01 when absent); FLAT and brute force ignore it. A negative radius returns nothing.
+
+---
+
+## 8. `execute_search` — one shard's answer
+
+`execute_search(index, ast, opts) -> (total_matches, Vec<SearchHit>)`:
+
+1. **Hybrid short-circuit.** If `rrf_k` or `linear_weights` is set and `as_hybrid_rrf()` matches, run the text part and the vector part separately (unpaginated), fuse them (§9), and paginate. (In the server the router fuses across shards first and clears these options on the sub-queries, so this branch is mainly exercised by direct callers and unit tests.)
+2. `evaluate_ast` → candidates; `total_matches` = candidate count.
+3. If the query has a vector clause, compute the exact distance of every candidate (`knn_distances`).
+4. **Sort**:
+   - by distance if there is a vector clause and either no `SORTBY` or `SORTBY` names the distance field (direction from `SORTBY`, default ascending);
+   - else by `SORTBY` field — **numeric values only** (from `numeric_fields`, `$.` tolerated; missing → −∞);
+   - else by score descending.
+5. Skip `offset`, take `limit`.
+6. Build hits. When sorting by distance, `score = −distance` (so the router's "score descending" merge keeps nearest first) and, if `SORTBY` was given, `sort_val = distance`. Otherwise `sort_val` = the numeric `SORTBY` value. Unless `NOCONTENT`: copy all `DocMeta.fields` (or only the `RETURN` list), and add the distance field (`knn_score_field`, formatted by `format_distance` as the shortest round-trip number, `-0` normalized to `0`) when it is wanted.
+
+---
+
+## 9. Hybrid fusion
+
+A hybrid query has a text/filter part and a vector part, e.g. `(rust db)=>[KNN 10 @emb $v]` with `RRF` or `LINEAR`. Two independent ranked lists are produced and merged.
+
+### 9.1 Reciprocal Rank Fusion — `reciprocal_rank_fusion(bm25_hits, vector_hits, k)`
+
+Each list contributes `1 / (k + rank + 1)` (rank 0-based) to a document's score; scores are summed per document and sorted descending. Fields come from whichever list saw the document first (text list first). Default `k` = 60.
+
+Worked example, k = 60: text list `[A, B, C]`, vector list `[B, D]`.
+
+| Doc | Text contribution | Vector contribution | Total |
+| :--- | :--- | :--- | :--- |
+| B | 1/62 = 0.01613 | 1/61 = 0.01639 | **0.03252** |
+| A | 1/61 = 0.01639 | – | 0.01639 |
+| D | – | 1/62 = 0.01613 | 0.01613 |
+| C | 1/63 = 0.01587 | – | 0.01587 |
+
+Result order: B, A, D, C.
+
+### 9.2 Linear fusion — `linear_score_fusion(bm25_hits, vector_hits, alpha, beta)`
+
+1. Text list: min-max normalize scores to `[0, 1]`; if all scores are equal (span ≤ 1e-12) each gets **1.0**. Add `alpha · norm`.
+2. Vector list: convert each score to a similarity — a score `<= 0` is a negated distance, so `sim = 1 / (1 + distance)`; a positive score is used as is. Min-max normalize; if all equal, each gets its **raw similarity** (not 1.0). Add `beta · norm`.
+3. A document missing from one list gets 0 from that list. Fields: text-side first, then missing fields filled from the vector side. Sort descending. Defaults: `alpha = beta = 0.5`.
+
+### 9.3 Cross-shard orchestration — `Router::ft_search`
+
+When `rrf_k`/`linear_weights` is set and `as_hybrid_rrf()` matches, the router:
+
+1. Recursively calls `ft_search` for the text part and then for the vector part, each a **full scatter/gather** with `offset = 0`, `limit = max(offset + limit, K, 100)`, fusion options cleared.
+2. Fuses the two merged lists with RRF or linear fusion, reports `total` = number of fused documents, and paginates.
+
+So a hybrid query costs two scatters instead of one. If a fusion option is given but the query does not have the hybrid shape (e.g. a pure `*=>[KNN ...]`), it is silently ignored.
+
+---
+
+## 10. Distributed search and aggregation
+
+### 10.1 `Router::ft_search` (non-hybrid)
+
+1. `scatter_opts` = the client options with `offset = 0`, `limit = offset + limit` (each shard must return enough hits for the final page).
+2. Run `execute_search` on the local partition (or the mirror if this shard has no partition of that name).
+3. If `num_shards > 1`: send `ShardMessage::SearchQuery { index, ast, options, responder }` to every other shard first, then await the replies (so shards work in parallel). Each remote shard queries **only its own partition** (empty result if it has none).
+4. Sum totals, concatenate hits. Sort by `sort_val` (if `SORTBY`; ascending/descending) or by score descending.
+5. If the query has a KNN clause, cap the page size at `min(limit, K)` and the reported total at `min(total, K)`.
+6. Skip `offset`, take the page.
+
+Worked example (3 shards, `FT.SEARCH idx "rust" LIMIT 10 5`): each shard is asked for its top 15 by BM25; the router receives up to 45 hits plus three totals, sorts all by score, skips 10, returns 5, and reports the summed total.
+
+### 10.2 `FT.AGGREGATE` — `Router::ft_aggregate` + `execute_aggregate_pipeline`
+
+1. Parse the query, then call `ft_search` with `limit = 100_000`, no sort, and `return_fields` = the `LOAD` list (or all fields if no `LOAD`).
+2. On the coordinating shard only, build one row per hit: `__key`, `__score`, then the loaded fields (`AggregateRow` = ordered `Vec<(String, String)>`; `get_row_field`/`set_row_field` ignore a leading `@`).
+3. Run the stages **in command order**:
+
+| Stage | Behaviour |
+| :--- | :--- |
+| `Filter(expr)` | `evaluate_filter`: exactly `@field op value` with `==`/`=`, `!=`, `>`, `>=`, `<`, `<=`; numeric if both sides parse, else string comparison; quotes stripped from the value; anything malformed or an unknown operator keeps the row. No `&&`/`\|\|`. |
+| `Apply{expr, alias}` | `evaluate_expr`: recursive-descent arithmetic with `+ - * /`, parentheses, unary minus, numbers, and `@field` (or bare identifier) references; missing/non-numeric fields are 0; division by zero gives 0. Result is an integer string if whole, else up to 4 decimals with trailing zeros trimmed. On a parse error the alias gets the value of the field named by `expr`. |
+| `Group{fields, reducers}` | Bucket rows by the string values of the group fields, emit one row per bucket with the group fields plus reducers: `COUNT`, `SUM`, `AVG` (2 decimals unless whole), `MIN`, `MAX`. Non-numeric values are skipped; `MIN`/`MAX` of nothing is `"0"`. Default reducer alias is the lowercase function name. Bucket order is unspecified. |
+| `Sort{fields, max}` | Stable multi-key sort; numeric when both values parse, else string order. `max` is always `None` from the parser. |
+| `Limit{offset, num}` | Skip/take. |
+
+The reply is `[row_count, row, row, ...]` where the count is the number of output rows.
+
+---
+
+## 11. Command surface
+
+| Command | Syntax as parsed (`src/resp.rs`) | Notes |
+| :--- | :--- | :--- |
+| `FT.CREATE` | `idx [ON HASH\|JSON] [PREFIX n p...] SCHEMA (id [AS alias] TEXT [WEIGHT w] [SORTABLE] [NOSTEM] \| NUMERIC [SORTABLE] \| TAG [SEPARATOR c] [CASESENSITIVE] \| VECTOR FLAT\|HNSW [nargs] TYPE t DIM d DISTANCE_METRIC m [INITIAL_CAP c] [BLOCK_SIZE b] [M m] [EF_CONSTRUCTION e] [EF_RUNTIME e] [EPSILON e])...` | Default `ON HASH`. Unknown options before `SCHEMA` are skipped; unknown field types are dropped. For `VECTOR`, `TYPE`/`DIM`/`DISTANCE_METRIC` are mandatory, `nargs` must be even and fit, algorithm-specific attributes are only accepted for their algorithm, `EPSILON > 0`. Backfills existing keys (§5.1). |
+| `FT.SEARCH` | `idx query [NOCONTENT] [WITHSCORES] [RRF [k]] [LINEAR [a b]] [SCORER RRF [K k] \| SCORER LINEAR [ALPHA a] [BETA b]] [LIMIT off n] [SORTBY f [ASC\|DESC]] [RETURN n f...] [PARAMS n k v...] [DIALECT 1-4] [TIMEOUT ms]` | `RRF` and `LINEAR` are mutually exclusive (last wins). Unknown tokens are skipped. Reply: `[total, id, [score], [field, value, ...], ...]`; scores printed with 6 decimals. `Unknown Index name` if neither copy exists. |
+| `FT.HYBRID` | `idx text_query vector_query [RRF [k]] [LINEAR [a b]] [SCORER RRF [K k \| k] \| SCORER LINEAR ...] [LIMIT] [RETURN] [PARAMS] [WITHSCORES] [NOCONTENT] [DIALECT x] [TIMEOUT x]` | Rewritten into an `FT.SEARCH`: a vector query starting `*=>`/`=>`/`[KNN` becomes `(text)=><knn>`, anything else (e.g. `@v:[VECTOR_RANGE ...]`) is appended with a space. RRF with k = 60 is on by default. `DIALECT`/`TIMEOUT` skipped. |
+| `FT.AGGREGATE` | `idx query [LOAD n @f...] [GROUPBY n @f... [REDUCE COUNT\|SUM\|AVG\|MIN\|MAX n args [AS a]]...] [APPLY expr [AS a]] [SORTBY n @f [ASC\|DESC]...] [LIMIT off n] [FILTER expr] [DIALECT x] [TIMEOUT x]` | `@` stripped from field names; `DIALECT`/`TIMEOUT` skipped. §10.2. |
+| `FT.ALTER` | `idx ... SCHEMA [ADD] (id [AS alias] type ...)+` | At least one valid field required. Vector parsing here is **lenient**: no mandatory attributes (defaults `DIM 1`, `COSINE`, `FLOAT32`), no algorithm check, unknown attributes ignored; only `DIM <= MAX_VECTOR_DIM` and `M <= MAX_HNSW_M` are enforced. §5.2. |
+| `FT.DROPINDEX` | `idx [DD]` | `DD` does not delete keys. |
+| `FT.INFO` | `idx` | Mirror only. 10 key/value pairs: `index_name`, `index_options` (empty), `index_definition` (`key_type`, `prefixes`), `attributes`, `num_docs`, `num_terms` (distinct terms), `total_inverted_index_blocks` (actually `total_terms`, the token total), `vector_index_sz_mb` (sum of `memory_usage`), `indexing` (`"0"`), `hash_indexing_failures`. Attributes list identifier/attribute/type plus `WEIGHT` (TEXT), `SEPARATOR` (TAG), or algorithm, data_type, dim, distance_metric, M, ef_construction, ef_runtime, num_vectors (VECTOR; `num_vectors` counts chunks too). |
+| `FT._LIST` | – | Sorted names from the mirror. |
+| `FT.EXPLAIN` | `idx query` | Returns `format!("{:?}", parse_query(query))`; `idx` is ignored. |
+| `FT.PROFILE` | `idx SEARCH [LIMITED] QUERY q [NOCONTENT] [WITHSCORES] [LIMIT off n] [PARAMS n ...] [DIALECT x] [TIMEOUT x]` | Everything before `QUERY` is ignored. Reply: `[search_results, ["Total profile time", s, "Parsing time", s, "Query plan", debug_ast, "Shards", num_shards]]`; times are wall clock in seconds with 6 decimals. |
+| `FT.ADD` | `idx doc_id score [...] FIELDS f v ...` | Legacy; writes only the mirror, ignores `score`, never indexes vectors. |
+
+---
+
+## 12. Invariants & gotchas
+
+- **Two copies must stay in sync.** Every code path that mutates documents must touch both `ShardDb.search_indices` and the mirror, or `FT.INFO` and `FT.SEARCH` disagree. Paths that touch only one (§4.6) are real divergences: `FT.ADD` and the JSON in-place mutators (`JSON.NUMINCRBY` etc.) update only the mirror, so `FT.SEARCH` does not see their changes.
+- **Indexes go stale on non-hooked writes.** `HDEL`, `HINCRBY`, key expiry, eviction and `FLUSHDB`/`FLUSHALL` do not touch indexes; deleted/expired documents stay searchable until the key is re-written or the index is rebuilt.
+- **Indexes are not per-DB.** Hooks fire for writes in any logical DB; the backfill scans the shard's current DB; `rebuild_search_indices` uses DB 0.
+- **`FieldScope` does not restrict where a term matched.** `@title:rust` returns documents containing `rust` in *any* text field, provided the document has a `title` field.
+- **HASH aliases are not query names.** For HASH documents, `fields`/`numeric_fields`/`tag_fields` are keyed by the raw hash field name (the identifier). `@alias:...` clauses for TEXT/NUMERIC/TAG look up the name as written, so use the identifier. Vector clauses do resolve aliases (`resolve_vector_field`).
+- **JSON text fields with `AS` count twice.** `extract_json_fields` stores the value under alias and identifier, and both are in `schema.fields`, so the text is tokenized twice (double term frequency and `doc_len`).
+- **Unknown HASH fields are searchable.** Fields not in the schema are indexed as stemmed text and are returned in results (vector blobs appear as lossy UTF-8).
+- **Query terms are always stemmed** even when the field is `NOSTEM`; prefix queries are never stemmed. A `NOSTEM` field containing `cats` does not match the query `cats` (stemmed to `cat`).
+- **Tag case sensitivity is index-side only.** The parser lowercases query tags, so mixed-case values in a `CASESENSITIVE` field can never match.
+- **`SORTBY` only sorts numeric fields** in `execute_search`; a text field sorts as all −∞ (arbitrary order).
+- **KNN totals are capped at K** by the router, and a hybrid query's total is the size of the fused list, not the true match count.
+- **`VectorFieldIndex` is keyed by document key, everything else by `DocId`.** Chunk keys contain a NUL byte; `resolve_vec_key_doc_id` relies on document keys not containing `\x00`.
+- **A bad vector deletes the old version.** Re-writing a document with an undecodable or wrong-dimension vector removes it from the index (and counts a failure) instead of keeping the previous version.
+- **IP similarity saturates.** IP distance is `−dot`; `distance_to_similarity` clamps negative distances, so every positive dot product maps to similarity 1.0.
+- **Lock pattern.** Mirror hooks take the registry read lock and then each index's write lock, across all shards, so the mirror is a cross-shard contention point; partitions are lock-free.
+
+---
+
+## 13. Limitations / not implemented
+
+- `WEIGHT`, `SORTABLE`, schema-level `EPSILON` and `BLOCK_SIZE` are stored (and round-tripped by persistence) but have no effect.
+- `DIALECT` is validated by `FT.SEARCH` and otherwise ignored; `TIMEOUT` is parsed and never enforced.
+- No phrase/positional or exact matching (`Exact` is never produced), no slop, no fuzzy (`%term%`), no exclusive numeric bounds, no geo fields, no parenthesized sub-expressions beyond one outer pair, no `INKEYS`/`INFIELDS`/`HIGHLIGHT`/`SUMMARIZE`, no `SCORER` other than BM25 for text.
+- `Prefix` scans the whole vocabulary; `TagFilter`, `Not` and `MatchAll` scan every document (no tag inverted index, no trie).
+- Multi-vector chunks only come from JSON documents; HASH documents always have one vector per field.
+- `FT.AGGREGATE` is not distributed: it fetches up to 100,000 hits and runs all stages on one shard. Only five reducers; `FILTER` supports a single comparison.
+- `FT.EXPLAIN` and `FT.PROFILE` report a `Debug`-printed AST and wall-clock timings, not a real iterator plan.
+- `FT.DROPINDEX DD` does not delete documents; `FT.ADD` is mirror-only and not persisted.
+- Every document is indexed twice (partition + mirror), doubling indexing CPU and memory.
+- The MCP tool `rudis_ft_search` exposes only `index`, `query` and `limit` (default 10).
+
+---
+
+## 14. Code map
+
+| File | Key symbols | What they do |
+| :--- | :--- | :--- |
+| `src/search.rs` | `FieldType`, `VectorDataType`, `VectorFieldAttrs`, `SchemaField`, `IndexSchema`, `ft_create_args`, `ft_alter_args`, `merge_schema_fields` | Schema model and canonical `FT.CREATE`/`FT.ALTER` serialization. |
+| `src/search.rs` | `decode_vector`, `decode_typed_blob`, `parse_vector_text`, `f16_to_f32`, `f32_to_f16`, `parse_vector_blob` | Text and typed little-endian vector decoding. |
+| `src/search.rs` | `Posting`, `DocMeta`, `OrderedF64`, `RangeTree`, `InvertedIndex`, `get_numeric_tree`, `build_vector_index` | Core index structures. |
+| `src/search.rs` | `tokenize_text`, `simple_stem`, `ENGLISH_STOP_WORDS` | Text analysis. |
+| `src/search.rs` | `InvertedIndex::{new, add_hash_document, add_document, remove_document, bm25_score, resolve_vector_field}` | Document indexing and scoring. |
+| `src/search.rs` | `SEARCH_INDICES`, `SEARCH_INDICES_COUNT`, `create_search_index`, `reset_search_index`, `ensure_search_index`, `drop_search_index`, `list_search_indices`, `get_search_index`, `has_active_search_indices`, `index_document_hook`, `index_json_document_hook`, `delete_document_hook`, `extract_json_fields` | Global mirror registry and write hooks. |
+| `src/search.rs` | `QueryAst`, `parse_query`, `parse_knn_clause`, `parse_vector_range_clause`, `strip_outer_parens`, `resolve_*_param` | Query parsing. |
+| `src/search.rs` | `evaluate_ast`, `knn_search`, `vector_range_search`, `knn_query_vector`, `knn_distances`, `min_doc_vector_distance`, `dedup_min_distance`, `resolve_vec_key_doc_id`, `distance_to_similarity`, `KNN_ADHOC_BF_RATIO` | Query evaluation and vector search. |
+| `src/search.rs` | `SearchOptions`, `SearchHit`, `execute_search`, `format_distance`, `reciprocal_rank_fusion`, `linear_score_fusion` | Per-shard execution and fusion. |
+| `src/search.rs` | `AggregateOptions`, `AggregateStage`, `GroupByStage`, `Reducer`, `ApplyStage`, `SortByStage`, `AggregateRow`, `execute_aggregate_pipeline`, `evaluate_expr`, `evaluate_filter` | `FT.AGGREGATE` pipeline. |
+| `src/router.rs` | `Router::{create_search_index, alter_search_index, drop_search_index, ft_search, ft_aggregate, has_search_index, forget_global_search_indices, search_aof_record}` | Cross-shard lifecycle, scatter/gather, hybrid orchestration. |
+| `src/shard.rs` | `ShardDb.search_indices`, `ShardDb::{init_search_index, define_search_index, alter_search_index, drop_search_index, rebuild_search_indices, reindex_hash_local, delete_document_local, index_json_document_local}`, `ShardMessage::{InitSearchIndex, DropSearchIndex, SearchQuery}`, RDB writer (`EXT_TYPE_SEARCH_INDEX` records) | Per-shard partitions, backfill, persistence hooks. |
+| `src/server.rs` | `ShardMessage::{InitSearchIndex, DropSearchIndex, SearchQuery}` handlers | Remote-shard side of the mesh. |
+| `src/connection.rs` | `Command::Ft*` arms, `reindex_hash_for_search`, HSET/JSON/DEL hook call sites, AOF replay arms in `execute_local_command`, `execute_cross_shard_replica_command` | Command dispatch, reply formatting, write hooks, replay and replica application. |
+| `src/resp.rs` | `"FT.CREATE"`, `"FT.SEARCH"`, `"FT.AGGREGATE"`, `"FT.ALTER"`, `"FT.PROFILE"`, `"FT.HYBRID"`, `"FT.ADD"`, ... arms, `parse_ft_params`, `counted_args`, `strip_field_sigil` | Argument parsing into `Command`, `IndexSchema`, `SearchOptions`, `AggregateOptions`. |
+| `src/aof.rs` | `command_to_resp` (`FT.CREATE`/`FT.ALTER`/`FT.DROPINDEX`), AOF rewrite and reshard handling | Definition persistence in the AOF. |
+| `src/table.rs` | `load_rdb_bytes` (`EXT_TYPE_SEARCH_INDEX` reader) | Definition restore from RDB. |
+| `src/redis_rdb.rs` | `EXT_TYPE_SEARCH_INDEX` (= 20) | RDB extension record type. |
+| `src/debug_cmd.rs` | `DEBUG LOADAOF` shard handler | Clears partitions before replay. |
+| `src/vector.rs` | `VectorFieldIndex`, `FlatIndex`, `HnswIndex`, `compute_distance`, `MAX_VECTOR_DIM`, `MAX_HNSW_M` | Vector indexes and distance kernels (Component 08). |
+| `src/mcp.rs` | `"rudis_ft_search"` tool | `FT.SEARCH` for MCP agents (Component 20). |
+
+Unit tests in `src/search.rs` (`mod tests`) cover BM25/CRUD, dense IDs and term-directed deletion, the range tree (including NaN bounds), typed vector decoding, FLAT binary ingest and dim validation, KNN with params/alias/distance sort, pre-filtered hybrid KNN, `VECTOR_RANGE`, JSON documents, multi-vector chunks with linear fusion, RRF, and the aggregate pipeline. Persistence of definitions is tested in `src/aof.rs` and `src/shard.rs`.

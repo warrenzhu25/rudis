@@ -1,576 +1,601 @@
-# Component 16: JSON Document Store & JSONPath Engine (Implementation Deep-Dive & Code Reference)
+# Component 16: JSON Document Store & JSONPath Engine — Implementation Reference
 
-> **Source File**: `src/json.rs` (991 lines)
-> **Command dispatch**: `src/resp.rs` (`Command::Json*` variants + parser), `src/connection.rs` (`execute_local_command` arms)
-> **Cross-shard fan-out**: `src/router.rs` (`Router::json_mget`), `src/shard.rs` (`ShardMessage::JsonMget`), `src/server.rs` (cross-shard mailbox loop)
-> **Persistence**: `src/shard.rs` (`ShardDb::save_rdb_chunk`/`save_extended_rdb_chunk`/`restore_rdb_chunk`), `src/table.rs` (`load_rdb`/`load_rdb_bytes`)
-> **AOF/replication encoding**: `src/aof.rs` (`command_to_resp`)
-> **RediSearch integration**: `src/search.rs` (`index_json_document_hook`, `extract_json_fields`), `src/shard.rs` (`ShardDb::index_json_document_local`)
 > **High-Level Design Spec**: [`docs/design/16_json_store.md`](../design/16_json_store.md)
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
+> **Main source file**: `src/json.rs` (JSONPath parser/evaluator and `JsonStore`).
+> **Also involved**: `src/resp.rs` (command parsing, experimental gate), `src/connection.rs`
+> (routing and `execute_local_command`), `src/router.rs` + `src/server.rs` (`JSON.MGET` fan-out),
+> `src/aof.rs` (AOF / replication encoding, AOF rewrite), `src/shard.rs` + `src/table.rs` +
+> `src/redis_rdb.rs` (RDB persistence), `src/search.rs` (RediSearch indexing), `src/digest.rs`
+> (`DEBUG DIGEST`).
 
 ---
 
-## 1. Source Module Map
+## 1. What this subsystem does
 
-| File | Role |
-| :--- | :--- |
-| `src/json.rs` | `PathSegment` enum, JSONPath parser/evaluator (`parse_json_path`, `query_json_path[_mut]`, `set_json_path`, `delete_json_path`), and `JsonStore` (the per-shard document map + every `json_*` command method). |
-| `src/resp.rs` | `Command::Json*` enum variants (lines 1437-1508) and the `"JSON.*" =>` parse arms (lines 10213-10418). |
-| `src/connection.rs` | `execute_local_command` match arms that call into `JsonStore` (lines 16783-16996), plus the `JsonMget` dispatch arm (7507-7517), the `record_change!` macro that drives dirty-tracking/AOF/replication (12740-12761), and the single-key extraction lists (`cmd_primary_key`, `for_each_cmd_key`, `get_cmd_name`) that include every `Json*` variant. |
-| `src/router.rs` | `Router::json_mget` (1543-1616): the only JSON command with its own bucket-by-shard, parallel-fan-out implementation. |
-| `src/shard.rs` | `ShardDb.json_store: JsonStore` field (618); `ShardMessage::JsonMget` wire struct (402-406); `ShardDb::save_rdb_chunk`/`save_extended_rdb_chunk`/`restore_rdb_chunk` (2274-2394, 2659+); `index_json_document_local` (773-792). |
-| `src/table.rs` | `load_rdb`/`load_rdb_bytes` file-load path that restores JSON documents via `type_byte == 7` (14566-14600). |
-| `src/aof.rs` | `command_to_resp` (166-1936): has **no** `Command::Json*` arm — every JSON write falls through to the final `_ => None`. |
-| `src/search.rs` | `index_json_document_hook`/`extract_json_fields` — the global (cross-shard) RediSearch JSON indexing path. |
+Rudis offers a RedisJSON-style API: clients store whole JSON documents under a key with
+`JSON.SET`, then read or modify parts of them with a **JSONPath** expression (a small path
+language such as `$.users[0].name`, where `$` is the document root). Typical users are
+applications that keep structured records (profiles, product catalogues, agent state) and want
+to update one field without rewriting the whole value, and RediSearch indexes declared `ON JSON`,
+which index fields pulled out of these documents.
+
+The subsystem has two parts:
+
+- **The JSONPath engine** — free functions in `src/json.rs` that parse a path string into
+  segments and walk a `serde_json::Value` tree to find, set, or delete nodes.
+- **`JsonStore`** — one per shard, a hash map from key to document, with one method per
+  `JSON.*` command.
+
+JSON commands are **experimental**: they are rejected as unknown commands unless the server runs
+with `enable-experimental-commands yes` (see §6.1).
+
+## 2. Mental model
+
+```mermaid
+flowchart TD
+    C["Client: JSON.SET doc $.a.b 5"] --> P["resp.rs build_command"]
+    P -->|"experimental commands off"| U["Command::Unknown"]
+    P -->|"on"| R["connection.rs: target_shard_of_cmd"]
+    R -->|"key owned by another shard"| X["router.execute_remote"]
+    R -->|"local"| E["execute_local_command"]
+    X --> E
+    E --> S["ShardDb.json_store: JsonStore"]
+    S --> J["JSONPath engine: parse_json_path, query_json_path(_mut), set_json_path, delete_json_path"]
+    E -->|"write changed something"| L["record_change: key invalidation, AOF append, replica stream"]
+    E -->|"write changed something"| I["search hooks: index_json_document_local / index_json_document_hook"]
+    M["Client: JSON.MGET k1 k2 k3 path"] --> RM["Router::json_mget"]
+    RM -->|"one ShardMessage::JsonMget per remote shard"| S
+```
+
+Every shard owns its keys (key → shard via the usual hash routing), so a JSON document lives
+entirely inside one shard's `JsonStore` and every single-key command runs on that shard's thread
+without locks. Only `JSON.MGET` touches several shards.
 
 ---
 
-## 2. Storage Model
+## 3. Storage model
 
 ```rust
-// src/json.rs:437-440
+// src/json.rs
 #[derive(Default, Debug)]
 pub struct JsonStore {
-    docs: HashMap<Bytes, Value>,   // Value = serde_json::Value (hashbrown::HashMap)
+    docs: HashMap<Bytes, Value>,   // hashbrown::HashMap; Value = serde_json::Value
 }
 ```
 
-There is **no bespoke JSON representation**. Every document is stored as a plain `serde_json::Value`
-(`Null | Bool | Number | String | Array | Object`) — the exact same enum any generic `serde_json`
-consumer uses, not a Redis-specific compact encoding, not an arena, not a DOM with parent pointers.
-`JsonStore` lives at `ShardDb.json_store: crate::json::JsonStore` (`src/shard.rs:618`), a field
-sitting alongside `table: RudisTable`, `crdt_store`, `probabilistic_store`, etc. — **JSON documents
-never become a `RudisValue` variant** and are invisible to ordinary `GET`/`TYPE`/`OBJECT ENCODING`.
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `docs` | `hashbrown::HashMap<Bytes, serde_json::Value>` | Key bytes → parsed document tree. |
 
-`JsonStore`'s only other state-bearing methods are `new()` (443), `iter()` (450, used by RDB save
-and by `FT.CREATE`'s backfill scan), `insert_raw(key, val)` (455, used only by RDB/replication
-restore paths — bypasses path logic entirely), `get(key)` (460), `len()`/`is_empty()` (874-880).
-There is no eviction, no TTL, no per-document size cap, and no limit on nesting depth — the only
-ceiling is `proto-max-bulk-len` on the inbound `JSON.SET` payload and available process memory.
+There is no custom JSON representation: a document is a plain `serde_json::Value`
+(`Null | Bool | Number | String | Array | Object`). Object key order follows `serde_json`'s map
+(sorted, since the crate does not enable `preserve_order`), which is why `JSON.OBJKEYS` returns keys
+alphabetically.
+
+The store is a field of the shard, `ShardDb.json_store: crate::json::JsonStore`, next to the main
+`table`, `probabilistic_store`, `crdt_store`, vector indexes and so on. **JSON documents are not
+`RudisValue`s** — they live outside the main keyspace table. Consequences:
+
+- Core commands (`GET`, `DEL`, `EXISTS`, `TYPE`, `EXPIRE`, `KEYS`, `SCAN`, `RENAME`) do not see or
+  touch JSON documents. Only `JSON.*` commands, persistence, digesting and search indexing read
+  `json_store`.
+- The same key name can exist both as a normal value and as a JSON document at once.
+- There is **one `JsonStore` per shard, not one per logical database**: `SELECT 3` does not give a
+  separate JSON namespace. Keyspace statistics (`ShardDb::keyspace_stats_by_db`) count JSON
+  documents under database 0, and `ShardDb::flushdb` only clears `json_store` when the current
+  database is 0; `ShardDb::flushall` always clears it.
+- No TTL, no eviction, no per-document size or nesting-depth cap. The inbound payload is bounded
+  by `proto-max-bulk-len` like any argument.
+
+Non-command helper methods on `JsonStore`:
+
+| Method | Used by |
+| :--- | :--- |
+| `new()` | `ShardDb` construction, flush. |
+| `iter()` | RDB save, AOF rewrite, `DEBUG DIGEST`, `FT.CREATE` backfill (`ShardDb::init_search_index`). |
+| `insert_raw(key, val)` | RDB load — inserts a parsed document directly, no path logic. |
+| `get(key)` | Search re-indexing after writes, persistence, digest. |
+| `len()` / `is_empty()` | Keyspace stats, tests. |
 
 ---
 
-## 3. JSONPath Engine
+## 4. The JSONPath engine
 
-### 3.1 Grammar actually supported
-
-`PathSegment` (`src/json.rs:7-16`):
+### 4.1 Path segments
 
 ```rust
+// src/json.rs
 pub enum PathSegment {
-    Root,
-    Field(String),
-    Index(isize),
-    Wildcard,
-    Slice { start: Option<isize>, end: Option<isize> },
+    Root,                                            // `$` or leading `.`
+    Field(String),                                   // `.name`, `["name"]`, `[name]`
+    Index(isize),                                    // `[3]`, `[-1]`
+    Wildcard,                                        // `*`, `.*`, `[*]`
+    Slice { start: Option<isize>, end: Option<isize> }, // `[1:3]`, `[:2]`, `[1:]`, `[:]`
 }
 ```
 
-Supported syntax, enumerated from what `parse_json_path` actually recognizes: `$` / `.` (root),
-`.field` / bare `field`, `[0]` / `[-1]` (negative index, resolved relative to array length at
-query time, not at parse time), `[*]` / bare `*` (wildcard — matches all object values or all
-array elements), `[0:2]` / `[:3]` / `[1:]` / `[:]` (slice, each side independently optional),
-`["key"]` / `['key']` (quoted bracket field access — lets a field name contain `.` or `[`), and a
-bare unquoted bracket name `[key]` (falls through to the same `Field` branch as a quoted name).
+### 4.2 Parsing (`parse_json_path`)
 
-**No filter expressions** (`?(@.price < N)`) exist anywhere in `src/json.rs` — there is no
-`@`-token handling, no comparison-operator parsing, nothing. A path containing `?(...)` gets
-parsed field-by-field as ordinary (nonexistent) field names and simply matches nothing.
+`parse_json_path(&str) -> Result<Vec<PathSegment>, String>` is a hand-written character scanner.
+In practice it **never returns `Err`**: anything it does not understand becomes a field name that
+simply matches nothing.
 
-### 3.2 Recursive descent (`$..field`) — re-verified, NOT implemented
+1. Trim whitespace. An empty string, `$` or `.` returns `[Root]`.
+2. Push `Root`. If the path starts with `$`, consume it and one following `.`; if it starts with
+   `.`, consume that dot. (A path such as `name` with no prefix also gets an implicit `Root`.)
+3. Loop over the remaining characters:
+   - `.` — consume it. If the next char is `*`, push `Wildcard`. Otherwise push nothing.
+   - `*` — push `Wildcard`.
+   - `[` — collect everything up to `]` (no escape handling) and trim it, then:
+     `*` → `Wildcard`; text wrapped in matching `"…"` or `'…'` → `Field` of the inner text;
+     text containing `:` → `Slice` (each side parsed as `isize`, empty or unparsable → `None`);
+     text that parses as `isize` → `Index`; anything else → `Field` (unquoted bracket name).
+   - Otherwise read an identifier up to the next `.` or `[` and push it as `Field`.
 
-The parser's main loop (`src/json.rs:43-118`) has a comment that is misleading on its own:
+Worked example: `$.items[-1]["first.name"]` →
+`[Root, Field("items"), Index(-1), Field("first.name")]`. The quoted bracket form is the only way
+to address a key that contains `.` or `[`.
 
-```rust
-// src/json.rs:43-52
-while let Some(&ch) = chars.peek() {
-    if ch == '.' {
-        chars.next();
-        // Could be another dot for recursive or wildcard
-        if chars.peek() == Some(&'*') {
-            chars.next();
-            segments.push(PathSegment::Wildcard);
-        }
-        continue;
-    }
-    ...
-```
+**Recursive descent is not supported.** For `$..name`, step 2 eats `$.`, the loop then eats the
+second `.` (not followed by `*`, so nothing is pushed — the in-code comment "Could be another dot
+for recursive or wildcard" refers only to the `.*` case), and `name` becomes a `Field`. The result
+`[Root, Field("name")]` is identical to `$.name`: it matches only a direct child of the root.
 
-Tracing `"$..name"` character by character: the pre-loop block consumes `$` (pushes `Root`) and
-then opportunistically consumes one trailing `.`, leaving `.name` (one dot + "name"). The main
-loop then sees `ch == '.'`, consumes *that* second dot, checks whether the next char is `*`
-(it's `n`, so no), and `continue`s **without pushing any segment at all** — the dot is simply
-discarded. The next iteration parses `"name"` as an ordinary `Field`. Final result:
-`[Root, Field("name")]` — byte-for-byte identical to parsing `"$.name"`.
+**Filter expressions are not supported.** There is no handling for `?(...)` or `@`; a path like
+`$.items[?(@.price<5)]` parses into a bracket `Field("?(@.price<5)")` and matches nothing.
 
-**There is no `PathSegment::RecursiveDescent` variant and no code path that walks more than one
-level down for a double dot.** `$..name` does not search `name` at every nesting depth; it
-silently degrades to a single-level `$.name` lookup, matching only a direct child of the root
-named `name`. This matches what `docs/design/16_json_store.md:31` already states ("no recursive
-descent"), and contradicts any claim that recursive descent is supported — there is no supporting
-code for that claim anywhere in `src/json.rs`.
+### 4.3 Querying (`query_json_path` / `query_json_path_mut`)
 
-### 3.3 `query_json_path` / `query_json_path_mut`: breadth-first, segment-by-segment fan-out
+Both functions evaluate a segment list breadth-first. They are two hand-maintained copies of the
+same algorithm — one returns `Vec<&Value>`, the other `Vec<&mut Value>` (so mutating commands can
+write through the results).
 
-Both functions (124-201 immutable, 204-285 mutable — hand-duplicated, not shared via a generic/
-trait) maintain a `Vec` of "current matches" and replace it with a new `Vec` after each segment:
+1. If the segments are empty or just `[Root]`, return `[root]`.
+2. Start with `current = [root]`. For each non-`Root` segment, build `next` from every node in
+   `current`:
+   - `Field(name)` — if the node is an object containing `name`, keep that child.
+   - `Index(i)` — if the node is an array: a negative `i` becomes `len + i`; keep the element if
+     the resulting index is in range.
+   - `Wildcard` — every value of an object, or every element of an array.
+   - `Slice { start, end }` — arrays only. `start` defaults to 0 and `end` to `len`; negative
+     values count from the end and are clamped at 0, positive values are clamped at `len`; if
+     `start < end` keep `arr[start..end]`, otherwise nothing.
+   - Nodes of the wrong type contribute nothing (no error).
+3. Replace `current` with `next`; stop early if it becomes empty.
 
-- `Field(name)`: for each current match that is an `Object`, look up `name`; non-matches drop out.
-- `Index(idx)`: negative indices are resolved as `len + idx` (as `usize`, so an index past the
-  start wraps rather than erroring — see §7); out-of-range indices silently drop the match.
-- `Wildcard`: fans out to every object value or every array element.
-- `Slice { start, end }`: `start`/`end` each independently default (`0` / array length) and are
-  clamped: negative counts from the end via `(len + s).max(0)`, positive is `.min(len)`; if the
-  resulting `s_idx >= e_idx` the slice contributes **zero** matches for that branch (no error).
+Worked example on `{"items":[{"p":10},{"p":25},{"p":50}]}` with `$.items[*].p`:
+after `items` → `[array]`; after `[*]` → the three objects; after `p` → `[10, 25, 50]`.
+With `$.items[-1:]` the slice resolves to `[2..3]` → `[{"p":50}]`.
 
-If `current` becomes empty after any segment, the loop `break`s early (124/204: `if current.is_empty() { break; }`). The two functions are textually near-identical except `&'a Value`/`map.get`/`&arr[i]` in the immutable version vs `&'a mut Value`/`map.get_mut`/`&mut arr[i]` in the mutable one — a real duplication-drift risk flagged again in §7.
+Index arithmetic note: a negative index whose magnitude exceeds the array length computes
+`len + i` as a negative `isize` and casts it to `usize`, producing a huge value that fails the
+range check — so it just matches nothing.
 
-### 3.4 `set_json_path`: parent-segment walk with silent-overwrite auto-vivification
+### 4.4 Setting (`set_json_path`)
 
-`src/json.rs:290-381`. Segments are split into `parent_segments` (all but last) and `last_seg`.
-Walking the parents (321-351):
+`set_json_path(root, path, new_value, nx, xx) -> Result<bool, &'static str>` writes exactly one
+location. `Ok(false)` means "not written because of NX/XX".
 
-```rust
-PathSegment::Field(name) => {
-    if !curr.is_object() { *curr = Value::Object(serde_json::Map::new()); }
-    let map = curr.as_object_mut().unwrap();
-    if !map.contains_key(name) { map.insert(name.clone(), Value::Object(Map::new())); }
-    curr = map.get_mut(name).unwrap();
-}
-PathSegment::Index(idx) => {
-    if !curr.is_array() { *curr = Value::Array(Vec::new()); }
-    let arr = curr.as_array_mut().unwrap();
-    while arr.len() <= actual_idx { arr.push(Value::Null); }   // pads with Null
-    curr = &mut arr[actual_idx];
-}
-_ => return Err("ERR wildcards not supported as parent path for SET"),
-```
+1. Parse the path. If it is the root: with `nx` return `Ok(false)` (the root always exists);
+   otherwise replace the whole document and return `Ok(true)`.
+2. Existence check, once, for the whole path: `target_exists = !query_json_path(..).is_empty()`.
+   `nx && target_exists` or `xx && !target_exists` → `Ok(false)`. (Passing both always yields
+   `Ok(false)`.)
+3. Split into parent segments and the last segment. Walk the parents with a single `&mut` cursor,
+   **auto-vivifying** (creating missing containers on the way):
+   - `Field(name)` — if the cursor is not an object, **replace it with `{}`**; insert
+     `name: {}` if missing; descend.
+   - `Index(i)` — if the cursor is not an array, **replace it with `[]`**; resolve `i` with
+     `set_index` (below); pad with `null` up to that index; descend.
+   - `Wildcard` / `Slice` → `Err("ERR wildcards not supported as parent path for SET")`.
+4. Apply the last segment: `Field` inserts into the (possibly freshly created) object; `Index`
+   resolves with `set_index`, pads with `null`, and assigns. Any other last segment →
+   `Err("ERR invalid target path for SET")`.
 
-**If an intermediate node exists but is the wrong type it is silently destroyed and replaced**
-with a fresh empty container (`*curr = Value::Object(...)` / `Value::Array(...)`) — there is no
-type-check error. `JSON.SET doc $.user.name "..."` where `user` currently holds a string will
-overwrite that string with `{}` and continue. The *only* error path for a parent segment is
-`Wildcard`/`Slice` (`"ERR wildcards not supported as parent path for SET"`); `last_seg` being
-anything other than `Field`/`Index` gives `"ERR invalid target path for SET"`.
+**Index bounds (`set_index` and `MAX_SET_INDEX_GAP`).** A client-chosen index used to drive an
+unbounded padding loop, so `set_index(len, idx)` enforces:
 
-`nx`/`xx` are checked once, up front, against `query_json_path(root, &segments).is_empty()`
-(308-314) — not per-match, since `set_json_path` always writes exactly one target (the last
-segment can't be a `Wildcard`/`Slice`, so there's never more than one write site). Passing both
-`nx: true, xx: true` always returns `Ok(false)`: either the target exists (nx fails) or it
-doesn't (xx fails) — there is no third outcome.
+- negative `idx` must land inside the array (`len - |idx|` must not underflow);
+- positive `idx` may extend the array by at most `MAX_SET_INDEX_GAP = 1 << 16` (65,536) padding
+  `null`s beyond its current length.
 
-### 3.5 `delete_json_path`: wildcard-last-segment clears the whole container
+Anything else is `Err("ERR index out of bounds")`. Example: with `{"a":[1,2,3]}`,
+`$.a[5]` = 7 gives `[1,2,3,null,null,7]`; `$.a[-4]` and `$.a[9223372036854775807]` are errors;
+on a missing array, `$.b[-1]` is an error because the fresh `[]` has length 0.
 
-`src/json.rs:385-434`. Root deletion special-cases to `*root = Value::Null` (391, count 1 — the
-key itself is removed one level up, in `JsonStore::json_del`, not here). For a non-root path, it
-calls `query_json_path_mut` on the **parent** segments and, per parent:
-- `Field`/`Index` last segment: removes exactly one entry if present.
-- `Wildcard` last segment: `map.clear()`/`arr.clear()` — removes every entry in that one container
-  and counts `map.len()`/`arr.len()` as the deleted count — so `JSON.DEL key $.items[*]` empties
-  the `items` array in place (array itself survives, now `[]`) rather than deleting one element
-  at a time.
-- `Slice` as last segment is unhandled (`_ => {}` at 429) — contributes 0 deletions silently.
+Worked example: `JSON.SET doc $.user.tags[1] '"x"'` on `{"user":"bob"}`:
+`user` exists but is a string, so it is replaced by `{}`; `tags` is created as `{}`, then (being the
+cursor for the last `Index` segment and not an array) replaced by `[]`; `set_index(0, 1)` → 1, the
+array is padded to `[null, "x"]`. Result: `{"user":{"tags":[null,"x"]}}` — the old string is gone
+without any error.
+
+### 4.5 Deleting (`delete_json_path`)
+
+`delete_json_path(root, path) -> usize` returns the number of removed entries.
+
+1. Root path → set the document to `null` and return 1. (`JsonStore::json_del` intercepts the
+   normal root forms `$`/`.`/no path and removes the key instead; this branch is only reached by
+   path strings that *parse* to root, such as an empty or whitespace-only string.)
+2. Otherwise find all parents with `query_json_path_mut(parent_segments)`; for each parent, by the
+   last segment:
+   - `Field(name)` — remove the key from an object.
+   - `Index(i)` — remove the element (negative counts from end) from an array; later elements
+     shift down.
+   - `Wildcard` — **clear the whole container**, counting its former size. `JSON.DEL k $.items[*]`
+     leaves `items` as `[]`.
+   - `Slice` — ignored; deletes nothing.
+
+Because parents can be multiple (`$.a[*].tmp`), one call can delete from many containers.
 
 ---
 
-## 4. `JsonStore` command methods — exact behavior
+## 5. `JsonStore` command methods
 
-All take `key: &[u8]`, internally doing `Bytes::copy_from_slice(key)` to look up `self.docs`
-(a `HashMap<Bytes, Value>` keyed by owned `Bytes` — each call allocates a fresh `Bytes` copy of
-the key for the lookup, even on a pure read).
+Every method takes `key: &[u8]` and copies it into a `Bytes` for the lookup. Default path for
+an omitted optional path is `$`.
 
-| Command | Method (lines) | Path default | Multi-match behavior |
-| :--- | :--- | :--- | :--- |
-| `JSON.SET` | `json_set` (465-499) | required | single write site only (§3.4) |
-| `JSON.GET` | `json_get` (502-531) | `$` | returns raw single value **only if** exactly 1 match **and** the path string contains neither `*` nor `:`; otherwise wraps in a JSON array |
-| `JSON.DEL`/`JSON.FORGET` | `json_del` (534-552) | none (root) | wildcard-last clears container (§3.5) |
-| `JSON.TYPE` | `json_type` (555-574) | `$` | **first match only** (`matches.first()`) |
-| `JSON.NUMINCRBY` | `json_numincrby` (577-612) | required | **all matches** incremented; single result → bare number string, multi-match → `"[v1,v2,...]"` |
-| `JSON.NUMMULTBY` | `json_nummultby` (615-655) | required | **all matches** multiplied (own method — see §5) |
-| `JSON.STRAPPEND` | `json_strappend` (658-686) | `$` | **all matches** appended to; returns the length of the *last* one processed |
-| `JSON.STRLEN` | `json_strlen` (689-698) | `$` | **first match only** |
-| `JSON.ARRAPPEND` | `json_arrappend` (701-737) | required | **all matches** appended to; returns length of the *last* one processed |
-| `JSON.ARRLEN` | `json_arrlen` (740-749) | `$` | **first match only** |
-| `JSON.ARRPOP` | `json_arrpop` (752-780) | `$` | **first match only** (`matches.into_iter().next()`), even for a wildcard path matching several arrays |
-| `JSON.OBJKEYS` | `json_objkeys` (783-792) | `$` | **first match only** |
-| `JSON.OBJLEN` | `json_objlen` (795-804) | `$` | **first match only** |
-| `JSON.TOGGLE` | `json_toggle` (807-833) | **required**, no default | **all matches** toggled |
-| `JSON.CLEAR` | `json_clear` (837-872) | `$` | **all matches** cleared/zeroed |
-| `JSON.MGET` | not a `JsonStore` method — see §6 | required | handled entirely in `router.rs` |
+| Command | Method | Path | Acts on | Return (method) |
+| :--- | :--- | :--- | :--- | :--- |
+| `JSON.SET k path json [NX\|XX]` | `json_set` | required | one location (§4.4) | `Result<bool, String>` |
+| `JSON.GET k [path ...]` | `json_get` | default `$` | all matches | `Option<String>` (§5.2) |
+| `JSON.DEL` / `JSON.FORGET k [path]` | `json_del` | default: whole key | all matches (§4.5) | `usize` |
+| `JSON.TYPE k [path]` | `json_type` | default `$` | **first match** | `Option<String>` |
+| `JSON.NUMINCRBY k path n` | `json_numincrby` | required | all matches | `Result<String, String>` |
+| `JSON.NUMMULTBY k path n` | `json_nummultby` | required | all matches | `Result<String, String>` |
+| `JSON.STRAPPEND k [path] str` | `json_strappend` | default `$` | all matches | `Result<usize, String>`, length of the last string |
+| `JSON.STRLEN k [path]` | `json_strlen` | default `$` | **first match** | `Option<usize>` (bytes) |
+| `JSON.ARRAPPEND k path v...` | `json_arrappend` | required | all matches | `Result<usize, String>`, length of the last array |
+| `JSON.ARRLEN k [path]` | `json_arrlen` | default `$` | **first match** | `Option<usize>` |
+| `JSON.ARRPOP k [path [index]]` | `json_arrpop` | default `$` | **first match** | `Option<String>` |
+| `JSON.OBJKEYS k [path]` | `json_objkeys` | default `$` | **first match** | `Option<Vec<String>>` |
+| `JSON.OBJLEN k [path]` | `json_objlen` | default `$` | **first match** | `Option<usize>` |
+| `JSON.TOGGLE k path` | `json_toggle` | required | all matches | `Result<String, String>` |
+| `JSON.CLEAR k [path]` | `json_clear` | default `$` | all matches | `usize` |
+| `JSON.MGET k... path` | — (`Router::json_mget`, §7) | required | per key, like `JSON.GET` with one path | — |
 
-Note the split: incrementing/multiplying/appending/toggling/clearing act on **every** matched
-node (loop `for val in matches`), while the length/introspection getters (`TYPE`, `STRLEN`,
-`ARRLEN`, `OBJKEYS`, `OBJLEN`) and `ARRPOP` act on **only the first** match — a wildcard path like
-`$.items[*]` behaves completely differently depending on which command you run against it.
+The split matters for wildcard paths: the mutators (`NUMINCRBY`, `NUMMULTBY`, `STRAPPEND`,
+`ARRAPPEND`, `TOGGLE`, `CLEAR`, `DEL`) touch **every** match, while the getters (`TYPE`, `STRLEN`,
+`ARRLEN`, `OBJKEYS`, `OBJLEN`) and `ARRPOP` look at **only the first** match.
 
-`JSON.TOGGLE`'s path parameter is **mandatory** at the parser level (`src/resp.rs:10391-10397`
-requires `args.len() >= 3`) — unlike real RedisJSON where path defaults to root — so
-`JSON.TOGGLE key` (no path) is a parse-time "wrong number of arguments" error here, not a
-root-level toggle.
+### 5.1 `json_set`
 
-### 4.1 Numeric mutation detail (`json_numincrby`/`json_nummultby`, nearly identical bodies)
+1. Parse `json_str` with `serde_json::from_str`; failure → `ERR invalid JSON value: …`.
+2. If the key exists, delegate to `set_json_path` with the caller's `nx`/`xx`.
+3. If the key is missing: `xx` → `Ok(false)`. Root path → insert the value as the new document.
+   Non-root path → start from `{}`, run `set_json_path` (NX/XX off), and insert the result only if
+   it succeeded. So `JSON.SET new $.a.b 1` creates `{"a":{"b":1}}` (RedisJSON would demand a root
+   path for a new key).
 
-```rust
-// src/json.rs:589-605 (numincrby) — nummultby (632-648) is the same shape with `*` not `+`
-for val in matches {
-    if let Value::Number(num) = val {
-        let cur = num.as_f64().unwrap_or(0.0);
-        let new_num = cur + delta;                      // or cur * factor
-        if let Some(n) = Number::from_f64(new_num) {
-            *val = Value::Number(n);
-            results.push(new_num.to_string());
-        } else {
-            let int_val = new_num.round() as i64;        // NaN/Infinity fallback
-            *val = json!(int_val);
-            results.push(int_val.to_string());
-        }
-    } else {
-        return Err("ERR value at path is not a number".to_string());
-    }
-}
-```
+### 5.2 `json_get` and the raw-vs-array rule
 
-If **any** matched node is a non-number, the whole call errors out with
-`"ERR value at path is not a number"` — but nodes processed earlier in the `matches` iteration
-order have **already been mutated in place** before the error is returned, since the loop doesn't
-pre-validate all matches before writing any of them. A wildcard `NUMINCRBY` over a mixed-type
-array can partially apply.
+1. Missing key → `None` (nil reply).
+2. No paths, or exactly one path equal to `$` or `.` → the whole document serialized.
+3. Exactly one other path → query it:
+   - no matches → the string `[]`;
+   - exactly one match **and** the path text contains neither `*` nor `:` → that value, raw;
+   - otherwise → a JSON array of all matches.
+4. Several paths → a JSON object mapping each path string to an **array** of its matches,
+   regardless of match count.
 
-### 4.2 `JSON.NUMMULTBY` now has its own `JsonStore` method — fixed since the last docs pass
+The raw/array choice looks at the **path text**, not just the count: `$.items[0]` returns `{"p":10}`
+but `$.items[*]` on a one-element array returns `[{"p":10}]`. Example: `JSON.GET k $.a $.b` →
+`{"$.a":[1],"$.b":[]}`.
 
-An earlier version of this subsystem (and the previous revision of this doc) had
-`Command::JsonNumMultBy` composed in `connection.rs` from two separate `json_numincrby` calls
-(`json_numincrby(key, path, 0.0)` to read, then a second call with the computed delta), which
-broke on any multi-match wildcard path because the intermediate read returned a bracketed
-multi-value string that couldn't `parse::<f64>()`. **That composition no longer exists.**
-`JsonStore::json_nummultby` (615-655) is now a standalone method, structurally identical to
-`json_numincrby` but multiplying instead of adding, and it correctly handles multi-match paths —
-confirmed by the in-file unit test:
+### 5.3 Numeric mutation (`json_numincrby` / `json_nummultby`)
 
-```rust
-// src/json.rs:976-989
-let mult_res = store.json_nummultby(key, "$.items[*].price", 2.0).unwrap();
-assert_eq!(mult_res, "[20,50,100]");   // doc had prices 10, 25, 50
-```
+The two methods are identical except for `+ delta` vs `* factor`.
 
-`connection.rs`'s `Command::JsonNumMultBy` arm (16863-16877) is now a single call:
-`db.json_store.json_nummultby(key, path, *factor)`, mirroring `JsonNumIncrBy`'s arm exactly.
-This was part of commit `784ccb4` ("multi-match json_nummultby and HNSW vector index integration
-in RediSearch" — `git log --oneline -- src/json.rs`).
+1. Missing key → `ERR could not find key`; no matches → `ERR path does not exist`.
+2. For each match in order: if it is not a number → return `ERR value at path is not a number`
+   **immediately** (earlier matches stay modified). Otherwise compute `cur (as f64) op n`.
+   If `Number::from_f64` accepts the result, store it as an f64 number and record
+   `new.to_string()`; if not (NaN or ±infinity), store `round() as i64` (saturating) instead.
+3. One result → return it bare (`"32"`); several → `"[20,50,100]"`.
 
-### 4.3 `JSON.GET`'s raw-vs-wrapped heuristic (502-531)
+Worked example: `{"items":[{"price":10},{"price":25},{"price":50}]}` with
+`JSON.NUMMULTBY k $.items[*].price 2` → reply `[20,50,100]` (this is the in-file test
+`test_json_nummultby_multi_match`).
 
-```rust
-// src/json.rs:510-519
-if paths.len() == 1 {
-    let matches = query_json_path(doc, &segments);
-    if matches.is_empty() {
-        Some("[]".to_string())
-    } else if matches.len() == 1 && !paths[0].contains('*') && !paths[0].contains(':') {
-        Some(serde_json::to_string(matches[0]).unwrap_or_default())   // raw value
-    } else {
-        Some(serde_json::to_string(&matches).unwrap_or_default())      // JSON array of matches
-    }
-}
-```
+All arithmetic goes through `f64`: integers above 2^53 lose precision, and a result is stored as
+a float number, so `JSON.GET` may render `32.0` even though the command replied `32` (Rust's `f64`
+`Display` drops the `.0`, `serde_json` keeps it).
 
-The raw-vs-array decision is driven by the **path string's syntax** (does it literally contain
-`*` or `:`), not purely by match count: `$.items[0]` with one match returns the raw value;
-`$.items[*]` with exactly one match (e.g. a single-element array) still returns it wrapped in an
-array, because the path text contains `*`. Multiple `paths` (`JSON.GET key $.a $.b`) always
-returns a JSON object mapping each path string to its (always array-wrapped, via `json!(matches)`)
-result set (521-528), regardless of match count per path.
+### 5.4 Other mutators
+
+- **`json_strappend`** — appends the argument **verbatim** (it is not JSON-decoded) to every matched
+  string; a non-string match → `ERR value at path is not a string`. `JSON.STRAPPEND k $.s '"y"'`
+  therefore appends the three characters `"y"`, quotes included.
+- **`json_arrappend`** — parses every value argument as JSON *before* touching the document
+  (`ERR invalid JSON element: …` leaves it unchanged), then appends clones to every matched array;
+  a non-array match → `ERR value at path is not an array`.
+- **`json_arrpop`** — first match only; must be a non-empty array. `index` defaults to `-1` (last),
+  negative counts from the end; out of range → `None`. Returns the popped value serialized as JSON.
+  Note that the index is resolved strictly (no clamping as in RedisJSON).
+- **`json_toggle`** — flips every matched boolean; a non-boolean match →
+  `ERR value at path is not a boolean`. Returns `"false"` / `"true"` or `"[true,false]"`.
+- **`json_clear`** — for each match: non-empty arrays and objects are emptied, non-zero numbers set
+  to `0`; strings, booleans, `null`, empty containers and zeros are left alone. Returns how many
+  nodes changed (0 for missing key).
+
+### 5.5 Read-only getters
+
+`json_type` maps the first match to `null | boolean | number | string | array | object`.
+`json_strlen` returns the **byte** length (`String::len`) of the first match if it is a string.
+`json_arrlen`, `json_objlen`, `json_objkeys` return the length / key list of the first match if it
+has the right type. Any type mismatch, missing key or no match → `None` (nil reply), never an error.
 
 ---
 
-## 5. In-place mutation mechanics (whole-document clone vs subtree mutation)
+## 6. Command dispatch end to end
 
-Every `JsonStore` mutator obtains `&mut Value` references directly into the stored document via
-`query_json_path_mut` and writes through them (`*val = ...`, `s.push_str(...)`, `arr.push(...)`,
-`map.clear()`) — **no document is ever deep-cloned to be mutated.** The one exception, and it's
-not inside `JsonStore` at all: `connection.rs`'s `JsonSet`/`JsonDel` arms need to call
-`db.index_json_document_local(...)` (a `&mut self` method on `ShardDb`) while also needing a
-`&Value` of the just-written document, and the borrow checker won't let `db.json_store.get(key)`
-stay borrowed across a `db.index_json_document_local(...)` call. So those two arms do:
+### 6.1 Parsing and the experimental gate (`src/resp.rs`)
+
+`build_command` upper-cases the command name. If the name contains a `.`,
+experimental commands are disabled (`experimental_commands_enabled()` false — set from the
+`enable-experimental-commands` config, default `no`) and the name starts with one of
+`EXPERIMENTAL_PREFIXES` (`JSON.`, `BF.`, `CF.`, `CMS.`, `TOPK.`, `FT.`, `SEMANTIC.`, `CRDT.`, `LLM.`,
+`MCP.`, `XDP.`), it returns `Command::Unknown` — the client sees the normal unknown-command error.
+
+Otherwise the `"JSON.*"` match arms build one of 16 `Command` variants:
+
+| Variant | Fields |
+| :--- | :--- |
+| `JsonSet` | `key, path: String, json_val: String, nx, xx` |
+| `JsonGet` | `key, paths: Vec<String>` (defaults to `["$"]`) |
+| `JsonDel` | `key, path: Option<String>` (shared by `JSON.DEL` and `JSON.FORGET`) |
+| `JsonType`, `JsonStrLen`, `JsonArrLen`, `JsonObjKeys`, `JsonObjLen`, `JsonClear` | `key, path: Option<String>` |
+| `JsonNumIncrBy` / `JsonNumMultBy` | `key, path: String, delta` / `factor: f64` |
+| `JsonStrAppend` | `key, path: Option<String>, value: String` |
+| `JsonArrAppend` | `key, path: String, values: Vec<String>` |
+| `JsonArrPop` | `key, path: Option<String>, index: Option<isize>` |
+| `JsonToggle` | `key, path: String` |
+| `JsonMget` | `keys: Vec<Bytes>, path: String` |
+
+Parser details worth knowing:
+
+- `JSON.FORGET` is a pure alias of `JSON.DEL` (same arm, same variant).
+- `NUMINCRBY`, `NUMMULTBY`, `ARRAPPEND` and `TOGGLE` require a path (`JSON.TOGGLE k` is a
+  wrong-number-of-arguments error). The number argument must parse as `f64` or the error is
+  `not a number`.
+- `JSON.SET` scans every argument after the value for `NX`/`XX` case-insensitively and silently
+  ignores anything else.
+- `JSON.STRAPPEND` with three arguments treats the third as the value (path `None`); with four the
+  third is the path.
+- `JSON.ARRPOP`'s index is read only after a path; an unparsable index becomes `None` (pop last).
+- `JSON.MGET` takes the **last** argument as the path and everything between as keys; at least one
+  key and the path are required.
+- Paths and values are converted with `String::from_utf8_lossy`.
+
+`Command::is_family_read` lists the read-only JSON variants (`JsonGet`, `JsonType`, `JsonStrLen`,
+`JsonArrLen`, `JsonObjKeys`, `JsonObjLen`, `JsonMget`); the rest are write commands
+(`is_write_command`), which matters for ACL categories, replicas and the AOF-rewrite hook.
+
+### 6.2 Routing (`src/connection.rs`)
+
+Every single-key `Json*` variant appears in the shared key-extraction helpers:
+
+- `cmd_primary_key` and `target_shard_of_cmd` — find the owning shard. In
+  `execute_command_inner`, if the target is the local shard the command runs through
+  `execute_local_command`; otherwise `router.execute_remote(target, cmd)` ships it to the owner,
+  which runs the same function.
+- `for_each_cmd_key` — used for `WATCH` / client-tracking invalidation and the AOF-rewrite
+  before-write hook. `JsonMget` is listed here with its multiple `keys`.
+- `get_cmd_name` — maps every JSON variant (including `JsonMget`) to the string `"JSON"` for
+  command stats and similar displays.
+
+`JsonMget` has its own arm in `execute_command_inner` that calls `Router::json_mget` (§7) and
+writes a RESP array of bulk strings / nils.
+
+### 6.3 Execution arms (`execute_local_command`)
+
+Each arm calls the matching `JsonStore` method and encodes the reply:
+
+| Outcome | RESP reply |
+| :--- | :--- |
+| `JSON.SET` written / skipped by NX-XX | `+OK` / nil |
+| `JSON.GET`, `ARRPOP`, `NUMINCRBY`, `NUMMULTBY`, `TOGGLE` result | bulk string (nil when `None`) |
+| `JSON.DEL`, `CLEAR`, `STRAPPEND`, `ARRAPPEND`, `STRLEN`, `ARRLEN`, `OBJLEN` | integer (getters: nil when `None`) |
+| `JSON.TYPE` | simple string, e.g. `+object` (nil when `None`) |
+| `JSON.OBJKEYS` | array of bulk strings (nil when `None`) |
+| any `Err(msg)` | error reply with `msg` |
+
+On a write that changed something — `json_set` → `Ok(true)`, `json_del`/`json_clear` count > 0,
+the `Result` mutators → `Ok`, `json_arrpop` → `Some` — the arm:
+
+1. calls `record_change!(cmd)` (§6.4);
+2. re-indexes the document for RediSearch (§8.3).
+
+Failed or no-op writes call neither.
+
+### 6.4 `record_change!` — invalidation, AOF and replication
+
+`record_change!` (a macro inside `execute_local_command`) does two things:
+
+1. If any client uses `WATCH` or client-side caching (`HAS_WATCHED_KEYS` / `HAS_TRACKING_CLIENTS`),
+   call `notify_key_invalidation` for each key of the command.
+2. Call `log_change`, which encodes the command with the AOF encoder and appends it to the shard's
+   AOF buffer (`AofWriter::append_command`); if replicas are connected, the same bytes are
+   streamed to them with `replication::propagate_shard_bytes`. Without an AOF, it encodes with
+   `aof::command_to_resp` only when replicas exist. A command the encoder cannot express is
+   reported through `aof::note_unpropagated`.
+
+`aof::command_to_resp` has arms for every JSON write: `JsonSet` (with `NX`/`XX`), `JsonDel`,
+`JsonClear`, `JsonNumIncrBy`, `JsonNumMultBy`, `JsonStrAppend`, `JsonArrAppend`, `JsonArrPop`
+(the index is emitted only when a path is present, mirroring the parser) and `JsonToggle`. JSON
+writes are logged **as issued** and replayed in order; this is deterministic because the store has
+no randomness or clocks. The test `test_json_writes_round_trip_through_aof_encoding` in
+`src/aof.rs` checks that each encoded form parses back to the identical `Command`.
+
+---
+
+## 7. `JSON.MGET` — batched cross-shard fan-out
+
+`JSON.MGET` is the only JSON command whose keys can live on different shards.
+`Router::json_mget(keys, path) -> Vec<Option<String>>`:
+
+1. Empty key list → empty result.
+2. Single-shard server (`num_shards <= 1`) → loop over the keys calling
+   `json_store.json_get(key, &[path])` on the local shard.
+3. Otherwise bucket keys by `target_shard(key)`: local keys into `local_keys`, remote keys into
+   one `Vec<(original_index, key)>` per shard (`remote_batches`).
+4. Resolve local keys immediately into a pre-sized `results` vector.
+5. For each remote shard with at least one key, send **one**
+   `ShardMessage::JsonMget { keys, path, responder }` with a `flume::bounded(1)` reply channel.
+6. Await the replies; scatter each `(index, value)` back into `results`. All requests are already
+   in flight, so the cost is about one round trip, not one per key or per shard.
+
+The remote side is the shard's cross-shard mailbox loop in `src/server.rs`: for each `(idx, key)` it
+calls `json_get(&key, &[path])` and replies with `Vec<(usize, Option<String>)>`.
 
 ```rust
-// src/connection.rs:16790-16798 (JsonSet) — JsonDel (16821-16833) does the same for the clear-or-delete case
-if let Some(doc) = db.json_store.get(key).cloned() {   // full Value clone, every successful SET/DEL
-    let k_str = String::from_utf8_lossy(key);
-    db.index_json_document_local(&k_str, &doc);
-    crate::search::index_json_document_hook(&k_str, &doc);
-}
+// src/shard.rs — ShardMessage variant
+JsonMget {
+    keys: Vec<(usize, Bytes)>,                               // (position in reply, key)
+    path: String,
+    responder: flume::Sender<Vec<(usize, Option<String>)>>,
+},
 ```
 
-Every other mutating command (`NumIncrBy`, `NumMultBy`, `StrAppend`, `ArrAppend`, `ArrPop`,
-`Toggle`, `Clear`) only calls the global `crate::search::index_json_document_hook`, passing a
-plain `&Value` borrow (`db.json_store.get(key)`, no `.cloned()`) — so **only `JSON.SET` and
-`JSON.DEL` pay a full-document clone cost**, and only because they also update the *shard-local*
-`search_indices` map (`index_json_document_local`), which the incremental mutators skip entirely.
-That means a RediSearch index with `ON JSON` schema sees shard-local index updates from
-`JSON.SET`/`JSON.DEL` but **not** from `JSON.NUMINCRBY`/`ARRAPPEND`/etc. against
-`ShardDb.search_indices` — only the global `SEARCH_INDICES` registry (via
-`index_json_document_hook`) is kept current for those. (Full dual-registry architecture is
-Component 09's territory; noted here only for the JSON-write code path.)
+Worked example: 3 shards, client on shard 0 sends `JSON.MGET a b c $.name`, where `a` is on shard
+0, `b` and `c` on shard 2. `a` is answered locally into slot 0; one `JsonMget` with
+`[(1,b),(2,c)]` goes to shard 2; its reply fills slots 1 and 2; the client gets a 3-element
+array. If sending to a shard fails or its reply is lost, those slots stay nil. Each value follows the
+single-path `JSON.GET` rule in §5.2, so a `$` path returns the whole document, a wildcard path an
+array.
 
 ---
 
-## 6. Command dispatch end-to-end
+## 8. Persistence, replication and integrations
 
-### 6.1 `Command` enum & parser (`src/resp.rs`)
+### 8.1 RDB snapshots
 
-16 `Json*` variants exist (1437-1508): `JsonSet{key,path,json_val,nx,xx}`, `JsonGet{key,paths}`,
-`JsonDel{key,path:Option}`, `JsonType{key,path:Option}`, `JsonNumIncrBy{key,path,delta}`,
-`JsonNumMultBy{key,path,factor}`, `JsonStrAppend{key,path:Option,value}`,
-`JsonStrLen{key,path:Option}`, `JsonArrAppend{key,path,values}`, `JsonArrLen{key,path:Option}`,
-`JsonArrPop{key,path:Option,index:Option<isize>}`, `JsonObjKeys{key,path:Option}`,
-`JsonObjLen{key,path:Option}`, `JsonToggle{key,path}` (mandatory path), `JsonClear{key,path:Option}`,
-`JsonMget{keys:Vec<Bytes>,path}`.
+Rudis writes Redis-compatible RDB files; state Redis cannot encode is written as Rudis
+"legacy-format" records inside an AUX field named `rudis-ext` (`redis_rdb::EXT_AUX_KEY`). Redis and
+Valkey skip unknown AUX fields, so the file still loads there (without the JSON documents).
 
-The parse arms (`src/resp.rs:10213-10418`) are plain string-command dispatch — no grammar/parser
-library. Two things worth flagging precisely:
-- **`"JSON.DEL" | "JSON.FORGET" =>` is a single shared arm** (10253) — `JSON.FORGET` is a true
-  alias of `JSON.DEL`, not a distinct command.
-- **`JSON.NUMMULTBY`/`JSON.NUMINCRBY`/`JSON.ARRAPPEND`/`JSON.TOGGLE` all require their path
-  argument** (`args.len() < 4`/`< 3` checks) — no "defaults to root" fallback for these four,
-  unlike `GET`/`DEL`/`TYPE`/`STRAPPEND`/`STRLEN`/`ARRLEN`/`ARRPOP`/`OBJKEYS`/`OBJLEN`/`CLEAR`
-  which do default an absent path argument to `$`/`None`.
-- `JSON.SET`'s `NX`/`XX` flags are parsed case-insensitively from any trailing args
-  (`to_uppercase()`, 10222-10228) with no validation against unrecognized trailing tokens — a
-  typo'd modifier is silently ignored rather than erroring.
+- **Save.** `ShardDb::save_extended_rdb_chunk` collects records via
+  `save_extended_legacy_records`, which iterates `ext_item_keys()` (JSON documents first, then Bloom
+  filters, vector indexes, Cuckoo filters, CMS and Top-K) and calls `save_ext_item` for each, then
+  wraps them with `redis_rdb::write_ext_aux`. A JSON record is:
+  `u32 LE key_len | key | 0x07 | u32 LE json_len | compact JSON text`.
+- **Load.** `redis_rdb` hands the `rudis-ext` blob to `table::load_legacy_ext`, which walks records
+  in `load_legacy_records`. For type byte `7` it UTF-8-decodes and `serde_json`-parses the text and,
+  if `router::target_shard(key, num_shards)` equals this shard, calls `json_store.insert_raw`.
+  Whole-file loads pass the real `(shard_id, num_shards)`, so each shard keeps only its own keys;
+  `ShardDb::restore_rdb_chunk` (per-shard chunks, e.g. replica full sync) uses
+  `redis_rdb::load_chunk`, which passes `(0, 1)`, so every record is accepted. A truncated or
+  unparsable JSON record is skipped. `restore_rdb_chunk` then calls `rebuild_search_indices`.
 
-**Commands that do not exist anywhere in the codebase** (not in the `Command` enum, not parsed,
-not implemented in `JsonStore`): `JSON.ARRINSERT`, `JSON.ARRTRIM`, `JSON.MERGE`, `JSON.DEBUG`,
-`JSON.RESP`. Sending any of these to the server hits the normal "unknown command" path — there is
-no stub, no partial implementation, no `unimplemented!()` marker; grepping `resp.rs`/`json.rs`/
-`connection.rs` for `ArrInsert`/`ArrTrim`/`JsonMerge`/`JsonDebug`/`JsonResp` finds zero matches.
+So JSON documents survive `SAVE`/`BGSAVE` + restart and are included in a replica's initial full
+sync.
 
-### 6.2 `execute_local_command` arms (`src/connection.rs:16783-16996`)
+### 8.2 AOF and AOF rewrite
 
-Each arm (`JsonSet` through `JsonClear`) follows the same shape: call the matching `JsonStore`
-method, and on a mutation-that-actually-changed-something, call `record_change!(cmd)` (§6.3) and
-re-index via `crate::search::index_json_document_hook` (and, for `JsonSet`/`JsonDel` only,
-`db.index_json_document_local` — §5). Response encoding is plain hand-rolled RESP: `+OK\r\n`,
-`$-1\r\n` for not-found/no-op, `:N\r\n` for integer-returning commands, `$len\r\n...\r\n` bulk for
-string-returning ones, and a manual `*N\r\n` + per-element bulk loop for `JSON.OBJKEYS` (16947-16956).
+- **Incremental AOF / replica stream** — every successful JSON write is appended as its original
+  command (§6.4), so `appendonly yes` recovers JSON mutations made after the last snapshot and
+  connected replicas receive JSON writes continuously.
+- **AOF rewrite as an RDB image** — the live rewrite builds a `shard::AofImage` a few pieces at a
+  time between commands. JSON documents are part of its "larger extended structures"
+  (`ExtKind::Json`), written one per step with `save_ext_item`. To keep the image as of the
+  rewrite's start, `aof_image_before_command` writes a key's unchanged state before the first write
+  to it; JSON writes are covered because they are write commands with keys in `for_each_cmd_key`.
+- **Canonical AOF** (`aof::write_canonical_aof`, used e.g. for resharding splits) emits one
+  `JSON.SET <key> $ <document>` per document.
 
-Every single-key `Json*` command is included in all three of `connection.rs`'s shared
-single-key-command lists: `cmd_primary_key` (2778, Json arms at 2902-2916, used for sharding
-target resolution), `for_each_cmd_key` (3041, Json arms at 3158-3169+, used by `record_change!`'s
-`WATCH`-key-touch logic and by `cmd_keys` at 3443), and `get_cmd_name` (3965, Json arms map to the
-literal string `"JSON"` for stats/`MONITOR`/ACL-category display, ~4250-4265). `JsonMget` is
-**not** in `cmd_primary_key`/`for_each_cmd_key` (it has `keys: Vec<Bytes>`, not a single `key`) —
-it gets its own standalone dispatch arm instead (next section).
+### 8.3 RediSearch indexing
 
-### 6.3 `record_change!` macro — dirty tracking, AOF, and replication fan-out
+After a successful write the execution arm re-indexes the document:
 
-```rust
-// src/connection.rs:12740-12761
-macro_rules! record_change {
-    ($cmd_expr:expr) => {
-        DIRTY_CHANGES.fetch_add(1, Ordering::Relaxed);
-        if HAS_WATCHED_KEYS.load(Ordering::Relaxed) {
-            for_each_cmd_key($cmd_expr, |k| touch_watched_key(db.port, k));
-        }
-        let need_aof = aof.is_some();
-        let need_rep = crate::replication::has_connected_replicas(db.port);
-        if need_aof || need_rep {
-            if let Some(bytes) = crate::aof::command_to_resp($cmd_expr) {
-                if let Some(aof_w) = aof { aof_w.borrow_mut().append(&bytes); }
-                if need_rep { crate::replication::propagate_shard_bytes(db.port, db.shard_id, &bytes); }
-            }
-        }
-    };
-}
-```
+| Command | Shard-local `ShardDb.search_indices` | Global `search::SEARCH_INDICES` |
+| :--- | :--- | :--- |
+| `JSON.SET` | `index_json_document_local` | `index_json_document_hook` |
+| `JSON.DEL` (key still exists) | `index_json_document_local` | `index_json_document_hook` |
+| `JSON.DEL` (key removed) | `delete_document_local` | `delete_document_hook` |
+| `NUMINCRBY`, `NUMMULTBY`, `STRAPPEND`, `ARRAPPEND`, `ARRPOP`, `TOGGLE`, `CLEAR` | — | `index_json_document_hook` |
 
-Every mutating `Json*` arm calls this (so `DIRTY_CHANGES` increments and `WATCH`ed-key
-invalidation fires correctly for JSON writes — that part works), **but** the AOF-append and
-replica-propagate both happen only `if let Some(bytes) = crate::aof::command_to_resp($cmd_expr)` —
-and that is where JSON falls through to nothing (§8).
+Both index functions loop over indexes whose `schema.on_type` upper-cases to `JSON`, skip the key
+if the index has prefixes and none match, then call `search::extract_json_fields(schema, doc)` —
+which stores the whole document under field `$` and evaluates each schema field's identifier with
+`parse_json_path` + `query_json_path` — and `add_document`. `SET`/`DEL` clone the whole document
+first (`json_store.get(key).cloned()`) because `index_json_document_local` needs `&mut ShardDb`
+while the document is borrowed from it. `FT.CREATE` backfills by iterating `json_store` in
+`ShardDb::init_search_index`. Field-extraction rules belong to
+[09_redisearch.md](09_redisearch.md).
+
+### 8.4 `DEBUG DIGEST`
+
+`src/digest.rs` includes JSON documents as extended keys: `json_digest` mixes type tag
+`TYPE_JSON` (100) and the document's compact JSON text. Both `shard_digest` and
+`key_value_digest` cover them, which is how AOF/replica tests compare datasets.
 
 ---
 
-## 7. `JSON.MGET` — now bucketed and fanned out in parallel (fixed since the last docs pass)
+## 9. Invariants & gotchas
 
-The previous revision of this subsystem issued one `Command::JsonGet` per key, sequentially
-awaited, one round trip at a time for remote shards — the same gap `MGET`/`MSET` originally had.
-**That is no longer the implementation.** `Command::JsonMget` now dispatches to a dedicated router
-method:
+1. **Not in the main keyspace.** Core commands ignore JSON documents; one JSON namespace per shard
+   is shared by all logical databases; `FLUSHDB` clears it only from database 0.
+2. **Silent destructive auto-vivification.** `JSON.SET` replaces any wrong-typed parent (or a
+   wrong-typed container at the last step) with `{}`/`[]` without an error (§4.4).
+3. **Partial writes on error are not logged.** A mutator that fails part-way leaves earlier matches
+   modified (e.g. `NUMINCRBY` over `[1,"x"]` increments `1`, then errors), and `set_json_path` can
+   create intermediate containers before hitting `ERR index out of bounds`. Because the arm sees an
+   `Err`, it calls neither `record_change!` nor the search hooks — the in-memory document then
+   differs from what the AOF, replicas and search indexes know.
+4. **First-match vs all-match.** Getters and `ARRPOP` use the first match; mutators use all
+   matches (§5).
+5. **`JSON.GET` shape depends on path text** (`*` or `:` forces an array), §5.2.
+6. **Unsupported syntax fails quietly.** `$..x` acts as `$.x`; filters match nothing; the parser
+   never errors.
+7. **Numbers are f64.** Precision loss above 2^53; results stored as floats (§5.3).
+8. **`STRAPPEND` appends raw text**, not a decoded JSON string; `STRLEN` counts bytes.
+9. **Two traversal copies.** `query_json_path` and `query_json_path_mut` must be changed together.
+10. **`MAX_SET_INDEX_GAP`** caps array padding at 65,536 nulls per `JSON.SET` index.
 
-```rust
-// src/connection.rs:7507-7517
-Command::JsonMget { keys, path } => {
-    let results = router.json_mget(keys, &path).await;
-    ...
-}
-```
+## 10. Limitations / not implemented
 
-`Router::json_mget` (`src/router.rs:1543-1616`):
-1. Single-shard fast path (`num_shards <= 1`, 1550-1557): straight local loop, no fan-out needed.
-2. Otherwise, partitions every key by `self.target_shard(&key)` into `local_keys` and one
-   `Vec<(idx, Bytes)>` per remote shard (`remote_batches`, 1559-1572), preserving each key's
-   original result-index.
-3. Local keys are resolved immediately in-place (1577-1582).
-4. One `ShardMessage::JsonMget { keys, path, responder }` is sent **per remote shard that has at
-   least one key** (not per key) over a `flume::bounded(1)` responder channel (1589-1604) —
-   this is the batched cross-shard IPC message, defined at `src/shard.rs:402-406`:
-   `JsonMget { keys: Vec<(usize, Bytes)>, path: String, responder: flume::Sender<Vec<(usize, Option<String>)>> }`.
-5. All remote responders are awaited concurrently (`for rx in responders { rx.recv_async().await }`,
-   1606-1613) — one round trip per *shard*, run in parallel, not one round trip per *key*.
-
-The actual remote-shard-side handler lives in the cross-shard mailbox receive loop,
-`src/server.rs:1470-1479`: for each `(idx, key)` in the batch it calls
-`db.json_store.json_get(&key, &[path_ref])` and sends back `Vec<(idx, Option<String>)>`, which
-`json_mget` scatters back into the correctly-ordered `results` vector by `idx`. (A second,
-near-identical handler exists at `src/router.rs:4188-4204` inside a `#[cfg(test)]`-style
-in-process test harness spawned with a dummy `ShardDb::new(9996)` — same logic, test-only.)
-
----
-
-## 8. Persistence & Replication — precise status (re-verified against current source)
-
-### 8.1 RDB save/restore: JSON documents **do** survive, via extended type tag `7`
-
-`ShardDb::save_rdb_chunk` (`src/shard.rs:2274-2318`) serializes the normal `RudisTable` entries
-first, then **unconditionally** calls `self.save_extended_rdb_chunk(buf)` at line 2317 — there is
-no feature flag or config gate skipping it. `save_extended_rdb_chunk` (2320-2394+) writes JSON
-documents as its *first* extended-record category:
-
-```rust
-// src/shard.rs:2321-2329
-for (key, val) in self.json_store.iter() {
-    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-    buf.extend_from_slice(key);
-    buf.push(7u8);                                            // extended-record type tag
-    let json_str = val.to_string();
-    buf.extend_from_slice(&(json_str.len() as u32).to_le_bytes());
-    buf.extend_from_slice(json_str.as_bytes());
-}
-```
-
-Wire format per record: `u32 LE key_len | key_bytes | 0x07 | u32 LE json_len | json_utf8_bytes`.
-(Bloom filters use tag `8`, vector-index nodes use tag `9|0x80`, etc. — JSON is simply the first
-of several extended record kinds appended after the ordinary table.)
-
-**Two independent restore paths both handle tag 7 identically:**
-- File-based load, `src/table.rs::load_rdb`/`load_rdb_bytes` (14566-14600): reads `type_byte == 7`,
-  UTF-8-decodes and `serde_json::from_str`s the payload, checks
-  `crate::router::target_shard(&key, num_shards) == shard_id` (so each shard only claims the keys
-  it owns on a multi-shard reload), then `db.json_store.insert_raw(key.clone(), val)`.
-- In-memory chunk restore, `src/shard.rs::ShardDb::restore_rdb_chunk` (2659+, tag-7 branch at
-  2705-2722): same decode, same `insert_raw`, no shard-ownership filter (caller already knows
-  which shard's chunk it is).
-
-**Where each path is wired in:**
-- `Router::generate_full_rdb` (`src/router.rs:3099-3120+`) calls `save_rdb_chunk` on the local
-  shard and fans a `ShardMessage::SaveRdbChunk` out to every other shard, concatenating all chunks
-  behind a `"REDIS0011"` header — this is what `SAVE`/`BGSAVE` writes to disk, and what
-  `table.rs::load_rdb`/`load_rdb_bytes` reads back on process startup. **JSON documents fully
-  survive a `SAVE`/`BGSAVE` + restart cycle.**
-- The per-shard replication full-sync handler in `src/connection.rs` (~2700-2723, the DFLY-FLOW-
-  style stream setup that registers a shard flow and fetches `save_rdb_chunk`) sends this same
-  chunk — including JSON — to a newly-attaching replica as its initial snapshot, consumed via
-  `restore_rdb_chunk`. **A replica's initial full resync also receives all JSON documents that
-  existed at snapshot time.**
-- This was added by commit `63437cb` ("feat(rdb): add snapshot persistence and restore for JSON,
-  probabilistic, and vector data types") — confirming the fix is real and recent, not speculative.
-
-This **reverses** an earlier finding (carried in a prior revision of this document) that JSON had
-"no relationship" to RDB and did not survive a restart. That claim is now false; verify-before-
-trusting it was the entire point of this pass, and the current code unambiguously persists JSON
-through both on-disk RDB and in-memory full-resync snapshot paths.
-
-### 8.2 AOF append / incremental replication: still zero coverage — confirmed precisely
-
-Despite every mutating `Json*` arm calling `record_change!(cmd)` (§6.3), which *does* attempt an
-AOF append and replica propagation, the actual encoding step fails silently for JSON:
-`crate::aof::command_to_resp` (`src/aof.rs:166-1936`) is one large `match cmd { ... }` with a
-dedicated arm per `Command` variant family (`Set`, `Incrbyfloat`, `Vsetattr`, geo, stream, CRDT,
-etc.) ending in a catch-all `_ => None` at line 1936. **Grepping the full body of this match for
-`Json` finds zero arms.** Every `Command::Json*` value — mutating or not — falls through to
-`_ => None`.
-
-Consequence, traced through `record_change!`: `command_to_resp($cmd_expr)` returns `None` →
-the `if let Some(bytes) = ...` body never executes → `aof_w.borrow_mut().append(&bytes)` never
-runs and `crate::replication::propagate_shard_bytes(...)` never runs. So:
-- `JSON.SET`/`DEL`/`NUMINCRBY`/`NUMMULTBY`/`STRAPPEND`/`ARRAPPEND`/`ARRPOP`/`TOGGLE`/`CLEAR` are
-  **never written to the AOF file** — an `appendonly yes` server that crashes and replays its AOF
-  will **not** recover any JSON mutation (only the RDB-snapshot state the AOF was based on).
-- They are **never incrementally propagated to connected replicas** — a replica only has the JSON
-  state captured at its last full resync (§8.1); every JSON write issued on the primary after that
-  moment silently never reaches it. (The same connected-replicas check and `DIRTY_CHANGES` counter
-  do still get updated — monitoring/`WATCH` semantics for JSON keys are otherwise normal; it is
-  specifically the wire-encoding step that is missing.)
-
-**Net persistence picture**: JSON documents are durable across `SAVE`/`BGSAVE`/restart and across
-a replica's *initial* full sync, but are **not** covered by continuous AOF durability or
-continuous replica propagation — a gap that sits between "fully persistent" and "ephemeral,"
-and is easy to miss because the RDB snapshot behavior alone looks like full persistence.
+- **Experimental**: off unless `enable-experimental-commands yes`.
+- **Missing commands**: `JSON.ARRINSERT`, `JSON.ARRINDEX`, `JSON.ARRTRIM`, `JSON.MERGE`,
+  `JSON.MSET`, `JSON.DEBUG`, `JSON.RESP` — none are parsed; they return unknown-command errors.
+  (`JSON.STRAPPEND` exists but without RedisJSON's JSON-string decoding of its argument.)
+- **JSONPath subset**: no recursive descent, no filters, no union (`[0,2]`), no slice step
+  (`[::2]`), no escapes inside bracket names.
+- **No legacy-path reply mode**: RedisJSON returns different shapes for `.a` vs `$.a` paths; here
+  both behave the same, with the §5.2 heuristic.
+- **`JSON.GET` formatting options** (`INDENT`, `NEWLINE`, `SPACE`) are not parsed — they would be
+  treated as paths.
+- **No TTL, no memory accounting per document, no `OBJECT`/`TYPE`/`DEL` integration.**
+- **Test coverage**: unit tests in `src/json.rs` (`test_json_crud_and_jsonpath`,
+  `test_json_wildcards_and_slices`, `test_json_nummultby_multi_match`,
+  `test_set_json_path_bounds_array_index`), the AOF round-trip test in `src/aof.rs`, a digest test
+  in `src/digest.rs`, and an RDB round-trip in `src/shard.rs` tests. Command parsing is exercised by
+  the `parse_command` fuzz target; there is no dedicated JSONPath fuzzer.
 
 ---
 
-## 9. RediSearch auto-indexing hook
+## 11. Code map
 
-`JSON.SET` (on any successful write, any path — not limited to root `$`) and `JSON.DEL` (on any
-successful deletion) call both `db.index_json_document_local(&k_str, &doc)` (shard-local
-`search_indices`, `src/shard.rs:773-792`) and `crate::search::index_json_document_hook(&k_str, &doc)`
-(global `SEARCH_INDICES` registry, `src/search.rs:1240-1260`). Both walk every registered index
-whose `schema.on_type` is `"JSON"` (case-insensitively), skip it if the key doesn't match any of
-the index's declared key prefixes, then call `extract_json_fields(schema, root)` and
-`idx.add_document(key, extracted_fields, extracted_vectors)`. `JSON.DEL` additionally calls
-`db.delete_document_local`/`crate::search::delete_document_hook` when the delete removed the
-*entire* document (key no longer present in `json_store` after the call) rather than a subtree.
-The six incremental mutators (`NUMINCRBY`/`NUMMULTBY`/`STRAPPEND`/`ARRAPPEND`/`ARRPOP`/`TOGGLE`/
-`CLEAR`) only call the global hook, not the shard-local one — see §5 for why. Field-extraction
-details (flattening rules, vector-field handling) are Component 09's territory
-(`docs/internal/09_redisearch.md`); this section only documents which JSON write paths trigger it.
-
----
-
-## 10. Known bugs, gaps, and gotchas (verified against current `src/json.rs`/`connection.rs`/`aof.rs`)
-
-1. **No recursive descent, despite the misleading in-code comment** (§3.2) — `$..field` silently
-   degrades to `$.field` (single-level lookup), it does not search every nesting depth. No filter
-   expressions (`?(@.price < N)`) either — unsupported syntax matches nothing, never errors.
-2. **Auto-vivification silently destroys wrong-typed intermediates** on `JSON.SET` (§3.4) — no
-   type-check error, the existing value at a parent segment is overwritten with an empty
-   container if it isn't already the right container type.
-3. **Read-only introspection commands only look at the first JSONPath match** (`TYPE`, `STRLEN`,
-   `ARRLEN`, `OBJKEYS`, `OBJLEN`) while the numeric/string/array/bool mutators act on *every*
-   match — a wildcard path behaves inconsistently depending on which command you issue against it.
-   `JSON.ARRPOP` is a mutator that nonetheless only touches the first match.
-4. **Partial mutation on type-mismatch mid-loop**: `NUMINCRBY`/`NUMMULTBY`/`STRAPPEND`/
-   `ARRAPPEND`/`TOGGLE` error out on hitting a wrong-typed node, but matches processed earlier in
-   the same call have already been mutated in place — there's no pre-validation pass or rollback.
-5. **`JSON.GET`'s raw-vs-array-wrapped response depends on the literal path string** containing
-   `*`/`:`, not purely on match count (§4.3) — `$.items[*]` with one match still returns `[value]`,
-   not `value`.
-6. **AOF/replication propagation is completely absent for every `Json*` command** (§8.2) — this is
-   independent of (and worse than) the RDB-snapshot persistence story in §8.1; both facts need to
-   be understood together to get an accurate picture of JSON durability.
-7. **`JSON.TOGGLE`'s path argument is mandatory** (no default-to-root), diverging from the
-   optional-path pattern every other read-modify command in this file uses.
-8. **`JSON.ARRINSERT`, `JSON.ARRTRIM`, `JSON.MERGE`, `JSON.DEBUG`, `JSON.RESP` do not exist** in
-   any form — not in the `Command` enum, not parsed, not implemented. Sending them is an unknown-
-   command error, with no partial/stub behavior to be aware of.
-9. **Two near-duplicate traversal implementations** (`query_json_path`/`query_json_path_mut`,
-   §3.3) that must be kept manually in sync on any future JSONPath semantic change.
-10. **Full-document clone on every successful `JSON.SET`/`JSON.DEL`** (§5), solely to satisfy the
-    borrow checker around the shard-local search-index update — the six incremental mutators avoid
-    this cost since they skip the shard-local index.
-
----
-
-## How to Verify Changes
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --lib -- --test-threads=1      # includes src/json.rs's 3 in-module tests
-```
-
-Relevant existing tests: `src/json.rs::tests::test_json_crud_and_jsonpath` (888-954),
-`test_json_wildcards_and_slices` (957-974), `test_json_nummultby_multi_match` (977-990 — the
-regression test proving §4.2's fix). JSONPath parsing also has fuzz coverage added by commit
-`f9b879c` ("add adversarial fuzz testing for RESP, JSONPath, and search query parsers").
+| File | Key symbols | What they do |
+| :--- | :--- | :--- |
+| `src/json.rs` | `PathSegment`, `parse_json_path` | Path grammar and parser. |
+| `src/json.rs` | `query_json_path`, `query_json_path_mut` | Breadth-first evaluation, shared and mutable. |
+| `src/json.rs` | `set_json_path`, `set_index`, `MAX_SET_INDEX_GAP` | Single-location write with auto-vivification and bounded padding. |
+| `src/json.rs` | `delete_json_path` | Field/index removal, wildcard clears container. |
+| `src/json.rs` | `JsonStore` and `json_*` methods | Per-shard document map and one method per command. |
+| `src/resp.rs` | `Command::Json*`, `build_command` `"JSON.*"` arms | Argument parsing into commands. |
+| `src/resp.rs` | `EXPERIMENTAL_PREFIXES`, `is_experimental_command_name`, `experimental_commands_enabled` | Experimental-command gate. |
+| `src/resp.rs` | `Command::is_family_read` | Marks the read-only JSON commands. |
+| `src/config.rs` | `enable_experimental_commands` | `enable-experimental-commands` setting. |
+| `src/connection.rs` | `cmd_primary_key`, `target_shard_of_cmd`, `for_each_cmd_key`, `get_cmd_name` | Key extraction, routing, invalidation, stats name. |
+| `src/connection.rs` | `execute_command_inner` (`JsonMget` arm), `execute_local_command` (JSON arms) | Dispatch and RESP reply encoding. |
+| `src/connection.rs` | `record_change!`, `log_change`, `aof_image_before_command` | Invalidation, AOF append, replica stream, rewrite hook. |
+| `src/router.rs` | `Router::json_mget` | Bucketed, concurrent multi-shard `JSON.MGET`. |
+| `src/shard.rs` | `ShardDb.json_store`, `ShardMessage::JsonMget` | Store field and cross-shard message. |
+| `src/server.rs` | cross-shard mailbox loop (`ShardMessage::JsonMget` arm) | Remote side of `JSON.MGET`. |
+| `src/shard.rs` | `save_extended_rdb_chunk`, `ext_item_keys`, `save_ext_item`, `ExtKind::Json`, `AofImage` | RDB / AOF-image save of documents (tag 7). |
+| `src/shard.rs` | `restore_rdb_chunk`, `flushdb`, `flushall`, `keyspace_stats_by_db` | Chunk restore, clearing, stats. |
+| `src/table.rs` | `load_legacy_ext`, `load_legacy_records` | Load tag-7 records with shard-ownership filter. |
+| `src/redis_rdb.rs` | `EXT_AUX_KEY`, `write_ext_aux`, `load_chunk` | `rudis-ext` AUX wrapper. |
+| `src/aof.rs` | `command_to_resp` JSON arms, `write_canonical_aof` | Per-command AOF/replication encoding; canonical rewrite as `JSON.SET`. |
+| `src/shard.rs` / `src/search.rs` | `index_json_document_local`, `delete_document_local`, `init_search_index` / `index_json_document_hook`, `delete_document_hook`, `extract_json_fields` | RediSearch indexing of JSON documents. |
+| `src/digest.rs` | `json_digest`, `TYPE_JSON`, `for_each_ext_key`, `ext_value_digest` | `DEBUG DIGEST` coverage. |

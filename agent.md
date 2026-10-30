@@ -38,7 +38,7 @@ This document defines the mandatory operating guidelines, architectural invarian
 4. **Zero-Allocation Steady State (Hot Paths) — Goal, With Known Exceptions**:
    - **Zero-Copy Parsing**: Payloads must be parsed as zero-copy buffer slices (`Bytes::split_to(len).freeze()`).
    - **Reusable Channels on the Fast Path**: The hottest cross-shard call sites (`GET`, `SET`, batched `MGET`/`MSET`, and similar) reuse pooled, pre-allocated reply descriptors (`FastGetDescriptor`, `FastSetDescriptor`, `BatchResponder`, `ScatterMgetDescriptor`, `ScatterMsetDescriptor` in `src/mailbox.rs`) instead of allocating a channel per call. **New hot-path code must follow this pattern, not allocate `flume::bounded(1)` per call.**
-   - Be aware this is a **standard to converge on, not yet a universally-enforced invariant**: many other `ShardMessage` variants outside the hottest call sites still allocate a fresh `flume::bounded(1)` request/reply channel per remote call today (see `docs/internal/04_sharding_mesh.md` §3 for the current inventory). Do not assume every cross-shard command already uses a pooled descriptor — check the specific message variant before relying on that assumption, and prefer migrating a variant to a pooled descriptor over adding new one-shot-channel call sites.
+   - Be aware this is a **standard to converge on, not yet a universally-enforced invariant**: many other `ShardMessage` variants outside the hottest call sites still allocate a fresh `flume::bounded(1)` request/reply channel per remote call today (see `docs/internal/04_sharding_mesh.md` §6, "Reply mechanisms" — especially §6.5 — for the current inventory). Do not assume every cross-shard command already uses a pooled descriptor — check the specific message variant before relying on that assumption, and prefer migrating a variant to a pooled descriptor over adding new one-shot-channel call sites.
 
 ---
 
@@ -167,6 +167,6 @@ All official benchmark numbers must be committed under `docs/benchmarks/`:
 | **Entrypoint** | `src/main.rs` | CLI arguments, core affinity mapping, cross-shard channel instantiation. | [01_reactor_runtime](docs/design/01_reactor_runtime.md) |
 | **Tests** | `tests/` | Multi-threaded end-to-end tests (`e2e_<area>.rs`, one binary per subsystem, helpers in `common/`) and channel waker verification (`test_cross_thread.rs`). | — |
 
-All 19 components are documented in [`docs/design/components.md`](docs/design/components.md) (high-level design and rationale) and [`docs/internal/components.md`](docs/internal/components.md) (concrete implementation and code references),
+All 21 components are documented in [`docs/design/components.md`](docs/design/components.md) (high-level design and rationale) and [`docs/internal/components.md`](docs/internal/components.md) (concrete implementation and code references),
 written as learning guides against the *actual* shipped code — not just what it does, but why
 it's built that way, with known limitations and gaps called out explicitly rather than left implicit.

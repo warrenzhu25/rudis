@@ -1,706 +1,576 @@
-# Component 03: RESP Protocol Engine & Command Parser (Implementation Deep-Dive & Code Reference)
+# Component 03: RESP Protocol Engine & Command Parser — Implementation Reference
 
-> **Source Files**: `src/resp.rs` (14,357 lines)
 > **High-Level Design Spec**: [`docs/design/03_resp_engine.md`](../design/03_resp_engine.md)
 > **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
->
-> This document was rewritten from a full pass over the current `src/resp.rs` (not carried
-> forward from a prior version). Every line number, count, and code excerpt below was verified
-> against the file as it exists today. The file has roughly **doubled** since the previous
-> revision of this document (was 9,155 lines / 108 `Command` variants / ~6,470-line
-> `build_command`; is now 14,357 lines / **369** `Command` variants / **~10,719-line**
-> `build_command`).
+> **Main source file**: `src/resp.rs` (framing, the `Command` enum, `build_command`, numeric
+> helpers, write-classification helpers). Reply encoding lives in `src/connection.rs`
+> (`write_resp_*`), with Pub/Sub push frames in `src/pubsub.rs`. Fuzz target:
+> `fuzz/fuzz_targets/parse_command.rs`.
 
 ---
 
-## 1. Source Module Map & Responsibilities
+## 1. What this subsystem does
 
-`src/resp.rs` contains no reply-encoding code; it is entry parsing and command construction
-only. Reply serialization (RESP2/RESP3) is implemented in `src/connection.rs`
-(`write_resp_*` free functions) and, for Pub/Sub push frames specifically, in `src/pubsub.rs`.
+Every byte a client sends to Rudis passes through this module before anything else happens.
+Its job is to turn a raw, possibly incomplete stream of bytes into a typed Rust value — one
+`Command` enum variant per request — that the rest of the server (routing, sharding, storage,
+replication, AOF) can match on without ever re-reading strings.
 
-| Region (lines) | Responsibility | Key Functions / Types |
+Who uses it:
+
+- **Client connections** (`src/connection.rs`): the main request loop, the Pub/Sub-mode loop and
+  the master-side replica-ACK reader.
+- **Replication and persistence**: a replica decoding its master's stream
+  (`src/replication.rs`), AOF replay and AOF-rewrite splitting (`src/aof.rs`), and legacy
+  search-index records in snapshots (`src/table.rs`).
+- **The AF_XDP kernel-bypass path** (`src/server.rs`): payloads pulled out of raw packets.
+
+It understands three wire grammars on the same port:
+
+1. **RESP arrays** (REdis Serialization Protocol): `*<N>\r\n` followed by `N` bulk strings
+   `$<len>\r\n<bytes>\r\n`. This is what every real Redis client library sends.
+2. **Memcached text storage commands**: `set|add|replace <key> <flags> <exptime> <bytes>
+   [noreply]\r\n<data>\r\n`.
+3. **Inline commands**: one space-separated text line such as `GET foo\r\n`, the form typed into
+   `telnet`/`nc`, with `redis-cli`-style quoting.
+
+The module only **parses**. It never writes reply bytes and never looks at whether a client
+negotiated RESP2 or RESP3 — that only affects reply encoding, which happens in
+`src/connection.rs`.
+
+## 2. Mental model
+
+Think of it as a two-stage pipeline: a **framer** that finds one complete request in the buffer
+and slices out its arguments, and a **constructor** (`build_command`) that maps the
+upper-cased command name plus arguments to a `Command` variant, validating arity and options on
+the way. The very hottest command shapes skip the constructor entirely.
+
+```mermaid
+flowchart TD
+    A["Connection read buffer (BytesMut)"] --> B["parse_command (loop)"]
+    B -->|"buffer empty"| N["Ok(None): wait for more bytes"]
+    B -->|"first byte is '*'"| C["parse_resp_array"]
+    B -->|"otherwise"| D["parse_memcached_storage_command"]
+    D -->|"not a memcached storage line"| E["parse_inline_command"]
+    D -->|"header ok, data incomplete"| N
+    D -->|"complete"| M["Command::MemcachedSet / Add / Replace"]
+    C -->|"pass 1: frame incomplete"| N
+    C -->|"pass 1: malformed"| X["Err('Protocol error: ...')"]
+    C -->|"*0 or *-1"| S["skipped: loop again"]
+    E -->|"blank line"| S
+    S --> B
+    C -->|"16 args or fewer"| F{"Fast-path shape?"}
+    F -->|"yes"| G["Command built directly from frame slices"]
+    F -->|"no"| H["build_command(args)"]
+    C -->|"more than 16 args"| H
+    E --> H
+    H -->|"experimental prefix and gate off"| U["Command::Unknown"]
+    H --> K["Command variant, or Err(message)"]
+```
+
+The returned value is always `Result<Option<Command>, String>`:
+
+| Result | Meaning | Caller's reaction |
 | :--- | :--- | :--- |
-| 1–349 | Shared subcommand/option enums used by `Command` variants, plus two small helper structs and two free functions | 27 enums (`ClusterSubcommand`, `DflyClusterSubcommand`, `DflyMigrateSubcommand`, `SetCondition`, `MsetexCondition`, `MsetexExpiry`, `IncrexIncrement/Bound/Expire`, `MemorySubcommand`, `TierSubcommand`, `ClientSubcommand`, `ClientReplyMode`, `LatencySubcommand`, `AclSubcommand`, `ObjectSubcommand`, `XinfoSubcommand`, `HexpireCondition`, `HFieldExpireOpt`, `HsetexCondition`, `VsimTarget`, `BitfieldOpType/Overflow`, `LmovemMode/Ordering`, `XnackMode`, `SetSlotSubcommand`), `ExpireOptions`/`BitfieldSubOp` structs, `parse_expire_options`, `parse_integer` |
-| 350–1784 | The command surface itself | `pub enum Command` — **369 variants**, ~1,435 lines |
-| 1786–1896 | Memcached storage-command header/body parser | `fn parse_memcached_storage_command` |
-| 1897–1913 | Top-level entry point / grammar dispatch | `pub fn parse_command` |
-| 1914–1928 | Allocation-free decimal decoder | `pub fn parse_decimal_bytes` |
-| 1929–1958 | Allocation-free ASCII-uppercase folding + the `proto-max-bulk-len` global | `pub fn bytes_to_uppercase_ascii`, `PROTO_MAX_BULK_LEN`, `get_/set_proto_max_bulk_len` |
-| 1959–2263 | RESP array parser (two-pass scan + ≤16-arg fast path) | `fn parse_resp_array` |
-| 2264–2284 | Inline (space-separated) command parser | `fn parse_inline_command` |
-| 2286–2314 | `LMOVEM`'s trailing-option parser | `fn parse_lmovem_trailer` |
-| 2316–13034 | The command constructor / dispatch table | `pub fn build_command` — **346 top-level match arms**, ~10,719 lines |
-| 13035–13075 | Redis-compatible float parsing (libc `strtod` fallback) | `pub fn parse_redis_f64` |
-| 13076–13094 | `ZRANGEBYSCORE`-style `(exclusive` bound parsing | `pub fn parse_score_bound` |
-| 13096–13108 | CRLF header scanning | `fn find_crlf`, `fn find_crlf_at` |
-| 13110–14357 | Unit tests (15 `#[test]` functions) | `mod tests` |
+| `Ok(Some(cmd))` | One complete command was consumed from the buffer | Execute it, call again |
+| `Ok(None)` | The buffer holds only a partial request (or nothing) | Read more bytes |
+| `Err(msg)` starting with `Protocol error:` | The byte stream itself is broken; nothing was consumed | Send the error, close the connection |
+| `Err(msg)` otherwise | The frame was consumed but the command is invalid (arity, syntax, range) | Send `-ERR ...`, keep going |
 
----
+## 3. Data structures
 
-## 2. What Changed Since the File Roughly Doubled
+### 3.1 `enum Command`
 
-A `git log`-independent read of the current source shows these are now present and were **not**
-described (or were described differently) in earlier passes over this file:
-
-1. **A real `proto-max-bulk-len` enforcement** (`src/resp.rs:1947–1957`) — the single biggest gap
-   flagged by the previous revision of this document is now closed. See §4.3 step 2 and §7.
-2. **Hash field TTLs**: `HEXPIRE`/`HPEXPIRE`/`HEXPIREAT`/`HPEXPIREAT`, `HTTL`/`HPTTL`/
-   `HEXPIRETIME`/`HPEXPIRETIME`, `HPERSIST`, `HGETEX`, `HSETEX` — Redis 7.4/8-style per-field
-   expiry on hashes (§3.3).
-3. **Stream consumer-group claim commands**: `XCLAIM`, `XAUTOCLAIM` plus newer Redis 8
-   reference-counted deletion commands `XDELEX`, `XACKDEL`, and a Rudis-specific
-   `XIDMPRECORD` (§3.3).
-4. **Redis 8 Vector Sets** (`VADD`/`VSIM`/`VEMB`/`VLINKS`/`VGETATTR`/`VSETATTR`/... — 14 `V*`
-   variants) layered on top of the pre-existing Rudis-native vector command grammar, sharing a
-   single `Command::Vadd` variant with two entirely different argument grammars distinguished by
-   content-sniffing, not by command name (§3.5, a real gotcha).
-5. **A full AI-native command surface actually lives in `resp.rs`**: semantic cache
-   (`SEMANTIC.*`, 5 variants), agent memory (`AGENT.MEM.*`, 5), LLM quota governance
-   (`LLM.QUOTA.*`, 3), agent checkpointing (`AGENT.CHECKPOINT.*` / `AGENT.TOOL.*`, 5), and MCP
-   (`MCP.TOOLS`/`MCP.CALL`/`MCP.RPC`, 3) — 21 variants total, parsed here and executed by
-   `src/agent.rs`/`src/semcache.rs`/`src/mcp.rs` (see subsystem 20).
-6. **CRDT multi-region commands** (`CRDT.SET`/`GET`/`DEL`/`INCRBY`/`SADD`/`SMEMBERS`/`SREM`/
-   `MERGE`/`GC`/`DUMP` — 10 variants).
-7. **Redis 7 Functions** (`FUNCTION LOAD`/`FCALL`/`LIST`/`DELETE`/`FLUSH`, plus `FUNCTION STATS`/
-   `KILL` that live in the "unsectioned" prelude of the enum).
-8. **RedisJSON** (`JSON.*`, 16 variants), **Geospatial** (`GEOADD`/`GEODIST`/.../
-   `GEOSEARCHSTORE`, 8 variants), **Probabilistic** (`BF.*`/`CF.*`/`CMS.*`/`TOPK.*`, 22
-   variants), **Full-text search** (`FT.*`, 10 variants — `FT.HYBRID` is parsed but is *not* its
-   own `Command` variant, see §3.6), **AF_XDP control** (`XDP.*`, 8 variants), and **Dragonfly
-   native extensions** (`DFLYCLUSTER`/`DFLYMIGRATE`/`DFLY FLOW`/`STICK`/`UNSTICK`/`STICKY`/
-   `DELEX`, 7 variants).
-9. **The ≤16-arg fast path grew from 17 to 20 fast-pathed command names** — `UNLINK`,
-   `READONLY`, `READWRITE` were added alongside the original 17 (§4.3 step 3).
-10. **The error-reply prefix whitelist in `connection.rs`'s `write_resp_err`** grew from 7 to 9
-    recognized prefixes (`NOGROUP`, `INVALIDOBJ` added; see §6).
-11. **`Command::Unlink` is dead from the parser's perspective** — `build_command` normalizes a
-    client-sent `UNLINK` to `Command::Del`, exactly like `DEL`. `Command::Unlink` is only ever
-    constructed internally, by `src/table.rs`'s lazy-expiry path, to give a distinct AOF/
-    replication command name when `lazyfree-lazy-expire` is active (§3.4, a real gotcha).
-
----
-
-## 3. Command Surface & Data Structures
-
-### 3.1 What `parse_command` actually recognizes
-
-```text
-First byte        Grammar                                   Handler
-──────────────────────────────────────────────────────────────────────────────
-'*'               RESP array: *N\r\n($len\r\ndata\r\n){N}    parse_resp_array
-otherwise         Try Memcached "set/add/replace key         parse_memcached_storage_command
-                  flags exptime bytes [noreply]\r\n<data>\r\n"
-otherwise         Space/tab-separated inline text             parse_inline_command
-```
-
-There is no separate frame type for simple strings (`+`), errors (`-`), or integers (`:`) on the
-*input* side — those are reply-only prefixes written by `connection.rs`, never parsed here,
-because a client never sends a command framed that way. None of the RESP3 input types (`%` map,
-`~` set, `,` double, `#` boolean, `_` null, `>` push) are recognized on input either;
-`resp.rs` never inspects the negotiated protocol version while parsing — protocol-version state
-(`CURRENT_CLIENT_RESP3`) lives entirely in `connection.rs` and only affects how replies are
-*written*, never how commands are *parsed*.
-
-### 3.2 `enum Command`: 369 variants, grouped by the file's own section comments
-
-`enum Command` spans `src/resp.rs:350`–`1784` (1,435 lines). It derives:
-
-```rust
-#[derive(Debug, PartialEq, Clone)]
-pub enum Command { /* 369 variants */ }
-```
-
-Not `Eq` — several variants (`Zadd`, `Zincrby`, score-range queries, vector-distance fields,
-etc.) carry `f64` fields, and `f64` has no total order (`NaN != NaN`), so `Eq` can't be derived.
-
-The enum has **30** `// SECTION NAME` comment markers inside its body (`grep -n "^    // [A-Z]"
-src/resp.rs`, restricted to the 350–1784 range). The first 55 variants (lines 350–526) sit
-*before* the first section comment — an unlabeled prelude covering `OBJECT`/`XINFO`/`LATENCY`
-subcommand wrappers, the new hash-field-expiry family, `XCLAIM`/`XAUTOCLAIM`, `AUTH`, `GET`,
-`SET`, `MSETEX`, `LCS`, `DEL`/`UNLINK`/`EXISTS`, `EXPIRE`, `COPY`, `CLUSTER`/`CLIENT` wrappers,
-`WAIT`/`WAITAOF`, `MIGRATE`, and the base `HSET`/`HGET`/... hash commands. Exact counts per
-section (verified by counting variant-start lines against each section boundary):
-
-| Variants | Section | Variants | Section |
-| -: | :--- | -: | :--- |
-| 55 | *(unsectioned prelude — see above)* | 5 | AI SEMANTIC CACHE COMMANDS |
-| 11 | LIST COMMANDS | 5 | AI AGENT MEMORY COMMANDS |
-| 15 | SET COMMANDS | 3 | LLM QUOTA GOVERNOR COMMANDS |
-| 23 | ZSET COMMANDS | 5 | AGENT CHECKPOINT & IDEMPOTENT TOOL EXECUTION |
-| 9 | GENERIC & DATABASE COMMANDS | 3 | MODEL CONTEXT PROTOCOL (MCP) COMMANDS |
-| 18 | EXTENDED STRING COMMANDS | 10 | CRDT MULTI-REGION COMMANDS |
-| 5 | LUA SCRIPTING COMMANDS | 5 | REDIS 7 FUNCTIONS |
-| 1 | TIERED STORAGE COMMANDS | 16 | REDISJSON COMMANDS |
-| 4 | CONFIG COMMANDS | 8 | GEOSPATIAL COMMANDS |
-| 13 | PUBSUB COMMANDS | 22 | PROBABILISTIC COMMANDS |
-| 4 | KEYSPACE INSPECTION | 10 | Full-Text Search (FT.*) |
-| 5 | TRANSACTIONS | 8 | AF_XDP & eBPF (XDP.*) |
-| 7 | BITMAP COMMANDS | 7 | Dragonfly native extensions |
-| 8 | HYPERLOGLOG COMMANDS | 12 | Memcached Protocol |
-| 2 | RDB SERIALIZATION | | |
-| 22 | STREAM COMMANDS | | |
-| 34 | VALKEY EXTENDED COMMANDS | | |
-| 14 | VECTOR COMMANDS | | |
-
-**369 total**, cross-checked two independent ways (a brace-depth walk of the enum body, and a
-plain `^    [A-Z]` prefix scan) — both agree exactly.
-
-A representative slice (field shapes are real, taken verbatim):
+`Command` is the single currency of the server: roughly 380 variants, one per command or command
+family. It derives `Debug, PartialEq, Clone` — not `Eq`, because several variants carry `f64`
+scores or `f32` vectors.
 
 ```rust
 pub enum Command {
-    Object(ObjectSubcommand),
-    Xinfo(XinfoSubcommand),
-    Latency(LatencySubcommand),
-    ...
-    Hexpire { key: Bytes, expire_ms: i64, is_at: bool, condition: HexpireCondition, fields: Vec<Bytes> },
-    Httl { key: Bytes, is_ms: bool, is_expiretime: bool, fields: Vec<Bytes> },
-    Hpersist { key: Bytes, fields: Vec<Bytes> },
-    Hgetex { key: Bytes, expire: HFieldExpireOpt, fields: Vec<Bytes> },
-    Hsetex { key: Bytes, condition: HsetexCondition, expire: HFieldExpireOpt, pairs: Vec<(Bytes, Bytes)> },
-    Xclaim { key: Bytes, group: Bytes, consumer: Bytes, min_idle_time: u64, ids: Vec<Bytes>,
-             idle: Option<u64>, time: Option<u64>, retrycount: Option<usize>, force: bool, justid: bool },
-    ...
-    Del(SmallVec<[Bytes; 1]>),       // inline-capacity 1: the common single-key case never allocates
-    Unlink(SmallVec<[Bytes; 1]>),    // see §3.4 — never built by the parser itself
-    Exists(SmallVec<[Bytes; 1]>),
-    ...
+    Get(Bytes),
+    Set { key: Bytes, value: Bytes, expire_in: Option<Duration>,
+          condition: SetCondition, get: bool, keepttl: bool, past_expired: bool },
+    Del(SmallVec<[Bytes; 1]>),        // inline capacity 1: single-key DEL never allocates
+    Unlink(SmallVec<[Bytes; 1]>),
+    IncrBy(Bytes, i64, IncrName),     // INCR/DECR/INCRBY/DECRBY as a signed delta
+    Hset { key: Bytes, fields: SmallVec<[(Bytes, Bytes); 1]> },
+    Hello { proto: Option<i64>, auth: Option<(String, String)>, setname: Option<String> },
+    FtSearch { index: String, query: String, options: Box<crate::search::SearchOptions> },
+    McpRpc(Bytes),
+    Debug(Vec<Bytes>),                // raw-args variant: executor parses the rest
     MemcachedSet { key: Bytes, flags: u32, exptime: u32, bytes: usize, noreply: bool, data: Bytes },
-    ...
-    Memory(MemorySubcommand),
     Unknown(String),
+    // ... ~370 more
 }
 ```
 
-Several variants deliberately embed types owned by other modules rather than redefining them
-locally: `Zadd`'s `flags: crate::table::ZAddFlags`, `Zrange`'s `opts: crate::table::ZRangeOpts`,
-stream commands' `crate::table::StreamId`/`crate::table::StreamTrimStrategy`, `ClientSubcommand
-::Unblock`'s `crate::block::ClientUnblockType`, `FT.*` commands' `crate::search::Reducer`,
-`XDP.*` commands' `crate::xdp::XdpAction`, and `VADD`/`VSIM`'s `crate::vector::VQuant` /
-`crate::vector::VectorMetric`.
+Design points worth knowing:
 
-### 3.3 New command families, in detail
+- **Arguments are `bytes::Bytes`.** A `Bytes` is a reference-counted view into a shared buffer;
+  cloning or slicing it is O(1) and copies no data. The framer hands out slices of one per-frame
+  buffer (see §4.3).
+- **Size is capped at compile time.** Every pipelined command is moved several times (parse
+  vector, per-shard batches, the remote shard's drain), so `resp.rs` contains
+  `const _: () = assert!(std::mem::size_of::<Command>() <= 184);`. Rarely used variants keep
+  under that budget by boxing their large fields — e.g. `FtSearch`/`FtAggregate` box
+  `SearchOptions`, `Zrangestore` boxes `ZRangeOpts`, `Xclaim` boxes its ID list, `Xadd` boxes
+  its idempotency option, `Xreadgroup` and `Lmovem` box optional fields, and `SemanticSet`'s
+  vector is a `Box<Vec<f32>>`. A new variant that breaks the budget fails the build.
+- **`SmallVec<[T; 1]>`** (a vector with one inline slot) is used for the common single-key or
+  single-field forms of `DEL`, `UNLINK`, `EXISTS`, `TOUCH`, `HSET`, `HDEL`, `SADD`, `SREM`,
+  `ZADD`, `ZREM`, `LPUSH`, `RPUSH`, so they parse without a heap allocation.
+- **Raw-args variants.** Commands whose grammar is owned by another module are stored unparsed as
+  `Vec<Bytes>`: `Debug`, `Slowlog`, `Commandlog`, `Lolwut`, `Sentinel`, `Replconf`, `ConfigGet`,
+  `Subscribe`, `Watch`, `Stick`, and similar.
+- **Borrowed types from other modules.** Variants embed types defined elsewhere rather than
+  duplicating them: `crate::table::ZAddFlags`, `ZRangeOpts`, `StreamId`, `StreamTrimStrategy`;
+  `crate::block::ClientUnblockType`; `crate::search::SearchOptions`/`Reducer`;
+  `crate::vector::VQuant`/`VectorMetric`; `crate::xdp::XdpAction`.
+- **`Unknown(String)`** is what `build_command` returns for a name it does not recognise (and
+  for experimental commands while they are disabled, §4.6). The executor replies
+  `-ERR unknown command '<name>'`. A few arms deliberately produce `Unknown` with a synthetic
+  string such as `"CONFIG HELP"` or `"OBJECT <sub>"` that the executor special-cases.
 
-**Hash field TTLs** (`HEXPIRE`/`HPEXPIRE`/`HEXPIREAT`/`HPEXPIREAT` at `src/resp.rs:7840`): one
-match arm handles all four spellings. Seconds-vs-milliseconds and absolute-vs-relative are
-derived purely from which of the four strings `cmd_name` equals (`raw_time.saturating_mul(1000)`
-for the two second-granularity spellings; `is_at = matches!(cmd_name, "HEXPIREAT" |
-"HPEXPIREAT")`). Syntax is `HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields field
-[field ...]`: the function walks condition flags until it hits the literal `FIELDS` token,
-requires `numfields` to match the actual trailing field count exactly (too few is a "wrong
-number of arguments" error, too many/duplicated `FIELDS`/condition flags after the field list is
-a distinct "unknown argument" error), rejecting more than one condition flag
-("Multiple condition flags specified"). `HTTL`/`HPTTL`/`HEXPIRETIME`/`HPEXPIRETIME` share the
-same `FIELDS numfields field...` tail grammar (`src/resp.rs:7947`); `HPERSIST` (`:7977`) and
-`HGETEX`/`HSETEX` (`:7994`, `:8104`) are the remaining field-TTL family members.
+The enum body is grouped by section comments (`// LIST COMMANDS`, `// ZSET COMMANDS`,
+`// STREAM COMMANDS`, `// VALKEY EXTENDED COMMANDS`, `// VECTOR COMMANDS`,
+`// AI SEMANTIC CACHE COMMANDS`, `// AI AGENT MEMORY COMMANDS`, `// LLM QUOTA GOVERNOR
+COMMANDS`, `// AGENT CHECKPOINT & IDEMPOTENT TOOL EXECUTION COMMANDS`, `// MODEL CONTEXT
+PROTOCOL (MCP) COMMANDS`, `// CRDT MULTI-REGION COMMANDS`, `// REDIS 7 FUNCTIONS`,
+`// REDISJSON COMMANDS`, `// GEOSPATIAL COMMANDS`, `// PROBABILISTIC COMMANDS`,
+`// Full-Text Search (FT.*)`, `// AF_XDP & eBPF (XDP.*)`, `// Dragonfly native extensions`,
+`// Memcached Protocol`, and others). Variants above the first section comment form an unlabeled
+prelude: `OBJECT`/`XINFO`/`LATENCY`/`COMMAND` wrappers, hash-field TTLs, `XCLAIM`/`XAUTOCLAIM`,
+`AUTH`, `GET`/`SET`/`MSETEX`, `DEL`/`UNLINK`/`EXISTS`, `CLUSTER`/`CLIENT`, `WAIT`, `MIGRATE`,
+and the basic hash commands.
 
-**Stream claim/delete commands**: `XCLAIM` (`src/resp.rs:8236`) and `XAUTOCLAIM` (`:8338`) are
-the standard Redis consumer-group reassignment commands. `XDELEX key [KEEPREF|DELREF|ACKED] IDS
-numids id [id...]` (`:7229`) and `XACKDEL key group [KEEPREF|DELREF|ACKED] IDS numids id
-[id...]` (`:7299`) are the Redis 8 "delete with PEL-reference-tracking strategy" commands: the
-strategy token is optional and defaults to `KeepRef` (`crate::table::StreamTrimStrategy`), and —
-like `HEXPIRE` — `numids` must exactly match the number of trailing ID arguments or the call is
-rejected. `XIDMPRECORD key producer-id insertion-id id` (`:7370`) is a Rudis-specific
-idempotent-record command (not part of upstream Redis/Valkey) taking exactly 5 arguments.
+### 3.2 Subcommand and option types
 
-**Redis 8 Vector Sets and AI-native command families** are covered in §3.5 and §3.7.
+Multi-verb commands wrap their verbs in a dedicated enum carried by one `Command` variant. All
+live at the top of `src/resp.rs`:
 
-### 3.4 Gotcha: `Command::Unlink` is never constructed by the parser
-
-```rust
-"DEL" | "DELETE" | "UNLINK" => {                       // src/resp.rs:2905
-    if args.len() < 2 {
-        return Err("wrong number of arguments for 'del' command".to_string());
-    }
-    if cmd_name == "DELETE" {
-        let noreply = args.len() > 2 && args[2].eq_ignore_ascii_case(b"noreply");
-        Ok(Some(Command::MemcachedDelete { key: args[1].clone(), noreply }))
-    } else {
-        args.remove(0);
-        Ok(Some(Command::Del(SmallVec::from_vec(args))))   // UNLINK falls in here too
-    }
-}
-```
-
-A client-sent `DEL` *or* `UNLINK` both become `Command::Del` — there is no behavioral
-distinction at parse time (both take the same fast path too, see §4.3). `Command::Unlink` does
-exist as a real, separately-matched variant throughout `connection.rs` (its execution arms are
-written as `Command::Del(keys) | Command::Unlink(keys) => ...`, so it behaves identically once
-built), but the *only* place that ever constructs it is `src/table.rs`'s lazy-expiry path:
-
-```rust
-// src/table.rs:4429 (and :4665, an identical second occurrence)
-let rep_cmd = if is_lazyfree_lazy_expire() {
-    Command::Unlink(smallvec::smallvec![key.clone()])
-} else {
-    Command::Del(smallvec::smallvec![key.clone()])
-};
-```
-
-I.e. `Command::Unlink` exists purely so the storage engine can propagate a lazily-expired key to
-AOF/replicas under the *name* `UNLINK` (for observability/compatibility with real Redis's
-`lazyfree-lazy-expire` semantics) without the parser itself needing any UNLINK-specific
-behavior. `src/aof.rs:276` and `src/connection.rs:3998` (`"UNLINK"` display name),
-`:5614`/`:5629` (propagation) are the consumers of this internally-synthesized variant.
-
-### 3.5 Gotcha: `VADD` has two unrelated argument grammars selected by content-sniffing
-
-`Command::Vadd` is built by one match arm (`src/resp.rs:9556`) that supports **both**:
-
-1. **Redis 8 Vector Sets syntax**: `VADD key [REDUCE dim] FP32|VALUES <data> element [CAS]
-   [NOQUANT|Q8|BIN] [EF ef] [SETATTR json] [M m] [TIERED]` — vectors arrive either as a raw
-   little-endian `f32` blob (`FP32`, validated to be a multiple of 4 bytes and each float
-   finite) or as `VALUES num v1 v2 ... vnum` (space-separated floats). Sets `is_redis_vset:
-   true`.
-2. **Rudis-native legacy syntax**: `VADD key element v1 v2 ... [QUANTIZE|SQ8] [PQ] [TIERED]
-   [metric]` — the vector is just the trailing numeric tokens themselves, and `quant`/`ef`/
-   `setattr`/`m`/`cas` are all left at their defaults (`None`/`false`). Sets
-   `is_redis_vset: false`.
-
-The dispatch between the two is **not** based on the command name (both are `VADD`) — it checks
-whether `args[2]` (the 3rd argument) uppercases to exactly `"REDUCE"`, `"FP32"`, or `"VALUES"`.
-Any other 3rd argument is assumed to be a vector element name in the legacy grammar. This means
-a legacy-style element literally named `reduce`, `fp32`, or `values` would misparse as the
-Vector Sets grammar — a real (if narrow) ambiguity in the wire protocol, not a doc inaccuracy.
-
-### 3.6 Gotcha: `FT.HYBRID` is parsed but has no `Command` variant of its own
-
-`"FT.HYBRID" => { ... }` (`src/resp.rs:12082`) parses `FT.HYBRID index text-query vector-query
-[SCORER RRF|LINEAR ...] [LIMIT ...] [RETURN ...] [PARAMS ...] [WITHSCORES] [NOCONTENT]`, builds
-a `crate::search::SearchOptions` (RRF `k` defaults to `60.0`; `LINEAR` alpha/beta default to
-`0.5`/`0.5`), and then **rewrites the two queries into one combined query string** before
-constructing a plain `Command::FtSearch`:
-
-```rust
-let query = if let Some(knn_tail) = trimmed_vec.strip_prefix("*=>").or_else(|| trimmed_vec.strip_prefix("=>")) {
-    format!("({})=>{}", text_query, knn_tail)
-} else if trimmed_vec.starts_with("[KNN") {
-    format!("({})=>{}", text_query, trimmed_vec)
-} else {
-    format!("{} {}", text_query, trimmed_vec)
-};
-...
-Ok(Some(Command::FtSearch { index, query, options }))
-```
-
-So `FT.HYBRID` is purely a **parse-time query-string-rewriting convenience** on top of
-`FT.SEARCH`'s existing execution path in `src/search.rs` — there is no `Command::FtHybrid`
-variant and no hybrid-specific execution code downstream of `resp.rs`.
-
-### 3.7 AI-native command families actually live in `resp.rs`
-
-Despite being executed by `src/agent.rs`/`src/semcache.rs`/`src/mcp.rs` (subsystem 20), all of
-their wire parsing is ordinary `build_command` arms in this file, following the same patterns as
-everything else: `SEMANTIC.SET`/`GET`/`DEL`/`FLUSH`/`INFO` (`src/resp.rs:12224`–`12441`),
-`AGENT.MEM.ADD`/`CONTEXT`/`COMPACT`/`INFO`/`CLEAR` (`:12442`–`12668`), `LLM.QUOTA.RESERVE`/
-`SETTLE`/`INFO` (`:12669`–`12772`), `AGENT.CHECKPOINT.PUT`/`GET`/`HISTORY` and
-`AGENT.TOOL.CLAIM`/`COMPLETE` (`:12773`–`12943`), and `MCP.TOOLS`/`CALL`/`RPC` (`:12944`–
-`12961`). `MCP.RPC` is the odd one out structurally — it takes exactly one argument and stores it
-unparsed as `Command::McpRpc(Bytes)`, deferring all JSON-RPC 2.0 envelope parsing to `mcp.rs`
-itself, whereas every other command in this family parses its arguments here.
-
-### 3.8 `XDP.RULE` breaks the file's own Subcommand-enum convention
-
-Every other multi-verb command family with real subcommands (`OBJECT`, `CLUSTER`, `CLIENT`,
-`ACL`, `LATENCY`, `XINFO`, `MEMORY`, `TIER`) wraps its subcommands in a dedicated
-`*Subcommand` enum and a single `Command::Foo(FooSubcommand)` variant. `XDP.RULE ADD|DEL|LIST`
-(`src/resp.rs:12969`) instead dispatches its subcommand inline inside the `"XDP.RULE"` match arm
-and constructs three *separate* top-level `Command` variants (`XdpRuleAdd`, `XdpRuleDel`,
-`XdpRuleList`) rather than one `Command::XdpRule(XdpRuleSubcommand)` — a structural inconsistency
-worth knowing about if extending either family.
-
----
-
-## 4. Parsing Algorithms & Code Logic
-
-### 4.1 `parse_command`: three grammars, tried in a fixed order (`src/resp.rs:1897`)
-
-```rust
-pub fn parse_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    if buf[0] == b'*' {
-        parse_resp_array(buf)
-    } else {
-        match parse_memcached_storage_command(buf)? {
-            Some(Some(cmd)) => Ok(Some(cmd)),
-            Some(None) => Ok(None),
-            None => parse_inline_command(buf),
-        }
-    }
-}
-```
-
-This is the sole entry point every ingestion loop in the codebase calls — see §5 for the full,
-verified list of 9 call sites across 4 files.
-
-### 4.2 `parse_memcached_storage_command`: a triple-layered `Option` result (`src/resp.rs:1786`–`1896`)
-
-Returns a triple-layered result deliberately: `Ok(None)` means "not a memcached storage command
-at all, try inline parsing next"; `Ok(Some(None))` means "it *is* one, but the data block hasn't
-fully arrived yet — wait for more bytes, don't fall through to inline parsing"; `Ok(Some(Some
-(cmd)))` is a complete parse. That extra `Option` layer specifically prevents a partially-
-received memcached `set key 0 0 1024\r\n<...only 200 bytes so far...>` from being misinterpreted
-as inline text.
-
-The header line must tokenize into at least 5 whitespace-separated fields (`<verb> <key> <flags>
-<exptime> <bytes>`, with an optional 6th `noreply` token, matched case-insensitively against
-`set`/`add`/`replace`); fewer than 5 tokens or non-numeric `flags`/`exptime`/`bytes` returns
-`Ok(None)` (falls through to inline parsing) rather than an error. Once the header is valid and
-the full `bytes`-length data block plus its trailing `\r\n` has arrived, key and data are each
-copied with `Bytes::copy_from_slice` (a real copy — this path trades allocation for simplicity,
-same as the inline-text path) into `Command::MemcachedSet`/`MemcachedAdd`/`MemcachedReplace`.
-
-### 4.3 `parse_resp_array`: two-pass validity scan, then a ≤16-arg fast path or a generic path (`src/resp.rs:1959`–`2263`)
-
-1. **Read the array-length header.** `find_crlf` locates the first `\r\n`; the digits between
-   `*` and it decode via `parse_decimal_bytes` (§4.4) into `num_args`. A non-digit/empty header
-   is `Err("Invalid array length in RESP frame")`.
-2. **Pass 1 — prove the frame is complete, enforce `proto-max-bulk-len`, and opportunistically
-   record offsets.** A fixed `[(usize, usize); 16]` stack array (`offsets`) and `is_small =
-   num_args <= 16` are set up before the scan. The loop walks each of the `num_args` bulk-string
-   headers (`$<len>\r\n<data>\r\n`) with `find_crlf_at`, validating the `$` prefix, decoding the
-   length with `parse_decimal_bytes`, **rejecting it outright if `arg_len >
-   get_proto_max_bulk_len()`** (`Err("Protocol error: excessive bulk string length")` —
-   this check runs unconditionally for every argument of every array, small or large, since it's
-   in the shared pass-1 loop), and checking the trailing `\r\n` after the data
-   (`"Expected bulk string in command array"`, `"Invalid bulk string length"`,
-   `"Expected CRLF after bulk string data"`, or `Ok(None)` if the buffer runs out mid-scan).
-   **Nothing in this pass mutates `buf`.** If `is_small`, each argument's `(data_start, arg_len)`
-   is cached into `offsets[i]` as the scan proceeds.
-3. **Pass 2a — small-array fast path (`num_args <= 16`).** The whole frame is split off the
-   receive buffer in one `buf.split_to(scan_cursor).freeze()` call, producing a single `Bytes`
-   (`frame`) that owns one shared allocation. If `num_args > 0`, the uppercase-folded first
-   argument's byte length (`cmd_len`) is matched, and within each length bucket a small number of
-   `eq_ignore_ascii_case` checks against the highest-frequency command names build the matching
-   `Command` variant directly from `frame.slice(..)` views — no call into `build_command` at all.
-   The current fast-path command list (**20 commands**, up from 17):
-
-   | Byte length | Commands |
-   | :-: | :--- |
-   | 3 | `GET` (exact 2 args), `SET` (exact 3 args, plain form only), `DEL` (2+ args) |
-   | 4 | `INCR`, `HGET`, `HSET` (single field/value), `SADD` (single member), `LPOP` (no count), `ZADD` (single score/member), `PING` (no argument), `MGET`, `MSET` |
-   | 5 | `LPUSH` (single value) |
-   | 6 | `EXISTS`, `LRANGE`, `ZRANGE` (plain `start`/`stop` form), `UNLINK` (2+ args — also builds `Command::Del`, per §3.4) |
-   | 8 | `READONLY` (no argument) |
-   | 9 | `READWRITE` (no argument), `SISMEMBER` |
-
-   Each fast-path arm still checks arity/shape (`SET key value EX 10` falls through — 5 args,
-   not 3). Anything that doesn't match falls through to building a generic `Vec<Bytes>` from the
-   cached `offsets` (still zero-copy, via `frame.slice(..)`) and calling `build_command`.
-4. **Pass 2b — general path (`num_args > 16`).** `buf.advance(newline_pos + 2)` consumes the
-   header line, and each argument is decoded and sliced off one at a time with its own
-   `buf.split_to(arg_len).freeze()` call, before calling `build_command`.
-
-Both paths end up calling only `Bytes`-level operations (`frame.slice(..)`,
-`BytesMut::split_to(..).freeze()`) — O(1) reference-count bumps, never a byte copy. The fast
-path's advantage is doing **one** `split_to` for the whole command instead of one per argument,
-plus skipping `build_command`'s dispatch entirely for the highest-frequency verbs.
-
-`parse_inline_command` (`src/resp.rs:2264`–`2284`) splits on spaces/tabs and builds each
-argument with `Bytes::copy_from_slice` — a real copy, because this path only serves
-interactive/debugging clients (`redis-cli`, `nc`), never the benchmarked pipelined workload. It
-delegates to `build_command` exactly like the general RESP-array path.
-
-### 4.4 Allocation-free decode helpers (`src/resp.rs:1914`–`1958`)
-
-```rust
-#[inline]
-pub fn parse_decimal_bytes(bytes: &[u8]) -> Option<usize> {
-    if bytes.is_empty() { return None; }
-    let mut val: usize = 0;
-    for &b in bytes {
-        if !b.is_ascii_digit() { return None; }
-        val = val.checked_mul(10)?.checked_add((b - b'0') as usize)?;
-    }
-    Some(val)
-}
-```
-
-Used everywhere a RESP length prefix needs to become a `usize`. No UTF-8 validation pass, no
-intermediate `&str`. `checked_mul`/`checked_add` make integer overflow return `None` (a parse
-error) rather than silently wrapping — this remains the *only* overflow guard in the
-length-decoding path; see §7 for what's still not bounded.
-
-```rust
-#[inline]
-pub fn bytes_to_uppercase_ascii<'a>(bytes: &'a [u8], buf: &'a mut [u8; 64], heap: &'a mut String) -> &'a str {
-    if bytes.len() <= 64 && bytes.is_ascii() {
-        for (i, b) in bytes.iter().enumerate() { buf[i] = b.to_ascii_uppercase(); }
-        unsafe { std::str::from_utf8_unchecked(&buf[..bytes.len()]) }
-    } else {
-        *heap = String::from_utf8_lossy(bytes).to_uppercase();
-        heap.as_str()
-    }
-}
-```
-
-Used by `build_command` to case-fold the command-name argument. Every real command name is
-short, plain ASCII, and fits the 64-byte stack buffer, so the common case never touches the
-heap; the `unsafe` block is justified by the preceding `is_ascii()` check (ASCII-uppercasing an
-ASCII byte cannot produce a non-ASCII byte, so the written bytes are valid UTF-8).
-
-```rust
-pub static PROTO_MAX_BULK_LEN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(512 * 1024 * 1024);   // 512 MiB, matches real Redis's default
-
-#[inline(always)]
-pub fn get_proto_max_bulk_len() -> usize { PROTO_MAX_BULK_LEN.load(Ordering::Relaxed) }
-pub fn set_proto_max_bulk_len(val: usize) { PROTO_MAX_BULK_LEN.store(val, Ordering::Relaxed); }
-```
-
-A global, runtime-mutable cap enforced in `parse_resp_array`'s pass 1 (§4.3 step 2). It's also
-reused outside the parser proper: `SETBIT`/`GETBIT`/`BITFIELD`'s offset-in-bits checks in
-`build_command` (`src/resp.rs:6261`, `6288`) and a symmetric check in `connection.rs:6490`
-compare a bit offset shifted right by 3 against this same limit, so one config knob bounds both
-"how big can a bulk string argument be" and "how big can a bitmap grow via `SETBIT`". Exposed to
-clients via `CONFIG GET/SET proto-max-bulk-len` (`src/connection.rs:6430`–`6527`).
-
-### 4.5 `build_command`: one shared constructor, ~10,719 lines, dispatched by uppercased name (`src/resp.rs:2316`–`13034`)
-
-```rust
-pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
-    if args.is_empty() { return Ok(None); }
-    let mut cmd_buf = [0u8; 64];
-    let mut cmd_heap = String::new();
-    let cmd_name = bytes_to_uppercase_ascii(&args[0], &mut cmd_buf, &mut cmd_heap);
-    match cmd_name {
-        "AUTH" => { ... }
-        "ACL" => { ... }
-        "GET" => { ... }
-        // ... 343 more top-level arms ...
-        _ => Ok(Some(Command::Unknown(cmd_name.to_string()))),
-    }
-}
-```
-
-`args: Vec<Bytes>` is `mut` because several arms (`DEL`/`UNLINK`, see §3.4) call
-`args.remove(0)` in place. The command-name lookup goes through `bytes_to_uppercase_ascii`
-(§4.4), not `String::from_utf8_lossy(..).to_uppercase()`, which would allocate on every
-dispatched command.
-
-The top-level `match cmd_name { .. }` has **346 arms** (verified by counting lines of the exact
-shape `^        "NAME"( | "ALIAS")* =>` — some names contain `.`/`-`, e.g. `"CRDT.SET"`,
-`"DEFRAG" | "ACTIVE-DEFRAG"`), covering **373 distinct command-name string literals** once
-`|`-joined aliases are counted individually (e.g. `"DEL" | "DELETE" | "UNLINK"`,
-`"HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT"`). The function body spans
-`src/resp.rs:2316`–`13034`, roughly **10,719 lines** — up from ~6,470 the last time this file
-was measured; the single-match-statement design has not changed, only grown. Arm order is
-roughly the order features were added over time, **not** grouped by the enum's own section
-comments — e.g. Memcached `STATS`/`VERSION`/`CONFIG` arms sit textually near the Dragonfly
-`STICK`/`UNSTICK`/`DELEX` arms, and the real Redis `CONFIG GET`/`SET` arm is a single,
-separate `"CONFIG"` match a few lines later — so §3.2's category table (enum declaration order)
-and `build_command`'s arm order are two independent orderings over the same command set.
-
-Nested dispatch is common: most arms that take options (`SET .. EX ..`, `ZADD .. GT LT NX ..`,
-`HELLO AUTH ..`, `HEXPIRE .. FIELDS ..`) run their own `while i < args.len() { match
-uppercased_option { .. } }` loop over the remaining arguments after fixed positional arguments
-are consumed. Subcommand families (`ACL`, `CLUSTER`, `XDP.RULE`, `DFLY`, `DFLYCLUSTER`) do the
-same one level deeper, matching on `args[1]` inside the outer arm.
-
-`GET`/`MemcachedGet` and `DEL`/`MemcachedDelete` disambiguate by arity, not by a protocol-mode
-flag: real Redis `GET`/`DEL` are strictly defined arities, so extra arguments unambiguously mean
-the Memcached dialect was intended instead (`GET k1 k2` → `Command::MemcachedGet`; `DELETE key
-[noreply]` → `Command::MemcachedDelete`).
-
-### 4.6 `HELLO`: parsed here, acted on in `connection.rs`
-
-`Command::Hello { proto: Option<u8>, auth: Option<(String, String)>, setname: Option<String> }`
-is all `resp.rs` produces. `connection.rs:9325`–`9403` is where `proto` is actually acted on:
-`p != 2 && p != 3` → `-NOPROTO unsupported protocol version`; on success it flips both the
-per-client `ClientInfo::is_resp3` flag *and* the `CURRENT_CLIENT_RESP3` thread-local (the latter
-is what every `write_resp_*` helper actually reads), and replies with a RESP3 map
-(`%7\r\n`) or a RESP2 flat array (`*14\r\n`) of the same 7 key/value pairs: `server` (`valkey`),
-`version` (`7.2.0`), `proto`, `id`, `mode` (`cluster`/`standalone`), `role` (`master`/`replica`),
-`modules` (empty array). `resp.rs` itself never sets or reads either RESP3 flag.
-
-### 4.7 `parse_redis_f64` / `parse_score_bound`: libc `strtod` as a fallback for exact Redis float parsing (`src/resp.rs:13035`–`13094`)
-
-Unchanged in substance from prior revisions of this file, only shifted in line number. Rust's
-own `f64::from_str` is tried first; if it fails, the string is handed to the real libc
-`strtod` via FFI, because Redis's accepted float grammar (`inf`, `+inf`, `-inf`, `infinity` and
-case variants; rejecting `nan` outright; rejecting an out-of-range literal that Rust would
-otherwise silently promote to `inf`) needs to match C's parsing rules exactly, and reimplementing
-`strtod` by hand is not worth it. `parse_score_bound` layers `ZRANGEBYSCORE`-style `(exclusive`
-prefix handling on top: a leading `(` strips itself and marks the bound exclusive; `-inf`/`+inf`/
-`inf` are special-cased directly (bypassing `parse_redis_f64`'s NaN/whitespace checks, unneeded
-for these literals); everything else delegates to `parse_redis_f64`.
-
-### 4.8 `find_crlf`/`find_crlf_at`: still a plain windowed scan (`src/resp.rs:13096`–`13108`)
-
-Unchanged — a `.windows(2).position(|w| w == b"\r\n")` scan, used only to find the end of small
-protocol headers (array lengths, bulk-string length prefixes), never to scan payload data. No
-SIMD opportunity is being left on the table here (see the storage engine's SIMD control-byte
-matching in `docs/internal/05_storage_engine.md` for where that technique actually applies, on
-16-byte groups).
-
----
-
-## 5. Every Caller of `parse_command` Outside `resp.rs`
-
-Verified by grepping for `resp::parse_command`/`parse_command(` across `src/*.rs` — **8 call
-sites across 4 files** (the former separate `handle_tls_connection` call site is gone: TLS clients
-now share the generic `handle_client` loop). Line numbers are approximate and drift as the code changes:
-
-| File:Line | Loop | What it does with the parsed `Command` |
+| Type | Carried by | Variants (abridged) |
 | :--- | :--- | :--- |
-| `connection.rs` (`handle_client`) | `handle_client<T: ClientTransport>`'s main read loop, shared by plaintext (`PlainTransport`) and TLS (`TlsTransport`) clients | Parses **all** complete commands currently buffered into a `Vec<Command>`, then hands the whole batch to `execute_commands_squashed` — the primary, pipelined client command path, for both transports. |
-| `connection.rs:2526` | `run_pubsub_loop`, draining commands already buffered before entering subscribe mode | One-time drain of any pipelined commands that arrived in the same read as the initial `SUBSCRIBE`. |
-| `connection.rs:2563` | `run_pubsub_loop`'s steady-state read loop | Parses commands from a client that is in Pub/Sub mode (still accepts `PING`, `SUBSCRIBE`/`UNSUBSCRIBE`, etc.). |
-| `connection.rs:2672` | Master-side replica ACK tracking (plain replication) | Decodes `REPLCONF ACK <offset>` frames sent back by a connected replica, feeding `hub.update_replica_ack`. |
-| `connection.rs:2753` | Master-side replica ACK tracking (`DFLY FLOW` per-shard replication) | Same as above but for the Dragonfly-style per-shard flow protocol, feeding `hub.update_shard_flow_ack`. |
-| `replication.rs:1107` | A replica's streaming-sync loop, reading from its master | Decodes each replicated mutation and applies it via `router.execute_replica_command`; specially recognizes `REPLCONF GETACK` (replies with its own offset) and `PING` (no-op) without executing them as data commands. |
-| `aof.rs:1952` | `replay_aof`, at startup | Decodes persisted commands back out of an AOF file and replays them with `execute_local_command`, independent of any live network connection. |
-| `server.rs:288` | The AF_XDP kernel-bypass RX path | Parses the payload extracted from each zero-copy packet descriptor (`crate::xdp::extract_transport_payload`) and routes it to the correct shard — the same parser serves the io_uring socket path and the XDP fast path identically. Note: the call itself is in `server.rs`, not `xdp.rs`; `xdp.rs` only supplies the socket/ring machinery and payload extraction. |
+| `ClusterSubcommand` | `Command::Cluster` | `KeySlot`, `Slots`, `Shards`, `Nodes`, `SetSlot(u16, SetSlotSubcommand)`, `AddSlots[Range]`, `Meet`, `Failover { force }`, `Reset { hard }`, `Rebalance {..}`, `Reshard {..}`, `BumpEpoch`, `SetConfigEpoch`, `FlushSlots`, ... |
+| `SetSlotSubcommand` | `ClusterSubcommand::SetSlot` | `Migrating`, `Importing`, `Stable`, `Node` |
+| `DflyClusterSubcommand` / `DflyMigrateSubcommand` | Dragonfly-compatible cluster/migration | `Config`, `GetSlotInfo`, `FlushSlots`, ... / `Init`, `Flow`, `Ack` |
+| `ClientSubcommand` | `Command::Client` | `List`, `Info`, `SetName`, `Kill`, `Tracking {..}`, `Caching`, `Unblock {..}`, `Pause`, `NoEvict`, `SetInfo`, `Reply(ClientReplyMode)`, ... |
+| `AclSubcommand` | `Command::Acl` | `List`, `Users`, `GetUser`, `SetUser`, `DelUser`, `WhoAmI`, `Cat`, `GenPass`, `DryRun`, `Log`, `LogReset`, `Save`, `Load`, `Help` |
+| `MemorySubcommand` | `Command::Memory` | `Usage`, `Stats`, `Purge`, `Doctor`, `Defrag`, `MallocStats` |
+| `TierSubcommand` | `Command::Tier` | `Spill`, `Load`, `Info`, `SpillAll`, `Cool`, `Decommit`, `Gc`, `Snapshot(PathBuf)` |
+| `LatencySubcommand`, `ObjectSubcommand`, `XinfoSubcommand` | `LATENCY`, `OBJECT`, `XINFO` | the respective Redis verbs |
+| `SetCondition` | `Set` | `None`, `Nx`, `Xx`, `Ifeq`, `Ifne`, `Ifdeq`, `Ifdne` (compare-and-set on value or digest) |
+| `MsetexCondition` / `MsetexExpiry` | `Msetex` | `None/Nx/Xx` / `None`, `KeepTtl`, `ExpireIn(Duration)` |
+| `IncrexIncrement` / `IncrexBound` / `IncrexExpire` | `INCREX` | int-or-float delta and bounds; `Ex/Px/Exat/Pxat/Persist` |
+| `HexpireCondition` / `HFieldExpireOpt` / `HsetexCondition` | hash-field TTL commands | `NX/XX/GT/LT`; `Persist`, `KeepTtl`, `ExMs`, `ExAtMs`; `Fnx/Fxx` |
+| `ExpireOptions` (struct) | `Expire` | `nx`, `xx`, `gt`, `lt` booleans, validated by `parse_expire_options` |
+| `BitfieldSubOp` (struct) + `BitfieldOpType`, `BitfieldOverflow` | `BITFIELD` | one `GET/SET/INCRBY` op with sign, width, offset, overflow mode |
+| `LmovemMode` / `LmovemOrdering` | `LMOVEM` | `Count/Exactly`; `Obo/Bulk` |
+| `VsimTarget` | `VSIM` | `Element(Bytes)` or `Vector(Vec<f32>)` |
+| `XnackMode` | `XNACK` | `Silent`, `Fail`, `Fatal` |
+| `IncrName` | `IncrBy` | which of `INCR/DECR/INCRBY/DECRBY` the client typed (kept for ACL, stats, MONITOR) |
 
-`src/mcp.rs` does **not** call `parse_command` — its `MCP.*` commands are parsed as ordinary
-`Command` variants here (§3.7), but the JSON-RPC 2.0 envelope *inside* `MCP.RPC`'s single `Bytes`
-argument is parsed separately by `mcp.rs` itself.
+One exception to the wrapper-enum convention: `XDP.RULE ADD|DEL|LIST` produces three separate
+top-level variants (`XdpRuleAdd`, `XdpRuleDel`, `XdpRuleList`).
 
-Other cross-component dependencies:
-- **`src/table.rs`**: Several `Command` variant fields carry types defined in `table.rs`
-  directly (§3.2), and `table.rs` itself constructs `Command::Unlink`/`Command::Del` internally
-  for lazy-expiry replication propagation (§3.4) — a rare case of `table.rs` depending on
-  `resp.rs`'s `Command` type rather than the reverse.
-- **`src/block.rs`**: `ClientSubcommand::Unblock` carries a `crate::block::ClientUnblockType`.
-- **`src/search.rs` / `src/xdp.rs` / `src/vector.rs`**: own the reducer/action/quantization enums
-  embedded in `FT.*`, `XDP.*`, and `V*` command variants (§3.2, §3.5).
+### 3.3 Module-level state
 
----
+| Item | Type | Meaning |
+| :--- | :--- | :--- |
+| `PROTO_MAX_BULK_LEN` | `static AtomicUsize`, default 512 MiB | Largest bulk string (and memcached data block) a client may send. Set by `CONFIG SET proto-max-bulk-len` via `set_proto_max_bulk_len`. Also bounds bit offsets in `SETBIT`/`GETBIT`/`BITFIELD` (offset `>> 3` must be below it). |
+| `DETACH_FRAME_MAX` | `const usize` = 64 KiB | Frames (or, for >16-arg commands, single arguments) up to this size are copied into their own allocation instead of sliced from the read buffer (§4.3). |
+| `TRUSTED_INPUT` | `thread_local Cell<bool>` | Set only while `parse_command_trusted` runs; disables the `proto-max-bulk-len` check for the server's own data. |
+| `EXPERIMENTAL_COMMANDS` | `static AtomicBool` | Gate for non-Redis command families (§4.6). Defaults to `false` in builds and `true` under `cfg(test)`. Set at startup from `enable-experimental-commands` (`main.rs` calls `set_experimental_commands`). |
+| `EXPERIMENTAL_PREFIXES` | `const &[&str]` | `JSON.`, `BF.`, `CF.`, `CMS.`, `TOPK.`, `FT.`, `SEMANTIC.`, `CRDT.`, `LLM.`, `MCP.`, `XDP.` |
+| `MAX_RANDOM_REPEATS` | `const i64` = 2^20 | Most elements a negative (repeating) `SRANDMEMBER`/`HRANDFIELD`/`ZRANDMEMBER`/`VRANDMEMBER` count may request; checked by `parse_random_count`. |
 
-## 6. RESP2 vs RESP3 Reply Encoding (in `connection.rs`/`pubsub.rs`, driven by state this file never touches)
+## 4. Algorithms
 
-`resp.rs` never emits a reply byte. All encoding lives in `connection.rs`'s `write_resp_*`
-family, gated on the thread-local `CURRENT_CLIENT_RESP3: Cell<bool>` (`connection.rs:191`),
-which is set once per command batch from the per-client `ClientInfo::is_resp3` flag
-(`connection.rs:4917`, `:19114`) and flipped by `HELLO`/`RESET` (§4.6).
+### 4.1 `parse_command`: the entry point
 
-Verified, by type, across the whole of `connection.rs`:
+1. If the buffer is empty, return `Ok(None)`.
+2. If the first byte is `*`, call `parse_resp_array`.
+3. Otherwise call `parse_memcached_storage_command`. It returns a three-level result:
+   `Ok(None)` = "not a memcached storage line, try inline"; `Ok(Some(None))` = "it is one, but
+   the data block hasn't fully arrived — wait"; `Ok(Some(Some(cmd)))` = complete. The middle
+   case stops a half-received `set k 0 0 1024\r\n<200 bytes>` from being misread as inline text.
+4. If that returned `Ok(None)`, call `parse_inline_command`.
+5. The array and inline parsers set a `skipped` flag when they consumed a frame that carries no
+   command (`*0`, any `*-N`, or a blank/whitespace-only inline line). `parse_command` then
+   **loops** back to step 1. It loops rather than recursing because a peer can send millions of
+   such 2-byte frames; recursion overflowed the stack.
 
-| RESP3 type | Used for | RESP2 fallback |
-| :-- | :-- | :-- |
-| `_\r\n` (null) | `write_resp_null`/`write_resp_null_array` (`:276`, `:285`) | `$-1\r\n` / `*-1\r\n` |
-| `,<val>\r\n` (double) | `write_resp_score` (`:324`) — zset scores, geo distances, etc. | a bulk string via `format_score` (handles `inf`/`-inf`/`nan`/`%.17g` via libc `snprintf`, matching `parse_redis_f64`'s own float grammar) |
-| `%<N>\r\n` (map) | Ad hoc, wherever a reply is conceptually key/value pairs: `HELLO` (`:9370`, 7 pairs), `FUNCTION STATS` (`:11367`–`11381`, nested maps for the per-engine breakdown), `VINFO` (`:18504`, 9 pairs), `VLINKS ... WITHSCORES` (`:18629`+, per-layer map), `PUBSUB`-adjacent and other `WITHSCORES`-flavored replies | the same data flattened into a `*<2N>\r\n` array of alternating key/value bulk strings |
-| `><N>\r\n` (push) | Pub/Sub `message`/`pmessage` frames only, built in **`src/pubsub.rs`** (`build_pubsub_frame`/`build_pubsub_pframe`, `:142`/`:163`), never in `connection.rs` or `resp.rs` | `*3\r\n`/`*4\r\n` (identical payload, ordinary array prefix) |
+`parse_command_trusted` is the same function wrapped in `TRUSTED_INPUT = true`. AOF replay
+(`replay_aof_inner`), AOF-rewrite splitting (`split_rewritten_aof_to_shards`) and the replica's
+master stream (`run_replica_worker`) use it, because that data was accepted earlier, possibly
+under a higher `proto-max-bulk-len`, and refusing it would leave a server unable to load its own
+AOF or follow its master after the limit was lowered.
 
-Grepping the whole of `connection.rs` for RESP3 set (`~`), boolean (`#t`/`#f`), verbatim string
-(`=`), and big-number (`(`) prefixes returns **zero matches** — Rudis's RESP3 support is
-deliberately partial: null, double, map, and push only. This matches what real clients actually
-rely on for scores/maps/messages; it is not a completeness gap by design, just worth knowing
-before assuming any RESP3 type is supported.
+### 4.2 Line endings: `find_newline` / `find_newline_at`
 
-**Inline commands**: `parse_inline_command` (§4.3) splits strictly on spaces/tabs, so a command
-argument containing a space must be sent as a proper RESP bulk-string array — there's no quoting
-support in the inline grammar.
+Both return `(line_end, advance_len)`: the index where the line's content stops and how many
+bytes to consume. They search for `\n` and treat a preceding `\r` as part of the terminator, so
+**header lines accept either CRLF or bare LF**. Bulk-string data is different — its trailing
+terminator must be exactly `\r\n` (§4.3). The memcached parser additionally requires its header
+line to end in CRLF; a bare-LF line is not considered a memcached command. The search is a plain
+byte scan used only on short headers, never on payload data.
 
-**Error reply formatting** (`write_resp_err`, `connection.rs:983`): a parse/execution `Err
-(String)` is written verbatim with a `-` prefix if it already starts with one of **9** recognized
-error-code words — `WRONGTYPE`, `CROSSSLOT`, `MOVED`, `ASK`, `NOSCRIPT`, `EXECABORT`,
-`BUSYGROUP`, `NOGROUP`, `INVALIDOBJ`, `ERR` (`NOGROUP` and `INVALIDOBJ` are new additions to this
-whitelist) — and otherwise gets `"ERR "` prepended.
+### 4.3 `parse_resp_array`: two passes, then fast path or generic path
 
----
+**Header.** Find the first newline. If none exists and more than 64 KiB is buffered, fail with
+`Protocol error: too big mbulk count string`; otherwise wait. If the count starts with `-`
+(e.g. `*-1`), consume it and mark `skipped`. Decode the count with `parse_decimal_bytes`; a
+non-digit count or one above **1,048,576** (Redis's `proto-max-multibulk-len` default) is
+`Protocol error: invalid multibulk length`. `*0` is consumed and `skipped`.
 
-## 7. Known Bugs, Edge Cases & Remaining Gaps
+**Pass 1 — prove the frame is complete, without consuming anything.** A stack array
+`offsets: [(usize, usize); 16]` is prepared, and `is_small = num_args <= 16`. For each of the
+`num_args` arguments, from a `scan_cursor`:
 
-- **Fixed since the last pass**: `proto-max-bulk-len` is now a real, config-settable,
-  runtime-enforced cap (§4.3 step 2, §4.4) — a client declaring a multi-gigabyte bulk string is
-  now rejected at parse time instead of being buffered. Default is 512 MiB, matching real Redis.
-- **Still open — no cap on `num_args` (the array *element count* itself).**
-  `parse_decimal_bytes` guards against `usize` overflow when decoding `*N\r\n`, and each
-  individual bulk string is now bounded by `proto-max-bulk-len`, but `N` itself (e.g. a client
-  sending `*2000000000\r\n`) is never compared against a `proto-max-multibulk-len`-equivalent
-  limit — real Redis caps this at 1,048,576 elements. In practice this is mostly
-  self-limiting (each element needs at least 4 real bytes — `$0\r\n` — already buffered before
-  the pass-1 loop advances past it, and an incomplete frame just returns `Ok(None)` to wait for
-  more bytes rather than allocating anything proportional to `N` up front), but a hostile client
-  that *does* stream that many tiny empty-bulk-string arguments would still make the server
-  build a `Vec<Bytes>` of ~2 billion entries in the general (`num_args > 16`) path before
-  `build_command` gets a chance to reject the command name — worth adding an explicit early cap.
-- **`Command::Unlink` / `Command::Del` have no execution-time distinction** despite Redis
-  documenting `UNLINK` as "like DEL but performs the actual memory reclamation in a background
-  thread" — here both a client-sent `UNLINK` and `DEL` are normalized to the identical
-  `Command::Del` at parse time (§3.4), so any behavioral difference would have to be implemented
-  entirely inside the table/storage layer's handling of `Command::Del`, not gated on which verb
-  the client actually sent.
-- **`VADD`'s grammar-sniffing ambiguity** (§3.5): a legacy-grammar `VADD key reduce ...` (where
-  `reduce` is meant as a literal element name, not the `REDUCE dim` option) would misparse as
-  Vector Sets syntax and likely fail differently than intended. Same for element names `fp32`/
-  `values`.
-- **`build_command`'s single 10,719-line `match`** continues to grow linearly with every new
-  command family (it roughly doubled in size since the previous review of this file, tracking
-  the `Command` enum's own growth from 108 to 369 variants) — still compiles to an efficient
-  jump table (Rust/LLVM handle large string matches via a length-then-bytes decision tree, not a
-  linear scan, which is exactly why the byte-length-bucketed fast path in §4.3 uses the same
-  technique by hand for the hottest dozen or so verbs), so this remains a maintainability
-  concern, not a performance one. Splitting it into per-family functions dispatched from a
-  smaller top-level match is a purely mechanical refactor that has not happened.
-- **`FT.HYBRID`'s query-rewriting is string-concatenation-based** (§3.6): it does not validate
-  that the constructed combined query is well-formed before handing it to
-  `Command::FtSearch`/`src/search.rs` — a malformed `vector-query` argument (not starting with
-  `*=>`, `=>`, or `[KNN`) is silently treated as free text and space-concatenated with the text
-  query rather than rejected as a syntax error.
+1. If the cursor is past the buffer end → `Ok(None)` (wait).
+2. The byte must be `$`, else `Protocol error: expected '$', got '<c>'`.
+3. Find the header's newline; if missing and over 64 KiB is buffered after the cursor →
+   `Protocol error: too big bulk count string`, else wait.
+4. A negative length (`$-1`) or non-digits → `Protocol error: invalid bulk length`.
+5. If the length exceeds `proto-max-bulk-len` and the input is not trusted →
+   `Protocol error: invalid bulk length`.
+6. If the data plus its 2-byte terminator isn't buffered yet → wait.
+7. The two bytes after the data must be `\r\n`, else `Protocol error: invalid CRLF in request`.
+8. If `is_small`, record `(data_start, len)` in `offsets[i]`.
 
----
+Nothing is consumed during pass 1, so an incomplete frame costs only a re-scan when more bytes
+arrive.
 
-## 8. Testing
+**Pass 2a — small arrays (≤ 16 arguments).** The whole frame is removed from the read buffer as
+one `Bytes` called `frame`:
 
-`resp.rs` carries its own `#[cfg(test)] mod tests` at the bottom of the file
-(`src/resp.rs:13110`–`14357`, **15** `#[test]` functions — up from 13): `test_resp_get`,
-`test_resp_set_and_put`, `test_inline_commands`, `test_resp_hash_commands`,
-`test_resp_keyspace_and_transactions`, `test_resp_bitmaps_and_hll`, `test_resp_dump_and_restore`,
-`test_resp_streams`, `test_valkey_extended_parsers`,
-`test_parse_decimal_bytes_and_ascii_uppercase`, `test_smallvec_exists_and_sadd_parsing`,
-`test_resp_lrange_zrange_fast_slice_parser`, `test_smallvec_del_and_hset_parsing`,
-`test_unlink_readonly_wait_object_commands` (covers the §4.3 fast-path additions), and
-`test_resp_semantic_cache_commands` (covers the new AI-native `SEMANTIC.*` parsing, §3.7). One
-test (`src/resp.rs:14130`–`14135`) temporarily overrides `PROTO_MAX_BULK_LEN` via
-`set_proto_max_bulk_len(5)` to exercise the new length-rejection path, then restores it.
+- Normally the frame is **copied** into its own allocation (`Bytes::copy_from_slice`) when it is
+  at most `DETACH_FRAME_MAX` (64 KiB). Reason: keys and values the table stores are slices of
+  `frame`; a slice of the shared read buffer would pin that entire buffer (128 KiB+) in memory
+  for as long as one key survives, invisible to `maxmemory` accounting.
+- A plain two-argument `GET` keeps the zero-copy `split_to(..).freeze()` slice, since `GET`
+  never retains its argument. Frames above 64 KiB are also zero-copy (the copy would cost more
+  and the pinned buffer is mostly the value itself).
 
-Broader coverage of command *execution* (as opposed to parsing) lives in `connection.rs`'s own
-much larger test module, which exercises `parse_command` end to end against real client-visible
-behavior.
+Then the first argument's **length** picks a bucket, and a few case-insensitive comparisons build
+the variant directly from `frame.slice(..)` views, skipping `build_command`:
 
----
+| Name length | Fast-path shapes (anything else falls through) |
+| :-: | :--- |
+| 3 | `GET k` (exactly 2 args) → `Get`; `SET k v` (exactly 3) → `Set` with no options; `DEL k...` → `Del` |
+| 4 | `INCR k` → `IncrBy(k, 1, Incr)`; `HGET k f`; `HSET k f v` (one pair); `SADD k m` (one member); `LPOP k`, `RPOP k`, `SPOP k` (no count); `ZADD k score m` (one pair, score parsed by `parse_redis_f64`); `HDEL`/`SREM`/`ZREM k item...`; `PING` (no arg); `MGET k...`; `MSET k v...` (even pair count) |
+| 5 | `TOUCH k...`; `RPUSH k v...`; `LPUSH k v` (one value) |
+| 6 | `EXISTS k...`; `LRANGE k start stop` and `ZRANGE k start stop` (integers only); `UNLINK k...` → `Unlink` |
+| 7 | `ZPOPMIN k` (no count) |
+| 8 | `READONLY` |
+| 9 | `READWRITE`; `SISMEMBER k m` |
 
-## Contributor Gotchas, Invariants & Debugging Guide
+If no shape matches, a `Vec<Bytes>` is built from the cached offsets (still slices of `frame`)
+and passed to `build_command`.
 
-* **Gotcha 1**: Inline commands split on whitespace; commands with spaces inside arguments must
-  be formatted as RESP bulk arrays (§6).
-* **Gotcha 2**: RESP3 push frames use the `>` prefix and are built entirely in `src/pubsub.rs`
-  (`build_pubsub_frame`/`build_pubsub_pframe`), never in `resp.rs`, which does not parse or emit
-  any RESP3 framing at all (§3.1, §6).
-* **Gotcha 3**: A ≤16-argument fast path in `parse_resp_array` short-circuits `build_command`
-  entirely for `GET`, `SET` (plain form only), `DEL`, `INCR`, `HGET`, `HSET`, `SADD`, `LPOP`,
-  `ZADD`, `PING`, `MGET`, `MSET`, `LPUSH`, `EXISTS`, `LRANGE`, `ZRANGE`, `UNLINK`, `READONLY`,
-  `READWRITE`, and `SISMEMBER` (§4.3 — 20 commands, not 17). Any variant form of these (e.g.
-  `SET key value EX 10`) or any command not on this list still goes through the general
-  `build_command` dispatch.
-* **Gotcha 4**: A malformed RESP frame (bad array/bulk-string length, missing `$`, missing
-  trailing `\r\n`, or now also an over-`proto-max-bulk-len` length) is returned as `Err`
-  *without* advancing the input buffer. Code that calls `parse_command` in a loop must itself
-  decide how to make progress after an error (every caller in §5 either `buf.clear()`s or closes
-  the connection) — `resp.rs` will keep re-reporting the same error on the same bytes otherwise.
-* **Gotcha 5**: `Command::Unlink` is never produced by `build_command`/`parse_resp_array` — a
-  client-sent `UNLINK` always becomes `Command::Del`. Only `src/table.rs`'s internal lazy-expiry
-  path constructs `Command::Unlink`, purely to name it differently in AOF/replication output
-  (§3.4).
-* **Gotcha 6**: `VADD`'s argument grammar is selected by sniffing whether `args[2]` is
-  `REDUCE`/`FP32`/`VALUES`, not by any explicit flag — see §3.5 for the resulting ambiguity.
-* **Gotcha 7**: `FT.HYBRID` has no `Command` variant; it rewrites its two queries into one
-  combined query string and constructs `Command::FtSearch` (§3.6).
+**Pass 2b — large arrays (> 16 arguments).** The `*N` header is consumed and each argument is
+taken one at a time: arguments up to `DETACH_FRAME_MAX` are copied, larger ones are
+`split_to(..).freeze()`. Pass 1 already validated every header, so this pass trusts them. Then
+`build_command`.
 
-### How to Verify Changes
-```bash
-# 1. Format check
-cargo fmt --check
+**Worked example.** A client sends `SET k v` as
+`*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n` (27 bytes):
 
-# 2. Clippy verification with zero warnings
-cargo clippy --all-targets -- -D warnings
+1. Header: `num_args = 3`, `scan_cursor = 4`.
+2. Pass 1 records `offsets = [(8,3), (17,1), (24,1)]` and ends with `scan_cursor = 27`.
+3. Not a `GET`, and 27 ≤ 64 KiB, so the 27 bytes are copied into `frame` and advanced out of the
+   read buffer.
+4. Name length 3, matches `SET` with exactly 3 args → `Command::Set { key: frame[17..18],
+   value: frame[24..25], expire_in: None, condition: SetCondition::None, .. }`.
+5. `SET k v EX 10` (5 args) would miss the fast path and go to `build_command`'s `"SET" | "PUT"`
+   arm.
 
-# 3. Run unit tests
-cargo test --lib -- --test-threads=1
-```
+### 4.4 `parse_inline_command` and `split_inline_args`
+
+1. Find the newline; if missing and over 64 KiB is buffered → `Protocol error: too big inline
+   request`, else wait.
+2. `split_inline_args` tokenises the line `redis-cli`-style: whitespace separates arguments;
+   `"double quotes"` support `\n \r \t \b \a \xHH` escapes; `'single quotes'` only unescape the
+   next byte; an unterminated quote, a quote glued to following text, or a quote character in the
+   middle of an unquoted word → `Protocol error: unbalanced quotes in request`.
+3. The line is consumed. An empty token list sets `skipped`; otherwise `build_command(tokens)`.
+
+Arguments are freshly allocated (`Bytes::from(Vec)`); this path serves interactive tools, not
+pipelined benchmarks.
+
+### 4.5 `parse_memcached_storage_command`
+
+1. Look only at the first line (scanning the whole buffer for CRLF made runs of bare-LF frames
+   quadratic). It must end in CRLF and start with `set`, `add` or `replace` (case-insensitive)
+   followed by a space or tab.
+2. Split on spaces/tabs; require at least 5 tokens and numeric `flags` (`u32`), `exptime`
+   (`u32`) and `bytes` (`usize`). Any failure returns `Ok(None)` → inline parsing.
+3. A 6th token equal to `noreply` sets `noreply`.
+4. `bytes` above `proto-max-bulk-len` → `Protocol error: invalid bulk length` (closes the
+   connection; also keeps the length arithmetic from overflowing).
+5. If the data block plus CRLF isn't fully buffered → `Ok(Some(None))`.
+6. If the block isn't followed by CRLF, the whole block is **consumed** and
+   `CLIENT_ERROR bad data chunk` returned. Consuming matters: this is not a `Protocol error:`, so
+   the caller keeps parsing, and leaving the bytes would loop forever.
+7. Otherwise copy key and data, consume, and return `MemcachedSet`/`MemcachedAdd`/
+   `MemcachedReplace`.
+
+Other memcached verbs arrive through the inline parser and are disambiguated inside
+`build_command` by arity: `delete k [noreply]` → `MemcachedDelete` (via the
+`"DEL" | "DELETE" | "UNLINK"` arm); `incr k 5 [noreply]` / `decr k 5 [noreply]` →
+`MemcachedIncr`/`MemcachedDecr` (2-argument `INCR k` stays Redis `IncrBy`); `stats` →
+`MemcachedStats`; `version` → `MemcachedVersion`; `quit` → the Redis `Quit`.
+
+### 4.6 `build_command`: the constructor
+
+1. Return `Ok(None)` for an empty argument list.
+2. Upper-case the name with `bytes_to_uppercase_ascii` into a 64-byte stack buffer (heap
+   fallback only for names over 64 bytes or non-ASCII).
+3. **Experimental gate.** If the name contains a `.` (no core command does, so this is a single
+   byte scan on the hot path), experimental commands are disabled, and the name starts with one
+   of `EXPERIMENTAL_PREFIXES`, return `Command::Unknown(<original name>)`. These families are not
+   Redis/Valkey commands, and most of their writes (other than `JSON.`, `SEMANTIC.`, `BF.`,
+   `CF.`, `CMS.`, `TOPK.`, `CRDT.` and the `FT.CREATE`/`FT.ALTER`/`FT.DROPINDEX` index
+   definitions) are neither written to the AOF nor replicated; `MCP.`/`XDP.`
+   also expose tool calls and packet-filter control. Note `AGENT.*` is **not** gated.
+4. `match cmd_name { ... }` — one large match with roughly 350 top-level arms (some arms list
+   aliases, e.g. `"SET" | "PUT"`, `"EVAL" | "EVAL_RO"`, `"BITFIELD" | "BITFIELD_RO"`,
+   `"GETRANGE" | "SUBSTR"`). Arm order roughly follows the order features were added, not the
+   enum's section order.
+5. The fallback arm returns `Command::Unknown(cmd_name)`.
+
+Typical arm shape: check arity, take positional arguments, then walk options with
+`while i < args.len() { match upper(args[i]) { ... } }`, rejecting duplicates and conflicts.
+Subcommand families (`ACL`, `CLUSTER`, `CLIENT`, `CONFIG`, `MEMORY`, `TIER`, `DFLY*`,
+`XDP.RULE`) match on `args[1]` one level deeper. Some arms (`MGET`, `DEL`, `EXISTS`) move
+arguments out with `args.remove(0)`, which is why `args` is `mut`.
+
+**Validating client-supplied counts.** Many grammars contain a count followed by that many items
+(`FIELDS n ...`, `PARAMS n ...`, `VALUES n ...`, `numkeys`). The parser never loops or
+pre-allocates based on such a count alone:
+
+- `counted_args(args, start, count, keyword)` returns the slice only if `count` items really
+  follow, else `Bad arguments for <keyword>: Expected an argument, but none provided`. FT.*
+  options (`PREFIX`, `RETURN`, `LOAD`, `GROUPBY`, `REDUCE`) and `parse_ft_params` use it.
+- `EVAL`/`EVALSHA`/`FCALL` reject a negative `numkeys` and one greater than the remaining
+  arguments.
+- `MSETEX` rejects `numkeys` outside `0..=i32::MAX` and caps its pre-allocation by
+  `args.len()`.
+- `VADD`/`VSIM ... VALUES n` require `n` items present; `HEXPIRE`-family and `HSETEX` require
+  `numfields` to match exactly.
+- Resource ceilings come from `crate::vector`: `MAX_VECTOR_DIM` (65,536), `MAX_HNSW_M` (4,096),
+  `MAX_VSET_EF` (1,000,000), `MAX_PROJECTION_ENTRIES` (2^24, for `REDUCE` input × output dim),
+  plus `MAX_RANDOM_REPEATS` for negative random-member counts.
+
+Expiry options (`SET EX/PX/EXAT/PXAT`, `GETEX`, `MSETEX`) are converted to a relative
+`Duration` at parse time. Absolute deadlines go through `until_unix_ms`, which subtracts the
+current time at nanosecond precision so `PEXPIRETIME` later returns exactly the `PXAT` value.
+`SET ... EXAT/PXAT` with a time in the past sets `past_expired = true` instead of a duration.
+
+### 4.7 Number parsing helpers
+
+- `parse_decimal_bytes(&[u8]) -> Option<usize>`: digits only, `checked_mul`/`checked_add` so an
+  overflowing length is `None` (a protocol error) rather than a wrapped value. Used for every
+  RESP length prefix; no UTF-8 pass, no intermediate `&str`.
+- `parse_integer` (private): `i64` from bytes.
+- `parse_redis_f64(&str) -> Option<f64>`: Redis's float grammar. Rejects empty strings,
+  leading/trailing whitespace and every `nan` spelling; accepts `inf`/`infinity` with optional
+  sign. Tries Rust's `f64::from_str` first, then libc `strtod` (via FFI) for C-only forms such as
+  hex floats. A finite-looking literal that overflows to infinity is rejected, matching Redis.
+- `parse_score_bound(&[u8]) -> Result<(f64, bool), String>`: `ZRANGEBYSCORE`-style bounds; a
+  leading `(` means exclusive (the `bool` is "inclusive"), `-inf`/`+inf`/`inf` are special-cased,
+  everything else goes to `parse_redis_f64`.
+- `parse_min_idle_time`: `XCLAIM`/`XAUTOCLAIM` min-idle-time with Redis's exact error texts.
+- `parse_lmovem_trailer`: `LMOVEM`'s optional `COUNT|EXACTLY n OBO|BULK` trailer (default
+  `Count, 1, Bulk`).
+
+### 4.8 Command classification on `impl Command`
+
+The parser module also answers two questions about a parsed command, used by the executor:
+
+- `allows_oom()`: whether the command may run while over `maxmemory`. True for `MIGRATE` (it
+  only removes local keys) and for `EVAL`/`EVALSHA` scripts whose `#!` shebang line contains
+  `allow-oom`.
+- `is_write_command()`: `EVAL`/`EVALSHA` are writes unless `read_only` (`EVAL_RO`/`EVALSHA_RO`)
+  or their shebang has `no-writes` (scripts without a shebang count as non-writes here);
+  `FCALL` asks `scripting::is_function_read_only`. Otherwise the name from
+  `connection::get_cmd_name` is checked against a fixed list of core write commands, and failing
+  that, `connection::acl_cmd_name` is looked up in the generated ACL command table
+  (`acl_categories::COMMANDS`) for the `@write` category. That lookup (`is_write_in_command_table`)
+  is cached per thread keyed by the `&'static str` address. Rudis-only families share one coarse
+  ACL name tagged `@write`, so `is_family_read` lists their read-only variants (`JsonGet`,
+  `BfExists`, `FtSearch`, `SemanticGet`, `CrdtGet`, ...) to exclude them.
+
+## 5. Notable command grammars
+
+**`DEL` vs `UNLINK`.** Both share one arm, but `UNLINK` builds `Command::Unlink` (in both the fast
+path and `build_command`). The executor treats them alike except that `UNLINK` may free a large
+value lazily (it checks `is_lazyfree_worthy` and counts `lazyfreed_objects`). The storage layer
+also synthesises `Command::Unlink` for lazily expired keys when `lazyfree-lazy-expire` is on, so
+AOF/replicas see `UNLINK`.
+
+**`HELLO`.** The parser produces `Hello { proto, auth, setname }`. A numeric first argument
+becomes `proto`; a non-numeric first argument other than `AUTH`/`SETNAME` becomes
+`proto = Some(-1)`; unknown later tokens are skipped. `connection.rs` rejects any proto other
+than 2 or 3 with `-NOPROTO unsupported protocol version`, flips the client's `is_resp3` flag,
+and replies with a 7-pair map (`%7` in RESP3, flat array in RESP2).
+
+**Hash-field TTLs.** `HEXPIRE | HPEXPIRE | HEXPIREAT | HPEXPIREAT` share one arm:
+`HEXPIRE key time [NX|XX|GT|LT] FIELDS numfields field...`. Seconds are multiplied by 1000
+(`saturating_mul`), `is_at` comes from the spelling, more than one condition flag →
+`Multiple condition flags specified`, `numfields` must be > 0 and match the remaining fields
+exactly, and a repeated `FIELDS` is rejected. `HTTL | HPTTL | HEXPIRETIME | HPEXPIRETIME`,
+`HPERSIST`, `HGETEX` and `HSETEX` complete the family.
+
+**Streams.** Besides the core `X*` commands: `XCLAIM`, `XAUTOCLAIM`; Redis 8's `XDELEX` and
+`XACKDEL` (`[KEEPREF|DELREF|ACKED] IDS n id...`, strategy defaulting to keep-ref, `n` must match);
+the Rudis-specific idempotent-record command `XIDMPRECORD key producer-id insertion-id id`; and
+`XNACK` (with `XnackMode` `SILENT|FAIL|FATAL`).
+
+**`VADD` — two grammars chosen by sniffing `args[2]`.** If the third argument upper-cases to
+`REDUCE`, `FP32` or `VALUES`, the **Redis 8 Vector Sets** grammar applies:
+`VADD key [REDUCE dim] FP32 blob|VALUES n v1..vn element [CAS] [NOQUANT|Q8|BIN] [EF ef]
+[SETATTR json] [M m] [TIERED]`. `FP32` blobs must be a non-empty multiple of 4 bytes of finite
+little-endian floats; `SETATTR` must be valid JSON (or blank); `M` must be ≥ 2; limits from §4.6
+apply; result has `is_redis_vset: true`. Otherwise the **Rudis-native** grammar applies:
+`VADD key element v1 v2 ... [QUANTIZE|SQ8] [PQ] [TIERED] [metric]`, where every token that
+isn't a flag or metric name must be a float; result has `is_redis_vset: false`.
+
+**`FT.HYBRID` — no variant of its own.** It parses `FT.HYBRID index text-query vector-query
+[SCORER RRF [K k] | LINEAR [ALPHA a] [BETA b]] [LIMIT off n] [RETURN n f...] [PARAMS n k v...]
+[WITHSCORES] [NOCONTENT]` (RRF `k` defaults to 60, LINEAR alpha/beta to 0.5/0.5) and rewrites the
+two queries into one: a vector query starting with `*=>` or `=>` becomes `(text)=>tail`, one
+starting with `[KNN` becomes `(text)=>[KNN...`, and anything else is space-concatenated. The
+result is an ordinary `Command::FtSearch`.
+
+**AI-native families.** `SEMANTIC.*`, `AGENT.MEM.*`, `LLM.QUOTA.*`, `AGENT.CHECKPOINT.*`,
+`AGENT.TOOL.*` and `MCP.*` are ordinary arms here and executed by `src/semcache.rs`,
+`src/agent.rs` and `src/mcp.rs`. `MCP.RPC` takes exactly one argument and stores it unparsed as
+`McpRpc(Bytes)`; the JSON-RPC envelope is parsed by `mcp.rs`. `MCP.CALL tool [json]` defaults
+the arguments to `{}`.
+
+**`CONFIG SET`.** Values wrapped in matching single or double quotes are unquoted at parse time;
+`CONFIG RESETSTAT` and `CONFIG REWRITE` are encoded as special `ConfigSet` pairs.
+
+## 6. Callers
+
+| Caller | Function | What it does with the result |
+| :--- | :--- | :--- |
+| `src/connection.rs` | `handle_client_loop` (plain and TLS transports) | Parses every complete command in the buffer into a batch (bounded by `MAX_DRAIN_BATCH_CMDS`), enforces `client-query-buffer-limit` on each command's consumed bytes and on a partial command, stops at `QUIT`. On a `Protocol error:` it writes the error and closes; on other errors it runs the already-parsed commands, then replies with the error and continues (inside `MULTI` the error also marks the transaction so `EXEC` aborts). |
+| `src/connection.rs` | `run_pubsub_loop` | Drains commands buffered before entering subscribed mode, then parses in steady state; closes on `Protocol error:`. |
+| `src/connection.rs` | `read_replica_acks` | On the master, decodes `REPLCONF ACK <offset>` frames from a replica. |
+| `src/replication.rs` | `run_replica_worker` | `parse_command_trusted` on the master's stream; tracks the consumed byte offset and handles `REPLCONF GETACK` and `PING` specially. |
+| `src/aof.rs` | `replay_aof_inner`, `split_rewritten_aof_to_shards` | `parse_command_trusted`; an `Unknown` command in the AOF is a load error. |
+| `src/table.rs` | `load_legacy_records` | Re-parses stored `FT.CREATE` commands from legacy snapshot records. |
+| `src/server.rs` | `run_shard_worker` (AF_XDP RX task) | Parses the payload from `xdp::extract_transport_payload` and executes it locally or routes it. |
+| `fuzz/fuzz_targets/parse_command.rs` | libFuzzer target | Asserts no panic and that every `Ok(Some)` consumes input. |
+
+## 7. Reply encoding (outside this module)
+
+`resp.rs` never writes replies. For orientation:
+
+- `connection.rs`'s `write_resp_*` functions read the thread-local `CURRENT_CLIENT_RESP3` to
+  choose RESP3 forms: `_\r\n` null (`write_resp_null`/`write_resp_null_array`), `,` doubles
+  (`write_resp_score`), and `%` maps in a handful of replies (e.g. `HELLO`). Pub/Sub push frames
+  (`>`) are built in `src/pubsub.rs`. RESP3 set (`~`), boolean (`#`), verbatim (`=`), big-number
+  (`(`) and attribute (`|`) types are not emitted.
+- `write_resp_err` sends only the first line of an error string. It passes the message through
+  unchanged if it starts with one of `WRONGTYPE`, `CROSSSLOT`, `MOVED`, `ASK`, `NOSCRIPT`,
+  `EXECABORT`, `BUSYGROUP`, `NOGROUP`, `INVALIDOBJ`, `NOREPLICAS`, `OOM`, `READONLY`, `NOPERM`,
+  `ERR`; otherwise it prepends `ERR `. That is why most parser errors are written without a
+  prefix (`"syntax error"`) and some include one (`"ERR syntax error"`) — both render the same.
+
+## 8. Invariants & gotchas
+
+- **Framing errors don't consume; command errors do.** Every `Protocol error:` leaves the buffer
+  untouched and callers must close the connection (or the same bytes would fail forever). Any
+  other `Err` comes from `build_command` *after* the frame was split off, or from the memcached
+  bad-chunk path which consumes explicitly — so the caller can keep parsing.
+- **`Ok(Some)` always consumes input.** The unit fuzz test and the cargo-fuzz target both assert
+  this; a parser change that breaks it makes connection loops spin.
+- **Split-invariance.** Feeding the same bytes in two pieces must yield the same commands as all
+  at once (asserted by `test_parse_command_byte_fuzz`). Pass 1 never consuming is what makes this
+  hold.
+- **Fast path and `build_command` must agree.** A fast-pathed shape (e.g. `SET k v`) never
+  reaches `build_command`, so a semantic change to an arm must be mirrored in
+  `parse_resp_array`'s fast path.
+- **Stored values must not pin the read buffer.** Keep the `DETACH_FRAME_MAX` copy when adding
+  zero-copy shortcuts; only commands that never retain their arguments (plain `GET`) may slice
+  the shared buffer for small frames.
+- **Memcached sniffing comes before inline.** Any non-`*` line shaped like
+  `set|add|replace <key> <num> <num> <num>` followed by CRLF is a memcached storage command, so
+  an inline `SET k 0 0 5` waits for a 5-byte data block instead of running Redis `SET`.
+- **`VADD` grammar ambiguity.** A native-grammar element literally named `reduce`, `fp32` or
+  `values` is parsed as Vector Sets syntax.
+- **Experimental commands look unknown when disabled.** With the gate off, `FT.CREATE` etc.
+  return `Unknown`; any internal code re-parsing such commands (e.g. legacy `FT.CREATE` records)
+  depends on the gate being on.
+- **Keep `Command` ≤ 184 bytes.** Box large fields of rare variants; the compile-time assertion
+  enforces it.
+- **`AUTH` and `HELLO AUTH` credentials are `String`s** built with `from_utf8_lossy`, so
+  non-UTF-8 passwords are altered before they reach the ACL layer.
+
+## 9. Limitations / not implemented
+
+- **RESP3 input types are not parsed.** Only arrays of bulk strings, inline text and memcached
+  storage lines are accepted; a client cannot send `%`, `~`, `,`, `#`, `_`, `>` frames (no real
+  client does).
+- **`Command::MemcachedGet` and `Command::MemcachedQuit` are never built by the parser.** `get`
+  with one key becomes Redis `Get`, `get k1 k2` is a wrong-arity error, `gets` is unknown, and
+  `quit` becomes `Quit`. The executor still has arms for both variants.
+- **`FT.HYBRID` rewriting is string concatenation.** A malformed vector query is silently treated
+  as free text rather than rejected.
+- **`build_command` is one very large `match`.** It compiles to an efficient length-then-bytes
+  decision tree, so this is a maintainability cost, not a speed cost; splitting it into
+  per-family functions has not been done.
+- **Bare-LF headers are accepted** in RESP and inline input (more lenient than Redis), while
+  bulk data still requires CRLF.
+
+## 10. Testing
+
+`src/resp.rs` has its own `mod tests`:
+
+- **Framing robustness:** `test_parse_command_byte_fuzz` (mutation fuzzer over a seed corpus of
+  RESP, inline and memcached input, `RUDIS_FUZZ_ITERS` env var controls iterations; checks no
+  panic, progress, split-invariance), `test_framing_rejects_hostile_lengths` (multibulk limit,
+  oversized memcached block, bad data chunk consumed), `test_empty_frames_do_not_recurse`
+  (500,000 empty frames on a 256 KiB stack).
+- **Hostile arguments:** `test_build_command_survives_hostile_arguments` (every ACL-table
+  command plus the module families with random hostile tokens, under `catch_unwind`),
+  `test_untrusted_counts_are_rejected`, `test_counted_options_still_parse_valid_input`,
+  `test_vector_and_random_count_limits`, `test_bf_reserve_error_rate_range`.
+- **Fast paths:** `test_fast_parse_rpush_rpop_spop_zpopmin`,
+  `test_smallvec_hdel_srem_zrem_touch_parsing`, `test_smallvec_exists_and_sadd_parsing`,
+  `test_smallvec_del_and_hset_parsing`, `test_resp_lrange_zrange_fast_slice_parser`,
+  `test_unlink_readonly_wait_object_commands` (also overrides `proto-max-bulk-len` to test the
+  length rejection).
+- **Grammar coverage:** `test_resp_get`, `test_resp_set_and_put`, `test_inline_commands`,
+  `test_resp_hash_commands`, `test_hgetex_zero_expire_accepted_negative_rejected`,
+  `test_resp_keyspace_and_transactions`, `test_resp_bitmaps_and_hll`,
+  `test_resp_dump_and_restore`, `test_resp_streams`, `test_valkey_extended_parsers`,
+  `test_resp_semantic_cache_commands`, `test_parse_decimal_bytes_and_ascii_uppercase`.
+- **Classification:** `test_migrate_is_allowed_over_maxmemory`,
+  `test_is_write_command_follows_command_table`.
+
+The cargo-fuzz target lives in `fuzz/fuzz_targets/parse_command.rs`. End-to-end behaviour of
+parsed commands is covered by `connection.rs`'s test module and `tests/`.
+
+## 11. Code map
+
+| File | Key symbols | What they do |
+| :--- | :--- | :--- |
+| `src/resp.rs` | `parse_command`, `parse_command_trusted` | Entry points; grammar dispatch, empty-frame loop, trusted-input flag |
+| `src/resp.rs` | `parse_resp_array` | Two-pass RESP array framer, `DETACH_FRAME_MAX` copy, ≤16-arg fast path |
+| `src/resp.rs` | `parse_inline_command`, `split_inline_args` | Inline line framing and `redis-cli`-style quoting |
+| `src/resp.rs` | `parse_memcached_storage_command` | Memcached `set/add/replace` header + data block |
+| `src/resp.rs` | `build_command` | Name → `Command` constructor, experimental gate, option parsing |
+| `src/resp.rs` | `enum Command`, `*Subcommand` enums, `SetCondition`, `IncrName`, `ExpireOptions`, `BitfieldSubOp`, ... | The typed command surface |
+| `src/resp.rs` | `Command::allows_oom`, `Command::is_write_command`, `is_family_read`, `is_write_in_command_table` | OOM and write classification |
+| `src/resp.rs` | `PROTO_MAX_BULK_LEN`, `get_/set_proto_max_bulk_len`, `DETACH_FRAME_MAX`, `MAX_RANDOM_REPEATS` | Limits |
+| `src/resp.rs` | `EXPERIMENTAL_PREFIXES`, `set_experimental_commands`, `experimental_commands_enabled`, `is_experimental_command_name` | Experimental command gate |
+| `src/resp.rs` | `parse_decimal_bytes`, `bytes_to_uppercase_ascii`, `parse_redis_f64`, `parse_score_bound`, `parse_expire_options`, `parse_random_count`, `parse_min_idle_time`, `parse_lmovem_trailer`, `counted_args`, `parse_ft_params`, `until_unix_ms`, `find_newline[_at]` | Parsing helpers |
+| `src/connection.rs` | `handle_client_loop`, `run_pubsub_loop`, `read_replica_acks` | Main callers; error/close policy |
+| `src/connection.rs` | `write_resp_*`, `write_resp_err`, `CURRENT_CLIENT_RESP3`, `get_cmd_name`, `acl_cmd_name` | Reply encoding, command names |
+| `src/replication.rs` / `src/aof.rs` | `run_replica_worker` / `replay_aof_inner`, `split_rewritten_aof_to_shards` | Trusted-input callers |
+| `src/main.rs` / `src/config.rs` | `set_experimental_commands(enable_experimental_commands)` | Startup wiring of the experimental gate |
+| `src/vector.rs` | `MAX_VECTOR_DIM`, `MAX_HNSW_M`, `MAX_VSET_EF`, `MAX_PROJECTION_ENTRIES` | Vector limits enforced at parse time |
+| `fuzz/fuzz_targets/parse_command.rs` | `fuzz_target!` | libFuzzer harness for the framer |

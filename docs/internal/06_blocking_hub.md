@@ -1,433 +1,567 @@
-# Component 06: Blocking Operations & The Reactive Event Hub (Implementation Deep-Dive & Code Reference)
+# Component 06: Blocking Operations & the Reactive Event Hub — Implementation Reference
 
-> **Source Files**: `src/block.rs` (765 lines), plus the call sites that drive it in `src/connection.rs`, `src/server.rs`, `src/router.rs`, `src/shard.rs`, `src/mailbox.rs`.
 > **High-Level Design Spec**: [`docs/design/06_blocking_hub.md`](../design/06_blocking_hub.md)
 > **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
-
-This document is a line-level reference. Every claim below cites the current file/line it was verified against (checked 2026-09-30, HEAD `5657bb6`). `src/block.rs` itself only defines the waiter registry and the pop/notify algorithms — it has **no async code and no command parsing**. All blocking/timeout/polling/IPC logic lives in the callers, chiefly `src/connection.rs`.
-
----
-
-## 1. Source Module Map
-
-| File | Role |
-| :--- | :--- |
-| `src/block.rs` | `BlockHub`: waiter queues keyed by `Bytes` (key name), synchronous pop-and-deliver algorithms, pause/resume for `MULTI`/`EXEC`. |
-| `src/connection.rs` | Command handlers for every blocking command; `wait_for_blocked_result`/`wait_for_stream_result` (the actual async wait loop + fd-disconnect poll); `notify_list_or_defer`/`notify_zset_or_defer`/`notify_stream_or_defer` (the write-command hooks that drive the hub); `CLIENT UNBLOCK`/`CLIENT LIST`/`INFO` integration. |
-| `src/server.rs` | Handles the cross-shard `ShardMessage::NotifyList` IPC message (the one case where a *different* OS thread must run the notify algorithm); contains the `has_blocked_waiters` guards on the `LPUSH`/`ZADD` "fast paths". |
-| `src/router.rs` | `rpush`/`lpush`/etc. convenience wrappers that call `notify_list_or_defer` after a local write; `CLIENT LIST` "b" flag rendering via `hub.is_blocked(id)`. |
-| `src/shard.rs` | Defines `ShardMessage::NotifyList { keys: Vec<Bytes> }` (shard.rs:423-424), the mailbox variant used for cross-shard notification during `EXEC`. |
-| `src/replication.rs` | `wait_replicas` — the **separate**, non-`BlockHub` polling loop that backs `WAIT`/`WAITAOF` (see §6.10). |
+> **Main source files**: `src/block.rs` (the `BlockHub` waiter registry and the serve-on-write
+> algorithms); `src/connection.rs` (every blocking command handler, the async wait loops, the
+> write-side hooks, EXEC deferral, `CLIENT UNBLOCK`/`KILL`, `INFO`); `src/shard.rs`
+> (`ShardMessage::NotifyList`, `SWAPDB`/`MOVE`/`COPY ... DB` wakeups); `src/server.rs` (the shard
+> mailbox handler for `NotifyList`, `FLUSHDB`/`FLUSHALL` stream wakeups, guarded write fast paths);
+> `src/router.rs` (`CLIENT LIST` `b` flag, flush wakeups, `rpush` helper); `src/replication.rs`
+> (`REPLICAOF` unblocking, and the separate `WAIT` loop).
 
 ---
 
-## 2. Core Data Structures (`src/block.rs:1-94`)
+## 1. What this subsystem does
+
+Some Redis commands *wait for data* instead of returning an empty answer:
+
+| Family | Commands | Waits until… |
+| :--- | :--- | :--- |
+| List pop | `BLPOP`, `BRPOP`, `BLMPOP` | some listed key holds a non-empty list |
+| List move | `BLMOVE`, `BRPOPLPUSH` (parsed as `BLMOVE` with `is_rpoplpush`), `BLMOVEM` (Rudis extension, blocking `LMOVEM`) | the source list has enough elements |
+| Sorted-set pop | `BZPOPMIN`, `BZPOPMAX`, `BZMPOP` | some listed key holds a non-empty sorted set |
+| Stream read | `XREAD ... BLOCK ms`, `XREADGROUP ... BLOCK ms [CLAIM min-idle]` | a stream gets entries newer than the requested ID (or, with `CLAIM`, a pending entry becomes claimable) |
+
+Each command takes a timeout (`0` = wait forever). A blocked client must be woken **immediately**
+when another client writes the data, must get the data **exactly once** (two clients blocked on
+one list must not both receive the same element), and the pop it receives must be logged to the
+AOF and replicated in the same order as the write that triggered it.
+
+The **block hub** (`BlockHub` in `src/block.rs`) is the registry that makes this work. Blocking
+command handlers *register* a waiter (key + what to do + a reply channel); write commands
+(`LPUSH`, `ZADD`, `XADD`, `RENAME`, …) *notify* the hub, which **serves the waiter on the spot**:
+it pops/moves/reads on the waiter's behalf, under the hub lock, using the writer's table, and sends
+the finished result through the waiter's channel. The blocked connection only has to format the
+reply.
+
+`src/block.rs` itself contains no async code and no command parsing. Waiting, timeouts, disconnect
+detection and reply formatting live in the callers, mostly `src/connection.rs`.
+
+---
+
+## 2. Mental model
+
+Jargon used throughout:
+
+- **Shard** — one OS thread owning a slice of the keyspace (its own `ShardDb`/`RudisTable`).
+  A client connection lives on one shard; the keys it touches may be owned by others.
+- **Owner shard** — the shard that `router.target_shard(key)` maps a key to.
+- **Waiter** — one registration "client C waits on key K to do operation O".
+- **Serve** — perform the waiter's operation against the table and send the result.
+- **flume channel** — a multi-producer/multi-consumer channel usable from any thread and
+  awaitable from async code; each blocked command owns one `flume::bounded(1)` channel.
+
+There is **one `BlockHub` per listening port**, shared by every shard thread behind a
+`parking_lot::Mutex`. Registration and notification both go through that single lock, so a waiter
+registered from shard 0 is visible to a write executing on shard 3 with no extra messaging.
+
+```mermaid
+sequenceDiagram
+    participant A as "Client A (conn on shard 0)"
+    participant S0 as "Shard 0 thread"
+    participant Hub as "BlockHub (one per port, Mutex)"
+    participant S1 as "Shard 1 thread (owns key q)"
+    participant B as "Client B"
+    A->>S0: BLPOP q 0
+    S0->>S1: execute_remote LPOP q (fast path)
+    S1-->>S0: nil (list empty)
+    S0->>Hub: register_blocked_client + register_list_waiter(q)
+    S0->>S1: recheck_blocking_keys (NotifyList q)
+    S0->>S0: wait_for_blocked_result (await rx, 20 ms disconnect poll)
+    B->>S1: LPUSH q hello
+    S1->>S1: table.lpush
+    S1->>Hub: notify_list_or_defer, then notify_list with shard 1 table
+    Hub->>Hub: lpop q on shard 1 table, propagate LPOP q 1 to AOF and replicas
+    Hub-->>S0: tx.send(Popped(q, [hello]))
+    S0-->>A: *2 q hello
+```
+
+The hub never runs on a "neutral" thread: `notify_*` always executes on the **owner shard's
+thread** with that shard's table, because that is the only place the data can be popped safely.
+When a notification is needed from a thread that does not own the key (EXEC cleanup, the
+post-registration recheck), it is forwarded to the owner as `ShardMessage::NotifyList`.
+
+---
+
+## 3. Data structures (`src/block.rs`)
+
+### 3.1 Result and operation enums
+
+| Type | Variants | Meaning |
+| :--- | :--- | :--- |
+| `ListPopType` | `Left`, `Right` | Which end of a list to pop from / push to. |
+| `ZSetPopType` | `Min`, `Max` | Pop lowest or highest scores. |
+| `ClientUnblockType` | `Timeout`, `Error`, `WrongType` | Why a waiter was released without data. `Timeout`/`Error` come from `CLIENT UNBLOCK`; `Error` also from `REPLICAOF`; `WrongType` from a move whose destination holds a non-list. |
+| `BlockedListResult` | `Popped(key, Vec<Bytes>)`, `Unblocked(ClientUnblockType)` | What a list waiter receives. |
+| `BlockedZSetResult` | `Popped { key, items: Vec<(Bytes, f64)>, is_zmpop }`, `Unblocked(..)` | What a sorted-set waiter receives. |
+| `BlockedStreamResult` | `Data(Vec<u8>)`, `Error(Vec<u8>)`, `CrossShard`, `Unblocked(..)` | What a stream waiter receives: a fully formatted RESP reply, an error reply, a bare "go re-query" signal for cross-shard reads, or a forced release. |
+
+`WaiterOp` says what serving a list waiter means:
 
 ```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ListPopType { Left, Right }                              // block.rs:7
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClientUnblockType { Timeout, Error, WrongType }          // block.rs:13
-
-#[derive(Clone, Debug)]
-pub enum BlockedListResult {                                      // block.rs:20
-    Popped(Bytes, Vec<Bytes>),
-    Unblocked(ClientUnblockType),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZSetPopType { Min, Max }                                  // block.rs:26
-
-#[derive(Clone, Debug)]
-pub enum BlockedZSetResult {                                       // block.rs:32
-    Popped { key: Bytes, items: Vec<(Bytes, f64)>, is_zmpop: bool },
-    Unblocked(ClientUnblockType),
-}
-
-pub struct ZSetWaiter {                                            // block.rs:41
-    pub client_id: u64,
-    pub key: Bytes,
-    pub pop_type: ZSetPopType,
-    pub count: usize,
-    pub is_zmpop: bool,
-    pub sender: Sender<BlockedZSetResult>,                         // flume::Sender
-}
-
-#[derive(Clone, Debug)]
-pub enum WaiterOp {                                                 // block.rs:51
-    Pop   { pop_type: ListPopType, count: usize },
-    Move  { where_from: ListPopType, where_to: ListPopType, destination: Bytes },
+pub enum WaiterOp {
+    Pop   { pop_type: ListPopType, count: usize, suppress_repl: bool },   // BLPOP/BRPOP/BLMPOP
+    Move  { where_from: ListPopType, where_to: ListPopType,
+            destination: Bytes, is_rpoplpush: bool },                       // BLMOVE/BRPOPLPUSH
     Movem { where_from: ListPopType, where_to: ListPopType, destination: Bytes,
-            mode: crate::resp::LmovemMode, count: usize, ordering: crate::resp::LmovemOrdering },
-}
-
-pub struct ListWaiter {                                            // block.rs:71
-    pub client_id: u64,
-    pub key: Bytes,
-    pub op: WaiterOp,
-    pub sender: Sender<BlockedListResult>,
-}
-
-pub struct StreamWaiter {                                          // block.rs:78
-    pub client_id: u64,
-    pub key: Bytes,
-    pub sender: Sender<()>,
+            mode: LmovemMode /* Count | Exactly */, count: usize,
+            ordering: LmovemOrdering /* Obo | Bulk */ },                    // BLMOVEM
 }
 ```
 
-`WaiterOp::Movem` is new (it did not exist in the pre-growth version of this file): it backs `BLMOVEM`, the blocking form of the new multi-element `LMOVEM` command (`git log`: `17e55ef feat(list): implement LMOVEM and BLMOVEM`). `ZSetWaiter.is_zmpop` and `ZSetWaiter.count` generalize the old single-element `BZPOPMIN`/`BZPOPMAX` waiter into also covering `BZMPOP` (count ≥ 1, `is_zmpop: true`).
+`suppress_repl` is set only by `register_list_waiter_no_repl`, used by the cross-shard `BLMOVE`
+path (§5.4): the pop is still appended to the owner's AOF, but not replicated, because the handler
+later replicates the logical `LMOVE` itself. `is_rpoplpush` only affects how the served move is
+propagated (`RPOPLPUSH` vs `LMOVE`).
 
-### 2.1 `BlockHub` struct (`block.rs:84-94`)
+### 3.2 Waiter records
+
+| Struct | Fields | Notes |
+| :--- | :--- | :--- |
+| `ListWaiter` | `client_id: u64`, `key: Bytes`, `op: WaiterOp`, `sender: Sender<BlockedListResult>` | One per (client, key). |
+| `ZSetWaiter` | `client_id`, `key`, `pop_type: ZSetPopType`, `count: usize`, `is_zmpop: bool`, `sender: Sender<BlockedZSetResult>` | `BZPOPMIN/MAX` register `count = 1, is_zmpop = false`; `BZMPOP` registers its `COUNT` and `is_zmpop = true` (the flag selects the reply shape). |
+| `StreamWaiter` | `client_id`, `key`, `cmd: Command`, `is_resp3: bool`, `is_cross_shard: bool`, `sender: Sender<BlockedStreamResult>` | `cmd` is the client's own `XREAD`/`XREADGROUP` rewritten to be non-blocking with concrete IDs (§5.5); the hub re-executes it. `is_resp3` lets the hub format the reply in the client's protocol. |
+
+### 3.3 `BlockHub`
 
 ```rust
 pub struct BlockHub {
     pub port: u16,
-    list_waiters: HashMap<Bytes, VecDeque<ListWaiter>>,            // FIFO per key
-    zset_waiters: HashMap<Bytes, VecDeque<ZSetWaiter>>,             // FIFO per key
-    stream_waiters: HashMap<Bytes, Vec<StreamWaiter>>,              // NOT FIFO-ordered, see §7
-    blocked_clients: HashMap<u64, Sender<BlockedListResult>>,       // client_id -> list/move/movem sender
-    blocked_zset_clients: HashMap<u64, Sender<BlockedZSetResult>>,  // client_id -> zset sender
-    blocked_stream_clients: HashMap<u64, Sender<()>>,               // client_id -> stream sender
-    paused_count: usize,                                            // nesting depth for MULTI/EXEC pause
-    pending_notifies: Vec<Bytes>,                                   // keys deferred while paused
+    list_waiters:   HashMap<(usize, Bytes), VecDeque<ListWaiter>>,  // FIFO per (db, key)
+    zset_waiters:   HashMap<(usize, Bytes), VecDeque<ZSetWaiter>>,  // FIFO per (db, key)
+    stream_waiters: HashMap<(usize, Bytes), Vec<StreamWaiter>>,     // all served each notify
+    blocked_clients:        HashMap<u64, Sender<BlockedListResult>>,   // client_id -> list sender
+    blocked_zset_clients:   HashMap<u64, Sender<BlockedZSetResult>>,   // client_id -> zset sender
+    blocked_stream_clients: HashMap<u64, Sender<BlockedStreamResult>>, // client_id -> stream sender
+    paused_count: usize,                    // >0 while an EXEC is running
+    pending_notifies: Vec<(usize, Bytes)>,  // keys written during EXEC, deduplicated
+    published_waiters: usize,               // this hub's share of TOTAL_BLOCKED_WAITERS
 }
 ```
 
-Nine fields total (was smaller pre-growth; `pending_notifies`/`paused_count` are the `MULTI`/`EXEC` deferred-notify machinery, §8). Every waiter queue is keyed by the **raw key `Bytes`**, not by shard — see §4 for why that is safe.
+- **Keys are `(db index, key)`**. The DB index is read from the thread-local
+  `connection::CURRENT_DB` at registration and notification time, so `SELECT 1; BLPOP k` and
+  `SELECT 0; LPUSH k x` do not meet. Callers that serve another DB first set both `CURRENT_DB`
+  and `ShardDb::select_db`.
+- **The waiter queues** answer "who waits on this key?". A client blocked on `BLPOP a b c` has one
+  `ListWaiter` in each of three queues, all sharing one `Sender`.
+- **The `blocked_*_clients` maps** answer "is this client blocked, and how do I reach it?" — used by
+  `CLIENT UNBLOCK`, `CLIENT LIST`'s `b` flag, `INFO`'s `blocked_clients`, and cleanup.
+- `BlockHub::default()` builds a hub for port 0. Dropping a hub withdraws its share from the global
+  counter (`Drop` calls `publish_waiters(0)`).
 
-### 2.2 Global registry (`block.rs:96-111`)
+### 3.4 Process-wide registry and the cheap "anyone blocked?" check
 
 ```rust
-pub static PORT_BLOCK_HUBS: LazyLock<Mutex<HashMap<u16, Arc<Mutex<BlockHub>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static TOTAL_BLOCKED_WAITERS: std::sync::atomic::AtomicUsize = AtomicUsize::new(0);
+pub static PORT_BLOCK_HUBS: LazyLock<Mutex<HashMap<u16, Arc<Mutex<BlockHub>>>>>;
+static TOTAL_BLOCKED_WAITERS: AtomicUsize;              // sum of every hub's share
 
-#[inline(always)]
-pub fn has_blocked_waiters(_port: u16) -> bool {
-    TOTAL_BLOCKED_WAITERS.load(Ordering::Relaxed) > 0
-}
-
-pub fn get_block_hub_for_port(port: u16) -> Arc<Mutex<BlockHub>> {
-    let mut map = PORT_BLOCK_HUBS.lock().unwrap();
-    map.entry(port).or_insert_with(|| Arc::new(Mutex::new(BlockHub::new(port)))).clone()
-}
+pub fn has_blocked_waiters(_port: u16) -> bool { TOTAL_BLOCKED_WAITERS.load(Relaxed) > 0 }
+pub fn get_block_hub_for_port(port: u16) -> Arc<Mutex<BlockHub>>;  // lazily inserts
 ```
 
-**There is exactly one `BlockHub` per listening port**, not one per shard, lazily created in a process-wide `Mutex<HashMap<u16, Arc<Mutex<BlockHub>>>>`. This is the cross-shard mechanism — see §4.
+`has_blocked_waiters` is the hot-path filter: every list/zset/stream write calls it, and when it
+is `false` the write never touches the hub mutex. It is process-wide (the `port` argument is
+ignored), so with several servers in one process a waiter on any port makes every port take the
+slow path — conservative, never a missed wakeup.
 
-**Verified bug/surprise**: `has_blocked_waiters`'s `port` parameter is named `_port` and is **unused**. `TOTAL_BLOCKED_WAITERS` is one process-wide `AtomicUsize`, not per-port, even though `PORT_BLOCK_HUBS` is keyed by port. `BlockHub::sync_atomic_waiters_count` (block.rs:134-144) computes a count from `self` alone and does `TOTAL_BLOCKED_WAITERS.store(count, ...)` — an unconditional overwrite, not an add/sub against a per-hub baseline. If a single process ever hosts two `BlockHub`s for two different ports (e.g. a test binary that spins up two servers, or `cfg(test)` tests in `block.rs` itself running in parallel threads with ports 12345/12346/12347), `sync_atomic_waiters_count` calls on hub A will clobber whatever hub B last stored. In the worst case this can make `has_blocked_waiters(portB)` return `false` while port B genuinely has blocked waiters, which causes `notify_list_or_defer`/`notify_zset_or_defer`/`notify_stream_or_defer` (connection.rs:211-253) to return immediately without ever taking the hub lock or delivering the notification — a real missed-wakeup, not just a missed optimization. In the common single-port-per-process deployment this is inert, since the shared counter degenerates to a correct single-hub counter.
+Each hub keeps the counter correct with **delta publishing**: after every mutation
+`sync_atomic_waiters_count` computes
+
+```
+count = paused_count + Σ waiters in all three queues + |blocked_clients| + |blocked_zset_clients| + |blocked_stream_clients|
+```
+
+and `publish_waiters(count)` does `fetch_add`/`fetch_sub` of the difference from
+`published_waiters`. A hub therefore only ever adds or removes its own contribution; one hub
+emptying cannot hide another hub's waiters (unit test
+`test_one_hub_emptying_does_not_hide_another_hubs_waiters`). The number is a "non-zero means
+look" signal, not a client count. `paused_count` is included so that while an EXEC is running the
+write hooks always reach the hub and defer their notifications (§6).
 
 ---
 
-## 3. `BlockHub` method inventory (`impl BlockHub`, `block.rs:119-619`)
+## 4. `BlockHub` API
 
-| Method | Lines | Purpose |
-| :--- | :--- | :--- |
-| `new(port)` | 120-132 | Zero-initializes all six maps/counters. |
-| `sync_atomic_waiters_count(&self)` | 135-144 | Recomputes `paused_count + Σlen(list/zset/stream waiters) + blocked_clients.len()*3-ish` and stores into the (global, see §2.2) atomic. Called after every mutating op. |
-| `is_paused` / `pause` / `add_pending_notify` / `resume` / `clear_pending_notifies` | 146-179 | `MULTI`/`EXEC` deferred-notify machinery, §8. |
-| `blocked_clients_count` | 181-185 | Sum of the three `blocked_*_clients` map lengths — used by `INFO`'s `blocked_clients`. |
-| `blocking_keys_count` | 187-205 | Distinct-key union across list/zset/stream waiter maps (non-empty queues only) — `INFO`'s `total_blocking_keys`. |
-| `blocking_keys_on_nokey_count` | 207-209 | `stream_waiters` non-empty-queue count only — `INFO`'s `total_blocking_keys_on_nokey`. Note: this does **not** distinguish "NOKEY" semantics the way real Redis does; it is simply "how many keys have at least one stream waiter," since only stream blocking (`XREAD`/`XREADGROUP`) in this codebase is driven by key-doesn't-exist-yet waits. |
-| `register_blocked_client` / `register_blocked_zset_client` | 211-223 | Insert into `blocked_clients`/`blocked_zset_clients` keyed by `client_id` (used by `CLIENT UNBLOCK`/disconnect cleanup — list/move/movem waiters all share one sender type so one map suffices). |
-| `is_blocked(client_id)` | 225-229 | OR of membership in all three `blocked_*` maps — backs the `CLIENT LIST`/`CLIENT INFO` `flags=b` bit. |
-| `remove_waiters_for_client` | 231-248 | Scrubs a client's entries out of **all** list/zset/stream waiter queues (not just one key) plus the three `blocked_*` maps, then prunes empty queue entries and re-syncs the atomic. This is what guarantees a client blocked on `BLPOP k1 k2` doesn't leave a dangling `k2` waiter after being satisfied via `k1`. |
-| `unregister_blocked_client` | 250-252 | Thin wrapper over `remove_waiters_for_client`; called from disconnect/timeout paths. |
-| `unblock_client(id, type)` | 254-281 | `CLIENT UNBLOCK` implementation — looks the id up in each `blocked_*` map, sends `Unblocked(type)` (or, for streams, just `try_send(())`, see §9.3 bug), purges that client's waiter entries, returns whether anything was unblocked. |
-| `register_list_waiter` | 283-301 | Push a `ListWaiter{ op: Pop }` onto `list_waiters[key]` (back of the `VecDeque` — FIFO). Backs `BLPOP`/`BRPOP`/`BLMPOP`. |
-| `register_move_waiter` | 303-326 | Push `ListWaiter{ op: Move }` — backs `BLMOVE`. |
-| `register_movem_waiter` | 328-357 | Push `ListWaiter{ op: Movem }` — backs `BLMOVEM` (new). |
-| `notify_list(table, key)` | 359-516 | The pop-and-deliver algorithm for all three `WaiterOp` variants, run under the hub lock using the **caller's local `RudisTable`**. See §3.1. |
-| `register_zset_waiter` | 518-539 | Push `ZSetWaiter` — backs `BZPOPMIN`/`BZPOPMAX` (count=1, is_zmpop=false) and `BZMPOP` (count=N, is_zmpop=true). |
-| `notify_zset(table, key)` | 542-584 | Pop-and-deliver for sorted sets. See §3.1. |
-| `register_stream_waiter` | 586-593 | Insert into `blocked_stream_clients` **and** push into `stream_waiters[key]`, de-duplicated by `client_id` within that key's `Vec`. Backs `XREAD BLOCK`/`XREADGROUP BLOCK`. |
-| `notify_stream(key)` | 596-612 | Broadcast wakeup to every waiter on that key — see §3.2 for the `thread::sleep` finding. |
-| `notify_all_streams` | 614-619 | Iterates every key with stream waiters and calls `notify_stream` on each — used by `MULTI`/`EXEC` resume (`connection.rs:1458`) and `FLUSHALL`/`FLUSHDB` (`connection.rs:14787`) to wake everyone unconditionally. |
+| Method | Purpose |
+| :--- | :--- |
+| `new(port)` | Empty hub. |
+| `register_blocked_client` / `register_blocked_zset_client` | Record the client's list / zset sender in `blocked_clients` / `blocked_zset_clients`. Called once per blocking command, before the per-key registrations. |
+| `register_list_waiter(client, key, pop_type, count, tx)` | Append a `WaiterOp::Pop` waiter (`suppress_repl = false`) to the back of the key's queue. |
+| `register_list_waiter_no_repl(..)` | Same with `suppress_repl = true` (cross-shard `BLMOVE`). |
+| `register_move_waiter(client, source, from, to, destination, is_rpoplpush, tx)` | Append a `WaiterOp::Move` on `source`. |
+| `register_movem_waiter(client, source, from, to, destination, mode, count, ordering, tx)` | Append a `WaiterOp::Movem` on `source`. |
+| `register_zset_waiter(client, key, pop_type, count, is_zmpop, tx)` | Append a `ZSetWaiter`. |
+| `register_stream_waiter(client, key, cmd, is_resp3, is_cross_shard, tx)` | Insert into `blocked_stream_clients` **and** push a `StreamWaiter` on the key, skipping the push if this client already waits on that key (so re-registering in a loop is safe). |
+| `notify_list(table, key)` | Serve list waiters on `key` (§5.1). |
+| `notify_zset(table, key)` | Serve sorted-set waiters on `key` (§5.2). |
+| `notify_stream(db, key)` | Serve stream waiters on `key` (§5.3). Takes the whole `ShardDb` because it executes commands. |
+| `notify_all_streams(db)` | `notify_stream` for every stream-waited key of the current DB. Used after `FLUSHDB`/`FLUSHALL` (local, `Router::flushdb/flushall`, the `ShardMessage::FlushDb/FlushAll` handlers) and `DEBUG` shard-flush. |
+| `notify_db_keys(db, db_idx)` | For DB `db_idx`, serve every waited key that now exists and is unexpired (lists, then zsets, then streams), deferring instead if paused. Used by `ShardDb::swap_dbs`, `move_key` and `copy_to_db` after `SWAPDB`/`MOVE`/`COPY ... DB`. |
+| `pause()` / `is_paused()` / `add_pending_notify(key)` / `resume()` | EXEC deferral (§6). |
+| `remove_waiters_for_client(id)` | Remove the client from **every** queue and all three `blocked_*` maps, prune empty queues, re-sync the counter. |
+| `unregister_blocked_client(id)` | Alias of `remove_waiters_for_client`; used by `BlockedClientGuard` and connection cleanup. |
+| `unblock_client(id, type)` | `CLIENT UNBLOCK`: send `Unblocked(type)` through whichever senders the client has, remove its waiters, return whether it was blocked. |
+| `unblock_writers()` | Release with `Error` every client whose served command would write: all list and zset waiters, plus `XREADGROUP` stream waiters (plain `XREAD` keeps waiting). Called when the server becomes a replica (`REPLICAOF host port`), matching Redis. |
+| `is_blocked(id)` | Membership in any `blocked_*` map — the `CLIENT LIST`/`CLIENT INFO` `b` flag. |
+| `blocked_clients_count()` | Sum of the three `blocked_*` map sizes — `INFO clients: blocked_clients` (plus clients held by `CLIENT PAUSE`). |
+| `blocking_keys_count()` | Distinct `(db, key)` pairs with at least one waiter of any kind — `total_blocking_keys`. |
+| `blocking_keys_on_nokey_count()` | Keys with at least one stream waiter — `total_blocking_keys_on_nokey` (an approximation: only stream waiters are counted). |
 
-### 3.1 `notify_list` / `notify_zset`: the actual pop algorithm
+Two private helpers propagate what serving changed:
 
-Both run entirely **under the `Mutex<BlockHub>` lock**, taking `&mut RudisTable` from the caller so the pop is atomic with the notification (no other thread can observe the pushed-then-immediately-repopped state): the push already happened (caller already ran `LPUSH`/`ZADD` against its own local table before calling `notify_*_or_defer`), and `notify_list`/`notify_zset` re-enter the table to pop the element(s) back out on the blocked waiter's behalf, then ship the popped value(s) through the waiter's `flume::Sender`.
-
-`notify_list` (`block.rs:361-516`) walks `list_waiters[key]` front-to-back with `pop_front()`:
-- `WaiterOp::Pop{ pop_type, count }`: pops `count` elements via `table.lpop`/`rpop`. If elements were available, sends `Popped`, marks the client satisfied, and **keeps looping** (so one `LPUSH` with N elements can satisfy multiple FIFO-queued `BLPOP`/`BLMPOP` waiters in a single notify call) — unless the key no longer exists, which stops the loop. If nothing was available, it `push_front`s the waiter back and stops (nothing later in the queue can be satisfied either, since count-based pops are monotonic in availability).
-- `WaiterOp::Move{ where_from, where_to, destination }`: checks `destination`'s type is `none`/`list` (else sends `WrongType` and continues to the next waiter), pops exactly one element, pushes it onto `destination`, sends `Popped`, and **unconditionally `break`s** — only one `BLMOVE` waiter is served per `notify_list` call, even if more elements remain in the source list and more `BLMOVE` waiters are queued behind it. See §9.1 for why this is a real limitation.
-- `WaiterOp::Movem{..}`: same shape as `Move` but delegates to `table.lmovem(...)`; also `break`s after one successful satisfaction.
-- After the loop, `notify_list` recurses into itself for the `destination` key if a `Move`/`Movem` just pushed into it (`dest_to_notify`), so a chain of `BLMOVE src1->dst1`, `BLMOVE dst1->dst2` wakes transitively in one call.
-- Finally, `remove_waiters_for_client` is called once per satisfied client id, scrubbing that client out of every other key's queue too (so a multi-key `BLPOP k1 k2` doesn't leave a stale `k2` entry after being satisfied on `k1`).
-
-`notify_zset` (`block.rs:542-584`) is the same FIFO-pop-while-available shape for `ZSetWaiter`, with one extra guard: `satisfied_clients.contains(&waiter.client_id)` to avoid re-serving the same client twice within one call (possible only if a client passed the same key twice to `BZPOPMIN`/`BZMPOP`).
-
-### 3.2 `notify_stream`: broadcast, not FIFO — and a blocking-sleep finding
-
-```rust
-pub fn notify_stream(&mut self, key: &Bytes) {
-    if let Some(waiters) = self.stream_waiters.remove(key) {
-        for (idx, waiter) in waiters.iter().enumerate() {
-            self.blocked_stream_clients.remove(&waiter.client_id);
-            if idx > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(1));   // block.rs:601
-            }
-            let _ = waiter.sender.try_send(());
-        }
-        ...
-    }
-}
-```
-
-Unlike lists/sorted sets (single winner per push, FIFO), `notify_stream` wakes **every** waiter registered on that key (a plain `Vec`, no FIFO ordering is implied or needed since all of them are told to go re-read the stream themselves). The signal itself carries no data — `Sender<()>` — each woken client re-runs its own `XREAD`/`XREADGROUP` to see what's new.
-
-**Verified bug**: `std::thread::sleep(1ms)` is inserted between each waiter's wakeup, apparently to stagger a thundering herd of clients re-reading the same stream. Rudis is a thread-per-core, single-threaded-per-shard async reactor (built on `monoio`); `notify_stream` is a **synchronous, non-async** function called directly from the reactor's command-handling path (via `notify_stream_or_defer`, the `MULTI`/`EXEC` resume path, `ShardMessage::NotifyList`, and `FLUSHALL`). A genuine `std::thread::sleep` here blocks the **entire shard's OS thread** — not just the notifying client, but every other connection pinned to that core — for `(N-1)` milliseconds when N clients are blocked on the same stream key. This directly violates the non-blocking-reactor invariant the rest of the codebase depends on and is the single most actionable finding in this file.
+- `propagate_served(port, cmd)` / `propagate_served_opts(port, cmd, suppress_repl)` convert the
+  equivalent non-blocking command to RESP (`aof::command_to_resp`; if that fails,
+  `aof::note_unpropagated`), append it to the current shard's AOF writer (found through the
+  thread-local `CURRENT_ROUTER`), and, unless suppressed and if replicas are connected, send it
+  with `replication::propagate_shard_bytes` (or `propagate_bytes` if no router is installed).
+  Because this runs on the owner's thread right after the triggering write, the AOF and replicas
+  see `LPUSH q x` followed by `LPOP q 1`, in that order, in the same shard's stream.
 
 ---
 
-## 4. Cross-shard wakeup mechanics
+## 5. Algorithms
 
-Rudis shards the keyspace across cores (`src/router.rs::target_shard`/`key_slot`); each shard owns its own `RudisTable` and runs on its own OS thread. The question: if a client's `BLPOP k` command is being served by shard A (because its *connection* was accepted there) but key `k` is owned by shard B, how does a `LPUSH k` executed on shard B wake the waiter?
+### 5.1 `notify_list(table, key)` — serve list waiters
 
-**Answer: there is no per-shard hub to wake across — there is only one.** `get_block_hub_for_port(port)` (`block.rs:106-111`) returns the *same* `Arc<Mutex<BlockHub>>` regardless of which shard thread calls it, because `PORT_BLOCK_HUBS` is keyed only by `port`, not by `(port, shard_id)`. Concretely:
+Runs under the hub lock on the owner shard's thread; the caller has already applied its write.
 
-1. A blocking command handler (e.g. `Command::Blpop`, `connection.rs:7909`) first tries a **local, non-blocking fast path**: for each key, if `router.target_shard(k) == router.shard_id` it pops directly from `router.local_db`; otherwise it issues `router.execute_remote(target, Command::Lpop{..})` — a synchronous cross-shard RPC through the mailbox — to try popping on the *other* shard right away. Only if every key comes back empty does it fall through to registering waiters.
-2. It then locks the single global hub and calls `hub.register_list_waiter(client_id, k, ..., tx)` **once per key**, regardless of which shard actually owns `k`. The waiter — including its `flume::Sender` — lives in the one shared `BlockHub`.
-3. Later, when some shard (whichever one physically owns `k`) executes an `LPUSH k` and the write succeeds, it calls `notify_list_or_defer(&mut local_db, &k)` (`connection.rs:211-222`) using **its own local `db.table`**. This locks the same global hub, finds the waiter (registered possibly by a different shard thread), and runs `notify_list`, which pops from the *owning* shard's local table (correct — the data genuinely lives there) and does `waiter.sender.send(...)`.
-4. `flume::Sender`/`Receiver` is a cross-thread MPMC channel, so the result crosses from shard B's thread to shard A's thread without any additional shard IPC — the `Mutex<BlockHub>` is the only cross-shard synchronization primitive involved in the common case.
+1. `touch_watched_key(port, key)` (a served pop modifies the key, so `WATCH`ers must be
+   invalidated). If the key is logically expired, return.
+2. Call `shard::before_write_table(table, db, key)` so an in-progress non-blocking AOF rewrite
+   snapshots the key's old image first (it is a no-op when no rewrite is running).
+3. Take waiters from the **front** of `list_waiters[(db, key)]` one at a time:
+   - Skip (drop) waiters whose receiver is gone (`sender.is_disconnected()`).
+   - If the key no longer exists, put the waiter back at the front and stop. (This also prevents a
+     move waiter from failing with `WRONGTYPE` before any element arrived.)
+   - **`Pop { pop_type, count, suppress_repl }`**: `lpop`/`rpop` up to `count`. If elements came
+     out, propagate `LPOP key n` / `RPOP key n` (n = actual number), send
+     `Popped(key, vals)`, record the client as satisfied, and **continue with the next waiter**
+     while the key still exists. If nothing came out (or the key is not a list), put the waiter
+     back and stop.
+   - **`Move { .. }`**: `before_write_table` for the destination; if the destination exists and is
+     not a list, send `Unblocked(WrongType)`, mark satisfied and continue. Otherwise pop one
+     element, push it to the destination, propagate `LMOVE` (or `RPOPLPUSH`), touch the
+     destination's watchers, send `Popped(key, [val])`, remember the destination for step 5 and
+     **stop** — at most one move waiter is served per call.
+   - **`Movem { .. }`**: same destination type check, then `table.lmovem(..)`. `Ok(Some(vals))`:
+     propagate `LMOVEM ... EXACTLY <n>` with the real count, touch both keys, send, remember the
+     destination, **stop**. `Ok(None)` (not enough elements — e.g. `EXACTLY 5` with 3 present):
+     put back, stop. `Err` (wrong type): send `Unblocked(WrongType)` and continue.
+4. For each satisfied client call `remove_waiters_for_client`, removing its waiters on all other
+   keys (a `BLPOP a b` served from `a` must not linger on `b`).
+5. If a move pushed into a destination, recurse `notify_list(table, destination)` so a waiter on
+   the destination (e.g. a chain `BLMOVE a b`, `BLPOP b`) is served in the same call.
 
-So the "cross-shard signal" for the ordinary (non-transactional) write path is: **a single process-wide `Mutex<BlockHub>` shared by all shard threads for a port, plus `flume` channels to ferry the result back to whichever thread owns the blocked connection.** There is no extra mailbox/IPC round-trip needed because registration and notification both go through the same lock, and the lock is uncontended in the vast majority of calls thanks to the `has_blocked_waiters` fast-reject check.
+**Worked example.** Clients C1, C2, C3 run `BLPOP q 0` in that order; C4 runs `BLMPOP 0 1 q LEFT
+COUNT 5` last. Then `RPUSH q a b c d` executes on q's owner shard:
 
-### 4.1 The one case that *does* need shard IPC: `MULTI`/`EXEC`
+1. `RPUSH` succeeds; its handler calls `notify_list_or_defer(db, q)`; the counter is non-zero, the
+   hub is not paused, so `notify_list` runs.
+2. C1: `lpop q 1` → `[a]`, propagate `LPOP q 1`, send. q still exists → continue.
+3. C2 gets `[b]`, C3 gets `[c]`. C4: `lpop q 5` → `[d]`, propagate `LPOP q 1`, send. q is now
+   gone → stop.
+4. All four clients are removed from the hub; each connection wakes up and formats its reply.
 
-During `EXEC`, the hub is paused (`hub_arc.lock().unwrap().pause()`, `connection.rs:1418`) so that writes inside the transaction don't notify waiters mid-transaction (`notify_*_or_defer` sees `hub.is_paused()==true` and calls `add_pending_notify(key)` instead of notifying — `connection.rs:218-220` etc.). After the transaction body runs, `hub_arc.lock().unwrap().resume()` (`connection.rs:1452`) drains `pending_notifies` and, **for each pending key**, decides where to run the actual notify:
+### 5.2 `notify_zset(table, key)` — serve sorted-set waiters
+
+Same shape as the `Pop` case: touch watchers, return if expired, `before_write_table`, then walk
+the FIFO queue. A waiter is skipped if disconnected **or already satisfied in this call** (a client
+that listed the same key twice). `zpopmin`/`zpopmax(key, count)`; non-empty result → propagate
+`ZPOPMIN/ZPOPMAX key n`, send `Popped { key, items, is_zmpop }`, continue while the key exists;
+empty or error → put back and stop. Satisfied clients are then removed everywhere.
+
+### 5.3 `notify_stream(db, key)` — serve stream waiters
+
+Stream waiters are not FIFO competitors: every client reading new entries can receive the same
+entries (and consumer groups hand out distinct entries by themselves). So `notify_stream` visits
+**all** waiters on the key and serves each one that now has something to read:
+
+1. If anyone waits on `(db, key)`, call `shard::before_write` (AOF-rewrite snapshot; serving an
+   `XREADGROUP` changes group state).
+2. For each waiter, in registration order:
+   - disconnected → mark for removal;
+   - `is_cross_shard` → send `CrossShard` (the client will re-query all shards itself), mark;
+   - otherwise set `CURRENT_CLIENT_RESP3` to the waiter's protocol and run the stored command with
+     `execute_local_command(&waiter.cmd, db, &mut out, aof)` using this shard's AOF writer. If
+     `out` is an empty reply (`$-1`, `*0`) — or, for `XREAD` only, a `-WRONGTYPE` error — the waiter
+     stays. Otherwise send `Error(out)` if it starts with `-`, else `Data(out)`, and mark it.
+3. Remove the marked waiters (and their `blocked_stream_clients` entries), drop the key's entry if
+   empty, remove those clients from every other stream key, re-sync the counter.
+
+Because the stored command is the client's own `XREADGROUP`, serving it updates the group's
+last-delivered ID and PEL, and `execute_local_command` logs/replicates it exactly like a normal
+read. An `XREADGROUP` whose group was destroyed (`XGROUP DESTROY`) or whose key was deleted gets
+the error reply its re-execution produces (for example a `NOGROUP` error) through `Error`.
+
+**Which writes notify streams.** `notify_stream_or_defer` is called by `XADD`, `XNACK`,
+`XGROUP DESTROY`, and by key-replacing commands — `SET` (including the `FastSet` mailbox path),
+`MSET`, `DEL`/`UNLINK` (including the `Del` mailbox path), `RENAME`, `MOVE`, `COPY` — so a blocked
+reader observes a stream that was deleted or replaced.
+
+### 5.4 The write side: `notify_*_or_defer` and friends (`src/connection.rs`)
 
 ```rust
-let pending = hub_arc.lock().unwrap().resume();
-for k in pending {
-    let shard_id = router.target_shard(&k);
-    if shard_id == router.shard_id {
-        // local: run notify_* using this thread's own table
-        let mut local_db = router.local_db.borrow_mut();
-        let mut hub = hub_arc.lock().unwrap();
-        hub.notify_stream(&k);
-        hub.notify_list(&mut local_db.table, &k);
-        hub.notify_zset(&mut local_db.table, &k);
-    } else {
-        // remote: ask the owning shard to do it with ITS table
-        let _ = router.senders[shard_id].send(ShardMessage::NotifyList { keys: vec![k] });
-    }
-}
-```
-(`connection.rs:1452-1464`)
-
-If the key is owned by a *different* shard than the one running `EXEC`, there is no local table to pop from, so it sends `ShardMessage::NotifyList { keys }` (`shard.rs:423-424`) through that shard's mailbox. The target shard's reactor loop picks it up in its `ShardMessage` match arm (`server.rs:1725-1733`):
-
-```rust
-ShardMessage::NotifyList { keys } => {
-    let mut db = cross_shard_db.borrow_mut();
+pub fn notify_list_or_defer(db: &mut ShardDb, key: &Bytes) {
+    touch_watched_key(db.port, key.as_ref());
+    if !crate::block::has_blocked_waiters(db.port) { return; }   // lock-free fast exit
     let hub_arc = crate::block::get_block_hub_for_port(db.port);
-    let mut hub = hub_arc.lock().unwrap();
-    for k in keys {
-        hub.notify_stream(&k);
-        hub.notify_list(&mut db.table, &k);
-        hub.notify_zset(&mut db.table, &k);
-    }
+    let mut hub = hub_arc.lock();
+    if hub.is_paused() { hub.add_pending_notify(key.clone()); }   // inside EXEC
+    else { hub.notify_list(&mut db.table, key); }
 }
+// notify_zset_or_defer / notify_stream_or_defer are identical apart from the notify_* call.
 ```
 
-This re-locks the same global hub from the *owning* shard's thread and runs the exact same `notify_list`/`notify_zset`/`notify_stream` using that shard's own local table — i.e. it is the same algorithm as the ordinary path, just dispatched through a mailbox message instead of being called inline, because `EXEC`'s deferred-notify design only knows "key K needs notifying" after the fact, potentially from the wrong shard thread.
+Callers (all run on the owner shard with its `ShardDb`):
 
-**`CLIENT PAUSE`/`CLIENT UNPAUSE` do not touch `BlockHub` at all** — `pause()`/`is_paused()`/`resume()` are called *only* from the `MULTI`/`EXEC`/`DISCARD`/`RESET` paths (`connection.rs:1335-1465`; grep confirms no other call sites). `ClientSubcommand::Pause`/`Unpause`/`NoTouch` are unconditional `+OK` no-ops (`connection.rs:7189-7192`) — naming collision only, not shared state.
+| Hook | Called after |
+| :--- | :--- |
+| `notify_list_or_defer` | `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LINSERT`, `LMOVE`/`LMOVEM` (on the destination), `SORT ... STORE` (on the destination), `RENAME`, `MOVE`, `COPY`, `Router::rpush` |
+| `notify_zset_or_defer` | `ZADD` (only when something changed), `ZINCRBY`, `MOVE`, `COPY` |
+| `notify_stream_or_defer` | see §5.3 |
+| `BlockHub::notify_db_keys` | `SWAPDB` (both DBs), `MOVE` and `COPY ... DB` (target DB) |
+| `BlockHub::notify_all_streams` | `FLUSHDB`, `FLUSHALL`, DEBUG shard-flush |
 
----
+**Write fast paths must respect the hub.** The pipeline-squashing executors have zero-allocation
+paths for `LPUSH`, `RPUSH` and `ZADD` that write the table directly and skip the notify hooks
+(`execute_commands_squashed_inner` in `src/connection.rs`, and the `ShardMessage::Batch` handler in
+`src/server.rs`). Each is guarded by `!has_blocked_waiters(port)`. In addition, the connection
+loop does not use the squashed path at all while `has_blocked_waiters` is true.
 
-## 5. Timeout handling & disconnect detection
+### 5.5 The blocking side: a command's life cycle
 
-### 5.1 `wait_for_blocked_result` (`connection.rs:407-443`) — list/zset blocking commands
+All list/zset handlers (`BLPOP`, `BRPOP`, `BLMPOP`, `BLMOVE`, `BLMOVEM`, `BZMPOP`, and
+`handle_bzpop` for `BZPOPMIN`/`BZPOPMAX`) follow the same steps:
 
-```rust
-pub async fn wait_for_blocked_result<T>(
-    rx: &flume::Receiver<T>, timeout_secs: f64, raw_fd: Option<RawFd>,
-) -> (Option<T>, bool) {
-    let deadline = (timeout_secs > 0.0).then(|| Instant::now() + Duration::from_secs_f64(timeout_secs));
-    loop {
-        let check_dur = deadline.map_or(Duration::from_millis(20), |dl| {
-            (dl.saturating_duration_since(Instant::now())).min(Duration::from_millis(20))
-        });
-        match monoio::time::timeout(check_dur, rx.recv_async()).await {
-            Ok(Ok(res)) => return (Some(res), false),       // woken by notify_list/notify_zset
-            Ok(Err(_))  => return (None, false),             // sender dropped
-            Err(_) => {                                      // 20ms tick elapsed, nobody woke us
-                if let Some(fd) = raw_fd && is_fd_closed(fd) { return (None, true); }
-                if let Some(dl) = deadline && Instant::now() >= dl { return (None, false); }
-                // else: loop again, wait up to another 20ms
-            }
-        }
-    }
-}
-```
+1. **Try without blocking.** For each key in order: if this shard owns it, pop from
+   `router.local_db` (and log/replicate the pop here); otherwise `router.execute_remote(target,
+   LPOP/ZPOPMIN/LMOVE/...)` — the owner logs it. A `WRONGTYPE` error is returned to the client.
+   The first key that yields data answers the command.
+2. **Inside MULTI/EXEC, never block.** If `in_tx(client_id)` is true, reply nil (`*-1` or `$-1`).
+3. **Arm cleanup.** Create a `BlockedClientGuard { port, client_id }` whose `Drop` calls
+   `unregister_blocked_client`, so success, timeout, error, disconnect and a dropped future all
+   leave the hub clean.
+4. **Register.** Create `flume::bounded(1)`, lock the hub, `register_blocked_client` (or
+   `register_blocked_zset_client`), then one `register_*_waiter` per key with clones of `tx`.
+5. **Recheck.** `recheck_blocking_keys(router, keys)`: step 1 and step 4 are not atomic (shards run
+   concurrently and step 1 may await remote hops), so a push landing in between would find no
+   waiter. The recheck runs `notify_stream` + `notify_list` + `notify_zset` for each key — directly
+   for locally owned keys, via `ShardMessage::NotifyList { db, keys }` (grouped per shard) for
+   remote ones — or, if the hub is paused, adds the keys to `pending_notifies`.
+6. **Wait.** `wait_for_blocked_result(&rx, timeout_secs, raw_fd)` (§5.6).
+7. **Reply.** `Popped` → format the reply (the hub already logged/replicated). `Unblocked(WrongType)`
+   → `-WRONGTYPE ...`. `Unblocked(Error)` → `-UNBLOCKED client unblocked via CLIENT UNBLOCK`.
+   Anything else (timeout, `Unblocked(Timeout)`, dropped sender) → nil. If the client disconnected,
+   return `true` so the connection closes. (`handle_bzpop` has no `WrongType` arm; it falls into
+   nil, which is unreachable in practice since zset waiters never receive it.)
 
-Key facts:
-- A timeout of `0.0` (the Redis convention for "block forever") means `deadline = None`, so the loop only ever exits via a received value or a detected disconnect — never a synthetic timeout.
-- **The 20ms figure is a disconnect-detection poll interval, not a channel-polling interval.** The actual wakeup is a real async wait on `rx.recv_async()` (no busy-polling of the channel); it's wrapped in `monoio::time::timeout(..)` capped at 20ms purely so the loop can periodically check whether the client's socket died.
-- `is_fd_closed` (`connection.rs:377-401`) does a zero-timeout `libc::poll` for `POLLRDHUP|POLLHUP|POLLERR`, and if `POLLIN` is set, an `MSG_PEEK|MSG_DONTWAIT` `recv` to distinguish "readable data" from "peer closed" (`recv` returning 0). This exists because a `flume::Receiver` alone cannot observe TCP-level disconnects — a client that vanishes without TCP FIN/RST on a half-duplex connection with no outstanding reads would otherwise block forever past any already-elapsed timeout. Max added latency to detect a dead client: ~20ms.
-- On return, the caller always has a `BlockedClientGuard` (`connection.rs:363-374`, RAII `Drop` impl) that calls `hub.unregister_blocked_client(client_id)` no matter which branch was taken, so disconnect, timeout, and success all converge on the same cleanup path.
+**`BLMOVE` / `BRPOPLPUSH` across shards.** Step 1 runs `LMOVE` on the source's shard when source
+and destination share a shard. If they do not: in cluster mode the reply is `-CROSSSLOT`; in
+standalone mode `blmove_across_shards` takes over. It first tries `move_element_across_shards`; if
+the source is empty it registers a **plain one-element pop** on the source with
+`register_list_waiter_no_repl`. When served, it checks the destination's type on its shard: a
+non-list puts the element back on the source and replies `WRONGTYPE`; otherwise it pushes the
+element to the destination shard and replicates the logical `LMOVE`/`RPOPLPUSH` (with hub
+propagation suppressed for the inner pushes). `BLMOVEM` has no cross-shard path: different shards
+→ `-CROSSSLOT` in every mode.
 
-### 5.2 `wait_for_stream_result` (`connection.rs:445-492`) — `XREAD`/`XREADGROUP BLOCK`
+**Streams (`XREAD`/`XREADGROUP` with `BLOCK`).** Blocking is allowed only for `XREAD`, or for
+`XREADGROUP` when every ID is `>` (`can_block`), and not inside a transaction.
 
-Structurally identical to §5.1 (same 20ms disconnect-poll cap, same `is_fd_closed` check), but takes `timeout_ms: u64` directly (stream blocking is specified in milliseconds, not the float seconds used by list/zset `BLPOP`-family timeouts) and a bare `Receiver<()>` (no payload — see §3.2).
+1. If all keys are on one shard, run the command there. If the reply is empty, rewrite it into
+   `unblocked_cmd`: `block_ms = None`, and IDs from `resolve_stream_last_ids`, which replaces `$`
+   and `+` by the stream's current last ID (`0-0` if the stream does not exist) so the hub's
+   re-execution only returns entries added after the client blocked.
+2. Register one `StreamWaiter` per key (`is_cross_shard = false`), `recheck_blocking_keys`, then
+   `wait_for_stream_result(&rx, block_ms, raw_fd)`. `Data`/`Error` are written verbatim;
+   `Unblocked(Timeout)` → `$-1`; `Unblocked(Error)` → `-UNBLOCKED ...`; timeout → `$-1`.
+3. Keys on several shards: in cluster mode with different slots → `-CROSSSLOT`; otherwise
+   `query_cross_shard_streams` fans the read out with `execute_remote` and merges the per-stream
+   blocks. If empty, the handler loops: register with `is_cross_shard = true` (deduplicated),
+   `recheck_blocking_keys`, wait for the remaining time. On `CrossShard` it re-queries all shards;
+   a non-empty result is the reply, otherwise it loops again.
 
-### 5.3 `XREADGROUP ... CLAIM`: event-driven *and* polled
+**`XREADGROUP ... CLAIM min-idle`** (Rudis extension; single-shard path only). Besides new entries,
+such a read can return pending entries idle for at least `min-idle` ms, which become eligible as
+time passes — no write announces that. The handler therefore waits in slices: each iteration
+computes, for locally owned keys, `ShardDb::earliest_claim_wait_ms(key, group, min_idle)` (time until
+the next pending entry becomes claimable), waits `min(remaining deadline, clamp(that, 1, 50))` ms
+(50 ms if nothing is pending or the key is remote), and when the slice expires without a hub
+result, re-runs `unblocked_cmd` itself; a non-empty reply ends the wait.
 
-`XREADGROUP` in this codebase accepts an extension not in upstream Redis: `claim: Option<min_idle>` (visible in `Command::Xreadgroup`), implementing `XNACK`/auto-claim semantics (`git log`: `5657bb6 feat(stream): implement XNACK, XREADGROUP CLAIM, and stream PEL persistence`). Its blocking loop (`connection.rs:7598-7672`) **re-registers the stream waiter on every iteration** (safe because `register_stream_waiter` de-dupes by `client_id` within a key, `block.rs:588-591`) and computes its own wait budget instead of trusting a pure event wakeup:
+### 5.6 Waiting, timeouts and disconnect detection
 
-```rust
-if let Command::Xreadgroup { ref group, claim: Some(min_idle), .. } = cmd {
-    let mut earliest_pel_wait: Option<u64> = None;
-    for k in keys {
-        if let Some(w) = db.earliest_claim_wait_ms(k, group, min_idle) {
-            earliest_pel_wait = Some(earliest_pel_wait.map_or(w, |m| m.min(w)));
-        }
-    }
-    let target_wait = earliest_pel_wait.map_or(50, |w| w.clamp(1, 50));
-    wait_timeout_ms = remaining_ms.min(target_wait);   // or just target_wait if no overall deadline
-}
-```
-(`connection.rs:7624-7636`, `earliest_claim_wait_ms` at `table.rs:13870-13891`)
+`wait_for_blocked_result<T>(rx, timeout_secs: f64, raw_fd)` (lists/zsets, seconds) and
+`wait_for_stream_result(rx, timeout_ms: u64, raw_fd)` (streams, milliseconds) share one loop:
 
-`earliest_claim_wait_ms` scans the consumer group's PEL (pending entries list) and returns the smallest `(delivery_time_ms + min_idle) - now` across all pending entries, i.e. "how long until the next entry becomes eligible to auto-claim." The loop then waits for `min(remaining_deadline, clamp(that, 1, 50))` milliseconds. **This is a genuine poll**, clamped to a 1-50ms interval, layered on top of the push-based `notify_stream` wakeup — `XREADGROUP ... CLAIM` is the one blocking command in this file that is not purely event-driven. Plain `XREAD`/`XREADGROUP` without `claim` never takes this branch and is purely push-driven.
+1. `timeout = 0` → no deadline (wait forever). Otherwise `deadline = now + timeout`.
+2. Each round waits on `rx.recv_async()` for at most `min(20 ms, remaining)`. The remaining time is
+   computed by `remaining_wait_ms`, which rounds **up** to whole milliseconds so the command never
+   times out early; `0` remaining → return `(None, false)` (timeout).
+3. A received value → `(Some(v), false)`. All senders gone → `(None, false)`.
+4. On a 20 ms tick without data: if `raw_fd` is known, the server is not shutting down, and
+   `is_fd_closed(fd)` is true → `(None, true)` (client gone). If the deadline passed → timeout.
+   Otherwise loop.
 
-The same loop shape (register → compute wait → `wait_for_stream_result` → re-read → loop) is duplicated verbatim for the cross-shard multi-stream-key case (`connection.rs:7690-7766`, driven by `query_cross_shard_streams`, `connection.rs:4780-4852`, which fans a multi-key `XREAD`/`XREADGROUP` out to each owning shard via `router.execute_remote` and merges the per-shard reply blocks).
-
----
-
-## 6. Every blocking command and its exact wakeup trigger
-
-All nine blocking command *forms* are enumerated together in two places that must be kept in sync by hand: the pipeline-flush-before-blocking-command list (`connection.rs:1868-1911`, used so a blocking command never gets stuck behind unflushed pipelined output) and the slowlog/stat-name table (`connection.rs:3969-4195`). Current canonical set: `BLPOP`, `BRPOP`, `BLMOVE`, `BLMOVEM`, `BLMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `XREAD` (with `block_ms: Some`), `XREADGROUP` (with `block_ms: Some`). `WAIT`/`WAITAOF` are **not** in this set (§6.10).
-
-| Command | Handler (connection.rs) | Registration call | Wakeup trigger |
-| :--- | :--- | :--- | :--- |
-| `BLPOP keys... timeout` | 7909-8043 | `register_list_waiter(..., Pop{Left,1})` per key | Any `LPUSH`/`RPUSH`/etc. on one of the keys that leaves ≥1 element, via `notify_list` |
-| `BRPOP keys... timeout` | 8044-8178 | `register_list_waiter(..., Pop{Right,1})` per key | Same as above |
-| `BLMOVE src dst from to timeout` | 8448-8572 | `register_move_waiter` (single key = `src`) | A push onto `src`; requires `src`/`dst` on the **same shard** or returns `CROSSSLOT` before ever blocking |
-| `BLMOVEM src dst from to mode count ordering timeout` | 8573-8811 | `register_movem_waiter` (single key = `src`) | A push onto `src`; same same-shard `CROSSSLOT` requirement as `BLMOVE` |
-| `BLMPOP timeout numkeys keys... <LEFT\|RIGHT> [COUNT n]` | 8909-9075 | `register_list_waiter(..., Pop{dir,count})` per key | Any push on any of the keys |
-| `BZPOPMIN keys... timeout` | 9080 → `handle_bzpop(..., is_min=true)` (4385-4531) | `register_zset_waiter(..., Min, 1, is_zmpop=false)` per key | `ZADD` (incl. fast path, see §10) on one of the keys |
-| `BZPOPMAX keys... timeout` | 9083 → `handle_bzpop(..., is_min=false)` | `register_zset_waiter(..., Max, 1, is_zmpop=false)` per key | Same |
-| `BZMPOP timeout numkeys keys... <MIN\|MAX> [COUNT n]` | 9178-9317 | `register_zset_waiter(..., count, is_zmpop=true)` per key | Same |
-| `XREAD BLOCK ms [...] STREAMS keys... ids...` | 7519-7674 (same-shard), 7690-7850ish (cross-shard) | `register_stream_waiter` per key, **re-registered every poll iteration** | Any `XADD` on one of the keys, via `notify_stream` (broadcast) |
-| `XREADGROUP GROUP g c BLOCK ms [CLAIM min-idle] STREAMS keys... ids...` | same handler as `XREAD` (shared match arm, 7519-7850ish) | same, plus the 1-50ms CLAIM poll (§5.3) | `XADD`, **or** CLAIM-eligibility poll elapsing |
-
-Only `ids == ">"` for every key (new-message mode) is eligible to block for `XREADGROUP`; `can_block` is explicitly computed as `ids.iter().all(|id| id == ">")` (`connection.rs:7554-7555`) — reading from an explicit/historical ID never blocks, matching real Redis semantics.
-
-### 6.1-6.9 Per-command behavioral notes
-
-- **Non-blocking fast path first, always.** Every blocking command handler is structured as: try to satisfy immediately via local/remote non-blocking pop → only if truly empty, register a waiter and await. None of them register-then-check; they check-then-register. This avoids a tiny race where data pushed microseconds before the command executes would otherwise be invisible to a naive register-first design — because registration happens strictly after the empty-check, and the empty-check is on the authoritative table, no push can be "lost" between the two steps (any push either lands before the check, in which case the fast path sees it, or after the check, in which case the subsequent push's `notify_*_or_defer` call will find the just-registered waiter).
-- **`IN_TX.get()` short-circuits every blocking path** to a non-blocking nil/null reply — `BLPOP` etc. inside `MULTI`/`EXEC` never actually block (matches real Redis: blocking commands inside a transaction return immediately if they would've blocked).
-- **`BLMOVE`/`BLMOVEM` require `source`/`destination` to resolve to the same shard** or immediately return `-CROSSSLOT Keys in request don't hash to the same slot` (`connection.rs:8450-8456`, `8575-8581`ish) **before even attempting to block** — this is checked even when cluster mode is off, since both keys must be popped/pushed against one `RudisTable` instance by the single-threaded `notify_list` call.
-- **AOF/replication propagation is rewritten on unblock, not replayed verbatim.** E.g. a satisfied `BLPOP` propagates as `LPOP key 1` (`connection.rs:7956-7961`), a satisfied `BLMOVE` propagates as the equivalent `LMOVE` (`connection.rs:8527-8535`), etc. — consistent with how real Redis rewrites blocking commands to their deterministic non-blocking equivalents for replication.
-
-### 6.10 `WAIT`/`WAITAOF` — NOT part of `BlockHub`
-
-`Command::Wait` calls `replication::wait_replicas`, `Command::WaitAof` calls `replication::wait_aof`; both are thin wrappers over `wait_acks` (`src/replication.rs`), a **pure poll loop**, entirely separate from `BlockHub` — no waiter registration, no `flume` channel, no `notify_*`:
-
-```rust
-loop {
-    let local_ok = local.is_some_and(|l| l.fsynced());      // WAITAOF only
-    let count = hub.count_acks(target_offset, aof);          // ack_offset, or FACK for WAITAOF
-    if (count >= numreplicas && (local_ok || !need_local))
-        || (timeout_ms > 0 && start.elapsed() >= timeout) { return (local_ok, count); }
-    // GETACK once a second while short of replicas; poll 1 ms, then 10 ms after 100 ms
-}
-```
-
-So `WAIT`/`WAITAOF` block the calling task (asynchronously — `monoio::time::sleep` yields the reactor, it does not stall the thread). A timeout of 0 waits forever, as in Redis; while waiting the client is counted in `WAIT_BLOCKED_CLIENTS` (INFO `blocked_clients`). `WAITAOF`'s local copy is a `LocalAofTarget`: every shard's `AofProgress::appended` at call time, met once each shard's `AofProgress::fsynced` reaches it. Replica copies count only by the `FACK` a replica with AOF sends in `REPLCONF ACK <off> FACK <aofoff>`. Grep confirms no reference to `block::` anywhere in `wait_replicas` or its call sites — this is a deliberate separate mechanism, not an oversight to "fix" by wiring it into `BlockHub`, but worth knowing so a reader doesn't go looking for `WAIT` inside `block.rs`.
+The 20 ms tick exists only for **disconnect detection**: a flume receiver cannot see a TCP close.
+`is_fd_closed` does a zero-timeout `libc::poll` for `POLLRDHUP | POLLHUP | POLLERR`; if only
+`POLLIN` is set it peeks one byte with `MSG_PEEK | MSG_DONTWAIT` and treats a `0` return as a peer
+close. During shutdown draining the server has already shut the read side, which would look like
+a close, so the check is skipped and the command is allowed to finish.
 
 ---
 
-## 7. Fairness / ordering guarantees
+## 6. MULTI/EXEC: deferred notification
 
-- **Lists and sorted sets: FIFO per key**, via `VecDeque::push_back` (register) / `pop_front` (notify). Two clients blocked on the same key in registration order `A` then `B` are satisfied in that same order, as long as each notify call has enough data to satisfy both (§3.1 loop-while-available). **No cross-key fairness**: a client blocked on `BLPOP k1 k2` is simply registered on both queues independently; if `k2` is pushed to first, that client is served from `k2`'s queue regardless of how long other clients have waited on `k1`.
-- **`BLMOVE`/`BLMOVEM`: single-winner per push event**, not "while available" — see §3.1's `break` note. If three clients are queued on `BLMOVE src dst` and a single `RPUSH src v1 v2 v3` pushes three elements, only the **first-queued** client is served by that `notify_list` call; the second and third remain blocked until another independent push event occurs (even though data they could consume already sits in `src`). This is a real behavioral gap versus `BLPOP`/`BLMPOP`, which drain as much of a single push as there are waiters.
-- **Streams: broadcast, not ordered.** Every waiter on a key is woken on every `XADD`, in `stream_waiters[key]`'s insertion order only for the purpose of the artificial inter-wakeup `sleep(1ms)` stagger (§3.2) — there is no "first blocked, first served" concept here since all waiters get the same signal and independently re-read the stream.
-- **`CLIENT UNBLOCK`** bypasses ordering entirely — it targets a specific `client_id` regardless of queue position.
-- **`MULTI`/`EXEC`**: within one transaction, multiple writes to the same key only produce one effective notification per key (`pending_notifies` dedups via `add_pending_notify`'s `if !self.pending_notifies.iter().any(|k| k == &key)` check, `block.rs:155-159`) — so three `LPUSH k` calls inside one `EXEC` wake blocked `k` waiters once after the transaction, not three times, and in particular do not give multiple elements to 3 separate single-element `BLPOP` waiters three separate times; the final `notify_list` call after `resume()` sees the fully-updated table and drains as many waiters as the final list length allows.
+Inside a transaction, blocked clients must not observe intermediate states (Redis serves them
+after `EXEC` completes). The hub's pause mechanism does this:
 
----
+1. `EXEC` runs its checks first (queued-command errors, cluster `CROSSSLOT`, `WATCH` taint); those
+   abort paths return before the hub is touched.
+2. It builds an `ExecCleanup` guard, takes VLL (cross-shard transaction) locks if needed, then
+   `hub.pause()` (`paused_count += 1`, which also makes `has_blocked_waiters` true) and stores the
+   hub in the guard.
+3. Queued commands run. Every `notify_*_or_defer`, `recheck_blocking_keys` and `notify_db_keys`
+   sees `is_paused()` and calls `add_pending_notify(key)`, which stores `(CURRENT_DB, key)` once.
+   Blocking commands inside the transaction never block (§5.5 step 2).
+4. When `ExecCleanup` drops — normally, or because the EXEC future was dropped/unwound after a
+   panicking queued command — it calls `resume()`: `paused_count -= 1`, and when it reaches zero
+   the pending list is returned. For each `(db, key)`: if this shard owns the key and
+   `local_db.try_borrow_mut()` succeeds, it selects that DB and runs `notify_stream`, `notify_list`
+   and `notify_zset` locally; otherwise it sends `ShardMessage::NotifyList { db, keys: vec![key] }`
+   to the owner.
+5. The owner's mailbox handler (`src/server.rs`) sets `CURRENT_DB`, selects the DB, locks the hub
+   and runs the same three notifies for each key against its own table.
 
-## 8. `MULTI`/`EXEC` deferred notification — full walkthrough
+**Example.** C1 is blocked in `BLPOP q 0`. C2 runs `MULTI; RPUSH q a; RPUSH q b; LPOP q; EXEC`.
+Both pushes defer `q` (stored once). `LPOP` inside the transaction returns `a`. After EXEC, one
+`notify_list(q)` runs and serves C1 with `b` — the final state, as Redis would.
 
-1. `EXEC` begins (`connection.rs:1397` onward): locks resolved, `IN_TX.set(true)`, then `hub_arc.lock().unwrap().pause()` — increments `paused_count`.
-2. Each queued command runs through the normal `execute_command` path. Any write that would call `notify_list_or_defer`/`notify_zset_or_defer`/`notify_stream_or_defer` instead hits `hub.is_paused() == true` and calls `hub.add_pending_notify(key)` (deduped), **never acquiring the table to pop early** — waiters stay registered and blocked throughout the transaction body.
-3. `IN_TX.set(false)`; `let pending = hub_arc.lock().unwrap().resume()` — decrements `paused_count`; if it reaches 0, drains and returns `pending_notifies` (a `Vec<Bytes>`), else returns `Vec::new()` (nested-pause case, though nothing in this codebase actually nests pause calls beyond one `EXEC` at a time — `paused_count` as a counter rather than a bool is defensive).
-4. For each pending key, dispatch locally or via `ShardMessage::NotifyList` depending on shard ownership (§4.1).
-5. `DISCARD`, `RESET`, an aborted `EXEC` (previous queuing error), a cross-slot `EXEC` in cluster mode, and a `WATCH`-tainted `EXEC` all call `clear_pending_notifies()` instead of `resume()` (`connection.rs:1337,1350,1364,1376,1388`) — this still decrements `paused_count` and re-syncs the atomic, but **drops `pending_notifies` without ever notifying anyone**. This is correct: those paths mean no writes actually happened (or won't be visible), so there's nothing to wake blocked clients for — but it does mean `pause()`/`clear_pending_notifies()` must be called in matched pairs by every transaction-exit branch, and a future code path that forgets the `clear_pending_notifies()` call on some new early-exit branch would leave `paused_count` permanently incremented, silently disabling the fast notify path hub-wide (since `is_paused()` would stay true and all future notifies degrade to being queued, never actually drained, until some future `resume()` finally reaches 0 — effectively starving every blocked client on that port). There is no `unwrap_or` / panic-safety around this invariant; it relies entirely on each call site remembering to balance `pause()`.
-
----
-
-## 9. `CLIENT UNBLOCK`, `CLIENT LIST`/`INFO`, and `CLIENT PAUSE`/`KILL`
-
-### 9.1 `CLIENT UNBLOCK <id> [TIMEOUT|ERROR]`
-
-`connection.rs:7178-7186`: directly calls `hub.unblock_client(target_id, unblock_type)` and returns `:1`/`:0`. `unblock_client` (`block.rs:254-281`) handles list/move/movem and zset waiters correctly — it sends `BlockedListResult::Unblocked(type)`/`BlockedZSetResult::Unblocked(type)`, which the waiting command's `match recv_res` arms translate into either a `WRONGTYPE`-style reply (never for `unblock_client`, only `Timeout`/`Error` are reachable here), a `-UNBLOCKED client unblocked via CLIENT UNBLOCK` error (`ClientUnblockType::Error`), or — since `Timeout` has no explicit match arm anywhere in the blocking-command handlers and falls through to each handler's `_ => write_resp_null_array(out)` catch-all — a plain nil reply, exactly matching real Redis's `CLIENT UNBLOCK ... TIMEOUT` semantics.
-
-**Verified bug: `CLIENT UNBLOCK` does not actually unblock `XREAD`/`XREADGROUP BLOCK` clients.** For stream waiters, `unblock_client` does `sender.try_send(())` (`block.rs:271`) — the exact same zero-payload signal `notify_stream` sends for "new data arrived." The `XREAD`/`XREADGROUP` blocking loop (`connection.rs:7598` onward) has no way to distinguish "woken because of real new data" from "woken because of `CLIENT UNBLOCK`" — both just cause it to re-run the read, find nothing new, and **loop back to `register_stream_waiter` + wait again**, ignoring the requested `TIMEOUT`/`ERROR` semantics entirely. A `CLIENT UNBLOCK <id> ERROR` issued against a client blocked in `XREAD BLOCK` will cause one spurious extra poll and then the client silently resumes blocking until real data arrives or its original deadline elapses — it never receives the `-UNBLOCKED` error the caller asked for.
-
-### 9.2 `CLIENT LIST` / `CLIENT INFO` / `INFO`
-
-- `flags=b` is rendered via `hub.is_blocked(client.id)` both in the per-connection `CLIENT INFO` path (`connection.rs:7084-7089`) and the full-registry `CLIENT LIST` path (`router.rs:2142-2146`).
-- `INFO`'s `# Clients` section reports `blocked_clients`, `total_blocking_keys`, `total_blocking_keys_on_nokey` by locking the hub once and calling `blocked_clients_count()`/`blocking_keys_count()`/`blocking_keys_on_nokey_count()` (`connection.rs:5954-5970`). Since the hub is global-per-port (not per-shard), these numbers are already correct process-wide totals without needing to aggregate across shards.
-
-### 9.3 `CLIENT PAUSE` / `CLIENT UNPAUSE` / `CLIENT KILL`: no-ops
-
-`ClientSubcommand::Kill(_) => out.extend_from_slice(b"+OK\r\n")` (`connection.rs:7172-7174`) and `ClientSubcommand::Pause(_) | Unpause | NoTouch(_) => out.extend_from_slice(b"+OK\r\n")` (`connection.rs:7189-7192`) are **unconditional acknowledgements that do nothing**. `CLIENT KILL` in particular does not look up the target connection, does not close its socket, and — relevant to this doc — does not call `hub.unblock_client`/`unregister_blocked_client` for the victim, so a `CLIENT KILL` issued against a client that is blocked in `BLPOP`/`XREAD BLOCK`/etc. has **zero effect**; that client keeps blocking until its own timeout or a real data event. (Real disconnects, i.e. the client actually closing its TCP connection, are still caught correctly via the `is_fd_closed` poll in §5.1/5.2 and the `BlockedClientGuard`/`TlsClientCleanup` `Drop` impls — only the *command-driven* `CLIENT KILL` is inert.)
+`pause`/`resume` are used only by EXEC. `CLIENT PAUSE` is a different mechanism
+(`set_client_pause`, `wait_if_client_paused`, `wait_if_tx_paused` in `src/connection.rs`): it
+delays commands before they run. Blocking commands count as writes for `CLIENT PAUSE WRITE`
+(`should_pause_command`), and paused clients are added to `INFO`'s `blocked_clients`.
 
 ---
 
-## 10. Fast-path bypass hazard: `LPUSH`/`ZADD` "arena" fast paths
+## 7. Releasing waiters without data
 
-Commit `23a1b24` ("perf(arena): implement small collection slab arena, slice zero-alloc dispatch, and lockless block/search bypass") added zero-allocation fast paths for `ZADD` and `LPUSH` inside the pipeline-squashing executors (`execute_commands_squashed` in connection.rs, and the analogous `ShardMessage::Batch` handling in server.rs). These fast paths call `table.zadd_slice_with_hash`/an equivalent `lpush` directly and **skip `notify_zset_or_defer`/`notify_list_or_defer` entirely** — they only handle `WATCH`/client-side-caching invalidation, not blocking wakeups. Each of the four call sites is therefore gated with an explicit `!crate::block::has_blocked_waiters(port)` guard so the fast path is only taken when nothing could possibly be blocked on that key:
+| Trigger | Mechanism | Client sees |
+| :--- | :--- | :--- |
+| Timeout | wait loop deadline (§5.6) | nil (`*-1` for pops, `$-1` for single-element moves and streams) |
+| `CLIENT UNBLOCK id [TIMEOUT]` | `unblock_client(id, Timeout)` sends `Unblocked(Timeout)` | nil; reply to the caller `:1` (or `:0` if not blocked) |
+| `CLIENT UNBLOCK id ERROR` | `unblock_client(id, Error)` | `-UNBLOCKED client unblocked via CLIENT UNBLOCK` |
+| `CLIENT KILL ...` | shuts the victim's socket down (`libc::shutdown`) and calls `remove_waiters_for_client` | connection closes; the victim's wait loop notices within one 20 ms tick |
+| Client closes connection | `is_fd_closed` in the wait loop; `ClientCleanup` drop calls `unregister_blocked_client` (when `has_blocked_waiters`) | — |
+| `REPLICAOF host port` | `unblock_writers()` releases list/zset waiters and `XREADGROUP` waiters with `Error` | `-UNBLOCKED ...` |
+| Move destination is not a list | `notify_list` sends `Unblocked(WrongType)` | `-WRONGTYPE ...` |
 
-- `server.rs:809` (`Lpush`, `ShardMessage::Batch` path 1)
-- `server.rs:923` (`Zadd`, `ShardMessage::Batch` path 1)
-- `server.rs:1149` (`Lpush`, `ShardMessage::Batch` path 2 / cross-shard router)
-- `server.rs:1263` (`Zadd`, `ShardMessage::Batch` path 2)
-- `connection.rs:19485` (`Zadd`, `execute_commands_squashed`)
-- `connection.rs:19528` (`Lpush`, `execute_commands_squashed`)
-
-The `ZADD` guard was added later than the others, in a dedicated fix: commit `3607df7` ("fix(block): ensure Zadd fast path notifies block hub when waiters are present, passing Redis TCL unit/type/zset suite") — before that fix, a pipelined `ZADD` could silently starve a `BZPOPMIN`/`BZPOPMAX`/`BZMPOP` waiter whenever the squashed-execution fast path was taken, since the fast path never touched `BlockHub` at all. The current code is correct for the common single-port-per-process case; see §2.2 for how the shared, non-per-port `TOTAL_BLOCKED_WAITERS` atomic backing `has_blocked_waiters` could reintroduce exactly this class of bug if multiple `BlockHub`s ever coexist in one process. **There is no equivalent fast path for `RPUSH`** — only `LPUSH` and `ZADD` got the zero-alloc treatment, so `RPUSH` always goes through the normal `notify_list_or_defer`-calling path and cannot regress this way.
-
----
-
-## 11. Known bugs / limitations (summary)
-
-1. **`has_blocked_waiters`'s `port` argument is unused; `TOTAL_BLOCKED_WAITERS` is one process-wide atomic, not per-port**, and `sync_atomic_waiters_count` does an absolute `store` from a single hub's count rather than an incremental update (`block.rs:98-104, 134-144`). Harmless with one port per process; a real missed-wakeup hazard if a process ever hosts multiple `BlockHub`s concurrently (also makes the `cfg(test)` unit tests in this file theoretically flaky if run concurrently with each other, since they use different ports 12345-12347 and all write through the same atomic).
-2. **`notify_stream` calls `std::thread::sleep(1ms)` synchronously between each of N woken waiters** (`block.rs:601`), stalling the entire owning shard's reactor thread for up to `(N-1)` ms on a single `XADD` to a hot stream with many blocked readers — a direct violation of the thread-per-core non-blocking design used everywhere else in this codebase.
-3. **`BLMOVE`/`BLMOVEM` satisfy only one waiter per push event**, even when the push delivers enough elements for several queued waiters (`block.rs:439-443, 492-497`, the `break` after one success) — unlike `BLPOP`/`BLMPOP`/`BZPOPMIN`/`BZMPOP`, which drain as many waiters as a single push allows.
-4. **`CLIENT UNBLOCK` does not work for stream blocking** (`XREAD BLOCK`/`XREADGROUP BLOCK`) — the stream channel carries no payload to distinguish "real data" from "forced unblock," so the blocking loop just spuriously re-polls and keeps blocking (`block.rs:271` vs. `connection.rs:7598`-onward's re-register-and-loop shape).
-5. **`CLIENT KILL` is a complete no-op** — it neither closes the target connection nor unblocks it if it's inside a blocking command (`connection.rs:7172-7174`).
-6. **`CLIENT PAUSE`/`CLIENT UNPAUSE` are no-ops** unrelated to `BlockHub.pause()`/`resume()`, which are reserved exclusively for internal `MULTI`/`EXEC` bookkeeping — a reader should not expect `CLIENT PAUSE` to interact with blocking commands at all in the current implementation.
-7. **`PORT_BLOCK_HUBS` entries are never removed** — `get_block_hub_for_port` only inserts, never evicts, so a process that creates many short-lived `BlockHub`s for many distinct ports (e.g. a test harness cycling through ports) leaks one `Arc<Mutex<BlockHub>>` map entry per port for the lifetime of the process. Not a concern for a single long-running production port.
-8. **`XREADGROUP ... CLAIM` polls at a clamped 1-50ms interval** (`connection.rs:7624-7636`) layered on top of the push-based stream notification — this is by design (there's no timer-wheel in `BlockHub` to schedule a wake at a PEL entry's exact eligibility time), but it means CLAIM-eligible messages can be delivered up to ~50ms late even though the entry has technically been eligible since `delivery_time_ms + min_idle`.
-9. **`WAIT`/`WAITAOF` are polled, not `BlockHub` waiters** (§6.10): easy to mistake for `BlockHub` users given their adjacency to the other blocking commands.
+`unblock_client` uses `send` for list/zset senders and `try_send` for stream senders; the
+stream path distinguishes the release because the payload is a typed `Unblocked(..)` value.
 
 ---
 
-## 12. How to verify these claims yourself
+## 8. Ordering and fairness
 
-```bash
-# Full struct/enum/impl inventory
-rg -n '^(pub )?(struct|enum|impl)\s' src/block.rs
+- **Lists and sorted sets are FIFO per `(db, key)`**: registration appends, notify serves from the
+  front, and a waiter that cannot be served stays at the front.
+- **Pop waiters drain a push**: one notify serves as many queued pop waiters as there are elements.
+- **Move waiters do not**: `notify_list` stops after one successful `Move`/`Movem`, so if three
+  clients wait in `BLMOVE src dst` and `RPUSH src a b c` arrives, only the first is served by that
+  push; the others are served by later writes to `src` (or a recheck), even though `src` still has
+  elements.
+- **Head-of-line blocking**: a waiter at the front that cannot be served stops the walk — e.g. a
+  `BLMOVEM ... EXACTLY 5` waiter in front of a `BLPOP` waiter keeps the `BLPOP` waiting while the
+  list has fewer than 5 elements.
+- **No cross-key fairness**: a client blocked on several keys is served by whichever key is written
+  first.
+- **Streams**: every waiter on the key is evaluated on each notify; there is no "first blocked,
+  first served".
+- **Transactions**: multiple writes to one key in an EXEC produce one notification after the EXEC.
 
-# All call sites that touch the hub, outside block.rs itself
-rg -n 'crate::block::|BlockHub' src/connection.rs src/server.rs src/router.rs src/shard.rs
+---
 
-# The thread::sleep finding
-rg -n 'thread::sleep' src/block.rs
+## 9. Invariants & gotchas
 
-# The unused `_port` parameter
-rg -n 'fn has_blocked_waiters' src/block.rs
+- **Serve on the owner thread only.** `notify_list/zset/stream` must receive the table/`ShardDb` of
+  the shard that owns `key`. Any caller without it must forward a `ShardMessage::NotifyList`.
+- **`CURRENT_DB` is part of the key.** Code that serves another DB (EXEC cleanup, the `NotifyList`
+  handler, `notify_db_keys`) sets `CURRENT_DB` *and* calls `select_db`, then restores both.
+- **Check, then register, then recheck.** Every blocking handler must call
+  `recheck_blocking_keys` after registering, or a write racing between the fast path and
+  registration leaves the client blocked until timeout.
+- **Every fast write path must be gated** by `has_blocked_waiters` (or call a notify hook). A
+  new zero-copy write path that skips both silently starves blocked clients.
+- **The hub lock is held while serving**, including running a stream waiter's `XREAD`/`XREADGROUP`
+  and appending to the AOF. Do not call anything that takes the hub lock from inside
+  `notify_*` (it is a non-reentrant `parking_lot::Mutex`); the recursive `notify_list` call for a
+  move destination works because it is a method call on the already-locked hub.
+- **Channels are `bounded(1)` and the hub uses blocking `send`.** A blocking command is served at
+  most once because the satisfied client is removed from all queues, but this relies on
+  per-call bookkeeping: `notify_zset` skips clients already satisfied in the same call,
+  `register_stream_waiter` deduplicates per key, but **`notify_list` has no such check**. By code
+  inspection, a client that names the same list twice (`BLPOP q q 0`, the parser does not
+  deduplicate keys) followed by a push of two or more elements would be served twice in one call:
+  the second `send` blocks the shard thread on a full channel (deadlock if the blocked connection
+  lives on the same shard; otherwise the second element is popped and lost). Not covered by tests.
+- **`notify_stream` leaves `CURRENT_CLIENT_RESP3` set** to the last served waiter's protocol. The
+  connection loop resets it before each command, so this is harmless today, but code after a
+  notify within the same command should not rely on it.
+- **EXEC pause is balanced by a guard.** `pause()` is only called after all EXEC early exits, and
+  `ExecCleanup::drop` always calls `resume()`. A leaked pause would make every later write on the
+  port defer forever.
+- **`has_blocked_waiters` is global.** It ignores its `port` argument; this is safe (a waiter on any
+  port only disables fast paths everywhere) but means multi-server test processes run slow paths.
+- **`PORT_BLOCK_HUBS` never shrinks**; one entry per port ever used.
 
-# Confirm WAIT/WAITAOF never reference block::
-rg -n 'block::' src/replication.rs   # expect: no matches
+---
 
-# Run the hub's own unit tests (block.rs:622-764)
-cargo test --lib block::tests -- --test-threads=1   # serialize to avoid the shared-atomic flakiness in §11.1
-```
+## 10. Limitations / not implemented
+
+- `BLMOVEM` requires source and destination on the same shard (`-CROSSSLOT` otherwise, even in
+  standalone mode); `BLMOVE` handles that case only in standalone mode.
+- Move waiters are served one per notify (§8).
+- `XREADGROUP ... CLAIM` eligibility is polled (1–50 ms slices), so a pending entry can be
+  delivered up to ~50 ms after it became claimable; for keys on another shard the slice is always
+  50 ms.
+- `XREAD` on a key that becomes a non-stream keeps waiting (the hub treats `-WRONGTYPE` as "nothing
+  yet" for `XREAD`).
+- `total_blocking_keys_on_nokey` counts keys with stream waiters, not Redis's exact "blocked on a
+  missing key" notion.
+- `may_block` (which excludes wait time from command statistics) lists the blocking commands but
+  not `BLMOVEM`, so time a `BLMOVEM` spends waiting is counted as execution time.
+- **`WAIT` / `WAITAOF` do not use the hub.** `replication::wait_replicas` / `wait_aof` are thin
+  wrappers over `wait_acks`, a poll loop: it sends `REPLCONF GETACK *` once a second while short
+  of replicas and polls every 1 ms (10 ms after the first 100 ms) until enough copies are
+  acknowledged or the timeout passes. A timeout of `0` waits forever, as in Redis. `WAITAOF`
+  counts only AOF-fsynced copies (see `14_persistence_replication.md` §6.8).
+
+---
+
+## 11. Code map
+
+| File | Key symbols | What they do |
+| :--- | :--- | :--- |
+| `src/block.rs` | `BlockHub`, `ListWaiter`, `ZSetWaiter`, `StreamWaiter`, `WaiterOp` | Waiter registry keyed by `(db, key)`. |
+| `src/block.rs` | `BlockedListResult`, `BlockedZSetResult`, `BlockedStreamResult`, `ClientUnblockType`, `ListPopType`, `ZSetPopType` | Messages sent to blocked commands. |
+| `src/block.rs` | `PORT_BLOCK_HUBS`, `get_block_hub_for_port`, `TOTAL_BLOCKED_WAITERS`, `has_blocked_waiters`, `sync_atomic_waiters_count`, `publish_waiters` | One hub per port; lock-free "anyone blocked?" counter with per-hub delta publishing. |
+| `src/block.rs` | `notify_list`, `notify_zset`, `notify_stream`, `notify_all_streams`, `notify_db_keys` | Serve-on-write algorithms. |
+| `src/block.rs` | `pause`, `resume`, `add_pending_notify`, `is_paused` | EXEC deferral. |
+| `src/block.rs` | `unblock_client`, `unblock_writers`, `remove_waiters_for_client`, `is_blocked`, `blocked_clients_count`, `blocking_keys_count`, `blocking_keys_on_nokey_count` | Release, cleanup and introspection. |
+| `src/block.rs` | `propagate_served`, `propagate_served_opts` | AOF + replication of pops/moves performed for a waiter. |
+| `src/block.rs` | `mod tests` | Pause/resume, multi-hub counter, list/move, zset/stream/unblock unit tests. |
+| `src/connection.rs` | `notify_list_or_defer`, `notify_zset_or_defer`, `notify_stream_or_defer` | Write-side hooks. |
+| `src/connection.rs` | `recheck_blocking_keys` | Post-registration recheck, local or via `NotifyList`. |
+| `src/connection.rs` | `BlockedClientGuard`, `wait_for_blocked_result`, `wait_for_stream_result`, `remaining_wait_ms`, `is_fd_closed` | Blocking wait loop, timeout and disconnect detection. |
+| `src/connection.rs` | `Command::Blpop/Brpop/Blmpop/Blmove/Blmovem/Bzmpop` arms, `handle_bzpop`, `blmove_across_shards` | List and sorted-set blocking handlers. |
+| `src/connection.rs` | `Command::Xread \| Command::Xreadgroup` arm, `resolve_stream_last_ids`, `query_cross_shard_streams` | Stream blocking (single-shard, cross-shard, `CLAIM`). |
+| `src/connection.rs` | `ExecCleanup` | Pauses the hub for EXEC and drains deferred notifications on drop. |
+| `src/connection.rs` | `ClientSubcommand::Unblock` / `Kill` arms, `ClientCleanup`, INFO clients section, `may_block`, `should_pause_command` | Release paths, metrics, stats, `CLIENT PAUSE` interplay. |
+| `src/connection.rs` | `execute_commands_squashed_inner` | Squashed pipeline with `LPUSH`/`RPUSH`/`ZADD` fast paths gated by `has_blocked_waiters`. |
+| `src/shard.rs` | `ShardMessage::NotifyList { db, keys }`, `ShardDb::swap_dbs`, `move_key`, `copy_to_db`, `before_write`, `before_write_table` | Cross-shard notify message; DB-moving wakeups; AOF-rewrite snapshot hooks used while serving. |
+| `src/server.rs` | `ShardMessage::NotifyList`, `FlushDb`, `FlushAll`, `Batch`, `ClientList` handlers | Owner-side notify; flush wakeups; guarded fast paths; `b` flag. |
+| `src/router.rs` | `Router::flushdb`, `Router::flushall`, `Router::rpush`, `Router::client_list` | Flush wakeups, push helper, `b` flag. |
+| `src/replication.rs` | `unblock_writers` call on `REPLICAOF`, `wait_replicas` | Replica-role unblocking; the separate `WAIT` poll loop. |
+| `src/debug_cmd.rs` | DEBUG shard-flush | Calls `notify_all_streams` after flushing a shard. |

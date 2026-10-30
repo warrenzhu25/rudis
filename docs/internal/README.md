@@ -1,40 +1,58 @@
-# Rudis Subsystem Implementation & Code References
+# Rudis Subsystem Implementation Reference
 
-This directory contains the **Internal Implementation Documents** for all 21 subsystems in Rudis.
-Each document focuses on **concrete Rust data structures, memory layouts, step-by-step algorithms, channel IPC protocols, and file/line references in `src/`**.
+This directory holds the **internal implementation documents** for the 21 subsystems of Rudis.
+Each one describes the current code: concrete Rust data structures, step-by-step algorithms,
+cross-shard message flows, invariants and gotchas, known limitations, and a code map. Code is
+referenced by file and symbol (no line numbers), and every document is meant to be readable
+without opening the source.
 
-For high-level architectural design and rationale, see [`docs/design/`](../design/).
+For design rationale ("why"), see [`docs/design/`](../design/).
 
----
+## How to read these docs
 
-## Subsystem Implementation Directory
+- **Start with [components.md](components.md).** It opens with a whole-system diagram of how a
+  request flows through the subsystems, then gives a one-screen summary of each subsystem
+  (structures, algorithms, gotchas) with links into the full documents.
+- **Newcomers: read the core path in order**, since later documents assume it:
+  1. [01 Reactor runtime](01_reactor_runtime.md): process startup, shard threads, accept loops, shutdown.
+  2. [02 Connection lifecycle](02_connection_lifecycle.md): the client loop, gates, execution strategies, MULTI/EXEC.
+  3. [03 RESP engine](03_resp_engine.md): how bytes become a `Command`.
+  4. [04 Sharding mesh](04_sharding_mesh.md): key routing and cross-shard messaging.
+  5. [05 Storage engine](05_storage_engine.md): the per-shard key table and value encodings.
+  6. [14 Persistence & replication](14_persistence_replication.md): how writes reach the AOF, RDB and replicas.
+- **Then read by interest.** Infrastructure: 06 (blocking), 07 (NVMe tier), 11 (cluster),
+  15 (security/TLS), 19 (pub/sub). Data-type and feature engines: 08, 09, 12, 13, 16, 17, 18,
+  20, 21. 10 (XDP) is a simulation, not part of the real network path.
+- **Each document has the same shape:** *What this subsystem does* → *Mental model* →
+  data structures → algorithms (often with worked examples) → *Invariants & gotchas* →
+  *Limitations / not implemented* → *Code map*. Skim the first two sections and the gotchas
+  first; dive into the algorithms when you need to change the code.
+- **Experimental families** (`JSON.`, `BF.`, `CF.`, `CMS.`, `TOPK.`, `FT.`, `SEMANTIC.`,
+  `CRDT.`, `LLM.`, `MCP.`, `XDP.`) are off unless `enable-experimental-commands` is set. Keep
+  that in mind when reading docs 08–10, 12, 16, 18 and 20–21.
 
-| # | Subsystem | Concrete Implementation Topics | Source Files | Modular Internal Doc |
+## Subsystem index
+
+| # | Subsystem | Summary | Main source files | Doc |
 | :-: | :--- | :--- | :--- | :--- |
-| 01 | **Reactor Runtime & Server Lifecycle** | `main.rs`/`run_shard_worker` startup sequence, accept loops, cross-shard receiver, panic isolation | `src/main.rs, src/server.rs` | [01_reactor_runtime.md](01_reactor_runtime.md) |
-| 02 | **Connection Lifecycle & Command Execution** | `handle_connection`/`execute_commands_squashed` internals, `BatchResponder` mailbox, output-buffer limits | `src/connection.rs` | [02_connection_lifecycle.md](02_connection_lifecycle.md) |
-| 03 | **RESP Protocol Engine & Command Parser** | `parse_resp_array` two-pass scan, small-array fast path, `build_command` dispatch | `src/resp.rs` | [03_resp_engine.md](03_resp_engine.md) |
-| 04 | **Sharding Architecture & Cross-Core Mesh** | `Router`/`ShardMessage`/`mailbox.rs` internals, dual routing paths, shared-memory scatter-gather descriptors | `src/router.rs, src/shard.rs, src/mailbox.rs` | [04_sharding_mesh.md](04_sharding_mesh.md) |
-| 05 | **Storage Engine & Compact Encodings** | `RudisFlatTable`/`RudisEntry` layouts, small/full encodings, extendible-hashing directory with segmented splits, tiering hooks, arena recycling | `src/table.rs` | [05_storage_engine.md](05_storage_engine.md) |
-| 06 | **Blocking Operations & The Reactive Event Hub** | `BlockHub` waiter queues, notify-under-lock pop, disconnect polling, `MULTI`/`EXEC` deferred notification | `src/block.rs` | [06_blocking_hub.md](06_blocking_hub.md) |
-| 07 | **NVMe SSD Tiered Storage Engine** | `ShardTierManager` stash/read/GC, SmallBins record format, `OpManager` coalescing, `fallocate` hole punching | `src/tiering.rs` | [07_nvme_tiering.md](07_nvme_tiering.md) |
-| 08 | **Vector Search Engine: HNSW, Redis 8 Vector Sets & NVMe Tiering** | `HnswIndex`/`FlatIndex` structs (Redis 8 Vector Sets are plain `HnswIndex` instances — no separate `VectorSetValue` type exists), AVX-512/AVX2/portable distance tiers, `.vtier` disk reranking | `src/vector.rs` | [08_vector_engine.md](08_vector_engine.md) |
-| 09 | **RediSearch Full-Text Engine & Hybrid Vector Fusion** | `InvertedIndex`, `VectorFieldIndex` (`FlatIndex` + `HnswIndex`), `FT.HYBRID` (RRF/Linear), `FT.PROFILE`, multi-vector JSON chunks | `src/search.rs` | [09_redisearch.md](09_redisearch.md) |
-| 10 | **Kernel Bypass & Zero-Copy Networking** | `XskSocket`/`XskUmem`/`XskRing` structs, CIDR rule engine, token-bucket limiter, unused `send_zc` | `src/xdp.rs, src/zerocopy.rs` | [10_kernel_bypass_xdp.md](10_kernel_bypass_xdp.md) |
-| 11 | **Redis Cluster Topology & Gossip Protocol** | `ClusterHub` gossip/election state, DUMP-and-replay slot migration, blocking cluster bus | `src/cluster.rs` | [11_cluster_topology.md](11_cluster_topology.md) |
-| 12 | **CRDT Data Types & Manual Multi-Region Sync** | HLC compare-exchange loop, per-type merge algorithms, `CRDT.DUMP`/`MERGE` wire format, on-demand GC | `src/crdt.rs` | [12_crdt_types.md](12_crdt_types.md) |
-| 13 | **Lua Scripting & Redis 7 Functions Engine** | Shard-aware `EVAL`/`EVALSHA` dispatch (forwards to the key's owning shard; `FCALL` remains local-shard-only), `redis.call` bridge, RESP↔Lua conversion, two-pass `FUNCTION LOAD` | `src/scripting.rs` | [13_scripting_functions.md](13_scripting_functions.md) |
-| 14 | **Persistence & Replication Engines** | `AofWriter` flush/fsync, ring-buffer backlog, `BGREWRITEAOF` compaction, PSYNC partial resync, DFLY FLOW | `src/replication.rs, src/aof.rs` | [14_persistence_replication.md](14_persistence_replication.md) |
-| 15 | **Security, Memory Allocator & TLS** | `AclUser`/`AclManager` enforcement, jemalloc stats via `tikv-jemalloc-ctl`, `rustls` handshake (kTLS not implemented — old scaffolding removed; TLS clients share the generic plaintext client loop; `requirepass` priming fixed; TLS cert loading still lacks PEM decoding) | `src/acl.rs, src/allocator.rs, src/tls.rs` | [15_security_tls.md](15_security_tls.md) |
-| 16 | **JSON Document Store & JSONPath Engine** | Whole-document `serde_json::Value` storage, hand-duplicated mutable/immutable path traversal, auto-vivification | `src/json.rs` | [16_json_store.md](16_json_store.md) |
-| 17 | **Geospatial Commands** | Bit-interleaved geohash encode/decode, `ZADD` delegation, geohash-interval-pruned radius/box search | `src/geo.rs` | [17_geospatial.md](17_geospatial.md) |
-| 18 | **Probabilistic Data Structures** | FNV-1a double-hashing, cuckoo eviction kicks, Space-Saving Top-K, RDB-persisted structures | `src/probabilistic.rs` | [18_probabilistic.md](18_probabilistic.md) |
-| 19 | **Pub/Sub Messaging Hub** | `PubSubHub` registry, `ShardedPresenceTable` bitmask, hand-written glob matcher, CRC16 sharded-channel routing | `src/pubsub.rs` | [19_pubsub.md](19_pubsub.md) |
-| 20 | **Agent Memory, LLM Quota & Checkpoints** | `AgentMemorySession` working+episodic memory, `LlmQuotaBucket` RPM/TPM governor, `AgentCheckpointThread` DAG, `AgentToolRegistry` leases | `src/agent.rs` | [20_agent_memory.md](20_agent_memory.md) |
-| 21 | **MCP Server** | `McpToolDef` catalog, `plan_tool_command` tool-to-Command translation, `MCP.TOOLS`/`MCP.CALL`/`MCP.RPC` dispatch via the normal command path | `src/mcp.rs` | [21_mcp_server.md](21_mcp_server.md) |
-
----
-
-* **Consolidated Document**: Read the entire unified implementation specification in [**`components.md`**](components.md) —
-  concrete data structures, key algorithms, and verified findings for all 21 subsystems, each linking back to its
-  full per-subsystem document above for exhaustive code-level depth.
+| 01 | **Reactor Runtime & Server Lifecycle** | Process startup (redis-server-compatible CLI/config, port probe, mesh, shard threads), the per-shard monoio worker (restore, background tasks, cross-shard receiver, accept loops with `conn_balance` hand-off), quiesce/drain shutdown, and process-wide log/metrics/stats plumbing. | `src/main.rs`, `src/server.rs`, `src/shutdown.rs`, `src/conn_balance.rs`, `src/netsec.rs`, `src/transport.rs`, `src/log.rs`, `src/telemetry.rs`, `src/server_stats.rs` | [01_reactor_runtime.md](01_reactor_runtime.md) |
+| 02 | **Connection Lifecycle & Command Execution** | Per-connection lifecycle: accept and cross-shard hand-off, the generic plaintext/TLS client loop, execution strategies, the command gate sequence and dispatch, MULTI/EXEC/WATCH with VLL locks, blocking waits, pipeline squashing over `BatchResponder`, limits and pauses, stats/SLOWLOG/COMMAND/DEBUG, and the Memcached gateway. | `src/connection.rs`, `src/transport.rs`, `src/mailbox.rs`, `src/slowlog.rs`, `src/command_info.rs`, `src/command_docs.rs`, `src/debug_cmd.rs` | [02_connection_lifecycle.md](02_connection_lifecycle.md) |
+| 03 | **RESP Protocol Engine & Command Parser** | RESP/inline/memcached framer and the `Command` enum + `build_command` constructor that turn client bytes into typed commands (with fast paths, hostile-input limits, a trusted-input mode and the experimental-command gate). | `src/resp.rs` | [03_resp_engine.md](03_resp_engine.md) |
+| 04 | **Sharding Architecture & Cross-Core Mesh** | Per-core shards and the cross-core mesh: key → slot → shard routing (static and `slot_owners`-aware), lock-free SPSC rings with a Doorbell wake-up, shared-memory reply descriptors (FastGet/FastSet, scatter MGET/MSET, `BatchResponder`), squashed-pipeline batching, broadcasts, SCAN cursors, slot-table propagation and cross-shard tx locks. | `src/router.rs`, `src/mailbox.rs`, `src/shard.rs`, `src/server.rs` (receive loop) | [04_sharding_mesh.md](04_sharding_mesh.md) |
+| 05 | **Storage Engine & Compact Encodings** | Per-shard key table (extendible-hashing directory over SIMD-probed segments with a dense 40-byte entry arena) plus `RudisTable` TTL/eviction/memory accounting and the compact encodings for keys, strings, hashes, sets, sorted sets, lists, HLLs, and DEBUG DIGEST. | `src/table.rs`, `src/compact.rs`, `src/smallhash.rs`, `src/packedhash.rs`, `src/pagestore.rs`, `src/packedset.rs`, `src/zindex.rs`, `src/packedlist.rs`, `src/hll.rs`, `src/digest.rs` | [05_storage_engine.md](05_storage_engine.md) |
+| 06 | **Blocking Operations & the Reactive Event Hub** | `BlockHub`: a per-port waiter registry (keyed by `(db, key)`) that serves BLPOP/BLMOVE/BLMOVEM/BZPOP*/BZMPOP/XREAD(GROUP) BLOCK waiters directly on the owner shard when a write lands, with EXEC deferral, post-registration recheck, and AOF/replication of served pops. | `src/block.rs`, `src/connection.rs`, `src/shard.rs` | [06_blocking_hub.md](06_blocking_hub.md) |
+| 07 | **NVMe SSD Tiered Storage** | Per-shard NVMe tier: spills values to a locked, start-truncated file (SmallBins 4 KiB packing, extent allocator with hole-punch reuse, xxh3-checked records) under maxmemory + noeviction, with Hot/Cooled/Tiered states, transparent hydration, streaming GETs, GC and TIER commands. | `src/tiering.rs`, `src/table.rs`, `src/router.rs`, `src/shard.rs` | [07_nvme_tiering.md](07_nvme_tiering.md) |
+| 08 | **Vector Search Engine** | One HNSW graph and one exact FLAT index shared by Redis 8 Vector Sets, RediSearch VECTOR fields, the `SEMANTIC.*` LLM cache and agent memory, with SIMD distance kernels, SQ8/binary/PQ compression, NVMe `.vtier` spilling and the VSIM FILTER language. | `src/vector.rs`, `src/shard.rs`, `src/search.rs` | [08_vector_engine.md](08_vector_engine.md) |
+| 09 | **RediSearch Full-Text Engine & Hybrid Fusion** | RediSearch-compatible secondary indexing over HASH/JSON keys: BM25 inverted index, B-tree numeric ranges, tag filters, FLAT/HNSW KNN and VECTOR_RANGE with pre-filtering, RRF/linear hybrid fusion, FT.AGGREGATE pipeline, per-shard partitions plus a global mirror, and definition-only AOF/RDB persistence. | `src/search.rs`, `src/router.rs`, `src/shard.rs` | [09_redisearch.md](09_redisearch.md) |
+| 10 | **Kernel Bypass & Zero-Copy Networking** | Simulated AF_XDP engine (UMEM/XSK rings, CIDR filter, per-IP token bucket, header parsing) behind the experimental `XDP.*` commands and a per-shard poll task that executes injected commands; unused MSG_ZEROCOPY/io_uring primitives; contrast with the real `netsec.rs` listener path. | `src/xdp.rs`, `src/zerocopy.rs`, `src/netsec.rs` | [10_kernel_bypass_xdp.md](10_kernel_bypass_xdp.md) |
+| 11 | **Redis Cluster Topology & Gossip** | Redis Cluster node state, text cluster bus (PING/PONG/gossip), PFAIL/FAIL detection, config-epoch slot ownership, elections and manual failover, multi-shard-port redirects, `nodes.conf`, and slot migration/rebalance. | `src/cluster.rs`, `src/connection.rs`, `src/router.rs`, `src/server.rs` | [11_cluster_topology.md](11_cluster_topology.md) |
+| 12 | **CRDT Data Types & Manual Multi-Region Sync** | Experimental `CRDT.*` types (LWW-Register, OR-Set, PN-Counter) on a hybrid logical clock, one `CrdtStore` per shard, manual multi-region sync (`CRDT.DUMP`/`MERGE`/`GC`), local writes logged to AOF/replicas as `CRDT.MERGE` effects, and CRDT state saved in RDB images. | `src/crdt.rs`, `src/connection.rs`, `src/router.rs`, `src/aof.rs` | [12_crdt_types.md](12_crdt_types.md) |
+| 13 | **Lua Scripting & Redis 7 Functions** | Embedded Lua 5.4 (mlua) for EVAL/EVALSHA/FCALL and FUNCTION libraries: process-wide script/library caches, per-call sandboxed VMs, `redis.call` with ACL/locality/OOM/read-only checks, shard routing (CROSSSLOT, forward to the `KEYS[1]` owner, keyless-script redirect), and function persistence via AOF/replication/RDB FUNCTION2. | `src/scripting.rs`, `src/connection.rs` | [13_scripting_functions.md](13_scripting_functions.md) |
+| 14 | **Persistence & Replication** | Per-shard AOF (`encode_command` write path, appendfsync barriers, RDB-preamble live rewrite, resharding/Redis import), Redis/Valkey-format RDB snapshots (SAVE/BGSAVE/save schedule), and PSYNC2 replication (backlog, forkless full-sync stream cut, `$EOF:` streaming, replica worker, WAIT/min-replicas, DFLY FLOW). | `src/aof.rs`, `src/replication.rs`, `src/snapshot.rs`, `src/redis_rdb.rs`, `src/router.rs`, `src/shard.rs` | [14_persistence_replication.md](14_persistence_replication.md) |
+| 15 | **Security, Memory Allocator & TLS** | Redis-style ACLs (hashed passwords, generated command/category table, `%R`/`%W` key and `&` channel permissions, ACL LOG/aclfile), network guards (bind, protected mode, port probe, DEBUG/MODULE gates), userspace rustls TLS with optional mTLS and runtime reload, and jemalloc telemetry/accounting helpers. | `src/acl.rs`, `src/acl_categories.rs`, `src/netsec.rs`, `src/tls.rs`, `src/transport.rs`, `src/allocator.rs` | [15_security_tls.md](15_security_tls.md) |
+| 16 | **JSON Document Store & JSONPath** | Per-shard RedisJSON-style document store (`serde_json::Value` per key) with a small JSONPath engine, 16 `JSON.*` commands (experimental-gated), batched cross-shard JSON.MGET, RDB/AOF/replication persistence and RediSearch indexing hooks. | `src/json.rs`, `src/connection.rs`, `src/router.rs`, `src/shard.rs` | [16_json_store.md](16_json_store.md) |
+| 17 | **Geospatial Commands** | Redis-compatible geo commands that store coordinates as 52-bit geohash scores in ordinary sorted sets and answer radius/box queries by scanning geohash score ranges and filtering candidates by exact spherical distance. | `src/geo.rs`, `src/connection.rs`, `src/resp.rs` | [17_geospatial.md](17_geospatial.md) |
+| 18 | **Probabilistic Data Structures** | Bloom, Cuckoo, Count-Min Sketch and Top-K in a per-shard side store outside the keyspace (experimental, saved to RDB, logged to AOF, replicated by deterministic replay), plus the Redis-compatible HyperLogLog codec that stores HLLs as ordinary HYLL strings in the keyspace. | `src/probabilistic.rs`, `src/hll.rs` | [18_probabilistic.md](18_probabilistic.md) |
+| 19 | **Pub/Sub Messaging Hub** | Exact-channel, pattern and slot-routed sharded pub/sub across shards: per-shard `PubSubHub`, a node-wide presence bitmask that limits cross-shard fan-out, direct delivery into byte-bounded subscriber queues, and a dedicated subscribed-mode connection loop. | `src/pubsub.rs`, `src/router.rs`, `src/connection.rs` | [19_pubsub.md](19_pubsub.md) |
+| 20 | **Agent Memory, LLM Quota & Checkpoints** | Per-shard AI-agent stores: token-budgeted conversation memory with HNSW episodic recall and compaction (`AGENT.MEM.*`), sliding-window RPM/TPM LLM quota governor (`LLM.QUOTA.*`), parent-pointer checkpoint threads (`AGENT.CHECKPOINT.*`), and idempotent tool-call leases (`AGENT.TOOL.*`), plus their RDB/AOF persistence. | `src/agent.rs`, `src/shard.rs`, `src/aof.rs` | [20_agent_memory.md](20_agent_memory.md) |
+| 21 | **MCP Server** | Experimental in-process Model Context Protocol server: an 11-tool catalog exposed over RESP (`MCP.TOOLS`, `MCP.CALL`, `MCP.RPC` JSON-RPC 2.0), where each tool call is planned into a native `Command` and re-enters the normal `execute_command` path. | `src/mcp.rs`, `src/connection.rs` | [21_mcp_server.md](21_mcp_server.md) |

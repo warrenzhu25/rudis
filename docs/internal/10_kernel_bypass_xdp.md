@@ -1,77 +1,115 @@
-# Component 10: Kernel Bypass & Zero-Copy Networking (Implementation Deep-Dive & Code Reference)
+# Component 10: Kernel Bypass & Zero-Copy Networking — Implementation Reference
 
-> **Source Files**: `src/xdp.rs` (706 lines), `src/zerocopy.rs` (352 lines)
 > **High-Level Design Spec**: [`docs/design/10_kernel_bypass_xdp.md`](../design/10_kernel_bypass_xdp.md)
 > **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
-
-> Re-verified line-by-line against the current `src/xdp.rs` and `src/zerocopy.rs` (both
-> unchanged in size since the previous pass — still exactly 706 and 352 lines — but re-read in
-> full rather than assumed unchanged), plus `src/server.rs`, `src/connection.rs`, `src/resp.rs`,
-> `src/router.rs` and `src/main.rs`/`src/lib.rs`. All findings from the prior revision were
-> re-checked against current line numbers (which shifted because `connection.rs` and `resp.rs`
-> have both grown substantially). One correction from the prior revision: the three rule-table
-> sub-operations are **not** separate top-level command names (`XDP.RULEADD`/`XDP.RULEDEL`/
-> `XDP.RULELIST`) — they are subcommands of a single `XDP.RULE ADD|DEL|LIST` command, parsed by
-> one `"XDP.RULE"` match arm in `resp.rs`. See §4.3.
+> **Main source files**: `src/xdp.rs` (simulated AF_XDP engine), `src/zerocopy.rs` (`MSG_ZEROCOPY` /
+> `io_uring` primitives), `src/netsec.rs` (the *real* listener path, for contrast). Integration points:
+> `src/server.rs` (per-shard XDP poll task), `src/connection.rs` (`XDP.*` dispatch,
+> `target_shard_of_cmd`, `execute_local_command`), `src/resp.rs` (`XDP.*` parsing, experimental-command
+> gate), `src/acl_categories.rs`, `src/main.rs` / `src/config.rs` (`enable-experimental-commands`).
 
 ---
 
-## 1. Source Module Map & Responsibilities
+## 1. What this subsystem does
 
-| File | Lines | Responsibility |
+Real "kernel bypass" networking (Linux **AF_XDP**) lets a program receive packets straight from the
+NIC into a shared memory area, skipping most of the kernel TCP/IP stack. An **eBPF/XDP program** (a
+small verified program the kernel runs on each incoming packet) decides per packet whether to drop
+it, pass it to the normal stack, bounce it back out (TX), or *redirect* it into a user-space socket
+(an **XSK**). Zero-copy *sending* (`MSG_ZEROCOPY`, `io_uring` `SendZc`) is the outbound counterpart:
+the kernel transmits directly from the application's pages instead of copying them.
+
+Rudis contains three pieces related to this area, and it is important to be clear about what each
+one really is:
+
+| Piece | What it really is | Who uses it |
 | :--- | :--- | :--- |
-| `src/xdp.rs` | 706 | In-process simulation of AF_XDP data structures (UMEM, rings, XSK sockets), a CIDR rule engine, a per-source-IP token-bucket rate limiter, and manual Ethernet/IPv4/TCP header parsing. Exposed via six `XDP.*` command names (eight `Command` enum variants, since `XDP.RULE` fans out to three). |
-| `src/zerocopy.rs` | 352 | Real, standalone primitives for Linux `MSG_ZEROCOPY` socket sends and `io_uring`-registered fixed buffers. Not wired into the server's connection I/O path. |
+| `src/xdp.rs` | An **in-process simulation** of AF_XDP: UMEM, the four XSK rings, a CIDR filter, a per-IP rate limiter and a hand-written Ethernet/IPv4/TCP parser. No eBPF program, no AF_XDP socket, no NIC. | The experimental `XDP.*` commands, and one background task per shard that executes commands found in packets injected with `XDP.INJECT`. |
+| `src/zerocopy.rs` | Real, correct wrappers around `SO_ZEROCOPY`, `send(..., MSG_ZEROCOPY)`, an `io_uring` `SendZc` builder and a page-aligned buffer pool for `io_uring` buffer registration. | Nobody — only its own unit tests. |
+| `src/netsec.rs` | The **real** network ingress path: `bind` parsing, `SO_REUSEPORT` listener creation, the port-in-use probe, and protected mode. | `main.rs` and every shard in `server.rs`. All real client traffic arrives here. |
 
-**Module registration**: `src/lib.rs:36-37` declares `pub mod xdp;` and `pub mod zerocopy;`
-unconditionally — no `#[cfg(...)]` gate on either `mod` statement. `src/main.rs` contains **zero**
-references to either module (grep confirms); it is not involved in process bootstrap beyond
-`server.rs` pulling in the `XdpEngine` singleton itself (§4.2).
-
-**Build configuration**: `Cargo.toml` (workspace root) defines no `[features]` table at all —
-neither module is behind a Cargo feature flag. Both compile unconditionally into every build, on
-every platform Rudis targets. There is no way to build Rudis *without* this code, and no way to
-opt into "real" AF_XDP behavior — the module always runs in its current, self-contained form.
+So: **no Rudis client traffic ever goes through kernel bypass.** Clients connect to ordinary TCP
+listeners built by `netsec.rs`. The XDP engine is a packet-classification and command-injection
+harness reachable only through admin commands, and only when experimental commands are enabled.
 
 ---
 
-## 2. Verified Status Summary
+## 2. Mental model
 
-**Neither module performs real Linux kernel bypass, and neither is on the path that serves the
-server's actual `6379` (or configured port) client traffic.** `server.rs`'s real accept loop binds
-an ordinary `SO_REUSEPORT` `monoio::net::TcpListener` per shard (Component 01) and is entirely
-independent of `XdpEngine`.
+```mermaid
+flowchart TD
+    subgraph Real["Real client path (netsec.rs)"]
+        NIC["NIC / kernel TCP stack"] --> L["SO_REUSEPORT listener per shard (bind_all)"]
+        L --> CONN["connection.rs handle_connection"]
+    end
 
-What *is* real: `src/xdp.rs`'s ring/socket types are not merely declared — they are instantiated
-and driven by a live, always-running background task per shard, spawned inside
-`run_shard_worker` (`src/server.rs:47`, loop body at lines 270-314; §4.2). That task can only ever
-see packets that a client injects via the `XDP.INJECT` command; there is no code path from a
-physical NIC, a raw socket, or a real eBPF/XDP program into it. The pipeline is wired end-to-end:
-rule/rate-limit filtering → transport-header stripping → RESP command parsing → **real command
-execution against the shard's actual keyspace** (the same `execute_local_command` /
-`Router::execute_remote` machinery an ordinary client connection uses) → a response written back
-onto a simulated `tx_ring`/`comp_ring`. It is entirely reachable only through the explicit
-`XDP.INJECT` admin command and never through real network ingress.
+    CONN -->|"XDP.INJECT qid payload"| INJ["XskSocket.inject_rx"]
+    CONN -->|"XDP.PACKET bytes"| PP1["XdpEngine.process_packet (classify only)"]
+    CONN -->|"XDP.RULE / STATS / INFO / SOCKET"| ENG["GLOBAL_XDP_ENGINE (one per process)"]
 
----
+    subgraph Sim["Simulated AF_XDP (xdp.rs)"]
+        INJ --> FILL["fill_ring: free frame indices"]
+        FILL --> UMEM["XskUmem frames"]
+        UMEM --> RX["rx_ring: XdpDesc"]
+        RX --> POLL["per-shard poll task (server.rs): rx_burst up to 32"]
+        POLL --> PP2["process_packet: CIDR rules, rate limit"]
+        PP2 -->|"Pass or Redirect"| EXT["extract_transport_payload"]
+        EXT --> PARSE["resp::parse_command"]
+        PARSE --> EXEC["execute_local_command or Router.execute_remote"]
+        EXEC --> TX["tx_burst: tx_ring + comp_ring (never drained)"]
+    end
 
-## 3. Data Structures (`src/xdp.rs`)
-
-### 3.1 `XdpAction` / `XdpMode` — enums
-
-```rust
-pub enum XdpAction { Pass, Drop, Redirect, Tx }     // xdp.rs:8-13
-pub enum XdpMode { Driver, Skb, Simulated }          // xdp.rs:67-71
+    EXEC -.->|"mutates real keyspace + AOF"| DB["Shard database"]
 ```
 
-`XdpAction` implements `Display` (xdp.rs:15-24), printing `"PASS"`/`"DROP"`/`"REDIRECT"`/`"TX"` —
-these are also the exact strings `XDP.RULE ADD` parses back in (§4.3), and what `XDP.PACKET`
-returns as a RESP simple string.
+Read the diagram as two worlds. The top box is how every real client reaches Rudis. The bottom box
+is a self-contained imitation of the AF_XDP data path whose *only* entry point is a client running
+`XDP.INJECT` over a normal connection. Once a payload is in the simulated RX ring, though, the
+command inside it is executed for real against the shard's database.
 
-`XdpMode::Driver` is a real enum variant but is **never constructed anywhere in the codebase** —
-grepping the crate for `XdpMode::Driver` finds only its `Display` arm (xdp.rs:76). There is no
-constructor path that selects it. The mode a running instance actually uses is decided once, at
-process startup, by the global engine initializer (xdp.rs:586-593):
+---
+
+## 3. Enablement and access control
+
+The `XDP.*` commands belong to the **experimental command families**. They are off by default.
+
+- **Config**: `enable-experimental-commands yes|no` in the config file (`RudisConfig::
+  enable_experimental_commands`, default `false`) or `--enable-experimental-commands yes|no` on the
+  command line. `main.rs` passes the result to `resp::set_experimental_commands`.
+- **Gate**: `resp::build_command` checks, for any command name containing a `.`, whether experimental
+  commands are disabled and `resp::is_experimental_command_name` matches one of
+  `EXPERIMENTAL_PREFIXES` (`JSON.`, `BF.`, `CF.`, `CMS.`, `TOPK.`, `FT.`, `SEMANTIC.`, `CRDT.`, `LLM.`,
+  `MCP.`, `XDP.`). If so, the command becomes `Command::Unknown` and the client gets an
+  "unknown command" error, exactly as if the command did not exist. In this crate's unit tests the
+  flag (`EXPERIMENTAL_COMMANDS`) defaults to on (`cfg!(test)`).
+- **ACL**: all `XDP.*` commands are reported under one command family name, `XDP`
+  (`connection::get_cmd_name`, which the ACL check `acl_cmd_name` falls back to), and the generated
+  ACL table (`acl_categories.rs`) lists `xdp` in
+  categories `@admin`, `@slow` and `@dangerous`. A user without those permissions cannot run them.
+- **Engine and poll tasks always exist.** The gate controls only the commands. The global engine is
+  created lazily on first use, and every shard always spawns its XDP poll task (§6.2); with
+  experimental commands disabled that task simply finds no socket and sleeps 200 ms between checks.
+
+---
+
+## 4. Data structures (`src/xdp.rs`)
+
+### 4.1 `XdpAction` and `XdpMode`
+
+```rust
+pub enum XdpAction { Pass, Drop, Redirect, Tx }
+pub enum XdpMode   { Driver, Skb, Simulated }
+```
+
+- `XdpAction` mirrors the real XDP verdicts. Its `Display` prints `PASS` / `DROP` / `REDIRECT` /
+  `TX`; these are the strings `XDP.RULE ADD` accepts (case-insensitively) and what `XDP.PACKET`
+  replies with.
+- `XdpMode` names the three ways a real XDP program can be attached: **driver** (native, in the NIC
+  driver), **SKB / generic** (after the kernel has built a socket buffer — slower but works
+  everywhere), and **simulated**. `Display` prints `driver`, `skb (generic)` and
+  `simulated (userspace bypass)`.
+
+The mode is chosen once by the global engine initializer:
 
 ```rust
 static GLOBAL_XDP_ENGINE: LazyLock<Arc<XdpEngine>> = LazyLock::new(|| {
@@ -84,594 +122,488 @@ static GLOBAL_XDP_ENGINE: LazyLock<Arc<XdpEngine>> = LazyLock::new(|| {
 });
 ```
 
-On essentially every real Linux host `/sys/class/net` exists, so **`XdpMode::Skb` is the mode
-selected in practice**, not `Simulated` — `Simulated` is the fallback for hosts without a
-`sysfs` network directory (e.g. some containers). This distinction matters because it changes
-`num_frames` (§3.5) and therefore how much memory the subsystem allocates on boot. Critically,
-selecting `Skb` here is purely cosmetic (it only changes what `XDP.INFO` prints) — it does not
-attach an eBPF program, open an `AF_XDP` socket, or bind to `eth0` (which may not even exist as a
-real interface on the host). `GLOBAL_XDP_ENGINE` is a process-wide `LazyLock<Arc<XdpEngine>>`
-(xdp.rs:586); `get_xdp_engine()` (xdp.rs:595-597) just clones the `Arc`. Every shard and every
-client connection shares exactly one `XdpEngine` instance.
+On essentially every Linux host `/sys/class/net` exists, so the mode is **`Skb` in practice**.
+This is purely a label plus a sizing decision (§4.5): nothing attaches an eBPF program or binds to
+`eth0` (which may not even exist). `XdpMode::Driver` is never constructed anywhere.
+`get_xdp_engine()` returns a clone of this one `Arc`, so every shard and every connection shares a
+single `XdpEngine`.
 
-### 3.2 `XdpRule` — CIDR filter entry
+### 4.2 `XdpRule` and `parse_cidr` — the CIDR filter
 
-```rust
-pub struct XdpRule {                 // xdp.rs:27-33
-    pub id: u32,
-    pub action: XdpAction,
-    pub cidr: String,
-    pub network: u32,   // pre-masked network address, from parse_cidr
-    pub netmask: u32,
-}
-```
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `id` | `u32` | Rule id from `XdpEngine::next_rule_id` (starts at 1, `fetch_add` per rule, never reused). |
+| `action` | `XdpAction` | Verdict returned when the rule matches. |
+| `cidr` | `String` | The CIDR string exactly as the user typed it (shown by `XDP.RULE LIST`). |
+| `network` | `u32` | Address already masked with `netmask`. |
+| `netmask` | `u32` | Prefix mask. |
 
-`parse_cidr` (xdp.rs:35-64) parses an IPv4 CIDR string (`a.b.c.d/n`, `n` optional and defaulting
-to `/32`) into a `(network, netmask)` pair with standard bitwise masking
-(`netmask = !0u32 << (32 - prefix_len)`, with an explicit `prefix_len == 0 → netmask = 0` special
-case to avoid a shift-by-32 panic). `prefix_len > 32` is rejected with an `Err`. Rules are stored
-as `RwLock<Vec<XdpRule>>` on `XdpEngine` and evaluated by **linear scan, first match wins**
-(xdp.rs:454-473) — acceptable given rule tables are expected to stay small; there is no CIDR trie
-or interval structure. `next_rule_id: AtomicU32` starts at `1` and is incremented with
-`fetch_add(.., Ordering::SeqCst)` per `add_rule` call (xdp.rs:372-385); IDs are never reused after
-a `del_rule`.
+**CIDR** ("Classless Inter-Domain Routing") notation `a.b.c.d/n` means "the first `n` bits of the
+address". `parse_cidr` works like this:
 
-### 3.3 `TokenBucket` — per-source-IP rate limiter
+1. Split on `/`; more than one `/` is an error.
+2. Parse the left side as an `Ipv4Addr` (IPv6 is not supported).
+3. Prefix length `n` is the right side, or 32 if absent; `n > 32` is an error.
+4. `netmask = 0` if `n == 0` (avoids a shift-by-32), else `!0u32 << (32 - n)`.
+5. `network = ip & netmask`.
 
-```rust
-pub struct TokenBucket {             // xdp.rs:83-88
-    pub tokens: f64,
-    pub capacity: f64,
-    pub refill_rate: f64,   // tokens/sec
-    pub last_update: Instant,
-}
+*Example*: `10.1.2.3/8` → `netmask = 0xFF00_0000`, `network = 0x0A00_0000`. A packet from
+`10.200.0.9` matches because `0x0AC8_0009 & 0xFF00_0000 == 0x0A00_0000`.
 
-impl TokenBucket {
-    pub fn new(capacity: f64, refill_rate: f64) -> Self { .. }   // xdp.rs:91-98, tokens starts full
-    pub fn allow(&mut self) -> bool {                            // xdp.rs:100-111
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_update).as_secs_f64();
-        self.last_update = now;
-        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
-        if self.tokens >= 1.0 { self.tokens -= 1.0; true } else { false }
-    }
-}
-```
+Rules live in `XdpEngine::rules: RwLock<Vec<XdpRule>>` and are evaluated by **linear scan, first
+match wins**, in insertion order. There is no priority field and no trie.
 
-Standard continuous-refill token bucket costing exactly **1 token per packet**, regardless of
-packet size (there is no byte-proportional variant in this file). `XdpEngine::rate_limiters` is a
-`RwLock<HashMap<u32, TokenBucket>>` keyed by source IPv4 (as `u32`); buckets are created lazily on
-first sight of an IP via `entry(ip).or_insert_with(..)` (xdp.rs:476-479) and **are never evicted**
-— one `TokenBucket` per distinct source IP the process has ever classified a packet for, for the
-lifetime of the process. This is a real, if minor, unbounded-growth characteristic. The default
-bucket, applied to every newly seen IP, has `capacity = 50_000.0` and `refill_rate = 100_000.0`
-tokens/sec (`XdpEngine::default_rate_capacity` / `default_rate_limit`, set in `XdpEngine::new`,
-xdp.rs:360-361).
+### 4.3 `TokenBucket` — per-source-IP rate limiter
 
-### 3.4 `XdpDesc` and `XskRing<T>` — descriptor and generic ring buffer
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `tokens` | `f64` | Tokens currently available (starts full). |
+| `capacity` | `f64` | Maximum tokens (burst size). |
+| `refill_rate` | `f64` | Tokens added per second. |
+| `last_update` | `Instant` | Time of the previous `allow()` call. |
+
+`allow()`:
+
+1. `elapsed` = seconds since `last_update`; set `last_update = now`.
+2. `tokens = min(tokens + elapsed * refill_rate, capacity)`.
+3. If `tokens >= 1`, subtract 1 and return `true`; otherwise return `false`.
+
+Every packet costs exactly one token regardless of size. The engine's default bucket, created the
+first time a source IP is seen, has `capacity = 50_000.0` (`default_rate_capacity`) and
+`refill_rate = 100_000.0` tokens/s (`default_rate_limit`). Buckets live in
+`XdpEngine::rate_limiters: RwLock<HashMap<u32, TokenBucket>>`, keyed by IPv4 address as `u32`, and
+are **never evicted**. There is no command to change the defaults.
+
+### 4.4 `XdpDesc` and `XskRing<T>` — descriptors and rings
 
 ```rust
-pub struct XdpDesc { pub addr: u64, pub len: u32, pub options: u32 }  // xdp.rs:122-126
+pub struct XdpDesc { pub addr: u64, pub len: u32, pub options: u32 }
 
-pub struct XskRing<T> {              // xdp.rs:129-134
+pub struct XskRing<T> {
     pub producer: AtomicU32,
     pub consumer: AtomicU32,
-    pub mask: u32,               // capacity - 1; capacity rounded up to next power of two
-    pub entries: Vec<RwLock<T>>,
+    pub mask: u32,                 // capacity - 1 (capacity is a power of two)
+    pub entries: Vec<RwLock<T>>,   // one parking_lot RwLock per slot
 }
 ```
 
-`XskRing::new(size)` (xdp.rs:137-149) rounds `size` up with `next_power_of_two()` and
-pre-allocates one `RwLock<T>` slot per entry via `T::default()` — so `T` must implement
-`Clone + Default`. `produce`/`consume` (xdp.rs:151-175) implement a classic index-based circular
-buffer: `produce` checks `prod.wrapping_sub(cons) > mask` to detect a full ring, writes into
-`entries[prod & mask]` under a per-slot `RwLock` write guard, then advances the producer index
-with `Ordering::Release`; `consume` mirrors this with `Ordering::Acquire` on the producer load and
-clones the slot's value out. This is **not lock-free in the strict sense** — each slot is
-protected by its own `RwLock<T>`, not a truly wait-free CAS-based SPSC design — but the index
-bookkeeping is atomic and the algorithm is correct for single-producer/single-consumer use within
-one process. `len()`/`is_empty()` (xdp.rs:177-187) are plain wrapping-subtract reads of the two
-atomics (`Ordering::Relaxed`). Four ring instances back each `XskSocket` (§3.6): `rx_ring:
-XskRing<XdpDesc>`, `fill_ring: XskRing<u64>`, `tx_ring: XskRing<XdpDesc>`, `comp_ring:
-XskRing<u64>` — mirroring the four rings a real AF_XDP socket exposes (Rx, Fill, Tx, Completion).
+A **descriptor** (`XdpDesc`) points at a packet inside UMEM: `addr` is a byte offset
+(`frame_index * frame_size`), `len` the packet length; `options` is always 0.
 
-### 3.5 `XskUmem` — simulated UMEM, and the unused `UmemFrame` struct
+`XskRing<T>` (requires `T: Clone + Default`) is a classic index-based circular buffer, modelled on
+the real AF_XDP rings:
+
+- `new(size)` rounds `size` up to a power of two and fills every slot with `T::default()`.
+- `produce(item)`: if `producer - consumer > mask` (wrapping), the ring is full → `false`. Otherwise
+  write the slot `producer & mask` under its write lock and store `producer + 1` with `Release`.
+  The ring holds exactly `capacity` items.
+- `consume()`: if `consumer == producer` → `None`. Otherwise clone the slot `consumer & mask` and
+  store `consumer + 1` with `Release`.
+- `len()` / `is_empty()` are `Relaxed` reads of the two indices.
+
+The design is **single-producer / single-consumer (SPSC)**: there is no compare-and-swap on the
+indices, so two concurrent producers (or two concurrent consumers) can claim the same slot. The doc
+comment calls it "lock-free", but each slot is guarded by its own `RwLock`.
+
+### 4.5 `XskUmem` — the simulated packet memory
+
+**UMEM** in real AF_XDP is one big, pinned memory region shared between kernel and user space and
+divided into fixed-size frames. The simulation:
 
 ```rust
-pub struct XskUmem {                 // xdp.rs:191-195
-    pub frame_size: usize,
-    pub num_frames: usize,
-    pub frames: RwLock<Vec<Vec<u8>>>,   // num_frames * frame_size bytes, fully allocated up front
+pub struct XskUmem {
+    pub frame_size: usize,                 // 2048
+    pub num_frames: usize,                 // 4096 (Skb/Driver) or 128 (Simulated)
+    pub frames: RwLock<Vec<Vec<u8>>>,      // one Vec per frame, allocated lazily
 }
 ```
 
-`XdpEngine::new` fixes `frame_size = 2048` unconditionally and sets `num_frames` based on mode
-(xdp.rs:347-351): **128 frames for `XdpMode::Simulated`, 4096 frames for every other mode**
-(i.e. `Skb` and the never-constructed `Driver` — see §3.1). `XskUmem::new` (xdp.rs:198-208)
-eagerly allocates `num_frames` separate `Vec<u8>` buffers, each zero-initialized to `frame_size`
-bytes (`vec![0u8; frame_size]`), stored in a `Vec<Vec<u8>>` behind one `RwLock`. Since every shard
-creates its own `XskSocket` at boot (§4.2), and each `XskSocket` owns an independently allocated
-`XskUmem`, the **per-shard UMEM footprint is `num_frames * frame_size` bytes**:
-- `Simulated` mode: 128 × 2048 B = 256 KiB per shard.
-- `Skb` mode (the practical default on Linux): 4096 × 2048 B = **8 MiB per shard**, i.e. 8 MiB ×
-  (number of shards) process-wide just for this otherwise-idle subsystem — e.g. 128 MiB total on
-  a 16-shard instance. This number is derived directly from the constants above, not measured;
-  actual RSS impact depends on allocator behavior and is not separately benchmarked here.
+- `XdpEngine::new` fixes `frame_size = 2048` and picks `num_frames = 128` for `Simulated`, `4096`
+  for every other mode.
+- `XskUmem::new` creates `num_frames` **empty** `Vec`s. A frame's buffer is allocated on first
+  write, sized to the packet, so an unused socket costs only the `Vec` headers, not
+  `num_frames * frame_size` bytes.
+- `write_frame(idx, data)` clears the frame and copies in at most `frame_size` bytes; longer data is
+  **silently truncated**. An out-of-range `idx` is a silent no-op.
+- `read_frame(idx, len)` returns `min(len, frame_size, frame.len())` bytes, or an empty `Vec` for an
+  out-of-range index.
 
-`write_frame`/`read_frame` (xdp.rs:210-226) are plain bounds-checked `copy_from_slice`/`to_vec`
-operations against a `frame_idx`-selected element of `frames`; `write_frame` silently truncates
-data longer than `frame_size` (`len = data.len().min(self.frame_size)`) rather than erroring, and
-both methods silently no-op/return-empty on an out-of-range `frame_idx` rather than panicking.
+`UmemFrame { addr, len, buffer }` is also declared in `xdp.rs` but is never constructed or used.
 
-**`UmemFrame`** (xdp.rs:114-118):
+### 4.6 `XskSocket` — the simulated AF_XDP socket
 
-```rust
-pub struct UmemFrame {
-    pub addr: u64,
-    pub len: u32,
-    pub buffer: Vec<u8>,
-}
-```
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `queue_id` | `u32` | Simulated NIC queue; by convention equals the shard id that polls it. |
+| `rx_ring` | `XskRing<XdpDesc>` | Received packets waiting for the poll task. |
+| `fill_ring` | `XskRing<u64>` | Free UMEM frame indices available for receiving. |
+| `tx_ring` | `XskRing<XdpDesc>` | "Transmitted" responses. Nothing ever consumes it. |
+| `comp_ring` | `XskRing<u64>` | Completion ring: frame indices whose TX "finished". Nothing ever consumes it. |
+| `umem` | `Arc<XskUmem>` | This socket's private frame memory. |
+| `rx_packets` / `tx_packets` | `AtomicU64` | Per-socket counters (not exposed by any command). |
 
-This struct is declared but **never constructed or referenced anywhere else in the crate** —
-`rg -n "UmemFrame" src/` returns exactly one hit, its own definition. It appears to be a leftover
-or planned-but-unused per-frame metadata type; `XskUmem` instead stores raw `Vec<u8>` buffers
-directly and `XdpDesc` (not `UmemFrame`) is what actually flows through the rings. Pure dead code
-with no runtime effect — safe to ignore, or a candidate for removal.
+`XskSocket::new(queue_id, frame_size, num_frames)` sizes all four rings to
+`max(num_frames, 64).next_power_of_two()` (4096 in `Skb` mode, 128 in `Simulated`) and pre-loads
+`fill_ring` with every frame index `0..num_frames`, so the fill ring starts full.
 
-### 3.6 `XskSocket` — simulated AF_XDP socket
+Methods:
 
-```rust
-pub struct XskSocket {               // xdp.rs:230-239
-    pub queue_id: u32,
-    pub rx_ring: XskRing<XdpDesc>,
-    pub fill_ring: XskRing<u64>,      // pre-filled with all frame indices on construction
-    pub tx_ring: XskRing<XdpDesc>,
-    pub comp_ring: XskRing<u64>,
-    pub umem: Arc<XskUmem>,
-    pub rx_packets: AtomicU64,
-    pub tx_packets: AtomicU64,
-}
-```
+1. **`inject_rx(packet) -> bool`** — take a free frame index from `fill_ring` (none → `false`);
+   copy the packet into that frame; push `XdpDesc { addr: idx * frame_size, len: packet.len() }`
+   onto `rx_ring`. If `rx_ring` is full, return the frame index to `fill_ring` and return `false`.
+   On success increment `rx_packets`. This is the **only** producer of `rx_ring` entries in the
+   codebase, and it is called only by `XDP.INJECT`.
+2. **`rx_burst(out, max_batch) -> usize`** — pop up to `max_batch` descriptors, compute
+   `idx = addr / frame_size`, copy the frame bytes (`read_frame(idx, len)`) into `out`, and return
+   `idx` to `fill_ring`. Returns the number of packets moved.
+3. **`tx_burst(packets) -> usize`** — for the *i*-th packet in the batch, write it into UMEM frame
+   *i* (frame indices are just positions in the batch, not taken from any free list), push a
+   descriptor onto `tx_ring` and, if that succeeded, push `i` onto `comp_ring` immediately
+   ("instant completion") and bump `tx_packets`. Stops at the first full `tx_ring`.
 
-`XskSocket::new(queue_id, frame_size, num_frames)` (xdp.rs:242-262): the ring capacity is
-`(num_frames.max(64)).next_power_of_two()` (so at least 64 slots even for small `num_frames`), and
-all four rings share this same capacity. At construction, `fill_ring` is pre-loaded with every
-frame index `0..num_frames` via repeated `produce()` calls — this is what makes `inject_rx`
-immediately usable without a separate "allocate frame" step.
-
-Key methods:
-- **`inject_rx(&self, packet: &[u8]) -> bool`** (xdp.rs:265-283): pops a free frame index from
-  `fill_ring`; if none is free, returns `false` immediately (packet dropped, no counter
-  incremented for this case). Otherwise copies `packet` into that UMEM frame via `write_frame`,
-  builds an `XdpDesc { addr: frame_idx * frame_size, len: packet.len() as u32, options: 0 }` and
-  pushes it onto `rx_ring`. If `rx_ring.produce` fails (ring full), the frame index is returned to
-  `fill_ring` and `false` is returned — no leak, but also no `rx_packets` increment on this
-  branch; `rx_packets` is only incremented on the success path. This is how a byte payload gets
-  *into* the simulated pipeline (§4.2) — the **only** producer of `rx_ring` entries in the whole
-  codebase is this method, called exclusively by the `XDP.INJECT` command handler (§4.3).
-- **`rx_burst(&self, out: &mut Vec<Vec<u8>>, max_batch: usize) -> usize`** (xdp.rs:286-300): pops
-  up to `max_batch` descriptors off `rx_ring` in a loop, reads each corresponding UMEM frame's
-  bytes into `out` via `read_frame`, and replenishes `fill_ring` with the freed frame index.
-  Returns the number of packets drained. Note: this method does **not** increment
-  `rx_packets`/`tx_packets` itself (those are updated in `inject_rx`/`tx_burst`).
-- **`tx_burst(&self, packets: &[&[u8]]) -> usize`** (xdp.rs:303-322): for each packet, writes it
-  into UMEM frame index `sent` (i.e. **frame indices are simply the 0-based position within the
-  batch**, not pulled from any free-list — this diverges from how `rx_burst`/`inject_rx` manage
-  frames, but is harmless here since nothing ever reads these tx frames back by address), pushes a
-  descriptor onto `tx_ring`, and immediately *also* pushes the same frame index onto `comp_ring`
-  (simulating instantaneous send completion — there is no actual transmission, so completion is
-  trivially "immediate").
-
-`XdpEngine::sockets: RwLock<HashMap<(u16, u32), Arc<XskSocket>>>` (xdp.rs:335) is a registry keyed
-by `(port, queue_id)` — **not** per-shard-exclusive: any shard can look up or create a socket for
-*any* `(port, queue_id)` pair, because `XdpEngine` itself is one process-wide singleton shared by
-every shard (§3.1). `get_or_create_socket(port, queue_id)` (xdp.rs:494-500) lazily constructs one
-`XskSocket` per key via `HashMap::entry(..).or_insert_with(..)`. `get_socket` (xdp.rs:502-504,
-read-only lookup, returns `None` if absent) and `list_sockets` (xdp.rs:506-508, returns all
-`(port, queue_id)` keys) are also provided but have no `XDP.*` command currently wired to them —
-`XDP.SOCKET` always calls `get_or_create_socket`, never `get_socket` (§4.3).
-
-### 3.7 `XdpEngine` — top-level struct
+### 4.7 `XdpEngine` — the process-wide engine
 
 ```rust
-pub struct XdpEngine {               // xdp.rs:325-344
-    pub ifname: String,
-    pub mode: XdpMode,
-    pub frame_size: usize,                                // 2048, fixed
-    pub num_frames: usize,                                 // 128 (Simulated) or 4096 (Skb/Driver)
+pub struct XdpEngine {
+    pub ifname: String,                     // "eth0" (label only)
+    pub mode: XdpMode,                      // Skb in practice
+    pub frame_size: usize,                  // 2048
+    pub num_frames: usize,                  // 4096 or 128
     pub rules: RwLock<Vec<XdpRule>>,
-    pub next_rule_id: AtomicU32,
-    pub rate_limiters: RwLock<HashMap<u32, TokenBucket>>,  // keyed by source IPv4
-    pub default_rate_limit: f64,                           // 100_000.0 tokens/sec
-    pub default_rate_capacity: f64,                        // 50_000.0 burst capacity
-    pub sockets: RwLock<HashMap<(u16, u32), Arc<XskSocket>>>,
-    pub rx_packets: AtomicU64,
-    pub rx_bytes: AtomicU64,
-    pub dropped_packets: AtomicU64,
-    pub redirected_packets: AtomicU64,
-    pub pass_packets: AtomicU64,
-    pub rate_limit_drops: AtomicU64,
+    pub next_rule_id: AtomicU32,            // starts at 1
+    pub rate_limiters: RwLock<HashMap<u32, TokenBucket>>,
+    pub default_rate_limit: f64,            // 100_000 tokens/s
+    pub default_rate_capacity: f64,         // 50_000 tokens
+    pub sockets: RwLock<HashMap<(u16, u32), Arc<XskSocket>>>,  // (port, queue_id)
+    // counters: rx_packets, rx_bytes, dropped_packets,
+    //           redirected_packets, pass_packets, rate_limit_drops (all AtomicU64)
 }
 ```
 
-`get_xdp_engine()` (xdp.rs:595-597) returns a clone of the process-wide `Arc<XdpEngine>` singleton
-— every shard, and every client connection, shares exactly one `XdpEngine`, including its
-`sockets` registry. A consequence worth calling out explicitly: **a connection accepted on shard
-B can inject a packet into the ring polled by shard A's background task**, simply by calling
-`XDP.INJECT <queue_id=A> <payload>` — nothing ties the issuing connection's shard to the
-`queue_id` argument (§4.2, §4.3).
+Methods: `add_rule`, `del_rule` (error `Rule ID <id> not found`), `list_rules` (clone),
+`process_packet` (§5.1), `get_or_create_socket(port, queue_id)` (creates on first use),
+`get_socket(port, queue_id)` (lookup only, used by the poll task), `list_sockets` (unused), and
+`info()` (the text block returned by `XDP.INFO`).
 
-### 3.8 `src/zerocopy.rs` — real, standalone, unused types
-
-```rust
-pub struct ZeroCopyStats {           // zerocopy.rs:21-27
-    pub zc_send_calls: AtomicU64,
-    pub zc_bytes_sent: AtomicU64,
-    pub registered_buffer_hits: AtomicU64,
-    pub registered_buffer_misses: AtomicU64,
-    pub fallback_sends: AtomicU64,
-}
-
-pub struct RegisteredBufferPool {    // zerocopy.rs:37-45
-    ptr: *mut u8,
-    layout: Layout,
-    slot_size: usize,
-    slot_count: usize,
-    free_slots: Vec<usize>,
-    iovecs: Vec<libc::iovec>,
-    stats: Arc<ZeroCopyStats>,
-}
-
-pub struct ZeroCopyEngine {          // zerocopy.rs:170-172
-    stats: Arc<ZeroCopyStats>,
-}
-```
-
-These are **separate** structs — `ZeroCopyEngine` does not own a `buffer_pool` field; a caller
-would need to wire the two together manually, and none does (both take their own
-`Arc<ZeroCopyStats>` independently). `RegisteredBufferPool::new(slot_count, slot_size, stats)`
-(zerocopy.rs:52-87) does a single `alloc_zeroed` allocation of `slot_count * slot_size` bytes
-page-aligned to `PAGE_SIZE = 4096` (`Layout::from_size_align(total_size, PAGE_SIZE)`), then slices
-it into `slot_count` contiguous `libc::iovec`s (one per slot, computed via pointer arithmetic
-`ptr.add(i * slot_size)`) for `io_uring::Submitter::register_buffers`, and seeds a `Vec<usize>`
-free-list `[0, 1, .., slot_count-1]`. Defaults: `DEFAULT_SLOT_COUNT = 16`, `DEFAULT_SLOT_SIZE =
-64 * 1024` (zerocopy.rs:11-14) → 16 × 64 KiB = **1 MiB total pool size** if constructed with the
-defaults (no code currently constructs it with any arguments — it has zero callers, §4.4).
-`acquire_slot`/`release_slot` (zerocopy.rs:95-114) pop/push the free-list and bump
-`registered_buffer_hits`/`misses` in `ZeroCopyStats`; `release_slot` guards against double-release
-via `free_slots.contains(&slot_idx)`. `get_slot`/`get_slot_mut` (zerocopy.rs:117-144) hand out
-raw-pointer-derived slices via `unsafe { std::slice::from_raw_parts[_mut] }`. `Drop for
-RegisteredBufferPool` (zerocopy.rs:159-167) calls `dealloc` with the stored `Layout`, matching the
-original allocation exactly (correct pairing). `unsafe impl Send + Sync` is declared explicitly
-(zerocopy.rs:47-48) since the struct holds a raw `*mut u8`.
+The `sockets` registry is keyed by `(port, queue_id)` and shared by all shards. **No socket exists
+at boot**; one is created only when `XDP.SOCKET`, `XDP.INJECT` or `XDP.INFO` asks for it.
 
 ---
 
-## 4. Execution Algorithms
+## 5. Algorithms (`src/xdp.rs`)
 
-### 4.1 `XdpEngine::process_packet` — manual Ethernet/IPv4/TCP parsing + filter pipeline
+### 5.1 `XdpEngine::process_packet` — classify one packet
 
-```rust
-pub fn process_packet(&self, packet: &[u8]) -> XdpAction {   // xdp.rs:404-492
-```
+1. **Count**: increment `rx_packets` and add `packet.len()` to `rx_bytes` (always, even for empty
+   input).
+2. **Empty** input → increment `dropped_packets`, return `Drop`.
+3. **Detect the frame shape** and extract the source IPv4 address:
+   - *Ethernet + IPv4*: `len >= 14` and bytes 12–13 are `08 00` (the IPv4 EtherType). If at least 20
+     bytes follow, the source IP is bytes 12–15 of the IP header.
+   - *Bare IPv4*: otherwise, if `len >= 20` and the top nibble of byte 0 is 4 (IP version 4), the
+     source IP is bytes 12–15.
+   - *Anything else* (e.g. raw RESP starting with `*`): no source IP.
 
-Step by step:
-1. **Counters first** (xdp.rs:405-407): `rx_packets` and `rx_bytes` are incremented
-   unconditionally, before any validation — even an empty packet counts toward `rx_packets`.
-2. **Empty-packet short-circuit** (xdp.rs:409-412): `packet.is_empty()` → increments
-   `dropped_packets` and returns `XdpAction::Drop` immediately.
-3. **Frame-shape detection** (xdp.rs:416-450): tries a 14-byte Ethernet header first — if
-   `packet.len() >= 14 && packet[12] == 0x08 && packet[13] == 0x00` (EtherType IPv4), it treats
-   bytes `14..` as an IPv4 header (requires `>= 20` more bytes, else `(None, None, 14)`). Otherwise,
-   if `packet.len() >= 20 && (packet[0] >> 4) == 4`, it treats the whole packet as a bare IPv4
-   datagram. If neither matches, `(src_ip, dst_port, payload_offset) = (None, None, 0)` — a
-   "plain text or diagnostic payload" case, e.g. raw RESP bytes with no network headers at all.
-   Both IP branches bounds-check length before indexing.
-4. **Field extraction**: source IPv4 address from bytes 12..16 of the IP header (big-endian
-   `u32`); if the IP protocol byte (offset 9) is `6` (TCP) and the packet is long enough, the
-   destination port is also parsed from the TCP header — but it is **computed and discarded**
-   (`let _ = payload_offset;`, xdp.rs:489, and `_dst_port` is never read at all). No code path in
-   this function currently branches on destination port.
-5. **CIDR rule scan** (xdp.rs:452-473): only runs if a source IP was extracted (`if let Some(ip) =
-   src_ip`). `self.rules` is scanned linearly; the first rule whose `(ip & netmask) == network`
-   decides the action (`Drop`/`Pass`/`Redirect`/`Tx`), increments the matching atomic counter
-   (`Tx` increments none), and returns immediately. Packets with no extractable source IP (the
-   "plain text" case) skip this step entirely.
-6. **Rate limiting** (xdp.rs:475-486): only reached if a source IP was extracted and no rule
-   matched. The per-source-IP `TokenBucket` is consulted (created lazily with the default
-   capacity/rate, §3.3); a failed `allow()` increments both `rate_limit_drops` and
-   `dropped_packets` and returns `XdpAction::Drop`.
-7. **Default fallback** (xdp.rs:488-491): anything not matched by a rule or rate-limited is
-   **unconditionally `Redirect`ed**, incrementing `redirected_packets`. This is a real, documented
-   gap: the inline comment above this line says "Redis port 6379 or cluster bus", but the code
-   never actually inspects the destination port it parsed in step 4 to make that decision — every
-   otherwise-unfiltered packet is redirected regardless of port.
-8. **Non-IP input** (empty `src_ip`, e.g. a plain RESP/inline-text payload with no recognizable
-   Ethernet/IPv4 header): skips rule/rate-limit evaluation entirely (steps 5-6) and falls straight
-   through to the same unconditional `Redirect` in step 7. In practice this is the common case for
-   `XDP.INJECT`-driven traffic, since injected payloads are typically raw RESP bytes, not
-   wire-format Ethernet frames (though `extract_transport_payload`, §4.3, can also strip real
-   Ethernet/IP/TCP headers if a caller does inject full wire-format frames).
+   For TCP (protocol byte 9 == 6) with enough bytes, the destination port is also read — assuming a
+   fixed 20-byte IP header — but it is never used.
+4. **CIDR rules** (only with a source IP): scan `rules`; on the first match return its action and
+   bump the matching counter (`dropped_packets`, `pass_packets`, `redirected_packets`; `Tx` bumps
+   none).
+5. **Rate limit** (only with a source IP and no matching rule): fetch or create the IP's
+   `TokenBucket`; if `allow()` fails, bump `rate_limit_drops` and `dropped_packets`, return `Drop`.
+6. **Default**: bump `redirected_packets` and return `Redirect`. The inline comment talks about
+   demuxing "Redis port 6379 or cluster bus", but no port check happens: every packet that reaches
+   this step is redirected.
 
-### 4.2 The real, wired ingestion loop — `src/server.rs`, per shard, at boot
+*Worked example* (rule `XDP.RULE ADD DROP 10.0.0.0/8` installed):
 
-Every shard's `run_shard_worker` (`src/server.rs:47`) spawns a `monoio` background task
-(`server.rs:270-314`) that continuously polls that shard's own `XskSocket`:
+| Input | Shape | Source IP | Result |
+| :--- | :--- | :--- | :--- |
+| 40-byte IPv4 header, src `10.1.2.3` | bare IPv4 | `10.1.2.3` | rule 1 matches → `Drop` |
+| 40-byte IPv4 header, src `172.16.0.1` | bare IPv4 | `172.16.0.1` | no rule, bucket allows → `Redirect` |
+| `*2\r\n$3\r\nGET\r\n$1\r\na\r\n` | none (`*` is `0x2A`) | — | skips rules and limiter → `Redirect` |
 
-```rust
-// server.rs:270-314 (annotated)
-let xdp_engine = crate::xdp::get_xdp_engine();                              // shared singleton
-let xsk_socket = xdp_engine.get_or_create_socket(shard_port, shard_id as u32); // queue_id = shard_id
-let xdp_db = local_db.clone();
-let xdp_aof = aof_writer.clone();
-let xdp_router = router.clone();
-monoio::spawn(async move {
-    let mut frames = Vec::with_capacity(32);
-    loop {
-        let count = xsk_socket.rx_burst(&mut frames, 32);
-        if count > 0 {
-            for frame in frames.drain(..) {
-                let action = xdp_engine.process_packet(&frame);
-                if (action == XdpAction::Pass || action == XdpAction::Redirect)
-                    && let Some(cmd_payload) = crate::xdp::extract_transport_payload(&frame)
-                {
-                    let mut b_mut = bytes::BytesMut::from(&cmd_payload[..]);
-                    if let Ok(Some(cmd)) = crate::resp::parse_command(&mut b_mut) {
-                        let target_sid = crate::connection::target_shard_of_cmd(&cmd, xdp_router.num_shards)
-                            .unwrap_or(xdp_router.shard_id);
-                        let mut out = Vec::new();
-                        if target_sid == xdp_router.shard_id {
-                            let mut db = xdp_db.borrow_mut();
-                            let _ = crate::connection::execute_local_command(
-                                &cmd, &mut db, &mut out, xdp_aof.as_ref().map(|a| a.as_ref()),
-                            );
-                        } else {
-                            let resp = xdp_router.execute_remote(target_sid, cmd).await;
-                            out.extend_from_slice(&resp);
-                        }
-                        if !out.is_empty() {
-                            xsk_socket.tx_burst(&[&out]);
-                        }
-                    }
-                }
-            }
-        } else {
-            monoio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-});
-```
+### 5.2 `extract_transport_payload` — strip headers to get the command bytes
 
-Walkthrough:
-1. **Socket identity**: `get_or_create_socket(shard_port, shard_id as u32)` — the `queue_id` for
-   each shard's *polled* socket is exactly that shard's own `shard_id`, and `shard_port` is the
-   same port value passed to `Router::new` and stored as `Router::port` (`src/router.rs:159`), so
-   `XDP.SOCKET`/`XDP.INJECT` issued from *any* connection on *any* shard use the same `port` value
-   and can reach any shard's polling ring by matching `queue_id` (§3.7's cross-shard-injection
-   point).
-2. **Poll loop cadence**: drains up to 32 frames per `rx_burst` call; if the burst was empty,
-   sleeps 5 ms before retrying. Busy shards process a full batch with no sleep; idle shards poll
-   at ~200 Hz.
-3. **Action filter**: only `Pass` and `Redirect` actions proceed to command extraction; `Drop` and
-   `Tx` classifications are discarded with no further effect (there is no code that acts on `Tx`
-   specially here — it is simply excluded from this `if`).
-4. **Header stripping**: `extract_transport_payload` (§4.3) turns the raw frame into a presumed
-   RESP/inline command payload.
-5. **RESP parsing**: `crate::resp::parse_command` is called directly on a `BytesMut` wrapping the
-   extracted payload — the same parser real client connections use (Component 03). A parse
-   failure (`Err` or `Ok(None)`, e.g. incomplete/malformed input) silently drops the frame with no
-   counter or log.
-6. **Routing decision**: `target_shard_of_cmd(&cmd, num_shards)` (`src/connection.rs:12338`)
-   contains an explicit `match` over a few hundred lines covering single-key commands (`GET`,
-   `SET`, `HSET`, `SADD`, `ZADD`, `LPUSH`, etc. — each mapped to `target_shard(key, num_shards)`)
-   and ends in a catch-all `_ => None` (confirmed at `connection.rs:12687`). Any command **not**
-   covered by that explicit list — including multi-key commands, admin commands, and even the
-   `XDP.*` commands themselves if somehow injected — falls through to `None`, which
-   `.unwrap_or(xdp_router.shard_id)` resolves to **the polling shard's own id**, i.e. it executes
-   locally regardless of true key ownership. This means routing correctness for the injection path
-   depends entirely on whether the parsed command happens to be one of the explicitly-listed
-   single-key variants.
-7. **Execution**: if `target_sid == xdp_router.shard_id`, the command runs through
-   `execute_local_command` (`connection.rs:12734`) directly against `local_db` — **the real
-   shard state**, with AOF logging applied the same as any client-issued write. Otherwise it is
-   shipped via `Router::execute_remote(target_sid, cmd)` (`router.rs:2209`, `async fn ... ->
-   Vec<u8>`), the same cross-shard mailbox mechanism (Component 04) an ordinary client connection
-   uses for cross-shard commands.
-8. **Response**: the raw RESP response bytes are written back via `xsk_socket.tx_burst(&[&out])`
-   — into the same socket's `tx_ring`/`comp_ring` the inbound frame arrived from. Nothing ever
-   consumes `tx_ring`/`comp_ring` to transmit bytes over a real network; `XDP.SOCKET` merely
-   reports their lengths (§4.3).
+Returns `Option<Bytes>` (always a copy):
 
-So the pipeline **is** fully wired end to end: a byte payload injected into `rx_ring` is
-classified (CIDR/rate-limit), has its RESP command extracted, is **actually executed against the
-shard's real database** (locally or via a genuine cross-shard call), and the real response is
-written back into the socket's simulated `tx_ring`/`comp_ring`. What is *not* real is how a
-payload gets into `rx_ring` in the first place: the only producer is `XskSocket::inject_rx`
-(§3.6), called exclusively from the `XDP.INJECT` command handler (§4.3) — there is still no eBPF
-program, raw socket, or NIC handing frames to this ring.
+1. Empty input → `None`.
+2. *Ethernet + IPv4 + TCP*: `len >= 54`, EtherType `08 00`, protocol byte (offset 23) == 6. The IP
+   header length comes from the IHL nibble (`(byte14 & 0x0F) * 4`), the TCP header length from the
+   TCP data-offset nibble; return everything after both. If the declared lengths run past the end of
+   the buffer (or leave no payload), return `None`.
+3. *Bare IPv4 + TCP*: `len >= 40`, version nibble 4, protocol 6 — same computation without the
+   14-byte Ethernet header.
+4. *Direct RESP* (first byte `*`, `+`, `$`, `:` or `-`) → the whole input.
+5. *Anything else* → the whole input, treated as an inline text command.
 
-### 4.3 The `XDP.*` command family — six command names, eight `Command` variants
-
-`src/resp.rs` parses the command strings at lines 12968-13030. Correction from a prior revision of
-this document: rule management is **one** command name, `XDP.RULE`, with `ADD`/`DEL`/`LIST`
-subcommands — not three separate top-level commands.
-
-| Command | Parse site (`resp.rs`) | `Command` variant (`resp.rs:1706-1720`) | Dispatch site (`connection.rs`) | Effect |
-| :--- | :--- | :--- | :--- | :--- |
-| `XDP.INFO` | 12968 | `XdpInfo` | 11717 | Formats `XdpEngine::info()` as a bulk string — ifname, mode, frame size/count, rule/socket counts, all six atomic counters. |
-| `XDP.RULE ADD <action> <cidr>` | 12969-12991 | `XdpRuleAdd { action, cidr }` | 11722 | `add_rule` — pushes a new `XdpRule`; replies with the new rule's integer id. `<action>` must be one of `DROP`/`PASS`/`REDIRECT`/`TX` (case-insensitive via `.to_uppercase()`), else `-ERR Unknown XDP action: ..`. |
-| `XDP.RULE DEL <id>` | 12992-13001 | `XdpRuleDel(u32)` | 11729 | `del_rule` — removes by id; `-ERR` if not found. |
-| `XDP.RULE LIST` | 13003 | `XdpRuleList` | 11736 | `list_rules` — clones and returns the rule vector as a RESP array of `"id:N action:X cidr:Y"` bulk strings. |
-| `XDP.STATS` | 13007 | `XdpStats` | 11745 | Returns 6 key/value pairs (12-element RESP array) for `rx_packets`, `rx_bytes`, `dropped_packets`, `redirected_packets`, `pass_packets`, `rate_limit_drops`. |
-| `XDP.PACKET <bytes>` | 13008-13013 | `XdpPacket(Bytes)` | 11766 | Calls `process_packet` **directly**, bypassing the ring entirely — a synchronous classify-and-reply request/response (`+PASS`/`+DROP`/`+REDIRECT`/`+TX`), not a ring injection. Never touches a command execution path. |
-| `XDP.SOCKET <queue_id>` | 13014-13020 | `XdpSocket(u32)` | 11772 | `get_or_create_socket(router.port, qid)` (creates if absent — **not** a read-only lookup), reports `queue_id`, `rx_len`, `fill_len`, `tx_len` as a 4-pair/8-element RESP array. |
-| `XDP.INJECT <queue_id> <bytes>` | 13021-13030 | `XdpInject { queue_id, payload }` | 11786 | `get_or_create_socket(router.port, queue_id).inject_rx(payload)` — the **only** producer for the background loop in §4.2. Replies `+OK` on success, `-ERR ring full` if `inject_rx` returned `false` (either no free UMEM frame or `rx_ring` already full). |
-
-All eight variants are tagged under the ACL/stats category `"XDP"` by the command-name classifier
-at `connection.rs:4306-4313`.
-
-`extract_transport_payload` (xdp.rs:544-583) mirrors `process_packet`'s frame-shape detection to
-strip Ethernet+IPv4+TCP headers:
-- **Ethernet+IPv4+TCP** (`packet.len() >= 54 && packet[12..14] == [0x08,0x00] && packet[14+9] ==
-  6`): computes the IPv4 header length from the IHL nibble (`(packet[14] & 0x0F) * 4`), then the
-  TCP header's data offset from its own nibble, and returns everything after both headers.
-- **Raw IPv4+TCP** (`packet.len() >= 40 && (packet[0] >> 4) == 4 && packet[9] == 6`): same
-  computation without the 14-byte Ethernet prefix.
-- **Direct RESP** (first byte is `*`, `+`, `$`, `:`, or `-`): returns the entire input unchanged.
-- **Anything else** (including too-short inputs that don't match either header shape): falls
-  through to the final `else` arm and is still returned unchanged as an "inline text command" —
-  the only way to get `None` back is an **empty** input packet (checked at function entry) or a
-  TCP/IP frame whose declared header lengths overrun the actual buffer (the bounds checks inside
-  the two header branches return early without hitting any `return Some(..)`, falling through to
-  the implicit `None` at the end of the function).
-
-### 4.4 `ZeroCopyEngine::send_zc` — real syscall usage, verified unreachable
-
-```rust
-pub fn send_zc(&self, fd: RawFd, data: &[u8]) -> io::Result<usize> {   // zerocopy.rs:200-246
-    let flags = if data.len() >= PAGE_SIZE {
-        libc::MSG_NOSIGNAL | MSG_ZEROCOPY
-    } else {
-        libc::MSG_NOSIGNAL
-    };
-    let ret = unsafe { libc::send(fd, data.as_ptr() as *const _, data.len(), flags) };
-    // on success: record zc_send_calls / zc_bytes_sent
-    // on ENOBUFS, or whenever MSG_ZEROCOPY was requested: fall back to a plain blocking send()
-}
-```
-
-Correct, idiomatic use of Linux's zero-copy send path — including the size threshold
-(`PAGE_SIZE`, 4 KiB) below which plain `send()` is used, since `MSG_ZEROCOPY` incurs page-pinning
-overhead not worth paying for small payloads. An empty `data` short-circuits to `Ok(0)` with no
-syscall. The fallback branch (zerocopy.rs:225-243) triggers on `ENOBUFS` *or* whenever
-`MSG_ZEROCOPY` was in the flags at all — i.e. it unconditionally retries with a plain blocking
-`send()` whenever the zero-copy attempt didn't cleanly succeed, not only on the documented
-"kernel buffer full" case; `fallback_sends` is incremented whenever this retry path runs.
-
-**What's missing**: Linux's `MSG_ZEROCOPY` contract requires the caller to poll `MSG_ERRQUEUE` via
-`recvmsg` for a completion notification before the source buffer can be safely reused or freed —
-`send_zc` does not do this anywhere in the file. Even a hypothetically wired-up caller would have
-no correct way to know when the kernel has finished the zero-copy DMA. `fd: RawFd` is a raw file
-descriptor; `connection.rs`'s real sockets are `monoio::net::TcpStream` objects whose underlying
-fd is never extracted or passed to this function anywhere in the codebase — **confirmed by grep
-(`rg -n "zerocopy::" src/*.rs`): zero callers outside `zerocopy.rs`'s own `#[cfg(test)]` module.**
-
-`build_io_uring_send_zc` (zerocopy.rs:249-260) similarly constructs a real
-`io_uring::opcode::SendZc` entry via the genuine `io-uring` crate dependency (also used, for
-unrelated purposes, by Component 07's tiered-storage direct I/O) — but nothing ever submits the
-resulting entry to a ring; `enable_so_zerocopy` (zerocopy.rs:180-196) is a correct
-`setsockopt(SOL_SOCKET, SO_ZEROCOPY, 1)` wrapper, also with zero callers outside its own tests.
+Unlike `process_packet`, this function honours IP and TCP header-length fields.
 
 ---
 
-## 5. Cross-Component Interactions
+## 6. Integration with the server
 
-- **`src/server.rs`** (Component 01): spawns the per-shard `XskSocket` polling task inside
-  `run_shard_worker` at boot (§4.2) — real integration, not merely a comment. It runs alongside,
-  and independently of, the shard's real `monoio` `TcpListener` accept loop; the two never
-  interact or share any state beyond both ultimately calling into the same `execute_local_command`
-  / `Router` machinery.
-- **`src/connection.rs`**: dispatches all eight `Xdp*` `Command` variants (`connection.rs:11717-
-  11795`, §4.3), each forwarding to `crate::xdp::get_xdp_engine()`. Also supplies
-  `target_shard_of_cmd` (12338) and `execute_local_command` (12734), both reused unmodified by the
-  §4.2 ingestion loop.
-- **`src/resp.rs`**: parses the six `XDP.*` command name strings into the eight `Command` enum
-  variants above (`resp.rs:12968-13030`), including mapping `"DROP"`/`"PASS"`/`"REDIRECT"`/`"TX"`
-  strings to `XdpAction` for `XDP.RULE ADD`.
-- **`src/router.rs`**: `Router::execute_remote` (`router.rs:2209`) is reused, unmodified, by the
-  §4.2 ingestion loop to route a command extracted from an injected packet to its owning shard
-  when `target_shard_of_cmd` resolves to a different shard than the one polling the socket — the
-  same cross-shard mailbox mechanism (Component 04) an ordinary client connection uses. `Router`
-  also supplies the `port: u16` field (`router.rs:159`) that both the boot-time socket
-  registration and the `XDP.SOCKET`/`XDP.INJECT` handlers key their sockets on.
-- **`src/main.rs`** / **`src/lib.rs`**: `lib.rs:36-37` declares both modules unconditionally;
-  `main.rs` has zero direct references to either — all wiring happens inside `server.rs`.
-- **`src/zerocopy.rs`**: no cross-component interactions — verified zero callers outside its own
-  test module, across the entire `src/*.rs` tree.
+### 6.1 The `XDP.*` commands
+
+Six command names, eight `Command` variants (`XDP.RULE` has three subcommands). Parsing is in
+`resp::build_command`; execution is in `connection.rs`. Every handler goes through
+`get_xdp_engine()`. `router.port` is the **shard port** of the connection's shard (the base port
+normally; `base_port + shard_id` in cluster mode).
+
+| Command | `Command` variant | Behaviour and reply |
+| :--- | :--- | :--- |
+| `XDP.INFO` | `XdpInfo` | First calls `get_or_create_socket(router.port, qid)` for every `qid` in `0..num_shards`, then returns `XdpEngine::info()` as a bulk string: `# XDP Kernel Bypass` header plus `interface`, `mode`, `umem_frame_size`, `umem_num_frames`, `active_ebpf_rules`, `active_xsk_queues` and the six counters. |
+| `XDP.RULE ADD <action> <cidr>` | `XdpRuleAdd { action, cidr }` | Needs at least 4 arguments (extra ones are ignored). `<action>` is `DROP`/`PASS`/`REDIRECT`/`TX` (any case), else `Unknown XDP action: ..`. Replies with the new rule id (integer), or `-ERR <parse_cidr error>`. |
+| `XDP.RULE DEL <id>` | `XdpRuleDel(u32)` | Exactly 3 arguments; non-numeric id → `Invalid rule ID`. `+OK` or `-ERR Rule ID <id> not found`. |
+| `XDP.RULE LIST` | `XdpRuleList` | Array of bulk strings `id:<id> action:<ACTION> cidr:<cidr>`. |
+| `XDP.STATS` | `XdpStats` | 12-element array: `rx_packets`, `rx_bytes`, `dropped_packets`, `redirected_packets`, `pass_packets`, `rate_limit_drops`, each followed by its integer value. |
+| `XDP.PACKET <bytes>` | `XdpPacket(Bytes)` | Runs `process_packet` directly (no ring, no command execution) and replies `+PASS`, `+DROP`, `+REDIRECT` or `+TX`. Updates the engine counters and rate limiters. |
+| `XDP.SOCKET <queue_id>` | `XdpSocket(u32)` | `get_or_create_socket(router.port, qid)` (creates if missing); 8-element array `queue_id`, `rx_len`, `fill_len`, `tx_len`. |
+| `XDP.INJECT <queue_id> <bytes>` | `XdpInject { queue_id, payload }` | `get_or_create_socket(router.port, qid).inject_rx(payload)`; `+OK`, or `-ERR ring full` when there is no free frame or `rx_ring` is full. |
+
+A non-numeric `<queue_id>` for `XDP.SOCKET` / `XDP.INJECT` is silently treated as `0`.
+
+### 6.2 The per-shard poll task (`server.rs`, `run_shard_worker`)
+
+Every shard spawns one `monoio` task at startup that pretends to be the user-space half of AF_XDP:
+
+1. Each iteration, look up `xdp_engine.get_socket(shard_port, shard_id)`. It does **not** create
+   the socket; a socket created later by a command is picked up on the next iteration.
+2. If the socket exists, `rx_burst(&mut frames, 32)` drains up to 32 packets.
+3. If nothing was drained (or there is no socket), sleep **5 ms** when experimental commands are
+   enabled, **200 ms** when they are disabled, then loop.
+4. For each frame: `process_packet`. Only `Pass` and `Redirect` continue; `Drop` and `Tx` are
+   discarded silently.
+5. `extract_transport_payload`, then `resp::parse_command` on the result (the same parser used for
+   client connections, so RESP arrays, inline commands and the memcached storage syntax all parse).
+   A parse error or incomplete command drops the frame with no log or counter.
+6. Pick the target shard: `connection::target_shard_of_cmd(&cmd, num_shards)`, which maps a list of
+   single-key commands (`GET`, `SET`, `HSET`, `SADD`, single-key `DEL`/`EXISTS`, …) to the key's
+   owner and returns `None` for everything else. `None` becomes the polling shard's own id.
+7. Execute: on the local shard via `connection::execute_local_command(&cmd, &mut db, &mut out,
+   aof)` — the real shard database, with AOF logging — or on another shard via
+   `Router::execute_remote(target_sid, cmd).await` (the normal cross-shard mailbox).
+8. If there is a reply, `tx_burst(&[&out])` writes it into the same socket's `tx_ring` and
+   `comp_ring`, where it stays forever.
+
+*Worked example* — single-shard server (shard 0, port 6379) started with
+`--enable-experimental-commands yes`:
+
+1. A client sends `XDP.INJECT 0 "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nb\r\n"`.
+2. The handler calls `get_or_create_socket(6379, 0)`, which builds the socket (4096-entry rings,
+   fill ring full). `inject_rx` takes frame 0, copies the 27 bytes in, pushes
+   `XdpDesc { addr: 0, len: 27 }` onto `rx_ring`, and the client gets `+OK`.
+3. Within about 5 ms the shard's poll task finds the socket, drains one frame and returns frame 0
+   to the fill ring.
+4. `process_packet` sees `*` → no source IP → `Redirect` (`redirected_packets` += 1).
+5. `extract_transport_payload` returns the bytes unchanged; `parse_command` yields `SET a b`;
+   `target_shard_of_cmd` gives shard 0.
+6. `execute_local_command` sets `a` = `b` and appends it to the AOF. `GET a` from any client now
+   returns `b`.
+7. `+OK\r\n` is written to UMEM frame 0 and to `tx_ring`; `XDP.SOCKET 0` now reports `tx_len 1`.
+
+### 6.3 Which socket does an injection reach?
+
+Sockets are keyed by `(port, queue_id)`, and shard *N* polls only `(shard_port_N, N)`.
+
+- **Non-cluster mode**: all shards share the base port, so `XDP.INJECT <N> ...` from a connection on
+  *any* shard lands in shard *N*'s ring. Nothing ties the queue id to the issuing connection.
+- **Cluster mode**: each shard has its own port (`base_port + shard_id`), and `router.port` is the
+  connection's own shard port. Only `XDP.INJECT <own shard id>` reaches a polled ring; other queue
+  ids create sockets that nothing polls. `XDP.INFO` likewise creates `num_shards` sockets on the
+  connection's port, only one of which is polled.
+- A queue id that matches no shard creates an orphan socket: injected packets sit in its `rx_ring`
+  until it fills, then injections fail with `-ERR ring full`.
 
 ---
 
-## 6. Future Improvements
+## 7. `src/zerocopy.rs` — zero-copy send primitives (unused)
 
-- **High-priority decision, not a fix: decide whether either file has a real future, and act
-  accordingly.** The §4.2 loop means `xdp.rs` is more thoroughly wired than "dead code with
-  tests," but it is still only reachable via an explicit `XDP.INJECT` admin command, never by real
-  network traffic. Either invest in real `AF_XDP`/`XSK` syscalls (a genuine `aya`/`libbpf`
-  dependency, root/`CAP_NET_ADMIN`/`CAP_BPF`, NIC driver support) and a real eBPF program, or
-  rename/document this module clearly as a packet-classification simulation harness rather than
-  implying kernel bypass. `zerocopy.rs` has no callers at all; either wire `send_zc`/
-  `RegisteredBufferPool` into `connection.rs`'s large-reply write path (which requires exposing
-  `monoio` socket file descriptors, not currently done anywhere) or remove it.
-- **Medium — add the missing `MSG_ERRQUEUE` completion polling** (§4.4) if `zerocopy.rs` is kept
-  — a real correctness gap in the zero-copy contract, independent of whether it ever gets a
-  caller.
-- **Medium — make `process_packet`'s default-Redirect fallback actually inspect the destination
-  port** (§4.1), matching its own doc comment, rather than unconditionally redirecting everything
-  unmatched.
-- **Medium — `target_shard_of_cmd`'s silent fallback to local execution** (§4.2 step 6) means any
-  command not in its explicit single-key whitelist (multi-key commands, admin commands, etc.)
-  injected via `XDP.INJECT` executes on whichever shard happened to be polling the ring it was
-  injected into, not necessarily the shard that actually owns the affected key(s) — a correctness
-  trap for anyone using `XDP.INJECT` to drive real traffic against a multi-shard keyspace.
-- **Low — bound `rate_limiters`' unbounded growth** (§3.3): one `TokenBucket` per distinct source
-  IP ever classified, never evicted. Low risk while only reachable via explicit commands, but
-  worth a periodic sweep if ever exposed more broadly.
-- **Low — remove the dead `UmemFrame` struct** (§3.5): declared, never constructed or referenced
-  anywhere else in the crate.
+The module is compiled into every build (`pub mod zerocopy` in `lib.rs`, no Cargo feature) but has
+**no callers outside its own tests**. Real connections are `monoio` streams whose file descriptors
+are never handed to it.
+
+### 7.1 Constants
+
+| Constant | Value | Meaning |
+| :--- | :--- | :--- |
+| `PAGE_SIZE` | 4096 | Alignment of the buffer pool; threshold for using `MSG_ZEROCOPY`. |
+| `DEFAULT_SLOT_SIZE` | 64 KiB | Suggested pool slot size. |
+| `DEFAULT_SLOT_COUNT` | 16 | Suggested slot count (16 × 64 KiB = 1 MiB). |
+| `MSG_ZEROCOPY` | `0x0400_0000` | Linux `send` flag, defined locally. |
+
+### 7.2 `ZeroCopyStats`
+
+Five `AtomicU64` counters: `zc_send_calls`, `zc_bytes_sent`, `registered_buffer_hits`,
+`registered_buffer_misses`, `fallback_sends`. Shared via `Arc` between the engine and pool if a
+caller chooses to.
+
+### 7.3 `RegisteredBufferPool`
+
+`io_uring` can **register** buffers with the kernel ahead of time ("fixed buffers"), so later I/O
+skips per-call page pinning and address translation. The pool prepares memory for that:
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `ptr` | `*mut u8` | One `alloc_zeroed` allocation of `slot_count * slot_size` bytes, aligned to `PAGE_SIZE`. |
+| `layout` | `Layout` | The allocation layout, reused by `Drop` for `dealloc`. |
+| `slot_size`, `slot_count` | `usize` | Geometry. |
+| `free_slots` | `Vec<usize>` | Free list (stack), initially `0..slot_count`. |
+| `iovecs` | `Vec<libc::iovec>` | One iovec per slot, ready for `io_uring::Submitter::register_buffers`. |
+| `stats` | `Arc<ZeroCopyStats>` | Hit/miss counters. |
+
+1. `new(slot_count, slot_size, stats)`: zero count or size → `InvalidInput`; product overflow
+   (`checked_mul`) → `InvalidInput`; allocation failure → `OutOfMemory`. Then build one iovec per
+   slot at `ptr + i * slot_size`.
+2. `acquire_slot()` pops the free list (`registered_buffer_hits` += 1) or returns `None`
+   (`registered_buffer_misses` += 1).
+3. `release_slot(idx)` pushes `idx` back unless it is out of range or already free (an O(n)
+   `contains` check); both cases are ignored silently.
+4. `get_slot(idx)` / `get_slot_mut(idx)` return slices over the slot (`None` if out of range);
+   `get_slot_mut` needs `&mut self`, so no two mutable slices can coexist.
+5. Accessors: `iovecs()`, `slot_size()`, `slot_count()`, `available_slots()`.
+
+`Send`/`Sync` are implemented manually: the pool owns its allocation exclusively, and every method
+that hands out mutable access takes `&mut self`. Nothing actually registers the iovecs with a ring.
+
+### 7.4 `ZeroCopyEngine`
+
+Holds only `stats: Arc<ZeroCopyStats>`.
+
+- **`enable_so_zerocopy(fd)`** — `setsockopt(SOL_SOCKET, SO_ZEROCOPY, 1)`. Linux requires this
+  before `MSG_ZEROCOPY` sends take effect.
+- **`unsafe fn send_zc(&self, fd, data)`**:
+  1. Empty `data` → `Ok(0)` without a syscall.
+  2. Flags: `MSG_NOSIGNAL | MSG_ZEROCOPY` when `data.len() >= PAGE_SIZE` (below one page, page
+     pinning costs more than copying), otherwise just `MSG_NOSIGNAL`.
+  3. `libc::send`. On success: `zc_send_calls` += 1, `zc_bytes_sent` += bytes sent.
+  4. On error, if the error is `ENOBUFS` **or** `MSG_ZEROCOPY` was requested, increment
+     `fallback_sends` and retry with only `MSG_NOSIGNAL`. A successful retry adds to `zc_bytes_sent`
+     (not `zc_send_calls`); a failed retry returns the *original* error.
+
+  It is `unsafe` because with `MSG_ZEROCOPY` the kernel may keep reading `data`'s pages after the
+  call returns, until a completion notification appears on the socket's error queue
+  (`recvmsg(..., MSG_ERRQUEUE)`). The caller must keep the buffer alive and unchanged until then.
+  The module itself has no error-queue reader.
+- **`build_io_uring_send_zc(fd, buf_ptr, len, slot_index)`** — builds an
+  `io_uring::opcode::SendZc` submission entry, setting `buf_index` when a registered slot is given.
+  The entry is never submitted anywhere.
+- `stats()` returns the shared counters.
 
 ---
 
-## Contributor Gotchas, Invariants & Debugging Guide
+## 8. The real network path: `src/netsec.rs` (for contrast)
 
-* **Gotcha 1 — UMEM footprint is per-shard, and depends on which `XdpMode` is actually selected.**
-  Every shard creates its own `XskSocket`/`XskUmem` at boot (§4.2), and `num_frames` is decided
-  once, process-wide, by whether `/sys/class/net` exists (§3.1) — true on essentially all real
-  Linux hosts, which selects `Skb` mode with **4096 frames × 2048 B = 8 MiB of UMEM per shard**
-  (not the 128-frame/256 KiB `Simulated` figure, which only applies on hosts without `sysfs`). On
-  a 16-shard instance that is roughly 128 MiB allocated at boot for a subsystem that, absent an
-  explicit `XDP.INJECT` call, never receives a packet.
-* **Gotcha 2 — `XDP.INJECT` is not a diagnostic no-op.** Because of the §4.2 background loop, an
-  injected payload that parses as a valid RESP command is **actually executed against real shard
-  state** (same code path as a normal client command, including AOF logging) and can mutate the
-  keyspace. Treat `XDP.INJECT` as equivalent to sending a command on an ordinary connection, not
-  as an inert test hook.
-* **Gotcha 3 — `XDP.PACKET` and `XDP.INJECT` exercise different code paths.** `XDP.PACKET` calls
-  `process_packet` directly and only ever returns a classification (`PASS`/`DROP`/`REDIRECT`/
-  `TX`); it never touches a ring and never executes a command. `XDP.INJECT` goes through the ring
-  and, if the payload parses as RESP/inline and is not filtered (classified `Pass` or `Redirect`),
-  does execute a command. Don't conflate the two when writing tests or reasoning about side
-  effects.
-* **Gotcha 4 — the `queue_id` argument to `XDP.INJECT`/`XDP.SOCKET` is not scoped to the issuing
-  connection's shard.** Because `XdpEngine` and its `sockets` map are one process-wide singleton
-  (§3.1, §3.7), `XDP.INJECT <queue_id> <payload>` on *any* connection, on *any* shard, reaches the
-  background polling loop of **whichever shard's `shard_id` equals `queue_id`** — including a
-  shard other than the one handling the current connection. Using a `queue_id` that doesn't match
-  any shard's id creates an orphaned socket that nothing ever polls; injected packets there sit in
-  `rx_ring` forever (bounded by ring capacity, after which further injects simply fail with `-ERR
-  ring full`).
-* **Gotcha 5 — command routing inside the ingestion loop is a partial whitelist, not a general
-  router.** `target_shard_of_cmd` (`connection.rs:12338`) only resolves ~a few hundred lines worth
-  of explicitly-matched single-key command variants to their owning shard; everything else
-  (`_ => None`, confirmed at `connection.rs:12687`) defaults to local execution on the polling
-  shard via `.unwrap_or(xdp_router.shard_id)`. Don't assume an injected multi-key or
-  non-key-addressed command gets routed correctly.
-* **Gotcha 6 — `RegisteredBufferPool`/`ZeroCopyEngine` are correct but fully inert.** `libc::send`
-  with `MSG_ZEROCOPY` is real, page-alignment is real, `io_uring::opcode::SendZc` construction is
-  real — but there is no caller anywhere outside `zerocopy.rs`'s own tests, and no completion
-  (`MSG_ERRQUEUE`) polling even if one were added.
-* **Gotcha 7 — the dead `UmemFrame` struct (xdp.rs:114-118) is not part of any live data path.**
-  `XskUmem` stores raw `Vec<u8>` buffers directly; `UmemFrame` is declared but never constructed.
-  Don't spend time tracing it expecting to find a call site.
+This module is how clients actually reach Rudis; it is documented in depth in
+[`01_reactor_runtime.md`](01_reactor_runtime.md). In brief:
 
-### How to Verify Changes
+- **`bind` parsing** — `parse_bind_spec` accepts Redis-style whitespace-separated addresses into
+  `BindAddr { ip, optional }`. `*` means all IPv4 interfaces, `::*` all IPv6 interfaces, brackets
+  are stripped, duplicates collapse, and a leading `-` marks an address optional (skip it if it
+  cannot be bound). The default is `DEFAULT_BIND = "* -::*"`. `format_bind_spec` renders it back for
+  `CONFIG GET bind`.
+- **Listeners** — `bind_reuseport_listener(ip, port, backlog)` creates a non-blocking TCP socket
+  with `SO_REUSEPORT` and `SO_REUSEADDR`, `IPV6_V6ONLY` for IPv6 (so `::` does not collide with
+  `*`), and 512 KiB send/receive buffers. `bind_all` binds every address; each shard calls it with
+  backlog 4096, so the kernel spreads incoming connections across shards. A failed optional address
+  is skipped; a failed required address, or nothing bound, is an error.
+- **Port probe** — `ensure_port_free` binds a probe socket *without* `SO_REUSEPORT` (which would
+  silently join another process's listener) to detect a port already in use.
+  `ensure_port_free_with_grace` retries it every 20 ms until a grace period expires (`main.rs` uses
+  3 s), covering listeners a crashed `io_uring` instance leaves behind briefly.
+- **Per-port settings** — process-wide maps keyed by base port so in-process test servers do not
+  interfere: `BIND_ADDRS`, `PROTECTED_MODE` (default on; `protected_mode_denies` refuses
+  non-loopback peers while the default user has no password, replying `PROTECTED_MODE_DENIED`), and
+  `enable-debug-command` / `enable-module-command` as `ProtectedAction::{No, Yes, Local}` (default
+  `No`; `Local` allows loopback peers only).
+
+None of this interacts with `xdp.rs` or `zerocopy.rs`.
+
+---
+
+## 9. Invariants & gotchas
+
+- **`XDP.INJECT` executes real commands.** A payload that parses and is classified `Pass` or
+  `Redirect` mutates the real keyspace and is written to the AOF. It runs through
+  `execute_local_command` directly, so it skips the per-connection checks a normal client goes
+  through (ACL key/command permissions, auth, MULTI state) — only the `XDP.INJECT` call itself is
+  ACL-checked. The database index used is whatever `connection::CURRENT_DB` holds on that shard
+  thread at the time.
+- **`XDP.PACKET` and `XDP.INJECT` take different paths.** `XDP.PACKET` only classifies; it never
+  touches a ring or executes anything. Both update the same engine counters.
+- **Inline text can look like IPv4.** `process_packet` treats any input of 20+ bytes whose first
+  byte's high nibble is 4 as an IPv4 header — that includes ASCII `@` and `A`–`O`. An injected inline
+  command such as `GET aaaaaaaaaaaaaaaa\r\n` (`G` = `0x47`) is "from" `97.97.97.97` (bytes 12–15 are
+  `aaaa`), so CIDR rules and the rate limiter apply to it and it gets a `TokenBucket`. RESP arrays
+  (`*` = `0x2A`) and lower-case inline commands are not affected.
+- **Packets over 2048 bytes are truncated.** `write_frame` keeps only `frame_size` bytes and
+  `read_frame` returns at most that, so a larger injected command arrives incomplete and is dropped
+  by the parser without any error.
+- **TX rings fill up and stay full.** Nothing consumes `tx_ring` or `comp_ring`. After `ring_size`
+  replies (4096 in `Skb` mode) `tx_burst` stops accepting, and later replies are discarded silently
+  (the command still executes).
+- **TX reuses RX frames.** `tx_burst` writes reply *i* into UMEM frame *i*; the poll task always
+  sends one reply, so every reply overwrites frame 0. Frame 0 is also in the RX free list, so a
+  packet injected into frame 0 that has not yet been drained (for example while the task awaits a
+  cross-shard `execute_remote`) can be overwritten.
+- **Rings are SPSC, injection is not.** `XDP.INJECT` can run concurrently from connections on
+  several shard threads against the same socket, making `fill_ring` multi-consumer and `rx_ring`
+  multi-producer. Without CAS on the indices, simultaneous injections can collide (a lost packet or
+  a duplicated frame index).
+- **Injection routing is a whitelist.** Commands outside `target_shard_of_cmd`'s single-key list
+  (multi-key commands, admin commands, and so on) run on the polling shard whether or not it owns the
+  keys.
+- **`process_packet` assumes a 20-byte IP header** when reading the (unused) TCP port, while
+  `extract_transport_payload` honours IHL and the TCP data offset.
+- **Unbounded state.** `rate_limiters` gains one bucket per distinct source IP and never shrinks;
+  the `sockets` map gains one socket per distinct `(port, queue_id)` requested and never shrinks.
+- **Memory per socket is small until used.** Frames are allocated on first write, but the four rings
+  (4096 slots each in `Skb` mode) and the frame `Vec` headers are allocated when the socket is
+  created. Sockets are created only by `XDP.*` commands.
+- **One engine per process.** Rules, rate limiters, counters and sockets are shared by all shards,
+  and by all servers started in the same process (unlike `netsec.rs` settings, which are keyed by
+  port).
+
+## 10. Limitations / not implemented
+
+- No real AF_XDP: no eBPF program, no `AF_XDP` socket, no UMEM registration with the kernel, no NIC
+  queue binding. `ifname` (`eth0`) and `mode` are labels only; `XdpMode::Driver` is never used.
+- No path from the network into the rings — `XDP.INJECT` is the only producer.
+- The default verdict ignores the destination port; there is no "demux to Redis port" logic.
+- IPv4 only (no IPv6 rules or parsing); no rule priorities, no rule persistence (rules live in
+  memory and vanish on restart), no command to tune the rate-limiter defaults.
+- Responses are never transmitted anywhere; there is no way to read `tx_ring` contents back.
+- `XdpSocket.rx_packets`/`tx_packets`, `list_sockets` and `UmemFrame` are unused.
+- `zerocopy.rs` is not wired into any I/O path; it has no `MSG_ERRQUEUE` completion handling, and
+  the buffer pool is never registered with an `io_uring` instance.
+
+---
+
+## 11. Code map
+
+| File | Key symbols | What they do |
+| :--- | :--- | :--- |
+| `src/xdp.rs` | `XdpAction`, `XdpMode` | Verdicts and attachment-mode labels. |
+| `src/xdp.rs` | `XdpRule`, `parse_cidr` | IPv4 CIDR filter entries and parsing. |
+| `src/xdp.rs` | `TokenBucket` | Per-source-IP rate limiter (1 token per packet). |
+| `src/xdp.rs` | `XdpDesc`, `XskRing<T>` | Descriptor and SPSC ring modelled on AF_XDP rings. |
+| `src/xdp.rs` | `XskUmem`, `UmemFrame` | Lazily allocated frame memory; `UmemFrame` is unused. |
+| `src/xdp.rs` | `XskSocket` (`inject_rx`, `rx_burst`, `tx_burst`) | Simulated XSK with rx/fill/tx/comp rings. |
+| `src/xdp.rs` | `XdpEngine` (`process_packet`, `add_rule`, `del_rule`, `list_rules`, `get_or_create_socket`, `get_socket`, `info`) | Process-wide engine: rules, limiter, socket registry, counters. |
+| `src/xdp.rs` | `extract_transport_payload` | Strips Ethernet/IPv4/TCP headers to get command bytes. |
+| `src/xdp.rs` | `GLOBAL_XDP_ENGINE`, `get_xdp_engine` | Singleton creation (mode picked from `/sys/class/net`) and access. |
+| `src/server.rs` | `run_shard_worker` (XDP poll task) | Drains the shard's socket, classifies, parses and executes injected commands. |
+| `src/connection.rs` | `Command::Xdp*` handlers, `get_cmd_name`, `target_shard_of_cmd`, `execute_local_command` | Command execution, ACL family name, routing and local execution reused by the poll task. |
+| `src/resp.rs` | `build_command` (`XDP.*` arms), `Command::Xdp*`, `EXPERIMENTAL_PREFIXES`, `is_experimental_command_name`, `set_experimental_commands`, `experimental_commands_enabled` | Parsing and the experimental-command gate. |
+| `src/acl_categories.rs` | `xdp` entry | ACL categories `@admin @slow @dangerous`. |
+| `src/config.rs`, `src/main.rs` | `enable_experimental_commands` | Config / CLI switch for the `XDP.*` commands. |
+| `src/zerocopy.rs` | `ZeroCopyStats`, `RegisteredBufferPool`, `ZeroCopyEngine` (`enable_so_zerocopy`, `send_zc`, `build_io_uring_send_zc`), `PAGE_SIZE`, `MSG_ZEROCOPY` | Unused zero-copy send and fixed-buffer primitives. |
+| `src/netsec.rs` | `parse_bind_spec`, `format_bind_spec`, `bind_reuseport_listener`, `bind_all`, `ensure_port_free`, `ensure_port_free_with_grace`, `protected_mode_denies`, `ProtectedAction` | The real listener path, port probe and protected mode. |
+
+### How to verify changes
+
 ```bash
-# 1. Format check
 cargo fmt --check
-
-# 2. Clippy verification with zero warnings
 cargo clippy --all-targets -- -D warnings
-
-# 3. Run unit tests
-cargo test --lib -- --test-threads=1
+cargo test --lib -- xdp:: zerocopy:: netsec::
 ```

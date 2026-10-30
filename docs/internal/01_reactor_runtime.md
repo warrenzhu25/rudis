@@ -1,785 +1,882 @@
-# Component 01: Reactor Runtime & Server Lifecycle (Implementation Deep-Dive & Code Reference)
+# Component 01: Reactor Runtime & Server Lifecycle — Implementation Reference
 
-> **Source Files**: `src/main.rs` (278 lines), `src/server.rs` (2,079 lines)
 > **High-Level Design Spec**: [`docs/design/01_reactor_runtime.md`](../design/01_reactor_runtime.md)
 > **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
->
-> This document is self-contained: every claim below was re-verified directly against the current
-> source (not carried forward from a previous pass) as of commit history through `13dc14d`. Where
-> this revision corrects or adds to a previous version of this document, that is called out
-> explicitly.
+> **Main source files**: `src/main.rs` (process entry), `src/server.rs` (per-shard worker),
+> `src/shutdown.rs` (signals, quiesce, drain barrier), `src/conn_balance.rs` (connection
+> rebalancing), `src/netsec.rs` (bind / protected mode / port probe), `src/transport.rs`
+> (plain-TCP client transport), `src/mailbox.rs` (cross-shard mesh, as used here),
+> `src/syscheck.rs`, `src/log.rs`, `src/telemetry.rs`, `src/server_stats.rs`, `src/cycleclock.rs`,
+> `src/lib.rs`.
 
 ---
 
-## 1. Source Module Map & Responsibilities
+## 1. What this subsystem does
 
-| File | Subsystem Role | Key Structs / Functions |
+Rudis is a Redis-compatible server built as a **shared-nothing, thread-per-core** system: the
+keyspace is split into *shards*, each shard is owned by exactly one OS thread, and that thread runs
+its own single-threaded async runtime. No two threads ever touch the same shard's data. This
+document covers everything needed to get those threads running and to stop them cleanly:
+
+- **Process startup** (`main.rs`): parse the redis-server-compatible command line and config file,
+  register process-wide settings (bind addresses, ACL, TLS, memory limits, logging, metrics),
+  refuse to start if the port is already taken, build the cross-shard message mesh, and spawn one
+  thread per shard.
+- **The shard worker** (`server.rs::run_shard_worker`): build the shard's async runtime, open
+  listeners, restore data from RDB or AOF, start background housekeeping tasks, run the
+  *cross-shard receiver* that executes requests sent by other shards, and accept client
+  connections.
+- **Connection placement**: the kernel spreads new connections over shards unevenly, so the accept
+  loop hands connections over to a less loaded shard (`conn_balance.rs`).
+- **Shutdown** (`shutdown.rs` + the tail of `run_shard_worker`): on `SIGTERM`/`SIGINT` or the
+  `SHUTDOWN` command, stop starting new command batches, optionally save, stop accepting, drain
+  clients, flush the AOF, and exit.
+- **Process-wide plumbing** used by every shard: the Redis-format server log (`log.rs`), `tracing`
+  routing and the Prometheus endpoint (`telemetry.rs`), INFO stats counters (`server_stats.rs`),
+  a cheap cycle-counter clock for SLOWLOG (`cycleclock.rs`), and OS sanity checks (`syscheck.rs`).
+
+Who uses it: operators (CLI flags, config, logs, signals, systemd), and every other component,
+which runs *inside* a shard thread set up here.
+
+Jargon used throughout:
+
+| Term | Meaning |
+| :--- | :--- |
+| **Shard** | One partition of the keyspace plus the thread that owns it. Identified by `shard_id` in `0..num_shards`. |
+| **monoio** | The thread-per-core async runtime. Rudis vendors a patched monoio 0.2.4 (`vendor/monoio`, see `RUDIS_PATCHES.md`). |
+| **io_uring / epoll** | Linux async I/O interfaces. monoio's `FusionDriver` uses io_uring when available; `LegacyDriver` uses epoll. |
+| **`ShardDb`** | A shard's data (`src/shard.rs`), held as `Rc<RefCell<ShardDb>>` — single-thread only by construction. |
+| **`Router`** | Per-shard object (`src/router.rs`) that knows how to reach every other shard and holds per-shard server state. One per shard, shared as `Rc<Router>` by every task on that thread. |
+| **Mesh / mailbox** | The N×N set of lock-free queues shards use to send `ShardMessage`s to each other (`src/mailbox.rs`). |
+| **`SO_REUSEPORT`** | Socket option letting every shard bind its own listener on the same port; the kernel picks which listener gets each new connection. |
+| **Base port** | The configured `port`. Many process-wide registries are keyed by it so several servers can run in one process (tests do this). |
+
+---
+
+## 2. Mental model
+
+```mermaid
+flowchart TD
+    A["main: THP off, clock calibrate, logging, signal handlers"] --> B["parse CLI + config file into RudisConfig"]
+    B --> C["register process-wide settings keyed by base port"]
+    C --> D["probe ports, AOF reshard, TLS config, banner, syscheck"]
+    D --> E["create_shard_mesh(num_shards)"]
+    E --> F["spawn thread rudis-shard-i for each shard"]
+    F --> G["run_shard_worker: pin core, build monoio runtime"]
+    G --> H["bind SO_REUSEPORT listeners (plain + TLS)"]
+    H --> I["restore RDB or replay AOF, open AofWriter"]
+    I --> J["build Router, spawn background tasks"]
+    J --> K["cross-shard receiver task"]
+    J --> L["accept loops"]
+    L -->|"claim_owner picks another shard"| M["AdoptConnection message"]
+    M --> K
+    L -->|"keep locally"| N["handle_connection task"]
+    K -->|"AdoptConnection"| N
+    L -->|"shutdown flag set"| O["drain clients, drain barrier, AOF sync"]
+    O --> P["thread exits, main joins, process exits"]
+```
+
+The key idea: after `main` spawns the threads, **each shard is an island**. Its runtime, its
+`ShardDb`, its `Router`, its client registry and its Pub/Sub hub are thread-local. Shards interact
+only by sending `ShardMessage`s through the mesh, plus a small set of process-wide registries
+(atomics or locked maps keyed by base port) for configuration and statistics.
+
+---
+
+## 3. Process startup (`main.rs`)
+
+### 3.1 Command line: redis-server compatible
+
+`main` accepts both Rudis's own flags and redis-server's command-line style, because container
+images and init scripts pass the latter:
+
+- `rudis /etc/redis.conf` — a first argument not starting with `-` is a config-file path.
+- `--<directive> <value...>` — any config directive, e.g. `--appendonly yes`, `--save 900 1 300 10`,
+  `--save ""`.
+
+`split_redis_server_args` separates the raw `argv` into three parts:
+
+1. Arguments for clap (`Args`): any `--name` found in the `RUDIS_FLAGS` table (dashes or
+   underscores accepted), plus its value if the table says it takes one (`--name=value` also works).
+   Short flags (`-p`, `-c`, `-t`) pass straight through.
+2. The positional config-file path, if any.
+3. Everything else, rewritten as config-file lines: the directive name followed by every
+   following argument up to the next `--option`. An empty value or a directive with no values
+   becomes `""`.
+
+Worked example (from the module's unit test):
+
+```text
+rudis /etc/redis.conf --port 6380 --appendonly yes --save 900 1 300 10 --no-pin --threads=2 --loglevel warning --save ""
+clap args : rudis --port 6380 --no-pin --threads=2
+config    : /etc/redis.conf
+extra     : "appendonly yes\nsave 900 1 300 10\nloglevel warning\nsave \"\"\n"
+```
+
+The extra lines are appended **after** the config file's contents and parsed together, so command
+line directives override the file, as in Redis.
+
+### 3.2 `Args` — the Rudis-native flags
+
+| Flag | Type | Meaning |
 | :--- | :--- | :--- |
-| `src/main.rs` | Process entry point: THP disablement, telemetry/signal init, CLI+config merge, ACL priming, core-affinity discovery, mesh creation, thread spawn/join | `Args` (clap), `get_process_affinity_cores`, `main` |
-| `src/server.rs` | Per-shard worker: socket setup, RDB/AOF restore, periodic tasks, cross-shard receiver, accept loops (plain + TLS), shutdown, panic isolation | `run_shard_worker`, `CatchUnwind`/`catch_unwind_async` |
-| `src/config.rs` | `RudisConfig` — file/CLI-merged configuration consumed by `main.rs` | `RudisConfig`, `load_file`, `merge_cli` |
-| `src/mailbox.rs` | Lock-free SPSC cross-shard mesh construction, consumed once by `main.rs` | `create_shard_mesh`, `ShardSender`, `ShardReceiver` |
-| `src/conn_balance.rs` | Per-connection load rebalancing census consulted by the accept loop | `claim_owner`, `plan_handoff`, `register_conn`/`unregister_conn` |
-| `src/syscheck.rs` | Startup OS/kernel sanity checks, printed once before shards spawn | `run_system_sanity_checks`, `SystemSanityReport` |
-| `src/shutdown.rs` | Process-wide shutdown flag + signal handlers | `is_shutting_down`, `install_signal_handlers` |
-| `src/agent.rs` / `src/mcp.rs` | Agent memory / MCP server — **not wired into startup at all**; see §5 | (state lives on `ShardDb`, see §5) |
+| `-c/--config` | path | Config file (also accepted positionally). |
+| `-p/--port` | u16 | Base port. |
+| `--bind` | string | Redis `bind` syntax, e.g. `"127.0.0.1 -::1"`. Default `* -::*`. |
+| `--protected-mode` | `yes`/`no` | Loopback-only access while the default user has no password (default yes). |
+| `-t/--threads` | usize | Number of shards. |
+| `--aof` | bool | Enable AOF persistence. |
+| `--aof-dir` | path | Data directory (`dir`). |
+| `--maxmemory` | string | Memory limit, e.g. `512mb`. |
+| `--tiered-offload-threshold` | u64 | NVMe offload threshold, percent (default 60). |
+| `--tiered-upload-threshold` | u64 | Upload-streaming threshold, percent (default 80). |
+| `--no-pin` | flag | Don't pin shard threads to CPU cores. |
+| `--idle-poll-us` | u64 | Microseconds a shard thread busy-polls before sleeping (overrides `idle-poll-us`; default 50). |
+| `--tls-port`, `--tls-cert-file`, `--tls-key-file` | | TLS listener and its certificate/key. |
+| `--cluster-enabled` | `yes`/`true`/`1` | Redis Cluster mode (per-shard ports). |
+| `--enable-experimental-commands` | `yes`/`no` | Accept the non-Redis command families (JSON., BF., FT., CRDT., MCP., XDP., ...). Default no. |
+| `--metrics-port`, `--metrics-bind` | u16, IP | Prometheus HTTP endpoint and its address (default `127.0.0.1`; the endpoint has no auth). |
+
+Everything else (e.g. `--maxmemory-policy allkeys-lru`) is a config directive handled by the
+split described above.
+
+### 3.3 Startup sequence
+
+`main` performs these steps in order. All of them run on the main thread before any shard exists.
+
+1. **Disable Transparent Huge Pages** for the process (`prctl(PR_SET_THP_DISABLE)`, Linux only), so
+   the kernel never promotes allocations to 2 MiB pages (latency spikes, copy-on-write
+   amplification during snapshots).
+2. `connection::mark_server_start()` — fixes the start time and run id used by `INFO server`.
+3. `cycleclock::init()` — calibrates the SLOWLOG clock (§9.4) now, a ~2 ms spin, rather than on
+   the first timed command.
+4. `telemetry::init_telemetry()` — routes `tracing` events into the server log (§9.2).
+5. `shutdown::install_signal_handlers()` — §7.1.
+6. **Parse arguments** (§3.1) and **load the config**: if a config file is given, read it, append
+   the command-line directives, parse with `RudisConfig::parse_str`, and record the path with
+   `config::set_active_config_file` (used by `CONFIG REWRITE`). Without a file, parse just the
+   command-line directives, or use `RudisConfig::default()`. Any parse error is fatal (exit 1,
+   message to the log and stderr via `log_fatal!`).
+7. **Merge CLI overrides** with `RudisConfig::merge_cli` (port, threads, aof, aof-dir, maxmemory,
+   both tiering thresholds, TLS port/cert/key, cluster flag), then apply `--bind`.
+8. **Network settings**: parse `bind` with `netsec::parse_bind_spec` and register it per base
+   port (`netsec::set_bind_addrs`); apply `--protected-mode` and register it
+   (`netsec::set_protected_mode`).
+9. **Memory and client limits**: `tiering::set_max_memory`, `set_offload_threshold_pct`,
+   `set_upload_threshold_pct` (keyed by port), `connection::set_max_clients`,
+   `connection::set_max_memory_policy`.
+10. **`requirepass`**: if set, `acl::get_acl_for_port(port).write().set_requirepass(pass)`
+    configures the `default` user's password (Component 15 owns the details).
+11. **Shard count**: `get_process_affinity_cores()` returns the CPU ids this process may run on
+    (`core_affinity::get_core_ids`, which on Linux is `sched_getaffinity` on the calling thread,
+    so it honours `taskset` and cgroup cpusets). `num_cores` is that count, falling back to
+    `available_parallelism()` and then 1. `num_shards = threads.unwrap_or(min(num_cores, 8))`.
+12. **Cluster hub**: always records the cluster config file path (`cluster-config-file`, default
+    `nodes.conf`, relative to `dir`). In cluster mode it also sets the hub's `cluster_enabled`,
+    the global `HAS_ACTIVE_CLUSTER`, and `num_shards`, then loads `nodes.conf`: if it describes this
+    node as a replica, `replication::set_startup_replicaof` schedules replication of its master;
+    if no file existed, a fresh one is saved.
+13. **Port probe** (§3.4): every port the process will listen on — the base port (or
+    `port..port+num_shards-1` in cluster mode), the TLS port, and the cluster bus port
+    `port + 10000` — must be free, else exit 1.
+14. **Misc runtime knobs**: `aof::set_aof_load_truncated`, `mailbox::set_cross_shard_spin`
+    (`cross-shard-spin`, default 0), `monoio::set_idle_poll_us` (patched-monoio idle polling,
+    default 50 µs), `resp::set_experimental_commands`, `config::set_save_points` (`save` rules;
+    **empty by default**, unlike Redis), and the metrics listener, which is **bound here**
+    (`telemetry::bind_metrics_listener`) so a bad address fails at startup, then served later by
+    shard 0.
+15. `allocator::set_background_thread(true)` — jemalloc's background purge thread (Redis default
+    `jemalloc-bg-thread yes`), so an idle server returns freed pages.
+16. **Apply remaining directives**: for every entry in `extra_directives`, `replicaof`/`slaveof`
+    becomes a startup replication target, and every directive goes through
+    `connection::apply_config_value` (the same code as `CONFIG SET`). Unknown directives are
+    collected and reported in one warning; invalid values are fatal. Logging directives
+    (`logfile`, `loglevel`, `log-format`, ...) take effect here, so the startup banner that follows
+    honours them.
+17. **ACL**: resolve a relative `aclfile` against `dir` and load it, then apply `user` lines from
+    the config. Errors are fatal.
+18. **AOF**: `appendfsync always` is registered with `aof::set_appendfsync`; an `AofConfig
+    { enabled, dir, fsync_every_sec }` is built. If AOF is on, `aof::reshard_aof_dir` imports Redis
+    7 AOF files or reshards per-shard AOF files written with a different shard count (originals
+    are kept in an `aof-reshard-backup-*` directory); failure is fatal.
+19. **TLS**: record cert/key/CA/`tls-auth-clients` in `tls::get_tls_runtime(port)`. If a TLS port
+    is configured, build a rustls server config from the files (with optional client-cert
+    verification), or — if no cert/key is given — from an **in-memory self-signed certificate**
+    for `localhost`/`127.0.0.1`. The result is stored in the TLS runtime (so it can be swapped later)
+    and wrapped in a `TlsWorkerConfig { tls_port, server_config }` for the shards.
+20. **Banner** (logged at notice level): ports, bind, shard count and pinning, metrics URL,
+    cluster port range, AOF on/off, followed by `syscheck` warnings (§9.5).
+21. **Mesh**: `mailbox::create_shard_mesh(num_shards)` (§4).
+22. **Spawn shards**: for each shard, a thread named `rudis-shard-{i}` with a
+    `SHARD_THREAD_STACK_SIZE` (32 MiB) stack runs `run_shard_worker(...)`. If pinning is enabled
+    and `shard_id < allowed_cores.len()`, the shard is pinned to `allowed_cores[shard_id]`;
+    otherwise it is left unpinned.
+23. **Join** every shard thread, then log `"Redis is now ready to exit, bye bye..."` and
+    `"rudis server gracefully stopped. Goodbye!"`.
+
+The 32 MiB stack exists because shard threads run deeply nested async state machines plus an
+embedded Lua VM; unoptimised builds overflow the 2 MiB default. Every spawner of
+`run_shard_worker` (including tests) must use `SHARD_THREAD_STACK_SIZE`.
+
+### 3.4 Why the port probe exists
+
+Shard listeners use `SO_REUSEPORT`, so if another process of the same user already listens on the
+port, the shards' `bind` would **succeed** and silently share that process's connections.
+`netsec::ensure_port_free` instead binds a probe socket *without* `SO_REUSEPORT` (but with
+`SO_REUSEADDR`, so `TIME_WAIT` leftovers don't count); Linux refuses it with `EADDRINUSE` while any
+listener holds the port. `ensure_port_free_with_grace` retries for up to 3 seconds (logging one
+warning), because when a previous io_uring-based instance is killed, the kernel tears down its rings
+asynchronously and its listening sockets linger briefly. Optional (`-`-prefixed) bind addresses that
+cannot be bound at all (e.g. no IPv6) are skipped, as in `bind_all`.
 
 ---
 
-## 2. Process Startup (`main.rs`)
+## 4. The cross-shard mesh, as seen by the runtime
 
-```
-Process Startup (main.rs)
-        │
-   #[cfg(target_os = "linux")] libc::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)     (line 90-95)
-        │
-   rudis::telemetry::init_telemetry()                                         (line 97)
-   rudis::shutdown::install_signal_handlers()                                 (line 98)
-        │
-   Args::parse()                                                              (line 99)
-        │
-   RudisConfig::load_file(--config) or RudisConfig::default()                 (line 102-107)
-        │
-   cluster_opt = args.cluster_enabled.map(|s| "yes"|"true"|"1")               (line 110-113)
-   server_config.merge_cli(port, threads, aof, aof_dir, maxmemory,
-       tiered_offload_threshold, tiered_upload_threshold,
-       tls_port, tls_cert_file, tls_key_file, cluster_opt)                    (line 114-126)
-        │
-   tiering::set_max_memory / set_offload_threshold_pct / set_upload_threshold_pct (keyed by port)
-   connection::set_max_clients / set_max_memory_policy                        (line 128-135)
-        │
-   requirepass → prime default ACL user's password + hash (line 137-153)      (NEW, see §2.3)
-        │
-   allowed_cores = get_process_affinity_cores()  (cgroup/taskset-aware)       (line 155-162, see §2.2)
-   num_shards = server_config.threads.unwrap_or_else(|| num_cores.min(8))     (line 164)
-        │
-   if cluster_enabled: cluster::get_cluster_hub(port) primed with num_shards  (line 166-174)
-        │
-   build AofConfig { enabled, dir, fsync_every_sec: true }                    (line 176-180)
-   build Option<TlsWorkerConfig> (file-based cert/key, or in-memory self-signed) (line 182-204)
-        │
-   print startup banner + syscheck::run_system_sanity_checks()                (line 206-235)
-        │
-   mailbox::create_shard_mesh(num_shards) → (senders_mesh, receivers)         (line 238)
-        │
-   for each shard: thread::Builder::new().name("rudis-shard-{i}").spawn(run_shard_worker(...)) (line 242-272)
-        │
-   for each handle: handle.join()                                             (line 274-276)
-        │
-   println!("rudis server gracefully stopped. Goodbye!")                      (line 277)
-```
+`create_shard_mesh(num_shards)` (`src/mailbox.rs`) runs once in `main` and returns
+`(senders_mesh, receivers)`:
 
-### 2.1 `Args` — every CLI flag, verified against current source
+- An N×N matrix of `SpscQueue<ShardMessage>` rings: `rings[i][j]` carries messages from shard `i`
+  to shard `j`. Capacity is 64 for `i != j` and 16 for the self-ring (rounded up to a power of
+  two). An SPSC (single-producer, single-consumer) ring needs no locks because exactly one
+  thread writes and one thread reads it.
+- When a ring is full, `push` falls back to a mutex-protected **overflow `VecDeque`**, so `send`
+  never blocks or fails for lack of space; FIFO order is preserved by draining the overflow into
+  the ring before appending.
+- Per target shard: one `Doorbell` (a 3-state atomic `IDLE/WAITING/RUNG` wake-up with a single
+  waker slot), one cache-padded `sleeping` flag, and one `SenderLife` whose drop rings the bell so
+  a parked receiver notices when every sender is gone.
 
-```rust
-#[derive(Parser, Debug)]
-#[command(name = "rudis", version = "0.1.0", about = "Multi-threaded Shared-Nothing Redis in Rust based on io_uring")]
-struct Args {
-    config: Option<PathBuf>,               // -c/--config
-    port: Option<u16>,                     // -p/--port
-    threads: Option<usize>,                // -t/--threads
-    aof: Option<bool>,                     // --aof
-    aof_dir: Option<PathBuf>,              // --aof-dir
-    maxmemory: Option<String>,             // --maxmemory (e.g. "512mb", "1gb")
-    tiered_offload_threshold: Option<u64>, // --tiered-offload-threshold (default: 60)
-    tiered_upload_threshold: Option<u64>,  // --tiered-upload-threshold (default: 80)
-    no_pin: bool,                          // --no-pin (default_value_t = false)
-    tls_port: Option<u16>,                 // --tls-port
-    tls_cert_file: Option<PathBuf>,        // --tls-cert-file
-    tls_key_file: Option<PathBuf>,         // --tls-key-file
-    cluster_enabled: Option<String>,       // --cluster-enabled yes|true|1
-}
-```
+Each shard gets **all N senders** (`senders_mesh[shard_id]`, so it can reach any shard including
+itself) and **only its own receiver**.
 
-This is the exact same flag set as the previous revision of this document described — **no new CLI
-flags were added** despite `main.rs` growing from 235 to 278 lines. The growth is entirely new
-*logic* inside `main`, not new surface area: the requirepass/ACL block (§2.3) and the
-`get_process_affinity_cores` helper (§2.2) account for it.
+| `ShardSender` field | Type | Meaning |
+| :--- | :--- | :--- |
+| `target_shard` | `usize` | Destination shard. |
+| `ring` | `Arc<SpscQueue<ShardMessage>>` | The dedicated ring from this shard to the target. |
+| `target_notify` | `Arc<Doorbell>` | Target's wake-up bell. |
+| `target_sleeping` | `Arc<CachePadded<AtomicBool>>` | Whether the target's receiver is about to park. |
+| `_life` | `Arc<SenderLife>` | Keeps the target's receiver "connected". |
 
-Every CLI value is `Option` and is merged on top of a `RudisConfig` (`src/config.rs`) that was
-itself either loaded from a `redis.conf`-style file (`-c/--config`) or defaulted
-(`RudisConfig::default()`). `RudisConfig`'s fields, verified against `src/config.rs`:
+**Send / receive protocol** (a Dekker-style handshake):
 
-```rust
-pub struct RudisConfig {
-    pub bind: String,                          // default "127.0.0.1"
-    pub port: u16,                              // default 6379
-    pub threads: Option<usize>,
-    pub maxclients: usize,                      // default 10000
-    pub maxmemory: Option<String>,
-    pub maxmemory_bytes: Option<u64>,
-    pub maxmemory_policy: String,                // default "noeviction"
-    pub appendonly: bool,
-    pub dir: PathBuf,                            // default "."
-    pub requirepass: Option<String>,
-    pub tls_port: Option<u16>,
-    pub tls_cert_file: Option<PathBuf>,
-    pub tls_key_file: Option<PathBuf>,
-    pub cluster_enabled: bool,
-    pub tiered_offload_threshold: u64,           // default 60
-    pub tiered_upload_threshold: u64,             // default 80
-    pub extra_directives: HashMap<String, String>,
-}
-```
+1. `send` pushes onto the ring, issues a `SeqCst` fence, then rings the doorbell **only if** the
+   target's `sleeping` flag is set. The common case (target awake) costs a push plus an atomic
+   load.
+2. `recv_async` tries `try_recv`; if empty, stores `sleeping = true`, fences, and tries again (this
+   closes the race with a sender that read `sleeping == false` just before). Only then does it
+   `await` the doorbell. After waking it clears `sleeping` and retries.
+3. `try_recv` scans incoming rings **round-robin**, starting after the ring that last delivered
+   (`next_ring`), so one busy producer cannot starve the others. Each ring stays FIFO; there is no
+   ordering across rings.
 
-`RudisConfig::merge_cli` takes 11 positional `Option<T>` arguments (port, threads, aof, aof_dir,
-maxmemory, tiered_offload_threshold, tiered_upload_threshold, tls_port, tls_cert_file,
-tls_key_file, cluster_enabled) and overwrites the corresponding field only when `Some`. There is
-`appendfsync` (`everysec`/`no`; `always` rejected) is read from the config file, not the CLI (see §3.1
-and Component 14).
+`mailbox::yield_now()` is a helper the receiver uses to give other tasks a turn (monoio 0.2 has no
+public `yield_now`; it spawns a tiny task that wakes the caller so it is re-queued at the back).
 
-### 2.2 Core-affinity discovery: `get_process_affinity_cores` (main.rs:66-87)
+Component 04 documents the mesh, the descriptors (`FastGetDescriptor`, `BatchResponder`, ...) and
+routing in full.
 
-**This is a real correction to a previous revision of this document**, which stated `num_shards`
-derives from `core_affinity::get_core_ids()`. The current code instead calls a dedicated helper
-that is cgroup/taskset-aware:
+---
 
-```rust
-fn get_process_affinity_cores() -> Vec<usize> {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) == 0 {
-            let cores: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
-                .filter(|&i| libc::CPU_ISSET(i, &set))
-                .collect();
-            if !cores.is_empty() { return cores; }
-        }
-    }
-    core_affinity::get_core_ids().unwrap_or_default().into_iter().map(|c| c.id).collect()
-}
-```
-
-On Linux, it calls `sched_getaffinity(0, ...)` directly and returns the exact set of CPU indices
-the *process* is currently allowed to run on — this correctly narrows to whatever a container
-cgroup, `taskset`, or `numactl` restriction has imposed, which `core_affinity::get_core_ids()`
-alone does not reliably do (that crate enumerates all online CPUs, not the process's actual
-affinity mask). Only if the syscall fails or returns an empty set does it fall back to
-`core_affinity::get_core_ids()`.
-
-`num_cores` (main.rs:156-162) is then `allowed_cores.len()` if non-empty, else
-`std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)` — a second fallback layer
-beyond `get_process_affinity_cores`'s own internal one.
-
-`num_shards = server_config.threads.unwrap_or_else(|| num_cores.min(8))` — **unchanged**: still
-capped at 8 by default absent an explicit `--threads`/`threads` override, so a large shared host
-does not silently spawn one `io_uring` ring and listener per core with no flags given.
-
-**Per-shard pinning** (main.rs:246-252) uses `allowed_cores[shard_id]` directly (not a second call
-to `core_affinity::get_core_ids()`), and only when `!args.no_pin && shard_id < allowed_cores.len()`;
-otherwise `core_id` is `None` and that shard's thread is left unpinned.
-
-### 2.3 requirepass → default-user ACL priming (main.rs:137-153, new since the prior doc revision)
-
-```rust
-if let Some(ref pass) = server_config.requirepass {
-    let acl = rudis::acl::get_acl_for_port(port);
-    let mut acl_guard = acl.write().unwrap();
-    if let Some(user) = acl_guard.get_user_mut("default") {
-        user.passwords.clear();
-        user.password_hashes.clear();
-        if !pass.is_empty() {
-            user.passwords.push(pass.clone());
-            let h = rudis::acl::hash_password_sha256(pass);
-            user.password_hashes.push(h);
-            user.nopass = false;
-            rudis::acl::HAS_CUSTOM_ACL.store(true, Ordering::Release);
-        } else {
-            user.nopass = true;
-        }
-    }
-}
-```
-
-If `requirepass` is set (from config file or, indirectly, CLI), `main.rs` reaches into the
-process-wide, port-keyed ACL registry (`crate::acl::get_acl_for_port`, an `RwLock`) *before any
-shard thread starts* and mutates the `default` user directly: clears any existing
-plaintext/hashed passwords, pushes the new plaintext password and its salted SHA-256 hash
-(`crate::acl::hash_password_sha256`), clears `nopass`, and flips the global
-`HAS_CUSTOM_ACL` atomic so the rest of the server knows ACL enforcement is now non-trivial. An
-empty `requirepass` string instead sets `nopass = true` (password requirement lifted). This is the
-*only* startup-time ACL mutation `main.rs` performs; everything else about ACL enforcement is
-Component 15's domain.
-
-### 2.4 `run_shard_worker`'s signature (unchanged)
+## 5. The shard worker (`run_shard_worker`, `server.rs`)
 
 ```rust
 pub fn run_shard_worker(
-    shard_id: usize,
-    num_shards: usize,
-    port: u16,
-    senders: Vec<crate::mailbox::ShardSender>,
-    rx: crate::mailbox::ShardReceiver,
-    core_id: Option<core_affinity::CoreId>,
+    shard_id: usize, num_shards: usize, port: u16,          // port = base port
+    senders: Vec<crate::mailbox::ShardSender>,               // one per shard
+    rx: crate::mailbox::ShardReceiver,                       // this shard's mailbox
+    core_id: Option<core_affinity::CoreId>,                  // None = unpinned
     aof_config: crate::aof::AofConfig,
     tls_config: Option<crate::tls::TlsWorkerConfig>,
     cluster_enabled: bool,
 )
 ```
 
-Every shard gets a clone of the full sender vector (so it can reach any other shard) but only its
-own receiver, plus its own clone of the optional `tls_config` and `aof_config`. The
-`(ShardSender, ShardReceiver)` mesh is built once by `mailbox::create_shard_mesh(num_shards)`
-(§2.5), not per-shard.
+### 5.1 Runtime construction
 
-### 2.5 The cross-shard mesh: `mailbox::create_shard_mesh` (src/mailbox.rs:627+)
+1. Pin to `core_id` if given (`core_affinity::set_for_current`).
+2. Seed the thread-local `ADOPTED_CLIENT_SEQ` to `(shard_id << 48) | (1 << 47) | 1` (client ids for
+   connections adopted from other shards; §6.3).
+3. Build `monoio::RuntimeBuilder::<FusionDriver>` with timers and a custom io_uring builder from
+   `shard_uring_builder()`: if the kernel supports them (Linux ≥ 5.19, probed once by building an
+   8-entry ring), it enables `IORING_SETUP_COOP_TASKRUN` (the kernel runs completions when the
+   thread next enters the kernel instead of interrupting it) and `IORING_SETUP_TASKRUN_FLAG`
+   (exposes "completions pending" so the patched runtime's idle poll can see it).
+4. If building the io_uring runtime fails (typically `ENOMEM` from a low `RLIMIT_MEMLOCK`), log a
+   warning explaining how to raise the locked-memory limit and fall back to
+   `RuntimeBuilder::<LegacyDriver>` (epoll). A slower shard beats a shard that never starts.
+5. Everything else runs inside `rt.block_on(async move { ... })`.
 
-Concrete shape, verified against `src/mailbox.rs`:
+### 5.2 Startup steps inside `block_on`
 
-- Allocates an **N×N matrix of `SpscQueue<ShardMessage>` rings** (`rings[i][j]` = the
-  single-producer/single-consumer ring carrying messages from shard `i` to shard `j`), each ring
-  constructed with capacity **256** (`SpscQueue::new(256)`).
-- Allocates one `flume::bounded::<()>(1)` "doorbell" channel per shard and one
-  `Arc<CachePadded<AtomicBool>>` "sleeping" flag per shard.
-- `ShardSender { target_shard, ring: Arc<SpscQueue<ShardMessage>>, target_notify: flume::Sender<()>, target_sleeping: Arc<CachePadded<AtomicBool>> }`:
-  `send()` pushes onto the ring unconditionally, then only `try_send(())` on the doorbell if the
-  target's `sleeping` flag is currently `true` — a classic low-wakeup-overhead pattern: the common
-  case (target already awake and polling) costs one lock-free push and one atomic load, no channel
-  send at all.
-- `ShardReceiver { shard_id, incoming_rings: Vec<Arc<SpscQueue<ShardMessage>>>, notify_rx, sleeping }`:
-  `try_recv()` linearly scans every incoming ring (one per peer shard) and pops the first
-  non-empty one — an O(num_shards) scan per drain attempt, not O(1). `recv_async()` (used by
-  `run_shard_worker`, §3.2) is a double-checked sleep loop: try once, set `sleeping = true`, try
-  again (closing the race where a sender checked `sleeping` as `false` just before this), then
-  `.await` the doorbell, drain any queued doorbell pings, and try once more.
+In order:
 
-This construction happens **once**, entirely inside `main.rs`'s call to `create_shard_mesh`, before
-any shard thread is spawned; `run_shard_worker` itself never constructs channels.
+1. **Ports and shared state.** Shard 0 records the startup `appendfsync everysec` flag
+   (`aof::set_fsync_every_sec`). `shard_port` is `base_port + shard_id` in cluster mode, else
+   `base_port`. `acl::share_acl_with_port(shard_port, base_port)` makes every shard port use one ACL
+   table, and `connection::set_node_port(shard_port, base_port)` maps the shard port back to its node.
+2. **Listeners.** `netsec::bind_all(bind_addrs, shard_port, 4096)` creates one listener per
+   configured bind address via `bind_reuseport_listener`: IPv4 or IPv6 socket (IPv6 sockets set
+   `IPV6_V6ONLY` so `::` does not collide with `*`), `SO_REUSEPORT`, `SO_REUSEADDR`, non-blocking,
+   512 KiB receive and send buffers, backlog 4096. Optional addresses that fail are skipped; a
+   required one failing, or nothing bound at all, panics the shard. If TLS is configured, the same
+   is done on `tls_port`. Each socket becomes a `monoio::net::TcpListener`.
+3. **`ShardDb`.** `Rc::new(RefCell::new(ShardDb::new(port).with_shard(shard_id)))` — no `Arc`, no
+   `Mutex`.
+4. **RDB restore** (only when AOF is **off**, as in Redis where the AOF is authoritative): if
+   `<dir>/<dbfilename>` exists, `table::load_rdb(path, db, shard_id, num_shards)`. Every shard
+   parses the whole file and keeps only the keys that hash to it (Component 05). Shard 0 also
+   restores the saved replication id/offset so replicas can `PSYNC` after a restart. Expired keys
+   dropped during the load are collected.
+5. **AOF replay** (only when AOF is **on**): `aof::replay_aof("<dir>/appendonly-<shard_id>.aof", db)`.
+6. **Load summary.** Each shard reports to `note_startup_load`, which sums per base port in the
+   `STARTUP_LOADS` map; the **last** shard to finish logs Redis's lines (`"Done loading RDB, keys
+   loaded: N, keys expired: M."`, `"DB loaded from disk: X seconds"`, or the AOF equivalents),
+   stores `LAST_LOAD_KEYS_LOADED` / `rdb_last_load_keys_expired` for `INFO persistence`, and
+   propagates the expired-on-load keys to replicas as `DEL`s.
+7. **Fatal load errors.** Any RDB or AOF error calls `fatal_startup_error`, which logs
+   `"[Shard N] FATAL: Fatal error loading the DB: ..."` and **exits the process with code 1**.
+   Serving an empty dataset instead would let the next save overwrite the original files.
+8. **AOF writer.** If AOF is on, `AofWriter::open` (failure is fatal). A dedicated flush task wakes
+   every **5 ms**:
+   - unless `appendfsync always` is active (it writes chunks on its own path), it first tries
+     `write_pending_sync()`; otherwise it takes a chunk (`take_flush_chunk`), writes it with
+     `write_all_at`, and reports back (`chunk_written`, which retries failed chunks);
+   - every **200th** tick (≈ 1 s) it calls `sync_data()` (fsync) if the `appendfsync everysec`
+     flag is currently set (`CONFIG SET appendfsync` can change it at runtime).
+   `replication::set_shard_log_context` then registers the writer so expirations anywhere on the
+   shard are logged as `DEL`s.
+9. **Cluster bus.** Only shard 0, and only in cluster mode, calls `cluster::start_cluster_bus(port)`.
+10. **Tiered storage.** `tiering::ShardTierManager::open(shard_id, port, tier_dir)` where
+    `tier_dir` is `$RUDIS_TIER_DIR` or `<dir>/rudis_tier_<port>` (under `dir` by default because
+    the system temp dir is often tmpfs). On success it is attached as `ShardDb::tier_manager`; on
+    failure a warning is logged and the shard runs without tiering.
+11. **Router.** Build the client registry (`Rc<RefCell<HashMap<u64, ClientInfo>>>`), the
+    per-shard `PubSubHub`, and `Router::new(shard_id, num_shards, shard_port, db, senders, aof,
+    pubsub, dir)`; then `set_base_port(base_port)`, set `cluster_enabled`, and switch maxmemory
+    accounting to allocator counts (`tier_stats.real_accounting = true`). Wrap it in `Rc` and
+    install it in the thread-local `CURRENT_ROUTER` via `connection::set_current_router`, so code
+    deep in the call stack (keyspace notifications, `current_shard_id()`) can reach it.
+12. Shard 0 calls `tiering::register_server()`; every shard publishes its memory state once.
+13. **Background tasks** (§5.3) and the **cross-shard receiver** (§5.4) are spawned.
+14. **Readiness.** A process-wide `READY` counter per base port is incremented; the shard that
+    brings it to `num_shards` calibrates real memory, logs Redis's `"Ready to accept connections
+    tcp"` (tooling waits for this exact line), and sends `READY=1` to systemd
+    (`shutdown::sd_notify`).
+15. **TLS accept loops** (§6.4), one per TLS listener.
+16. Shard 0 only: start replication for a configured `replicaof`; in cluster mode, a 100 ms task
+    that makes a master that lost all its slots replicate its new master (`hub.take_follow()`).
+17. Shard 0 only: the **save scheduler** (§5.3) and the **signal watcher** (§7.2).
+18. **Plain accept loops** (§6): every listener but the first gets a spawned `accept_loop`; the
+    first runs `accept_loop` directly, so `block_on` stays inside it until shutdown.
+19. **Shutdown tail** (§7.3): drain clients, wait at the drain barrier, final AOF sync.
 
----
+### 5.3 Background tasks
 
-## 3. Execution Algorithms (`run_shard_worker`, `src/server.rs`)
+All are `monoio::spawn`ed on the shard's own runtime and share its `Rc` state with no locking.
 
-### 3.1 Startup sequence inside `run_shard_worker`
+| Task | Runs on | Period | What it does |
+| :--- | :--- | :--- | :--- |
+| Expiry & memory | every shard | 100 ms | Updates the read-only-replica flag; runs `active_expire_cycle()` **unless this server is a replica** (replicas wait for the master's `DEL`); unless a snapshot is running, `table.shrink_step(32)` and `table.trim_arena_step(32)` to give back emptied segments/arenas; `refresh_data_step(50_000)` to recount part of the dataset estimate; `publish_memory_state()`; shard 0 also `calibrate_real_memory()`; `server_stats::sample()` for INFO rates. |
+| AOF flush | every shard with AOF | 5 ms | §5.2 step 8. |
+| Auto-tier | every shard | 20 ms | `router.check_auto_tier_local()` — offload cold data to NVMe when over threshold (Component 07). |
+| Tier GC | every shard | 2 s | `router.gc_local()` — tier file GC and hole punching. |
+| AF_XDP ingress | every shard | 5 ms idle (200 ms when experimental commands are off) | Polls the shard's XDP socket (`rx_burst`, up to 32 frames), parses a RESP command from each passed/redirected frame, executes locally or via `execute_remote`, transmits the reply. Packets only arrive through the experimental `XDP.*` commands (Component 10). |
+| Metrics server | shard 0, if `--metrics-port` | on demand | `telemetry::serve_metrics` (§9.3). |
+| Cluster follow | shard 0, cluster mode | 100 ms | Replicate a new master after losing all slots. |
+| Save scheduler | shard 0 | 100 ms | If no save/rewrite is in progress and a `save <secs> <changes>` point is due, log `"N changes in S seconds. Saving..."` and `bgsave()`. Once a second (every 10th tick), if AOF is on and not rate-limited, check `auto-aof-rewrite-percentage` / `-min-size` against the AOF base size and start `bgrewriteaof()`. Stops when shutdown begins. |
+| Signal watcher | shard 0 | 50 ms | §7.2. |
 
-In order (line numbers refer to `src/server.rs`):
+### 5.4 The cross-shard receiver
 
-1. **(58-60)** Pins to its core via `core_affinity::set_for_current`, if `core_id` is `Some`.
-2. **(62)** Seeds thread-local `ADOPTED_CLIENT_SEQ` (used only for connections handed off from
-   another shard, §3.4) to `(shard_id << 48) | (1 << 47) | 1` — bit 47 set, so ids minted here can
-   never collide with this shard's own plain-accept or TLS-accept id ranges.
-3. **(64-67)** Builds `monoio::RuntimeBuilder::<monoio::FusionDriver>::new().enable_timer()`.
-   `FusionDriver`, not a hardcoded `IoUringDriver` — it selects an `io_uring`-backed driver where
-   available and falls back to a legacy poll-based driver otherwise.
-4. **(69-2047)** Inside `rt.block_on(async move { ... })`:
-   - **(70-75)** Computes `shard_port`: `base_port + shard_id` if `cluster_enabled`, else
-     `base_port` (every shard shares the same port via `SO_REUSEPORT` otherwise).
-   - **(77-99)** Plain TCP listener: `Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))`,
-     `set_reuse_port(true)`, `set_reuse_address(true)`, `set_nonblocking(true)`,
-     `set_recv_buffer_size(512*1024)` / `set_send_buffer_size(512*1024)`, `bind`, `listen(4096)`,
-     converted into a `monoio::net::TcpListener`.
-   - **(101-127)** **If `tls_config` is `Some`**, an independent, byte-for-byte identical socket
-     setup sequence (only the bound port differs) produces a second `Option<TcpListener>`
-     (`tls_listener`).
-   - **(130)** `let local_db = Rc::new(RefCell::new(ShardDb::new(port).with_shard(shard_id)))`.
-   - **(132-148) RDB restore**, only if AOF is *not* enabled: if `<aof_dir>/dump.rdb` exists,
-     `crate::table::load_rdb(&rdb_path, &mut local_db.borrow_mut(), shard_id, num_shards)` — every
-     shard parses the **entire** RDB file independently and keeps only the keys that hash to itself
-     (see Component 05).
-   - **(150-203) AOF replay + writer**, only if AOF is enabled: `crate::aof::replay_aof` against
-     `<aof_dir>/appendonly-<shard_id>.aof`, then `AofWriter::open`. If opened, spawns a dedicated
-     `monoio::spawn` task that wakes **every 5ms** (`monoio::time::sleep(Duration::from_millis(5))`),
-     flushes any pending write chunk (`take_flush_chunk` → `write_all_at`), recycles the drained
-     buffer (`recycle_chunk`), and — when `fsync_every_sec` is set (always `true` today, see §2) —
-     `sync_data()`s (fsync) every **200th** tick, i.e. roughly once per second.
-   - **(205-208) Cluster bus**: only `shard_id == 0` calls `crate::cluster::start_cluster_bus(port)`
-     — a single, once-per-process background listener.
-   - **(210-221) Tiered storage**: opens a `crate::tiering::ShardTierManager` for this shard/port
-     (directory from `RUDIS_TIER_DIR` env var, else `<dir>/rudis_tier_<port>`; the file is locked
-     and truncated on open) and, on success, attaches it to `local_db.borrow_mut().tier_manager`.
-   - **(223-241)** Builds `client_registry` (`Rc<RefCell<HashMap<u64, ClientInfo>>>`), `pubsub`
-     (`Rc<RefCell<PubSubHub>>`), and the shard's `Router` via `Router::new(shard_id, num_shards,
-     shard_port, local_db.clone(), senders, aof_writer.clone(), pubsub.clone(), aof_config.dir.clone())`,
-     then sets `r.base_port = base_port; r.cluster_enabled = cluster_enabled;` explicitly after
-     construction. **Line 241, new since the previous revision of this document**:
-     `crate::connection::set_current_router(router.clone())` — populates a thread-local
-     (`CURRENT_ROUTER: RefCell<Option<Rc<Router>>>` in `src/connection.rs`) so that code deep in the
-     call stack (notably `notify_keyspace_event`, used for keyspace-notification pub/sub) can reach
-     the shard's `Router` without it being threaded explicitly through every function signature.
-     This is set once per shard, at startup, and never changed again.
-   - **(243-268)** Spawns three independent periodic `monoio::spawn` tasks, all sharing the same
-     `Rc<RefCell<ShardDb>>`/`Router` with no synchronization:
-     - every **100ms**: `active_db.borrow_mut().active_expire_cycle()`
-     - every **20ms**: `offload_router.check_auto_tier().await`
-     - every **2s**: `gc_router.gc_local()`
-   - **(270-314)** Spawns an **AF_XDP kernel-bypass ingress loop** (`crate::xdp`, Component 10's
-     domain): polls a zero-copy Rx ring via `xsk_socket.rx_burst(&mut frames, 32)`; for
-     `Pass`/`Redirect` actions, parses the extracted command and either executes it locally
-     (`execute_local_command`) or forwards it to the owning shard (`execute_remote`), sleeping
-     **5ms** when nothing is pending. Runs unconditionally per shard; the underlying engine no-ops
-     if no AF_XDP socket is actually attached to the interface.
-   - **(316-1853)** Spawns the **cross-shard receiver task** (§3.2).
-   - **(1856-1859)** Prints the shard's startup banner.
-   - **(1861-1926)** Spawns the **TLS accept loop**, if configured, then **(1929-2027)** enters the
-     **plain accept loop** — both run until shutdown (§3.3, §3.4).
-5. **(2029-2046)** After the plain accept loop returns (shutdown), flushes and `fsync`s the AOF
-   writer if one is open, then `block_on` returns and the thread's closure ends;
-   `main.rs`'s `handle.join()` for this shard then unblocks.
-
-### 3.2 The cross-shard receiver loop: burst-draining `ShardMessage` dispatch
+One task per shard executes every `ShardMessage` other shards (or the shard itself) send:
 
 ```rust
-monoio::spawn(async move {
-    while let Ok(mut msg) = rx.recv_async().await {
-        let mut burst = 0;
-        loop {
-            match msg { /* ~66 variants */ }
-            burst += 1;
-            if burst >= 64 { break; }
-            match rx.try_recv() {
-                Ok(next) => msg = next,
-                Err(_) => break,
-            }
+while let Ok(mut msg) = rx.recv_async().await {
+    let mut burst = 0;
+    loop {
+        match msg { /* one arm per ShardMessage variant */ }
+        burst += 1;
+        if burst >= 64 {                                   // fairness: let local clients run
+            aof_write_after_mailbox(&cross_shard_aof, base_port);
+            crate::mailbox::yield_now().await;
+            break;
+        }
+        match rx.try_recv() {
+            Ok(next) => msg = next,
+            Err(_) => { aof_write_after_mailbox(&cross_shard_aof, base_port); break; }
         }
     }
-});
+}
 ```
 
-The outer `recv_async().await` suspends the task when the mailbox is empty (per the
-double-checked-sleep protocol in §2.5); once woken, it loops on the cheap, non-async `try_recv()`
-to drain up to **64** already-queued messages inline before yielding back. This amortizes async
-wakeup/poll overhead under sustained cross-shard load (fan-out `MGET`/`MSET`, pipeline squashing
-from many peers hitting one shard at once).
+1. `recv_async` parks the task when every incoming ring is empty.
+2. Once woken, up to **64** messages are handled back-to-back with the non-async `try_recv`,
+   amortising wake-up cost under heavy fan-out.
+3. After a run ends (mailbox empty or burst limit hit), `aof_write_after_mailbox` writes any AOF
+   bytes those messages appended to the kernel (not under `appendfsync always`), so connections on
+   other shards waiting to reply to those writes see them written without another round-trip.
+4. At the burst limit the task also **yields**: `recv_async` would otherwise be immediately ready
+   while messages keep arriving, and a steady stream from other shards would starve this shard's
+   own connections.
 
-**`ShardMessage` now has 66 variants** (verified by direct enumeration of `src/shard.rs`'s
-`pub enum ShardMessage`, up from "60+" in the previous revision of this document), grouped by
-purpose:
+Handlers that need I/O (cold-tier reads, AOF sync, RDB chunk streaming, tier operations) spawn a
+separate task and reply from it, so the receiver loop itself never awaits a slow operation.
+
+`ShardMessage` (`src/shard.rs`) has **79 variants**, grouped:
 
 | Category | Variants |
 | :--- | :--- |
-| Key/value ops | `Get`, `Set`, `Del`, `Delex`, `DelKeys`, `Exists`, `ExpireTime`, `IncrBy`, `Expire`, `Persist`, `Ttl`, `Keys`, `Scan`, `RandomKey`, `ActiveDefrag` |
-| Batched/scatter-gather fan-out | `Batch`, `Mget`, `Mset`, `ScatterMget`, `ScatterMset`, `FastGet`, `FastSet`, `JsonMget` |
-| Cluster/slot control | `CountKeysInSlot`, `GetKeysInSlot`, `SetSlotState`, `SetSlotOwner`, `FlushSlots`, `Stick`, `Unstick`, `IsSticky` |
-| Persistence | `SaveRdbChunk`, `RestoreRdbChunk`, `SyncAof`, `RewriteAof` |
-| Replication apply | `ExecuteReplicaCmd` |
-| Pub/Sub (global + sharded, Redis 7) | `Publish`, `PubsubChannels`, `PubsubNumsub`, `PubsubNumpat`, `Spublish`, `Ssubscribe`, `Sunsubscribe`, `PubsubShardchannels`, `PubsubShardnumsub`, `RemoveClientPubSub` |
-| Blocking-op wakeups | `NotifyList` |
-| Distributed transaction locking | `AcquireTxLock`, `ReleaseTxLock` |
-| NVMe tiering control | `TierSpill`, `TierLoad`, `TierSpillAll`, `TierCool`, `TierDecommit`, `TierGc`, `TierSnapshot`, `StreamColdRead`, `GetUsedMemory` |
-| Full-text search | `InitSearchIndex`, `DropSearchIndex`, `SearchQuery` |
-| Admin/stats | `ClientList`, `FlushCommandStats`, `ResetCommandStats` |
-| Connection handoff | `AdoptConnection` (§3.4) |
+| Connection handoff | `AdoptConnection` (§6.3) |
+| Single-key ops | `FastGet`, `FastSet`, `Del`, `DelIfUnchanged`, `DelKeys`, `Delex`, `Exists`, `IncrBy`, `Expire`, `Persist`, `Ttl`, `ExpireTime` |
+| Pipelines / fan-out | `Batch`, `Mget`, `Mset`, `ScatterMget`, `ScatterMset`, `JsonMget` |
+| Keyspace / DB | `Keys`, `Scan`, `RandomKey`, `KeyspaceStats`, `FlushDb`, `FlushAll`, `SwapDb`, `ActiveDefrag` |
+| Cluster / slots | `CountKeysInSlot`, `GetKeysInSlot`, `SetSlotState`, `SetSlotOwner`, `SlotBarrier`, `FlushSlots`, `Stick`, `Unstick`, `IsSticky` |
+| Persistence | `SyncAof`, `WriteAof`, `RewriteAof`, `SaveRdbChunk`, `StreamRdbChunk`, `RestoreRdbChunk` |
+| Replication | `StartSyncImage`, `SyncImageStep`, `DropSyncImage`, `ExecuteReplicaCmd`, `ExecuteReplicaCmds` |
+| Pub/Sub | `Publish`, `Spublish`, `Ssubscribe`, `Sunsubscribe`, `PubsubChannels`, `PubsubShardchannels`, `PubsubNumsub`, `PubsubShardnumsub`, `PubsubNumpat`, `RemoveClientPubSub` |
+| Blocking ops | `NotifyList` |
+| Transactions | `AcquireTxLock`, `ReleaseTxLock` |
+| Memory / tiering | `GetUsedMemory`, `MemoryBreakdown`, `EvictUntilUnder`, `TryEvictOneKey`, `TierSpill`, `TierLoad`, `TierSpillAll`, `TierCool`, `TierDecommit`, `TierAutoSpill`, `TierGc`, `TierSnapshot`, `StreamColdRead` |
+| Search | `InitSearchIndex`, `DropSearchIndex`, `SearchQuery` |
+| Admin / stats | `ClientList`, `FlushCommandStats`, `ResetCommandStats` |
 
-`RemoveClientPubSub`, `Spublish`/`Ssubscribe`/`Sunsubscribe`/`PubsubShardchannels`/`PubsubShardnumsub`
-(sharded pub/sub), `Scan`/`Keys`/`RandomKey`/`ExpireTime`/`Delex`, and
-`InitSearchIndex`/`DropSearchIndex`/`SearchQuery` did not exist in the previous revision of this
-document's enumeration.
+Most handlers start by setting the thread-local `CURRENT_DB` and calling `select_db(db)` because
+each message carries the requesting client's selected database.
 
-#### `ShardMessage::Batch` — precise mechanics, including a dead-code finding
+### 5.5 `ShardMessage::Batch` — remote half of pipeline squashing
 
-`ShardMessage::Batch { items, responder, is_resp3 }` is the pipeline-squashing primitive
-(`connection.rs` sends one `Batch` per remote shard per pipeline flush). Its handler
-(`src/server.rs:619-1325`) reads:
+When a client pipelines commands, its connection groups the commands owned by each remote shard
+into one `Batch { db, items, responder, is_resp3, client_id, no_touch, defer_bcast }`. Each item is
+`(idx, key_hash, Command)`: the slot index in the client's reply array, the pre-computed key hash,
+and the command. The handler:
+
+1. Installs the requesting client's context in thread-locals: RESP3 flag, DB, `CLIENT_NO_TOUCH`,
+   `DEFER_BCAST_FLUSH`, and `CURRENT_CLIENT_ID` (so tracking, `NOLOOP` and script stats behave as if
+   the client ran the command locally). Previous values are restored afterwards.
+2. Borrows the `ShardDb` once and iterates the items **in place** (the owning shard drops the
+   commands when it takes the batch back, so key refcounts never bounce between cores).
+3. For each item, `hydrate_cmd_keys` (bring tiered keys back if needed), then try a **fast path**
+   that writes a compact reply straight into the responder slot (`responder.write_slot`):
+   - reads (`GET`, single-key `EXISTS`/`TOUCH`, `HGET`, `HMGET`, `SISMEMBER`, `SMISMEMBER`,
+     `ZMSCORE`, `LRANGE`, `ZRANGE`) — only when no client uses client-side tracking;
+   - writes (plain `SET`, `INCRBY`, single-key `DEL`/`UNLINK`, `HSET`, `SADD`, `LPUSH`, `RPUSH`,
+     `HDEL`/`SREM`/`ZREM`, `SPOP`, `ZPOPMIN`, `LPOP`/`RPOP`, `ZADD`) — only when there is **no
+     tracking, no AOF, no connected replica, and no keyspace notifications** (and, for some, no
+     active search index), because the fast path skips logging and notification;
+   - `EVAL`/`EVALSHA`/`FCALL` run through the scripting engine with the client's ACL user;
+   - anything else goes through `execute_local_command`, the general dispatcher.
+4. A `GET` that misses in memory but whose key is tiered is **deferred** into `cold_gets` instead
+   of being read inline.
+5. If SLOWLOG is enabled, each item is timed with `cycleclock` and slow ones are reported through
+   `responder.report_slow` (the owner logs them with the client's address and name).
+6. After the loop: if anything was written, `check_auto_tier_after_write()`. If `cold_gets` is
+   empty, `responder.finish(items)` hands the batch back immediately. Otherwise one spawned task
+   reads each deferred key with `stream_cold_read_local`, fills its slot, then calls `finish`.
+
+Worked example: a client on shard 0 pipelines `SET a 1`, `GET b`, `INCR c`, with `a` and `b` on
+shard 1 and `c` on shard 0, AOF off. Shard 0 runs `INCR c` itself and sends shard 1 one `Batch`
+with items `(0, h(a), SET a 1)` and `(1, h(b), GET b)`. Shard 1's receiver writes `+OK` into slot 0
+via the `SET` fast path; `b` is not in memory but is tiered, so `(1, b)` goes to `cold_gets`. The
+receiver spawns a task that reads `b` from NVMe, writes its bulk reply into slot 1 and calls
+`finish`; shard 0's connection then emits the three replies in order.
+
+---
+
+## 6. Accepting connections
+
+### 6.1 Waiting for a connection without losing it
+
+Every accept loop uses `accept_until_shutdown(listener)`, which calls `accept_polling` with a
+**200 ms** poll (`ACCEPT_SHUTDOWN_POLL`) and `shutdown::is_shutting_down` as the stop check:
 
 ```rust
-let has_tier_manager = cross_shard_db.borrow().tier_manager.is_some();
-let needs_async = false;                       // <-- hardcoded, never reassigned
-if needs_async {
-    // ~340 lines (627-966): a duplicate fast-path dispatcher (Get/Set/IncrBy/
-    // Exists/Del/Hget/Hset/Sismember/Sadd/Lpush/Lpop/Rpop/Lrange/Zrange) that
-    // spawns an async task and can .await a cold-tier read per GET.
-    // UNREACHABLE — `needs_async` is a `let`-bound constant `false` with no
-    // assignment anywhere else in the file. This entire branch is dead code.
-} else {
-    // The branch that always runs (967-1325):
-    let mut cold_gets: SmallVec<[(usize, Bytes); 8]> = SmallVec::new();
-    for (idx, key_hash, cmd) in items.drain(..) {
-        // same command set as the dead branch (Get/Set/IncrBy/Exists/Del/Hget/
-        // Hset/Sismember/Sadd/Lpush/Lpop/Rpop/Lrange/Zrange/Zadd), handled
-        // synchronously via *_with_hash fast paths, with `execute_local_command`
-        // as the generic fallback for anything not special-cased;
-        // a tiered GET miss is pushed onto `cold_gets` instead of resolved inline.
-    }
-    if cold_gets.is_empty() {
-        responder.finish(items);               // fully synchronous path
-    } else {
-        monoio::spawn(async move {
-            // resolves only the deferred cold GETs via stream_cold_read_local,
-            // then responder.finish(items)
-        });
-    }
-}
-```
-
-So the accurate behavior is: **every** `Batch` message runs its fast-path command dispatch
-synchronously, item by item, in the calling task; only keys that miss the in-memory table *and*
-are confirmed tiered are deferred, and even then only those specific slots are resolved by a single
-follow-up `monoio::spawn` task after the synchronous loop finishes — not "the whole batch" moving
-to an async task. See §6 for why the dead `if needs_async { ... }` branch matters.
-
-### 3.3 The accept loop(s): plain TCP, optional TLS, and connection rebalancing
-
-```rust
-let mut next_client_id: u64 = ((shard_id as u64) << 48) + 1;
+let mut accept = std::pin::pin!(listener.accept());
 loop {
-    if crate::shutdown::is_shutting_down() { break; }
-    let accept_res = match monoio::time::timeout(Duration::from_millis(200), listener.accept()).await {
-        Ok(res) => res,
-        Err(_) => continue, // 200ms timeout elapsed with no connection; re-check the shutdown flag
-    };
-    match accept_res {
-        Ok((stream, client_addr)) => {
-            let _ = stream.set_nodelay(true);
-            // also sets TCP_NODELAY and TCP_QUICKACK directly via setsockopt (server.rs:1946-1963)
-            let client_id = next_client_id; next_client_id += 1;
-            let owner = if cluster_enabled {
-                crate::conn_balance::register_conn(shard_id);
-                shard_id
-            } else {
-                crate::conn_balance::claim_owner(shard_id, num_shards)
-            };
-            if owner != shard_id {
-                let fd = std::os::unix::io::IntoRawFd::into_raw_fd(stream);
-                let handed = router.senders[owner].send(ShardMessage::AdoptConnection { fd, peer: client_addr }).is_ok();
-                if !handed {
-                    crate::conn_balance::unregister_conn(owner);
-                    unsafe { libc::close(fd) };
-                }
-            } else {
-                monoio::spawn(async move {
-                    let res = catch_unwind_async(async move {
-                        handle_connection(stream, client_addr, client_id, reg, r).await;
-                    }).await;
-                    crate::conn_balance::unregister_conn(shard_id);
-                    if let Err(e) = res { crate::connection::inc_isolated_panics(); tracing::error!(...); }
-                });
-            }
-        }
-        Err(e) => eprintln!("[Shard {}] Accept error: {}", shard_id, e),
-    }
+    if stop() { return None; }
+    if let Ok(res) = monoio::time::timeout(poll, accept.as_mut()).await { return Some(res); }
 }
 ```
 
-Client IDs encode the *owning* shard in the top 16 bits (`(shard_id << 48) + counter`), so IDs
-never collide across shards.
+The **same** accept future is kept alive across timeouts. Creating a fresh
+`timeout(.., listener.accept())` each round would drop an in-flight io_uring accept; if the kernel
+had already accepted a connection, monoio discards that completion and the client hangs forever
+with a leaked fd (`test_accept_polling_never_loses_a_connection` pins this down).
 
-**Connection rebalancing algorithm** (`src/conn_balance.rs`, verified line-for-line against source):
-`SO_REUSEPORT` assigns a new connection to a shard by hashing its 4-tuple; for loopback clients
-only the ephemeral source port varies, so this is effectively a random ball-into-bins draw,
-re-rolled per reconnect. The module's own doc comment gives **measured** numbers for this: *2.74M
-ops/s at 64 connections versus 5.44M ops/s at 256 connections* on an otherwise identical
-configuration — 64 connections over 16 shards puts ~8 on the busiest shard and 1-2 on others, and
-since throughput is gated by the most-loaded shard the server runs at ~51.9% of ideal capacity
-(matching a Monte-Carlo prediction). Deferring `accept()` on an overloaded shard does **not** help:
-`SO_REUSEPORT` commits a connection to a specific listener's accept queue at SYN time.
+### 6.2 The plain accept loop (`accept_loop`)
 
-The fix is explicit, not kernel-level:
-- `CONN_COUNTS: [AtomicUsize; 256]` (`MAX_TRACKED_SHARDS = 256`) is a process-global per-shard
-  connection census, touched exactly twice per connection (accept, close) — never on the
-  per-command hot path.
-- `claim_owner(accepting_shard, num_shards)` scans for the least-loaded shard
-  (`least_loaded`, an O(num_shards) linear scan starting from the accepting shard's own count) and,
-  if it differs from the accepting shard, **reserves the slot atomically** via a single
-  `compare_exchange(best_count, best_count + 1, Relaxed, Relaxed)` against the count observed
-  during the scan — so two shards racing for the same target cannot both win; the loser retries
-  the scan. It retries up to **`MAX_CLAIM_RETRIES = 4`** times before giving up and keeping the
-  connection locally (a bounded retry loop specifically to avoid livelocking the accept path under
-  a hot census). The reservation happens *before* the fd is handed off, specifically so a burst of
-  concurrent accepts across shards cannot all independently pick the same "idle-looking" target
-  (a bug the module's own test suite — `test_claim_owner_reservation_is_visible_immediately` —
-  exists explicitly to pin down).
-- If `owner != shard_id`, the raw fd is released via `into_raw_fd` (no `Drop`, so the fd stays
-  open) and handed to the target shard as `ShardMessage::AdoptConnection { fd, peer }` — valid
-  without `SCM_RIGHTS` because all shards are threads in one process sharing a single fd table. The
-  receiving shard's cross-shard receiver loop reconstructs a `monoio::net::TcpStream`
-  (`from_raw_fd`/`from_std`) and spawns `handle_connection` on it, **deliberately skipping**
-  `register_conn` on arrival — the sending shard already reserved the census slot, so double-
-  registering would make the target look busier than reality for the whole in-flight window.
-- **Cluster mode is exempt**: each shard binds its own port there (`register_conn` is still called,
-  but `claim_owner`/handoff never runs), so distribution is client-chosen and rebalancing would
-  break `MOVED` semantics for no benefit.
+All plain listeners of a shard share one client-id counter starting at `(shard_id << 48) + 1`, so
+the top 16 bits of a client id identify the accepting shard. For each accepted connection:
 
-**TLS accept loop** (`src/server.rs:1861-1926`): structurally near-identical to the plain loop
-(same 200ms shutdown-poll timeout via `monoio::time::timeout`), with client IDs carved from the
-*upper* half of the shard's 48-bit ID space (`(shard_id << 48) | 0x8000_0000_0000` plus an
-incrementing counter). Each accepted connection is upgraded via `crate::tls::TlsSession::new` +
-`session.handshake_monoio` (a real `rustls` handshake driven over the `monoio` stream, bounded by a
-10 s handshake timeout) and then wrapped in a `TlsTransport`, which is driven by the same generic
-`crate::connection::handle_client<T: ClientTransport>` loop the plain path uses (via
-`PlainTransport`) — there is no longer a separate TLS client loop. Both accept and post-handshake
-work are wrapped in `catch_unwind_async`.
+1. **Protected mode**: if `netsec::protected_mode_denies(base_port, peer_ip)` — protected mode is
+   on, the peer is not loopback (IPv4, IPv6, or IPv4-mapped loopback), and the `default` user has
+   `nopass` — send the Redis `-DENIED ...` message with a non-blocking `send` and close.
+2. Set `TCP_NODELAY`, TCP keepalive (`apply_tcp_keepalive`, from `tcp-keepalive`: idle = N s,
+   interval N/3, 3 probes; skipped when 0), and `TCP_QUICKACK`.
+3. Take the next client id.
+4. Pick the owning shard (§6.3): in cluster mode always this shard (`register_conn`); otherwise
+   `conn_balance::claim_owner(shard_id, num_shards)`.
+5. If the owner is another shard: release the fd without closing it (`into_raw_fd`) and send
+   `ShardMessage::AdoptConnection { fd, peer }`. If the send fails, give back the reserved slot
+   (`unregister_conn(owner)`) and close the fd.
+6. Otherwise spawn `handle_connection(stream, peer, client_id, registry, router)` wrapped in
+   `catch_unwind_async` (§8); when it ends, `unregister_conn(shard_id)`; a caught panic increments
+   the isolated-panic counter and is logged with the client id.
+7. Accept errors are logged as warnings; the loop continues.
 
-**Verified gap: TLS connections never touch `conn_balance` at all.** Reading `src/server.rs:1861-1926`
-line-by-line shows no call to `conn_balance::register_conn`, `claim_owner`, or `unregister_conn`
-anywhere in the TLS accept path — unlike the plain-TCP path's explicit calls at lines 1981-1991 and
-2015. This means: (1) TLS connections are never rebalanced off an overloaded shard, even though
-they suffer from exactly the same `SO_REUSEPORT` hashing skew the plain path works around; and
-(2) because TLS connections never increment `CONN_COUNTS`, the plain-TCP accept loop's
-least-loaded scan is *blind to TLS load* on every shard — a shard holding hundreds of TLS
-connections and zero plain ones looks perfectly idle to `claim_owner` and will keep absorbing
-plain-TCP handoffs. See §6.
+`handle_connection` wraps the stream in `transport::PlainTransport` and runs the generic
+`connection::handle_client` loop (Component 02).
 
-### 3.4 Shutdown
+### 6.3 Connection rebalancing (`conn_balance.rs`)
 
-Both accept loops poll `crate::shutdown::is_shutting_down()` once per iteration and break when
-`true`, discovering the flag within ~200ms of `SIGINT`/`SIGTERM` (enforced by wrapping
-`listener.accept()`/`tls_listener.accept()` in `monoio::time::timeout(Duration::from_millis(200), ...)`).
-After the **plain** accept loop returns, if this shard opened an `AofWriter`, its pending write
-buffer is flushed (`write_all_at`) and `fsync`'d (`sync_data()`) before the shard's `async move`
-block completes (`src/server.rs:2029-2046`). The shard's `block_on` then returns, the thread's
-closure ends, and `main.rs`'s `handle.join()` for that shard unblocks. Once every shard thread has
-joined, `main` prints `"rudis server gracefully stopped. Goodbye!"`.
+**The problem.** With `SO_REUSEPORT` the kernel chooses a listener by hashing the connection's
+4-tuple. For a loopback client only the ephemeral source port varies, so placement is a random
+"balls into bins" draw. With 64 connections on 16 shards the busiest shard gets ~8 while others get
+1–2, and throughput is gated by the busiest shard: measured 2.74M ops/s at 64 connections vs 5.44M
+at 256, matching a Monte-Carlo prediction of 51.9% of ideal. Delaying `accept()` doesn't help — the
+kernel commits the connection to one listener's queue at SYN time.
 
-**This is real but partial — re-verified, still true**: the cross-shard receiver task, the three
-periodic maintenance tasks, the AF_XDP ingress loop, and the TLS accept loop are not explicitly
-cancelled; they stop only because dropping the runtime drops every task still scheduled on it.
-Already-accepted client connections are **not** drained or given a chance to finish an in-flight
-request — they end the same abrupt way. **No `SAVE`/`BGSAVE` is triggered automatically on
-shutdown.** Only the AOF writer (if any) gets a final flush+fsync; an RDB-only deployment
-(`appendonly no`) loses any writes since the last manual/scheduled `SAVE`/`BGSAVE` on a clean
-`SIGTERM`.
+**The fix.** A process-global census `CONN_COUNTS: [AtomicUsize; MAX_TRACKED_SHARDS]` (256) counts
+connections per shard. It is touched only on accept and close, never per command.
 
-`shutdown.rs` itself (76 lines, unchanged) is a single `static SHUTDOWN_REQUESTED: AtomicBool`
-behind `is_shutting_down`/`request_shutdown`/`reset_shutdown` (test-only), plus
-`install_signal_handlers()` which does exactly three things: `libc::signal(SIGPIPE, SIG_IGN)`, and
-installs `handle_signal` (which just calls `request_shutdown()`) for both `SIGINT` and `SIGTERM`.
-There is no signal-safety concern beyond the bare `AtomicBool` store — no allocation, no logging,
-no async machinery runs inside the signal handler itself.
+`claim_owner(accepting_shard, num_shards)`:
 
-### 3.5 `catch_unwind_async` / `CatchUnwind` (panic isolation)
+1. If fewer than 2 shards are tracked, or the accepting shard is beyond the tracked range, register
+   locally and return it.
+2. Up to `MAX_CLAIM_RETRIES` (4) times: scan for the least-loaded shard (`least_loaded` starts with
+   the accepting shard's own count and only switches on a **strictly** lower count, so ties keep
+   the connection local). If that is the accepting shard, stop. Otherwise try
+   `compare_exchange(best_count, best_count + 1)` on the target's counter: success **reserves** the
+   slot and returns the target; failure means another shard raced for it, so re-scan.
+3. After 4 lost races, register locally (keeping one connection on a slightly busier shard is
+   cheaper than stalling accepts).
+
+The reservation happens **before** the handoff. If the count only rose when the target adopted the
+connection, the target would look idle during the in-flight window and every concurrently
+accepting shard would pick it.
+
+**Adoption.** The fd is just an integer valid process-wide (all shards share one fd table, so no
+`SCM_RIGHTS`). The target's receiver handles `AdoptConnection` by rebuilding a
+`std::net::TcpStream` (`from_raw_fd`) and `monoio::net::TcpStream::from_std`, takes a client id from
+`ADOPTED_CLIENT_SEQ` (bit 47 set), and spawns `handle_connection` under `catch_unwind_async`. It
+deliberately does **not** call `register_conn` — the sender already reserved the slot — but does
+`unregister_conn` when the connection ends, or immediately if `from_std` fails.
+
+`plan_handoff` is the pure decision function (same rule, no reservation), kept for tests and
+callers that only need the answer. `unregister_conn` saturates at zero so a double-unregister cannot
+wrap and make a shard look permanently idle.
+
+**Cluster mode is exempt**: each shard listens on its own port and clients choose the shard on
+purpose to reach its slots; moving the connection would answer from the wrong shard and break
+`MOVED` redirection.
+
+Worked example (4 shards, census `[3, 1, 2, 1]`): shard 0 accepts. `least_loaded` sees shard 1 at 1
+(shard 3 ties, not strictly lower, so shard 1 wins). CAS `1 → 2` on shard 1 succeeds; census
+becomes `[3, 2, 2, 1]` and shard 0 sends `AdoptConnection` to shard 1. If shard 2 accepted
+concurrently and won the CAS on shard 1 first, shard 0's CAS fails, it re-scans, finds shard 3 at
+1, and claims it.
+
+### 6.4 The TLS accept loop
+
+One spawned loop per TLS listener, sharing a client-id counter starting at
+`(shard_id << 48) | (1 << 46) | 1` (bit 46 keeps TLS ids apart from plain and adopted ids). For each
+connection:
+
+1. Set `TCP_NODELAY` and TCP keepalive; take a client id.
+2. Choose the server config: `tls::active_tls_server_config(base_port)` (the current one, which can
+   be replaced at runtime) or the startup config.
+3. Spawn a task (under `catch_unwind_async`) that creates a `TlsSession` and runs
+   `handshake_monoio` with a **10 s** limit (`TLS_HANDSHAKE_TIMEOUT`), so stalled sockets cannot pile
+   up before they count as clients. Handshake errors and timeouts are logged at **verbose** level
+   (port scanners would otherwise flood the log).
+4. Wrap the stream in `TlsTransport`; apply the protected-mode check (the denial is written through
+   the TLS transport); then run the same generic `connection::handle_client` as plain TCP.
+
+TLS connections are **not** part of the `conn_balance` census (see §11).
+
+### 6.5 The client transport abstraction (`transport.rs`)
+
+`connection::handle_client` is generic over the `ClientTransport` trait and monomorphised per
+transport — `PlainTransport` here and `tls::TlsTransport` — so the plaintext hot path pays nothing
+for the abstraction.
+
+| `ClientTransport` method | Purpose |
+| :--- | :--- |
+| `raw_fd()` | Underlying socket, for `shutdown(2)` (CLIENT KILL, shutdown drain) and disconnect polling. |
+| `push_target()` | How other threads deliver out-of-band data (MONITOR lines, tracking invalidations). |
+| `read(buf)` | Wait for input and append it. |
+| `read_ready(buf)` | Append input that already arrived, without waiting. |
+| `write_all(data)` | Write everything. |
+| `flush(out_buf, set_omem)` | Write `out_buf`, reporting queued bytes to `set_omem` (for `omem` / output-buffer limits). |
+| `into_split(writer_tx)` | Split into read/write halves for Pub/Sub mode. |
+| `into_tcp_stream()` | Hand over the raw TCP stream (replication links); TLS cannot. |
+
+`PlainTransport` specifics:
+
+- `read` rents the `BytesMut` directly to io_uring (no intermediate copy); if the read filled all
+  spare room, it keeps draining with non-blocking `recv` (`recv_ready`) until the socket is empty.
+  `recv_ready` first grows the buffer if spare room is below `MIN_READ_SPARE` (16 KiB).
+- `flush` first tries a non-blocking `send` (`MSG_DONTWAIT | MSG_NOSIGNAL`); only the remainder,
+  if any, goes through an io_uring `write_all`, while `set_omem` reports the queued size.
+- `PushTarget::Fd(fd)` writes out-of-band messages straight to the socket with a non-blocking send
+  (dropped if the socket buffer is full). TLS uses `PushTarget::Queue`, a bounded channel
+  (`PUSH_QUEUE_CAPACITY` = 4096) drained and encrypted by the owning connection.
+
+---
+
+## 7. Shutdown
+
+### 7.1 Signals
+
+`install_signal_handlers` installs:
+
+| Signal | Handler effect |
+| :--- | :--- |
+| `SIGINT`, `SIGTERM` | `handle_signal`: stores the signal number in `LAST_SHUTDOWN_SIGNAL` and sets `SHUTDOWN_SIGNALLED`. It does **not** stop the server by itself. |
+| `SIGHUP` | `log::request_reopen()` — reopen the log file before the next write (logrotate). |
+| `SIGPIPE` | Ignored. |
+
+Handlers only store to atomics, which is async-signal-safe.
+
+### 7.2 Deciding to shut down: quiesce, then save
+
+Two paths lead to shutdown, both through `Router::save_before_shutdown(save, own_batches)`:
+
+- **Signal**: shard 0's watcher task polls `take_shutdown_signal()` every 50 ms. On a signal it
+  logs `"Received SIGTERM scheduling shutdown..."` and calls `save_before_shutdown(None, 0)`.
+- **`SHUTDOWN [SAVE|NOSAVE]` command**: the connection logs `"User requested shutdown..."` and
+  calls `save_before_shutdown(save, 1)` (its own batch is still running, hence `own = 1`).
+
+`save_before_shutdown`:
+
+1. **Quiesce** (`shutdown::quiesce(own, CLIENT_DRAIN_TIMEOUT)`): set `QUIESCING`, then wait (1 ms
+   steps, up to 2 s) until at most `own` command batches are executing anywhere. Every connection
+   brackets each command batch with `shutdown::enter_batch(shard)`, which increments a per-shard
+   counter in `INFLIGHT` (256 cache-padded slots, each written only by its shard) and returns
+   `None` while quiescing; a connection that gets `None` sleeps in 10 ms steps and closes once
+   shutdown is confirmed. Increment-then-check on one side and set-then-read on the other (both
+   `SeqCst`) guarantee that either the batch sees the flag or `quiesce` sees the batch. Result: the
+   final save contains every acknowledged write and nothing is acknowledged after it. A batch stuck
+   in, e.g., `BLPOP` is not waited for past the timeout (a warning is logged).
+2. **Save?** `config::should_save_on_shutdown(save, has_save_points)`: an explicit `SAVE`/`NOSAVE`
+   wins; otherwise save only if `save` points are configured (none by default).
+3. If saving: wait for any running `BGSAVE` to finish, log `"Saving the final RDB snapshot before
+   exiting."`, and `save_rdb()`.
+4. On success the caller calls `shutdown::request_shutdown()`, which sets `SHUTDOWN_REQUESTED` and
+   sends `STOPPING=1` to systemd (once). On failure, `unquiesce()` lets batches run again and the
+   server **keeps serving** (`"Error trying to save the DB, can't exit ... use SHUTDOWN NOSAVE"`);
+   sending the signal again retries.
+
+### 7.3 Stopping the shards
+
+Once `SHUTDOWN_REQUESTED` is set, on every shard:
+
+1. Accept loops see `is_shutting_down()` within 200 ms and return; the primary loop returning
+   lets `run_shard_worker` continue. The save scheduler, cluster-follow and signal tasks exit on
+   the same flag.
+2. **`drain_clients`**: repeatedly (every 5 ms, until the client registry is empty or
+   `CLIENT_DRAIN_TIMEOUT` = 2 s) call `shutdown(fd, SHUT_RD)` on every registered client socket.
+   An idle client's pending read returns EOF at once; a client mid-command finishes it and writes
+   the reply before its next read sees EOF. Repeating each round also catches connections adopted
+   in the meantime. Clients that never read again (blocked commands) are dropped at the timeout.
+3. **Drain barrier**: `mark_shard_drained()`, then wait (5 ms steps) until
+   `all_shards_drained(num_shards)` or `SHARD_BARRIER_TIMEOUT` (3 s). Meanwhile the shard's
+   receiver task keeps running, so a draining client on another shard can still complete a
+   cross-shard request against this shard.
+4. **Final AOF sync**: `AofWriter::sync_durable` writes and fsyncs remaining AOF data.
+5. `block_on` returns; dropping the runtime drops every remaining task (receiver, periodic tasks,
+   TLS loops, anything still blocked). The thread ends, `main`'s `join` returns, and after all
+   shards join, the process exits.
+
+Worked example (`appendonly yes`, no `save` points, `systemctl stop`): systemd sends `SIGTERM` →
+handler sets the flag → within 50 ms shard 0's watcher quiesces (in-flight pipelines finish; new
+ones wait) → no save point, so no RDB save → `request_shutdown()` (systemd sees `STOPPING=1`) →
+each shard's accept loop exits within 200 ms → waiting connections see shutdown and close; others
+get EOF from `SHUT_RD` → barrier → each shard fsyncs its AOF → threads join → `"rudis server
+gracefully stopped. Goodbye!"`.
+
+---
+
+## 8. Panic isolation (`CatchUnwind`)
 
 ```rust
-pub struct CatchUnwind<F> { inner: F }
-pub fn catch_unwind_async<F: Future>(f: F) -> CatchUnwind<F> { CatchUnwind { inner: f } }
-impl<F: Future> Future for CatchUnwind<F> {
-    type Output = Result<F::Output, Box<dyn std::any::Any + Send + 'static>>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let inner = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().inner) };
-        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
-            Ok(Poll::Ready(val)) => Poll::Ready(Ok(val)),
-            Ok(Poll::Pending) => Poll::Pending,
-            Err(e) => Poll::Ready(Err(e)),
-        }
-    }
-}
+pub struct CatchUnwind<F> { inner: Pin<Box<F>> }   // boxed: Unpin, no unsafe projection
+pub fn catch_unwind_async<F: Future>(f: F) -> CatchUnwind<F>;
+// poll() = std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx)))
+// Output = Result<F::Output, Box<dyn Any + Send>>
 ```
 
-A hand-rolled `Future` combinator (unchanged, `src/server.rs:12-31`): every `poll` call is wrapped
-in `std::panic::catch_unwind`, so a panic inside the wrapped future becomes an `Err` instead of an
-unwind that would otherwise propagate through `monoio::spawn` and — because the runtime is
-single-threaded per shard — potentially take down every other task and connection sharing that
-shard's runtime. Every accept path (plain, TLS, and cross-shard-adopted) wraps its call to
-its connection entry point (all of which run the generic `handle_client` loop) in this combinator and, on `Err`, calls
-`crate::connection::inc_isolated_panics()` and logs via `tracing::error!` instead of propagating.
+Every poll of the wrapped future runs inside `catch_unwind`, turning a panic into `Err`. Because a
+shard is one thread running many tasks, an uncaught panic in one connection would unwind through the
+runtime and kill every connection on that shard. All three connection entry points (plain, TLS,
+adopted) are wrapped; on `Err` they call `connection::inc_isolated_panics()` (exported as
+`rudis_isolated_panics_total`) and log the panic message (`log::panic_message`) with the client id.
+The cost is one allocation per connection.
 
 ---
 
-## 4. Router construction and its object pools (context for §3.1)
+## 9. Process-wide plumbing
 
-`Router::new` (`src/router.rs:186+`) takes 8 arguments (`shard_id, num_shards, port, local_db,
-senders, aof, pubsub, db_dir`) — unchanged in shape from the previous revision — but the `Router`
-struct itself has grown substantially and now carries several `Rc<RefCell<Vec<...>>>` **object
-pools** used to avoid per-request heap allocation on the cross-shard scatter-gather path:
-`notify_channel_pool`, `remote_responder_pool`, `mget_batch_pool`, `mset_batch_pool`,
-`mget_desc_pool`, `mset_desc_pool`, `pubsub_responder_pool`. It also carries
-`presence_table: Arc<ShardedPresenceTable>` and `tier_stats: Arc<TieringStats>` — genuinely shared
-`Arc<Atomic...>`-backed state (not `Arc<Mutex<...>>`), consistent with Gotcha 1 below: these are
-cross-shard *counters/flags*, not a shared mutable `ShardDb`. Full field-by-field treatment of
-`Router` and these pools belongs to Component 04; this document only needs to establish that
-`run_shard_worker` constructs exactly one `Router` per shard and everything downstream (accept
-loops, cross-shard receiver, periodic tasks, XDP loop) shares that single `Rc<Router>`.
+### 9.1 Server log (`log.rs`)
 
----
+Rudis writes Redis/Valkey-format log lines:
 
-## 5. `agent.rs` / `mcp.rs`: verified to have **no** special startup wiring
-
-The task of checking whether the new `src/agent.rs` (802 lines) and `src/mcp.rs` (748 lines)
-modules need wiring into server startup was investigated directly, by grepping every
-`agent::`/`mcp::` reference across the codebase. **Answer: no wiring exists, and none is needed.**
-
-- `src/lib.rs` declares `pub mod agent;` and `pub mod mcp;` — that is the entire extent of their
-  presence in the module tree from a startup perspective. Neither is referenced anywhere in
-  `src/main.rs` or `src/server.rs`.
-- **Agent memory state lives directly on `ShardDb`** (`src/shard.rs:606-620`):
-  ```rust
-  pub struct ShardDb {
-      // ...
-      pub agent_memories: hashbrown::HashMap<Bytes, crate::agent::AgentMemorySession>,
-      pub llm_quotas: hashbrown::HashMap<Bytes, crate::agent::LlmQuotaBucket>,
-      pub agent_checkpoints: hashbrown::HashMap<Bytes, crate::agent::AgentCheckpointThread>,
-      pub agent_tools: hashbrown::HashMap<Bytes, crate::agent::AgentToolRegistry>,
-      // ...
-  }
-  ```
-  These four maps are ordinary, empty-initialized `HashMap` fields, populated lazily the same way
-  `ShardDb::new(port)` (called once per shard at `server.rs:130`, §3.1 step 2) initializes every
-  other per-shard collection. There is no separate constructor call, no separate spawn task, and
-  no config knob for agent memory — it rides along for free inside the existing per-shard restore
-  path, and (like everything else on `ShardDb`) is per-shard, in-memory, and **not** restored from
-  RDB/AOF on its own (no `agent_memories`/`agent_checkpoints` handling was found in the RDB/AOF
-  read paths reached from `server.rs`; persistence for this state, if any, is Component 20's
-  concern, not something `run_shard_worker` sets up).
-- **Commands are routed exactly like every other Redis command** — through `src/resp.rs`'s parser
-  and the normal per-connection `execute_command` dispatch in `src/connection.rs`, with no separate
-  listener, port, or protocol:
-  - `AGENT.MEM.ADD`, `AGENT.MEM.CONTEXT`, `AGENT.MEM.COMPACT`, `AGENT.MEM.INFO`, `AGENT.MEM.CLEAR`,
-    `AGENT.CHECKPOINT.PUT`, `AGENT.CHECKPOINT.GET`, `AGENT.CHECKPOINT.HISTORY`,
-    `AGENT.TOOL.CLAIM`, `AGENT.TOOL.COMPLETE` are parsed as ordinary RESP command names in
-    `src/resp.rs` (~line 12442+).
-  - `MCP.TOOLS`, `MCP.CALL`, `MCP.RPC` are likewise parsed as RESP commands (`src/resp.rs:12949-12962`).
-    Their handlers (`src/connection.rs:5743-5880`) are pure in-process glue:
-    `Command::McpCall` resolves a tool name + JSON args to a *regular* `Command` via
-    `crate::mcp::plan_tool_command`, then recursively calls `execute_command(planned, router, ...)`
-    — the exact same dispatch function every other command goes through — and reformats the
-    sub-result as MCP JSON. `Command::McpRpc` implements JSON-RPC 2.0 `initialize`/`ping`/
-    `tools/list`/`tools/call` by the same mechanism. There is no standalone MCP server process,
-    port, or task anywhere in `main.rs`/`server.rs` — "the MCP server" is three RESP commands
-    served by the same per-connection task as `GET`/`SET`.
-
-Net effect: a reader auditing `main.rs`/`server.rs` for AI-native runtime wiring will correctly
-find nothing, because there is nothing there by design — the integration point is the command
-dispatcher, not the reactor.
-
----
-
-## 6. Known Bugs & Limitations (verified by direct reading, this pass)
-
-1. **New — `ShardMessage::Batch`'s async fast-path branch is unreachable dead code.**
-   `src/server.rs:625`: `let needs_async = false;` is never reassigned, so the
-   `if needs_async { ... }` block spanning roughly `src/server.rs:627-966` (~340 lines, a full
-   duplicate of the fast-path command dispatcher, including a second, subtly different cold-tier
-   `.await` strategy) can never execute. It is safe to delete, and anyone extending "the async
-   Batch path" should be aware they are editing dead code unless they also flip the condition —
-   search for `needs_async` before assuming either branch is "the" implementation. See §3.2 for
-   the precise mechanics of the branch that actually runs.
-2. **New — TLS connections are invisible to `conn_balance`.** The TLS accept loop
-   (`src/server.rs:1861-1926`) never calls `register_conn`/`claim_owner`/`unregister_conn`. TLS
-   connections are therefore never rebalanced off an overloaded shard, and — because they don't
-   increment `CONN_COUNTS` — their presence silently skews the plain-TCP accept loop's
-   least-loaded-shard calculation, making a TLS-heavy shard look artificially idle. See §3.3.
-3. **Re-verified, still true — graceful shutdown does not drain in-flight work.** §3.4: accept
-   loops stop and AOF is flushed/fsync'd, but in-flight client requests, an in-progress
-   `BGSAVE`/`BGREWRITEAOF`, and the cross-shard/periodic/XDP/TLS-accept tasks are all simply
-   dropped with the runtime rather than told to finish or cancel cleanly. No automatic
-   `SAVE`/`BGSAVE` runs on shutdown.
-4. **Re-verified, still true — static shard/slot model.** `run_shard_worker` assigns shards
-   statically at startup and never changes `num_shards`; Components 04/11 carry live-migration
-   machinery that is only partially wired to this static model.
-5. **Re-verified, still true — no jitter on periodic tasks.** The 100ms/20ms/2s/5ms periodic tasks
-   (§3.1) have no jitter or adaptive backoff; on a host running many shards they tend to tick in
-   near-lockstep, a minor but avoidable source of correlated CPU bursts.
-6. **Re-verified, still true — duplicated plain/TLS socket setup.** `src/server.rs:101-127`'s TLS
-   listener setup is a near-verbatim copy of the plain listener's at lines 77-99, differing only in
-   the bound port.
-7. **Re-verified, still true — `SO_REUSEPORT` imbalance is mitigated, not eliminated.**
-   `conn_balance` corrects for it after the fact, per-connection (§3.3); it does not change the
-   kernel's initial hash-based assignment, is bounded to 4 retries before giving up
-   (`MAX_CLAIM_RETRIES`), tracks at most 256 shards (`MAX_TRACKED_SHARDS`), and — per finding 2
-   above — now has a blind spot for TLS load specifically.
-
----
-
-## 7. Cross-Component Interactions
-
-- **`src/connection.rs`**: every accepted socket (plain via `PlainTransport`, TLS via `TlsTransport`)
-  becomes a `handle_client<T: ClientTransport>(...)` task spawned on this shard's runtime,
-  panic-isolated per §3.5.
-  `CURRENT_ROUTER`/`set_current_router` (§3.1) also lives here. See Component 02.
-- **`src/router.rs`**: `Router` is constructed once per shard (§4) and shared (`Rc`) with every
-  connection task; owns the `senders` mesh, slot ownership state, the AOF writer handle, `db_dir`,
-  `base_port`, `cluster_enabled`, and the object pools described in §4. See Component 04.
-- **`src/mailbox.rs`**: `create_shard_mesh` (§2.5) builds the N×N SPSC ring matrix consumed by
-  `main.rs`; `ShardSender`/`ShardReceiver` are the types `run_shard_worker` is handed. See
-  Component 04.
-- **`src/conn_balance.rs`**: the connection-count rebalancing logic behind §3.3's `AdoptConnection`
-  handoff — a pure-atomics module with no async/thread-per-core concerns of its own.
-- **`src/aof.rs`**: AOF replay on startup, the 5ms flush / ~1s fsync task, and the final
-  flush+fsync on shutdown, all driven from here.
-- **`src/tiering.rs`**: `ShardTierManager::open`, the 20ms auto-tier check, the 2s GC task, and the
-  `Tier*`/`StreamColdRead` message variants.
-- **`src/cluster.rs`**: `start_cluster_bus(port)` (shard 0 only); `cluster_enabled` changes the
-  socket-binding strategy (§3.1) and the connection-rebalancing exemption (§3.3).
-- **`src/block.rs`**: `get_block_hub_for_port(port)` — the one place this subsystem reaches for a
-  real, shared mutex instead of thread-local state.
-- **`src/pubsub.rs`**: per-shard `PubSubHub`, reachable cross-shard via `ShardMessage::Publish`/
-  `PubsubChannels`/`PubsubNumsub`/`PubsubNumpat`/`Spublish`/`Ssubscribe`/`Sunsubscribe`/
-  `PubsubShardchannels`/`PubsubShardnumsub`.
-- **`src/tls.rs`**: `TlsWorkerConfig`, `TlsSession::new`/`handshake_monoio`, and cert
-  loading/self-signed generation, wired up from `main.rs` when a TLS port is configured.
-- **`src/xdp.rs`**: the per-shard AF_XDP ingress loop described in §3.1 (Component 10 owns the
-  packet-processing detail).
-- **`src/shutdown.rs`**: the `AtomicBool` flag and signal handlers behind §3.4.
-- **`src/config.rs`**: `RudisConfig` — the file/CLI-merged configuration consumed by `main.rs`
-  (§2.1).
-- **`src/acl.rs`**: `get_acl_for_port`, `hash_password_sha256`, `HAS_CUSTOM_ACL` — the requirepass
-  priming main.rs performs before any shard starts (§2.3). See Component 15.
-- **`src/syscheck.rs`** / **`src/telemetry.rs`**: startup sanity-check reporting and
-  `tracing`-based structured logging initialization, both invoked from `main.rs` before any shard
-  thread is spawned.
-- **`src/agent.rs`** / **`src/mcp.rs`**: deliberately **not** referenced from `main.rs`/`server.rs`
-  — see §5.
-
----
-
-## 8. Startup Sanity Checks (`src/syscheck.rs`, 209 lines, in full)
-
-`main.rs` calls `rudis::syscheck::run_system_sanity_checks()` (line 233) after building the banner
-strings but before printing the closing `====` line, then `print_sanity_warnings(&report)` prints
-any accumulated warnings. `run_system_sanity_checks()` is a thin wrapper around
-`run_sanity_checks_with_paths` with the real `/proc`/`/sys` paths hardcoded (the path-parameterized
-version exists purely so tests can point it at temp files). It runs exactly four checks, each
-independently optional (a missing file yields `None`, not a warning):
-
-| Check | Source path | Threshold | Warning text (abridged) |
-| :--- | :--- | :--- | :--- |
-| `overcommit_memory` | `/proc/sys/vm/overcommit_memory` | must equal `1` | "background saves may fail under low memory conditions" + `sysctl vm.overcommit_memory=1` |
-| `somaxconn` | `/proc/sys/net/core/somaxconn` | must be `>= 512` | "High connection rate may be throttled" + `sysctl -w net.core.somaxconn=4096` |
-| max open files | `getrlimit(RLIMIT_NOFILE)` | must be `>= 10000` | "Connection limit may be restricted" + `ulimit -n 65536` |
-| Transparent Huge Pages | `/sys/kernel/mm/transparent_hugepage/enabled` | must **not** contain the literal substring `"[always]"` | "will cause high latency spikes and memory bloat" + `echo never > .../enabled` |
-
-`SystemSanityReport::is_optimal()` is simply `self.warnings.is_empty()`. Note this check is purely
-advisory/observational — it runs *after* `main.rs` has already unconditionally called
-`libc::prctl(PR_SET_THP_DISABLE, ...)` at process start (§2), so the THP warning here is about the
-*system-wide* kernel default, not this process's own (already-disabled) THP behavior; a warning can
-legitimately fire even though this specific `rudis` process is unaffected.
-
----
-
-## Contributor Gotchas, Invariants & Debugging Guide
-
-* **Gotcha 1**: Never introduce `Arc<Mutex<_>>` or any cross-thread handle to `ShardDb`. `ShardDb`
-  is strictly `!Send` by construction (`Rc<RefCell<_>>`), and that is intentional. `Router`'s own
-  `Arc<Atomic...>` fields (`is_saving`, `last_save_time`, `presence_table`, `tier_stats`, §4) are a
-  different, acceptable pattern — shared atomics/counters, never a shared mutable `ShardDb`.
-* **Gotcha 2**: Any new listening socket must set both `SO_REUSEPORT` and `SO_REUSEADDR`, matching
-  the pattern in §3.1 for both the plain and TLS listeners — and if it should participate in load
-  balancing, it must also call into `conn_balance` explicitly (the TLS listener currently does
-  not — see §6 finding 2 — do not copy that omission into new code without a reason).
-* **Gotcha 3**: Transparent Huge Pages are disabled once, in `main.rs`, before any shard thread
-  starts (`#[cfg(target_os = "linux")] libc::prctl(...)`) — do not rely on per-shard THP handling.
-* **Gotcha 4**: The cross-shard receiver loop drains up to 64 messages per wakeup via
-  `rx.try_recv()`; a handler that blocks the async task for a long time (a synchronous,
-  non-yielding loop) delays every other message already queued behind it in that burst.
-* **Gotcha 5**: `is_shutting_down()` is polled inside the accept loops via a 200ms
-  `monoio::time::timeout` around `accept()`, not via a dedicated cancellation future — a new
-  long-lived per-shard loop added elsewhere will not automatically observe shutdown unless it
-  adopts the same polling pattern (or an equivalent).
-* **Gotcha 6**: Any new per-connection entry point should be wrapped in `catch_unwind_async`
-  (§3.5) the same way the plain and TLS `handle_client` entry points are, or a panic in that path will
-  take down the whole shard.
-* **Gotcha 7 (new)**: Before assuming "the" implementation of a `ShardMessage::Batch`-style
-  branching construct, check whether the condition that selects it is actually reachable —
-  `needs_async` in `src/server.rs` is a compile-time-dead `false` (§6 finding 1). `cargo clippy`
-  does not currently flag this (the branch is syntactically live code, just never selected by a
-  `const`-foldable-but-not-`const` local), so it will not be caught automatically.
-* **Gotcha 8 (new)**: `crate::connection::set_current_router` (called once per shard at startup,
-  §3.1) populates a thread-local `CURRENT_ROUTER`. Code that calls `notify_keyspace_event` (or
-  anything else that reads `CURRENT_ROUTER`) before this call has run on a given shard thread will
-  silently no-op rather than panic — the read is `if let Some(router) = cr.borrow().as_ref()`, not
-  an `unwrap()`. Keep this call early in `run_shard_worker` if you reorder the startup sequence.
-* **Gotcha 9 (new)**: `agent.rs`/`mcp.rs` state and commands need **no** startup wiring (§5) — if
-  you add a new `AGENT.*`/`MCP.*` command, add it to `src/resp.rs`'s parser and
-  `src/connection.rs`'s dispatch exactly like any other Redis command; there is no separate
-  initialization path in `main.rs`/`server.rs` to update.
-
-### How to Verify Changes
-```bash
-# 1. Format check
-cargo fmt --check
-
-# 2. Clippy verification with zero warnings
-cargo clippy --all-targets -- -D warnings
-
-# 3. Run unit tests
-cargo test --lib -- --test-threads=1
+```text
+12345:M 10 Oct 2026 20:36:35.123 * Ready to accept connections tcp
 ```
+
+`<pid>:<role> <timestamp> <level-char> <message>` — role `M` (master) or `S` (replica, set via
+`set_role_replica`); level chars `.` debug, `-` verbose, `*` notice, `#` warning.
+
+- **Config** (applied through `CONFIG SET` / config directives): `loglevel`
+  (`debug|verbose|notice|warning|nothing`, default notice), `log-format` (`legacy|logfmt`, Valkey
+  8.1 style `pid=.. role=.. timestamp=".." level=.. message=".."`), `log-timestamp-format`
+  (`legacy|iso8601|milliseconds`), `logfile` (empty = stdout; opened at once so a bad path fails at
+  startup).
+- **Macros**: `log_debug!`, `log_verbose!`, `log_notice!`, `log_warning!` check `enabled(level)` (one
+  relaxed atomic load) **before** formatting; `log_fatal!` logs at warning level **and** always
+  prints to stderr, for errors the process exits on.
+- **Writing**: each line is one `write(2)` under a mutex, so lines from different shards never
+  interleave; messages are truncated to `LOG_MAX_LEN` (1024) bytes. Before each write to a file,
+  the sink checks (one `stat`) that the path still names the open file (device + inode) and reopens
+  if not — so logrotate's rename-and-create works without a signal; `SIGHUP` forces a reopen.
+- **`RateLimit`**: lets a request-triggerable warning (OOM rejection, output-buffer disconnect)
+  through at most once per interval.
+- Logging is for operational events only, never the per-command path.
+
+### 9.2 `tracing` integration (`telemetry::init_telemetry`)
+
+`init_telemetry` (idempotent) installs a `tracing_subscriber` registry with an optional `RUST_LOG`
+`EnvFilter` and `log::RedisLogLayer`. The layer maps `ERROR`/`WARN` → warning, `INFO` → notice,
+`DEBUG`/`TRACE` → debug, and re-checks `loglevel` on every event (callsite interest is
+"sometimes"), so `CONFIG SET loglevel` applies to `tracing` events too.
+
+### 9.3 Prometheus endpoint (`telemetry.rs`)
+
+With `--metrics-port` / `metrics-port`, `main` binds the listener; shard 0 serves it with
+`serve_metrics`. Each connection gets 5 s (`METRICS_REQUEST_TIMEOUT`) to send a request head of at
+most 8 KiB (`METRICS_MAX_REQUEST`). `GET /metrics` returns text format `version=0.0.4`; other paths
+404, other methods 405; responses are `Connection: close`. Before formatting, the router flushes
+every shard's buffered command stats and fans out a used-memory query (one INFO-style fan-out per
+scrape). Exported families include connected/max clients, isolated panics, used/max memory,
+expired/evicted keys, tiered keys and RAM hits/misses, the `server_stats` counters as `_total`
+counters, per-command calls/duration/failed/rejected and latency histograms (power-of-two µs
+buckets, 1 µs to ~16.8 s), error counts by prefix, RDB/AOF state gauges (including
+`aof_last_write_ok`), `loading`, and numeric `INFO replication` fields plus a role label.
+
+### 9.4 INFO stats counters and SLOWLOG clock
+
+**`server_stats.rs`** backs INFO `# Stats` (`total_commands_processed`, connections received and
+rejected, net input/output bytes, keyspace hits/misses, sync full/partial, buffer-limit
+disconnections, ACL denials — 16 counters in `enum Stat`). Each thread owns a leaked, 128-byte
+aligned `Slot` registered in a global list; `add` is a relaxed load+store on the thread's own slot
+(no locked instruction, no cache-line ping-pong). Readers sum all slots. `CONFIG RESETSTAT`
+(`reset`) records the current sums as a `BASELINE` instead of zeroing slots, which would race with
+their owners. `sample()` (called from every shard's 100 ms task; calls closer than 100 ms are
+ignored) feeds a 16-sample ring from which `instantaneous()` reports ops/sec and input/output
+bytes/sec.
+
+**`cycleclock.rs`** gives cheap timestamps for timing every command of a pipeline (two
+`Instant::now()` per command cost ~5% on cheap commands). On x86-64 with an invariant TSC
+(`constant_tsc` and `nonstop_tsc` in `/proc/cpuinfo`), `now()` is one `rdtsc` and `micros_since`
+converts with a ticks-per-µs rate calibrated once by a 2 ms spin; elsewhere it falls back to
+`Instant` nanoseconds.
+
+### 9.5 OS sanity checks (`syscheck.rs`)
+
+`run_system_sanity_checks()` (a wrapper over the path-parameterised
+`run_sanity_checks_with_paths`, which tests use) returns a `SystemSanityReport`; a missing file
+yields `None`, not a warning. `print_sanity_warnings` logs each warning under
+`"  System Kernel Checks:"`.
+
+| Check | Source | Warns when |
+| :--- | :--- | :--- |
+| `overcommit_memory` | `/proc/sys/vm/overcommit_memory` | value ≠ 1 (background saves may fail) |
+| `somaxconn` | `/proc/sys/net/core/somaxconn` | < 512 |
+| max open files | `getrlimit(RLIMIT_NOFILE)` soft limit | < 10000 |
+| THP | `/sys/kernel/mm/transparent_hugepage/enabled` | contains `[always]` |
+
+The THP warning is about the system default; this process already disabled THP for itself at
+startup.
+
+---
+
+## 10. Invariants & gotchas
+
+1. **Never share `ShardDb` across threads.** It is `Rc<RefCell<_>>` on purpose. Cross-thread state
+   in this subsystem is limited to atomics (`CONN_COUNTS`, `INFLIGHT`, shutdown flags, stats slots)
+   and locked registries keyed by base port. To touch another shard's data, send a `ShardMessage`.
+2. **`RefCell` borrows must not span an `.await`.** All tasks on a shard share the same `ShardDb`;
+   holding `borrow_mut()` across an await panics the next task that borrows. The Batch handler
+   explicitly drops and re-acquires its borrow around script execution.
+3. **Use `SHARD_THREAD_STACK_SIZE`** for any thread that runs `run_shard_worker`.
+4. **Long-lived loops must watch `is_shutting_down()`** (or be fine being dropped with the
+   runtime). There is no cancellation token.
+5. **Never wrap a fresh `listener.accept()` in `timeout` per iteration** — use
+   `accept_until_shutdown`/`accept_polling` (§6.1), or connections are silently lost.
+6. **Wrap new connection entry points in `catch_unwind_async`**, and pair each `conn_balance`
+   registration or reservation with exactly one `unregister_conn` on the owning shard.
+7. **Adopted connections must not `register_conn`** — `claim_owner` already reserved the slot.
+8. **Every command batch must go through `shutdown::enter_batch`**, or `quiesce` cannot guarantee
+   the final save covers all acknowledged writes.
+9. **Keep handlers in the receiver loop non-blocking.** A slow synchronous handler delays every
+   message queued behind it (up to 64 per burst) and all local connections. Spawn a task for I/O.
+10. **Batch fast paths skip AOF, replication, tracking and keyspace notifications**, which is why
+    each is gated on those features being off. A new fast path must use the same guards.
+11. **`CURRENT_ROUTER` is empty until `set_current_router` runs**; readers use
+    `if let Some(..)`, so code running earlier on a shard thread silently does nothing.
+12. **Startup load failure exits the whole process** (`fatal_startup_error`), by design.
+13. **Process-wide registries are keyed by base port**, so several servers can live in one process
+    (the e2e tests rely on this). New global settings should follow that pattern.
+
+---
+
+## 11. Limitations / not implemented
+
+- **TLS connections bypass `conn_balance`.** The TLS accept loop never calls `claim_owner`,
+  `register_conn` or `unregister_conn`: TLS clients are never rebalanced off a hot shard, and the
+  census (and so plain-TCP placement) does not see TLS load.
+- **Rebalancing is per connection, at accept time.** Existing connections never move; `claim_owner`
+  gives up after 4 lost races; only the first 256 shards are tracked.
+- **Static shard count.** `num_shards` is fixed at startup (default `min(cores, 8)`); changing it
+  requires a restart (the AOF is resharded on startup; Components 04/11 cover slot migration).
+- **Shutdown drain is bounded, not complete.** `quiesce` waits at most 2 s for running batches,
+  client drain at most 2 s, the barrier at most 3 s; clients blocked longer (e.g. `BLPOP`) are
+  dropped, and remaining tasks are dropped with the runtime rather than cancelled.
+- **No RDB save on SIGTERM by default**, because `save` points default to empty: with `appendonly
+  no` and no `save` lines, writes since the last manual `SAVE`/`BGSAVE` are lost on shutdown.
+- **Periodic tasks have no jitter**; on a many-shard host they tend to tick in step.
+- **The AF_XDP loop runs on every shard** even though packets only arrive through experimental
+  `XDP.*` commands; it idles at 200 ms while experimental commands are disabled.
+- **Port probe race**: the probe is closed before shards bind, so a process grabbing the port in
+  between still slips through.
+- **Agent memory / MCP need no startup wiring**: `agent.rs` and `mcp.rs` are not referenced from
+  `main.rs` or `server.rs`; their state lives on `ShardDb` and their commands go through normal
+  command dispatch (see Components 20 and 21).
+
+---
+
+## 12. Code map
+
+| File | Key symbols | What they do |
+| :--- | :--- | :--- |
+| `src/main.rs` | `Args`, `RUDIS_FLAGS`, `split_redis_server_args`, `get_process_affinity_cores`, `main` | CLI parsing (Rudis + redis-server style), config merge, process-wide setup, port probe, mesh creation, shard spawn/join. |
+| `src/server.rs` | `run_shard_worker`, `SHARD_THREAD_STACK_SIZE`, `shard_uring_builder` | Per-shard runtime, listeners, restore, background tasks, receiver, accept loops, shutdown tail. |
+| `src/server.rs` | `fatal_startup_error`, `note_startup_load`, `StartupLoad`, `LAST_LOAD_KEYS_LOADED`, `rdb_last_load_keys_expired` | Fatal load handling and the once-per-server load summary. |
+| `src/server.rs` | `accept_loop`, `accept_until_shutdown`, `accept_polling`, `ACCEPT_SHUTDOWN_POLL`, `TLS_HANDSHAKE_TIMEOUT`, `ADOPTED_CLIENT_SEQ` | Accepting plain/TLS clients without losing connections; client-id ranges. |
+| `src/server.rs` | `drain_clients`, `aof_write_after_mailbox`, `CatchUnwind`, `catch_unwind_async` | Shutdown drain, AOF write-through after mailbox runs, panic isolation. |
+| `src/shutdown.rs` | `install_signal_handlers`, `take_shutdown_signal`, `request_shutdown`, `is_shutting_down`, `sd_notify` | Signals, the shutdown flag, systemd notifications. |
+| `src/shutdown.rs` | `enter_batch`, `BatchGuard`, `quiesce`, `unquiesce`, `is_quiescing`, `CLIENT_DRAIN_TIMEOUT`, `SHARD_BARRIER_TIMEOUT`, `mark_shard_drained`, `all_shards_drained` | Quiesce before the final save; drain barrier. |
+| `src/conn_balance.rs` | `CONN_COUNTS`, `MAX_TRACKED_SHARDS`, `claim_owner`, `plan_handoff`, `register_conn`, `unregister_conn`, `MAX_CLAIM_RETRIES` | Connection census and accept-time rebalancing. |
+| `src/netsec.rs` | `parse_bind_spec`, `bind_all`, `bind_reuseport_listener`, `ensure_port_free_with_grace`, `protected_mode_denies`, `PROTECTED_MODE_DENIED` | Bind addresses, listener sockets, port probe, protected mode. |
+| `src/mailbox.rs` | `create_shard_mesh`, `ShardSender`, `ShardReceiver`, `SpscQueue`, `Doorbell`, `yield_now`, `set_cross_shard_spin` | Cross-shard mesh used by the receiver loop. |
+| `src/transport.rs` | `ClientTransport`, `PlainTransport`, `PushTarget`, `recv_ready`, `MIN_READ_SPARE`, `PUSH_QUEUE_CAPACITY` | Byte-stream abstraction under the client loop. |
+| `src/connection.rs` | `handle_connection`, `handle_client`, `set_current_router`, `apply_tcp_keepalive`, `inc_isolated_panics`, `mark_server_start` | Connection entry points and helpers called from here (Component 02). |
+| `src/router.rs` | `Router::new`, `save_before_shutdown`, `bgsave`, `bgrewriteaof` | Per-shard router; shutdown save (Component 04/14). |
+| `src/log.rs` | `log_*!` macros, `log_fatal!`, `set_loglevel`, `set_logfile`, `request_reopen`, `RateLimit`, `RedisLogLayer`, `panic_message` | Redis-format server log. |
+| `src/telemetry.rs` | `init_telemetry`, `bind_metrics_listener`, `take_metrics_listener`, `serve_metrics`, `format_prometheus_metrics`, `format_server_state_metrics` | `tracing` routing and the Prometheus endpoint. |
+| `src/server_stats.rs` | `Stat`, `add`, `total`, `reset`, `sample`, `instantaneous`, `note_key_lookup` | Per-thread INFO stats counters and instantaneous rates. |
+| `src/cycleclock.rs` | `init`, `now`, `micros_since` | TSC-based timestamps for SLOWLOG. |
+| `src/syscheck.rs` | `run_system_sanity_checks`, `run_sanity_checks_with_paths`, `SystemSanityReport`, `print_sanity_warnings` | Startup OS checks. |
+| `src/lib.rs` | module list, `#[global_allocator] GLOBAL` (jemalloc) | Crate root; jemalloc is the global allocator. |
+| `vendor/monoio/RUDIS_PATCHES.md` | — | Rudis's monoio patches (foreign-waker draining on submit, idle poll). |

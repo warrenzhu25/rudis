@@ -1,1140 +1,896 @@
-# Component 05: Storage Engine & Compact Encodings (Implementation Deep-Dive & Code Reference)
+# Component 05: Storage Engine & Compact Encodings (Implementation Guide)
 
-> **Source File**: `src/table.rs` (16,925 lines, 349 `pub fn`)
-> **High-Level Design Spec**: [`docs/design/05_storage_engine.md`](../design/05_storage_engine.md)
-> **Bucket-Layout Design Deep-Dive**: [`docs/design/rudis_table.md`](../design/rudis_table.md) — **read with caution**: it
-> predates the extendible-hashing rewrite documented below and describes an older flat single-array design.
-> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
-
-This is a ground-up rewrite of this document. `table.rs` has grown from ~11.7K to ~16.9K lines since the last
-revision, and its core hash table was rebuilt twice in that window: once to add a cooperative incremental-rehash
-protocol, and again — superseding the first change almost entirely — to replace the single flat array with a
-**Dragonfly-style extendible-hashing directory over fixed-size SIMD segments**. Every struct, constant, and line
-number below was read directly out of the current source (commit history current as of `69fb2be`); nothing is
-carried forward from memory.
+> **High-level design**: [`docs/design/05_storage_engine.md`](../design/05_storage_engine.md)
+> **Consolidated implementation spec**: [`components.md`](components.md)
+> **Background reading**: [`docs/design/rudis_table.md`](../design/rudis_table.md) (the original table design spec; useful for motivation, but this document is the reference for how the code works today)
 
 ---
 
-## 1. Source Module Map & Responsibilities
+## 1. What this subsystem does
 
-| File | Role |
-| :--- | :--- |
-| `src/table.rs` | The entire thread-local storage engine: the SIMD-probed, extendible-hashing hash table (`RudisFlatTable` = `directory` + `Vec<RawSegment>`), the per-shard façade over it (`RudisTable`), every `RudisValue` compact/full encoding pair, key-level and hash-field-level expiration bookkeeping, NVMe-tiering hooks, cluster-slot counting, and the small-collection allocation arena. |
+Every Redis key a shard owns lives in one in-memory hash table that belongs to that shard's thread. This
+subsystem is that table plus the encodings of the values stored in it:
 
-`table.rs` has no submodules; everything below is one flat file, organized here by concern rather than by
-source order.
+- **Who uses it**: every command handler. A connection routes a command to the owning shard
+  (see `04_sharding_mesh.md`); the shard calls methods on its `RudisTable` (`get_with_hash`,
+  `set_extended_with_hash`, `hset_*`, `lpush`, `zadd`, `pfadd`, …). Persistence (RDB/AOF), replication,
+  NVMe tiering, cluster slot migration, `SCAN`, `DEBUG DIGEST` and `MEMORY STATS` also read it directly.
+- **What problem it solves**: holding hundreds of millions of keys per process with (a) no stop-the-world
+  resize, (b) as few bytes per key as possible, and (c) Redis-compatible semantics for TTLs, eviction
+  policies, and the six core data types.
+- **No locks**: a table is never shared between threads. All the cleverness goes into memory layout and
+  bounded amounts of work per operation.
 
----
+The subsystem has two halves:
 
-## 2. Structural Overview
+1. **The key table** (`src/table.rs`): a Dragonfly-style *extendible-hashing* table — a directory of
+   pointers to fixed-size, SIMD-probed *segments* — wrapped by `RudisTable`, which adds TTLs, eviction,
+   memory accounting and the command-level API.
+2. **Compact encodings** (`src/compact.rs`, `src/smallhash.rs`, `src/packedhash.rs`, `src/pagestore.rs`,
+   `src/packedset.rs`, `src/zindex.rs`, `src/packedlist.rs`, `src/hll.rs`): byte-packed representations of
+   keys, strings and collections that replace one-heap-object-per-element layouts.
 
-```
-RudisTable                                          (src/table.rs:2418)
-├── table: RudisFlatTable                            (src/table.rs:1976)
-│   ├── segments: Vec<RawSegment>                     one or more fixed-capacity SIMD sub-tables
-│   │   └── RawSegment                                (src/table.rs:1584)
-│   │       ├── ctrl: Vec<u8>                          control-byte array (main probe region)
-│   │       ├── slots: Vec<Option<RudisEntry>>         main region + 4-slot overflow stash, parallel to ctrl
-│   │       ├── capacity, mask, items, growth_left
-│   │       ├── local_depth: u8                        extendible-hashing depth of this segment
-│   │       └── stash_ctrl: [u8; 4], stash_count: u8    DashTable-style 4-slot overflow stash
-│   ├── directory: Vec<u32>                            2^global_depth pointers into `segments`
-│   ├── global_depth: u8, dir_mask: usize
-│   ├── capacity, items
-│   └── slot_counts: Box<[u32; 16384]>                 per-cluster-slot live-key counters
-├── sample_cursor: usize                  shared TTL-sampling cursor (key-level AND hash-field-level)
-├── spill_cursor: usize                   NVMe-tiering spill-candidate round-robin cursor
-├── used_memory: usize                    running estimate of live value bytes
-├── arena: SmallCollectionArena           recycled Vec/VecDeque pool for small collections
-├── num_expires: usize                    count of live entries currently carrying a whole-key TTL
-└── hash_field_expires: HashMap<Bytes, HashMap<Bytes, Instant>>   per-field TTLs for HEXPIRE (hash fields)
-```
-
-`RudisTable` is the type embedded directly in `ShardDb` (`pub table: crate::table::RudisTable`,
-`src/shard.rs:578`) — one instance per shard, owned exclusively by that shard's thread. There is exactly
-one `RudisFlatTable` inside each `RudisTable`.
-
-**What changed structurally since the last revision of this document**: the table used to be one flat
-`ctrl`/`slots` pair resized monolithically. It is now a **directory of fixed 1024-slot segments**, each
-independently split or compacted. This is the single biggest change in the file and is covered in full in
-§5.
+`src/digest.rs` (`DEBUG DIGEST`) is documented here too because it is the one place that must treat every
+encoding as equal.
 
 ---
 
-## 3. Data Structures & Memory Layouts
+## 2. Mental model
 
-### 3.1 `RawSegment` — a fixed-capacity SIMD-probed sub-table with an overflow stash
-
-```rust
-// src/table.rs:1576-1594
-const SEG_SHIFT: usize = 10;
-const SEG_CAP: usize = 1 << SEG_SHIFT;   // 1024 main SIMD slots per segment
-const STASH_CAP: usize = 4;              // 4 DashTable-style overflow stash slots per segment
-const GLOBAL_IDX_SHIFT: usize = 11;      // bits reserved for a segment-local index in a global index
-const GLOBAL_IDX_MASK: usize = (1 << GLOBAL_IDX_SHIFT) - 1;
-
-/// Fixed-size SwissTable segment with a 4-slot DashTable-style overflow stash,
-/// managed by `RudisFlatTable`'s extendible hashing directory.
-pub struct RawSegment {
-    pub ctrl: Vec<u8>,                     // len = capacity + GROUP_SIZE (mirrored tail, see §3.4)
-    pub slots: Vec<Option<RudisEntry>>,    // len = capacity + STASH_CAP
-    pub capacity: usize,                   // power of two, GROUP_SIZE..=SEG_CAP
-    mask: usize,                           // capacity - 1
-    pub items: usize,                      // live entries, main region + stash
-    pub growth_left: usize,                // inserts allowed before a split/grow is forced
-    pub local_depth: u8,                   // this segment's extendible-hashing depth
-    pub stash_ctrl: [u8; STASH_CAP],       // inline fingerprint array for the 4 stash slots
-    pub stash_count: u8,
-}
+```mermaid
+flowchart TD
+    CMD["Command handler on shard thread"] --> RT["RudisTable: TTLs, eviction, memory accounting"]
+    RT --> FT["RudisFlatTable: directory of segment ids"]
+    FT -->|"bits above 10 of mixed hash"| DIR["directory: Vec of u32, len = 2^global_depth"]
+    DIR --> SEG["RawSegment: up to 1024 slots + 4 stash slots"]
+    SEG -->|"ctrl byte + u16 slot_idx"| ARENA["entries arena: Vec of RudisEntry, 40 B each"]
+    ARENA --> KEY["CompactKey 24 B: key bytes, optional packed TTL"]
+    ARENA --> VAL["RudisValue 16 B"]
+    VAL --> STR["CompactStr: inline, bit-packed, heap, shared"]
+    VAL --> COLL["Boxed collections"]
+    COLL --> SH["SmallHash / PackedHash"]
+    COLL --> SET["RudisSet: Small Vec / PackedSet"]
+    COLL --> ZS["RudisZSet: Small Vec / ZIndex"]
+    COLL --> PL["PackedList"]
+    COLL --> ST["RudisStream"]
+    SH --> PS["PageStore: 4 KiB packed pages"]
+    SET --> PS
+    ZS --> PS
 ```
 
-`RawSegment` derives neither `Clone` nor `Debug`; it is move-only, owned exclusively by the `Vec<RawSegment>`
-inside `RudisFlatTable`.
+Read it top to bottom as "how a lookup finds a value":
 
-A segment starts small (`GROUP_SIZE` = 16 slots) and doubles in place (§5.2, case 2) up to `SEG_CAP` = 1024
-slots before the extendible-hashing directory ever gets involved — so a shard holding only a few keys never
-pays for a 1024-slot segment.
+1. Hash the key once (`fxhash::hash64`), then *avalanche* it (`mix_hash`, a multiply/xorshift finalizer so
+   that every bit of the hash depends on every bit of the key).
+2. Bits 10 and up of the mixed hash index the **directory**, which names a **segment**.
+3. Inside the segment, the low bits pick a starting slot; a SIMD-style compare of 16 one-byte
+   **fingerprints** (top 7 bits of the hash) finds candidate slots.
+4. A candidate slot holds a 2-byte index into the segment's **entry arena**; the entry's key is compared
+   byte-for-byte to confirm the hit.
+5. The entry's `RudisValue` is either a small inline value (int, short string) or a pointer to a boxed,
+   byte-packed collection.
 
-`RawSegment::new` (`src/table.rs:1597–1615`):
+---
 
-```rust
-pub fn new(capacity: usize, local_depth: u8) -> Self {
-    let cap = capacity.next_power_of_two().clamp(GROUP_SIZE, SEG_CAP);
-    let ctrl = vec![EMPTY; cap + GROUP_SIZE];
-    let mut slots = Vec::with_capacity(cap + STASH_CAP);
-    slots.resize_with(cap + STASH_CAP, || None);
-    let stash_bonus = if cap == SEG_CAP { STASH_CAP } else { 0 };
-    Self {
-        ctrl, slots, capacity: cap, mask: cap - 1, items: 0,
-        growth_left: (cap * 7) / 8 + stash_bonus,
-        local_depth, stash_ctrl: [EMPTY; STASH_CAP], stash_count: 0,
-    }
-}
-```
+## 3. Entries: the 40-byte unit of storage
 
-**Gotcha**: the 4 stash slots are *physically allocated* in `slots` for every segment regardless of size
-(`cap + STASH_CAP`), but `growth_left` only credits them (`stash_bonus`) once the segment has reached full
-`SEG_CAP` (1024) capacity. A sub-`SEG_CAP` segment can still technically write into its stash region via the
-same index arithmetic, but `growth_left` will hit zero slightly earlier than the segment's true physical
-capacity for such segments — not a correctness bug (it just triggers an in-place doubling one insert sooner
-than strictly necessary), but worth knowing if you're reasoning about exact growth-left arithmetic.
-
-**Segment memory footprint, computed from `size_of::<Option<RudisEntry>>() == 88`** (see §3.3 below, and the
-`test_rudis_entry_size` unit test at `src/table.rs:14975–14986` which asserts this):
-
-| Component | Size (full, 1024-slot segment) |
-| :--- | :--- |
-| `ctrl: Vec<u8>` | `1024 + GROUP_SIZE(16)` = 1,040 bytes |
-| `slots: Vec<Option<RudisEntry>>` | `(1024 + STASH_CAP(4)) * 88` = 90,464 bytes |
-| `stash_ctrl` | 4 bytes (inline, no heap) |
-| scalar fields (`capacity`, `mask`, `items`, `growth_left`, `local_depth`) | ~33 bytes (padded) |
-| **Total (heap-allocated, per full segment)** | **≈ 91,504 bytes (≈ 89.4 KiB)** |
-
-**Correction / stale-comment flag**: the source comment directly above `SEG_CAP` (`src/table.rs:1577`) reads
-`"1024 main SIMD slots per segment (~48KB, L1/L2 cache resident)"`. The actual computed size of a full
-segment's backing storage is **~89 KiB, not ~48 KiB** — off by roughly 1.9x at the current 88-byte
-`RudisEntry` size. This looks like a comment that was never updated after `RudisEntry`'s layout was last
-touched (`e3bfe9a`, "shrink RudisValue to 40B, RudisEntry to 88B"); either the comment predates that change
-or was simply never re-derived. Flagging here so it doesn't get propagated as fact.
-
-### 3.2 The overflow stash, in detail
-
-`STASH_CAP = 4` per segment. The stash is **not** a textbook DashTable two-choice/displacement structure —
-it is a flat 4-slot side array checked by linear scan with a fingerprint pre-filter, reachable only after a
-probe has already walked 2 full 16-byte SIMD groups (32 main-region slots) without finding the key or an
-empty slot:
+### 3.1 `RudisEntry`
 
 ```rust
-// RawSegment::find_entry, src/table.rs:1676-1729 (structure shared by find_entry_mut and
-// find_or_prepare_insert_raw)
-loop {
-    let (match_mask, empty_mask) = probe_group_match_or_empty(...);   // SIMD compare, 16 ctrl bytes
-    // ... check match_mask for a key hit, return on empty_mask != 0 ...
-    step += GROUP_SIZE;                     // triangular probe step, see §5.1
-    if step == 2 * GROUP_SIZE && self.stash_count > 0 {
-        for s in 0..STASH_CAP {
-            if self.stash_ctrl[s] == tag {
-                let slot_idx = self.capacity + s;   // stash slots live at indices [capacity, capacity+4)
-                // fast_slice_eq key compare, return on hit
-            }
-        }
-    }
-    if step >= self.capacity { return None; }   // bounded probe — never loops forever
-    idx = (idx + step) & self.mask;
-}
-```
-
-On insert (`find_or_prepare_insert_raw`, `src/table.rs:1805–1881`), if no free slot has been found in the
-main region by the time `step == 2 * GROUP_SIZE` and the stash isn't full, a stash slot becomes the
-candidate insert index — this is what actually bounds a segment's worst-case probe chain: any key that would
-otherwise require a long tail-probe past 32 main-region slots gets shunted into the stash instead. Stash
-slots are addressed as `capacity + stash_index` in the same `usize` index space as main-region slots, so
-`insert_at`/`remove`/`remove_present` (`src/table.rs:1884–1962`) branch on `insert_idx < self.capacity` to
-decide whether to touch `ctrl`/`set_ctrl` or `stash_ctrl`/`stash_count`.
-
-Removing the last item from a segment (`items == 0`) resets **both** the main `ctrl` array to `EMPTY` and the
-stash (`stash_ctrl = [EMPTY; STASH_CAP]`, `stash_count = 0`), and restores `growth_left` including the stash
-bonus if the segment is full-sized — the same "cheap full-reset" optimization the old flat table had,
-extended to the stash.
-
-### 3.3 `RudisEntry` — the inlined key/value/TTL slot
-
-```rust
-// src/table.rs:1476-1481
-#[derive(Clone, Debug)]
+// src/table.rs
 pub struct RudisEntry {
-    pub key: Bytes,                  // 32 bytes
-    pub val: RudisValue,             // 40 bytes
-    pub expire_at: Option<Instant>,  // 16 bytes
+    pub key: crate::compact::CompactKey, // 24 B — key bytes AND the expiry deadline
+    pub val: RudisValue,                 // 16 B
 }
+const _: () = assert!(std::mem::size_of::<RudisEntry>() == 40);
 ```
 
-Verified by the in-file unit test (`src/table.rs:14975–14986`):
+There is no separate `expire_at` field. The deadline lives inside the key (§3.3), so keys without a TTL do
+not pay for one. Use the accessors: `expire_at()`, `set_expire_at()`, `take_expire_at()`. `uncool()` turns a
+`Cooled` value (see §8.6) back into a plain in-memory value and returns the stale disk pointer.
+
+### 3.2 `Expiry` — an `Option<Instant>` in 8 bytes
+
+`Expiry(Option<NonZeroU64>)` stores *nanoseconds since a process-wide base instant, plus one*; 0 means "no
+TTL". The base (`expiry_base`) is chosen once, one hour before first use and aligned to a whole wall-clock
+millisecond, so that:
+
+- deadlines slightly in the past (e.g. a restored already-expired key) still round-trip;
+- absolute `PXAT`/`PEXPIREAT` deadlines land exactly on the millisecond grid used by inline keys.
+
+Deadlines before the base clamp to it (they are expired either way); ordering is preserved.
+
+### 3.3 `CompactKey` — 24-byte keys with an optional deadline
+
+`src/compact.rs`. A 24-byte enum (`Option<CompactKey>` is also 24 bytes):
+
+| Variant | Holds | When used |
+| :--- | :--- | :--- |
+| `Inline { len, data: [u8; 22] }` | ≤ 22 key bytes | key without TTL, ≤ 22 B |
+| `Inline23([u8; 23])` | exactly 23 bytes | key without TTL, 23 B (`INLINE_CAP`) |
+| `InlineTtl { len, data: [u8; 17], ttl: [u8; 5] }` | ≤ 17 bytes + deadline | key with TTL, ≤ 17 B |
+| `InlineTtl18 { data: [u8; 18], ttl: [u8; 5] }` | 18 bytes + deadline | key with TTL, 18 B (`INLINE_TTL_CAP`) |
+| `Heap(Box<[u8]>)` | exact-size heap copy | longer key, no TTL |
+| `HeapTtl(Box<[u8]>)` | `[8-byte raw Expiry][key bytes]` | longer key with TTL, or a deadline too far out to pack |
+
+Inline deadlines are packed by `pack_ttl_ms` into 40 bits of **milliseconds** (rounded to the nearest ms,
+so `PTTL` never reports more than was set); that covers about 34.8 years past the base, after which the key
+falls back to `HeapTtl`. `HeapTtl` keeps the exact nanosecond deadline. `set_ttl` updates the deadline in
+place when the representation does not change, and otherwise re-encodes the key (e.g. adding a TTL to a
+20-byte inline key moves it to `HeapTtl`).
+
+**Example.** `SET session:42 x EX 60` stores key `session:42` (10 B) as `InlineTtl` with the deadline in the
+5 `ttl` bytes: zero heap allocations for the key. A 40-byte key with a TTL costs one 48-byte heap allocation.
+
+`heap_bytes()` reports the heap cost (0 for inline variants) and feeds memory accounting.
+
+### 3.4 `RudisValue` — 16 bytes
 
 ```rust
-assert_eq!(std::mem::size_of::<RudisValue>(), 40);
-assert_eq!(std::mem::size_of::<RudisEntry>(), 88);
-assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 88);   // niche-optimized, no size increase
-```
-
-`align_of::<RudisEntry>() == 8` — it is not cache-line-aligned, and at 88 bytes it never fits in a single
-64-byte cache line regardless of alignment.
-
-### 3.4 Hashing, fingerprinting, and SIMD group comparison
-
-```rust
-// src/table.rs:1483-1499
-#[inline(always)]
-pub fn hash_key(key: &[u8]) -> u64 {
-    hash64(key)   // fxhash::hash64 — see docs/design/rudis_table.md §4 for rationale
-}
-
-#[inline(always)]
-fn mix_hash(mut h: u64) -> u64 {
-    h ^= h >> 32;
-    h = h.wrapping_mul(0xd6e8feb86659fd93);
-    h ^= h >> 32;
-    h
-}
-
-#[inline(always)]
-pub fn fingerprint(hash: u64) -> u8 {
-    (hash >> 57) as u8 & 0x7F   // top 7 bits of the (mixed) hash
-}
-```
-
-`mix_hash` is the **single-pass hash avalanche** finalizer added in `b3d3362` (a truncated MurmurHash3
-`fmix64`-style xorshift/multiply/xorshift — one multiply, not the usual two). `RudisFlatTable` applies
-`mix_hash` to the raw `fxhash::hash64` output before doing anything else with it — directory indexing
-(`dir_index`, §5.2) and segment-local probing both operate on the *mixed* hash, and `fingerprint()` is always
-computed on that mixed value too. FxHash's own multiplicative step is fast but has known weaker
-high-bit mixing for directory-index selection (which reads high bits via `>> SEG_SHIFT`); the avalanche pass
-exists specifically to make the directory-index bits and the fingerprint bits behave independently of each
-other and of the raw key content.
-
-SIMD group comparison (`src/table.rs:1501–1574`): on `x86_64`, `probe_group_match_or_empty` and
-`probe_group_match_del_empty` use `_mm_loadu_si128` + `_mm_cmpeq_epi8` + `_mm_movemask_epi8` to compare all
-16 control bytes against a target fingerprint (and, in the `_del_empty` variant, `DELETED`/`EMPTY` too) in
-one pair of vector instructions, yielding 16-bit match bitmasks. On any other target architecture, both
-functions fall back to a **portable scalar loop** over the same 16 bytes
-(`#[cfg(not(target_arch = "x86_64"))]`, `src/table.rs:1538–1574`) — there is still no NEON or other non-x86
-SIMD implementation (unchanged from the prior revision of this document; see §9's future-improvements list).
-
-Constants: `GROUP_SIZE = 16`, `EMPTY = 0xFF`, `DELETED = 0xFE` (`src/table.rs:8–11`, unchanged).
-
-`fast_slice_eq` (`src/table.rs:1627–1672`) is a hand-rolled key-byte comparator added in `8fbc821`: for keys
-up to 32 bytes it reads two (or four) overlapping `u32`/`u64` words via unaligned pointer loads instead of
-calling `<[u8]>::eq`, checking the first and last word(s) of the slice so short keys are compared with 1–2
-integer comparisons instead of a byte-by-byte loop; it falls back to `a == b` above 32 bytes. Every probe
-function (`find_entry`, `find_entry_mut`, `find_or_prepare_insert_raw`) uses this for the final key-equality
-check after a fingerprint match.
-
-### 3.5 `RudisFlatTable` — the extendible-hashing directory over segments
-
-```rust
-// src/table.rs:1974-1984
-/// Dragonfly-style Extendible Hashing Table (`Directory` + Fixed-Size SIMD `RawSegment`s).
-/// Eliminates monolithic stop-the-world resizes and `old_table` double-lookup overhead.
-pub struct RudisFlatTable {
-    pub segments: Vec<RawSegment>,
-    pub directory: Vec<u32>,     // len == 2^global_depth; directory[i] = index into `segments`
-    pub global_depth: u8,
-    dir_mask: usize,             // directory.len() - 1
-    pub capacity: usize,         // sum of all segments' physical capacity
-    pub items: usize,
-    pub slot_counts: Box<[u32; 16384]>,
-}
-```
-
-A freshly created table (`RudisFlatTable::new`, `src/table.rs:1987–1999`) has exactly **one** segment and a
-one-entry directory (`global_depth = 0`, `directory = vec![0]`) — the extendible-hashing machinery is
-entirely dormant until that single segment fills up and needs to split.
-
-`dir_index` (`src/table.rs:2001–2004`) picks a directory slot from the *mixed* hash:
-
-```rust
-fn dir_index(&self, mixed_hash: u64) -> usize {
-    ((mixed_hash >> SEG_SHIFT) as usize) & self.dir_mask
-}
-```
-
-i.e. it uses the bits of the hash *above* the 10 bits (`SEG_SHIFT`) already consumed by in-segment probing —
-the same hash value locates both the segment (via the directory) and the slot within that segment (via
-`(h as usize) & seg.mask`), with no overlap between the two bit ranges as long as `global_depth` stays within
-the width of a `u64` (in practice `global_depth` only grows a few bits before a shard would hold many
-millions of segments × 1024 slots, so this is not a practical concern).
-
-A **global index** (the `usize` returned by `find_entry`/`find_or_prepare_insert`/etc. and stored by callers
-like `hset_slice_fast`) packs a segment id and a segment-local slot index into one integer:
-`global_idx = (seg_id << GLOBAL_IDX_SHIFT) | local_idx`, with `GLOBAL_IDX_SHIFT = 11` (2,048) comfortably
-covering the largest possible local index (`SEG_CAP + STASH_CAP - 1` = 1,027).
-
----
-
-## 4. Hashing → Directory → Segment → Slot: the Full Lookup/Insert Path
-
-### 4.1 Lookup (`RudisFlatTable::find_entry`, `contains`, `find_entry_mut`)
-
-```rust
-// src/table.rs:2074-2085 (find_entry; contains and find_entry_mut are structurally identical)
-pub fn find_entry(&self, key: &[u8], hash: u64) -> Option<(usize, &RudisEntry)> {
-    if self.items == 0 { return None; }
-    let h = mix_hash(hash);
-    let dir_idx = self.dir_index(h);
-    let seg_id = self.directory[dir_idx] as usize;   // unsafe get_unchecked in the real code
-    let seg = &self.segments[seg_id];
-    seg.find_entry(key, h).map(|(local_idx, entry)| ((seg_id << GLOBAL_IDX_SHIFT) | local_idx, entry))
-}
-```
-
-Every lookup is: mix the caller-supplied raw `fxhash::hash64` once, index the directory (O(1), one `Vec`
-index), index the segment (O(1), one `Vec` index), then run the triangular SIMD probe described in §3.2
-inside that single fixed-size segment. None of `find_entry`/`contains`/`find_entry_mut` evaluate TTL — that
-is layered on top by `RudisTable` (§6).
-
-### 4.2 Insert (`find_or_prepare_insert`, `insert`, `insert_prepared`)
-
-```rust
-// src/table.rs:2117-2136
-pub fn find_or_prepare_insert(&mut self, key: &[u8], hash: u64) -> (Option<usize>, usize) {
-    let h = mix_hash(hash);
-    let mut dir_idx = self.dir_index(h);
-    let mut seg_id = self.directory[dir_idx] as usize;
-
-    if self.segments[seg_id].growth_left == 0 {
-        if let Some((local_idx, _)) = self.segments[seg_id].find_entry(key, h) {
-            return (Some(global_idx), global_idx);   // key already exists — no split needed
-        }
-        self.split_or_grow_segment(dir_idx, seg_id, h);   // §5
-        dir_idx = self.dir_index(h);
-        seg_id = self.directory[dir_idx] as usize;
-    }
-    let (existing, local_idx) = self.segments[seg_id].find_or_prepare_insert_raw(key, h);
-    // pack (seg_id, local_idx) into a global index and return
-}
-```
-
-Note the ordering: a segment at `growth_left == 0` is checked for a **key match first** (an update to an
-existing key never needs to trigger a split), and only a genuinely new key triggers
-`split_or_grow_segment`. `insert` (`src/table.rs:2154–2171`) and `insert_prepared`
-(`src/table.rs:2173–2187`, used by callers that already ran `find_or_prepare_insert` once, e.g.
-`hset_slice_fast`) both also maintain `slot_counts` (§8) — but only when
-`crate::cluster::HAS_ACTIVE_CLUSTER` is `true` at the moment of the mutation, checked on every single
-insert/remove.
-
-### 4.3 Removal (`remove_key`, `remove`, `remove_present`)
-
-`src/table.rs:2189–2226`. All three unpack the global index back into `(seg_id, local_idx)` and delegate to
-`RawSegment::remove`/`remove_present` (§3.2), then decrement `RudisFlatTable::items` and `slot_counts` (again
-gated on `HAS_ACTIVE_CLUSTER`).
-
----
-
-## 5. Extendible Hashing: Segment Splitting, and What Happened to Incremental Rehashing
-
-This is the section that changed the most since the last revision and is the central mechanism of the
-current design. Read it in full.
-
-### 5.1 `split_or_grow_segment` — the four-way decision tree
-
-```rust
-// src/table.rs:2006-2072 (abridged, control flow preserved)
-fn split_or_grow_segment(&mut self, mut dir_idx: usize, mut seg_id: usize, mixed_hash: u64) {
-    while self.segments[seg_id].growth_left == 0 {
-        let seg_items = self.segments[seg_id].items;
-        let seg_cap = self.segments[seg_id].capacity;
-
-        // 1. Tombstone-dominated (< 50% live): compact THIS SEGMENT ONLY in place.
-        if seg_items * 2 < seg_cap {
-            self.segments[seg_id].rebuild(seg_cap);   // re-probe every live entry into a fresh same-size segment
-            break;
-        }
-
-        // 2. Genuinely full, but hasn't reached SEG_CAP (1024) yet: double THIS SEGMENT ONLY in place.
-        if seg_cap < SEG_CAP {
-            self.segments[seg_id].rebuild((seg_cap * 2).min(SEG_CAP));
-            self.capacity = /* segments.len()==1 ? new_cap : segments.len() << SEG_SHIFT */;
-            break;
-        }
-
-        // 3. At SEG_CAP and genuinely full: an Extendible-Hashing SPLIT.
-        let d = self.segments[seg_id].local_depth;
-        if d == self.global_depth {
-            // Directory doesn't have enough resolution to distinguish the two new segments —
-            // double the directory (append a copy of itself) and bump global_depth first.
-            let len = self.directory.len();
-            for i in 0..len { self.directory.push(self.directory[i]); }
-            self.global_depth += 1;
-            self.dir_mask = self.directory.len() - 1;
-            dir_idx = self.dir_index(mixed_hash);
-        }
-
-        // Split this segment's SEG_CAP entries into two new SEG_CAP segments by bit `SEG_SHIFT + d`.
-        let mut seg_zero = RawSegment::new(SEG_CAP, d + 1);
-        let mut seg_one = RawSegment::new(SEG_CAP, d + 1);
-        let bit_shift = SEG_SHIFT + (d as usize);
-        for entry in self.segments[seg_id].slots.drain(..).flatten() {
-            let h = mix_hash(hash_key(&entry.key));
-            if ((h >> bit_shift) & 1) == 0 { seg_zero.insert_migrated(entry, h); }
-            else                           { seg_one.insert_migrated(entry, h); }
-        }
-        self.segments[seg_id] = seg_zero;
-        let new_seg_id = self.segments.len();
-        self.segments.push(seg_one);
-        self.capacity = self.segments.len() << SEG_SHIFT;
-
-        // Retarget every directory entry that pointed at the old segment and whose extra bit is 1.
-        let base = dir_idx & ((1usize << d) - 1);
-        let step = 1usize << (d + 1);
-        let mut i = base | (1usize << d);
-        while i < self.directory.len() {
-            self.directory[i] = new_seg_id as u32;
-            i += step;
-        }
-        dir_idx = self.dir_index(mixed_hash);
-        seg_id = self.directory[dir_idx] as usize;
-        // loop again — the segment the caller actually wanted to insert into might itself
-        // still be full if it just got unlucky and both halves of the split landed full
-    }
-}
-```
-
-**Four distinct outcomes, cheapest first**: (1) in-place tombstone compaction of one segment, (2) in-place
-doubling of one sub-1024 segment, (3) a real extendible-hashing split of one 1024-slot segment into two
-1024-slot segments (with the directory doubled first, but *only* when this segment's `local_depth` has
-caught up to `global_depth` — most splits do **not** require a directory doubling, only a directory
-retarget), (4) — implicit — the `while` loop simply repeats if, after any of the above, the target segment
-is *still* full (rare, but possible after case 3 if the split was maximally unlucky).
-
-**Every one of these operations touches at most one segment's worth of data** — at most 1,024–2,048 entries
-(a split reads ≤1,028 entries out of the old segment and writes them into two new ones) — regardless of how
-many billions of keys live in the rest of the table. This is the structural property that makes a
-large-table insert's worst-case cost bounded and predictable, and it is the entire reason the mechanism
-described next exists only as dead code.
-
-### 5.2 `is_rehashing` / `rehash_step` / `finish_rehash` / `migrate_key_if_in_old` / `prepare_key_lookup` — **dead stubs**
-
-```rust
-// src/table.rs:2138-2152 (RudisFlatTable); src/table.rs:2701-2723 (RudisTable forwards to these 1:1)
-pub fn is_rehashing(&self) -> bool { false }
-pub fn migrate_key_if_in_old(&mut self, _key: &[u8], _hash: u64) {}
-pub fn rehash_step(&mut self, _n: usize) -> bool { false }
-pub fn finish_rehash(&mut self) {}
-// RudisTable::prepare_key_lookup, src/table.rs:2723, is also a no-op: fn prepare_key_lookup(&mut self, _key: &[u8], _hash: u64) {}
-```
-
-This is directly relevant to the task brief for this document, which asked specifically about "progressive
-incremental table rehashing" mentioned in a recent commit message. Here is the full history, reconstructed
-from `git log -- src/table.rs`:
-
-1. **`e244128`** ("progressive incremental table rehashing for latency spike elimination") added a real
-   cooperative rehash protocol to the *old* flat single-array `RudisFlatTable`: an `old_table` field, a
-   `rehash_step(n)` that migrated `n` buckets per call, and `migrate_key_if_in_old` to check the old array on
-   a miss against the new one — the classic "rehash a little on every operation" design (similar in spirit to
-   Redis's own incremental rehashing).
-2. **`c956deb`** and **`62b25b5`** ("bound probe loops and enforce proactive resizing", "bound SwissTable probe
-   loops, respect `sched_getaffinity`") landed fixes on top of that design shortly after.
-3. **`4713691`** ("implement Dragonfly-style extendible hashing directory") **replaced the entire flat-array +
-   `old_table` design** with the segmented directory structure described in §3.5/§5.1. Because a segment
-   split now costs O(1,024) in the worst case regardless of total table size, there is no longer a "large
-   monolithic rehash" to spread incrementally across calls — the problem the incremental rehash protocol
-   existed to solve was designed away at the data-structure level instead.
-4. **`b3d3362`** kept the five methods above as no-op stubs (`is_rehashing` unconditionally `false`,
-   `rehash_step` unconditionally `false`/no-op) rather than deleting them.
-
-**Verified**: `grep -rn 'is_rehashing\|rehash_step\|finish_rehash\|migrate_key_if_in_old\|prepare_key_lookup'
-src/*.rs` outside `table.rs` returns **zero matches** — nothing anywhere else in the codebase calls any of
-these five methods. They are pure vestigial API surface from the superseded design, currently unreachable
-dead code kept (presumably) for source compatibility with external callers or tests that may not currently
-exist. If you're looking for "the incremental rehashing feature," there isn't one in the sense of a
-multi-call cooperative protocol — the thing that made it unnecessary is the extendible-hashing segment cap.
-
-### 5.3 `RawSegment::rebuild` — the actual per-segment "resize"
-
-```rust
-// src/table.rs:1964-1971
-pub fn rebuild(&mut self, new_cap: usize) {
-    let mut next = RawSegment::new(new_cap, self.local_depth);
-    for entry in self.slots.drain(..).flatten() {
-        let h = mix_hash(hash_key(&entry.key));
-        next.insert_migrated(entry, h);
-    }
-    *self = next;
-}
-```
-
-This is a monolithic rehash — but monolithic *within one segment*, i.e. bounded at `SEG_CAP` (1,024) entries
-maximum. There is no time-sliced/incremental version of even this — it's a synchronous loop over the
-segment's own slots — but because the segment is capped, "monolithic" here means "at most ~1K entries," not
-"the whole table."
-
-### 5.4 `RudisFlatTable::defrag` — whole-table maintenance
-
-```rust
-// src/table.rs:2330-2365 (abridged)
-pub fn defrag(&mut self) -> usize {
-    let optimal_cap = (self.items * 2).next_power_of_two().max(64);
-    if optimal_cap <= SEG_CAP && (self.segments.len() > 1 || optimal_cap < before_cap || has_del) {
-        // Collapse the ENTIRE table back down to a single segment (even if it was split into many)
-        // whenever the live item count would now fit in one segment.
-        // ... rebuilds everything into one new RawSegment, resets directory to `vec![0]`, global_depth = 0 ...
-    } else if has_del {
-        // Otherwise, just rebuild any individual segment that currently holds a tombstone.
-        for seg in self.segments.iter_mut() {
-            if seg.ctrl.contains(&DELETED) { let cap = seg.capacity; seg.rebuild(cap); }
-        }
-    }
-}
-```
-
-This is the one place a whole-table structural collapse can still happen — but only when a table that had
-grown past one segment has since shrunk back down to fitting in one again (e.g. after a mass `DEL`). It is
-reachable end-to-end via `RudisTable::active_defrag` → `ShardDb::active_defrag` (`src/shard.rs:815`) → a
-cross-shard `ShardMessage::ActiveDefrag` round-trip (`src/router.rs:1626`, `src/server.rs:494`) — i.e. it is
-operator-triggered maintenance (`connection.rs:8759`), not something the table runs on its own initiative.
-`active_defrag` additionally `Bytes::copy_from_slice`s every live `String`/`SmallHash` field/value to release
-slack capacity, then calls `recalculate_used_memory` (§7).
-
----
-
-## 6. The Real `RudisValue` Enum
-
-```rust
-// src/table.rs:1416-1431
-#[derive(Clone, Debug, PartialEq, Eq)]
+// src/table.rs
 pub enum RudisValue {
-    String(Bytes),
+    String(crate::compact::CompactStr),
     Int(i64),
-    SmallHash(Vec<(Bytes, Bytes)>),
-    Hash(Box<RudisHashMap>),                          // RudisHashMap = HashMap<Bytes, Bytes, FxBuildHasher>
-    List(std::collections::VecDeque<Bytes>),
+    SmallHash(crate::smallhash::SmallHash),
+    Hash(Box<RudisHashMap>),                 // RudisHashMap = crate::packedhash::PackedHash
+    List(Box<crate::packedlist::PackedList>),
     Set(Box<RudisSet>),
     ZSet(Box<RudisZSet>),
-    HyperLogLog(Box<[u8; 16384]>),
+    HyperLogLog(Box<[u8; 16384]>),           // legacy only, see §7.7
     Stream(Box<RudisStream>),
-    Tiered(TieredPointer),
-    Cooled { ptr: TieredPointer, val: Box<RudisValue> },
+    Tiered(Box<TieredPointer>),              // value lives only on NVMe
+    Cooled(Box<CooledValue>),                // in RAM and on NVMe: { ptr, val }
 }
+const _: () = assert!(std::mem::size_of::<RudisValue>() == 16);
 ```
 
-Unchanged in shape from the prior revision: all four collection-carrying variants remain boxed, which is
-precisely what keeps `size_of::<RudisValue>()` at 40 bytes (verified by the unit test, §3.3) instead of
-ballooning to the size of the largest possible collection header. There is no `Bitmap` variant
-(`SETBIT`/`GETBIT` operate directly on `RudisValue::String` bytes) and no `Json` variant (handled entirely by
-`src/json.rs`).
+Everything except `String`, `Int` and `SmallHash` (an 8-byte pointer) is boxed so that the enum fits beside
+`CompactStr`'s 16-byte layout. `Tiered`/`Cooled` are boxed too; they are cold.
 
-`approx_bytes()` (`src/table.rs:1434–1448`) — the per-variant memory heuristic behind `used_memory` — is also
-unchanged:
+Three size functions exist; know which is which:
 
-| Variant | Heuristic |
-| :--- | :--- |
-| `String` | `len()` |
-| `Int` | `8` |
-| `SmallHash` | `Σ (k.len() + v.len() + 16)` per pair |
-| `Hash` | `Σ (k.len() + v.len() + 32)` per pair |
-| `List` | `Σ (b.len() + 16)` per element |
-| `Set` | `len() * 32` — flat estimate, ignores actual member byte length |
-| `ZSet` | `len() * 48` — likewise flat |
-| `HyperLogLog` | `16384` (fixed) |
-| `Stream` | `len() * 64` |
-| `Tiered` | `24` |
-| `Cooled { val, .. }` | `24 + val.approx_bytes()` |
-
----
-
-## 7. Compact Encodings Deep-Dive
-
-Still **no Listpack, Intset, or pointer-based skiplist anywhere in this file.** Three of the eleven
-`RudisValue` variants have a genuine small/full adaptive representation; the rest are fixed Rust types. One
-variant (`HyperLogLog`) has an important new nuance described in §7.5.
-
-### 7.1 Strings: `String(Bytes)` vs. `Int(i64)`
-
-`set_extended_with_hash` (`src/table.rs:3123`) parses every incoming value as a 64-bit integer first
-(`parse_i64_bytes`, hand-written ASCII digit loop, no `str::parse`); a clean parse stores `RudisValue::Int`,
-otherwise `RudisValue::String`. `format_i64` special-cases `0`–`10` and `-1` as `Bytes::from_static` to avoid
-allocation for the most common small integers.
-
-### 7.2 Hashes: `SmallHash(Vec<(Bytes, Bytes)>)` vs. `Hash(Box<RudisHashMap>)`
-
-Thresholds are **runtime-configurable process-wide atomics** owned by `connection.rs`:
-
-```rust
-// src/connection.rs:1006-1008
-pub static HASH_MAX_ENTRIES: AtomicUsize = AtomicUsize::new(512);
-pub static HASH_MAX_VALUE: AtomicUsize = AtomicUsize::new(64);
-```
-
-`hset` now dispatches through `hset_slice_fast` (`src/table.rs:4746`), a perf-optimized path added in the
-`fc3345b`/`68fd391` series that uses `find_entry_mut`/`find_or_prepare_insert` directly instead of a second
-lookup; `hsetnx` (`src/table.rs:5026–5086`) shows the promotion check most plainly:
-
-```rust
-let should_promote = pairs.len() >= max_entries || field.len() > max_value || value.len() > max_value;
-pairs.push((field, value));
-if should_promote {
-    let map: RudisHashMap = pairs.drain(..).collect();
-    entry.val = RudisValue::Hash(Box::new(map));
-}
-```
-
-`SmallHash` is a linearly-searched `Vec` of pairs, not a byte-packed buffer. New hashes are born `SmallHash`
-(acquired from the arena, §11) unless a field/value already exceeds `max_value`, in which case they're born
-directly as `Hash`.
-
-### 7.3 Sets: `RudisSet::Small(Vec<SmallSetEntry>)` vs. `Full(HashSet<Bytes, FxBuildHasher>)`
-
-```rust
-// src/table.rs:662-673
-const SMALL_SET_LIMIT: usize = 64;   // still a hardcoded constant, not runtime-configurable
-
-pub struct SmallSetEntry { pub hash: u64, pub member: Bytes }
-
-pub enum RudisSet {
-    Small(Vec<SmallSetEntry>),
-    Full(hashbrown::HashSet<Bytes, FxBuildHasher>),
-}
-```
-
-Each small-form entry caches `fxhash::hash64(member)`; `contains`/`insert`/`remove` compare the cached `u64`
-before falling back to a byte comparison, so a miss on a large member is rejected without touching the member
-bytes. Crossing `SMALL_SET_LIMIT` (64 entries) converts to `Full` by draining the `Vec`. Deletion from the
-small form uses `Vec::swap_remove` — O(1) but reorders the vector. `RudisSetIter` (`src/table.rs:683–706`)
-unifies iteration over both representations.
-
-### 7.4 Sorted sets: `RudisZSet::Small(Vec<(OrderedScore, Bytes)>)` vs. `Full { dict, tree }`
-
-```rust
-// src/table.rs:144, 147-153
-const SMALL_ZSET_LIMIT: usize = 64;   // still hardcoded
-
-pub enum RudisZSet {
-    Small(Vec<(OrderedScore, Bytes)>),
-    Full {
-        dict: hashbrown::HashMap<Bytes, f64>,               // NOT FxBuildHasher — default hashbrown hasher
-        tree: std::collections::BTreeSet<(OrderedScore, Bytes)>,
-    },
-}
-```
-
-`OrderedScore(f64)` (`src/table.rs:14–29`) wraps `f64::total_cmp` so `(OrderedScore, Bytes)` can live in a
-`BTreeSet`/be `binary_search`-ed. The small form's `insert` (`src/table.rs:198–235`) locates the insertion
-point with `binary_search` (O(log n)) but `Vec::insert` still shifts every following element (O(n) overall).
-Crossing `SMALL_ZSET_LIMIT` converts to `Full`, pairing a `HashMap<Bytes, f64>` with a
-`BTreeSet<(OrderedScore, Bytes)>`.
-
-**`rank()` is still not O(log n) in either representation** (`src/table.rs:254–274`) — `BTreeSet` has no
-built-in rank/order-statistics operation, so `ZRANK`/`ZREVRANK` pay an O(n) `.position()` walk regardless of
-representation.
-
-**`range()` by score, however, is genuinely sub-linear in the `Full` form**: `ZRangeOpts::by_score` uses
-`tree.range((Included((OrderedScore(min), Bytes::new())), Unbounded)).take_while(...)`
-(`src/table.rs:364–378`), i.e. an O(log n) `BTreeSet::range` seek to the start bound followed by an O(k) walk
-for the `k` matching elements — `ZRANGEBYSCORE` is efficient; only `ZRANK`/`ZREVRANK` are the linear
-outlier.
-
-### 7.5 HyperLogLog: `HyperLogLog(Box<[u8; 16384]>)` is now a **legacy-only read path** — live writes use sparse `String`
-
-This is a real behavioral change since the prior revision of this document, uncovered by tracing every
-constructor of `RudisValue::HyperLogLog` in the current source.
-
-`pfadd` (`src/table.rs:11123–11181`) — the only way to create a fresh HLL via `PFADD` — **never constructs
-`RudisValue::HyperLogLog`**. A brand-new key is created via `crate::hll::hll_create_sparse_empty()` and
-stored as a plain `RudisValue::String`:
-
-```rust
-// pfadd, new-key branch, src/table.rs:11160-11168
-let bytes = if elements.is_empty() {
-    crate::hll::hll_create_sparse_empty()
-} else {
-    let mut b = crate::hll::hll_create_sparse_empty();
-    let _ = crate::hll::hll_add(&mut b, elements)?;
-    b
-};
-self.set(key, Bytes::from(bytes), None);
-```
-
-`pfadd`/`pfcount`/`pfmerge` all branch on the *existing* value's variant and handle **both**
-`RudisValue::String` (validated/decoded via `crate::hll::hll_validate`/`hll_decode_registers`, which
-transparently understands both Redis's real sparse run-length format and the dense format — see `src/hll.rs`)
-and `RudisValue::HyperLogLog` (the legacy dense box, read directly). But a `grep` for every construction site
-of `RudisValue::HyperLogLog` across the entire codebase (not just reads/matches) turns up exactly one place
-that builds it: **`RESTORE`/DUMP payload deserialization**, type tag `5`
-(`src/table.rs:12717–12725`), for loading an old DUMP blob that was serialized back when the dense box was
-the live representation. Everywhere else `RudisValue::HyperLogLog(regs)` appears in `table.rs` is a
-match-arm that *reads* an already-existing dense box (`pfadd`, `pfcount`, `pfmerge`, `pfdebug_*`,
-`get_with_hash`, `write_get_resp`, DUMP-serialization for an already-dense key, etc.) — none of them create
-one from scratch.
-
-**Practical upshot**: on a table with no `RESTORE`d legacy DUMP payloads, `RudisValue::HyperLogLog` never
-appears at all; every live HLL is a `RudisValue::String` holding Redis's real sparse-or-dense byte encoding
-(auto-promoted from sparse to dense by `crate::hll::hll_add`/`hll_count` once a register update makes the
-sparse form larger than the dense form, mirroring real Redis's own HLL promotion behavior — `PFDEBUG
-ENCODING`/`PFDEBUG TODENSE` at `src/table.rs:11365–11402` expose this state for introspection/testing). This
-supersedes the prior revision's claim that HLLs are "always a dense `Box<[u8; 16384]>`... used
-unconditionally" — that was accurate before the sparse-HLL work (`b85b6a7`) landed; it no longer is.
-
-### 7.6 Lists: always `VecDeque<Bytes>`
-
-Unchanged: `RudisValue::List(std::collections::VecDeque<Bytes>)`, one representation regardless of length.
-`LPUSH`/`RPUSH`/`LPOP`/`RPOP` map directly to `push_front`/`push_back`/`pop_front`/`pop_back`; no
-compact/large-list distinction, no listpack-equivalent small form.
-
-### 7.7 Streams: `BTreeMap<StreamId, Vec<(Bytes, Bytes)>>` plus substantially more bookkeeping than before
-
-```rust
-// src/table.rs:928-931, 987-995, 1076-1172 (all current fields)
-pub struct StreamId { pub ms: u64, pub seq: u64 }
-
-pub enum StreamAddId { Auto, AutoSeq(u64), Explicit(StreamId) }
-
-#[repr(u8)]
-pub enum StreamTrimStrategy { KeepRef = 0, DelRef = 1, Acked = 2 }
-
-pub enum StreamIdmpOption {
-    Manual { producer: Bytes, iid: Bytes },
-    Auto { producer: Bytes },
-}
-
-pub enum StreamAddResult { Added(StreamId), Duplicate(StreamId), NoMkStream }
-
-pub struct IdmpProducer {
-    pub iids: HashMap<Bytes, (StreamId, u64)>,        // internal-id -> (assigned StreamId, timestamp)
-    pub order: std::collections::VecDeque<Bytes>,      // insertion order, for IDMP window eviction
-}
-
-pub struct StreamPelEntry {
-    pub consumer: Bytes,
-    pub delivery_time_ms: u64,
-    pub delivery_count: usize,
-    pub nack_seq: u64,               // NEW: XNACK sequencing
-}
-
-pub struct StreamConsumer {
-    pub name: Bytes,
-    pub seen_time_ms: u64,
-    pub active_time_ms: Option<u64>, // NEW
-    pub pel: std::collections::BTreeMap<StreamId, u64>,
-}
-
-pub struct StreamGroup {
-    pub name: Bytes,
-    pub last_delivered_id: StreamId,
-    pub entries_read: Option<u64>,   // NEW: XINFO GROUPS `entries-read`
-    pub consumers: HashMap<Bytes, StreamConsumer>,
-    pub pel: std::collections::BTreeMap<StreamId, StreamPelEntry>,
-    pub next_nack_seq: u64,          // NEW: monotonic XNACK sequence counter
-}
-
-pub struct RudisStream {
-    pub entries: std::collections::BTreeMap<StreamId, Vec<(Bytes, Bytes)>>,
-    pub last_id: StreamId,
-    pub entries_added: u64,                       // NEW: lifetime add counter (survives trims)
-    pub max_deleted_entry_id: StreamId,            // NEW
-    pub groups: HashMap<Bytes, StreamGroup>,
-    pub idmp_duration: Option<u64>,                // NEW: idempotent-producer dedup window (ms)
-    pub idmp_maxsize: Option<usize>,               // NEW: per-producer dedup cache size cap
-    pub idmp_producers: HashMap<Bytes, IdmpProducer>,  // NEW
-    pub iids_added: u64,                           // NEW: stats counters
-    pub iids_duplicates: u64,                      // NEW
-    pub nodes: std::collections::VecDeque<Vec<StreamId>>,  // NEW: fake "radix tree node" chunks
-}
-```
-
-`StreamId` (`Ord`-derived) keeps `entries` naturally ordered via the `BTreeMap`. New since the prior revision:
-
-- **Idempotent producers** (`IdmpProducer`, `StreamIdmpOption`, `compute_stream_auto_iid`,
-  `STREAM_IDMP_DURATION`/`STREAM_IDMP_MAXSIZE` atomics defaulting to `100`ms/`100` entries,
-  `src/table.rs:1097–1131`) — an `XADD` extension letting a producer supply a manual or auto-computed
-  internal id (`iid`); a duplicate `iid` within the configured time/size window returns the
-  previously-assigned `StreamId` instead of creating a new entry (`StreamAddResult::Duplicate`). This is a
-  Rudis-specific idempotent-write extension, not part of standard Redis stream semantics.
-- **XNACK support**: `StreamPelEntry.nack_seq` plus `StreamGroup.next_nack_seq`, a monotonically increasing
-  per-group counter stamped onto PEL entries so a negative-acknowledgement can reference a specific delivery
-  attempt.
-- **Fake radix-tree node accounting**: `RudisStream.nodes` is a `VecDeque<Vec<StreamId>>` chunked at
-  `STREAM_NODE_MAX_ENTRIES` (default 100, `src/table.rs:1097–1098`) IDs per "node"
-  (`rebuild_nodes`/push/remove logic around `src/table.rs:1197–1235`). It has nothing to do with lookup
-  performance (the real index is still the `BTreeMap`) — it exists purely so `XINFO STREAM`'s
-  `radix-tree-keys`/`radix-tree-nodes` fields (`src/table.rs:14076–14080`, `14212`) can report
-  realistic-looking numbers for Redis-compatibility, mirroring the shape (if not the actual implementation)
-  of real Redis's listpack-chunked stream storage.
-
-### 7.8 HyperLogLog legacy dense format: still a fixed `Box<[u8; 16384]>` when it exists
-
-See §7.5 — unchanged in byte layout, just no longer constructed by any live write path.
-
----
-
-## 8. Expiration & Memory Management
-
-### 8.1 Key-level TTLs: `num_expires` fast path — unchanged in spirit, still present everywhere
-
-```rust
-// RudisTable::get_with_hash, src/table.rs:2875-2899 (abridged) — the fast-path pattern repeated
-// throughout every read/write command in this file
-if self.num_expires > 0
-    && let Some(expire_at) = entry.expire_at
-    && !crate::connection::ALLOW_ACCESS_EXPIRED.load(Ordering::Relaxed)
-    && Instant::now() >= expire_at
-{
-    self.expire_slot(idx);
-    return Ok(None);
-}
-```
-
-`num_expires` — a running count of entries with `expire_at.is_some()` — is checked first, before
-`ALLOW_ACCESS_EXPIRED` or any `Instant::now()` call, inlined directly into dozens of hot per-command paths
-(`get_with_hash`, `get_compact_with_hash`, `write_get_resp`, `write_hget_resp`, `increx`, …) rather than
-funneled through one shared helper everywhere. On a table where no key carries a TTL this collapses
-expiration checking to a single integer comparison with no clock read. `expire`/`persist` and every real
-eviction/removal path keep it in sync (increment on no-TTL→TTL, decrement on the reverse or on removal of a
-TTL-carrying key).
-
-`ALLOW_ACCESS_EXPIRED` (`src/connection.rs:1009`) is a process-wide `AtomicBool` that, when set, disables
-expiration checks everywhere regardless of `num_expires` — used for debug/inspection paths that need to see
-logically-expired keys.
-
-### 8.2 Active key-level expiration sampling — now segment-aware
-
-```rust
-// RudisTable::active_expire_cycle, src/table.rs:10437-10469 (key-level portion)
-let bound = self.table.cursor_bound();
-let max_scan = bound.min(512);
-let mut checked = 0;
-let mut slots_scanned = 0;
-while checked < 20 && slots_scanned < max_scan && self.num_expires > 0 {
-    let cur = self.sample_cursor % bound;
-    self.sample_cursor = (self.sample_cursor + 1) % bound;
-    let idx = self.table.cursor_to_global_idx(cur);
-    if let Some(entry) = self.table.get_slot(idx) && entry.expire_at.is_some() {
-        if self.check_expired_slot(idx) { expired_count += 1; inc_expired_keys_active(); }
-        checked += 1;
-    }
-    slots_scanned += 1;
-}
-```
-
-**Correction vs. the prior revision**: the sampling loop no longer indexes the table directly by a flat
-`0..capacity` cursor — it goes through `RudisFlatTable::cursor_bound()`/`cursor_to_global_idx()`
-(`src/table.rs:2295–2314`), which account for the segmented layout: with one segment, the cursor space is
-just that segment's `slots.len()`; with multiple segments, it's `segments.len() * (SEG_CAP + STASH_CAP)`,
-and a cursor value is mapped to a `(seg_id, local_idx)` pair via integer division/modulo by that stride. This
-keeps the round-robin sweep correct across an arbitrary number of segments.
-
-Also new: `max_scan = bound.min(512)` bounds how many *cursor positions* a single call will step through (not
-just how many TTL'd keys it will expire) — on a huge, TTL-sparse table, the old unconditional 20-key quota
-with no positional cap could in principle scan very deep before finding 20 TTL'd keys; this change caps the
-positional cost of a single call at 512 slots regardless.
-
-### 8.3 Hash-field-level TTLs (`HEXPIRE`/`HTTL`/`HPERSIST`/`HGETEX`/`HSETEX`) — a second, independent expiry subsystem
-
-```rust
-// RudisTable, src/table.rs:2425
-pub hash_field_expires: hashbrown::HashMap<Bytes, hashbrown::HashMap<Bytes, Instant>>,
-```
-
-This is a completely separate map from the main table: outer key is the hash's Redis key, inner map is
-`field -> Instant` for fields that carry a field-level TTL (`HEXPIRE key seconds FIELDS n f1 f2 ...`). It is
-**not** reflected in `num_expires` at all — `num_expires` only ever counts whole-key TTLs.
-
-Two mechanisms keep it current:
-
-- **Passive**: `purge_expired_hash_fields(key)` (`src/table.rs:5088–5109`) is called at the top of hash
-  read/write commands (`write_hget_resp`, `hexpire`, `httl`, `hgetex`, `hsetex`, `hdel`, …), each gated by
-  `if !self.hash_field_expires.is_empty()` so it costs nothing on shards that never used `HEXPIRE`. It
-  `retain`s the inner map, collecting expired field names, then calls `self.hdel(key, &expired)` to actually
-  remove them from the hash's `RudisValue`.
-- **Active**: `evict_expired_hash_fields_sample(max_keys)` (`src/table.rs:10393–10433`), called with
-  `max_keys = 8` as the very first thing `active_expire_cycle` does on every invocation
-  (`src/table.rs:10439–10441`), before the key-level sampling loop in §8.2 even runs.
-
-**Gotcha — shared cursor, different moduli**: `evict_expired_hash_fields_sample` samples its starting point
-via `self.sample_cursor % total` where `total = self.hash_field_expires.len()` — the **same**
-`RudisTable::sample_cursor` field the key-level expiration loop in §8.2 advances via `% bound` (the main
-table's cursor-space size). `evict_expired_hash_fields_sample` itself never advances `sample_cursor`; it only
-reads whatever position the *previous* call's key-level sweep left it at, then reduces that value modulo a
-completely different number. In practice this means hash-field sampling does not get a clean, dedicated
-round-robin traversal of `hash_field_expires` — its effective starting point on any given call is whatever
-pseudo-random residue the key-level sweep's cursor happens to leave behind, modulo the (usually much smaller)
-`hash_field_expires.len()`. Not a correctness bug (eventually every key does get sampled, and the passive
-path backstops anything missed), but worth knowing if `HEXPIRE`'s active-eviction latency ever needs to be
-reasoned about precisely.
-
-### 8.4 Eviction under memory pressure (`try_evict_one_key`) — still no real LRU
-
-```rust
-// RudisTable::try_evict_one_key, src/table.rs:2802-2857 (abridged)
-pub fn try_evict_one_key(&mut self, policy: &str) -> Option<usize> {
-    let bound = self.table.cursor_bound();
-    let is_volatile = policy.to_lowercase().starts_with("volatile");
-    let mut checked = 0;
-    let mut attempts = 0;
-    while checked < 10 && attempts < bound {
-        let cur = self.sample_cursor % bound;
-        self.sample_cursor = (self.sample_cursor + 1) % bound;
-        attempts += 1;
-        let idx = self.table.cursor_to_global_idx(cur);
-        if let Some(entry) = self.table.get_slot(idx) {
-            if is_volatile && entry.expire_at.is_none() { continue; }
-            if policy.to_lowercase().contains("ttl") {
-                // track the minimum expire_at seen so far -> "nearest to expiring wins"
-            } else {
-                best_slot = Some(idx);   // first sampled occupied slot wins — this is what "*-lru" resolves to
-                checked += 1;
-            }
-        }
-    }
-    // remove `best_slot`, update used_memory, inc_evicted_keys(), return bytes freed
-}
-```
-
-Re-verified against the current source, and the conclusion from the prior revision still holds exactly:
-**this samples up to 10 occupied slots via the shared `sample_cursor`/`cursor_bound`/`cursor_to_global_idx`
-machinery, and only `*-ttl` policies get genuine comparison (nearest expiry wins).** `allkeys-lru` and
-`volatile-lru` take the *first* sampled occupied (and, for `volatile-*`, TTL-carrying) slot — there is still
-no access-recency clock, second-chance bit, or any other recency signal anywhere in `RudisEntry` or
-`RawSegment`/`RudisFlatTable`. As implemented, `allkeys-lru` is indistinguishable from `allkeys-random`, and
-`volatile-lru` from `volatile-random`. `try_evict_one_key` also now shares the very same `sample_cursor` as
-both expiration sweeps in §8.2/§8.3 — three independent consumers (key-TTL sampling, hash-field-TTL sampling,
-and eviction sampling) all advance and read the one `RudisTable::sample_cursor` field, each against its own
-modulus. This is a change from the prior revision, which described `sample_cursor` as dedicated to
-active-expiration only (and a separate `spill_cursor` for tiering, which remains genuinely independent — see
-§10).
-
----
-
-## 9. MGET/MSET Direct Buffer Serialization
-
-The commit that introduced this (`b3d3362`) mostly touched `connection.rs`/`router.rs`/`mailbox.rs`, not
-`table.rs` — the bulk of the batching/response-gathering machinery (`write_resp_bulk_bytesmut`,
-`write_resp_array_header_bytesmut` in `connection.rs`, `Router::begin_mget_resp`/`finish_mget_resp`/
-`begin_mset`/`finish_mset` in `router.rs`, and the scatter/gather descriptors in `mailbox.rs`) lives outside
-this file's scope — see `docs/internal/04_sharding_mesh.md` for that side. `table.rs`'s contribution is the
-primitive the fast paths call directly:
-
-- **Single pre-computed hash, reused for routing and lookup.** `Router::begin_mget_resp`
-  (`src/router.rs:1274`) computes `target_shard_and_hash(key)` once per key to decide local-vs-remote
-  routing, then — for keys that land on the current shard — passes that *same* hash straight into
-  `RudisTable::get_with_hash(key, key_hash)` (`src/router.rs:1328`) instead of calling plain `get(key)`,
-  which would recompute `hash_key` a second time.
-- **A family of `write_*_resp` methods that serialize straight into the caller's output `Vec<u8>`,
-  bypassing an intermediate `Bytes`/`Vec<Bytes>` allocation entirely**: `write_get_resp`
-  (`src/table.rs:2946`), `write_hget_resp` (`5850`), `write_lpop_resp`/`write_lpop_resp_with_hash` (`6778`,
-  `6857`), `write_rpop_resp`/`write_rpop_resp_with_hash` (`6868`, `6947`), `write_lrange_resp` (`7304`),
-  `write_sismember_resp` (`8189`), `write_zrange_resp` (`9823`). Each does the TTL check and
-  `RudisValue` match internally, then calls `crate::connection::write_resp_bulk`/`write_resp_null` directly
-  on the passed-in buffer rather than returning an owned value for the caller to re-serialize.
-- The genuinely-local (`num_shards <= 1`, or all keys land on the current shard) MGET fast path in
-  `router.rs` reserves the output buffer once (`total_keys * 32 + 16`) and writes the RESP array header plus
-  every element directly, with **zero channel operations and zero intermediate per-key allocation** — this
-  is the "direct buffer serialization" the commit message refers to, and `get_with_hash` (not a
-  batch-oriented table.rs API) is the primitive it's built on.
-
-There is no dedicated "batch get" or "batch set" method inside `RudisTable` itself — MGET/MSET batching is
-entirely a `router.rs`/`connection.rs`-level concern layered on top of table.rs's ordinary single-key,
-hash-reusing primitives.
-
----
-
-## 10. NVMe Tiering Hooks — unchanged behavior, adapted to the segmented layout
-
-Built around two `RudisValue` variants (`src/table.rs:1401–1430`):
-
-```rust
-pub struct TieredPointer { pub file_id: u32, pub offset: u64, pub length: u32, pub value_type: u8 }
-// RudisValue::Tiered(TieredPointer)                                — value lives only on disk
-// RudisValue::Cooled { ptr: TieredPointer, val: Box<RudisValue> }  — on disk AND still cached in RAM
-```
-
-`get_with_hash` and friends unwrap `Cooled` transparently (`match &entry.val { Cooled { val, .. } =>
-val.as_ref(), other => other }`). Relevant methods, current line numbers:
-
-- `get_hot_keys_for_spill(&mut self, limit)` (`src/table.rs:3765–3788`): round-robins `spill_cursor` (now
-  over `cursor_bound()`/`cursor_to_global_idx()`, same segment-aware adaptation as §8.2's sampling) collecting
-  keys whose value isn't already `Tiered`/`Cooled`, up to `limit`.
-- `restore_tiered_value` (`3716–3731`): `Tiered(ptr)` → `Cooled { ptr, val }`, adds `val.approx_bytes()` to
-  `used_memory`.
-- `decommit_cooled_key` (`3734–3747`): single-key inverse, `Cooled` → `Tiered`, frees bytes.
-- `decommit_all_cooled` (`3749–3763`): the same conversion applied table-wide in one pass.
-- `get_value_for_spill` (`3791+`): serializes a non-tiered value's payload/type tag for `src/tiering.rs`,
-  lazily expiring the key along the way if it turns out stale.
-
-`spill_cursor` remains a field distinct from `sample_cursor` (unlike the three-way sharing of `sample_cursor`
-described in §8.4) — tiering sampling still never perturbs expiration/eviction sampling cadence, or
-vice versa.
-
----
-
-## 11. Cluster Slot Indexing
-
-Unchanged in design from the prior revision — a count-only fixed array, not a reverse key index:
-
-```rust
-pub slot_counts: Box<[u32; 16384]>,   // one field on RudisFlatTable, NOT per-segment
-```
-
-Incremented/decremented inside `RudisFlatTable::insert`/`insert_prepared`/`remove`/`remove_present`, but
-**only when `crate::cluster::HAS_ACTIVE_CLUSTER` is `true` at the moment of the mutation** — with cluster
-mode inactive the array is never touched and stays stale/zero.
-
-```rust
-// count_keys_in_slot, src/table.rs:9280-9316 (current)
-pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
-    if self.table.items == 0 { return 0; }
-    if crate::cluster::HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed) {
-        if self.table.slot_counts[slot as usize] == 0 { return 0; }
-        if self.num_expires == 0 { return self.table.slot_counts[slot as usize] as usize; }
-    }
-    // full linear scan via self.table.enumerate_slots(), filtering by crate::router::key_slot(&entry.key) == slot,
-    // lazily expiring any stale entries encountered along the way
-}
-```
-
-Same three-way behavior as before: (1) cluster inactive → always a full scan; (2) cluster active, counter is
-`0` → O(1) true zero; (3) cluster active, counter `>0`, and **no key anywhere in the table has a TTL**
-(`num_expires == 0`) → O(1), counter trusted directly; (4) cluster active, non-empty slot, and *any* key
-anywhere in the shard has a TTL → full `O(table capacity)` scan, because the counter might overcount
-already-logically-expired-but-not-yet-evicted keys. The only mechanical change is that the fallback scan now
-goes through `enumerate_slots()` (`src/table.rs:2258–2267`), a segment-aware iterator
-(`segments.iter().enumerate().flat_map(...)`) instead of indexing a flat array directly. `get_keys_in_slot`
-(`src/table.rs:9318–9358`) follows the identical shape. This remains a real regression versus a reverse-index
-design for cluster-active, non-empty-slot, `num_expires > 0` workloads (see §13).
-
----
-
-## 12. Memory Accounting
-
-`RudisTable::used_memory` is a running estimate, not an exact allocator query. `RudisTable::new`
-(`src/table.rs:2660–2672`) seeds it with the initial table's structural overhead:
-
-```rust
-let base_mem = 64 * std::mem::size_of::<Option<RudisEntry>>() + 64 + GROUP_SIZE + 16384 * 4;
-//            = 64 * 88                                        + 64 + 16         + 65,536
-//            = 5,632                                          + 80             + 65,536  = 71,248 bytes
-```
-
-(the `16384 * 4` term is the 64 KiB `slot_counts` array, allocated unconditionally even when cluster mode is
-never turned on).
-
-Every mutation updates `used_memory` incrementally (`+= entry_mem` on insert, `-= freed` on remove/expire/
-evict, where `freed = key.len() + val.approx_bytes() + 64`). `recalculate_used_memory`
-(`src/table.rs:2725–2734`) recomputes it from scratch — `capacity * size_of::<Option<RudisEntry>>() +
-ctrl_bytes() + 16384*4`, plus every live entry's `key.len() + approx_bytes() + 64` — used by `active_defrag`
-and available for drift-correction. `RudisFlatTable::ctrl_bytes()` (`src/table.rs:2274–2278`) now sums every
-segment's `ctrl.len()` plus `directory.len() * size_of::<u32>()`, reflecting the segmented layout.
-
-Set/ZSet remain the two variants whose `approx_bytes()` heuristic doesn't scale with actual member byte
-length (flat `count * constant`) — unchanged caveat from the prior revision.
-
----
-
-## 13. Small-Collection Allocation Arena — unchanged
-
-`RudisTable.arena: crate::allocator::SmallCollectionArena` (`src/allocator.rs:100–107`) recycles the backing
-allocations behind `List` (`VecDeque<Bytes>`), `SmallHash` (`Vec<(Bytes, Bytes)>`), small `Set`
-(`Vec<SmallSetEntry>`), and small `ZSet` (`Vec<(OrderedScore, Bytes)>`) — the four representations that churn
-allocations fastest. Verified still current: `MAX_ARENA_POOLED = 1024` entries per pool
-(`src/allocator.rs:94`), a per-collection capacity ceiling of `512` elements before a buffer is dropped rather
-than pooled (`src/allocator.rs:137,159,181,206`). `RudisTable::recycle_value` (`src/table.rs:2675–2694`)
-dispatches values back to the arena on overwrite/delete/expire; `Full`-form `Set`/`ZSet`, `Hash`, `Stream`,
-and every other variant are simply dropped, not pooled.
-
----
-
-## 14. Concrete Numbers — Summary Table
-
-| Quantity | Value | Source |
+| Method | Meaning | Used for |
 | :--- | :--- | :--- |
-| `size_of::<RudisValue>()` | 40 bytes | unit test, `table.rs:14983` |
-| `size_of::<RudisEntry>()` / `Option<RudisEntry>` | 88 bytes (both — niche-optimized) | unit test, `table.rs:14984-14985` |
-| `align_of::<RudisEntry>()` | 8 bytes | struct field types |
-| `GROUP_SIZE` (SIMD probe group) | 16 | `table.rs:8` |
-| `SEG_CAP` (max single-segment capacity) | 1,024 | `table.rs:1577` |
-| `STASH_CAP` (overflow stash slots/segment) | 4 | `table.rs:1578` |
-| `GLOBAL_IDX_SHIFT` | 11 bits (max local index 2,047) | `table.rs:1579` |
-| Max load factor before split/grow | 7/8 (87.5%), `+4` stash slots at full `SEG_CAP` | `RawSegment::new` |
-| Full-segment heap footprint | ≈ 91,504 bytes (≈ 89.4 KiB) — **not** the ~48 KiB the source comment claims | computed, §3.1 |
-| `HASH_MAX_ENTRIES` default | 512 (runtime-configurable) | `connection.rs:1006` |
-| `HASH_MAX_VALUE` default | 64 bytes (runtime-configurable) | `connection.rs:1008` |
-| `SMALL_SET_LIMIT` | 64 (hardcoded) | `table.rs:662` |
-| `SMALL_ZSET_LIMIT` | 64 (hardcoded) | `table.rs:144` |
-| `STREAM_NODE_MAX_ENTRIES` default | 100 | `table.rs:1097` |
-| `STREAM_IDMP_DURATION` default | 100 ms | `table.rs:1099` |
-| `STREAM_IDMP_MAXSIZE` default | 100 entries | `table.rs:1101` |
-| Active expiration sample size | 20 TTL'd keys, capped at 512 scanned cursor positions, per call | `table.rs:10437-10469` |
-| Hash-field active expiration sample size | 8 keys per call | `table.rs:10393` |
-| Eviction sample size | 10 occupied slots per call | `table.rs:2802-2857` |
-| `MAX_ARENA_POOLED` | 1,024 pooled collections per pool | `allocator.rs:94` |
-| Arena per-collection capacity ceiling | 512 elements | `allocator.rs:137` et al. |
-| `slot_counts` array | `Box<[u32; 16384]>` = 64 KiB, one per table (not per segment) | `table.rs:1983` |
-| `RudisTable::new()` base memory | 71,248 bytes | computed, §12 |
+| `mem_bytes()` | heap bytes beyond the slot: 0 for `Int` and inline strings, `heap_bytes()` for heap strings, `24 + inner` for `Cooled`, else `approx_bytes()` | `used_memory` / dataset estimate |
+| `approx_bytes()` | logical size heuristic: string length, `Int` = 8, `SmallHash` Σ(k+v+2), `Hash` Σ(k+v+32), `List` Σ(len+16), `Set` len×32, `ZSet` len×48, `HyperLogLog` 16384, `Stream` len×64, `Tiered` 24 | `MEMORY USAGE`, spill thresholds |
+| `collection_len()` | element count of hashes and lists (0 otherwise) | budgeting the dataset recount (§5.5) |
+
+### 3.5 `CompactStr` — 16-byte string values
+
+`src/compact.rs`. The variant is chosen in `CompactStr::new` by length and content:
+
+| Length | Content | Variant | Heap |
+| :--- | :--- | :--- | :--- |
+| 0–14 | any | `Inline { len, data: [u8;14] }` | none |
+| 15 | any | `Inline15` | none |
+| 16 | ASCII | `Packed` (7 bits/char → 14 bytes) | none |
+| 17 | ASCII | `Packed17` (16 chars 7-bit packed + 1 raw byte) | none |
+| 18–20 | all chars in a 64-symbol alphabet | `Packed6A18..20` (`0-9A-Za-z:-`) or `Packed6B18..20` (`0-9A-Za-z_.`) | none |
+| 21–24 | all chars in a 32-symbol alphabet | `Packed5A21..24` (`0-9a-f:-_.TZ /+ghiklnv`, aimed at hex, timestamps, ids) or `Packed5B21..24` (`a-z:-_./ `) | none |
+| 25–255 | ASCII, and packing lands in a smaller jemalloc size class | `HeapPacked { len, ptr }` (7 bits/char) | `ceil(7n/8)` |
+| other | any | `Heap { len: u32, ptr }` (thin pointer + length) | `n` |
+| ≥ 256 after first read | any | `Shared(Box<Bytes>)` | `n + size_of::<Bytes>()` |
+
+Key mechanics:
+
+- **Reading**: `view()` returns a `StrView` that derefs to `[u8]` — a borrowed slice for contiguous variants,
+  or bytes unpacked onto the stack (or into a `Vec` for `HeapPacked`). `extend_into` / `write_resp_bulk`
+  unpack straight into an output buffer. `as_contiguous()` returns `None` for packed variants.
+- **7-bit packing** uses SWAR (`pack7_u64`/`unpack7_u64`), or BMI2 `pext`/`pdep` when the CPU has it
+  (`pack7_heap_bmi2`). `heap_pack_pays` only picks `HeapPacked` when `alloc_class(packed_len(n)) <
+  alloc_class(n)` (16-byte classes to 128 B, 32-byte classes to 256 B).
+- **Zero-copy sharing**: a `Heap` value of at least `SHARE_MIN` (256) bytes is converted in place to
+  `Shared` the first time it is read (`needs_share` / `make_shared`, driven by `RudisValue::string_needs_share`
+  in `get_with_hash`). Later reads — often cross-shard — are a refcount clone instead of malloc + memcpy.
+  `HeapPacked` stops at 255 bytes for exactly this reason.
+- **Integers**: `set_extended_with_hash` first tries `parse_i64_bytes`; a clean parse stores
+  `RudisValue::Int`. `format_i64` turns it back into bytes on read.
+
+**Example.** `SET user:1:ts 2026-10-30T14:29:57Z` → 20 chars, all in `ALPHABET_6A`
+(`0-9A-Za-z:-`) → `Packed6A20`, 0 heap bytes. The same value with a trailing `.123` (24 chars) packs into
+`Packed5A24` because every char is in `ALPHABET_5A`.
+
+`CompactStr` contains `unsafe` code (raw `NonNull` ownership for `Heap`/`HeapPacked`, manual `Send`/`Sync`);
+`scripts/miri_compact.sh` runs its tests under Miri. (The module doc comment's "safe Rust only" describes
+`CompactKey`, not `CompactStr`.)
 
 ---
 
-## Contributor Gotchas, Invariants & Debugging Guide
+## 4. `RawSegment`: one SwissTable-style segment
 
-* **Gotcha 1**: `RudisValue` is held to 40 bytes by boxing its four collection-carrying variants (`Hash`,
-  `Set`, `ZSet`, `Stream`). A new unboxed variant with a payload larger than the current 32-byte maximum
-  (`String`/`List`/`Cooled`) silently grows every `RudisEntry`.
-* **Gotcha 2**: `RudisEntry` is 88 bytes as `32B key (Bytes) + 40B val (RudisValue) + 16B expire_at
-  (Option<Instant>)`, alignment 8 — not cache-line-aligned, and wouldn't fit one 64-byte line even if it were.
-* **Gotcha 3**: the comment `"1024 main SIMD slots per segment (~48KB, L1/L2 cache resident)"`
-  (`table.rs:1577`) is stale/inaccurate — a full segment's backing storage is ≈89 KiB at the current 88-byte
-  `RudisEntry` size (§3.1). Don't cite it as fact.
-* **Gotcha 4**: `is_rehashing`/`rehash_step`/`finish_rehash`/`migrate_key_if_in_old`/`prepare_key_lookup` are
-  all unconditional no-op stubs with zero external callers anywhere in the codebase (§5.2). The incremental
-  rehashing feature they implemented was superseded by the extendible-hashing segment design and is
-  effectively dead code today.
-* **Gotcha 5**: `RudisValue::HyperLogLog` is only ever *constructed* by `RESTORE`-ing a legacy DUMP payload
-  (type tag `5`). Every live `PFADD` writes a `RudisValue::String` holding Redis's real sparse/dense HLL byte
-  format (`src/hll.rs`). Don't assume a table has any `HyperLogLog`-variant entries just because it has HLL
-  keys (§7.5).
-* **Gotcha 6**: `hash_field_expires` (HEXPIRE) is entirely independent of `num_expires` — field-level TTLs
-  never affect `num_expires`, and whole-key TTL handling never looks at `hash_field_expires`. They're
-  separate maps with separate fast-path guards (`num_expires > 0` vs. `!hash_field_expires.is_empty()`).
-* **Gotcha 7**: `RudisTable::sample_cursor` is now shared by **three** independent samplers —
-  active key-TTL expiration (§8.2), active hash-field-TTL expiration (§8.3), and `try_evict_one_key` (§8.4) —
-  each reading/advancing it modulo its own, different bound. `spill_cursor` (NVMe tiering, §10) remains the
-  one genuinely independent cursor.
-* **Gotcha 8**: `slot_counts` is only maintained while `crate::cluster::HAS_ACTIVE_CLUSTER` is `true` at the
-  time of each insert/remove. Toggling cluster mode on after keys already exist leaves the counters
-  under-reporting until the table is repopulated (§11).
-* **Gotcha 9**: any code path that mutates `expire_at` directly on a `RudisEntry` without going through
-  `expire()`/`persist()`/the table's own removal paths desynchronizes `num_expires` from reality.
-* **Gotcha 10**: a `RawSegment` physically allocates its 4 stash slots regardless of the segment's current
-  size, but `growth_left` only credits them once the segment reaches full `SEG_CAP` — see §3.1.
+A segment is a small open-addressing hash table. Slots are tiny (3 bytes); the 40-byte entries live in a
+dense side array (the *arena*), so empty slots cost almost nothing.
 
-### How to Verify Changes
-
-```bash
-# 1. Format check
-cargo fmt --check
-
-# 2. Clippy verification with zero warnings
-cargo clippy --all-targets -- -D warnings
-
-# 3. Run unit tests (table.rs has its own #[cfg(test)] mod at the bottom of the file, including
-#    test_rudis_entry_size and test_extendible_hashing_segment_splits)
-cargo test --lib -- --test-threads=1
+```rust
+// src/table.rs (trimmed)
+pub struct RawSegment {
+    pub ctrl: Vec<u8>,          // capacity + 16 control bytes (16 mirrored at the end)
+    slot_idx: Vec<u16>,         // slot -> index into `entries`, or NO_ENTRY (u16::MAX)
+    entries: Vec<RudisEntry>,   // dense arena, may contain holes
+    last_access: Vec<u16>,      // LRU clock or LFU word, parallel to `entries`
+    holes: Vec<u64>,            // bitmap: bit i set => entries[i] is a dead placeholder
+    pub capacity: usize,        // power of two, 16..=1024 main slots
+    pub items: usize,           // live entries (main + stash)
+    pub growth_left: usize,     // inserts into EMPTY slots before split/grow
+    pub local_depth: u8,        // extendible-hashing depth (u8::MAX marks a merge hole)
+    pub stash_ctrl: [u8; 4], pub stash_count: u8,
+    data_est: usize,            // estimated bytes of this segment's entries
+}
 ```
+
+### 4.1 Constants
+
+| Constant | Value | Meaning |
+| :--- | :--- | :--- |
+| `GROUP_SIZE` | 16 | control bytes compared per probe step |
+| `EMPTY` / `DELETED` | `0xFF` / `0xFE` | control byte of a never-used / tombstoned slot; full slots hold a 7-bit fingerprint |
+| `SEG_SHIFT`, `SEG_CAP` | 10, 1024 | max main slots per segment |
+| `STASH_CAP` | 4 | overflow stash slots per segment |
+| `GLOBAL_IDX_SHIFT` | 11 | a *global index* is `seg_id << 11 \| local_slot` |
+| `MERGE_MAX_ITEMS` | 256 (`SEG_CAP / 4`) | buddy segments merge when their combined items fit |
+| `HOLE_DEPTH` | `u8::MAX` | `local_depth` of a placeholder left by a merge |
+| `NO_ENTRY` | `u16::MAX` | `slot_idx` value of an unoccupied slot |
+
+### 4.2 Probing
+
+`find_entry`, `find_entry_mut` and `find_or_prepare_insert_raw` share one loop:
+
+1. `tag = fingerprint(h)` (top 7 bits); `idx = h & mask`; prefetch `slot_idx[idx]` (`prefetch_read`) so the
+   arena-index load overlaps the control-group load.
+2. Compare the 16 control bytes at `idx` against `tag` and `EMPTY` (`probe_group_match_or_empty`; the insert
+   variant also reports `DELETED`). These are plain loops that LLVM lowers to `pcmpeqb` + `pmovmskb` on
+   x86-64; there are no hand-written intrinsics.
+3. For each matching bit, follow `slot_idx` into `entries` and compare keys with `fast_slice_eq`
+   (overlapping 4/8-byte word compares for keys ≤ 32 bytes).
+4. If the group has an `EMPTY` byte, the key is absent — stop. (The insert variant returns the first
+   `DELETED` slot seen, else that `EMPTY` slot, as the insert position.)
+5. Otherwise advance *triangularly*: `step += 16; idx = (idx + step) & mask`.
+6. When `step` reaches 32 (two full groups probed), scan the 4-slot **stash** by fingerprint. On insert, if
+   no free main slot has been seen yet and the stash has room, a stash slot becomes the insert position.
+7. Give up when `step >= capacity` (probing is bounded).
+
+Stash slots are addressed as `capacity + s` in the same index space as main slots, so `insert_at`,
+`mark_slot_free` and `remove` branch on `idx < capacity`.
+
+### 4.3 Insert, delete and the arena
+
+- **Insert** (`insert_at`): reuse the lowest hole in the arena (`take_hole`) or push a new entry (growing
+  the arena by 1/16, at least 16, with `reserve_exact` — `grow_arena`). Write the fingerprint into `ctrl`
+  (or `stash_ctrl`), store the arena index in `slot_idx`, stamp `last_access` with `access_word_new()`.
+  `growth_left` drops only when an `EMPTY` main slot (or a stash slot) is consumed — reusing a `DELETED`
+  slot is free.
+- **Delete** (`remove`/`remove_present` → `mark_slot_free` + `take_entry`): a main slot becomes `DELETED`
+  (a tombstone, so probe chains stay intact); a stash slot becomes `EMPTY` and returns its growth credit. The
+  arena entry is popped if it is last, otherwise replaced with a placeholder and marked in `holes`. Nothing
+  else moves, so no back-pointer from entry to slot is needed.
+- **Last item removed**: the whole segment resets — all control bytes `EMPTY`, stash cleared, arena
+  cleared, `growth_left` restored.
+- **Arena trimming**: `maybe_trim_arena` compacts the arena (walking slots so each moved entry's
+  `slot_idx` is repointed) once fewer than half of at least 32 arena positions are live. The periodic
+  `RudisFlatTable::trim_step` (§5.5) trims more aggressively.
+- `growth_left` starts at `capacity * 7 / 8`, plus `STASH_CAP` only for a full 1024-slot segment. The stash
+  slots exist physically in every segment (`slot_idx` has `capacity + 4` entries) but are only credited at
+  full size.
+
+### 4.4 Memory per key
+
+A full 1024-slot segment has ≈ 3.2 KB of fixed arrays (1,040 ctrl bytes, 1,028 × 2-byte `slot_idx`, a
+17-word hole bitmap) plus 42 bytes per arena position (40-byte entry + 2-byte access word). With segments
+typically 45–60% full (they all split at the same time under uniform hashing), a key costs roughly
+42 B + ~6 B of slots, plus any heap bytes of its key and value. (The source comment beside `SEG_CAP` still
+says "~48KB" per segment; that figure predates the slot/arena split and is not accurate.)
+
+---
+
+## 5. `RudisFlatTable`: extendible hashing over segments
+
+```rust
+// src/table.rs (trimmed)
+pub struct RudisFlatTable {
+    pub segments: Vec<RawSegment>,
+    pub directory: Vec<u32>,       // len == 2^global_depth; entry = segment id
+    pub global_depth: u8,
+    pub capacity: usize, pub items: usize,
+    pub slot_counts: Option<Box<[u32; 16384]>>, // cluster-slot key counts, built lazily
+    layout_epoch: u64,             // bumped whenever segments are renumbered or entries move between them
+    seg_heap_bytes: usize, seg_fixed_bytes: usize, // incremental sums of segment heap bytes
+    trim_cursor: usize, data_est_total: usize, data_cursor: usize,
+}
+```
+
+A new table (`RudisFlatTable::new(64)`, as `RudisTable::new` creates it) is one 64-slot segment and a
+one-entry directory (`global_depth = 0`).
+
+### 5.1 Lookup and insert
+
+`find_entry(key, hash)`: `h = mix_hash(hash)`; `seg_id = directory[(h >> 10) & dir_mask]`; probe that segment;
+return `(seg_id << 11 | local_slot, &entry)`. The caller passes the raw `hash_key` value so it can compute it
+once and reuse it (e.g. the router hashes a key for shard routing and then calls `get_with_hash`).
+
+`find_or_prepare_insert(key, hash)` returns `(existing_global_idx, insert_global_idx)`. If the target
+segment has `growth_left == 0`, it first checks whether the key already exists (an overwrite never forces a
+split), and only for a new key calls `split_or_grow_segment`. Callers then use `insert_prepared` to place
+the entry without a second probe. `insert`, `insert_prepared`, `remove` and `remove_present` keep `items`,
+the per-segment `data_est`, `seg_heap_bytes` and (when built) `slot_counts` in sync.
+
+`find_entry_mut` and `get_slot_mut` stamp the slot's access word (they are "client accesses");
+`get_slot_mut_no_touch` does not.
+
+### 5.2 Growing: `split_or_grow_segment`
+
+Runs while the target segment's `growth_left == 0`, cheapest option first:
+
+1. **Tombstone purge** — fewer than half the slots are live: `rebuild` the segment at the same capacity
+   (re-inserting every live entry, which drops all `DELETED` bytes).
+2. **In-place doubling** — capacity below 1024: `rebuild` at twice the capacity.
+3. **Split** — a full 1024-slot segment at local depth `d`:
+   1. If `d == global_depth`, double the directory (append a copy of itself) and increment `global_depth`.
+   2. Drain the segment, hash every entry once, count how many go each way, and build two 1024-slot segments
+      at depth `d + 1` with exactly sized arenas. Bit `10 + d` of the mixed hash decides: 0 stays in the old
+      segment id, 1 goes to a new segment appended at the end of `segments`.
+   3. Repoint every directory entry that referenced the old segment and has bit `d` set to the new id.
+   4. Loop: if the segment the key maps to is still full, repeat.
+
+Every step touches at most one segment (≤ 1,028 entries) regardless of table size, which is why there is no
+incremental rehash protocol. The methods `is_rehashing`, `rehash_step`, `finish_rehash`,
+`migrate_key_if_in_old` and `RudisTable::prepare_key_lookup` remain as no-op stubs (always `false` / empty)
+and nothing outside `table.rs` calls them.
+
+**Worked example.** A fresh shard receives 1,000 distinct `SET`s:
+
+1. Keys 1–56 fill the 64-slot segment (`64 × 7/8 = 56`); key 57 finds `growth_left == 0` → case 2 doubles to
+   128 slots. The same happens at 128 → 256 → 512 → 1024.
+2. At 1024 slots the segment takes `896 + 4 = 900` keys. Key 901 → case 3 with `d = 0 = global_depth`: the
+   directory becomes `[0, 0]`, then entries with bit 10 = 1 move to new segment 1 and `directory[1] = 1`.
+   Directory: `[0, 1]`, both segments at depth 1, ~450 keys each.
+3. When segment 1 fills later (`d = 1 = global_depth`), the directory doubles to `[0, 1, 0, 1]`, segment 1
+   splits by bit 11 into segments 1 and 2, and `directory[3] = 2`. Segment 0 (depth 1) is still pointed to
+   by entries 0 and 2 — most splits only repoint, they do not double.
+
+### 5.3 Shrinking: `shrink_step`, `defrag`, `clear`
+
+Deletes never shrink a segment by themselves. Three mechanisms give memory back:
+
+- **`shrink_step(max_merges)`** (periodic, §6.7): walks the directory looking for *buddy* pairs — two
+  segments at the same depth `d` whose patterns differ only in bit `d-1` — whose combined `items` ≤
+  `MERGE_MAX_ITEMS` (256). Each pair is merged by `merge_buddies` into one 1024-slot segment at depth `d-1`.
+  The merged segment takes the **higher** of the two ids and the lower id becomes a tiny `HOLE_DEPTH`
+  placeholder, so a positional `SCAN` cursor that already passed the lower id still meets the moved
+  entries. Afterwards `shrink_directory` halves the directory while no segment needs the full depth, and
+  `compact_holes` drops placeholders and renumbers once holes are at least half of `segments`.
+  `RudisTable::shrink_step` additionally calls `defrag` once there are multiple segments but
+  `len * 2 <= 1024`.
+- **`defrag()`**: if `next_pow2(items × 2)` (min 64) fits in one segment and the table has several segments,
+  is oversized, or has tombstones, everything is rebuilt into a single segment and the directory reset to
+  `[0]`. Otherwise every segment containing a `DELETED` byte is rebuilt in place.
+- **`clear()`**: back to one 64-slot segment; drops `slot_counts`.
+
+`layout_epoch` increments whenever entries move between segment ids (`clear`, a collapsing `defrag`, any
+merge, hole compaction). Splits only append segments and in-place rebuilds keep entries in their segment, so
+they do not bump it.
+
+### 5.4 Positional cursors and segment patterns
+
+Background walkers address slots positionally:
+
+- `cursor_bound()` = the single segment's `slot_count()` when there is one segment, else
+  `segments.len() × 1028`.
+- `cursor_to_global_idx(c)` = `c` for one segment, else `(c / 1028) << 11 | (c % 1028)`.
+
+Used by active expiry, eviction sampling, tier spill candidate selection, `RANDOMKEY` and large-table
+`SCAN`.
+
+`segment_pattern(seg)` returns `(local_depth, low depth bits of key_dir_bits)` that every key in `seg`
+shares; a split only refines patterns. The yielding RDB save (`RdbSaveCursor` in `src/shard.rs`) walks
+segment ids in order and records written patterns, so a key that moves to a new segment during the save is
+not written twice; if `layout_epoch` changes mid-save it writes only the keys no recorded pattern covers.
+See `14_persistence_replication.md`.
+
+### 5.5 Incremental bookkeeping and maintenance steps
+
+| Method | What it does |
+| :--- | :--- |
+| `struct_bytes()` | O(1): `seg_heap_bytes` + segment vector + directory + `slot_counts` (if built) |
+| `struct_bytes_exact()` | same, recomputed from every segment (for drift checks) |
+| `free_arena_bytes()` | arena bytes allocated but not holding a live entry |
+| `dataset_estimate()` | Σ per-segment `data_est`: exact on insert/remove, refreshed by `refresh_data_step` |
+| `refresh_data_step(budget)` | recounts segments round-robin (`data_cursor`) until ~`budget` units of work (1 per entry + collection length) so in-place growth (`HSET` on an existing hash, `APPEND`, `LPUSH`) is reflected |
+| `trim_step(budget)` | for up to `budget` segments round-robin (`trim_cursor`): if the arena has ≥ 64 positions and more than 1/8 free, compact it to ~1/16 slack |
+| `slot_count(slot)` | live-or-not-yet-reaped keys in a cluster slot; builds `slot_counts` on first call by scanning every entry |
+
+---
+
+## 6. `RudisTable`: the per-shard engine
+
+```rust
+// src/table.rs
+pub struct RudisTable {
+    table: RudisFlatTable,
+    sample_cursor: usize,   // shared by active expiry, hash-field expiry and eviction sampling
+    spill_cursor: usize,    // tiering spill-candidate cursor (independent)
+    pub data_bytes: usize,  // bytes held by entries (keys, values, ENTRY_OVERHEAD each)
+    pub arena: crate::allocator::SmallCollectionArena,
+    pub num_expires: usize, // entries with a whole-key TTL
+    pub hash_field_expires: hashbrown::HashMap<Bytes, hashbrown::HashMap<Bytes, Instant>>,
+    pub dropped_tier: smallvec::SmallVec<[(TieredPointer, bool); 4]>, // stale NVMe extents to release
+}
+```
+
+`ShardDb` (`src/shard.rs`) holds the selected database's table in `table` and the others in
+`tables: Vec<Option<RudisTable>>` (multi-DB support, `SELECT`).
+
+### 6.1 Key expiry
+
+**Passive (lazy) expiry.** Read and write paths check `num_expires > 0` first — a single integer compare
+with no clock read on shards that have no TTLs — and only then `entry.expire_at()`,
+`connection::access_expired_allowed()` and `Instant::now()`. `check_expired_slot(idx)` packages this; many
+hot paths inline the same pattern. An expired key is removed by `expire_slot`, which:
+
+1. does nothing while clients are paused (`CLIENT PAUSE`), and does nothing on a **read-only replica**
+   (`replication::hide_expired_keys()`): the replica keeps the key until its master's `DEL` arrives, while
+   `check_expired_slot` still reports it as gone so reads hide it;
+2. otherwise removes the entry, queues any tier extent on `dropped_tier`, decrements `num_expires` and
+   `data_bytes`, bumps `expired_keys`, logs a `DEL` to the AOF/replicas (`replication::log_expired_key`,
+   skipped while replaying writes), touches `WATCH`ed keys, sends client-tracking invalidations and an
+   `expired` keyspace event.
+
+`access_expired_allowed()` is true when the `ALLOW_ACCESS_EXPIRED` flag is set or while the thread is
+replaying writes (`REPLAYING_WRITES`, AOF load / replication apply): nothing expires during replay.
+
+**Active expiry** (`active_expire_cycle`, every 100 ms from the shard cron, skipped on replicas, while
+paused, or when `PAUSE_CRON` is set):
+
+1. If `hash_field_expires` is non-empty, run `evict_expired_hash_fields_sample(8)` first (§6.2).
+2. If `num_expires == 0`, stop.
+3. Walk positional cursor slots from `sample_cursor`, examining TTL-carrying entries, until 20 have been
+   checked, 512 positions have been scanned (`max_scan = min(bound, 512)`), or no TTLs remain.
+4. Expired ones go through `check_expired_slot` and bump `expired_keys_active`.
+
+`ShardDb::active_expire_cycle` runs it on the selected DB and on every other DB that has TTLs.
+
+### 6.2 Hash-field TTLs (`HEXPIRE`, `HPEXPIRE`, `HTTL`, `HPERSIST`, `HGETEX`, `HSETEX`)
+
+`hash_field_expires` maps *hash key → (field → deadline)*. It is independent of `num_expires`.
+
+- **Passive**: `purge_expired_hash_fields(key)` runs at the top of hash commands (gated on the map being
+  non-empty), removes expired fields from the inner map, logs them as `HDEL` (`replication::log_expired_fields`)
+  and deletes them via `hdel`. Like keys, nothing is purged while replaying or on a read-only replica.
+- **Reads that must not purge** (`HRANDFIELD`, `HSCAN`) use `expired_fields_view`, and a read-only replica
+  uses `replica_hidden_fields`; both return a `HiddenFields` list the read skips.
+- **Active**: `evict_expired_hash_fields_sample(max_keys)` picks up to `max_keys` hash keys starting at
+  `sample_cursor % hash_field_expires.len()` and purges each. It reads but never advances `sample_cursor`.
+
+### 6.3 Access tracking: 16-bit LRU clock or LFU word
+
+Each arena entry has a parallel 16-bit `last_access` word:
+
+- **LRU mode** (default): `lru_now()` = `CLOCK_MONOTONIC_COARSE` seconds truncated to 16 bits. Idle time is
+  `lru_now().wrapping_sub(word)`, exact up to ~18.2 hours; a key idle longer wraps and looks recent.
+- **LFU mode** (`LFU_ACTIVE`, set when `maxmemory-policy` contains `lfu`): high byte = last decrement time in
+  minutes mod 256, low byte = logarithmic counter, as in Redis. New keys start at `LFU_INIT_VAL` (5).
+  `access_word_touched` decays the counter by one per `LFU_DECAY_TIME` minutes (`lfu-decay-time`, default 1;
+  0 never decays) and increments it with probability `1 / ((counter − 5) × LFU_LOG_FACTOR + 1)`
+  (`lfu-log-factor`, default 10). Minutes wrap at 256 (~4.3 h).
+
+Reads stamp the word unless the client set `CLIENT NO-TOUCH` (`connection::CLIENT_NO_TOUCH`). Migrations
+(split, rebuild, merge, defrag) carry the word along.
+
+### 6.4 Eviction: `try_evict_one_key_with(policy, on_evict)`
+
+Called (through `ShardDb::try_evict_one_key`) by the router's `evict_local_until_under` until the shard is
+under its share of `maxmemory`.
+
+1. Return `None` for an empty table, or for a `volatile-*` policy when `num_expires == 0`.
+2. Walk positional slots from the shared `sample_cursor` (at most `cursor_bound()` positions). For
+   `volatile-*` policies skip keys without a TTL.
+3. Choose by policy:
+   - `*-ttl`: keep the nearest deadline seen;
+   - `*-lru`: keep the largest idle time; `*-lfu`: keep the smallest decayed counter (`255 − counter`);
+   - `*-random`: keep the last sampled key.
+   LRU/LFU/random stop after 10 eligible keys.
+4. Remove the winner, queue tier extents, adjust `num_expires` / `data_bytes`, bump `evicted_keys`, call
+   `on_evict` (the caller logs a `DEL` to AOF/replicas), then `WATCH`/tracking/`evicted` notifications.
+   Returns the accounted bytes freed.
+
+`eviction_size()` (= `struct_bytes() + dataset_estimate()`) is what the router uses to split eviction
+between shards.
+
+### 6.5 Memory accounting
+
+`used_memory() = data_bytes + table.struct_bytes()`, O(1). Every entry is charged
+`key.heap_bytes() + val.mem_bytes() + ENTRY_OVERHEAD` (16). `ENTRY_OVERHEAD` must stay non-zero: with fully
+inline keys and values an eviction would otherwise free 0 accounted bytes and `evict_local_until_under`
+would evict everything.
+
+This is an estimate used to split eviction and pace tiering; the `maxmemory` limit itself is checked
+against allocator counters (`tiering::TieringStats::real_used_total`).
+
+`memory_breakdown()` (for `MEMORY STATS`) returns a `MemoryBreakdown`:
+
+| Field | Meaning |
+| :--- | :--- |
+| `keys` | live key count |
+| `dataset` | incremental `data_bytes` |
+| `dataset_estimate` | per-segment estimate (`dataset_estimate()`) |
+| `dataset_exact` | `dataset` recomputed by walking every entry |
+| `table` / `table_exact` | `struct_bytes()` incremental / recomputed |
+| `free_arena` | `free_arena_bytes()` |
+
+`recalculate_used_memory()` rebuilds `data_bytes` from scratch (used by `active_defrag`).
+
+### 6.6 Small helpers worth knowing
+
+- `insert_entry(entry)` deletes any existing key first, then inserts and charges memory.
+- `take_key_entry(key)` removes an entry and its field-TTL map together (used by `MOVE` via
+  `ShardDb::move_key`).
+- `peek_entry(key)` reads without expiry, access stamping or warming (`DEBUG DIGEST-VALUE`).
+- `find_entry_mut_warm` / `get_slot_mut_warm` / `warm_slot` turn a `Cooled` value back into a plain one before
+  an in-place mutation and queue the stale extent on `dropped_tier`.
+- `is_lazyfree_worthy(key)`: true for collections over 64 elements (or streams with consumer groups);
+  `UNLINK` uses it to decide whether a delete counts as a lazy free.
+- `active_defrag()` runs `defrag`, re-creates every string value with `CompactStr::new`, then recalculates
+  memory. It is triggered by an explicit cross-shard request, not by the cron.
+
+### 6.7 The shard cron
+
+Every 100 ms each shard (`src/server.rs`):
+
+1. sets the read-only-replica flag; if not a replica, runs `ShardDb::active_expire_cycle`;
+2. unless an RDB save is walking the segments (`is_saving`), runs `table.shrink_step(32)` and
+   `table.trim_arena_step(32)` on the **selected** DB's table;
+3. runs `refresh_data_step(50_000)` on every DB (read-only, safe during a save);
+4. publishes the shard's memory state.
+
+### 6.8 SCAN
+
+`RudisTable::scan(cursor, pattern, count, type)` has two modes:
+
+- **≤ 8,192 keys**: compute an odd 32-bit hash (`xxh3(key) as u32 | 1`) per live key, sort, and return keys
+  with hash ≥ cursor; the next cursor is the next larger hash. Stable across resizes because it does not
+  depend on slot positions.
+- **Larger**: a positional cursor over `cursor_bound()`; returns after `count` matches. Splits append
+  segments and merges keep entries at the higher id (§5.3), so keys present for the whole scan are seen.
+
+### 6.9 Cluster slot counts
+
+`count_keys_in_slot` / `get_keys_in_slot` (for `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT`) ask
+`RudisFlatTable::slot_count`, which builds the 64 KiB `slot_counts` array on first use and then maintains it on
+every insert/remove. A zero count returns immediately. A non-zero count is trusted when `num_expires == 0`;
+otherwise the table is scanned (`enumerate_slots`), counting live keys and removing expired ones.
+
+### 6.10 Read fast paths
+
+The `write_*_resp` family serialize a reply directly into the connection's output buffer without an
+intermediate `Bytes`: `write_get_resp`, `write_hget_resp`, `write_lpop_resp[_with_hash]`,
+`write_rpop_resp[_with_hash]`, `write_lrange_resp`, `write_sismember_resp`, `write_zrange_resp`.
+`get_compact_with_hash` returns a `shard::CompactResp`. MGET/MSET batching lives in the router and connection
+layers (see `04_sharding_mesh.md`); the table contributes hash-reusing single-key primitives such as
+`get_with_hash`.
+
+---
+
+## 7. Collection encodings
+
+| Type | Small form | Large form | Switch point | `OBJECT ENCODING` (small / large) |
+| :--- | :--- | :--- | :--- | :--- |
+| String | `Int(i64)` or `String(CompactStr)` | — | content-based | `int` / `raw` |
+| Hash | `SmallHash` | `Hash(Box<PackedHash>)` | > `hash-max-listpack-entries` (512) fields, or a field/value > `hash-max-listpack-value` (64) bytes | `listpack` / `hashtable` |
+| Set | `RudisSet::Small(Vec<SmallSetEntry>)` | `RudisSet::Full(PackedSet)` | > 64 members (`SMALL_SET_LIMIT`) | `intset` / `hashtable` |
+| Sorted set | `RudisZSet::Small(Vec<(OrderedScore, CompactKey)>)` | `RudisZSet::Full(ZIndex)` | > 64 members (`SMALL_ZSET_LIMIT`) | `listpack` / `skiplist` |
+| List | `PackedList` (one form) | — | — | `quicklist` |
+| HyperLogLog | `String` holding a Redis `HYLL` blob | — | sparse ↔ dense inside the blob | `raw` |
+| Stream | `RudisStream` (one form) | — | — | `stream` |
+
+Hash thresholds are the runtime atomics `connection::HASH_MAX_ENTRIES` / `HASH_MAX_VALUE`, settable with
+`CONFIG SET hash-max-listpack-*` (and the `ziplist` aliases). The set and sorted-set limits are constants;
+the `set-max-*`, `zset-max-*` and `list-max-*` directives are not wired to them. Conversion is one-way: a
+large collection never shrinks back to the small form.
+
+### 7.1 `SmallHash` — one exact-size allocation (`src/smallhash.rs`)
+
+`SmallHash { ptr: NonNull<u8> }` (8 bytes) owns one allocation laid out as
+`[count: u32][len: u32][pairs…]`, each pair `[varint flen][field][varint vlen][value]`. A 5-byte field and
+5-byte value cost 12 bytes. Lookups are a linear scan (`find`); `set` overwrites a same-length value in place
+and otherwise splices (`replace_range`, which `realloc`s to the exact new size); `push_new` appends a field
+known to be absent. Iteration is in insertion order. `to_map()` converts to a `PackedHash` on promotion.
+`SmallHash` uses `unsafe` raw allocation; `scripts/miri_smallhash.sh` covers it.
+
+### 7.2 `PageStore` — the shared packed-entry heap (`src/pagestore.rs`)
+
+Large hashes, sets and sorted sets all store their elements in a `PageStore<H>`:
+
+- An entry is `[varint(len << 1 | dead)][payload]`, addressed by a **handle** `H` = (page, offset).
+  `u32` handles are `page << 12 | offset` (2^20 pages); `u64` handles are `page << 32 | offset`.
+- Normal pages hold up to `PAGE_BYTES` (4096, an exact allocator size class). A payload longer than
+  `OWN_PAGE_MIN` (1024) gets its own page. Page 0 is stored inline in the store (`Pages::first`) so a
+  one-page collection needs no page-table load.
+- Only the *current* page takes appends. It starts at `FIRST_PAGE_CAP` (64) bytes and grows by a quarter at
+  a time up to 4096, so small collections stay small.
+- `release(h)` sets the dead bit. A fully dead page is freed to `free_pages` for reuse. Once at least half a
+  page is dead, `release` returns that page and the owner compacts it: `moves(page)` lists
+  `(old, new, payload)` for every live entry that will move (read-only, so the owner can still look entries
+  up to find what points at them), then `compact(page)` slides entries down and `shrink_to_fit`s the buffer.
+- `insert` returns `None` when the next page would not fit the handle type; owners then **widen** once from
+  `u32` to `u64` handles (`Repr::Narrow` → `Repr::Wide`), so there is no size limit.
+
+### 7.3 `PackedHash` — large hashes (`src/packedhash.rs`)
+
+`PackedHash(Repr)` where each repr is `Inner { dict: hashbrown::HashTable<H>, store: PageStore<H>, len }`.
+A bucket is just a handle; each field/value pair is one page entry `[varint flen][field][value]`.
+
+- `get`: hash the field (`fxhash`), probe `dict`, compare the field through the page.
+- `insert` on an existing field: same-length value → overwrite in place; otherwise append the new pair,
+  repoint the bucket, release the old entry.
+- Page compaction re-hashes each moved field to find and repoint its bucket.
+- Iteration is in hash-table order.
+
+### 7.4 Sets: `SmallSetEntry` vector and `PackedSet` (`src/packedset.rs`)
+
+- **Small**: `Vec<SmallSetEntry { hash: u64, member: CompactKey }>`. The cached `fxhash` lets
+  `contains`/`insert`/`remove` reject most non-matches without touching member bytes. Removal uses
+  `swap_remove` (O(1), reorders). `pop` takes the last element.
+- **Full**: `PackedSet`, Dragonfly-`DenseSet`-style: `dict: HashTable<H>` whose buckets hold the member's page
+  location directly, plus a `PageStore`. A 5-byte member costs a 6-byte page entry plus a 4-byte bucket.
+  `pop` (for `SPOP`) resumes scanning buckets at `pop_cursor` instead of bucket 0, so draining a set scans the
+  table about once.
+
+### 7.5 Sorted sets: small vector and `ZIndex` (`src/zindex.rs`)
+
+- **Small**: a `Vec<(OrderedScore, CompactKey)>` kept sorted by (score, member). `OrderedScore(f64)` orders with
+  `f64::total_cmp`. Insert removes any old entry, then binary-searches the position (`Vec::insert` shifts the
+  tail).
+- **Full**: `ZIndex`, each member stored once:
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `store` | `PageStore<H>` | entries `[score: f64 LE][member bytes]` |
+| `dict` | `hashbrown::HashTable<H>` | member → handle |
+| `runs` | `VecDeque<VecDeque<H>>` | handles in (score, member) order, split into sorted runs of ≤ `CHUNK_MAX` (127) |
+| `len` | `usize` | member count |
+
+Operations:
+
+1. `get`/`contains_key`: one hash lookup, then read the score from the page.
+2. `insert`/`remove`: hash lookup, then `lower_bound` — binary search over run tails, then within one run —
+   and a shift of at most 127 handles. A run that exceeds 127 splits in half; a run under 31 (`CHUNK_MAX / 4`)
+   merges with its successor if they fit. Runs are allocated at 128 handles (512 bytes as `u32`).
+3. A score change rewrites the 8 score bytes in place and re-links the handle.
+4. `rank`: lower bound plus the sum of preceding run lengths — O(len / 127).
+5. `pop_first`/`pop_last` (`ZPOPMIN`/`ZPOPMAX`) take from the ends of the deques without shifting.
+6. `iter_from_score(min)` seeks with `lower_bound` (used for `ZRANGEBYSCORE`).
+7. Page compaction locates each moved entry's run slot (binary search) and bucket (re-hash) *before* moving
+   anything, then repoints both.
+
+### 7.6 Lists: `PackedList` (`src/packedlist.rs`)
+
+`PackedList { chunks: VecDeque<Chunk>, len }`, `Chunk` is 32 bytes:
+
+- `Chunk::Packed(Packed)` — a byte deque `buf: Vec<u8>` with a 4-byte header `[count: u16][head: u16]` in the
+  buffer itself; live entries are `buf[head..]`, each `[varint len][bytes][reversed varint len]` so the chunk can
+  be walked from either end. At most `CHUNK_MAX` (4092) live bytes, so a full chunk is exactly 4096 bytes.
+- `Chunk::Big(Bytes)` — one element longer than `PACK_MAX` (63) bytes, sharing the `Bytes` it arrived in.
+
+Behaviour:
+
+1. **Push back**: append to the last packed chunk if it fits. A new chunk is allocated full-size only when the
+   previous chunk is a full packed chunk; otherwise (first chunk, or after a `Big` chunk) it starts small and
+   grows by a quarter (at least 4 entries, at least `MIN_STEP` = 32 bytes). If most of a chunk has been popped
+   from the front, the dead front is reclaimed instead of growing.
+2. **Push front**: write into the gap before `head`; when the gap runs out, re-lay the chunk with a fresh gap of
+   about a quarter of its live size.
+3. **Pop**: advance `head` (front) or truncate (back); an emptied chunk is dropped.
+4. **Index access** (`locate`): walk chunk counts from the nearer end, then scan within the chunk.
+5. **Middle insert/remove**: a `memmove` within one chunk.
+
+**Example.** `RPUSH q a b c` → one packed chunk holding three 3-byte entries (`[1]a[1]`, …) after its 4-byte
+header. `RPUSH q <100-byte blob>` appends a `Big` chunk. A following `RPUSH q d` starts a new small packed
+chunk rather than a 4 KB one.
+
+### 7.7 HyperLogLog (`src/hll.rs`)
+
+Live HyperLogLogs are `RudisValue::String` values holding Redis's own `HYLL` byte format, so `GET`/`SET`/`DUMP`
+interoperate with Redis:
+
+- 16-byte header: `"HYLL"`, encoding byte (`HLL_DENSE` = 0, `HLL_SPARSE` = 1), 3 unused bytes, an 8-byte
+  little-endian cached cardinality whose bit 63 set means "stale".
+- **Dense**: 16,384 six-bit registers (`HLL_DENSE_SIZE` = 12,304 bytes total).
+- **Sparse**: run-length opcodes `ZERO` (1 byte, ≤ 64 zero registers), `XZERO` (2 bytes, ≤ 16,384), `VAL`
+  (1 byte, value 1–32, run ≤ 4).
+
+Algorithm of `PFADD key e1 e2`:
+
+1. New key: start from `hll_create_sparse_empty()` (header + one `XZERO` covering all registers: 18 bytes).
+2. `hll_add` decodes all 16,384 registers, and for each element computes `hll_pat_len` (MurmurHash64A with
+   seed `0xadc83b19`; low 14 bits pick the register, the run of zero bits after them + 1 is the candidate).
+3. If any register increased, re-encode with `hll_create_from_regs`: sparse when every register ≤ 32 and the
+   payload stays within `HLL_SPARSE_MAX_BYTES` (3000), else dense; the cardinality cache is marked stale.
+
+`PFCOUNT` (`hll_count`) returns the cached cardinality if valid, otherwise computes it with Redis's estimator
+(`hll_compute_card`, Ertl's improved estimator via `hll_sigma`/`hll_tau`) and writes it back into the header.
+`PFMERGE` takes register-wise maxima. `PFDEBUG GETREG/ENCODING/TODENSE` are supported.
+
+`RudisValue::HyperLogLog(Box<[u8; 16384]>)` (one byte per register) is a legacy representation. It is built
+only by `RudisTable::deserialize_val_payload` (type tag 5 of the internal value payload used by tier records
+and legacy Rudis-format payloads). Commands still accept it.
+
+### 7.8 Streams
+
+`RudisStream` is a single representation:
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `entries` | `BTreeMap<StreamId, Vec<(Bytes, Bytes)>>` | entries ordered by `StreamId { ms, seq }` |
+| `last_id`, `max_deleted_entry_id` | `StreamId` | for ID generation and `XINFO` |
+| `entries_added` | `u64` | lifetime count (survives trimming) |
+| `groups` | `HashMap<Bytes, StreamGroup>` | consumer groups: `last_delivered_id`, `entries_read`, `consumers`, `pel: BTreeMap<StreamId, StreamPelEntry>`, `next_nack_seq` |
+| `idmp_duration`, `idmp_maxsize`, `idmp_producers`, `iids_added`, `iids_duplicates` | — | idempotent-producer de-duplication for `XADD` (Rudis extension; defaults `STREAM_IDMP_DURATION` = 100 ms, `STREAM_IDMP_MAXSIZE` = 100) |
+| `nodes` | `VecDeque<Vec<StreamId>>` | IDs chunked by `STREAM_NODE_MAX_ENTRIES` (100), only so `XINFO STREAM` can report radix-tree-like `radix-tree-keys`/`radix-tree-nodes` numbers |
+
+`StreamPelEntry` carries `consumer`, `delivery_time_ms`, `delivery_count` and `nack_seq`. See the streams
+sections of the command docs for semantics.
+
+---
+
+## 8. Other pieces
+
+### 8.1 `SmallCollectionArena` (`src/allocator.rs`)
+
+A per-table pool of empty containers reused on delete/overwrite (`RudisTable::recycle_value`):
+
+| Pool | Recycled from | Limit |
+| :--- | :--- | :--- |
+| `list_pool` | `List` (`PackedList` after `clear()`, keeping its chunk queue allocation) | `MAX_ARENA_POOLED` (1024) |
+| `set_pool` | `RudisSet::Small` vectors with capacity ≤ 512 | 1024 |
+| `zset_pool` | `RudisZSet::Small` vectors with capacity ≤ 512 | 1024 |
+
+Small hashes are not pooled (`acquire_small_hash` returns `SmallHash::new()`; `recycle_small_hash` drops) —
+a `SmallHash` is one exact allocation that every insert reallocates anyway. Large collections are dropped.
+
+### 8.2 `DEBUG DIGEST` (`src/digest.rs`)
+
+Computes a SHA1-based digest of the *logical* dataset, modelled on Redis's `computeDatasetDigest`, so a master
+and replica, or a server before and after a reload, agree:
+
+1. Per shard (`shard_digest`), for every DB and every live key: `kd = mix(db index if > 0, key name)`, then
+   `object_digest` mixes a type tag (Redis `OBJ_*` numbers; 100–105 for JSON, Bloom, Cuckoo, CMS, Top-K,
+   vector sets) and the value, then XORs in `!!expire!!` if the key has a TTL (presence only — deadlines
+   differ between master and replica). The shard XORs all `kd`s.
+2. Encoding independence: strings digest their bytes (an `Int` as its decimal text, a legacy HLL as its
+   registers); lists and stream entries are mixed in order; set members, hash fields and `(member, score)`
+   pairs are XORed so small and large encodings agree; scores use `%.17g` (`format_score`). Hash fields with
+   a TTL add `!!hexpire!!`.
+3. Expired-but-unreclaimed keys and fields are skipped. Tiered values are read back without promotion; an
+   unreadable one digests as `TYPE_UNREADABLE` plus its pointer so the failure shows as a mismatch.
+4. Shards return `"<40 hex>:<count>"` (`encode_shard_part`); `combine_shards` XORs them and returns 40 zeros
+   for an empty dataset. `DEBUG DIGEST-VALUE` (`key_value_digest`) digests one key without its name.
+
+The digest is not bit-compatible with Redis's; it only has to agree between Rudis servers.
+
+### 8.3 NVMe tiering hooks
+
+- `get_hot_keys_for_spill(limit)`: walks positional slots from `spill_cursor` (at most
+  `max(limit × 64, 4096)` positions per call) collecting keys whose value is not already tiered and whose
+  `approx_bytes()` ≥ `MIN_SPILL_VALUE_BYTES` (64). Despite the name it does not consult access recency.
+- `get_value_for_spill(key)`: serializes a value (`serialize_val_payload`) with its type tag
+  (0 string/int, 1 list, 2 set, 3 zset, 4 hash, 5 legacy HLL, 6 stream).
+- `restore_tiered_value`: `Tiered` → `Cooled`; `decommit_cooled_key` / `decommit_all_cooled`: `Cooled` →
+  `Tiered`, freeing the in-memory copy.
+- Removing, expiring or evicting a tiered/cooled key, or warming a cooled one before mutation, pushes its
+  extent onto `dropped_tier`; `ShardDb::drain_dropped_tier` releases them. See `07_nvme_tiering.md`.
+
+---
+
+## 9. Numbers at a glance
+
+| Quantity | Value |
+| :--- | :--- |
+| `size_of::<RudisEntry>()` | 40 B (compile-time assert) |
+| `size_of::<CompactKey>()` / `RudisValue` / `CompactStr` | 24 / 16 / 16 B |
+| Inline key capacity | 23 B without TTL, 18 B with TTL |
+| Inline string capacity | 15 B any; 16–17 ASCII; 18–20 in a 6-bit alphabet; 21–24 in a 5-bit alphabet |
+| `SHARE_MIN` | 256 B |
+| Segment | 16–1024 main slots + 4 stash; split at 7/8 load |
+| Per-slot / per-arena-entry | 3 B / 42 B |
+| Initial / cleared table | one 64-slot segment |
+| Active expiry | every 100 ms; ≤ 20 TTL keys checked, ≤ 512 positions scanned; ≤ 8 hash keys for field TTLs |
+| Eviction sample | 10 eligible keys (LRU/LFU/random) |
+| Cron maintenance | `shrink_step(32)`, `trim_arena_step(32)`, `refresh_data_step(50_000)` |
+| `HASH_MAX_ENTRIES` / `HASH_MAX_VALUE` | 512 / 64 (runtime-configurable) |
+| `SMALL_SET_LIMIT` / `SMALL_ZSET_LIMIT` | 64 / 64 (constants) |
+| `PAGE_BYTES` / `OWN_PAGE_MIN` | 4096 / 1024 |
+| `ZIndex` run length | ≤ 127 handles |
+| `PACK_MAX` / list chunk | 63 B / 4096 B including header |
+| HLL | 16,384 registers; dense 12,304 B; sparse ≤ 3,000 B payload |
+
+---
+
+## 10. Invariants & gotchas
+
+- **Key lookups need the mixed hash.** `RudisFlatTable` methods take the raw `hash_key(key)` and apply
+  `mix_hash` themselves; never pass an already-mixed hash.
+- **Stash invariant**: an entry lives in the stash only if, when inserted, its first two probe groups had no
+  free slot. Deletes turn main slots into `DELETED` (not `EMPTY`), so lookups still reach the stash.
+- **Tombstones count against growth**: `DELETED` slots are not credited back to `growth_left`; heavy
+  delete/insert churn triggers same-size rebuilds (case 1 of §5.2).
+- **Global indexes are short-lived.** A `seg_id << 11 | slot` index is invalidated by any insert that may
+  split or rebuild a segment, and by `shrink_step`, `defrag` and `clear`. (Arena trimming is safe: it moves
+  entries but repoints `slot_idx`, so slot positions stay valid.) Re-find instead of caching.
+- **`num_expires` must match reality.** Any code that sets or clears a TTL must adjust it (via
+  `set_expire_at`/`take_expire_at` plus a counter update, as `expire`/`persist` do). Several fast paths skip
+  the TTL check entirely when it is 0.
+- **`data_bytes` is not maintained by every write path** (e.g. some `HSET` fast paths and slot-scan
+  expirations in `count_keys_in_slot`). `dataset_estimate` (exact on insert/remove, refreshed by the cron) is
+  what eviction relies on; `MEMORY STATS` shows the drift between `dataset`, `dataset_estimate` and
+  `dataset_exact`.
+- **`sample_cursor` is shared** by active expiry and eviction (both advance it modulo `cursor_bound()`) and
+  read by hash-field sampling (modulo `hash_field_expires.len()`). `spill_cursor` is independent.
+- **Expiry is suppressed** during `CLIENT PAUSE`, during write replay, and on read-only replicas — the key
+  stays in the table (and in `num_expires`) while reads treat it as gone.
+- **`volatile-ttl` / `allkeys-ttl` scan far**: the TTL branch of eviction sampling never increments the
+  "checked" counter, so each eviction walks up to `cursor_bound()` positions.
+- **`*-random` eviction is positional**: it takes the 10th eligible slot after the shared cursor, not a random
+  key.
+- **The 16-bit LRU clock wraps** after ~18.2 h of idleness; very old keys can look fresh.
+- **HLL re-encodes from scratch**: every modifying `PFADD` decodes 16,384 registers and re-encodes. Because
+  `hll_create_from_regs` prefers sparse whenever it fits, an HLL converted with `PFDEBUG TODENSE` can return
+  to sparse on the next modifying `PFADD` (Redis never goes dense → sparse).
+- **Legacy dense HLL reads**: `GET` on a `RudisValue::HyperLogLog` returns the 16,384 raw register bytes, not
+  a `HYLL` blob.
+- **Packed strings are not contiguous**: use `view()` / `extend_into()`; `as_contiguous()` returns `None` for
+  packed variants. Bit operations (`SETBIT`) re-encode, so a flipped bit can move a value between inline,
+  packed and heap forms.
+- **Collections never demote**: a hash that grew past 512 fields stays a `PackedHash` after deletes, likewise
+  sets and sorted sets.
+
+---
+
+## 11. Limitations / not implemented
+
+- `OBJECT ENCODING` is approximate: a small set reports `intset` even for non-integer members; a list is
+  always `quicklist`; string values report `int` or `raw` (never `embstr`).
+  `RudisValue::encoding_str` (another reporting path) reports `hashtable` / `skiplist` for sets and sorted sets
+  regardless of size.
+- Set, sorted-set and list encoding thresholds are not configurable (`set-max-*`, `zset-max-*`,
+  `list-max-*` are accepted names but have no effect).
+- `ZCOUNT` on a large sorted set (`RudisZSet::count`) iterates every member instead of seeking; lexicographic
+  ranges also iterate.
+- Periodic `shrink_step` / `trim_arena_step` only run on the currently selected DB's table; other DBs only
+  shrink via `active_defrag`, `FLUSHDB`, or their own deletes resetting empty segments.
+- `approx_bytes()` for sets, sorted sets and streams is a flat per-element constant, independent of member size.
+- `is_rehashing` / `rehash_step` / `finish_rehash` / `migrate_key_if_in_old` / `prepare_key_lookup` are dead
+  stubs from an earlier design.
+- The stream `nodes` field is bookkeeping for `XINFO` output only; lookups use the `BTreeMap`.
+
+---
+
+## 12. Code map
+
+| File | Key symbols | What they do |
+| :--- | :--- | :--- |
+| `src/table.rs` | `RudisEntry`, `Expiry`, `expiry_base` | 40-byte entry; packed 8-byte deadline |
+| `src/table.rs` | `RudisValue`, `CooledValue`, `TieredPointer`, `mem_bytes`, `approx_bytes`, `encoding_str` | value enum and its size/encoding helpers |
+| `src/table.rs` | `hash_key`, `mix_hash`, `fingerprint`, `key_dir_bits`, `dir_bits_mask`, `probe_group_match_or_empty`, `fast_slice_eq` | hashing and probe primitives |
+| `src/table.rs` | `RawSegment` (`find_entry`, `find_or_prepare_insert_raw`, `insert_at`, `remove`, `rebuild`, `trim_arena`, `take_hole`) | one segment: slots, stash, arena |
+| `src/table.rs` | `RudisFlatTable` (`find_or_prepare_insert`, `split_or_grow_segment`, `shrink_step`, `merge_buddies`, `defrag`, `trim_step`, `refresh_data_step`, `cursor_bound`, `segment_pattern`, `slot_count`) | extendible-hashing directory and maintenance |
+| `src/table.rs` | `lru_now`, `access_word_new`, `access_word_touched`, `lfu_decayed_counter`, `LFU_ACTIVE` | LRU clock / LFU counter |
+| `src/table.rs` | `RudisTable` (`expire_slot`, `check_expired_slot`, `active_expire_cycle`, `evict_expired_hash_fields_sample`, `purge_expired_hash_fields`, `try_evict_one_key_with`, `used_memory`, `memory_breakdown`, `scan`, `count_keys_in_slot`, `get_hot_keys_for_spill`, `write_get_resp`) | per-shard engine API |
+| `src/table.rs` | `RudisSet`, `SmallSetEntry`, `RudisZSet`, `OrderedScore`, `RudisStream`, `MemoryBreakdown` | collection wrappers and stats |
+| `src/compact.rs` | `CompactKey`, `pack_ttl_ms`, `CompactStr`, `StrView`, `pack7_heap`, `heap_pack_pays`, `SHARE_MIN` | inline/packed keys and strings |
+| `src/smallhash.rs` | `SmallHash` | listpack-like small hash in one allocation |
+| `src/pagestore.rs` | `PageStore`, `Handle`, `PAGE_BYTES`, `OWN_PAGE_MIN` | packed entry pages with dead bits and compaction |
+| `src/packedhash.rs` | `PackedHash` | large hash: handle table + pages |
+| `src/packedset.rs` | `PackedSet` | large set: handle table + pages, resumable `pop` |
+| `src/zindex.rs` | `ZIndex`, `CHUNK_MAX` | large sorted set: dict + sorted runs of handles |
+| `src/packedlist.rs` | `PackedList`, `Chunk`, `Packed`, `PACK_MAX`, `CHUNK_MAX` | chunked list of packed entries |
+| `src/hll.rs` | `hll_add`, `hll_count`, `hll_merge`, `hll_create_from_regs`, `hll_compute_card` | Redis-format HyperLogLog |
+| `src/digest.rs` | `shard_digest`, `object_digest`, `key_value_digest`, `combine_shards` | `DEBUG DIGEST` |
+| `src/allocator.rs` | `SmallCollectionArena`, `MAX_ARENA_POOLED` | container recycling pool |
+| `src/shard.rs` | `ShardDb::table`, `tables`, `active_expire_cycle`, `eviction_size`, `RdbSaveCursor` | per-DB tables, cron entry points, segment-walking save |
+| `src/server.rs` | shard cron loop | 100 ms expiry / shrink / trim / refresh |
+
+### Verifying changes
+
+Unit tests live in `#[cfg(test)]` modules at the bottom of each file (e.g. the model tests in
+`packedhash.rs`, `RawSegment::check_invariants` / `RudisFlatTable::check_invariants` used by table tests).
+`scripts/miri_compact.sh` and `scripts/miri_smallhash.sh` run the unsafe-code tests under Miri. The usual
+gate is `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --lib`.
