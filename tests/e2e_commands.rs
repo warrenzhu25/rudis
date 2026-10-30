@@ -13124,3 +13124,111 @@ fn test_watch_and_expired_keys_e2e() {
     assert_eq!(r(&["FLUSHALL"]), "+OK\r\n");
     assert_eq!(r(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]), "+OK\r\n");
 }
+
+/// What MULTI / EXEC check, as Redis does: a command queued while a
+/// script runs past its time limit (-BUSY) or over maxmemory (-OOM) aborts
+/// the EXEC; an EXEC is refused whole, with the reason, while a script is
+/// busy, over maxmemory, or with too few good replicas for its writes; and
+/// a REPLICAOF inside an EXEC doesn't stop the writes after it.
+#[test]
+fn test_multi_exec_checks_server_state_e2e() {
+    let port = 29985u16;
+    let ps = port.to_string();
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _server = Kill(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "2", "--no-pin", "--save", ""],
+        port,
+    ));
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let mut c = connect();
+    let mut admin = connect();
+    assert_eq!(resp_cmd_all(&mut c, &["SET", "xx", "1"]), "+OK\r\n");
+
+    // Too few good replicas for the EXEC's writes.
+    assert_eq!(resp_cmd_all(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["INCR", "xx"]), "+QUEUED\r\n");
+    resp_cmd_all(&mut admin, &["CONFIG", "SET", "min-replicas-to-write", "2"]);
+    let e = resp_cmd_all(&mut c, &["EXEC"]);
+    assert!(
+        e.starts_with("-EXECABORT") && e.contains("NOREPLICAS"),
+        "{e}"
+    );
+    resp_cmd_all(&mut admin, &["CONFIG", "SET", "min-replicas-to-write", "0"]);
+    assert_eq!(resp_cmd_all(&mut c, &["GET", "xx"]), "$1\r\n1\r\n");
+
+    // Over maxmemory: when queued, and at EXEC.
+    assert_eq!(resp_cmd_all(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["SET", "a", "1"]), "+QUEUED\r\n");
+    resp_cmd_all(&mut admin, &["CONFIG", "SET", "maxmemory", "1"]);
+    assert!(resp_cmd_all(&mut c, &["LPUSH", "l", "v"]).starts_with("-OOM"));
+    resp_cmd_all(&mut admin, &["CONFIG", "SET", "maxmemory", "0"]);
+    let e = resp_cmd_all(&mut c, &["EXEC"]);
+    assert!(e.starts_with("-EXECABORT"), "{e}");
+    assert_eq!(resp_cmd_all(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["SET", "a", "1"]), "+QUEUED\r\n");
+    resp_cmd_all(&mut admin, &["CONFIG", "SET", "maxmemory", "1"]);
+    let e = resp_cmd_all(&mut c, &["EXEC"]);
+    resp_cmd_all(&mut admin, &["CONFIG", "SET", "maxmemory", "0"]);
+    assert!(e.starts_with("-EXECABORT") && e.contains("OOM"), "{e}");
+    assert_eq!(resp_cmd_all(&mut c, &["EXISTS", "a", "l"]), ":0\r\n");
+
+    // A script busy past its time limit.
+    resp_cmd_all(&mut admin, &["CONFIG", "SET", "lua-time-limit", "10"]);
+    // The script on another shard thread than `c`'s (a client id carries
+    // its shard in the top bits): clients of the script's own thread wait
+    // for it rather than get -BUSY.
+    let shard_of = |s: &mut TcpStream| -> u64 {
+        resp_cmd_all(s, &["CLIENT", "ID"])
+            .trim_start_matches(':')
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+            >> 48
+    };
+    let c_shard = shard_of(&mut c);
+    let mut busy = loop {
+        let mut b = connect();
+        if shard_of(&mut b) != c_shard {
+            break b;
+        }
+    };
+    assert_eq!(resp_cmd_all(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["INCR", "xx"]), "+QUEUED\r\n");
+    busy.write_all(b"*3\r\n$4\r\nEVAL\r\n$17\r\nwhile true do end\r\n$1\r\n0\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    assert!(resp_cmd_all(&mut c, &["INCR", "xx"]).starts_with("-BUSY"));
+    let e = resp_cmd_all(&mut c, &["EXEC"]);
+    assert!(e.starts_with("-EXECABORT") && e.contains("BUSY"), "{e}");
+    // From this client: it answered, so the script doesn't hold its
+    // thread (`admin` may share the script's).
+    assert_eq!(resp_cmd_all(&mut c, &["SCRIPT", "KILL"]), "+OK\r\n");
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(resp_cmd_all(&mut c, &["GET", "xx"]), "$1\r\n1\r\n");
+
+    // A REPLICAOF inside the EXEC: the writes after it still run.
+    assert_eq!(resp_cmd_all(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["SET", "f1", "1"]), "+QUEUED\r\n");
+    assert_eq!(
+        resp_cmd_all(&mut c, &["REPLICAOF", "127.0.0.1", "1"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(resp_cmd_all(&mut c, &["SET", "f2", "1"]), "+QUEUED\r\n");
+    assert_eq!(
+        resp_cmd_all(&mut c, &["EXEC"]),
+        "*3\r\n+OK\r\n+OK\r\n+OK\r\n"
+    );
+    assert!(resp_cmd_all(&mut c, &["SET", "f3", "1"]).starts_with("-READONLY"));
+    assert_eq!(resp_cmd_all(&mut c, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    assert_eq!(resp_cmd_all(&mut c, &["EXISTS", "f1", "f2"]), ":2\r\n");
+}

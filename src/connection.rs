@@ -2157,6 +2157,34 @@ async fn touch_live_watched_keys_on_swapdb(router: &Router, db1: usize, db2: usi
     }
 }
 
+/// Whether `cmd`, a write that may grow memory, is refused for being over
+/// `maxmemory` (evicting first under an eviction policy), as `execute_command`
+/// checks it. For MULTI, which checks when queueing, as Redis does.
+async fn oom_refuses(router: &Router, cmd: &Command, client_id: u64, out: &mut Vec<u8>) -> bool {
+    let max_mem = router
+        .tier_stats
+        .max_memory
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if max_mem == 0
+        || maxmemory_ignored_as_replica(router.base_port)
+        || !cmd.is_write_command()
+        || cmd.allows_oom()
+    {
+        return false;
+    }
+    let policy = get_max_memory_policy();
+    if policy != "noeviction" {
+        !router
+            .evict_until_under_maxmemory(max_mem as usize, &policy, client_id, out)
+            .await
+    } else {
+        router.over_maxmemory_checked().await && {
+            router.check_auto_tier().await;
+            router.over_maxmemory()
+        }
+    }
+}
+
 /// WATCH: like Redis, a key already past its TTL counts as not existing:
 /// it is expired first (so deleting or emptying it later changes nothing
 /// the client watched), then watched.
@@ -5427,6 +5455,70 @@ async fn execute_tx_step(
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 *in_multi = false;
+                // EXEC itself is refused while a script runs past its time
+                // limit: like Redis, the transaction is discarded with the
+                // reason.
+                if let Some(busy) = crate::scripting::busy_script_reply(router.port) {
+                    record_failed_stat("EXEC");
+                    record_error_stat("EXECABORT", None);
+                    tx_queue.clear();
+                    *tx_has_error = false;
+                    unwatch_keys(router.port, client_id);
+                    out_buf.extend_from_slice(b"-EXECABORT Transaction discarded because of: ");
+                    out_buf.extend_from_slice(&busy[1..]);
+                    return false;
+                }
+                // So is a transaction with writes the server no longer takes
+                // (as Redis checks an EXEC like its writes): a replica now, or
+                // too few good replicas. Checked here, so none of it runs.
+                let tx_writes = tx_queue
+                    .iter()
+                    .any(|c| c.is_write_command() || crate::aof::command_to_resp(c).is_some());
+                let refused: Option<&[u8]> = if let Some(down) =
+                    tx_queue.iter().find_map(|c| masterdown_refuses(router, c))
+                {
+                    Some(down)
+                } else if !tx_writes {
+                    None
+                } else if crate::replication::HAS_SLAVE_INSTANCE
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+                    && crate::replication::cached_hub(router.base_port).is_slave()
+                {
+                    Some(b"READONLY You can't write against a read only replica.\r\n")
+                } else if MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0
+                    && not_enough_good_replicas(router.base_port)
+                {
+                    Some(b"NOREPLICAS Not enough good replicas to write.\r\n")
+                } else {
+                    None
+                };
+                // And one with a write that uses memory, over maxmemory.
+                let refused = match refused {
+                    Some(r) => Some(r),
+                    None => {
+                        let mut oom = false;
+                        for c in tx_queue.iter() {
+                            if oom_refuses(router, c, client_id, out_buf).await {
+                                oom = true;
+                                break;
+                            }
+                        }
+                        oom.then_some(
+                            &b"OOM command not allowed when used memory > 'maxmemory'.\r\n"[..],
+                        )
+                    }
+                };
+                if let Some(reason) = refused {
+                    record_failed_stat("EXEC");
+                    record_error_stat("EXECABORT", None);
+                    tx_queue.clear();
+                    *tx_has_error = false;
+                    unwatch_keys(router.port, client_id);
+                    out_buf.extend_from_slice(b"-EXECABORT Transaction discarded because of: ");
+                    out_buf.extend_from_slice(reason);
+                    return false;
+                }
                 if *tx_has_error {
                     if let Some(ref addr_s) = monitor_addr {
                         broadcast_monitor(router.port, addr_s, &[Bytes::from_static(b"exec")]);
@@ -5584,6 +5676,26 @@ async fn execute_tx_step(
                 ) {
                     *tx_has_error = true;
                     out_buf.extend_from_slice(&err);
+                    return false;
+                }
+                // And a script running past its time limit: the command
+                // gets -BUSY now and the EXEC aborts.
+                if !allowed_while_busy(c)
+                    && let Some(busy) = crate::scripting::busy_script_reply(router.port)
+                {
+                    *tx_has_error = true;
+                    out_buf.extend_from_slice(busy);
+                    return false;
+                }
+                // And memory: a write refused for OOM now aborts the EXEC.
+                if oom_refuses(router, c, client_id, out_buf).await {
+                    *tx_has_error = true;
+                    let c_name = get_cmd_name(c);
+                    record_rejected_stat(c_name);
+                    record_error_stat("OOM", Some(c_name));
+                    out_buf.extend_from_slice(
+                        b"-OOM command not allowed when used memory > 'maxmemory'.\r\n",
+                    );
                     return false;
                 }
                 if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -11787,10 +11899,13 @@ async fn execute_command_inner(
         return false;
     }
 
+    // Not for a command of a running EXEC: like Redis, those passed the
+    // check when queued, and run even after a REPLICAOF in the same EXEC.
     if crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
         && REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
         && crate::replication::cached_hub(router.base_port).is_slave()
         && (cmd.is_write_command() || crate::aof::command_to_resp(&cmd).is_some())
+        && !in_tx(client_id)
     {
         out.extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");
         return false;
@@ -31778,6 +31893,48 @@ mod tests {
             (&["GETDEL", "a"], &[]),
             (&["MSETNX", "m1", "1"], &["set"]),
         ]);
+    }
+
+    /// MULTI and EXEC refuse writes over maxmemory as a command would be
+    /// (`oom_refuses`): only writes that may use memory, and only with a
+    /// limit set.
+    #[monoio::test]
+    async fn test_oom_refuses_memory_using_writes_over_the_limit() {
+        let dir = std::env::temp_dir().join(format!("rudis-oom-refuses-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
+        let router = Router::new(
+            0,
+            1,
+            6391,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::shard::ShardDb::new(6391))),
+            senders_mesh[0].clone(),
+            None,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::pubsub::PubSubHub::new())),
+            dir,
+        );
+        let set = Command::Set {
+            key: Bytes::from_static(b"k"),
+            value: Bytes::from_static(b"v"),
+            expire_in: None,
+            condition: crate::resp::SetCondition::None,
+            get: false,
+            keepttl: false,
+            past_expired: false,
+        };
+        let get = Command::Get(Bytes::from_static(b"k"));
+        let mut out = Vec::new();
+        assert!(!oom_refuses(&router, &set, 1, &mut out).await, "no limit");
+        router
+            .tier_stats
+            .max_memory
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(oom_refuses(&router, &set, 1, &mut out).await);
+        assert!(!oom_refuses(&router, &get, 1, &mut out).await, "a read");
+        router
+            .tier_stats
+            .max_memory
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[monoio::test]
