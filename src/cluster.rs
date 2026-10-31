@@ -35,6 +35,10 @@ pub struct ClusterNodeInfo {
     /// `fail`, so a failing node keeps its role (and its slots stay known).
     pub flags: String,
     pub fail: FailState,
+    /// How many shards (and so consecutive client ports from `port`) the
+    /// node runs, as it announces; 0 until known. MOVED and CLUSTER SLOTS
+    /// point at the shard's own port, saving clients a second redirect.
+    pub shards: u16,
     pub master_id: String,
     pub ping_sent: u64,
     pub pong_recv: u64,
@@ -44,6 +48,16 @@ pub struct ClusterNodeInfo {
 }
 
 impl ClusterNodeInfo {
+    /// The client port serving `slot` on this node: its shard's own port
+    /// when it announced several shards.
+    pub fn port_for_slot(&self, slot: u16) -> u16 {
+        if self.shards > 1 {
+            self.port + crate::router::slot_to_shard(slot, self.shards as usize) as u16
+        } else {
+            self.port
+        }
+    }
+
     pub fn is_master(&self) -> bool {
         self.flags != "slave"
     }
@@ -624,6 +638,7 @@ impl ClusterHub {
                         cport,
                         flags: parse_flags(&clean_flags).0,
                         fail: parse_flags(&clean_flags).1,
+                        shards: 0,
                         master_id,
                         ping_sent,
                         pong_recv,
@@ -734,13 +749,30 @@ impl ClusterHub {
     /// The `PING` this node sends on the cluster bus.
     fn ping_frame(&self, gossip: &str) -> String {
         format!(
-            "PING {} {} {} {} GOSSIP {}\r\n",
+            "PING {} {} {} {} {} GOSSIP {}\r\n",
             self.my_id(),
             self.config_epoch.load(Ordering::Relaxed),
             self.role.read(),
             slots_repr(&self.my_slots.read()),
+            self.announce_tokens(),
             gossip
         )
+    }
+
+    /// What PINGs and PONGs announce besides role and slots: `shards=N`
+    /// (client ports from ours, one per shard) and, for a replica,
+    /// `of=<master id>`. Older peers ignore tokens they don't know.
+    fn announce_tokens(&self) -> String {
+        let shards = if self.cluster_enabled.load(Ordering::Relaxed) {
+            self.num_shards.load(Ordering::Relaxed).max(1)
+        } else {
+            1
+        };
+        let mut t = format!("shards={shards}");
+        if *self.role.read() == "slave" {
+            t.push_str(&format!(" of={}", self.master_id.read()));
+        }
+        t
     }
 
     /// Applies a `+PONG <id> <epoch> <role> <slots>` reply from `node_id`.
@@ -772,6 +804,7 @@ impl ClusterHub {
                 && let Some(role) = parts.get(3)
             {
                 node.flags = parse_flags(role).0;
+                apply_announce(node, &parts);
             }
         }
         self.claim_slots(key, epoch, slots);
@@ -987,6 +1020,7 @@ impl ClusterHub {
                         cport,
                         flags: "master".to_string(),
                         fail: FailState::Ok,
+                        shards: 0,
                         master_id: "-".to_string(),
                         ping_sent: now,
                         pong_recv: now,
@@ -1050,6 +1084,7 @@ impl ClusterHub {
                                     cport,
                                     flags: parse_flags(&remote_role).0,
                                     fail: FailState::Ok,
+                                    shards: 0,
                                     master_id: "-".to_string(),
                                     ping_sent: now,
                                     pong_recv: now,
@@ -1225,25 +1260,33 @@ impl ClusterHub {
             end: u16,
             master_ip: String,
             master_port: u16,
+            master_shards: u16,
             master_id: String,
-            replicas: Vec<(String, u16, String)>,
+            /// (ip, port, id, shards)
+            replicas: Vec<(String, u16, String, u16)>,
         }
 
         let mut entries = Vec::new();
 
         // 1. Myself if master
         if my_role == "master" {
-            let my_replicas: Vec<(String, u16, String)> = nodes
+            let my_replicas: Vec<(String, u16, String, u16)> = nodes
                 .values()
                 .filter(|n| n.master_id == my_id)
-                .map(|n| (n.ip.clone(), n.port, n.id.clone()))
+                .map(|n| (n.ip.clone(), n.port, n.id.clone(), n.shards))
                 .collect();
+            let my_shards = if self.cluster_enabled.load(Ordering::Relaxed) {
+                self.num_shards.load(Ordering::Relaxed).max(1) as u16
+            } else {
+                1
+            };
             for &(s, e) in &my_slots {
                 entries.push(MasterSlotEntry {
                     start: s,
                     end: e,
                     master_ip: "127.0.0.1".to_string(),
                     master_port: self.port,
+                    master_shards: my_shards,
                     master_id: my_id.clone(),
                     replicas: my_replicas.clone(),
                 });
@@ -1253,10 +1296,10 @@ impl ClusterHub {
         // 2. Peer masters
         for peer in nodes.values() {
             if peer.is_master() {
-                let peer_replicas: Vec<(String, u16, String)> = nodes
+                let peer_replicas: Vec<(String, u16, String, u16)> = nodes
                     .values()
                     .filter(|n| n.master_id == peer.id)
-                    .map(|n| (n.ip.clone(), n.port, n.id.clone()))
+                    .map(|n| (n.ip.clone(), n.port, n.id.clone(), n.shards))
                     .collect();
                 for &(s, e) in &peer.slots {
                     entries.push(MasterSlotEntry {
@@ -1264,6 +1307,7 @@ impl ClusterHub {
                         end: e,
                         master_ip: peer.ip.clone(),
                         master_port: peer.port,
+                        master_shards: peer.shards,
                         master_id: peer.id.clone(),
                         replicas: peer_replicas.clone(),
                     });
@@ -1271,6 +1315,52 @@ impl ClusterHub {
             }
         }
 
+        // A node with several shards serves each part of its slots on that
+        // shard's own port: one entry per part, so clients reach the right
+        // port without a second MOVED.
+        let shard_port = |port: u16, shards: u16, slot: u16| {
+            if shards > 1 {
+                port + crate::router::slot_to_shard(slot, shards as usize) as u16
+            } else {
+                port
+            }
+        };
+        let mut split = Vec::with_capacity(entries.len());
+        for e in entries {
+            let mut start = e.start;
+            while start <= e.end {
+                let mut end = e.end;
+                if e.master_shards > 1 {
+                    let shard = crate::router::slot_to_shard(start, e.master_shards as usize);
+                    let shard_end = ((shard + 1) * 16384).div_ceil(e.master_shards as usize) - 1;
+                    end = end.min(shard_end as u16);
+                    // div_ceil may overshoot the shard's last slot by one.
+                    while crate::router::slot_to_shard(end, e.master_shards as usize) != shard {
+                        end -= 1;
+                    }
+                }
+                split.push(MasterSlotEntry {
+                    start,
+                    end,
+                    master_ip: e.master_ip.clone(),
+                    master_port: shard_port(e.master_port, e.master_shards, start),
+                    master_shards: 1,
+                    master_id: e.master_id.clone(),
+                    replicas: e
+                        .replicas
+                        .iter()
+                        .map(|(ip, p, id, sh)| {
+                            (ip.clone(), shard_port(*p, *sh, start), id.clone(), 1)
+                        })
+                        .collect(),
+                });
+                if end == u16::MAX {
+                    break;
+                }
+                start = end + 1;
+            }
+        }
+        let mut entries = split;
         entries.sort_by_key(|e| e.start);
 
         out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
@@ -1291,7 +1381,7 @@ impl ClusterHub {
                 .as_bytes(),
             );
             // Replicas tuples
-            for (rip, rport, rid) in entry.replicas {
+            for (rip, rport, rid, _) in entry.replicas {
                 out.extend_from_slice(
                     format!(
                         "*3\r\n${}\r\n{}\r\n:{}\r\n${}\r\n{}\r\n",
@@ -2361,12 +2451,27 @@ fn pong_reply(hub: &ClusterHub) -> String {
         slots_repr.pop();
     }
     format!(
-        "+PONG {} {} {} {}\r\n",
+        "+PONG {} {} {} {} {}\r\n",
         hub.my_id(),
         my_epoch,
         role,
-        slots_repr
+        slots_repr,
+        hub.announce_tokens()
     )
+}
+
+/// Records what a peer's PING or PONG announced (see `announce_tokens`).
+fn apply_announce(node: &mut ClusterNodeInfo, parts: &[&str]) {
+    for p in parts {
+        if let Some(n) = p.strip_prefix("shards=").and_then(|n| n.parse().ok()) {
+            node.shards = n;
+        } else if let Some(m) = p.strip_prefix("of=") {
+            node.master_id = m.to_string();
+        }
+    }
+    if node.is_master() {
+        node.master_id = "-".to_string();
+    }
 }
 
 fn handle_cluster_bus_conn(stream: TcpStream, hub: &Arc<ClusterHub>) {
@@ -2440,6 +2545,7 @@ pub fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                         cport: peer_cport,
                         flags: "master".to_string(),
                         fail: FailState::Ok,
+                        shards: 0,
                         master_id: "-".to_string(),
                         ping_sent: now,
                         pong_recv: now,
@@ -2472,13 +2578,18 @@ pub fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                     if parts.len() >= 4 {
                         node.flags = parse_flags(parts[3]).0;
                     }
+                    let own = parts
+                        .iter()
+                        .position(|p| *p == "GOSSIP")
+                        .map_or(&parts[..], |g| &parts[..g]);
+                    apply_announce(node, own);
                 }
             }
             if parts.len() >= 4 {
                 // No slot list (the next field is GOSSIP or nothing): none.
                 let slots = parts
                     .get(4)
-                    .filter(|f| **f != "GOSSIP")
+                    .filter(|f| **f != "GOSSIP" && !f.contains('='))
                     .map_or_else(Vec::new, |r| parse_slot_ranges(r));
                 hub.claim_slots(&peer_id, parts[2].parse::<u64>().ok(), slots);
             }
@@ -2528,6 +2639,7 @@ pub fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                                         cport: gcport,
                                         flags: grole,
                                         fail: gfail,
+                                        shards: 0,
                                         master_id: "-".to_string(),
                                         ping_sent: now,
                                         pong_recv: now,
@@ -2865,6 +2977,7 @@ mod tests {
             cport: port + 10000,
             flags: "master".to_string(),
             fail: FailState::Ok,
+            shards: 0,
             master_id: "-".to_string(),
             ping_sent: 0,
             pong_recv: 0,
@@ -2924,6 +3037,7 @@ mod tests {
                     cport: port,
                     flags: "master".to_string(),
                     fail: FailState::Ok,
+                    shards: 0,
                     master_id: "-".to_string(),
                     ping_sent: 0,
                     pong_recv: 0,
@@ -3016,6 +3130,7 @@ mod tests {
                 cport,
                 flags: "master".to_string(),
                 fail,
+                shards: 0,
                 master_id: "-".to_string(),
                 ping_sent: 0,
                 pong_recv: 0,
@@ -3130,6 +3245,49 @@ mod tests {
     }
 
     #[test]
+    fn test_peer_shards_give_single_hop_redirects() {
+        // A peer announcing 2 shards serves slots 0-8191 on its port and
+        // 8192-16383 on the next: CLUSTER SLOTS and MOVED say so.
+        let hub = ClusterHub::new(7970);
+        hub.my_slots.write().clear();
+        let peer = "p".repeat(40);
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7971 {peer} 0"), &hub);
+        handle_cluster_bus_line(
+            &format!("PING {peer} 0 master 0-16383 shards=2 GOSSIP "),
+            &hub,
+        );
+        let node = hub.nodes.read()[&peer].clone();
+        assert_eq!(node.shards, 2);
+        assert_eq!(node.port_for_slot(100), 7971);
+        assert_eq!(node.port_for_slot(9000), 7972);
+        let mut out = Vec::new();
+        hub.cluster_slots(&mut out, 1);
+        let slots = String::from_utf8_lossy(&out);
+        assert!(
+            slots.contains(":0\r\n:8191\r\n*3\r\n$9\r\n127.0.0.1\r\n:7971\r\n"),
+            "{slots}"
+        );
+        assert!(
+            slots.contains(":8192\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:7972\r\n"),
+            "{slots}"
+        );
+        // A replica announces its master, so it is listed under it.
+        let rep = "q".repeat(40);
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7981 {rep} 0"), &hub);
+        handle_cluster_bus_line(
+            &format!("PING {rep} 0 slave shards=2 of={peer} GOSSIP "),
+            &hub,
+        );
+        assert_eq!(hub.nodes.read()[&rep].master_id, peer);
+        let mut out = Vec::new();
+        hub.cluster_slots(&mut out, 1);
+        assert!(
+            String::from_utf8_lossy(&out).contains(":7982\r\n"),
+            "replica's shard-1 port listed"
+        );
+    }
+
+    #[test]
     fn test_gossiped_node_takes_its_slots_from_its_pongs() {
         // A node first heard of through gossip must accept its own PONGs,
         // even at epoch 0 (a fresh node), or its slots stay unknown here.
@@ -3156,6 +3314,7 @@ mod tests {
             cport: port + 10000,
             flags: flags.to_string(),
             fail: FailState::Ok,
+            shards: 0,
             master_id: "-".to_string(),
             ping_sent: 0,
             pong_recv: 0,
@@ -3251,6 +3410,7 @@ mod tests {
                     cport: 17001,
                     flags: "master".to_string(),
                     fail: FailState::Ok,
+                    shards: 0,
                     master_id: "-".to_string(),
                     ping_sent: now,
                     pong_recv: now.saturating_sub(6000), // silent for 6s (>5s PFAIL threshold)
@@ -3268,6 +3428,7 @@ mod tests {
                     cport: 17002,
                     flags: "master".to_string(),
                     fail: FailState::Ok,
+                    shards: 0,
                     master_id: "-".to_string(),
                     ping_sent: now,
                     pong_recv: now,
@@ -3422,6 +3583,7 @@ mod tests {
                 cport: 17201,
                 flags: "master".to_string(),
                 fail: FailState::Ok,
+                shards: 0,
                 master_id: "-".to_string(),
                 ping_sent: 0,
                 pong_recv: 0,
@@ -3688,6 +3850,7 @@ mod tests {
                 cport: 17601,
                 flags: "master".to_string(),
                 fail: FailState::Ok,
+                shards: 0,
                 master_id: "-".to_string(),
                 ping_sent: 0,
                 pong_recv: 0,

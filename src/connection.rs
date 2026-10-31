@@ -11867,7 +11867,8 @@ async fn execute_command_inner(
                             })
                         {
                             out.extend_from_slice(
-                                format!("-MOVED {} {}:{}\r\n", slot, peer.ip, peer.port).as_bytes(),
+                                format!("-MOVED {} {}:{}\r\n", slot, peer.ip, peer.port_for_slot(slot))
+                                    .as_bytes(),
                             );
                             return false;
                         }

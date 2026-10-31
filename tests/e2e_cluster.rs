@@ -3670,3 +3670,73 @@ fn test_slot_migration_reuses_one_connection_e2e() {
     assert!(opened <= 4, "{opened} connections for {n} keys");
     assert_eq!(resp_cmd(&mut c2, &["DBSIZE"]), format!(":{n}\r\n"));
 }
+
+/// Two cluster-mode nodes of 2 shards each: a node redirects a key served
+/// by its peer straight to the peer's shard port (one MOVED, not two), and
+/// CLUSTER SLOTS lists each shard's own port.
+#[test]
+fn test_cluster_moved_points_at_the_peers_shard_port_e2e() {
+    let (a, b) = (18309u16, 18315u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_hop_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "2",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (da, db) = (mk_dir(a), mk_dir(b));
+    let _na = spawn(a, &da);
+    let _nb = spawn(b, &db);
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    assert_eq!(
+        cmd(b, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let k = (0..1000)
+        .map(|i| format!("hop{i}"))
+        .find(|k| rudis::router::key_slot(k.as_bytes()) >= 8192)
+        .unwrap();
+    let slot = rudis::router::key_slot(k.as_bytes());
+    let want = format!("-MOVED {} 127.0.0.1:{}\r\n", slot, a + 1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = cmd(b, &["GET", &k]);
+        if got == want {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "got {got:?}, want {want:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let slots = cmd(b, &["CLUSTER", "SLOTS"]);
+    assert!(
+        slots.contains(&format!(
+            ":8192\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:{}\r\n",
+            a + 1
+        )),
+        "{slots}"
+    );
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}
