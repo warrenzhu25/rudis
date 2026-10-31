@@ -794,7 +794,7 @@ more than one shard is classified once:
 | a cross-shard MSET | the whole batch holds a lock-free write mark while it runs; if that is refused (an MGET reads under locks), not squashed |
 | only MGETs, some cross-shard | squashed as usual after noting the epoch (not squashed if a cross-shard write is running); checked at the end (§9.4) |
 
-### 9.2 Phase 1 — walk the pipeline
+### 9.2 Phase 1: walk the pipeline
 
 The reply array gets one slot per command. The loop also decides once whether **write fast
 paths** are allowed: only when there is no AOF, no connected replica, and no keyspace
@@ -828,7 +828,7 @@ notifications, because fast paths skip all three. Then, for each command:
 Commands for the same shard need no barrier between them: messages from one shard to another are
 delivered in order, so they run in pipeline order anyway.
 
-### 9.3 Phase 2/3 — dispatch and harvest
+### 9.3 Phase 2 and 3: dispatch and harvest
 
 1. For each shard with a non-empty batch: prepare that shard's batch responder with the reply
    array, swap in a recycled list for the next batch, send the batch, and remember the shard in a
@@ -853,7 +853,7 @@ messages and streams them once. Those bytes are flushed before any message other
 message (single-key GET/SET, batches, MGET/MSET and their scatter variants), so a flush, a
 full-sync cut or a cross-shard step always comes after them.
 
-### 9.4 Phase 4/5 — assemble
+### 9.4 Phase 4 and 5: assemble
 
 1. Read the values of local GETs that hit tiered (on-disk) keys.
 2. Log remote slow commands with this client's address. Slots after the pipeline's own are parts
@@ -1122,7 +1122,7 @@ over one connection.
 
 ---
 
-## 15. Invariants & gotchas
+## 15. Invariants and gotchas
 
 * **Reply order is pipeline order.** Squashing preserves it through in-order delivery per shard
   plus the flush of pending batches before any command that is not batched. New code that runs a
@@ -1172,7 +1172,7 @@ over one connection.
 
 ---
 
-## 16. Limitations / not implemented
+## 16. Limitations and not implemented
 
 * **At most 64 shards for pipelines.** The pipeline path tracks pending shards in a 64-bit mask, so
   shard numbers of 64 or more would alias. The default shard count is the number of cores, up to

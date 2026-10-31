@@ -382,7 +382,7 @@ full-resync snapshot and never sees later quota changes.
 
 ---
 
-## 7. Invariants & gotchas
+## 7. Invariants and gotchas
 
 1. **One store per key family, no collisions with normal keys.** A string key `foo` and an agent session `foo` coexist; `DEL foo` removes only the string.
 2. **`active_tokens` must equal the sum of non-compacted turn tokens.** `add` adds, `compact` subtracts and adds the summary; the RDB path restores the stored value rather than recomputing it.
@@ -402,7 +402,7 @@ full-resync snapshot and never sees later quota changes.
 
 ---
 
-## 8. Limitations / not implemented
+## 8. Limitations and not implemented
 
 * There are no per-session limits: turn count, content size and the HNSW index grow until `AGENT.MEM.CLEAR` deletes the whole session. There is no selective eviction, no TTL, and no way to delete a single turn or
   embedding.

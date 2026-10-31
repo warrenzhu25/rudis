@@ -478,7 +478,7 @@ None of this interacts with xdp.rs or zerocopy.rs.
 
 ---
 
-## 9. Invariants & gotchas
+## 9. Invariants and gotchas
 
 1. **`XDP.INJECT` executes real commands.** A payload that parses and is classified Pass or
    Redirect changes the real keyspace, is written to the AOF and is propagated to replicas. It runs
@@ -527,7 +527,7 @@ None of this interacts with xdp.rs or zerocopy.rs.
 
 ---
 
-## 10. Limitations / not implemented
+## 10. Limitations and not implemented
 
 * No real AF_XDP: no eBPF program, no AF_XDP socket, no UMEM registration with the kernel and no
   NIC queue binding. The interface name (`eth0`) and the mode are labels only, and the driver mode

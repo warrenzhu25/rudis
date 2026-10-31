@@ -223,35 +223,25 @@ Setting a user clones the existing user (or creates a new one), applies every ru
 stores the result, so a bad rule leaves the user untouched (or uncreated). All errors have the form `Error
 in ACL SETUSER modifier '<rule>': <reason>`. Usernames containing a space or NUL are rejected.
 
-| Rule (keywords are case-insensitive) | Effect |
-| :--- | :--- |
-| `on`, `off` | Enable or disable. |
-| `nopass` | Set `nopass`, clear hashes. |
-| `resetpass` | Clear `nopass`, clear hashes. |
-| `>pw` | Clear `nopass`, add the hash of `pw` (deduplicated). |
-| `<pw` | Remove the hash of `pw`. |
-| `#hex` | Clear `nopass`, add a validated hash. |
-| `!hex` | Remove a validated hash. |
-| `allkeys`, `~*` | All keys; clear patterns. |
-| `resetkeys` | No keys; clear patterns. |
-| `~pat` | Add a pattern with read and write. |
-| `%R~pat`, `%W~pat`, `%RW~pat` | Add a pattern with those permissions; repeating a pattern ORs permissions in. Adding any pattern while `allkeys` is set is an error. |
-| `allchannels`, `&*` | All channels; clear patterns. |
-| `resetchannels` | No channels; clear patterns. |
-| `&pat` | Add a channel glob (an error while all channels are allowed). |
-| `allcommands`, `+@all` | Full permission set; reset the rule history. |
-| `nocommands`, `-@all` | Empty permission set; reset the rule history. |
-| `+@cat`, `-@cat` | Set or clear every command whose categories include it (unknown category is an error). |
-| `+cmd`, `-cmd` | Set or clear that command; a container rule cascades to all its subcommands (`+config` grants `config\|get`, `config\|set`, ...). |
-| `+container\|sub`, `-container\|sub` | A precise subcommand rule (it is its own table entry). |
-| `+cmd\|arg` | A **first-argument rule**, only for plain commands without subcommands (for example `+select\|0`, `+debug\|object`). |
-| `sanitize-payload`, `skip-sanitize-payload` | Set the payload-sanitizing flag. |
-| `clearselectors` | Accepted, a no-op (selectors do not exist). |
-| `reset` | Back to a new user (keeps the name). |
-| `(...)` | Error: `Selectors are not supported`. |
-| `+cont\|sub\|arg` | Error: `Allowing first-arg of a subcommand is not supported`. |
-| Unknown `+x`, `-x`, `-nopass` and so on | Error: `Unknown command or category name in ACL`. |
-| Anything else | Error: `Syntax error`. |
+ACL configurations are composed of individual rule tokens that govern credentials,
+commands, keys, and pub/sub channels:
+
+* **Account status and credentials:** Accounts can be enabled (`on`) or disabled (`off`). Credentials
+  can be marked passwordless (`nopass`, allowing unauthenticated access), configured with plaintext
+  passwords (`>password`, stored as SHA-256 hashes), or assigned precomputed hex hashes (`#hex`).
+  Hashes can be revoked with `<password` or `!hex`, and cleared entirely with `resetpass`.
+* **Command categories and rules:** Users can be granted all commands (`+@all` or `allcommands`) or
+  restricted to none (`-@all` or `nocommands`). Access can be granted or revoked by category
+  (`+@read`, `-@dangerous`), by command name (`+get`, `-set`), by subcommand (`+config|get`), or by
+  first argument (`+select|0`).
+* **Key patterns and access types:** Key permissions encompass all keys (`~*` or `allkeys`), no keys
+  (`resetkeys`), or specific glob patterns. Patterns can specify read-only (`%R~pattern`), write-only
+  (`%W~pattern`), or read-write access (`~pattern` or `%RW~pattern`).
+* **Pub/sub channels:** Channel access allows all channels (`&*` or `allchannels`), no channels
+  (`resetchannels`), or specific channel patterns (`&pattern`).
+
+A comprehensive table of all rule tokens, syntax modifiers, and error strings is indexed in
+[Reference details](#133-acl-rule-syntax-tokens).
 
 Any removal (`-cmd`, `-@cat`) clears the `allcommands` flag, as in Redis: from then on commands that are
 not in the table are denied.
@@ -604,7 +594,7 @@ and sorted-set pool lengths. The table recycles a value's storage when a key is 
 
 ---
 
-## 10. Invariants & gotchas
+## 10. Invariants and gotchas
 
 1. **ACL lookup uses the shard port; protected mode and the TLS runtime use the base port.** In cluster mode these
    differ; it works because every shard port is aliased to the base table. A new code path that looks up an ACL
@@ -627,7 +617,7 @@ and sorted-set pool lengths. The table recycles a value's storage when a key is 
 
 ---
 
-## 11. Limitations / not implemented
+## 11. Limitations and not implemented
 
 * **ACL selectors** (`(...)` rules, Redis 7) are rejected, and `clearselectors` is a no-op.
 * **First-argument rules** work only for plain commands, and `ACL GETUSER` has no `selectors` field.
@@ -771,3 +761,36 @@ the per-base-port registry `TLS_RUNTIMES`. Shards receive `TlsWorkerConfig { tls
 | `ACL GENPASS` | 1–4096 bits, default 256 | Random password length. |
 | `MAX_ARENA_POOLED` | 1024 | Pool size per collection kind. |
 | `MEMORY DOCTOR` thresholds | 100 MB and 1.4× used; 20% over `maxmemory`; 2% plus 1 MB drift; 64 MB and 10% untracked | Warning conditions. |
+
+
+### 13.3 ACL Rule Syntax Tokens
+
+| Rule (keywords are case-insensitive) | Effect |
+| :--- | :--- |
+| `on`, `off` | Enable or disable. |
+| `nopass` | Set `nopass`, clear hashes. |
+| `resetpass` | Clear `nopass`, clear hashes. |
+| `>pw` | Clear `nopass`, add the hash of `pw` (deduplicated). |
+| `<pw` | Remove the hash of `pw`. |
+| `#hex` | Clear `nopass`, add a validated hash. |
+| `!hex` | Remove a validated hash. |
+| `allkeys`, `~*` | All keys; clear patterns. |
+| `resetkeys` | No keys; clear patterns. |
+| `~pat` | Add a pattern with read and write. |
+| `%R~pat`, `%W~pat`, `%RW~pat` | Add a pattern with those permissions; repeating a pattern ORs permissions in. Adding any pattern while `allkeys` is set is an error. |
+| `allchannels`, `&*` | All channels; clear patterns. |
+| `resetchannels` | No channels; clear patterns. |
+| `&pat` | Add a channel glob (an error while all channels are allowed). |
+| `allcommands`, `+@all` | Full permission set; reset the rule history. |
+| `nocommands`, `-@all` | Empty permission set; reset the rule history. |
+| `+@cat`, `-@cat` | Set or clear every command whose categories include it (unknown category is an error). |
+| `+cmd`, `-cmd` | Set or clear that command; a container rule cascades to all its subcommands (`+config` grants `config\|get`, `config\|set`, ...). |
+| `+container\|sub`, `-container\|sub` | A precise subcommand rule (it is its own table entry). |
+| `+cmd\|arg` | A **first-argument rule**, only for plain commands without subcommands (for example `+select\|0`, `+debug\|object`). |
+| `sanitize-payload`, `skip-sanitize-payload` | Set the payload-sanitizing flag. |
+| `clearselectors` | Accepted, a no-op (selectors do not exist). |
+| `reset` | Back to a new user (keeps the name). |
+| `(...)` | Error: `Selectors are not supported`. |
+| `+cont\|sub\|arg` | Error: `Allowing first-arg of a subcommand is not supported`. |
+| Unknown `+x`, `-x`, `-nopass` and so on | Error: `Unknown command or category name in ACL`. |
+| Anything else | Error: `Syntax error`. |

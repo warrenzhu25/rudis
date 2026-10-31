@@ -166,7 +166,7 @@ process-wide flag is set at startup with `cluster-enabled yes` and whenever `CLU
 node.
 
 Nearly every operation, including the pipeline path, asks the router. A few places still use the
-free-standing helpers; [§9](#9-limitations--not-implemented) lists them and explains when that
+free-standing helpers; [§9](#9-limitations-and-not-implemented) lists them and explains when that
 matters.
 
 ### 3.4 Worked example
@@ -619,7 +619,7 @@ Commands without a dedicated router method — some hash, list and SORT helpers,
 fallback for vector-set, OBJECT, XINFO and similar commands — run on the owner through "execute
 remote" ([§7.6](#76-running-any-command-on-another-shard)).
 
-### 7.2 Single-command MGET — scatter-gather
+### 7.2 Single-command MGET: scatter-gather
 
 An MGET outside a transaction runs in atomic mode
 ([§7.4](#74-cross-shard-atomicity-a-seqlock-with-a-locked-fallback)). Inside `EXEC` it runs the
@@ -1020,7 +1020,7 @@ element, then retry the move in the same locked way.
 
 ---
 
-## 8. Invariants & gotchas
+## 8. Invariants and gotchas
 
 * **One writer per slot, read only after "done".** Every slot of a shared reply object is written
   by exactly one shard and read only after the requester sees completion. Two shards writing the
@@ -1065,7 +1065,7 @@ element, then retry the move in the same locked way.
 
 ---
 
-## 9. Limitations / not implemented
+## 9. Limitations and not implemented
 
 * **Some code still routes with the default layout.** The per-command routing helpers in the
   connection code use the free-standing functions. The pipeline path corrects their answer when

@@ -303,44 +303,44 @@ Every variant, including `ProbRestore`, is routed to the key's shard: by CRC16 s
 the normal slot `MOVED`/`ASK` checks apply. For ACL purposes each family is one command name (`bf`, `cf`, `cms`, `topk`, categorised `@write @slow`). The read-only variants
 (`*EXISTS`, `*INFO`, `CMS.QUERY`, `TOPK.QUERY`, `TOPK.LIST`) are marked by `is_family_read`. The families are not listed in `COMMAND INFO`.
 
-### 9.3 Behaviour reference
+### 9.3 Command operations
 
-| Command | Missing key | Reply and behaviour |
-| :--- | :--- | :--- |
-| `BF.RESERVE key error_rate capacity` | | `-ERR item exists` if the Bloom key exists; otherwise `try_new`, then `+OK` or `-ERR Bloom filter too large: ...` |
-| `BF.ADD key item` | auto-creates `new(1000, 0.01)` | `:1` if newly added, `:0` if probably present |
-| `BF.MADD key item...` | auto-creates | An array of `:1`/`:0` |
-| `BF.EXISTS key item` | `:0` | `:1`/`:0` |
-| `BF.MEXISTS key item...` | all `:0` | An array of `:1`/`:0` |
-| `BF.INFO key` | `-ERR not found` | `Capacity`, `Size` (words × 8 bytes), `Number of filters` (always 1), `Number of items inserted` (the count) |
-| `CF.RESERVE key capacity` | | `-ERR item exists`, or `try_new` then `+OK` / `-ERR Cuckoo filter too large: ...` |
-| `CF.ADD key item` | auto-creates `new(1000)` | `:1`; on a full filter `-ERR ERR Cuckoo filter is full` (see gotchas) |
-| `CF.ADDNX key item` | auto-creates | `:0` if the item is contained, otherwise like `CF.ADD` |
-| `CF.EXISTS key item` | `:0` | `:1`/`:0` |
-| `CF.DEL key item` | `:0` (no auto-create) | `:1` if a fingerprint was removed, else `:0` |
-| `CF.INFO key` | `-ERR not found` | `Size` (buckets × 8), `Number of buckets`, `Number of items inserted` |
-| `CMS.INITBYDIM key width depth` | | **Overwrites** any existing sketch; `try_new`, then `+OK` / `-ERR CMS: width x depth too large: ...` |
-| `CMS.INITBYPROB key error probability` | | **Overwrites**; `from_prob`; always `+OK` |
-| `CMS.INCRBY key item inc [item inc ...]` | auto-creates `new(2000, 5)` | An array of new estimates (one per pair) |
-| `CMS.QUERY key item...` | zeros | An array of estimates |
-| `CMS.INFO key` | `-ERR not found` | `width`, `depth`, `count` (the total) |
-| `TOPK.RESERVE key topk` | | **Overwrites silently** with a new tracker; `+OK` |
-| `TOPK.ADD key item...` | auto-creates `TopK::new(50)` | An array: the evicted item as a bulk string, or `$-1`; the increment is always 1 |
-| `TOPK.QUERY key item...` | all `:0` | An array of `:1`/`:0` (tracked or not) |
-| `TOPK.LIST key` | `*0` | Item names only, in list order (no counts) |
-| `TOPK.INFO key` | `-ERR not found` | `k`, `width` (the number of currently tracked items) |
-| `BF/CF/CMS/TOPK.RESTORE key payload` | | Restores, then `+OK`, or `-ERR <decode error>`; replaces the structure |
+Commands across the probabilistic families share consistent operational patterns:
 
-**Worked example.** `CMS.INCRBY clicks a 3 b 1 a 2` on a missing key creates a 2000×5 sketch, increments `a` by 3, `b` by 1 and `a` by 2 in order, and replies `*3 :3 :1 :5`
-(assuming no collisions). One `CMS.INCRBY` line is written to the AOF and replicas.
+* **Bloom filters (`BF.*`):** Filters can be pre-allocated with a target capacity and error probability
+  (`BF.RESERVE`). If items are added to an uninitialized key (`BF.ADD` or `BF.MADD`), a filter is
+  automatically created with default sizing (capacity 1,000, error rate 1%). Existence queries (`BF.EXISTS`,
+  `BF.MEXISTS`) return boolean flags, and `BF.INFO` reports capacity, memory footprint, and item counts.
+* **Cuckoo filters (`CF.*`):** Filters can be explicitly sized (`CF.RESERVE`) or auto-created on first insert
+  (`CF.ADD`, `CF.ADDNX`). Because Cuckoo filters store fingerprints, they support item deletion (`CF.DEL`),
+  returning whether a matching fingerprint was found and purged. When a filter exhausts its eviction kicks,
+  further additions fail with an error.
+* **Count-Min Sketches (`CMS.*`):** Sketches can be initialized with explicit dimensions (`CMS.INITBYDIM`)
+  or derived from target error and confidence probabilities (`CMS.INITBYPROB`). Increments (`CMS.INCRBY`)
+  add positive counts to items (auto-creating a default 2000×5 sketch if absent), and point queries
+  (`CMS.QUERY`) return the minimum estimate across hash rows.
+* **Top-K trackers (`TOPK.*`):** Trackers maintain the highest-frequency elements using HeavyKeeper/Space-Saving
+  decay (`TOPK.RESERVE`). Additions (`TOPK.ADD`) increment counts and return whether an existing item was evicted
+  from the top-k set. Queries test membership (`TOPK.QUERY`) and list all tracked items (`TOPK.LIST`).
 
-### 9.4 Interaction with the rest of the server
+A complete reference table of all commands, auto-creation parameters, and wire responses is indexed in
+[Reference details](#153-probabilistic-command-reference).
 
-* **Invisible to generic key commands.** `DEL`, `EXISTS`, `TYPE`, `KEYS`, `SCAN`, `RENAME`, `EXPIRE`, `TTL`, `DBSIZE`, `DUMP`, `OBJECT` and `MEMORY USAGE` operate only on the main table. A
-  Bloom filter cannot be deleted or given a TTL. Only `FLUSHALL`, or `FLUSHDB` while database 0 is selected, removes it.
-* **Counted in some places.** The keyspace statistics add the four map sizes to database 0's key count (`INFO keyspace`). `DEBUG DIGEST` includes the structures. `WATCH` and client-side
-  tracking see their keys, so a mutation invalidates them.
-* **Not counted in memory.** The used-memory total and eviction sum only the tables, so these structures are neither reported nor evictable under `maxmemory`.
+**Worked example.** The auto-create default `new(1000, 0.01)` gives `m = ceil(1000 × 4.605 / 0.4805) = 9586` bits,
+`k = round(9.586 × 0.693) = 7`, and 150 words. `BF.INFO` reports `Size = 150 × 8 = 1200` bytes.
+
+`try_new` runs the same formula and refuses when `bits / 8` exceeds `MAX_SKETCH_BYTES` (roughly 448 million items at 1%
+error fill 512 MiB).
+
+**Add** returns whether the item was newly added:
+
+1. Compute `(h1, h2)`.
+2. For *i* from 0 to *k* − 1: `bit = (h1 + i·h2) mod m`. If the bit is clear, set it and remember that the item was not
+   already present.
+3. If any bit was newly set, increment the count (saturating) and return `true`. Otherwise return `false`: the item was
+   *probably* already present.
+
+**Contains** computes the same *k* positions and returns `false` as soon as one is clear.
 
 ---
 
@@ -464,7 +464,7 @@ Any other `PFDEBUG` subcommand gives `unknown subcommand for 'pfdebug' command`.
 
 ---
 
-## 11. Invariants & gotchas
+## 11. Invariants and gotchas
 
 1. **Replay determinism is required.** Changes to the hash seeds, the fingerprint function, the kick-chain rules, or Top-K tie-breaking change what AOF replay or a replica computes from the same commands.
    Keep every path free of random numbers and hash-map iteration order.
@@ -485,7 +485,7 @@ Any other `PFDEBUG` subcommand gives `unknown subcommand for 'pfdebug' command`.
 
 ---
 
-## 12. Limitations / not implemented
+## 12. Limitations and not implemented
 
 * No scalable Bloom or Cuckoo filters (`EXPANSION`, `NONSCALING`), no `BF.INSERT`, `BF.SCANDUMP` or `BF.LOADCHUNK`, no `CF.COUNT`, `CF.INSERT` or `CF.MEXISTS`, no `CMS.MERGE`, no `TOPK.INCRBY` or
   `TOPK.COUNT`, and no `TOPK.LIST WITHCOUNT`. `TOPK.ADD` always increments by 1.
@@ -617,3 +617,8 @@ pub struct ProbabilisticStore {
 | `HLL_SPARSE_MAX_BYTES` | 3000 | Largest sparse encoding before switching to dense. |
 | HyperLogLog murmur seed | `0xadc83b19` | Redis's seed. |
 | RDB tags | 8, 10, 11, 12 | Bloom, Cuckoo, CMS, Top-K records in `rudis-ext`. |
+
+
+### 15.3 Probabilistic Command Reference
+
+

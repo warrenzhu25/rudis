@@ -134,7 +134,7 @@ $11 inputSchema $<n> <schema serialized as a JSON string>
 
 This is a flat key and value array, **not** a RESP3 map, even for RESP3 clients, and the schema is a JSON string inside a bulk string, not a nested RESP structure.
 
-### 5.2 MCP.CALL <tool> [args_json]
+### 5.2 MCP.CALL tool execution
 
 Parsing needs 2 or 3 words in total, else `ERR wrong number of arguments for 'mcp.call' command`. The tool is the lossy-UTF-8 second word; `args_json` defaults to `{}` when omitted.
 
@@ -159,7 +159,7 @@ Handling in the dispatcher:
 
 A following `MCP.CALL rudis_kv_get {"key":"mcp:k1"}` runs `GET`, gets `$9\r\nmcp_hello\r\n`, and returns `"text":"mcp_hello"`.
 
-### 5.3 MCP.RPC <json_rpc_request>
+### 5.3 MCP.RPC JSON-RPC handling
 
 Parsing needs exactly 2 words (the command plus one bulk string holding the whole JSON-RPC request), else `ERR wrong number of arguments for 'mcp.rpc' command`.
 
@@ -303,7 +303,7 @@ Backing subsystems reached through the inner dispatch:
 
 ---
 
-## 9. Invariants & gotchas
+## 9. Invariants and gotchas
 
 1. **The schema and the planner are maintained by hand, separately.** Nothing checks that they agree. Known mismatches: `rudis_semantic_get` advertises `k` (default 1) but the planner ignores it; `rudis_semantic_set`
    accepts `tokens` but the schema does not list it.
@@ -322,7 +322,7 @@ Backing subsystems reached through the inner dispatch:
 
 ---
 
-## 10. Limitations / not implemented
+## 10. Limitations and not implemented
 
 * **Experimental gate:** disabled unless `enable-experimental-commands` is on.
 * **Cargo feature:** a build without the `mcp` feature refuses all three commands with `-ERR MCP is not compiled into this build (cargo feature mcp)`.

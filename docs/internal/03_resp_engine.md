@@ -590,7 +590,7 @@ The parser never writes replies. For orientation:
 
 ---
 
-## 8. Invariants & gotchas
+## 8. Invariants and gotchas
 
 * **Framing errors don't consume; command errors do.** A protocol error leaves the buffer
   untouched, so the caller must close the connection — otherwise the same bytes would fail
@@ -627,7 +627,7 @@ The parser never writes replies. For orientation:
 
 ---
 
-## 9. Limitations / not implemented
+## 9. Limitations and not implemented
 
 * **RESP3 input types are not parsed.** Only arrays of bulk strings, inline text and memcached
   storage lines are accepted. A client cannot send RESP3 maps, sets, doubles, booleans, nulls or

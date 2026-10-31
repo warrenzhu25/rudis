@@ -639,7 +639,7 @@ that matter most:
 
 ---
 
-## 12. Invariants & gotchas
+## 12. Invariants and gotchas
 
 1. **The two copies must stay in sync.** Every code path that changes documents must touch both
    the shard partition and the mirror, or `FT.INFO` and `FT.SEARCH` disagree. The paths in §4.6
@@ -680,7 +680,7 @@ that matter most:
 
 ---
 
-## 13. Limitations / not implemented
+## 13. Limitations and not implemented
 
 * `WEIGHT`, `SORTABLE`, schema-level `EPSILON` and `BLOCK_SIZE` are stored and round-tripped by
   persistence but have no effect.

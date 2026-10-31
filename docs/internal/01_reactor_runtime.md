@@ -938,7 +938,7 @@ check.
 
 ---
 
-## 10. Invariants & gotchas
+## 10. Invariants and gotchas
 
 1. **Never share a shard's data across threads.** It is single-thread state on purpose. Cross-thread
    state in this subsystem is limited to atomics (connection census, in-flight counters, shutdown
@@ -984,7 +984,7 @@ check.
 
 ---
 
-## 11. Limitations / not implemented
+## 11. Limitations and not implemented
 
 - **TLS connections are not rebalanced.** The TLS accept loop never touches the connection census:
   TLS clients are never moved off a hot shard, and plain-TCP placement does not see TLS load.

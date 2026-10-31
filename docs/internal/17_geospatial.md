@@ -304,7 +304,7 @@ relies on the sorted-set add's own type check.
 * **Parse:** at least 2 arguments.
 * **Execute:** an array of 11-character strings, or nil bulk for missing members.
 
-### 7.5 GEORADIUS key lon lat radius unit [options] (and GEORADIUS_RO)
+### 7.5 GEORADIUS and GEORADIUS RO
 
 The options are `WITHCOORD`, `WITHDIST`, `WITHHASH`, `COUNT n [ANY]`, `ANY`, `ASC`, `DESC`, `STORE dst` and `STOREDIST dst`.
 
@@ -395,7 +395,7 @@ So for a large set, a search costs about (at most 9 cells) × (a seek plus the m
 
 ---
 
-## 10. Invariants & gotchas
+## 10. Invariants and gotchas
 
 1. **The latitude limit is ±85.05112878°**, not ±90°. Out-of-range input is rejected at parse time and again in the encoder for `GEOADD`.
 2. **Two geohash flavours.** Stored scores use the Mercator latitude range; `GEOHASH` strings are re-encoded with the standard ±90° range. Do not
@@ -413,7 +413,7 @@ So for a large set, a search costs about (at most 9 cells) × (a seek plus the m
 
 ---
 
-## 11. Limitations / not implemented
+## 11. Limitations and not implemented
 
 * **A store destination on a different shard (standalone multi-shard mode).** Rudis partitions the keyspace across shard threads by key hash (hash-tag
   aware) even when cluster mode is off (the default shard count is the smaller of the core count and 8). The router sends `GEORADIUS* STORE/STOREDIST`

@@ -266,17 +266,21 @@ appends (its router and every clone of it, the mailbox loop, the expiry log, the
 writer now (nothing with the AOF off), swaps it, and tells a flusher whether its writer is still the one in
 the slot.
 
-| Operation | What it does |
-| :--- | :--- |
-| `open(path)` | Creates the directory and file, resumes at the current file length. |
-| `open_incremental(target, incr)` | A writer that appends to a fresh `incr` file while its path is `target` (§4.7). |
-| `append`, `append_command` | Adds bytes (after a `SELECT` if needed), bumps the appended count and `AOF_APPENDS` (only while some server runs `appendfsync always`). |
-| `write_pending_sync` | Blocking positional write of the whole buffer at the offset when nothing is in flight; on error the buffer stays for a retry. |
-| `take_flush_chunk`, `chunk_written` | Hands the buffer out for an async write; a failed chunk is put back in front of the buffer so it is retried, not dropped. |
-| `write_through(aof)` | Group commit to the kernel (no fsync): returns once the written count reaches the appended count as of the call. |
-| `sync_durable(aof)` | Group commit with `sync_data`: returns at once if an earlier fsync already covered the target offset; marks what it covered as fsynced. |
-| `written_total`, `mark_fsynced(upto)` | What an fsync started now covers; record it (the fsynced mark never goes back). |
-| `swap_after_rewrite`, `swap_after_live_rewrite` | Re-point the writer at a freshly renamed file, mark everything fsynced, delete the `.incr` file if any. |
+The writer exposes a focused set of operations:
+
+* **File management:** Opening the target log path and resuming at current file length, or opening
+  incremental files while an online runtime switch is active (§4.7).
+* **Command appending:** Buffering incoming RESP bytes (injecting database SELECT commands across DB
+  boundaries) and advancing monotonic appended byte counters.
+* **Kernel commits:** Writing pending buffers synchronously to the kernel, or handing chunks off to
+  asynchronous Monoio background writers with automatic retry preservation upon failure.
+* **Durable fsyncs:** Driving group-committed fsync barriers that advance the shared durability progress
+  record once disk synchronization succeeds.
+* **Descriptor swap:** Atomically rebinding the writer to a freshly compacted file following a background
+  rewrite, marking all preceding data fsynced and clearing incremental staging files.
+
+All underlying method signatures, chunk-size limits, and structure layouts are indexed in
+[Reference details](#111-aof-writer-and-progress).
 
 ### 4.3 When AOF bytes hit the disk
 
@@ -440,11 +444,11 @@ AUX repl-stream-db, repl-id, repl-offset             (when known)
 OP_EOF (0xFF), CRC64 (u64 LE)
 ```
 
-Values use plain (non-compact) Redis types: strings as `RDB_TYPE_STRING` (integer-encoded when they fit 32
-bits, never LZF-compressed), lists as `TYPE_LIST`, sets as `TYPE_SET`, sorted sets as `TYPE_ZSET_2`, hashes
-as `TYPE_HASH`, HyperLogLogs as dense `HYLL` strings, and streams as `TYPE_STREAM_LISTPACKS_3` (including
-groups, PEL and consumers). On read, all compact encodings (ziplist, listpack, intset, zipmap, quicklist,
-LZF strings and the Redis 7.4 hash-field-TTL types) are decoded; module data is rejected.
+Values are encoded using standard Redis type identifiers: strings (integer-encoded when fitting 32 bits,
+without compression), lists, sets, sorted sets, hashes, HyperLogLogs (as dense strings), and streams
+(including consumer groups, pending entry lists, and consumer metadata). On read, all standard compact
+encodings (ziplists, listpacks, integer sets, zipmaps, quicklists, compressed strings, and Redis 7.4 hash field
+TTL records) are accepted and decoded; unknown module records are rejected.
 
 **Integrity checks on read** (RDB loads and `RESTORE`), as Redis's integrity checks do:
 
@@ -984,7 +988,7 @@ Details that keep it to one shutdown:
 
 ---
 
-## 8. Invariants & gotchas
+## 8. Invariants and gotchas
 
 1. **Encode or lose it.** A write reaches the AOF and replicas only through the encoder (or an explicit shard-mutation log). New
    write commands need an encoder arm (or an entry in the coverage test's lists). If replaying the command would not reproduce the
@@ -1016,7 +1020,7 @@ Details that keep it to one shutdown:
 
 ---
 
-## 9. Limitations / not implemented
+## 9. Limitations and not implemented
 
 * **DFLY FLOW is partial.** The `lsn` argument is accepted but unused (every flow gets the full shard chunk), `"SYNC1"` is a fixed
   token, flows do not appear in `INFO replication` or `ROLE`, flows do not take part in the full-sync cut, and Rudis's own replica

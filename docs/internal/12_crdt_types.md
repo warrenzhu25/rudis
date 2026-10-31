@@ -477,7 +477,7 @@ The server's listening port is passed to the store, so the node id is the port:
 
 ---
 
-## 9. Invariants & gotchas
+## 9. Invariants and gotchas
 
 1. **Merge is commutative, associative and idempotent** for all three types. That is what makes effect
    logging and repeated `CRDT.MERGE` safe.
@@ -512,7 +512,7 @@ The server's listening port is passed to the store, so the node id is the port:
 
 ---
 
-## 10. Limitations / not implemented
+## 10. Limitations and not implemented
 
 * **No automatic multi-region sync.** There is no peer list, discovery, gossip, timer or streaming.
   `CRDT.DUMP` and `CRDT.MERGE` must be driven externally.

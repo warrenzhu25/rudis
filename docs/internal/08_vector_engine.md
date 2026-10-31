@@ -731,7 +731,7 @@ memory and recall for full-precision, SQ8 and tiered indexes, with and without r
 
 ---
 
-## 12. Invariants & gotchas
+## 12. Invariants and gotchas
 
 1. **One implementation, many owners.** Vector sets, FT fields, semantic caches and agent sessions
    are independent index instances with different defaults: build ef is 64 by default and 200
@@ -766,7 +766,7 @@ memory and recall for full-precision, SQ8 and tiered indexes, with and without r
 
 ---
 
-## 13. Limitations / not implemented
+## 13. Limitations and not implemented
 
 * **The spill file is never reclaimed.** Removed or updated vectors leave dead bytes behind. The
   file lives in the system temp directory, is never deleted when the index is dropped, and is

@@ -588,7 +588,7 @@ apart from a reply.
 
 ---
 
-## 9. Invariants & gotchas
+## 9. Invariants and gotchas
 
 * **Serve on the owner thread only.** The serving functions must receive the data of the shard
   that owns the key. A caller without it must send the owner a "notify these keys" message.
@@ -633,7 +633,7 @@ apart from a reply.
 
 ---
 
-## 10. Limitations / not implemented
+## 10. Limitations and not implemented
 
 * **BLMOVEM needs both keys on one shard** (`-CROSSSLOT` otherwise, even in standalone mode).
   BLMOVE handles keys on different shards only in standalone mode with `cross-shard-strict` off.

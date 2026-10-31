@@ -265,44 +265,43 @@ shard 1, which returns the value.
 
 ### 6.1 redis.call and redis.pcall
 
-Both are created with scoped Lua functions, so the closures can borrow the caller's AOF writer for
-exactly the duration of the run. Each call goes through these steps:
+Both functions are created as scoped Lua callables, allowing their closures to borrow the shard thread's
+append-only file writer safely for the duration of the script. Every invocation follows fourteen steps:
 
-1. **Arguments to bytes.** Lua strings as is; integers and floats via their text form. Anything else
-   (tables, booleans, nil, functions) gives `ERR Lua redis lib command arguments must be strings or
-   integers`. No arguments gives `ERR Please specify at least one argument for redis.call()`.
-2. **Parse** with the wire parser. A parse error mentioning "wrong number of arguments" becomes `ERR
-   Wrong number of args calling Redis command from script`; other parse errors are prefixed with
-   `ERR `. An unknown command gives `Unknown Redis command called from script`.
-3. **DEBUG gate.** `DEBUG` is allowed only when `enable-debug-command` is `yes` for this port; `local` is
-   not enough because a script has no client address.
-4. **ACL.** The command is checked against the user (empty means `default`), with command, key and
-   channel permissions all applying. Denials surface as `NOPERM ...` and are counted as rejected calls.
-5. **Redirect** check (§5.3).
-6. **Locality.** If any key of the command belongs to another shard, the error is `ERR Script attempted
-   to access a non local key: pass every key the script uses in KEYS, and use hash tags so they all map
-   to one shard`.
-7. **Forbidden commands:** `CLUSTER`, `REPLICAOF`, `SHUTDOWN`, `SAVE`, `BGSAVE` and `BGREWRITEAOF` give
-   `ERR This Redis command is not allowed from script`.
-8. **min-replicas.** If `min-replicas-to-write` is positive, the command is a write and there are not
-   enough good replicas, the error is `NOREPLICAS Not enough good replicas to write.`
-9. **Read-only scripts.** If the script is read-only (§6.3) and the command is a write (or `PUBLISH`,
-   `SPUBLISH` or `PFCOUNT`), the error is `ERR Write commands are not allowed from read-only scripts.`
-10. **maxmemory.** With `maxmemory` set, policy `noeviction`, and a write command that does not allow
-    OOM, sum this shard's allocator-measured usage with every other shard's published usage; above the
-    limit the error is `OOM command not allowed when used memory > 'maxmemory'.`
-11. **Bookkeeping.** Record the command statistic; for a write, flag the run as having written (§6.7);
-    count writes for save rules where the dirty count is not computed on change; count the command for
-    the active-client total; and, when `MONITOR` clients exist, emit a MONITOR line with source `lua`.
-12. **Execute** through the local-execution routine against this shard's data and AOF.
-13. **Error reply.** If the output starts with `-`, count it (failed-call and error statistics by
-    prefix), set the recorded-error flag and rewrite "wrong number of arguments" as above.
-    `redis.call` raises a Lua error with the message; `redis.pcall` returns `{err = "..."}`.
-14. **Success.** Convert the output to a Lua value (§6.5).
+1. **Argument conversion:** Lua strings pass through unchanged, while integers and floating-point numbers
+   are converted to decimal strings. Complex types such as tables, booleans, functions, or nil trigger an
+   argument-type error. Invoking the call with zero arguments triggers a missing-argument error.
+2. **Wire parsing:** Arguments are parsed through the standard command parser. Syntax errors (such as
+   argument-count mismatches) and unrecognized command names produce standard parser errors.
+3. **Debug gate:** The DEBUG command is rejected unless explicitly enabled on the server port.
+4. **ACL authorization:** The command is verified against the authenticated user's permissions, checking
+   command categories, key patterns, and channel permissions. Denials return permission errors and bump the
+   rejected-calls counter.
+5. **Keyless redirect:** For armed keyless scripts, the first remote key hit triggers a redirect to that key's
+   owner shard (§5.3).
+6. **Key locality:** Every key referenced by the command must belong to the current shard. Cross-shard keys
+   are rejected with a non-local key error.
+7. **Forbidden commands:** Administrative, replication, and persistence commands (including CLUSTER,
+   REPLICAOF, SHUTDOWN, SAVE, BGSAVE, and BGREWRITEAOF) cannot be executed from inside a script.
+8. **Replication safety:** If minimum healthy replicas are configured, mutating commands fail when the active
+   replica count falls below the required threshold.
+9. **Read-only enforcement:** If the script is marked read-only (§6.3), write commands, channel publishing,
+   and probabilistic updates are rejected.
+10. **Memory limit:** Under maximum memory policies with no eviction, mutating commands are rejected if total
+    server memory exceeds the configured limit.
+11. **Telemetry:** Command statistics are updated. Mutating commands mark the script as having written,
+    increment the dirty-keys counter for background saves, update active-client totals, and publish a MONITOR
+    stream line with source marked as lua.
+12. **Execution:** The command is executed against the local shard storage and appended to the local transaction
+    or persistence log.
+13. **Error trapping:** If execution returns an error, failure metrics are updated and the error flag is set.
+    While redis.call raises a Lua runtime exception, redis.pcall traps the error and returns a table containing
+    an err field.
+14. **Return conversion:** Successful results are translated from the protocol representation to native Lua
+    tables, strings, booleans, or numbers (§6.5).
 
-`redis.pcall` performs the identical sequence but turns every failure from steps 1–10 into a returned
-`{err = "..."}` table instead of raising. Steps 4, 6, 9 and 10 also bump the rejected and error
-counters and set the recorded-error flag.
+Both functions share identical validation, but redis.pcall intercepts failures across all validation steps,
+returning a Lua error table instead of raising an unhandled exception.
 
 ### 6.2 The script environment
 
@@ -357,14 +356,14 @@ A run is **read-only** when:
   flag using *_ro command.` (`EVAL_RO` of an unflagged script is not rejected up front; only its writes
   fail.)
 
-`EVAL` parses an optional shebang on the first line (`#!lua flags=no-writes,allow-oom`):
+Scripts executed through EVAL can declare an optional shebang line on the first line (such as
+`#!lua flags=no-writes,allow-oom`). The parser checks four rules:
 
-1. The engine must be `lua` (case-insensitive), else `ERR Unexpected engine in script shebang`.
-2. Every further token must be `key=value` with the key `flags`, else `ERR Unknown lua shebang option:
-   '<key>'`.
-3. Allowed flags are `no-writes`, `allow-oom`, `allow-stale` and `no-cluster`, else `ERR Unexpected flag
-   in script shebang: '<flag>'`.
-4. The shebang line is turned into a `--` comment before compiling.
+1. **Engine name:** The declared engine must be lua (case-insensitive); other engine names are rejected.
+2. **Options syntax:** Subsequent options must follow key-value syntax with the key named flags.
+3. **Supported flags:** Permitted flag values include no-writes, allow-oom, allow-stale, and no-cluster;
+   unrecognized flags trigger validation errors.
+4. **Stripping:** The shebang line is converted to a comment before compiling the Lua chunk.
 
 **Top-level classification** uses the flags without running the script:
 
@@ -482,10 +481,10 @@ server's base port and answer:
 
 | Situation | Reply |
 | :--- | :--- |
-| No script running | `-NOTBUSY No scripts in execution right now.` |
-| The script already ran a write | `-UNKILLABLE Sorry the script already executed write commands against the dataset. ...` |
-| `SCRIPT KILL` for an `FCALL`, or `FUNCTION KILL` for an `EVAL` | The `-BUSY` reply naming the right kill command. |
-| Otherwise | Set the *killed* flag and reply `+OK`; the hook ends the script at its next check. |
+| No script running | Returns a NOTBUSY error indicating no script is running. |
+| Script already performed a write | Returns an UNKILLABLE error because dataset modifications have occurred. |
+| Wrong kill command used (e.g., SCRIPT KILL on FCALL) | Returns a BUSY error directing the caller to the correct kill command. |
+| Healthy read-only script | Sets the termination flag and replies with OK; the instruction hook terminates execution. |
 
 The kill does not depend on the busy flag: a script can be killed before it passes the threshold. Once
 a shutdown sets the process-wide shutdown flag, the hook stops the script whether or not it wrote, so
@@ -527,17 +526,14 @@ the script instead of getting `-BUSY`.
 
 ### 7.1 FUNCTION LOAD
 
-1. **Metadata.** The first line must start with `#!` (else `ERR Missing library metadata`). The token
-   after `#!` must be `lua` (case-insensitive; else `ERR Engine '<x>' not found`). Every other
-   whitespace token must be `name=<lib>` (quotes trimmed); repeats give `ERR Invalid metadata value, name
-   argument was given multiple times`; anything else gives `ERR Invalid metadata value given: <tok>`;
-   none gives `ERR Library name was not given`.
-2. **Name check.** The name must match `[A-Za-z0-9_]+`.
-3. **Exists?** If a library with that name (case-insensitive) exists and `REPLACE` was not given, the
-   error is `ERR Library '<lib>' already exists`.
-4. **Load-time sandbox.** A fresh Lua state; copy globals into a private table, add `unpack`, then
-   remove `math`, `os`, `getmetatable`, `setmetatable`, `load`, `loadstring`, `dofile`, `loadfile`,
-   `print`, `rawget`, `rawset`, `rawequal`, `collectgarbage`, `package`, `coroutine`, `io` and `debug`.
+1. **Metadata header:** The library payload must begin with a shebang line naming the lua engine
+   and the library name (`#!lua name=<name>`). Malformed tokens, missing names, or duplicated name options
+   are rejected with syntax errors.
+2. **Name validation:** Library names must contain only alphanumeric characters and underscores.
+3. **Collision check:** If a library with the same name already exists and the replace flag was not passed,
+   the load fails with an existence error.
+4. **Sandboxed execution:** The code executes inside a restricted, isolated Lua environment with access to
+   system and debugging libraries stripped.
    Add `bit`, `cjson` and `cmsgpack`. The `redis` global is a read-only proxy exposing only
    `register_function`, `REDIS_VERSION`, `REDIS_VERSION_NUM` and the `LOG_*` constants; `_G` is locked as
    in §6.2.
@@ -644,7 +640,7 @@ global write lock (a unit test covers the linear scaling).
 
 ---
 
-## 9. Invariants & gotchas
+## 9. Invariants and gotchas
 
 1. **Single-shard execution.** A script only ever sees one shard's data. Declared keys must share an
    owner (`CROSSSLOT` otherwise) and every key a script touches must be local (the non-local-key error
@@ -690,7 +686,7 @@ global write lock (a unit test covers the linear scaling).
 
 ---
 
-## 10. Limitations / not implemented
+## 10. Limitations and not implemented
 
 * A busy script cannot be preempted on its own shard: clients on that shard wait for it to end, and so
   does any cross-shard request sent to that shard. Only connections served by other shards see `-BUSY`

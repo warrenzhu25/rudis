@@ -935,7 +935,7 @@ RESTORE:
 
 ---
 
-## 9. Invariants & gotchas
+## 9. Invariants and gotchas
 
 * **Lookups need the raw hash, not the mixed one.** Table methods take the plain key hash and mix
   it themselves; passing an already-mixed hash finds nothing.
@@ -984,7 +984,7 @@ RESTORE:
 
 ---
 
-## 10. Limitations / not implemented
+## 10. Limitations and not implemented
 
 * **OBJECT ENCODING is approximate.** A small set reports `intset` even for non-integer members, a
   list always reports `quicklist`, and strings report `int` or `raw` (never `embstr`). A second

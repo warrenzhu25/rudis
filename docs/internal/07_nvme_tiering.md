@@ -604,7 +604,7 @@ An unknown subcommand returns an error listing the valid ones. Exact reply forma
 
 ---
 
-## 6. Invariants & gotchas
+## 6. Invariants and gotchas
 
 - **One pointer, one owner.** Each piece of disk space is referenced by exactly one table slot. COPY
   reads the value back rather than sharing, and every removal queues the pointer exactly once.
@@ -639,7 +639,7 @@ An unknown subcommand returns an error listing the valid ones. Exact reply forma
 
 ---
 
-## 7. Limitations / not implemented
+## 7. Limitations and not implemented
 
 - **The upload threshold does nothing.** Its comment describes a "stream without promotion" cut-off,
   but the only such check reads the offload threshold.

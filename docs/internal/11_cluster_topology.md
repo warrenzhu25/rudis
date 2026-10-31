@@ -725,7 +725,7 @@ line was found.
 
 ---
 
-## 16. Invariants & gotchas
+## 16. Invariants and gotchas
 
 1. **One identity per node.** All cluster and replication lookups use the base port. Code that looked
    up the hub by the shard port would create a separate, phantom hub claiming all 16384 slots.
@@ -779,7 +779,7 @@ line was found.
 
 ---
 
-## 17. Limitations / not implemented
+## 17. Limitations and not implemented
 
 * **Single-host addressing.** A node always advertises itself as `127.0.0.1` (in `MEET`, `CLUSTER
   NODES`, `CLUSTER SLOTS`, `CLUSTER SHARDS` and local MOVED replies), `CLUSTER MEET` to a port equal

@@ -472,7 +472,7 @@ replica tests compare datasets.
 
 ---
 
-## 9. Invariants & gotchas
+## 9. Invariants and gotchas
 
 1. **Not in the main keyspace.** Core commands ignore JSON documents; one JSON namespace per shard is shared by all
    logical databases; `FLUSHDB` clears it only from database 0.
@@ -492,7 +492,7 @@ replica tests compare datasets.
 
 ---
 
-## 10. Limitations / not implemented
+## 10. Limitations and not implemented
 
 * **Experimental:** off unless `enable-experimental-commands yes`.
 * **Missing commands:** `JSON.ARRINSERT`, `JSON.ARRINDEX`, `JSON.ARRTRIM`, `JSON.MERGE`, `JSON.MSET`, `JSON.DEBUG`

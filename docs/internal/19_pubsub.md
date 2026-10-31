@@ -349,7 +349,7 @@ So a client that unsubscribes from everything (or uses RESP3) can run normal com
 
 ---
 
-## 8. Invariants & gotchas
+## 8. Invariants and gotchas
 
 1. **The client map must contain an id if and only if that client has at least one subscription in this hub** (on the home shard, remote shard-channel subscriptions in the shard-channel index also
    count). Every unsubscribe path removes the client-map and RESP3 entries when the total hits 0. Keep that if you add a new subscription kind.
@@ -370,7 +370,7 @@ So a client that unsubscribes from everything (or uses RESP3) can run normal com
 
 ---
 
-## 9. Limitations / not implemented
+## 9. Limitations and not implemented
 
 * There is no pattern index: each publish glob-matches every pattern on every interested shard.
 * Presence filtering covers 256 shard ids; above that every shard is always contacted.
