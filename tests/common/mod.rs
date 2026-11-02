@@ -155,12 +155,18 @@ pub fn start_test_server_cluster(port: u16, num_shards: usize) {
             .expect("Failed to spawn test cluster shard");
     }
 
+    // Every shard listens on its own port (base + shard) in cluster mode,
+    // each coming up on its own thread: wait for all of them, or a test's
+    // first connection to a shard port can be refused.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
-            break;
+    for p in port..port + num_shards as u16 {
+        while TcpStream::connect(("127.0.0.1", p)).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cluster shard port {p} did not start"
+            );
+            thread::sleep(Duration::from_millis(20));
         }
-        thread::sleep(Duration::from_millis(20));
     }
 }
 
