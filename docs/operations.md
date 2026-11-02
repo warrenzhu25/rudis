@@ -98,6 +98,9 @@ Check with `CLUSTER NODES` on each node that every peer shows its reachable addr
 (sequentially, one slot at a time, in batches of 100 keys). Clients that follow `-ASK`/`-MOVED`
 keep working during the move. Gossip resends the full node table on each tick, so it suits
 clusters of up to a few dozen nodes ([design doc](design/11_cluster_topology.md)).
+If a move fails (target unreachable, a key refused), the command replies `-ERR ... not moved` and
+stops; that slot stays on the source in the migrating state, with every key still reachable. Fix
+the cause and run the same command again to finish it.
 
 ## 7. Upgrades and rollback
 

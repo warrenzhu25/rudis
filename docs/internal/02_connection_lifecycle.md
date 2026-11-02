@@ -1192,9 +1192,6 @@ over one connection.
 * **A cross-shard element move blocks the source shard's thread**, spinning (and yielding) until
   the destination answers its push, for up to 10 s. If the destination never answers, the pop
   stays done and the push may be lost; the reply slot is leaked rather than freed.
-* **Slot migration does not stop on failure.** If a key batch fails while rebalancing, the loop
-  stops but the slot is still handed over, so keys not yet moved stay on the source and become
-  unreachable through redirection.
 * **Dead code.** An unused responder-channel type alias, and a results pool that is carried
   through the connection scratch and the squashed path but never used.
 * **Squashed-path statistics double count.** A squashed batch adds its size to the client's

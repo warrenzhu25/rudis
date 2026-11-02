@@ -9596,12 +9596,127 @@ async fn migrate_keys_to_node(
     }
 }
 
+/// Whether a reply to `CLUSTER SETSLOT` is `+OK`; otherwise the reply (or
+/// what was read of it) as the error.
+fn setslot_reply_ok(reply: &[u8]) -> Result<(), String> {
+    if reply.starts_with(b"+OK\r\n") {
+        return Ok(());
+    }
+    let line = reply.split(|&b| b == b'\r').next().unwrap_or_default();
+    Err(
+        match String::from_utf8_lossy(line).trim_start_matches(['-', '+']) {
+            "" => "no reply".to_string(),
+            l => l.to_string(),
+        },
+    )
+}
+
+/// Sends `CLUSTER SETSLOT <slot> <args...>` to the node at `host:port` and
+/// waits for its `+OK` (1 s to connect, 1 s for the reply).
+async fn send_setslot(host: &str, port: u16, slot: u16, args: &[&str]) -> Result<(), String> {
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+        .ok()
+        .and_then(|mut a| a.next())
+        .ok_or_else(|| format!("cannot resolve {host}:{port}"))?;
+    let mut stream = match monoio::time::timeout(
+        Duration::from_millis(1000),
+        monoio::net::TcpStream::connect(addr),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("cannot connect to {host}:{port}: {e}")),
+        Err(_) => return Err(format!("timed out connecting to {host}:{port}")),
+    };
+    let slot = slot.to_string();
+    let mut parts = vec!["CLUSTER", "SETSLOT", slot.as_str()];
+    parts.extend_from_slice(args);
+    let mut cmd = format!("*{}\r\n", parts.len());
+    for p in &parts {
+        cmd.push_str(&format!("${}\r\n{}\r\n", p.len(), p));
+    }
+    let (res, _) = stream.write_all(cmd.into_bytes()).await;
+    res.map_err(|e| format!("cannot write to {host}:{port}: {e}"))?;
+    let mut reply = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_millis(1000);
+    while !reply.windows(2).any(|w| w == b"\r\n") {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match monoio::time::timeout(left, stream.read(Vec::with_capacity(256))).await {
+            Ok((Ok(n), buf)) if n > 0 => reply.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    setslot_reply_ok(&reply)
+        .map_err(|e| format!("{host}:{port} refused SETSLOT {}: {e}", args.join(" ")))
+}
+
+/// Moves one slot of ours to the node at `host:port`, as `redis-cli
+/// --cluster reshard` does: the target is set importing first (nothing
+/// changes here if it refuses), then the slot migrating here, then the
+/// keys move in batches, and only once every key moved does the target
+/// take the slot (`SETSLOT NODE`). On a failure past the first step the slot
+/// stays migrating: keys still here are served here, the moved ones via
+/// `-ASK` at the target, and nothing is lost. Run the move again (or
+/// `SETSLOT STABLE`) to settle it.
+async fn migrate_slot_to(
+    router: &Router,
+    slot: u16,
+    host: &str,
+    port: u16,
+    target_id: Option<&str>,
+    batch_size: usize,
+) -> Result<(), String> {
+    let target_addr = format!("{host}:{port}");
+    send_setslot(host, port, slot, &["IMPORTING", &router.my_id()]).await?;
+    if let Some(id) = target_id {
+        crate::cluster::get_cluster_hub(router.base_port)
+            .slot_states
+            .write()
+            .insert(slot, ("migrating".to_string(), id.to_string()));
+    }
+    router.set_slot_state(
+        slot,
+        crate::shard::SlotState::Migrating(target_addr.clone()),
+    );
+    router.sync_slot_tables().await;
+
+    let mut conn = None;
+    loop {
+        let keys = router.get_keys_in_slot(slot, batch_size).await;
+        if keys.is_empty() {
+            break;
+        }
+        migrate_keys_to_node(
+            router,
+            &keys,
+            host,
+            port,
+            MigrateOpts {
+                copy: false,
+                replace: true,
+                timeout: SLOT_MIGRATION_TIMEOUT,
+            },
+            &mut conn,
+        )
+        .await?;
+    }
+    drop(conn);
+
+    send_setslot(host, port, slot, &["NODE", "myself"]).await?;
+    router.set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
+    router.sync_slot_tables().await;
+    Ok(())
+}
+
+/// Runs a rebalance or reshard plan. Returns how many plans were applied, or
+/// stops at the first slot that could not be moved: that slot is left as
+/// `migrate_slot_to` leaves it, and the rest of the plan is not run.
 async fn execute_rebalance_plans(
     router: &Router,
     hub: &std::sync::Arc<crate::cluster::ClusterHub>,
     plans: &[crate::cluster::SlotMigrationPlan],
     pipeline: usize,
-) -> usize {
+) -> Result<usize, String> {
     let mut moved = 0;
     for p in plans {
         let (host, port_str) = match p.target_addr.split_once(':') {
@@ -9611,91 +9726,21 @@ async fn execute_rebalance_plans(
         let target_port: u16 = port_str.parse().unwrap_or(6379);
 
         if p.source_node_id == hub.my_id() {
-            hub.slot_states
-                .write()
-                .insert(p.slot, ("migrating".to_string(), p.target_node_id.clone()));
-            router.set_slot_state(
+            migrate_slot_to(
+                router,
                 p.slot,
-                crate::shard::SlotState::Migrating(p.target_addr.clone()),
-            );
-            router.sync_slot_tables().await;
-
-            let target_sock = format!("{}:{}", host, target_port)
-                .parse::<std::net::SocketAddr>()
-                .ok();
-            if let Some(sock_addr) = target_sock
-                && let Ok(Ok(mut stream)) = monoio::time::timeout(
-                    Duration::from_millis(1000),
-                    monoio::net::TcpStream::connect(sock_addr),
+                &host,
+                target_port,
+                Some(&p.target_node_id),
+                pipeline.clamp(1, 1000),
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "slot {} not moved ({} slots moved before it): {}",
+                    p.slot, moved, e
                 )
-                .await
-            {
-                let cmd_importing = format!(
-                    "*5\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$9\r\nIMPORTING\r\n${}\r\n{}\r\n",
-                    p.slot.to_string().len(),
-                    p.slot,
-                    hub.my_id().len(),
-                    hub.my_id()
-                );
-                let (w_res, _) = stream.write_all(cmd_importing.into_bytes()).await;
-                if w_res.is_ok() {
-                    let buf = vec![0u8; 64];
-                    let _ =
-                        monoio::time::timeout(Duration::from_millis(1000), stream.read(buf)).await;
-                }
-            }
-
-            let batch_size = pipeline.clamp(1, 1000);
-            let mut conn = None;
-            loop {
-                let keys = router.get_keys_in_slot(p.slot, batch_size).await;
-                if keys.is_empty() {
-                    break;
-                }
-                if migrate_keys_to_node(
-                    router,
-                    &keys,
-                    &host,
-                    target_port,
-                    MigrateOpts {
-                        copy: false,
-                        replace: true,
-                        timeout: SLOT_MIGRATION_TIMEOUT,
-                    },
-                    &mut conn,
-                )
-                .await
-                .is_err()
-                {
-                    break;
-                }
-            }
-
-            if let Some(sock_addr) = target_sock
-                && let Ok(Ok(mut stream)) = monoio::time::timeout(
-                    Duration::from_millis(1000),
-                    monoio::net::TcpStream::connect(sock_addr),
-                )
-                .await
-            {
-                let cmd_node = format!(
-                    "*5\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$4\r\nNODE\r\n$6\r\nmyself\r\n",
-                    p.slot.to_string().len(),
-                    p.slot
-                );
-                let (w_res, _) = stream.write_all(cmd_node.into_bytes()).await;
-                if w_res.is_ok() {
-                    let buf = vec![0u8; 64];
-                    let _ =
-                        monoio::time::timeout(Duration::from_millis(1000), stream.read(buf)).await;
-                }
-            }
-
-            router.set_slot_state(
-                p.slot,
-                crate::shard::SlotState::Moved(p.target_addr.clone()),
-            );
-            router.sync_slot_tables().await;
+            })?;
             hub.assign_slot(p.slot, &p.target_node_id);
             hub.slot_states.write().remove(&p.slot);
             hub.bump_config_epoch();
@@ -9720,7 +9765,7 @@ async fn execute_rebalance_plans(
             moved += 1;
         }
     }
-    moved
+    Ok(moved)
 }
 
 fn parse_bulk_str_from_resp(res: &[u8]) -> Option<Bytes> {
@@ -13753,106 +13798,13 @@ async fn execute_command_inner(
                     }
                 },
                 ClusterSubcommand::MigrateSlot { slot, host, port } => {
-                    let target_addr = format!("{}:{}", host, port);
-                    // 1. Mark local slot as Migrating
-                    router.set_slot_state(
-                        slot,
-                        crate::shard::SlotState::Migrating(target_addr.clone()),
-                    );
-                    router.sync_slot_tables().await;
-
-                    // 2. Notify remote node: CLUSTER SETSLOT <slot> IMPORTING <my_id>
-                    let my_id = router.my_id();
-                    let target_sock = match std::net::ToSocketAddrs::to_socket_addrs(&target_addr) {
-                        Ok(mut iter) => iter.next(),
-                        Err(_) => None,
-                    };
-                    if let Some(sock_addr) = target_sock
-                        && let Ok(Ok(mut stream)) = monoio::time::timeout(
-                            Duration::from_millis(1000),
-                            monoio::net::TcpStream::connect(sock_addr),
-                        )
-                        .await
-                    {
-                        let slot_str = slot.to_string();
-                        let setslot_import = format!(
-                            "*5\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$9\r\nIMPORTING\r\n${}\r\n{}\r\n",
-                            slot_str.len(),
-                            slot_str,
-                            my_id.len(),
-                            my_id
-                        );
-                        let (write_res, _) = stream.write_all(setslot_import.into_bytes()).await;
-                        if write_res.is_ok() {
-                            let buf = vec![0u8; 64];
-                            let _ = monoio::time::timeout(
-                                Duration::from_millis(1000),
-                                stream.read(buf),
-                            )
-                            .await;
-                        }
-                    }
-
-                    // 3. Migrate keys belonging to this slot in batches, over
-                    //    one connection to the target.
-                    let mut conn = None;
-                    loop {
-                        let keys = router.get_keys_in_slot(slot, 100).await;
-                        if keys.is_empty() {
-                            break;
-                        }
-                        if let Err(e) = migrate_keys_to_node(
-                            router,
-                            &keys,
-                            &host,
-                            port,
-                            MigrateOpts {
-                                copy: false,
-                                replace: true,
-                                timeout: SLOT_MIGRATION_TIMEOUT,
-                            },
-                            &mut conn,
-                        )
-                        .await
-                        {
-                            out.extend_from_slice(
-                                format!("-ERR migration failed: {}\r\n", e).as_bytes(),
-                            );
+                    match migrate_slot_to(router, slot, &host, port, None, 100).await {
+                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => {
+                            out.extend_from_slice(format!("-ERR migration failed: {}\r\n", e).as_bytes());
                             return false;
                         }
                     }
-
-                    drop(conn);
-
-                    // 4. Notify remote node to take final ownership: CLUSTER SETSLOT <slot> NODE myself
-                    if let Some(sock_addr) = target_sock
-                        && let Ok(Ok(mut stream)) = monoio::time::timeout(
-                            Duration::from_millis(1000),
-                            monoio::net::TcpStream::connect(sock_addr),
-                        )
-                        .await
-                    {
-                        let slot_str = slot.to_string();
-                        let setslot_node = format!(
-                            "*5\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$4\r\nNODE\r\n$6\r\nmyself\r\n",
-                            slot_str.len(),
-                            slot_str
-                        );
-                        let (write_res, _) = stream.write_all(setslot_node.into_bytes()).await;
-                        if write_res.is_ok() {
-                            let buf = vec![0u8; 64];
-                            let _ = monoio::time::timeout(
-                                Duration::from_millis(1000),
-                                stream.read(buf),
-                            )
-                            .await;
-                        }
-                    }
-
-                    // 5. Update local state to Moved
-                    router.set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
-                    router.sync_slot_tables().await;
-                    out.extend_from_slice(b"+OK\r\n");
                 }
                 ClusterSubcommand::Rebalance {
                     host,
@@ -13902,10 +13854,12 @@ async fn execute_command_inner(
                                     }
                                 }
                             } else {
-                                let moved =
-                                    execute_rebalance_plans(router, &hub, &plans, pipeline_batch)
-                                        .await;
-                                write_resp_integer(out, moved as i64);
+                                match execute_rebalance_plans(router, &hub, &plans, pipeline_batch)
+                                    .await
+                                {
+                                    Ok(moved) => write_resp_integer(out, moved as i64),
+                                    Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+                                }
                             }
                         }
                         Err(e) => {
@@ -13927,8 +13881,10 @@ async fn execute_command_inner(
                     let hub = crate::cluster::get_cluster_hub(router.base_port);
                     match hub.compute_reshard_plan(&target_node_id, &source_node_id, slots) {
                         Ok(plans) => {
-                            let moved = execute_rebalance_plans(router, &hub, &plans, 100).await;
-                            write_resp_integer(out, moved as i64);
+                            match execute_rebalance_plans(router, &hub, &plans, 100).await {
+                                Ok(moved) => write_resp_integer(out, moved as i64),
+                                Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+                            }
                         }
                         Err(e) => {
                             out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
@@ -32358,6 +32314,18 @@ mod tests {
         map.insert((7001, 9), entry(true));
         assert_eq!(is_rep(global_client_entry(&map, 7000, 2, 9)), Some(true));
         assert!(global_client_entry(&map, 7000, 1, 9).is_none());
+    }
+
+    #[test]
+    fn test_setslot_reply_must_be_ok() {
+        assert_eq!(setslot_reply_ok(b"+OK\r\n"), Ok(()));
+        assert_eq!(
+            setslot_reply_ok(b"-NOPERM this user has no permissions\r\n"),
+            Err("NOPERM this user has no permissions".to_string())
+        );
+        assert_eq!(setslot_reply_ok(b""), Err("no reply".to_string()));
+        assert_eq!(setslot_reply_ok(b"+OK"), Err("OK".to_string())); // cut short
+        assert!(setslot_reply_ok(b"+QUEUED\r\n").is_err());
     }
 
     #[test]

@@ -3930,3 +3930,119 @@ fn test_cluster_announce_ip_reaches_peers_and_redirects_e2e() {
     );
     assert_eq!(cmd(a, a_shard_port, &["GET", &key]), "$-1\r\n");
 }
+
+/// A REBALANCE whose key transfer fails must not hand the slot over: the
+/// keys not yet moved would sit on the source behind a -MOVED to a target
+/// that never got them. Nor may a target that refuses SETSLOT IMPORTING
+/// leave the source's slot migrating (new keys would be sent to -ASK it).
+#[test]
+fn test_rebalance_never_hands_over_a_slot_whose_keys_did_not_move_e2e() {
+    let (port1, port2) = (18241u16, 18242u16);
+    start_test_server(port1, 2);
+    rudis::cluster::start_cluster_bus(port1);
+    start_test_server(port2, 2);
+    rudis::cluster::start_cluster_bus(port2);
+    let mut c1 = TcpStream::connect(("127.0.0.1", port1)).unwrap();
+    let mut c2 = TcpStream::connect(("127.0.0.1", port2)).unwrap();
+    c1.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Node 1 serves 0..12000; a targeted REBALANCE moves its last slot first.
+    assert_eq!(
+        resp_cmd(&mut c1, &["CLUSTER", "ADDSLOTSRANGE", "0", "12000"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c2, &["CLUSTER", "ADDSLOTSRANGE", "12001", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut c1,
+            &["CLUSTER", "MEET", "127.0.0.1", &port2.to_string()]
+        ),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let check = resp_cmd(&mut c1, &["CLUSTER", "CHECK"]);
+        if check.contains("[OK] All 16384 slots covered") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cluster did not form: {check}\n{}\n{}",
+            resp_cmd(&mut c1, &["CLUSTER", "NODES"]),
+            resp_cmd(&mut c2, &["CLUSTER", "NODES"])
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let tag = (0..)
+        .map(|i| format!("t{i}"))
+        .find(|t| rudis::router::key_slot(format!("{{{t}}}").as_bytes()) == 12000)
+        .unwrap();
+    let keys: Vec<String> = (0..20).map(|i| format!("{{{tag}}}:{i}")).collect();
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut c1, &["SET", k, "v"]), "+OK\r\n");
+    }
+    let missing = format!("{{{tag}}}:missing");
+    let rebalance = |c: &mut TcpStream| {
+        resp_cmd(
+            c,
+            &["CLUSTER", "REBALANCE", "127.0.0.1", &port2.to_string(), "1"],
+        )
+    };
+    let all_keys_on_node1 = |c: &mut TcpStream| {
+        for k in &keys {
+            assert_eq!(resp_cmd(c, &["GET", k]), "$1\r\nv\r\n", "{k}");
+        }
+    };
+
+    // 1. The target refuses SETSLOT IMPORTING: nothing changes here.
+    assert_eq!(
+        resp_cmd(&mut c2, &["ACL", "SETUSER", "default", "-cluster"]),
+        "+OK\r\n"
+    );
+    let r = rebalance(&mut c1);
+    assert!(
+        r.starts_with("-ERR slot 12000 not moved (0 slots moved before it)")
+            && r.contains("NOPERM"),
+        "{r}"
+    );
+    all_keys_on_node1(&mut c1);
+    assert_eq!(resp_cmd(&mut c1, &["GET", &missing]), "$-1\r\n"); // not -ASK
+
+    // 2. It takes the slot but refuses every key: the slot stays here,
+    // migrating, with every key still served here.
+    assert_eq!(
+        resp_cmd(
+            &mut c2,
+            &["ACL", "SETUSER", "default", "+cluster", "-restore"]
+        ),
+        "+OK\r\n"
+    );
+    let r = rebalance(&mut c1);
+    assert!(
+        r.starts_with("-ERR slot 12000 not moved")
+            && r.contains("Target instance replied with error"),
+        "{r}"
+    );
+    all_keys_on_node1(&mut c1);
+    assert_eq!(resp_cmd(&mut c2, &["DBSIZE"]), ":0\r\n");
+    let nodes = resp_cmd(&mut c1, &["CLUSTER", "NODES"]);
+    let me = nodes.lines().find(|l| l.contains("myself")).unwrap();
+    assert!(me.contains(" 0-12000"), "{me}");
+    assert!(me.contains("[12000->-"), "{me}"); // still migrating
+
+    // 3. Once the target accepts the keys, running it again finishes it.
+    assert_eq!(
+        resp_cmd(&mut c2, &["ACL", "SETUSER", "default", "+restore"]),
+        "+OK\r\n"
+    );
+    assert_eq!(rebalance(&mut c1), ":1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c2, &["DBSIZE"]),
+        format!(":{}\r\n", keys.len())
+    );
+    assert!(resp_cmd(&mut c1, &["GET", &keys[0]]).starts_with("-MOVED 12000 127.0.0.1:"));
+}

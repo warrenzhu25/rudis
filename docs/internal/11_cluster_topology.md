@@ -603,19 +603,30 @@ IOERR ...`, and a retry opens a new connection.
 `DUMP` works from the tier record, so keys spilled to NVMe migrate too. Slot migration uses
 replace-on-restore and a 5 s timeout, and never copies.
 
-### 11.2 CLUSTER MIGRATE-SLOT
+### 11.2 Moving one slot
 
-`CLUSTER MIGRATE-SLOT <slot> <host> <port>` (also `MIGRATESLOT`) runs on the source node:
+`CLUSTER MIGRATE-SLOT <slot> <host> <port>` (also `MIGRATESLOT`) and each source-side step of
+`REBALANCE` and `RESHARD` (§11.4) move a slot the same way, in the order `redis-cli --cluster
+reshard` uses:
 
-1. Mark the slot migrating locally and wait on the barrier.
-2. Send `CLUSTER SETSLOT <slot> IMPORTING <my id>` to the target's client port (1 s timeouts).
-3. Repeatedly list up to 100 keys in the slot and migrate them (all batches over one connection)
-   until none are left. On error reply `-ERR migration failed: ...` and stop; the slot stays
-   migrating.
-4. Send `CLUSTER SETSLOT <slot> NODE myself` to the target.
-5. Mark the slot moved locally and reply `+OK`.
+1. Send `CLUSTER SETSLOT <slot> IMPORTING <my id>` to the target's client port (1 s to connect, 1 s
+   for the reply). Anything but `+OK` (or no answer) stops here with **nothing changed** locally, so
+   new keys of the slot are not sent to `-ASK` a target that does not take them.
+2. Mark the slot migrating locally (and, for `REBALANCE`/`RESHARD`, in the hub's reporting copy) and
+   wait on the barrier.
+3. Repeatedly list a batch of keys in the slot (100, or `PIPELINE` for `REBALANCE`) and migrate them,
+   all batches over one connection, until none are left.
+4. Send `CLUSTER SETSLOT <slot> NODE myself` to the target, again requiring `+OK`.
+5. Mark the slot moved locally.
 
-This path does not edit the hub's slot list. The target's `SETSLOT ... NODE myself` bumps its config
+A failure in steps 3–4 stops the move with the slot **still migrating** and still ours: keys not yet
+moved are served here, the moved ones through `-ASK` at the target (which is importing), so no key
+becomes unreachable. Run the move again to finish it, or `CLUSTER SETSLOT <slot> STABLE` on both
+sides to abandon it (moved keys stay on the target). `MIGRATE-SLOT` replies `-ERR migration failed:
+<reason>`; `REBALANCE` and `RESHARD` reply `-ERR slot <s> not moved (<n> slots moved before it):
+<reason>` and do not run the rest of the plan.
+
+`MIGRATE-SLOT` does not edit the hub's slot list. The target's `SETSLOT ... NODE myself` bumps its config
 epoch and claims the slot, and the source drops it when the target's next PING or PONG reaches the
 conflict rule.
 
@@ -645,11 +656,9 @@ The syntax is `CLUSTER REBALANCE [<host> <port> [<slots>]] [WEIGHTS id=w ...] [S
    <id> (<addr>)`, or `*** No rebalancing needed! All nodes balanced. ***`.
 2. Otherwise the plan runs (batch size is `PIPELINE` clamped to 1–1000; `RESHARD` uses 100) and the
    reply is the number of plans applied. For each plan:
-   * **We are the source:** mark the slot migrating (hub and router); send `SETSLOT IMPORTING` to the
-     target; move keys in batches over one connection until the slot is empty or a batch fails; send
-     `SETSLOT NODE myself` to the target; mark the slot moved locally; assign it to the target; clear
-     the hub state; bump the config epoch; and refresh the target (an immediate PING and PONG, so both
-     sides learn each other's new epoch).
+   * **We are the source:** move the slot as in §11.2 (stopping the whole plan if that fails); then
+     assign it to the target; clear the hub state; bump the config epoch; and refresh the target (an
+     immediate PING and PONG, so both sides learn each other's new epoch).
    * **We are the target:** mark the slot importing, then immediately assign it to us and bump the
      epoch. No keys are fetched.
    * **Neither:** skipped.
@@ -782,9 +791,8 @@ line was found.
 13. **`REBALANCE` moves data only from the source node.** Run it on the donor. On the receiving node a
     plan is pure bookkeeping, and the router's slot state is left at importing, so clients that do not
     send `ASKING` are redirected back to the source.
-14. **Slot migration finalises even after a failed batch** in the rebalance executor: the loop stops,
-    but the slot is still handed over (`SETSLOT NODE`, moved), so unmoved keys stay on the source behind
-    a `-MOVED`. `MIGRATE-SLOT` instead stops with an error and leaves the slot migrating.
+14. **A slot is handed over only after all its keys moved** and the target answered `SETSLOT NODE`
+    with `+OK` (§11.2). A failed move leaves the slot migrating on the source, never moved.
 15. **Bus code runs on blocking operating-system threads**, outside the async runtime. It must not
     `await` or touch shard-local (`Rc`/`RefCell`) state; it reaches shards only through the hub and
     through the follow mailbox and pause flags. That is why `MFSTART` uses the blocking, sleep-polling
