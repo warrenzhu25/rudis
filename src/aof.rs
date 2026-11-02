@@ -784,10 +784,11 @@ async fn rewrite_live_inner(
 }
 
 /// `rdb-key-save-delay` (a test knob, in microseconds) for one step of a
-/// live AOF rewrite, also the last one, so even a tiny dataset's rewrite
-/// can be caught running. Slept in short slices, ending early once the
-/// knob is lowered, so a test can let a slowed rewrite finish.
-async fn rewrite_key_save_delay() {
+/// live AOF rewrite or an RDB save (`SAVE`/`BGSAVE`), also the last one, so
+/// even a tiny dataset's save can be caught running. Slept in short slices,
+/// ending early once the knob is lowered, so a test can let a slowed save
+/// finish.
+pub(crate) async fn rewrite_key_save_delay() {
     let delay = || crate::connection::RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed);
     let start = std::time::Instant::now();
     loop {

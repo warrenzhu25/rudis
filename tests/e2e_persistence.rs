@@ -4064,6 +4064,10 @@ fn test_bgrewriteaof_does_not_block_and_keeps_every_write_e2e() {
         .write_all(b"BLMOVE src dst LEFT RIGHT 0\r\n")
         .unwrap();
     thread::sleep(Duration::from_millis(100));
+    // Slowed, so plenty of writes land while the rewrite runs however fast
+    // this build walks the keys (a release build finished within ~40
+    // rounds); lowered again once they have.
+    set_key_save_delay(&mut c, 2_000);
     assert!(send_and_read_reply(&mut c, b"BGREWRITEAOF\r\n").starts_with('+'));
     let start = std::time::Instant::now();
     let mut worst = Duration::ZERO;
@@ -4085,6 +4089,9 @@ fn test_bgrewriteaof_does_not_block_and_keeps_every_write_e2e() {
                 send_and_read_reply(&mut c, b"LPUSH src moved\r\n"),
                 ":1\r\n"
             );
+        }
+        if i == 60 {
+            set_key_save_delay(&mut c, 0);
         }
         i += 1;
         if i.is_multiple_of(20)
@@ -4913,7 +4920,13 @@ fn test_bgsave_keeps_keys_evicted_while_it_runs_e2e() {
         ),
         "+OK\r\n"
     );
+    // Slowed, so the evictions below land while it runs however fast this
+    // build writes it.
+    set_key_save_delay(&mut c, 20_000);
     assert!(resp_cmd_all(&mut c, &["BGSAVE"]).starts_with("+Background saving started"));
+    // The save starts its images in the background (within a few ms): only
+    // keys evicted after that are the save's to keep.
+    thread::sleep(Duration::from_millis(50));
     // Now well under what the data takes: new writes evict old keys.
     let limit = (used / 2).to_string();
     assert_eq!(
@@ -4922,11 +4935,17 @@ fn test_bgsave_keeps_keys_evicted_while_it_runs_e2e() {
     );
     let val = "n".repeat(100);
     let mut i = 0;
+    while i < 1000 {
+        resp_cmd_all(&mut c, &["SET", &format!("new:{i}"), &val]);
+        i += 1;
+    }
+    assert_save_running(
+        &mut c,
+        "the save ended before the evictions: the test proves nothing",
+    );
+    set_key_save_delay(&mut c, 0);
     while info_field_u64(&mut c, "persistence", "rdb_bgsave_in_progress") != 0 {
-        for _ in 0..200 {
-            resp_cmd_all(&mut c, &["SET", &format!("new:{i}"), &val]);
-            i += 1;
-        }
+        thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "ok");
     let evicted = info_field_u64(&mut c, "stats", "evicted_keys");
@@ -4988,15 +5007,18 @@ fn test_bgsave_survives_swapdb_while_it_runs_e2e() {
     );
     assert_eq!(resp_cmd_all(&mut c, &["SELECT", "1"]), "+OK\r\n");
     assert_eq!(resp_cmd_all(&mut c, &["SET", "one", "1"]), "+OK\r\n");
+    // Slowed, so the save still runs at the swap however fast this build
+    // writes it (a release build finished 300000 keys within 50 ms).
+    set_key_save_delay(&mut c, 20_000);
     assert!(resp_cmd_all(&mut c, &["BGSAVE"]).starts_with("+Background saving started"));
     // The save starts its images in the background (within a few ms).
     thread::sleep(Duration::from_millis(50));
     assert_eq!(resp_cmd_all(&mut c, &["SWAPDB", "0", "1"]), "+OK\r\n");
-    assert_eq!(
-        info_field_u64(&mut c, "persistence", "rdb_bgsave_in_progress"),
-        1,
-        "the save ended before the swap: the test proves nothing"
+    assert_save_running(
+        &mut c,
+        "the save ended before the swap: the test proves nothing",
     );
+    set_key_save_delay(&mut c, 0);
     while info_field_u64(&mut c, "persistence", "rdb_bgsave_in_progress") != 0 {
         thread::sleep(Duration::from_millis(10));
     }
@@ -5010,5 +5032,64 @@ fn test_bgsave_survives_swapdb_while_it_runs_e2e() {
     assert_eq!(resp_cmd_all(&mut c, &["SELECT", "1"]), "+OK\r\n");
     assert_eq!(resp_cmd_all(&mut c, &["DBSIZE"]), ":1\r\n");
     assert_eq!(resp_cmd_all(&mut c, &["GET", "one"]), "$1\r\n1\r\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sets `rdb-key-save-delay` (µs per save step; 0 lets a slowed save finish).
+fn set_key_save_delay(c: &mut TcpStream, micros: u64) {
+    assert_eq!(
+        resp_cmd_all(
+            c,
+            &["CONFIG", "SET", "rdb-key-save-delay", &micros.to_string()]
+        ),
+        "+OK\r\n"
+    );
+}
+
+/// Asserts a BGSAVE is really still running: a second one is refused
+/// (INFO's `rdb_bgsave_in_progress` stays 1 while `rdb-key-save-delay` is
+/// set, even once the save ended).
+fn assert_save_running(c: &mut TcpStream, why: &str) {
+    assert_eq!(
+        resp_cmd_all(c, &["BGSAVE"]),
+        "-ERR Background save already in progress\r\n",
+        "{why}"
+    );
+}
+
+/// FLUSHALL aborting a BGSAVE is not a failed save (Redis kills its child
+/// on purpose and leaves `rdb_last_bgsave_status` alone): writes must not
+/// then be refused with -MISCONF (`stop-writes-on-bgsave-error`).
+#[test]
+fn test_flushall_aborting_a_bgsave_does_not_fail_it_e2e() {
+    let port = 18251u16;
+    let dir = std::env::temp_dir().join(format!("rudis-flushabort-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let ps = port.to_string();
+    let _server = ServerGuard(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "2", "--no-pin", "--dir", &ds],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(resp_cmd_all(&mut c, &["SET", "k", "v"]), "+OK\r\n");
+    set_key_save_delay(&mut c, 10_000_000);
+    assert!(resp_cmd_all(&mut c, &["BGSAVE"]).starts_with("+Background saving started"));
+    thread::sleep(Duration::from_millis(50));
+    assert_save_running(&mut c, "the save is not slowed: the test proves nothing");
+    set_key_save_delay(&mut c, 0);
+    assert_eq!(resp_cmd_all(&mut c, &["FLUSHALL"]), "+OK\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while info_field_u64(&mut c, "persistence", "rdb_bgsave_in_progress") != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the save never stopped"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "ok");
+    assert_eq!(resp_cmd_all(&mut c, &["SET", "k2", "v"]), "+OK\r\n");
     let _ = std::fs::remove_dir_all(&dir);
 }

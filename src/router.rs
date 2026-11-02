@@ -351,6 +351,10 @@ pub fn shard_size_for_eviction(
 /// panic isolated with `catch_unwind`). Otherwise one such save refuses
 /// every later SAVE/BGSAVE/BGREWRITEAOF as "in progress" and shutdown waits
 /// forever in `save_before_shutdown`.
+/// Why a save stopped when FLUSHALL aborted it (not a failure: see
+/// `SnapshotState::abandon`).
+const SAVE_ABORTED: &str = "save aborted by FLUSHALL";
+
 struct SaveFlagGuard {
     is_saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
     base_port: u16,
@@ -5579,7 +5583,11 @@ impl Router {
         // Clear it before `finish` so a save seen as finished is not still
         // holding the flag.
         self.is_saving.store(false, Ordering::SeqCst);
-        crate::snapshot::state(self.base_port).finish(dirty_before, res.is_ok());
+        let state = crate::snapshot::state(self.base_port);
+        match &res {
+            Err(e) if e == SAVE_ABORTED => state.abandon(),
+            _ => state.finish(dirty_before, res.is_ok()),
+        }
         res
     }
 
@@ -5674,7 +5682,7 @@ impl Router {
         for sid in 0..self.num_shards {
             loop {
                 if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
-                    return Err("save aborted by FLUSHALL".to_string());
+                    return Err(SAVE_ABORTED.to_string());
                 }
                 let step = if sid == self.shard_id {
                     let step = crate::shard::save_image_step(self);
@@ -5693,6 +5701,9 @@ impl Router {
                 if !piece.is_empty() && chunk_tx.send_async(Some(piece)).await.is_err() {
                     return Err(WRITER_GONE.to_string());
                 }
+                // `rdb-key-save-delay`: lets tests act while a save runs,
+                // however fast this build walks the images.
+                crate::aof::rewrite_key_save_delay().await;
                 if done {
                     break;
                 }
@@ -5701,7 +5712,7 @@ impl Router {
         // Every shard removed its image with its last piece.
         guard.armed = false;
         if crate::connection::RDB_BGSAVE_ABORTED.load(Ordering::SeqCst) {
-            return Err("save aborted by FLUSHALL".to_string());
+            return Err(SAVE_ABORTED.to_string());
         }
         Ok(history)
     }

@@ -136,6 +136,14 @@ impl SnapshotState {
         self.in_progress.store(false, Ordering::SeqCst);
     }
 
+    /// Call when a save is abandoned on purpose (FLUSHALL aborts a BGSAVE,
+    /// as Redis kills its child): it neither succeeded nor failed, so, as in
+    /// Redis, the last save's status and time stay as they were and a good
+    /// status does not turn into `MISCONF`.
+    pub fn abandon(&self) {
+        self.in_progress.store(false, Ordering::SeqCst);
+    }
+
     pub fn in_progress(&self) -> bool {
         self.in_progress.load(Ordering::SeqCst)
     }
@@ -346,6 +354,21 @@ mod tests {
         assert!(!save_point_reached(&[], 1_000_000, 1_000_000));
         assert_eq!(format_save_points(&points), "3600 1 300 100 60 10000");
         assert_eq!(format_save_points(&[]), "");
+    }
+
+    #[test]
+    fn test_abandoned_save_is_neither_success_nor_failure() {
+        let st = state(3);
+        let t0 = st.last_save_unix();
+        note_write();
+        let pending = st.changes_since_last_save();
+        st.begin();
+        assert!(st.in_progress());
+        st.abandon();
+        assert!(!st.in_progress());
+        assert!(st.last_save_ok()); // not turned into a failure
+        assert_eq!(st.last_save_unix(), t0); // nor counted as a save
+        assert!(st.changes_since_last_save() >= pending);
     }
 
     #[test]
