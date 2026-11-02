@@ -307,6 +307,25 @@ impl ClusterHub {
         }
     }
 
+    /// Whether `ip:port` is this node: its own port at an address it listens
+    /// on (a wildcard bind covers the loopback addresses). Another host may
+    /// well use the same port, so the port alone says nothing.
+    pub fn is_my_addr(&self, ip: &str, port: u16) -> bool {
+        if port != self.port {
+            return false;
+        }
+        let Ok(ip) = ip
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+        else {
+            return ip.eq_ignore_ascii_case("localhost");
+        };
+        crate::netsec::bind_addrs(self.port).iter().any(|b| {
+            b.ip == ip || (b.ip.is_unspecified() && (ip.is_loopback() || ip.is_unspecified()))
+        })
+    }
+
     /// Whether this node serves `slot`.
     pub fn owns_slot(&self, slot: u16) -> bool {
         self.my_slots
@@ -992,13 +1011,51 @@ impl ClusterHub {
         )
     }
 
+    /// Records a peer being MEET under `temp_id` so it is known at once,
+    /// unless a node at that address and port is known already (hosts
+    /// commonly share a port, so the port alone is not a node). Returns
+    /// whether it was added.
+    fn add_meet_placeholder(
+        &self,
+        temp_id: &str,
+        ip: &str,
+        port: u16,
+        cport: u16,
+        now: u64,
+    ) -> bool {
+        let mut nodes = self.nodes.write();
+        if nodes.values().any(|n| n.ip == ip && n.port == port) {
+            return false;
+        }
+        nodes.insert(
+            temp_id.to_string(),
+            ClusterNodeInfo {
+                id: temp_id.to_string(),
+                ip: ip.to_string(),
+                port,
+                cport,
+                flags: "master".to_string(),
+                fail: FailState::Ok,
+                shards: 0,
+                master_id: "-".to_string(),
+                ping_sent: now,
+                pong_recv: now,
+                // Unknown until the peer answers; any real epoch is newer.
+                config_epoch: 0,
+                link_state: "connected".to_string(),
+                slots: Vec::new(),
+            },
+        );
+        true
+    }
+
     pub fn cluster_meet(&self, ip: &str, port: u16) -> Result<(), String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
-        if port == self.port {
+        if self.is_my_addr(ip, port) {
             return Ok(());
         }
 
@@ -1007,32 +1064,9 @@ impl ClusterHub {
         };
         let temp_id = generate_node_id(port);
 
-        // Pre-insert peer into nodes table so it is known immediately
-        {
-            let mut nodes = self.nodes.write();
-            if !nodes.values().any(|n| n.port == port) {
-                nodes.insert(
-                    temp_id.clone(),
-                    ClusterNodeInfo {
-                        id: temp_id.clone(),
-                        ip: ip.to_string(),
-                        port,
-                        cport,
-                        flags: "master".to_string(),
-                        fail: FailState::Ok,
-                        shards: 0,
-                        master_id: "-".to_string(),
-                        ping_sent: now,
-                        pong_recv: now,
-                        // Unknown until the peer answers; any real epoch is newer.
-                        config_epoch: 0,
-                        link_state: "connected".to_string(),
-                        slots: Vec::new(),
-                    },
-                );
-                self.has_nodes.store(true, Ordering::Release);
-                HAS_ACTIVE_CLUSTER.store(true, Ordering::Release);
-            }
+        if self.add_meet_placeholder(&temp_id, ip, port, cport, now) {
+            self.has_nodes.store(true, Ordering::Release);
+            HAS_ACTIVE_CLUSTER.store(true, Ordering::Release);
         }
 
         // Connect to remote cluster bus (cport = port + 10000)
@@ -1075,6 +1109,11 @@ impl ClusterHub {
                                 parts.get(4).map_or_else(Vec::new, |r| parse_slot_ranges(r));
                             let mut nodes = self.nodes.write();
                             nodes.remove(&temp_id);
+                            // An address of our own we didn't recognize
+                            // (say, a wildcard bind reached by a host IP).
+                            if remote_id == self.my_id() {
+                                return Ok(());
+                            }
                             nodes.insert(
                                 remote_id.clone(),
                                 ClusterNodeInfo {
@@ -1820,9 +1859,22 @@ impl ClusterHub {
 
         // Targeted rebalance to a specific node:
         if let Some((ref target_host, target_port, opt_slots)) = options.target_host_port {
-            let target_idx = masters.iter().position(|m| {
-                m.port == target_port || m.addr == format!("{}:{}", target_host, target_port)
-            });
+            // By address; by port alone only when no other master shares it
+            // (nodes on different hosts commonly do).
+            let target_addr_str = format!("{}:{}", target_host, target_port);
+            let target_idx = masters
+                .iter()
+                .position(|m| m.addr == target_addr_str)
+                .or_else(|| {
+                    let mut same_port = masters
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| m.port == target_port);
+                    match (same_port.next(), same_port.next()) {
+                        (Some((i, _)), None) => Some(i),
+                        _ => None,
+                    }
+                });
             let (target_node_id, target_addr) = match target_idx {
                 Some(idx) => (masters[idx].id.clone(), masters[idx].addr.clone()),
                 None => (
@@ -2519,6 +2571,10 @@ pub fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
                 return Some("-ERR invalid port\r\n".to_string());
             };
             let peer_id = parts[3].to_string();
+            if peer_id == hub.my_id() {
+                // Our own MEET, sent to an address of ours.
+                return Some(pong_reply(hub));
+            }
             let peer_epoch: u64 = if parts.len() >= 5 {
                 parts[4].parse().unwrap_or(1)
             } else {
@@ -3303,6 +3359,92 @@ mod tests {
         assert_eq!(hub.nodes.read()[&fresh].config_epoch, 0);
         assert!(hub.apply_pong(&fresh, &format!("+PONG {fresh} 0 master 10923-16383")));
         assert_eq!(hub.nodes.read()[&fresh].slots, vec![(10923, 16383)]);
+    }
+
+    #[test]
+    fn test_peers_on_other_hosts_may_share_our_port() {
+        // Placeholders rather than `cluster_meet`, which flags a cluster as
+        // active process-wide and so changes other tests' key routing.
+        let port = 7130;
+        crate::netsec::set_bind_addrs(port, crate::netsec::parse_bind_spec("127.0.0.1").unwrap());
+        let hub = ClusterHub::new(port);
+        assert!(hub.is_my_addr("127.0.0.1", port));
+        assert!(hub.is_my_addr("localhost", port));
+        assert!(!hub.is_my_addr("127.0.0.2", port));
+        assert!(!hub.is_my_addr("127.0.0.1", port + 1));
+
+        hub.add_meet_placeholder("p2", "127.0.0.2", port, port + 10000, 0);
+        hub.add_meet_placeholder("p3", "127.0.0.3", port, port + 10000, 0);
+        // Already known at that address: no second placeholder.
+        assert!(!hub.add_meet_placeholder("p3b", "127.0.0.3", port, port + 10000, 0));
+        let mut addrs: Vec<String> = hub
+            .nodes
+            .read()
+            .values()
+            .map(|n| format!("{}:{}", n.ip, n.port))
+            .collect();
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            [format!("127.0.0.2:{port}"), format!("127.0.0.3:{port}")]
+        );
+
+        // A wildcard bind is reached on any loopback address.
+        let wild = 7131;
+        crate::netsec::set_bind_addrs(wild, crate::netsec::parse_bind_spec("*").unwrap());
+        let hub = ClusterHub::new(wild);
+        assert!(hub.is_my_addr("127.0.0.2", wild));
+        assert!(!hub.is_my_addr("10.1.2.3", wild));
+    }
+
+    #[test]
+    fn test_our_own_meet_is_not_taken_for_a_peer() {
+        let hub = ClusterHub::new(7132);
+        let me = hub.my_id();
+        let reply = handle_cluster_bus_line(&format!("MEET 10.0.0.9 7132 {me} 3 0-16383"), &hub);
+        assert!(reply.unwrap().starts_with("+PONG"));
+        assert!(hub.nodes.read().is_empty());
+    }
+
+    #[test]
+    fn test_rebalance_target_is_found_by_address_not_port_alone() {
+        let hub = ClusterHub::new(7133);
+        for (id, ip) in [("a", "127.0.0.2"), ("b", "127.0.0.3")] {
+            let id = id.repeat(40);
+            hub.nodes.write().insert(
+                id.clone(),
+                ClusterNodeInfo {
+                    id,
+                    ip: ip.to_string(),
+                    port: 7000,
+                    cport: 17000,
+                    flags: "master".to_string(),
+                    fail: FailState::Ok,
+                    shards: 1,
+                    master_id: "-".to_string(),
+                    ping_sent: 0,
+                    pong_recv: 0,
+                    config_epoch: 1,
+                    link_state: "connected".to_string(),
+                    slots: Vec::new(),
+                },
+            );
+        }
+        let plan = |host: &str, port: u16| {
+            let opts = RebalanceOptions {
+                target_host_port: Some((host.to_string(), port, Some(1))),
+                ..RebalanceOptions::default()
+            };
+            hub.compute_rebalance_plan(&opts).unwrap()
+        };
+        let p = plan("127.0.0.3", 7000);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].target_node_id, "b".repeat(40));
+        assert_eq!(p[0].target_addr, "127.0.0.3:7000");
+        // Port 7000 alone is ambiguous: a new target, not either master.
+        let p = plan("10.9.9.9", 7000);
+        assert_eq!(p[0].target_addr, "10.9.9.9:7000");
+        assert!(![&"a".repeat(40), &"b".repeat(40)].contains(&&p[0].target_node_id));
     }
 
     #[test]

@@ -483,6 +483,17 @@ pub fn spawn_rudis_listening(args: &[&str], port: u16) -> std::process::Child {
 /// [`spawn_rudis_listening`] with `MONOIO_FORCE_LEGACY_DRIVER` set to
 /// `legacy` (`"0"` runs the io_uring driver production uses).
 pub fn spawn_rudis_listening_driver(args: &[&str], port: u16, legacy: &str) -> std::process::Child {
+    spawn_rudis_listening_at(args, "127.0.0.1", port, legacy)
+}
+
+/// [`spawn_rudis_listening_driver`], waiting for the server at `ip` (for a
+/// node bound to another loopback address, standing in for another host).
+pub fn spawn_rudis_listening_at(
+    args: &[&str],
+    ip: &str,
+    port: u16,
+    legacy: &str,
+) -> std::process::Child {
     let mut child = rudis_bin()
         .args(args)
         .args(DEBUG_ON)
@@ -497,7 +508,7 @@ pub fn spawn_rudis_listening_driver(args: &[&str], port: u16, legacy: &str) -> s
     // listener, which completes handshakes but never answers. Any reply
     // (`+PONG`, `-NOAUTH`, `-LOADING`, ...) comes from a live server.
     let ready = || -> bool {
-        let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+        let Ok(mut s) = TcpStream::connect((ip, port)) else {
             return false;
         };
         let _ = s.set_read_timeout(Some(Duration::from_millis(500)));

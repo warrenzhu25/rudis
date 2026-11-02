@@ -281,12 +281,15 @@ not our own, the receiver:
 
 `CLUSTER MEET` runs synchronously in the client command handler:
 
-1. It returns at once if the port is our own.
-2. It inserts a placeholder entry under a temporary id (unless some node already has that port) with
-   epoch 0 and no slots, and flags the hub as having peers and a cluster as active.
+1. It returns at once if the address is our own: our port at an address we are bound to (a wildcard
+   bind covers the loopback addresses). Another host may use the same port.
+2. It inserts a placeholder entry under a temporary id (unless some node already has that address
+   and port) with epoch 0 and no slots, and flags the hub as having peers and a cluster as active.
 3. It connects to the peer's bus port (300 ms connect and I/O timeouts), sends `MEET 127.0.0.1 <my
    port> <my id> <config epoch> <my slots>` and, on a `+PONG`, replaces the placeholder with the
-   real id, role, epoch and slots.
+   real id, role, epoch and slots. A PONG carrying our own id (an address of ours that the check in
+   step 1 missed) only drops the placeholder; likewise a received `MEET` with our own id is answered
+   but not recorded.
 4. It saves `nodes.conf`. If the handshake failed, the placeholder stays, and the next tick's PONG
    renames it.
 
@@ -641,10 +644,10 @@ target node and address). They change nothing.
 **Masters considered:** this node if it is a master, plus every peer that is a master (healthy or
 not, with or without slots). If there are none, the error is `No master nodes found in cluster`.
 
-**Targeted mode** (`<host> <port>` given): the target is the master matching that port or
-`host:port` (if none, a placeholder id). The donor is the largest other master if the target is us,
-else us (or the first master). Up to the requested slot count (default 1) are popped from the end of
-the donor's list.
+**Targeted mode** (`<host> <port>` given): the target is the master at that `host:port`, or else
+the only master with that port (if none or several, a placeholder id). The donor is the largest
+other master if the target is us, else us (or the first master). Up to the requested slot count
+(default 1) are popped from the end of the donor's list.
 
 **Auto or weighted mode** (a single master gives an empty plan):
 
@@ -782,11 +785,10 @@ line was found.
 ## 17. Limitations and not implemented
 
 * **Single-host addressing.** A node always advertises itself as `127.0.0.1` (in `MEET`, `CLUSTER
-  NODES`, `CLUSTER SLOTS`, `CLUSTER SHARDS` and local MOVED replies), `CLUSTER MEET` to a port equal
-  to our own is silently ignored, and the MEET placeholder is matched by port only. Multi-host
-  clusters, or several hosts using the same port, are not supported. The `cluster-announce-*` names
-  are in the config parser's list of known Redis directives, but nothing in the cluster code reads
-  them.
+  NODES`, `CLUSTER SLOTS`, `CLUSTER SHARDS` and local MOVED replies), so peers on other hosts record
+  it at the wrong address. (Peers themselves are told apart by address and port, so nodes on
+  different hosts may share a port.) The `cluster-announce-*` names are in the config parser's list
+  of known Redis directives, but nothing in the cluster code reads them.
 * **No bus outside cluster mode.** The bus starts only with `cluster-enabled yes`; a non-cluster node
   can send `CLUSTER MEET` but cannot receive heartbeats.
 * **Unauthenticated, text bus.** Any client that can reach the bus port can send `FAIL`,

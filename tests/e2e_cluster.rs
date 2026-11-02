@@ -3742,3 +3742,79 @@ fn test_cluster_moved_points_at_the_peers_shard_port_e2e() {
     let _ = std::fs::remove_dir_all(&da);
     let _ = std::fs::remove_dir_all(&db);
 }
+
+/// Two nodes on one port at different addresses (other loopback addresses
+/// stand in for other hosts): CLUSTER MEET of the peer must not be taken
+/// for a MEET of ourselves, as when the port alone identified a node.
+#[test]
+fn test_cluster_meet_peer_on_same_port_other_address_e2e() {
+    let port = 28401u16;
+    let spawn = |ip: &str| {
+        let dir = std::env::temp_dir().join(format!(
+            "rudis_cluster_sameport_{}_{}",
+            ip,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ServerGuard(spawn_rudis_listening_at(
+            &[
+                "--port",
+                &port.to_string(),
+                "--bind",
+                ip,
+                "--dir",
+                dir.to_str().unwrap(),
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "1",
+                "--no-pin",
+            ],
+            ip,
+            port,
+            &legacy_driver_env(),
+        ))
+    };
+    let _a = spawn("127.0.0.1");
+    let _b = spawn("127.0.0.2");
+    let cmd = |ip: &str, args: &[&str]| {
+        let mut c = TcpStream::connect((ip, port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd(&mut c, args)
+    };
+    let b_id = cmd("127.0.0.2", &["CLUSTER", "MYID"])
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_string();
+
+    // Meeting our own address is still a no-op.
+    assert_eq!(
+        cmd(
+            "127.0.0.1",
+            &["CLUSTER", "MEET", "127.0.0.1", &port.to_string()]
+        ),
+        "+OK\r\n"
+    );
+    let node_lines = |nodes: String| nodes.lines().filter(|l| l.contains("connected")).count();
+    assert_eq!(node_lines(cmd("127.0.0.1", &["CLUSTER", "NODES"])), 1);
+
+    assert_eq!(
+        cmd(
+            "127.0.0.1",
+            &["CLUSTER", "MEET", "127.0.0.2", &port.to_string()]
+        ),
+        "+OK\r\n"
+    );
+    let want = format!("{b_id} 127.0.0.2:{port}@{}", port + 10000);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let nodes = cmd("127.0.0.1", &["CLUSTER", "NODES"]);
+        if nodes.contains(&want) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{nodes}");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
