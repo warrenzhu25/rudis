@@ -13232,3 +13232,63 @@ fn test_multi_exec_checks_server_state_e2e() {
     assert_eq!(resp_cmd_all(&mut c, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
     assert_eq!(resp_cmd_all(&mut c, &["EXISTS", "f1", "f2"]), ":2\r\n");
 }
+
+/// A pipeline whose keys land on shards numbered 64 and above (more shards
+/// than bits in a `u64`) must still collect every shard's batch: the
+/// pending-shard set once was a single `u64`, so shard 64 aliased shard 0.
+#[test]
+fn test_pipeline_across_more_than_64_shards_e2e() {
+    let port = 26471;
+    let num_shards = 72;
+    start_test_server(port, num_shards);
+
+    // One key per shard, so the pipeline sends a batch to every shard.
+    let mut keys = vec![String::new(); num_shards];
+    let mut found = 0;
+    for i in 0.. {
+        let k = format!("wide_{i}");
+        let s = target_shard(k.as_bytes(), num_shards);
+        if keys[s].is_empty() {
+            keys[s] = k;
+            found += 1;
+            if found == num_shards {
+                break;
+            }
+        }
+    }
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut pipeline = Vec::new();
+    for (s, k) in keys.iter().enumerate() {
+        pipeline.extend(format_resp_cmd(&["SADD", k, &format!("m{s}")]));
+    }
+    for k in &keys {
+        pipeline.extend(format_resp_cmd(&["SMEMBERS", k]));
+    }
+    client.write_all(&pipeline).unwrap();
+
+    let mut expected = ":1\r\n".repeat(num_shards);
+    for s in 0..num_shards {
+        let m = format!("m{s}");
+        expected.push_str(&format!("*1\r\n${}\r\n{}\r\n", m.len(), m));
+    }
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+}
+
+/// `threads` past the pending-shard set's reach is refused at startup rather
+/// than misrouting pipelines.
+#[test]
+fn test_threads_above_the_shard_cap_refuse_to_start_e2e() {
+    let err = rudis_startup_error(&["--port", "26472", "--no-pin", "--threads", "257"]);
+    assert!(
+        err.contains("'threads' is 257, but at most 256 shards are supported"),
+        "{err}"
+    );
+    let err = rudis_startup_error(&["--port", "26472", "--no-pin", "--threads", "0"]);
+    assert!(err.contains("'threads' must be at least 1"), "{err}");
+}

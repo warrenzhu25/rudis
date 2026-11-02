@@ -29451,7 +29451,7 @@ async fn flush_remote_batches(
 ) {
     // Dispatch batched hops to all remote shards in parallel using pre-allocated channels
     let resp_base_ptr = responses.as_mut_ptr();
-    let mut pending_mask: u64 = 0;
+    let mut pending = crate::shardset::ShardSet::new();
     for (target_shard, items) in remote_batches.iter_mut().enumerate() {
         if !items.is_empty() {
             let responder = &responders[target_shard];
@@ -29468,7 +29468,7 @@ async fn flush_remote_batches(
                 replicate_as: None,
             };
             if router.senders[target_shard].send(msg).is_ok() {
-                pending_mask |= 1u64 << target_shard;
+                pending.insert(target_shard);
             }
         }
     }
@@ -29476,35 +29476,31 @@ async fn flush_remote_batches(
     // Await the replies; optionally poll first (`cross-shard-spin`, default 0)
     // before parking so the event loop can serve other connections meanwhile.
     for _spin in 0..crate::mailbox::cross_shard_spin() {
-        if pending_mask == 0 {
+        if pending.is_empty() {
             break;
         }
-        let mut check_mask = pending_mask;
-        while check_mask != 0 {
-            let target_shard = check_mask.trailing_zeros() as usize;
+        for target_shard in pending.iter() {
             let responder = &responders[target_shard];
             if let Some(mut recycled_items) = responder.try_take() {
                 // The remote shard leaves the commands in place; dropping them
                 // here keeps their key refcounts on this core.
                 recycled_items.clear();
                 items_pool.push(recycled_items);
-                pending_mask &= !(1u64 << target_shard);
+                pending.remove(target_shard);
             }
-            check_mask &= check_mask - 1;
         }
-        if pending_mask == 0 {
+        if pending.is_empty() {
             break;
         }
         std::hint::spin_loop();
     }
-    while pending_mask != 0 {
-        let target_shard = pending_mask.trailing_zeros() as usize;
+    while let Some(target_shard) = pending.first() {
         let responder = &responders[target_shard];
         if let Some(mut recycled_items) = responder.wait_take().await {
             recycled_items.clear();
             items_pool.push(recycled_items);
         }
-        pending_mask &= !(1u64 << target_shard);
+        pending.remove(target_shard);
     }
 }
 
@@ -32275,23 +32271,23 @@ mod tests {
         let mut resp_slot = [crate::shard::CompactResp::NULL; 4];
         responder.prepare(resp_slot.as_mut_ptr(), resp_slot.len());
 
-        let mut pending_mask: u64 = 0b101; // shards 0 and 2
+        let mut pending = crate::shardset::ShardSet::new();
+        pending.insert(0);
+        pending.insert(2);
         let responders = [responder.clone(), responder.clone(), responder.clone()];
 
         // Finish shard 0
         responder.finish(vec![]);
-        let mut check_mask = pending_mask;
-        while check_mask != 0 {
-            let target_shard = check_mask.trailing_zeros() as usize;
+        for target_shard in pending.iter() {
             if target_shard == 0 {
                 let r = &responders[target_shard];
                 if let Some(_items) = r.try_take() {
-                    pending_mask &= !(1u64 << target_shard);
+                    pending.remove(target_shard);
                 }
             }
-            check_mask &= check_mask - 1;
         }
-        assert_eq!(pending_mask, 0b100); // only shard 2 remaining
+        // Only shard 2 remains.
+        assert_eq!(pending.iter().collect::<Vec<_>>(), [2]);
     }
 
     #[monoio::test]

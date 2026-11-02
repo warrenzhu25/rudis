@@ -266,6 +266,10 @@ fn main() {
         args.tls_key_file,
         cluster_opt,
     );
+    if let Err(e) = server_config.validate_threads() {
+        log_fatal!("FATAL CONFIG: {}", e);
+        std::process::exit(1);
+    }
 
     if let Some(b) = args.bind {
         server_config.bind = b;

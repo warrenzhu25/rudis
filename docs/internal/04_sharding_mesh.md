@@ -1085,8 +1085,9 @@ element, then retry the move in the same locked way.
 * **Cross-shard MSETs are not ordered against each other.** Two concurrent lock-free MSETs of the
   same keys can apply in different orders on different shards. Atomic MGETs never see either one
   half applied, but the final values may mix the two.
-* **At most 64 shards for pipelines.** The pipeline path tracks in-flight shards in a 64-bit mask,
-  and nothing caps the `threads` setting.
+* **At most 256 shards.** The pipeline path tracks in-flight shards in a fixed 256-bit
+  `ShardSet` (`src/shardset.rs`), matching the pub/sub presence masks; `threads` above 256 (or
+  0) is refused at startup.
 * **Not every gather is pooled.** A number of low-traffic fan-outs (§6.5) still create a new
   channel per remote shard per call, and multi-key DEL uses per-shard channels rather than a
   scatter object.

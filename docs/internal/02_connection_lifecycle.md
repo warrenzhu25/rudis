@@ -1174,9 +1174,9 @@ over one connection.
 
 ## 16. Limitations and not implemented
 
-* **At most 64 shards for pipelines.** The pipeline path tracks pending shards in a 64-bit mask, so
-  shard numbers of 64 or more would alias. The default shard count is the number of cores, up to
-  8, but `threads` can be set higher and nothing caps it at 64.
+* **At most 256 shards.** The pipeline path tracks pending shards in a fixed 256-bit `ShardSet`
+  (`src/shardset.rs`). The default shard count is the number of cores, up to 8; a `threads`
+  setting above 256 (or 0) is refused at startup.
 * **CLIENT NO-EVICT** does nothing.
 * **Memcached support is partial.** Only set, add, replace, delete, incr, decr, stats and version
   have Memcached-style replies. `get` answers in RESP and takes one key; gets, cas, append, prepend

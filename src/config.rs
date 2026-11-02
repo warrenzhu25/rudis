@@ -842,6 +842,20 @@ impl RudisConfig {
         Self::parse_str(&content)
     }
 
+    /// Checks an explicit `threads` setting: at least 1, and at most
+    /// `shardset::MAX_SHARDS` (the reach of the pipeline's pending-shard set
+    /// and of the pub/sub presence masks).
+    pub fn validate_threads(&self) -> Result<(), String> {
+        match self.threads {
+            Some(0) => Err("'threads' must be at least 1".to_string()),
+            Some(n) if n > crate::shardset::MAX_SHARDS => Err(format!(
+                "'threads' is {n}, but at most {} shards are supported",
+                crate::shardset::MAX_SHARDS
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Overrides configuration settings with explicitly provided CLI arguments
     pub fn merge_cli(
         &mut self,
@@ -1324,6 +1338,21 @@ mod tests {
         );
         assert!(RudisConfig::parse_str("appendfsync sometimes").is_err());
         assert!(RudisConfig::parse_str("appendonly on").is_err());
+    }
+
+    #[test]
+    fn test_validate_threads_bounds() {
+        let mut cfg = RudisConfig::parse_str("").unwrap();
+        assert!(cfg.validate_threads().is_ok()); // unset: the default applies
+        for ok in [1, 64, 65, crate::shardset::MAX_SHARDS] {
+            cfg.threads = Some(ok);
+            assert!(cfg.validate_threads().is_ok(), "threads {ok}");
+        }
+        cfg.threads = Some(0);
+        assert!(cfg.validate_threads().is_err());
+        cfg.threads = Some(crate::shardset::MAX_SHARDS + 1);
+        let err = cfg.validate_threads().unwrap_err();
+        assert!(err.contains("at most 256 shards"), "{err}");
     }
 
     #[test]
