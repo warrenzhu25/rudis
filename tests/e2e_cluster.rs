@@ -2563,11 +2563,13 @@ fn test_cluster_master_failure_promotes_its_replica_e2e() {
     let info = cmd(replica, &["INFO", "replication"]);
     assert!(info.contains("role:master"), "{info}");
     assert_eq!(cmd(replica, &["DBSIZE"]), format!(":{}\r\n", keys.len()));
-    // The other masters route the victim's slots to the promoted replica.
+    // The other masters route the victim's slots to the promoted replica,
+    // at the port of the replica's shard serving them.
+    let replica_shard_port = replica + rudis::router::slot_to_shard(10923, 2) as u16;
     let slot_owner_is_replica = |p: u16| {
         let slots = cmd(p, &["CLUSTER", "SLOTS"]);
         slots.contains(&format!(
-            ":10923\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:{replica}\r\n"
+            ":10923\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:{replica_shard_port}\r\n"
         ))
     };
     wait_until("masters route the slots to the replica", &mut || {

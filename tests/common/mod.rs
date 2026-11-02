@@ -1723,10 +1723,12 @@ pub fn connect_ready(port: u16) -> TcpStream {
     }
 }
 
-/// Waits until every node's CLUSTER SLOTS shows all three ranges of a
+/// Waits until every node's CLUSTER SLOTS covers all 16384 slots of a
 /// 3-master test cluster: a master's slots are only learned from its own
 /// PINGs/PONGs, so killing one before that leaves the others (its replicas
-/// included) without its slots to fail over.
+/// included) without its slots to fail over. Coverage is checked rather
+/// than exact ranges, since a multi-shard master's range is listed split
+/// at its shards' boundaries.
 pub fn wait_for_slot_views(ports: &[u16]) {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -1738,16 +1740,7 @@ pub fn wait_for_slot_views(ports: &[u16]) {
                 resp_cmd(&mut c, &["CLUSTER", "SLOTS"])
             })
             .collect();
-        let full = |v: &String| {
-            [
-                ":0\r\n:5460\r\n",
-                ":5461\r\n:10922\r\n",
-                ":10923\r\n:16383\r\n",
-            ]
-            .iter()
-            .all(|r| v.contains(r))
-        };
-        if views.iter().all(full) {
+        if views.iter().all(|v| slots_reply_covers_all_slots(v)) {
             return;
         }
         assert!(
@@ -1756,6 +1749,26 @@ pub fn wait_for_slot_views(ports: &[u16]) {
         );
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Whether a RESP2 CLUSTER SLOTS reply's ranges cover slots 0..=16383.
+/// A range is the only place two integer lines follow each other.
+pub fn slots_reply_covers_all_slots(reply: &str) -> bool {
+    let lines: Vec<&str> = reply.split("\r\n").collect();
+    let int = |l: &str| l.strip_prefix(':').and_then(|n| n.parse::<u32>().ok());
+    let mut ranges: Vec<(u32, u32)> = lines
+        .windows(2)
+        .filter_map(|w| Some((int(w[0])?, int(w[1])?)))
+        .collect();
+    ranges.sort();
+    let mut next = 0;
+    for (start, end) in ranges {
+        if start > next {
+            return false;
+        }
+        next = next.max(end + 1);
+    }
+    next == 16384
 }
 
 /// Sends `cmd` and reads until `n` complete RESP replies arrived.
