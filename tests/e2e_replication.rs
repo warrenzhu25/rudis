@@ -6927,6 +6927,17 @@ fn test_dual_channel_full_sync_under_writes_e2e() {
         "+OK\r\n"
     );
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // ~10 MB/s: what the replica keeps up with, but more than the limit
+    // holds for a whole transfer and load. A coverage-instrumented build
+    // (cargo-llvm-cov sets LLVM_PROFILE_FILE) applies the stream several
+    // times slower, so its replica overran the limit and full-synced again
+    // and again; ~2.5 MB/s there still far exceeds the limit over its
+    // slower transfer.
+    let pause = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        Duration::from_millis(40)
+    } else {
+        Duration::from_millis(10)
+    };
     let writer = {
         let stop = stop.clone();
         thread::spawn(move || {
@@ -6950,9 +6961,7 @@ fn test_dual_channel_full_sync_under_writes_e2e() {
                     got += w.read(&mut buf).unwrap();
                 }
                 n += 200;
-                // ~10 MB/s: what the replica keeps up with, but more than
-                // the limit holds for a whole transfer and load.
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(pause);
             }
         })
     };
