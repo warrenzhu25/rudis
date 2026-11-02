@@ -2256,3 +2256,81 @@ fn test_metrics_report_per_shard_keys_and_memory_e2e() {
     assert!(gauge("rudis_process_resident_memory_bytes") > 0);
     gauge("rudis_mailbox_overflows_total");
 }
+
+/// Reads `n` complete RESP replies.
+fn read_replies(c: &mut TcpStream, n: usize) -> Vec<String> {
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while out.len() < n {
+        match resp_value_end(&buf, at) {
+            Some(end) if at < buf.len() => {
+                out.push(String::from_utf8_lossy(&buf[at..end]).into_owned());
+                at = end;
+            }
+            _ => {
+                let mut chunk = [0u8; 65536];
+                let r = c.read(&mut chunk).unwrap();
+                assert!(r > 0, "connection closed after {} replies", out.len());
+                buf.extend_from_slice(&chunk[..r]);
+            }
+        }
+    }
+    out
+}
+
+/// Pipelined GETs and MGETs of keys spilled to NVMe answer their values,
+/// on whichever shard each key lives: the squashed and cross-shard batch
+/// paths must read the tier, not take the tiered slot for a wrong type.
+#[test]
+fn test_pipelined_gets_of_spilled_keys_e2e() {
+    let port = 16491;
+    start_test_server(port, 4);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let keys: Vec<String> = (0..40).map(|i| format!("cold:{i}")).collect();
+    let val = |k: &str| format!("{k}-").repeat(30);
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut c, &["SET", k, &val(k)]), "+OK\r\n");
+    }
+    assert_eq!(resp_cmd(&mut c, &["SET", "hot", "h"]), "+OK\r\n");
+    let spilled: i64 = resp_cmd(&mut c, &["TIER", "SPILLALL"])
+        .trim_start_matches(':')
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(spilled >= keys.len() as i64, "{spilled}");
+    let bulk = |v: &str| format!("${}\r\n{}\r\n", v.len(), v);
+
+    // GETs only (the squashed GET path), then GETs mixed with other
+    // commands and an MGET across shards.
+    for round in 0..2 {
+        let mut pipe = Vec::new();
+        let mut want = Vec::new();
+        for k in &keys {
+            pipe.extend(format_resp_cmd(&["GET", k]));
+            want.push(bulk(&val(k)));
+            if round == 1 {
+                pipe.extend(format_resp_cmd(&["GET", "hot"]));
+                want.push(bulk("h"));
+            }
+        }
+        if round == 1 {
+            let mut mget = vec!["MGET"];
+            mget.extend(keys.iter().map(String::as_str));
+            pipe.extend(format_resp_cmd(&mget));
+            let mut arr = format!("*{}\r\n", keys.len());
+            for k in &keys {
+                arr.push_str(&bulk(&val(k)));
+            }
+            want.push(arr);
+        }
+        c.write_all(&pipe).unwrap();
+        let got = read_replies(&mut c, want.len());
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g, w, "round {round}, reply {i}");
+        }
+        // Spill again for the next round (reads may have promoted keys).
+        resp_cmd(&mut c, &["TIER", "SPILLALL"]);
+    }
+}

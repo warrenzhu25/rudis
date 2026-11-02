@@ -993,6 +993,7 @@ impl Router {
         match val {
             crate::table::RudisValue::String(s) => Some(s.to_bytes()),
             crate::table::RudisValue::Int(n) => Some(crate::table::RudisTable::format_i64(n)),
+            crate::table::RudisValue::HyperLogLog(regs) => Some(Bytes::copy_from_slice(&regs[..])),
             _ => None,
         }
     }

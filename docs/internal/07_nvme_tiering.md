@@ -643,11 +643,6 @@ An unknown subcommand returns an error listing the valid ones. Exact reply forma
 
 - **The upload threshold does nothing.** Its comment describes a "stream without promotion" cut-off,
   but the only such check reads the offload threshold.
-- **A pipelined GET of a spilled key may answer WRONGTYPE.** The table's fast compact lookup returns
-  the wrong-type error for any non-string value, including a tiered pointer. The squashed-pipeline and
-  cross-shard batch GET paths expect "not found in RAM" before queuing a cold read, so for a tiered
-  slot they appear to take the error branch instead; the squashed MGET path appears to answer nil.
-  Single GETs handle it correctly. No end-to-end test pipelines GETs on spilled keys.
 - **Streaming only covers strings.** Other types return nothing from the streaming read.
 - **Victim selection is round-robin**, not LRU or LFU, so hot keys can be spilled.
 - **The triggering shard absorbs the whole excess** in its own pass. Other shards are asked to spill

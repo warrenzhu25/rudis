@@ -4263,6 +4263,11 @@ impl RudisTable {
                 RudisValue::HyperLogLog(regs) => Ok(Some(crate::shard::CompactResp::from_bulk(
                     &Bytes::copy_from_slice(&regs[..]),
                 ))),
+                // Spilled to the tier: "not in RAM", so the caller queues a
+                // cold read (see `RudisTable::is_tiered`). Only the types GET
+                // reads (strings and ints, HyperLogLogs) are; any other is a
+                // wrong type, as in RAM.
+                RudisValue::Tiered(ptr) if matches!(ptr.value_type, 0 | 5) => Ok(None),
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             };
             if !crate::connection::CLIENT_NO_TOUCH.get() {
@@ -20441,6 +20446,39 @@ mod tests {
         assert_eq!(table.xlen(b"restored_stream").unwrap(), 5);
         let restored_range = table.xrange(b"restored_stream", "-", "+", None).unwrap();
         assert_eq!(restored_range.len(), 5);
+    }
+
+    #[test]
+    fn test_compact_get_of_a_spilled_key_asks_for_a_cold_read() {
+        let mut table = RudisTable::new();
+        let ptr = |value_type| TieredPointer {
+            file_id: 0,
+            offset: 4096,
+            length: 128,
+            value_type,
+        };
+        table.set(Bytes::from_static(b"s"), Bytes::from_static(b"v"), None);
+        table.set(Bytes::from_static(b"n"), Bytes::from_static(b"12"), None);
+        table
+            .lpush(Bytes::from_static(b"l"), vec![Bytes::from_static(b"x")])
+            .unwrap();
+        assert!(table.set_tiered_pointer(b"s", ptr(0)));
+        assert!(table.set_tiered_pointer(b"n", ptr(0))); // ints spill as strings
+        assert!(table.set_tiered_pointer(b"l", ptr(1)));
+        // Not in RAM, so the pipelined paths queue a cold read (they check
+        // `is_tiered` on `Ok(None)`), where it used to be WRONGTYPE.
+        for k in [&b"s"[..], b"n"] {
+            assert!(matches!(table.get_compact(k), Ok(None)));
+            assert!(table.is_tiered(k).is_some());
+        }
+        // A spilled list is still a wrong type for GET.
+        assert!(
+            table
+                .get_compact(b"l")
+                .unwrap_err()
+                .starts_with("WRONGTYPE")
+        );
+        assert!(matches!(table.get_compact(b"missing"), Ok(None)));
     }
 
     #[test]
