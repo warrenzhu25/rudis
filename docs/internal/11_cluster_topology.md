@@ -192,17 +192,17 @@ base port plus that shard number. This shows up in three places:
    replies and `CLUSTER SLOTS` point at the exact shard port. A client therefore needs at most one
    redirect.
 2. **Local redirect.** A command for a slot this node serves, arriving on the wrong shard port, gets
-   `-MOVED <slot> 127.0.0.1:<base port + owning shard>` (§10).
+   `-MOVED <slot> <announced ip>:<announced port + owning shard>` (§10, §6.5).
 3. **Single-node view.** Before any peer is known, the introspection commands present each shard as
    if it were a separate master:
    * `CLUSTER NODES` shows this view only when cluster mode is on, the peer table is empty and the
      slot list is still the default 0–16383. The `myself` line shows the first shard's range,
      then there is one line per extra shard with its pseudo id, its address
-     (`127.0.0.1:<port+shard>@<port+shard+10000>`) and its range (`shard × 16384 / N` up to
+     (`<announced ip>:<announced port+shard>@<that port+10000>`) and its range (`shard × 16384 / N` up to
      `(shard + 1) × 16384 / N − 1`, the last ending at 16383).
    * `CLUSTER SLOTS` shows one entry per shard with the same ranges and pseudo ids whenever the
-     peer table is empty; the port is the base port plus the shard in cluster mode, else the base
-     port.
+     peer table is empty; the port is the announced port plus the shard in cluster mode, else the
+     announced port.
    * `CLUSTER SHARDS` shows one shard entry per local shard (shard 0 uses the real id).
    * `CLUSTER CHECK` counts the pseudo peers' ranges (see the gotcha in §16).
 
@@ -246,9 +246,9 @@ any line must never panic.
 
 | Frame | Sent by | Effect at the receiver | Reply |
 | :--- | :--- | :--- | :--- |
-| `MEET <ip> <port> <id> <epoch> [<slots>]` | `CLUSTER MEET` | Inserts or refreshes the sender as a master (keeping any epoch and slots already known), then applies its slot claim. Refused if the table is full and the sender is new. | `+PONG ...`, or `-ERR too many cluster nodes` or `-ERR invalid port` |
-| `PING <id> <epoch> <role> [<slots>] shards=N [of=<master>] GOSSIP <entries>` | tick thread, peer refresh | For a **known** sender: records the sign of life, sets the link connected and health OK, applies the role and announce tokens, applies the slot claim, then ingests gossip (§6.3). Unknown senders are not added. | `+PONG ...` |
-| `+PONG <id> <epoch> <role> [<slots>] shards=N [of=<master>]` | reply to MEET and PING | If the id differs from the key we used (a MEET placeholder), the entry is renamed to the real id. Applies the role, tokens and slot claim. | none |
+| `MEET <ip> <port> <id> <epoch> [<slots>] [cport=<bus port>]` | `CLUSTER MEET` | Inserts or refreshes the sender as a master (keeping any epoch and slots already known), then applies its slot claim. Refused if the table is full and the sender is new. | `+PONG ...`, or `-ERR too many cluster nodes` or `-ERR invalid port` |
+| `PING <id> <epoch> <role> [<slots>] shards=N [ip=..] port=.. cport=.. [of=<master>] GOSSIP <entries>` | tick thread, peer refresh | For a **known** sender: records the sign of life, sets the link connected and health OK, applies the role and announce tokens, applies the slot claim, then ingests gossip (§6.3). Unknown senders are not added. | `+PONG ...` |
+| `+PONG <id> <epoch> <role> [<slots>] shards=N [ip=..] port=.. cport=.. [of=<master>]` | reply to MEET and PING | If the id differs from the key we used (a MEET placeholder), the entry is renamed to the real id. Applies the role, tokens and slot claim. | none |
 | `FAIL <id>` | a node that confirmed a failure | Marks the node FAIL and its link disconnected. | `+OK` |
 | `FAILOVER <id> <epoch> <slots>` | manual failover | Marks the sender a healthy master and applies its slot claim. | `+OK` |
 | `FAILOVER_ANNOUNCE <id> <epoch> <slots>` | election winner | Same as `FAILOVER`. Older claims (the failed master's) give way through the claim rule. | `+OK` |
@@ -257,8 +257,11 @@ any line must never panic.
 | anything else | | | `-ERR unknown clusterbus command` |
 
 Slot lists are written `start-end,start-end,...` (a single slot as `s-s`). **Announce tokens** are
-`shards=N` (the shard count in cluster mode, else 1) and, for a replica, `of=<master id>`. The
-receiver stores them and forces the master id to `-` for masters. Because a slotless node's slot
+`shards=N` (the shard count in cluster mode, else 1), the sender's announced address (`ip=` only
+when `cluster-announce-ip` is set, `port=` and `cport=` always; §6.5) and, for a replica,
+`of=<master id>`. The receiver stores them (ignoring an `ip=` that is not an IP address and zero
+ports) and forces the master id to `-` for masters. A `MEET`'s `cport=` gives the bus port; without
+it (older senders) the bus port is the port plus 10000. Because a slotless node's slot
 field is empty, a PING's fifth token counts as a slot list only if it is not `GOSSIP` and contains
 no `=`.
 
@@ -285,8 +288,8 @@ not our own, the receiver:
    bind covers the loopback addresses). Another host may use the same port.
 2. It inserts a placeholder entry under a temporary id (unless some node already has that address
    and port) with epoch 0 and no slots, and flags the hub as having peers and a cluster as active.
-3. It connects to the peer's bus port (300 ms connect and I/O timeouts), sends `MEET 127.0.0.1 <my
-   port> <my id> <config epoch> <my slots>` and, on a `+PONG`, replaces the placeholder with the
+3. It connects to the peer's bus port (300 ms connect and I/O timeouts), sends `MEET <announced ip>
+   <announced port> <my id> <config epoch> <my slots> cport=<announced bus port>` and, on a `+PONG`, replaces the placeholder with the
    real id, role, epoch and slots. A PONG carrying our own id (an address of ours that the check in
    step 1 missed) only drops the placeholder; likewise a received `MEET` with our own id is answered
    but not recorded.
@@ -296,6 +299,23 @@ not our own, the receiver:
 `CLUSTER FORGET <id>` removes the node and every failure report by or about it. `CLUSTER RESET`
 clears the node table and reports; `RESET HARD` also generates a new id, resets the epochs (current
 1, config 0), sets the role to master and clears the slot list.
+
+### 6.5 The announced address
+
+A node tells peers and clients to reach it at its **announced address**:
+
+| Setting (config file, `--name value`, `CONFIG SET`/`GET`) | Default | Announced as |
+| :--- | :--- | :--- |
+| `cluster-announce-ip` | empty | that IP address, else `127.0.0.1` |
+| `cluster-announce-port` | 0 | that port, else the port we listen on; shard N at this port + N |
+| `cluster-announce-bus-port` | 0 | that port, else the announced port + 10000 |
+
+It appears in the `MEET` frame, the announce tokens of every PING and PONG (so a change reaches peers
+with the next tick), the `myself` line of `CLUSTER NODES` (and `nodes.conf`), our own entries in
+`CLUSTER SLOTS` and `CLUSTER SHARDS`, the local-shard `-MOVED`, and the rebalance and reshard plans.
+`cluster-announce-ip` must be an IP address (not `0.0.0.0`); `CONFIG SET` refuses anything else.
+Peers learn our address only from what we announce, so **a multi-host cluster needs
+`cluster-announce-ip` on every node**; without it each node calls itself `127.0.0.1`.
 
 ---
 
@@ -516,8 +536,8 @@ For each command, the checks run in this order:
    * **Stable** matters only if cluster mode is on or a cluster is active. The slot is "served here"
      if the hub owns it, **or** the command is a read, the client sent `READONLY`, and this node is a
      replica of the slot's master. If it is served here and cluster mode is on, then another local
-     shard owning the slot gives `-MOVED <slot> 127.0.0.1:<base port + that shard>`, and otherwise the
-     command executes. If it is not served here, the first known non-FAIL master peer whose slots
+     shard owning the slot gives `-MOVED <slot> <announced ip>:<announced port + that shard>`, and
+     otherwise the command executes. If it is not served here, the first known non-FAIL master peer whose slots
      include it gives `-MOVED <slot> <peer ip>:<exact shard port>`, and no such peer gives
      `-CLUSTERDOWN Hash slot not served`.
 
@@ -536,7 +556,7 @@ shard, the transaction is discarded (queue cleared, WATCHes dropped) and the rep
   so the reply is `-MOVED 12182 <Y ip>:7101`. At 7101, Y owns the slot and shard 1 is the owner, so
   the command executes.
 * `GET k` with slot 3000 sent to 7001 (X's shard 1): X serves it but shard 0 owns it, so the reply is
-  `-MOVED 3000 127.0.0.1:7000`.
+  `-MOVED 3000 <X's announced ip>:7000`.
 
 The pipeline-squashing fast path (Component 04) performs its own cluster checks and falls back to
 running commands one by one through the normal path when the pipeline mixes slots, touches a slot
@@ -674,7 +694,7 @@ The reshard plan pops `min(count, source slots)` slots from the end of the sourc
 
 | Command | Source of truth and notes |
 | :--- | :--- |
-| `CLUSTER NODES` | The `myself` line (`127.0.0.1:<port>@<cport> myself,<role> <master> 0 0 <epoch> connected <slots>` plus migration markers `[s->-id]` and `[s-<-id]`), then peers sorted by id with flags, ping and pong times, epoch, link state and slots. Single-node view per §5. |
+| `CLUSTER NODES` | The `myself` line (`<announced ip>:<port>@<cport> myself,<role> <master> 0 0 <epoch> connected <slots>` plus migration markers `[s->-id]` and `[s-<-id]`), then peers sorted by id with flags, ping and pong times, epoch, link state and slots. Single-node view per §5. |
 | `CLUSTER SLOTS` | Peerless: §5. Otherwise one entry per contiguous range per master (us if a master, plus peer masters), split at shard boundaries for multi-shard nodes so each points at the serving shard port; replicas (nodes whose master id is that master) are listed with their own shard port. |
 | `CLUSTER SHARDS` | One entry per master with its replicas; per node `id`, `port`, `ip`, `endpoint` (equal to ip), `role`, `replication-offset` (always 0) and `health` (`fail` if FAIL, else `online`). |
 | `CLUSTER INFO` | `cluster_state` (§7.2), PFAIL and FAIL counts, `cluster_known_nodes` and `cluster_size` (both peers + 1), epochs. `cluster_slots_assigned` and `cluster_slots_ok` are fixed at 16384 and the message stats at 0. |
@@ -750,7 +770,7 @@ line was found.
    `-MOVED`. Multi-node `CLUSTER SLOTS` uses the routing formula and is exact.
 8. **Two kinds of MOVED target.** The stable-branch peer redirect uses the exact shard port; the
    moved and importing redirects use the peer's base `ip:port`, so a multi-shard target may redirect
-   once more. The local-shard redirect always says `127.0.0.1`.
+   once more. The local-shard redirect uses our announced address (§6.5).
 9. **Health recovers only through direct contact:** our PING succeeds, its PING arrives, or a
    failover message names it. Failure reports never expire by time; they are retracted only by a later
    gossip entry from the same reporter, or by `FORGET` or `RESET`.
@@ -784,11 +804,10 @@ line was found.
 
 ## 17. Limitations and not implemented
 
-* **Single-host addressing.** A node always advertises itself as `127.0.0.1` (in `MEET`, `CLUSTER
-  NODES`, `CLUSTER SLOTS`, `CLUSTER SHARDS` and local MOVED replies), so peers on other hosts record
-  it at the wrong address. (Peers themselves are told apart by address and port, so nodes on
-  different hosts may share a port.) The `cluster-announce-*` names are in the config parser's list
-  of known Redis directives, but nothing in the cluster code reads them.
+* **No address discovery.** Without `cluster-announce-ip` a node announces `127.0.0.1`; unlike
+  Redis it does not learn its address from the connections peers reach it on, so a multi-host
+  cluster must set `cluster-announce-ip` on every node (§6.5). `cluster-announce-hostname`,
+  `cluster-announce-client-ipv4/ipv6` and `cluster-announce-tls-port` are accepted but ignored.
 * **No bus outside cluster mode.** The bus starts only with `cluster-enabled yes`; a non-cluster node
   can send `CLUSTER MEET` but cannot receive heartbeats.
 * **Unauthenticated, text bus.** Any client that can reach the bus port can send `FAIL`,

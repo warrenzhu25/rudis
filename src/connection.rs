@@ -3845,6 +3845,20 @@ pub fn apply_config_value(
                 .node_timeout_ms
                 .store(ms, Ordering::Relaxed);
         }
+        "cluster-announce-ip" => {
+            if !val_str.is_empty() && !crate::cluster::valid_announced_ip(val_str) {
+                return Err(format!("Invalid cluster-announce-ip '{val_str}'"));
+            }
+            *crate::cluster::get_cluster_hub(base_port)
+                .announce_ip
+                .write() = (!val_str.is_empty()).then(|| val_str.to_string());
+        }
+        "cluster-announce-port" => crate::cluster::get_cluster_hub(base_port)
+            .announce_port
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "cluster-announce-bus-port" => crate::cluster::get_cluster_hub(base_port)
+            .announce_bus_port
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
         "cluster-config-file" => {
             if val_str.is_empty() {
                 return Err("Invalid cluster-config-file".to_string());
@@ -4100,20 +4114,36 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
-    let all_configs: [(&str, String); 100] = [
+    let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
+    let all_configs: [(&str, String); 103] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
         ("tls-cert-file", tls_cert_file),
         ("tls-key-file", tls_key_file),
-        (
-            "cluster-config-file",
-            crate::cluster::get_cluster_hub(router.base_port).config_file_name(),
-        ),
+        ("cluster-config-file", cluster_hub.config_file_name()),
         (
             "cluster-node-timeout",
-            crate::cluster::get_cluster_hub(router.base_port)
+            cluster_hub
                 .node_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "cluster-announce-ip",
+            cluster_hub.announce_ip.read().clone().unwrap_or_default(),
+        ),
+        (
+            "cluster-announce-port",
+            cluster_hub
+                .announce_port
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "cluster-announce-bus-port",
+            cluster_hub
+                .announce_bus_port
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .to_string(),
         ),
@@ -4498,9 +4528,19 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 );
                 return;
             }
+        } else if p_str == "cluster-announce-ip" {
+            if !val_str.is_empty() && !crate::cluster::valid_announced_ip(&val_str) {
+                out.extend_from_slice(
+                    b"-ERR CONFIG SET failed (possibly related to argument 'cluster-announce-ip') - argument must be an IP address\r\n",
+                );
+                return;
+            }
         } else if matches!(
             p_str.as_str(),
-            "replica-announce-port" | "slave-announce-port"
+            "replica-announce-port"
+                | "slave-announce-port"
+                | "cluster-announce-port"
+                | "cluster-announce-bus-port"
         ) {
             if val_str.parse::<u16>().is_err() {
                 out.extend_from_slice(
@@ -11849,9 +11889,9 @@ async fn execute_command_inner(
                         if router.cluster_enabled {
                             let target_shard = router.target_shard_for_slot(slot);
                             if target_shard != router.shard_id {
-                                let target_port = router.base_port + target_shard as u16;
+                                let target_port = hub.my_port() + target_shard as u16;
                                 out.extend_from_slice(
-                                    format!("-MOVED {} 127.0.0.1:{}\r\n", slot, target_port)
+                                    format!("-MOVED {} {}:{}\r\n", slot, hub.my_ip(), target_port)
                                         .as_bytes(),
                                 );
                                 return false;

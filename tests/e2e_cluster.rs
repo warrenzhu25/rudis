@@ -3818,3 +3818,115 @@ fn test_cluster_meet_peer_on_same_port_other_address_e2e() {
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// Two nodes on one port at different addresses, each with
+/// `cluster-announce-ip`: each learns the other's announced address from the
+/// bus, and redirects and CLUSTER NODES/SLOTS name it, not 127.0.0.1.
+#[test]
+fn test_cluster_announce_ip_reaches_peers_and_redirects_e2e() {
+    let port = 28402u16;
+    let spawn = |ip: &str| {
+        let dir = std::env::temp_dir().join(format!(
+            "rudis_cluster_announce_{}_{}",
+            ip,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ServerGuard(spawn_rudis_listening_at(
+            &[
+                "--port",
+                &port.to_string(),
+                "--bind",
+                ip,
+                "--cluster-announce-ip",
+                ip,
+                "--dir",
+                dir.to_str().unwrap(),
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "2",
+                "--no-pin",
+            ],
+            ip,
+            port,
+            &legacy_driver_env(),
+        ))
+    };
+    let (a, b) = ("127.0.0.2", "127.0.0.3");
+    let _a = spawn(a);
+    let _b = spawn(b);
+    let cmd = |ip: &str, p: u16, args: &[&str]| {
+        let mut c = TcpStream::connect((ip, p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd(&mut c, args)
+    };
+    let id = |ip: &str| {
+        cmd(ip, port, &["CLUSTER", "MYID"])
+            .lines()
+            .nth(1)
+            .unwrap()
+            .to_string()
+    };
+    let (a_id, b_id) = (id(a), id(b));
+    assert_eq!(
+        cmd(a, port, &["CONFIG", "GET", "cluster-announce-ip"]),
+        format!("*2\r\n$19\r\ncluster-announce-ip\r\n$9\r\n{a}\r\n")
+    );
+    assert!(cmd(a, port, &["CONFIG", "SET", "cluster-announce-ip", "nope"]).starts_with("-ERR"));
+
+    for (ip, (s, e)) in [(a, ("0", "8191")), (b, ("8192", "16383"))] {
+        assert_eq!(
+            cmd(ip, port, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(ip, port, &["CLUSTER", "ADDSLOTSRANGE", s, e]),
+            "+OK\r\n"
+        );
+    }
+    assert_eq!(
+        cmd(a, port, &["CLUSTER", "MEET", b, &port.to_string()]),
+        "+OK\r\n"
+    );
+
+    // B learned A from A's MEET: at A's announced address, not 127.0.0.1.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (na, nb) = (
+            cmd(a, port, &["CLUSTER", "NODES"]),
+            cmd(b, port, &["CLUSTER", "NODES"]),
+        );
+        let ok = nb.contains(&format!("{a_id} {a}:{port}@{} master", port + 10000))
+            && na.contains(&format!("{b_id} {b}:{port}@{} master", port + 10000))
+            && na.contains(&format!("{a_id} {a}:{port}@{} myself,master", port + 10000))
+            && slots_reply_covers_all_slots(&cmd(b, port, &["CLUSTER", "SLOTS"]));
+        if ok {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "A:\n{na}\nB:\n{nb}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!cmd(b, port, &["CLUSTER", "SLOTS"]).contains("127.0.0.1"));
+
+    // A key of A's, asked of B: redirected to A's announced address and
+    // the port of A's shard serving it.
+    let key = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| rudis::router::key_slot(k.as_bytes()) < 8192)
+        .unwrap();
+    let slot = rudis::router::key_slot(key.as_bytes());
+    let a_shard_port = port + rudis::router::slot_to_shard(slot, 2) as u16;
+    assert_eq!(
+        cmd(b, port, &["GET", &key]),
+        format!("-MOVED {slot} {a}:{a_shard_port}\r\n")
+    );
+    // Asked of A's other shard: the local redirect names A's address too.
+    let other = if a_shard_port == port { port + 1 } else { port };
+    assert_eq!(
+        cmd(a, other, &["GET", &key]),
+        format!("-MOVED {slot} {a}:{a_shard_port}\r\n")
+    );
+    assert_eq!(cmd(a, a_shard_port, &["GET", &key]), "$-1\r\n");
+}

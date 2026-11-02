@@ -209,6 +209,14 @@ pub struct ClusterHub {
     /// This master paused its writers for a replica's manual failover
     /// (until it steps down, or the pause times out).
     pub mf_paused: AtomicBool,
+    /// `cluster-announce-ip`: the address peers and clients are told to
+    /// reach this node at (MEET, CLUSTER NODES/SLOTS/SHARDS, MOVED).
+    pub announce_ip: RwLock<Option<String>>,
+    /// `cluster-announce-port` (0: the port we listen on). Shard N is at
+    /// this port + N, as with the real one.
+    pub announce_port: std::sync::atomic::AtomicU16,
+    /// `cluster-announce-bus-port` (0: the announced port + 10000).
+    pub announce_bus_port: std::sync::atomic::AtomicU16,
 }
 
 pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
@@ -304,13 +312,46 @@ impl ClusterHub {
             follow: parking_lot::Mutex::new(None),
             node_timeout_ms: AtomicU64::new(NODE_TIMEOUT_MS),
             mf_paused: AtomicBool::new(false),
+            announce_ip: RwLock::new(None),
+            announce_port: std::sync::atomic::AtomicU16::new(0),
+            announce_bus_port: std::sync::atomic::AtomicU16::new(0),
         }
     }
 
-    /// Whether `ip:port` is this node: its own port at an address it listens
-    /// on (a wildcard bind covers the loopback addresses). Another host may
-    /// well use the same port, so the port alone says nothing.
+    /// The address this node announces (`cluster-announce-ip`, else
+    /// `127.0.0.1`).
+    pub fn my_ip(&self) -> String {
+        self.announce_ip
+            .read()
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string())
+    }
+
+    /// The client port this node announces (shard 0's).
+    pub fn my_port(&self) -> u16 {
+        match self.announce_port.load(Ordering::Relaxed) {
+            0 => self.port,
+            p => p,
+        }
+    }
+
+    /// The cluster-bus port this node announces.
+    pub fn my_cport(&self) -> u16 {
+        match self.announce_bus_port.load(Ordering::Relaxed) {
+            0 if self.announce_port.load(Ordering::Relaxed) == 0 => self.cport,
+            0 => self.my_port().saturating_add(10000),
+            p => p,
+        }
+    }
+
+    /// Whether `ip:port` is this node: its announced address and port, or its
+    /// own port at an address it listens on (a wildcard bind covers the
+    /// loopback addresses). Another host may well use the same port, so the
+    /// port alone says nothing.
     pub fn is_my_addr(&self, ip: &str, port: u16) -> bool {
+        if port == self.my_port() && self.announce_ip.read().as_deref() == Some(ip) {
+            return true;
+        }
         if port != self.port {
             return false;
         }
@@ -779,8 +820,10 @@ impl ClusterHub {
     }
 
     /// What PINGs and PONGs announce besides role and slots: `shards=N`
-    /// (client ports from ours, one per shard) and, for a replica,
-    /// `of=<master id>`. Older peers ignore tokens they don't know.
+    /// (client ports from ours, one per shard), our announced address
+    /// (`ip=`, `port=`, `cport=`) so a changed `cluster-announce-*` reaches
+    /// peers, and, for a replica, `of=<master id>`. Older peers ignore tokens
+    /// they don't know.
     fn announce_tokens(&self) -> String {
         let shards = if self.cluster_enabled.load(Ordering::Relaxed) {
             self.num_shards.load(Ordering::Relaxed).max(1)
@@ -788,6 +831,14 @@ impl ClusterHub {
             1
         };
         let mut t = format!("shards={shards}");
+        if let Some(ip) = self.announce_ip.read().as_deref() {
+            t.push_str(&format!(" ip={ip}"));
+        }
+        t.push_str(&format!(
+            " port={} cport={}",
+            self.my_port(),
+            self.my_cport()
+        ));
         if *self.role.read() == "slave" {
             t.push_str(&format!(" of={}", self.master_id.read()));
         }
@@ -913,11 +964,13 @@ impl ClusterHub {
         };
 
         let my_flags = format!("myself,{}", role);
+        let (my_ip, my_port, my_cport) = (self.my_ip(), self.my_port(), self.my_cport());
         out.push_str(&format!(
-            "{} 127.0.0.1:{}@{} {} {} 0 0 {} connected{}{}\n",
+            "{} {}:{}@{} {} {} 0 0 {} connected{}{}\n",
             my_id,
-            self.port,
-            self.cport,
+            my_ip,
+            my_port,
+            my_cport,
             my_flags,
             master_id,
             cfg_epoch,
@@ -929,7 +982,7 @@ impl ClusterHub {
         let nodes = self.nodes.read();
         if single_node_view && is_cluster && nodes.is_empty() {
             for s in 1..num_shards {
-                let peer_port = self.port + s as u16;
+                let peer_port = my_port + s as u16;
                 let peer_cport = peer_port + 10000;
                 let peer_start = s * 16384 / num_shards;
                 let peer_end = if s == num_shards - 1 {
@@ -939,8 +992,9 @@ impl ClusterHub {
                 };
                 let peer_id = format!("{:040x}", s + 1);
                 out.push_str(&format!(
-                    "{} 127.0.0.1:{}@{} master - 0 0 {} connected {}-{}\n",
+                    "{} {}:{}@{} master - 0 0 {} connected {}-{}\n",
                     peer_id,
+                    my_ip,
                     peer_port,
                     peer_cport,
                     s + 1,
@@ -1088,11 +1142,13 @@ impl ClusterHub {
                 slots_repr.pop();
             }
             let meet_frame = format!(
-                "MEET 127.0.0.1 {} {} {} {}\r\n",
-                self.port,
+                "MEET {} {} {} {} {} cport={}\r\n",
+                self.my_ip(),
+                self.my_port(),
                 self.my_id(),
                 my_epoch,
-                slots_repr
+                slots_repr,
+                self.my_cport()
             );
             if stream.write_all(meet_frame.as_bytes()).is_ok() {
                 let mut buf = [0u8; 512];
@@ -1260,6 +1316,7 @@ impl ClusterHub {
         let nodes = self.nodes.read();
         if nodes.is_empty() {
             // Standalone node fallback: report slots divided across local num_shards
+            let my_ip = self.my_ip();
             out.extend_from_slice(format!("*{}\r\n", num_shards).as_bytes());
             for s in 0..num_shards {
                 let start_slot = s * 16384 / num_shards;
@@ -1270,15 +1327,17 @@ impl ClusterHub {
                 };
                 let node_id = format!("{:040x}", s + 1);
                 let shard_port = if self.cluster_enabled.load(Ordering::Relaxed) {
-                    self.port + s as u16
+                    self.my_port() + s as u16
                 } else {
-                    self.port
+                    self.my_port()
                 };
                 out.extend_from_slice(b"*3\r\n");
                 out.extend_from_slice(format!(":{}\r\n:{}\r\n", start_slot, end_slot).as_bytes());
                 out.extend_from_slice(
                     format!(
-                        "*3\r\n$9\r\n127.0.0.1\r\n:{}\r\n${}\r\n{}\r\n",
+                        "*3\r\n${}\r\n{}\r\n:{}\r\n${}\r\n{}\r\n",
+                        my_ip.len(),
+                        my_ip,
                         shard_port,
                         node_id.len(),
                         node_id
@@ -1323,8 +1382,8 @@ impl ClusterHub {
                 entries.push(MasterSlotEntry {
                     start: s,
                     end: e,
-                    master_ip: "127.0.0.1".to_string(),
-                    master_port: self.port,
+                    master_ip: self.my_ip(),
+                    master_port: self.my_port(),
                     master_shards: my_shards,
                     master_id: my_id.clone(),
                     replicas: my_replicas.clone(),
@@ -1454,8 +1513,8 @@ impl ClusterHub {
             let mut shard_nodes = Vec::new();
             shard_nodes.push((
                 my_id.clone(),
-                self.port,
-                "127.0.0.1".to_string(),
+                self.my_port(),
+                self.my_ip(),
                 "master".to_string(),
                 "online".to_string(),
             ));
@@ -1517,8 +1576,8 @@ impl ClusterHub {
                 if *self.master_id.read() == peer.id {
                     shard_nodes.push((
                         my_id.clone(),
-                        self.port,
-                        "127.0.0.1".to_string(),
+                        self.my_port(),
+                        self.my_ip(),
                         "replica".to_string(),
                         "online".to_string(),
                     ));
@@ -1541,7 +1600,7 @@ impl ClusterHub {
                     } else {
                         (s + 1) * 16384 / num_shards - 1
                     };
-                    let shard_port = self.port + s as u16;
+                    let shard_port = self.my_port() + s as u16;
                     let node_id = if s == 0 {
                         my_id.clone()
                     } else {
@@ -1550,7 +1609,7 @@ impl ClusterHub {
                     let shard_nodes = vec![(
                         node_id,
                         shard_port,
-                        "127.0.0.1".to_string(),
+                        self.my_ip(),
                         "master".to_string(),
                         "online".to_string(),
                     )];
@@ -1563,8 +1622,8 @@ impl ClusterHub {
                 // Fallback for single node
                 let shard_nodes = vec![(
                     my_id,
-                    self.port,
-                    "127.0.0.1".to_string(),
+                    self.my_port(),
+                    self.my_ip(),
                     my_role,
                     "online".to_string(),
                 )];
@@ -1812,7 +1871,7 @@ impl ClusterHub {
 
         let mut masters = Vec::new();
         let my_id = self.my_id();
-        let my_addr = format!("127.0.0.1:{}", self.port);
+        let my_addr = format!("{}:{}", self.my_ip(), self.my_port());
         let my_slots: Vec<u16> = {
             let ranges = self.my_slots.read();
             let mut s = Vec::new();
@@ -1828,7 +1887,7 @@ impl ClusterHub {
             masters.push(Master {
                 id: my_id.clone(),
                 addr: my_addr,
-                port: self.port,
+                port: self.my_port(),
                 slots: my_slots,
             });
         }
@@ -2029,7 +2088,7 @@ impl ClusterHub {
                     s.push(slot);
                 }
             }
-            (format!("127.0.0.1:{}", self.port), s)
+            (format!("{}:{}", self.my_ip(), self.my_port()), s)
         } else {
             let nodes = self.nodes.read();
             let node = nodes
@@ -2045,7 +2104,7 @@ impl ClusterHub {
         };
 
         let target_addr = if target_node_id == my_id {
-            format!("127.0.0.1:{}", self.port)
+            format!("{}:{}", self.my_ip(), self.my_port())
         } else {
             let nodes = self.nodes.read();
             let node = nodes
@@ -2512,6 +2571,13 @@ fn pong_reply(hub: &ClusterHub) -> String {
     )
 }
 
+/// Whether `ip` may be announced or taken from a peer's announcement: an IP
+/// address (as `cluster-announce-ip` requires in Redis).
+pub fn valid_announced_ip(ip: &str) -> bool {
+    ip.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| !ip.is_unspecified())
+}
+
 /// Records what a peer's PING or PONG announced (see `announce_tokens`).
 fn apply_announce(node: &mut ClusterNodeInfo, parts: &[&str]) {
     for p in parts {
@@ -2519,6 +2585,16 @@ fn apply_announce(node: &mut ClusterNodeInfo, parts: &[&str]) {
             node.shards = n;
         } else if let Some(m) = p.strip_prefix("of=") {
             node.master_id = m.to_string();
+        } else if let Some(ip) = p.strip_prefix("ip=").filter(|ip| valid_announced_ip(ip)) {
+            node.ip = ip.to_string();
+        } else if let Some(port) = p.strip_prefix("port=").and_then(|n| n.parse().ok())
+            && port != 0
+        {
+            node.port = port;
+        } else if let Some(cport) = p.strip_prefix("cport=").and_then(|n| n.parse().ok())
+            && cport != 0
+        {
+            node.cport = cport;
         }
     }
     if node.is_master() {
@@ -2558,18 +2634,27 @@ pub fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
     let cmd = *parts.first()?;
     match cmd {
         "MEET" => {
-            // MEET <ip> <port> <node_id> <epoch> <slots>
+            // MEET <ip> <port> <node_id> <epoch> <slots> [cport=<bus port>]
             if parts.len() < 4 {
                 return None;
             }
             let peer_ip = parts[1].to_string();
-            let Some((peer_port, peer_cport)) = parts[2]
+            let Some((peer_port, mut peer_cport)) = parts[2]
                 .parse::<u16>()
                 .ok()
                 .and_then(|p| Some((p, bus_port(p)?)))
             else {
                 return Some("-ERR invalid port\r\n".to_string());
             };
+            // An announced bus port (`cluster-announce-bus-port`).
+            if let Some(c) = parts
+                .iter()
+                .skip(5)
+                .find_map(|p| p.strip_prefix("cport=")?.parse::<u16>().ok())
+                .filter(|c| *c != 0)
+            {
+                peer_cport = c;
+            }
             let peer_id = parts[3].to_string();
             if peer_id == hub.my_id() {
                 // Our own MEET, sent to an address of ours.
@@ -3445,6 +3530,86 @@ mod tests {
         let p = plan("10.9.9.9", 7000);
         assert_eq!(p[0].target_addr, "10.9.9.9:7000");
         assert!(![&"a".repeat(40), &"b".repeat(40)].contains(&&p[0].target_node_id));
+    }
+
+    #[test]
+    fn test_announced_address_is_what_peers_and_clients_see() {
+        let hub = ClusterHub::new(7140);
+        hub.cluster_enabled.store(true, Ordering::Relaxed);
+        hub.num_shards.store(2, Ordering::Relaxed);
+        // Unset: the address and ports we listen on.
+        assert_eq!(
+            (hub.my_ip().as_str(), hub.my_port(), hub.my_cport()),
+            ("127.0.0.1", 7140, 17140)
+        );
+        assert!(
+            hub.cluster_nodes()
+                .contains(" 127.0.0.1:7140@17140 myself,master")
+        );
+
+        *hub.announce_ip.write() = Some("10.1.1.1".to_string());
+        hub.announce_port.store(27000, Ordering::Relaxed);
+        assert_eq!(hub.my_cport(), 37000); // announced port + 10000
+        let nodes = hub.cluster_nodes();
+        assert!(
+            nodes.contains(" 10.1.1.1:27000@37000 myself,master"),
+            "{nodes}"
+        );
+        // The single-node view's shard 1, at the announced port + 1.
+        assert!(nodes.contains(" 10.1.1.1:27001@37001 master"), "{nodes}");
+        let mut slots = Vec::new();
+        hub.cluster_slots(&mut slots, 2);
+        let slots = String::from_utf8(slots).unwrap();
+        assert!(slots.contains("$8\r\n10.1.1.1\r\n:27000\r\n"), "{slots}");
+        assert!(slots.contains("$8\r\n10.1.1.1\r\n:27001\r\n"), "{slots}");
+        let mut shards = Vec::new();
+        hub.cluster_shards(&mut shards);
+        let shards = String::from_utf8(shards).unwrap();
+        assert!(
+            shards.contains("10.1.1.1") && !shards.contains("127.0.0.1"),
+            "{shards}"
+        );
+        assert!(hub.is_my_addr("10.1.1.1", 27000));
+        assert!(
+            hub.announce_tokens()
+                .contains("ip=10.1.1.1 port=27000 cport=37000")
+        );
+
+        hub.announce_bus_port.store(27555, Ordering::Relaxed);
+        assert_eq!(hub.my_cport(), 27555);
+        assert!(hub.cluster_nodes().contains(" 10.1.1.1:27000@27555 myself"));
+    }
+
+    #[test]
+    fn test_peers_take_announced_addresses_from_meet_and_ping() {
+        let hub = ClusterHub::new(7141);
+        let peer = "e".repeat(40);
+        handle_cluster_bus_line(&format!("MEET 10.2.2.2 27100 {peer} 1  cport=27555"), &hub);
+        let addr = |hub: &ClusterHub| {
+            let nodes = hub.nodes.read();
+            let n = &nodes[&peer];
+            (n.ip.clone(), n.port, n.cport)
+        };
+        assert_eq!(addr(&hub), ("10.2.2.2".to_string(), 27100, 27555));
+        // Without the token, the bus port is the port + 10000, as before.
+        let old = "f".repeat(40);
+        handle_cluster_bus_line(&format!("MEET 10.2.2.3 7000 {old} 1 0-5"), &hub);
+        assert_eq!(hub.nodes.read()[&old].cport, 17000);
+
+        // A changed announcement reaches peers with the next PING.
+        handle_cluster_bus_line(
+            &format!("PING {peer} 1 master shards=1 ip=10.3.3.3 port=27200 cport=27600 GOSSIP "),
+            &hub,
+        );
+        assert_eq!(addr(&hub), ("10.3.3.3".to_string(), 27200, 27600));
+        // Not an IP address, or zero ports: ignored.
+        handle_cluster_bus_line(
+            &format!("PING {peer} 1 master shards=1 ip=not-an-ip port=0 cport=0 GOSSIP "),
+            &hub,
+        );
+        assert_eq!(addr(&hub), ("10.3.3.3".to_string(), 27200, 27600));
+        assert!(!valid_announced_ip("0.0.0.0"));
+        assert!(valid_announced_ip("::1"));
     }
 
     #[test]
