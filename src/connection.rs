@@ -2285,11 +2285,26 @@ static GLOBAL_CLIENTS: std::sync::LazyLock<
 /// connected on (client ids are unique in the process). CLIENT KILL looked
 /// it up under the killer's own port, so on a cluster-mode node a client on
 /// another shard port was reported killed but stayed connected.
+/// The registry entry of client `cid` of the server on `base_port`. Client
+/// ids are per-server sequences, so several servers in one process (tests
+/// run many) hand out the same ids: the port must match too. A cluster-mode
+/// node's shard N registers its clients under `base_port + N`.
 fn global_client_entry(
     map: &hashbrown::HashMap<(u16, u64), GlobalClientEntry>,
+    base_port: u16,
+    shard_ports: u16,
     cid: u64,
 ) -> Option<&GlobalClientEntry> {
-    map.iter().find_map(|((_, c), e)| (*c == cid).then_some(e))
+    (0..shard_ports.max(1)).find_map(|s| map.get(&(base_port.wrapping_add(s), cid)))
+}
+
+/// The number of client ports of `router`'s server, from its base port.
+fn client_port_span(router: &Router) -> u16 {
+    if router.cluster_enabled {
+        router.num_shards as u16
+    } else {
+        1
+    }
 }
 
 /// Counts a command a script ran towards its calling client's `tot_cmds`.
@@ -14255,7 +14270,7 @@ async fn execute_command_inner(
                             for cid in killed_cids {
                                 if cid == client_id {
                                     close_conn = true;
-                                } else if let Some(entry) = global_client_entry(&map, cid) {
+                                } else if let Some(entry) = global_client_entry(&map, router.base_port, client_port_span(router), cid) {
                                     if entry
                                         .stats
                                         .killed
@@ -14414,7 +14429,7 @@ async fn execute_command_inner(
                                 {
                                     continue;
                                 }
-                                let entry_opt = global_client_entry(&map, cid);
+                                let entry_opt = global_client_entry(&map, router.base_port, client_port_span(router), cid);
                                 if let Some(ref f_user) = filter_user {
                                     let u = entry_opt
                                         .map(|e| e.auth_user.as_str())
@@ -14469,7 +14484,7 @@ async fn execute_command_inner(
                             for cid in killed_cids {
                                 if cid == client_id {
                                     close_conn = true;
-                                } else if let Some(entry) = global_client_entry(&map, cid) {
+                                } else if let Some(entry) = global_client_entry(&map, router.base_port, client_port_span(router), cid) {
                                     if entry
                                         .stats
                                         .killed
@@ -32303,6 +32318,46 @@ mod tests {
         let _ = set_client_output_buffer_limit_str(
             "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
         );
+    }
+
+    #[test]
+    fn test_global_client_entry_is_the_servers_own_not_a_same_id_one() {
+        let entry = |replica: bool| {
+            let stats = std::sync::Arc::new(ClientStats::new(
+                Instant::now(),
+                "127.0.0.1:1".parse().unwrap(),
+            ));
+            stats
+                .is_replica
+                .store(replica, std::sync::atomic::Ordering::Relaxed);
+            GlobalClientEntry {
+                raw_fd: -1,
+                push: crate::transport::PushTarget::Fd(-1),
+                track_tx: flume::unbounded().0,
+                is_resp3: false,
+                auth_user: "default".to_string(),
+                is_pubsub: false,
+                stats,
+            }
+        };
+        let is_rep = |e: Option<&GlobalClientEntry>| {
+            e.map(|e| {
+                e.stats
+                    .is_replica
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+        };
+        // Two servers in one process gave out the same id 7.
+        let mut map = hashbrown::HashMap::new();
+        map.insert((16425, 7), entry(false));
+        map.insert((16424, 7), entry(true));
+        assert_eq!(is_rep(global_client_entry(&map, 16424, 1, 7)), Some(true));
+        assert_eq!(is_rep(global_client_entry(&map, 16425, 1, 7)), Some(false));
+        assert!(global_client_entry(&map, 16426, 1, 7).is_none());
+        // A cluster-mode node of 2 shards: its shard 1 registers at base + 1.
+        map.insert((7001, 9), entry(true));
+        assert_eq!(is_rep(global_client_entry(&map, 7000, 2, 9)), Some(true));
+        assert!(global_client_entry(&map, 7000, 1, 9).is_none());
     }
 
     #[test]
