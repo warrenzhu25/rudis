@@ -6088,6 +6088,9 @@ mod tests {
     /// key.
     #[test]
     fn image_writes_each_key_once_across_splits() {
+        // Builds an image: moves the process-wide SYNC_IMAGE_BYTES that
+        // memory-limit tests read.
+        let _sync_images = SYNC_IMAGE_TEST_LOCK.lock();
         let mut db = ShardDb::new(0);
         for i in 0..6000 {
             db.table
@@ -6426,6 +6429,9 @@ mod tests {
 
     #[test]
     fn test_rdb_save_fails_on_unreadable_tiered_key() {
+        // Builds an image: moves the process-wide SYNC_IMAGE_BYTES that
+        // memory-limit tests read.
+        let _sync_images = SYNC_IMAGE_TEST_LOCK.lock();
         let dir = std::env::temp_dir().join(format!("rudis_tier_rdb_fail_{}", std::process::id()));
         let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()

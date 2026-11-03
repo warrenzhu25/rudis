@@ -5996,7 +5996,16 @@ mod tests {
 
     #[test]
     fn test_check_auto_tier_terminates_when_nothing_can_spill() {
-        let port = 19871;
+        // A port of its own: tiering stats are per port, and another test's
+        // router on a shared port published its own (tiny) usage over ours.
+        let port = 19881;
+        // The used-memory total subtracts the process-wide full-sync image
+        // bytes: a test building an image meanwhile made this one see itself
+        // under the limit.
+        let _sync_images = crate::shard::SYNC_IMAGE_TEST_LOCK.lock();
+        // The spill path runs only under `noeviction`; pin it.
+        let _policy_guard = crate::connection::MAX_MEMORY_POLICY_TEST_LOCK.lock();
+        crate::connection::set_max_memory_policy("noeviction");
         let (router, db) = single_shard_router(port);
         fill_and_limit(&router, &db, port);
         let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
@@ -6276,6 +6285,8 @@ mod tests {
     #[test]
     fn test_check_auto_tier_spills_under_limit() {
         let port = 19872;
+        // See test_check_auto_tier_terminates_when_nothing_can_spill.
+        let _sync_images = crate::shard::SYNC_IMAGE_TEST_LOCK.lock();
         // Auto-tier spilling only runs under `noeviction`; pin it.
         let _policy_guard = crate::connection::MAX_MEMORY_POLICY_TEST_LOCK.lock();
         crate::connection::set_max_memory_policy("noeviction");
