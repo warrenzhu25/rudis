@@ -5806,8 +5806,15 @@ fn test_streamed_full_sync_e2e() {
     let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
     m.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
     // ~600 MB: ~300 MB a shard, which the buffered path serialized in one go.
+    // A coverage-instrumented build (cargo-llvm-cov sets LLVM_PROFILE_FILE)
+    // takes a tenth: at full size it starved the whole test process (other
+    // tests' in-process replication links timed out, and a read here waited
+    // past its 60 s timeout); the streamed path is the same at either size,
+    // and uninstrumented runs keep the full size and the latency check.
+    let instrumented = std::env::var_os("LLVM_PROFILE_FILE").is_some();
+    let keys = if instrumented { "300000" } else { "3000000" };
     assert_eq!(
-        send_and_read_reply(&mut m, b"DEBUG POPULATE 3000000 key 200\r\n"),
+        resp_cmd_all(&mut m, &["DEBUG", "POPULATE", keys, "key", "200"]),
         "+OK\r\n"
     );
     for i in 0..100 {
