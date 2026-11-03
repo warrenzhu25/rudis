@@ -2707,6 +2707,28 @@ pub fn is_loading(port: u16) -> bool {
         && get_replication_hub(port).loading.load(Ordering::Relaxed)
 }
 
+/// How long a command waits for a full-sync load to end before it is
+/// answered `-LOADING` (see [`wait_out_short_load`]).
+const SHORT_LOAD_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Waits (in 1 ms slices, at most [`SHORT_LOAD_WAIT`]) for the full-sync
+/// load on `port` to end; returns whether it did. A Redis replica loading a
+/// small RDB is busy on its one thread, so a command arriving meanwhile just
+/// waits the millisecond and runs; only a long load (Redis serves events
+/// between chunks of one) answers `-LOADING`. Rudis's shards answered
+/// `-LOADING` at once even for a millisecond-long load, so a client polling
+/// a replica right as it synced got errors Redis never gives.
+pub async fn wait_out_short_load(port: u16) -> bool {
+    let start = std::time::Instant::now();
+    while is_loading(port) {
+        if start.elapsed() >= SHORT_LOAD_WAIT {
+            return false;
+        }
+        monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    true
+}
+
 /// Marks `hub` as loading until dropped, so a panicking load clears it too.
 struct LoadingGuard<'a>(&'a ReplicationHub);
 
@@ -5570,6 +5592,37 @@ mod tests {
             hub.try_partial_resync(8, tx2, &replid, now as i64 + 1)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn test_commands_wait_out_a_short_load_but_not_a_long_one() {
+        let port = 19992;
+        let hub = get_replication_hub(port);
+        let rt = || {
+            monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        // Not loading: no wait.
+        assert!(rt().block_on(wait_out_short_load(port)));
+        // A load that ends within the wait: the command runs.
+        std::thread::scope(|scope| {
+            let guard = LoadingGuard::new(&hub);
+            assert!(is_loading(port));
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                drop(guard);
+            });
+            assert!(rt().block_on(wait_out_short_load(port)));
+        });
+        // One that outlasts it: -LOADING, after about SHORT_LOAD_WAIT.
+        let guard = LoadingGuard::new(&hub);
+        let start = std::time::Instant::now();
+        assert!(!rt().block_on(wait_out_short_load(port)));
+        assert!(start.elapsed() >= SHORT_LOAD_WAIT);
+        drop(guard);
+        assert!(!is_loading(port));
     }
 
     #[test]

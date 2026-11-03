@@ -1166,7 +1166,7 @@ pub struct FullSyncCut {
 | `replica_batches_in_flight` | `AtomicUsize` | Replicated batches sent to shards and not applied yet. |
 | `tx_stream_token` | bounded(1) channel | Held by an `EXEC` while its `MULTI` ... `EXEC` block is open (§6.3). |
 | `cancel_sync`, `sync_conn`, `worker_exit` | | Stop, interrupt and await the replica worker. |
-| `loading` | `AtomicBool` | Loading a full sync: data commands get `-LOADING`. |
+| `loading` | `AtomicBool` | Loading a full sync: data commands wait for it up to 100 ms (`wait_out_short_load`, as a Redis replica busy loading makes them wait), then get `-LOADING`. |
 | `pending_peers` | `Mutex<HashMap<u64, PendingPeer>>` | `REPLCONF` details seen before `PSYNC` (port, ip, `capa eof`, `capa dual-channel`, `rdb-channel`, `rdb-client-id`); capped at 4096. |
 | `rdb_claims` | `Mutex<HashMap<u64, RdbChannelClaim>>` | Dual-channel streams waiting for the replica's main connection (§6.4). |
 | `no_replicas_since`, `restart_grace` | `AtomicU64`, `AtomicBool` | Start of the backlog TTL countdown; shorter grace after a restart (§6.2). |

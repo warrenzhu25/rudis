@@ -12031,7 +12031,10 @@ async fn execute_command_inner(
         }
     }
 
-    if crate::replication::is_loading(router.base_port) && !allowed_while_loading(&cmd) {
+    if crate::replication::is_loading(router.base_port)
+        && !allowed_while_loading(&cmd)
+        && !crate::replication::wait_out_short_load(router.base_port).await
+    {
         out.extend_from_slice(b"-LOADING Redis is loading the dataset in memory\r\n");
         return false;
     }

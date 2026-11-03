@@ -7371,3 +7371,61 @@ fn test_replication_backpressure_holds_writes_for_a_slow_replica_e2e() {
         resp_cmd_all(&mut m, &["DEBUG", "DIGEST"])
     );
 }
+
+/// Clients polling a replica while it full-syncs a small dataset never get
+/// -LOADING: like a Redis replica (busy on its one thread for the
+/// millisecond the load takes), a command arriving during a short load
+/// waits for it. Only long loads answer -LOADING (see the test above).
+#[test]
+fn test_replica_short_load_never_answers_loading_e2e() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (mp, rp) = (18281u16, 18282u16);
+    let (ms, rs) = (mp.to_string(), rp.to_string());
+    let _master = ServerGuard(spawn_rudis_listening(
+        &["--port", &ms, "--threads", "2", "--no-pin", "--save", ""],
+        mp,
+    ));
+    let _replica = ServerGuard(spawn_rudis_listening(
+        &["--port", &rs, "--threads", "2", "--no-pin", "--save", ""],
+        rp,
+    ));
+    let connect = |port: u16| {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    };
+    assert_eq!(
+        resp_cmd_all(&mut connect(mp), &["SET", "x", "1"]),
+        "+OK\r\n"
+    );
+    let loading = Arc::new(AtomicUsize::new(0));
+    let synced = Arc::new(AtomicBool::new(false));
+    let pollers: Vec<_> = (0..16)
+        .map(|_| {
+            let mut c = connect(rp);
+            let (loading, synced) = (loading.clone(), synced.clone());
+            thread::spawn(move || {
+                // Until the value arrives: nil before the sync, 1 after.
+                while !synced.load(Ordering::Relaxed) {
+                    let r = resp_cmd_all(&mut c, &["GET", "x"]);
+                    if r.starts_with("-LOADING") {
+                        loading.fetch_add(1, Ordering::Relaxed);
+                    } else if r == "$1\r\n1\r\n" {
+                        synced.store(true, Ordering::Relaxed);
+                    } else {
+                        assert_eq!(r, "$-1\r\n");
+                    }
+                }
+            })
+        })
+        .collect();
+    assert_eq!(
+        resp_cmd_all(&mut connect(rp), &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    for p in pollers {
+        p.join().unwrap();
+    }
+    assert_eq!(loading.load(Ordering::Relaxed), 0, "a client got -LOADING");
+}
