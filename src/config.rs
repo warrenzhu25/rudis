@@ -407,6 +407,8 @@ const RUDIS_CONFIG_NAMES: &[&str] = &[
     "backup-sealed-ttl",
     "backupdirname",
     "key-load-delay",
+    "repl-backpressure-max-delay",
+    "repl-backpressure-threshold",
     "slowlog-entry-max-argc",
     "slowlog-entry-max-string-len",
     "stream-idmp-duration",

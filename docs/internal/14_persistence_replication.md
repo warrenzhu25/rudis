@@ -901,8 +901,18 @@ and resyncs partially, receiving those `DEL`s.
 * **EXEC checks up front.** An `EXEC` whose queue a stale replica would refuse (`-MASTERDOWN`), or with writes on a
   read-only replica (`-READONLY`), with too few good replicas (`-NOREPLICAS`), or over `maxmemory`, is discarded whole with
   `-EXECABORT Transaction discarded because of: <reason>`; commands of a running `EXEC` are not checked again.
+* **Backpressure (`repl-backpressure-threshold`, Rudis-only, default 0 = off).** Each replica tracks whether it is
+  *congested*: its buffered stream (output buffer plus what the writer is writing, or during a full sync what the cut
+  holds back) reached the threshold; it stays congested until that drains to half. While any replica is congested
+  (a process-wide count), a write waits at the write gate (the one `CLIENT PAUSE WRITE` uses, so pipelines and
+  `EXEC` too) in 1 ms slices until no replica is congested or `repl-backpressure-max-delay` (ms, default 100)
+  passed, then runs. Reads are never held. A replica stops counting once it overflows its output limit (it is being
+  dropped), its link ends, or the threshold is set to 0. The idea: a replica that falls behind slows writers to its
+  pace instead of overrunning `client-output-buffer-limit replica` and full-syncing again (which costs far more).
+  One relaxed atomic load on the write path while nothing is congested. `INFO replication` on a master shows
+  `repl_backpressure_congested_replicas` and `repl_backpressure_delayed_writes`.
 * `ROLE` and `INFO replication` are computed on demand: role, `connected_slaves`, `slaveN:ip=,port=,state=online|wait_bgsave,
-  offset=,lag=`, `master_failover_state` (`no-failover`, `waiting-for-sync`, `failover-in-progress`), `master_replid`,
+  offset=,lag=`, `master_failover_state` (`no-failover`, `waiting-for-sync`, `failover-in-progress`), the backpressure fields above, `master_replid`,
   `master_replid2`, `master_repl_offset`, `second_repl_offset`, `repl_backlog_active` (the real replication-active flag),
   and backlog size, first byte and length; on a replica also link status, `master_last_io_seconds_ago`, sync in progress,
   `slave_repl_offset`, priority and read-only. A replica's `ROLE` state is `connecting`, `handshake`, `sync` (also while

@@ -7251,3 +7251,123 @@ fn test_replica_serve_stale_data_e2e() {
     assert_eq!(r(&["GET", "k"]), "$1\r\nv\r\n");
     assert_eq!(r(&["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
 }
+
+/// `repl-backpressure-threshold`: once a replica's buffered stream reaches
+/// it, writes on the master wait (up to `repl-backpressure-max-delay` each)
+/// instead of piling the stream up until the replica is dropped and
+/// full-syncs again; reads are not held back, and once the replica drains,
+/// writes run at full speed again.
+#[test]
+fn test_replication_backpressure_holds_writes_for_a_slow_replica_e2e() {
+    let (mp, rp) = (18271u16, 18272u16);
+    let (ms, rs) = (mp.to_string(), rp.to_string());
+    let _master = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &ms,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--save",
+            "",
+            "--repl-backpressure-threshold",
+            "4mb",
+            "--repl-backpressure-max-delay",
+            "200",
+        ],
+        mp,
+    ));
+    let replica = ServerGuard(spawn_rudis_listening(
+        &["--port", &rs, "--threads", "2", "--no-pin", "--save", ""],
+        rp,
+    ));
+    let connect = |port: u16| {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        c
+    };
+    let (mut m, mut r) = (connect(mp), connect(rp));
+    assert_eq!(
+        resp_cmd_all(&mut m, &["CONFIG", "GET", "repl-backpressure-threshold"]),
+        "*2\r\n$27\r\nrepl-backpressure-threshold\r\n$7\r\n4194304\r\n"
+    );
+    assert_eq!(resp_cmd_all(&mut m, &["SET", "probe", "1"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut r);
+    let info = |c: &mut TcpStream, f: &str| info_u64(c, "replication", f);
+
+    // The replica stops reading: its stream backs up on the master (past
+    // the socket buffers) until it is congested.
+    let pid = replica.0.id().to_string();
+    let signal = |sig: &str| {
+        assert!(
+            std::process::Command::new("kill")
+                .args([sig, &pid])
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    signal("-STOP");
+    struct Cont(String);
+    impl Drop for Cont {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("kill")
+                .args(["-CONT", &self.0])
+                .status();
+        }
+    }
+    let _cont = Cont(pid.clone());
+    let val = "v".repeat(1 << 20);
+    let mut n = 0;
+    while info(&mut m, "repl_backpressure_congested_replicas") == 0 {
+        assert_eq!(
+            resp_cmd_all(&mut m, &["SET", &format!("big{n}"), &val]),
+            "+OK\r\n"
+        );
+        n += 1;
+        assert!(n < 300, "never congested after {n} MB");
+    }
+    // A write now waits for the replica (up to the 200 ms cap); a read does
+    // not.
+    let t = std::time::Instant::now();
+    assert_eq!(resp_cmd_all(&mut m, &["SET", "held", "1"]), "+OK\r\n");
+    let write_took = t.elapsed();
+    let t = std::time::Instant::now();
+    assert_eq!(resp_cmd_all(&mut m, &["GET", "probe"]), "$1\r\n1\r\n");
+    let read_took = t.elapsed();
+    assert!(
+        write_took >= Duration::from_millis(150),
+        "write took {write_took:?}"
+    );
+    assert!(
+        read_took < Duration::from_millis(100),
+        "read took {read_took:?}"
+    );
+    assert!(info_u64(&mut m, "replication", "repl_backpressure_delayed_writes") >= 1);
+
+    // It reads again: it drains, writes run freely, and it never had to
+    // full-sync again.
+    signal("-CONT");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while info(&mut m, "repl_backpressure_congested_replicas") != 0 {
+        assert!(std::time::Instant::now() < deadline, "never drained");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let t = std::time::Instant::now();
+    assert_eq!(resp_cmd_all(&mut m, &["SET", "free", "1"]), "+OK\r\n");
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(resp_cmd_all(&mut m, &["WAIT", "1", "10000"]), ":1\r\n");
+    assert_eq!(info_u64(&mut m, "stats", "sync_full"), 1);
+    assert_eq!(
+        resp_cmd_all(&mut r, &["DEBUG", "DIGEST"]),
+        resp_cmd_all(&mut m, &["DEBUG", "DIGEST"])
+    );
+}

@@ -1841,7 +1841,11 @@ fn counts_as_running_write(cmd: &Command) -> bool {
 /// per-command path, which waits at the pause gate.
 pub fn enter_write_batch(commands: &[Command]) -> Option<WriteRunning> {
     let guard = WriteRunning::enter(commands.iter().any(counts_as_running_write));
-    if guard.0.is_some() && is_client_paused().is_some() {
+    // A congested replica (`repl-backpressure-threshold`) holds writes back
+    // at the same gate.
+    if guard.0.is_some()
+        && (is_client_paused().is_some() || crate::replication::backpressure_active())
+    {
         return None;
     }
     Some(guard)
@@ -1863,9 +1867,19 @@ pub async fn wait_if_client_paused(port: u16, client_id: u64, cmd: &Command) -> 
         return WriteRunning(None);
     }
     let counts = counts_as_running_write(cmd);
+    let mut waited_for_replicas = false;
     loop {
         let running = WriteRunning::enter(counts);
         let Some((rem_ms, write_only)) = is_client_paused() else {
+            // A replica falling behind holds the write back (once, bounded
+            // by `repl-backpressure-max-delay`), then it checks the pause
+            // again.
+            if counts && !waited_for_replicas && crate::replication::backpressure_active() {
+                drop(running);
+                waited_for_replicas = true;
+                crate::replication::backpressure_delay().await;
+                continue;
+            }
             return running;
         };
         if !should_pause_command(cmd, write_only) {
@@ -1894,9 +1908,17 @@ pub async fn wait_if_client_paused(port: u16, client_id: u64, cmd: &Command) -> 
 
 pub async fn wait_if_tx_paused(port: u16, client_id: u64, tx_queue: &[Command]) -> WriteRunning {
     let counts = tx_queue.iter().any(counts_as_running_write);
+    let mut waited_for_replicas = false;
     loop {
         let running = WriteRunning::enter(counts);
         let Some((rem_ms, write_only)) = is_client_paused() else {
+            // See wait_if_client_paused.
+            if counts && !waited_for_replicas && crate::replication::backpressure_active() {
+                drop(running);
+                waited_for_replicas = true;
+                crate::replication::backpressure_delay().await;
+                continue;
+            }
             return running;
         };
         let should_pause =
@@ -3605,6 +3627,10 @@ pub fn apply_config_value(
         }
         "repl-backlog-ttl" => crate::replication::REPL_BACKLOG_TTL
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "repl-backpressure-threshold" => crate::replication::REPL_BACKPRESSURE_THRESHOLD
+            .store(parse_config_bytes(name, val_str)?, Ordering::Relaxed),
+        "repl-backpressure-max-delay" => crate::replication::REPL_BACKPRESSURE_MAX_DELAY_MS
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
         "repl-ping-replica-period" | "repl-ping-slave-period" => {
             let secs: u64 = parse_config_num(name, val_str)?;
             if secs == 0 {
@@ -4130,7 +4156,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 103] = [
+    let all_configs: [(&str, String); 105] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
@@ -4374,6 +4400,18 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         (
             "repl-timeout",
             crate::replication::REPL_TIMEOUT_SECS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "repl-backpressure-threshold",
+            crate::replication::REPL_BACKPRESSURE_THRESHOLD
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "repl-backpressure-max-delay",
+            crate::replication::REPL_BACKPRESSURE_MAX_DELAY_MS
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .to_string(),
         ),

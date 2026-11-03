@@ -94,6 +94,58 @@ pub struct ConnectedReplica {
     /// Set by `ReplicationHub::disconnect_replicas`: the replica must
     /// reconnect (our history changed); nothing more is sent to it.
     disconnected: AtomicBool,
+    /// Counted in [`CONGESTED_REPLICAS`]: its buffered stream reached
+    /// `repl-backpressure-threshold` and has not yet fallen to half of it.
+    congested: AtomicBool,
+}
+
+/// `repl-backpressure-threshold` (bytes; 0, the default, turns it off): once
+/// a replica's buffered stream (output buffer, plus what a full sync holds
+/// back) reaches it, writes wait (see [`backpressure_delay`]) until it falls
+/// to half, so a replica that falls behind is waited for instead of
+/// overrunning `client-output-buffer-limit replica` and full-syncing again.
+pub static REPL_BACKPRESSURE_THRESHOLD: AtomicU64 = AtomicU64::new(0);
+
+/// `repl-backpressure-max-delay` (ms, default 100): the longest one write
+/// waits for congested replicas; it then runs anyway, so a replica that
+/// stopped reading slows writers but cannot stall them.
+pub static REPL_BACKPRESSURE_MAX_DELAY_MS: AtomicU64 = AtomicU64::new(100);
+
+/// Replicas (across the process) whose buffered stream is over the
+/// threshold; writes wait while this is not 0.
+static CONGESTED_REPLICAS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Writes that waited for a congested replica (INFO
+/// `repl_backpressure_delayed_writes`).
+pub static REPL_BACKPRESSURE_DELAYED_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether writes should wait for a congested replica now: one relaxed load
+/// on the write path while nothing is congested.
+#[inline]
+pub fn backpressure_active() -> bool {
+    CONGESTED_REPLICAS.load(Ordering::Relaxed) != 0
+        && REPL_BACKPRESSURE_THRESHOLD.load(Ordering::Relaxed) != 0
+}
+
+/// Replicas currently over `repl-backpressure-threshold` (INFO).
+pub fn congested_replicas() -> usize {
+    CONGESTED_REPLICAS.load(Ordering::Relaxed)
+}
+
+/// Waits (in 1 ms slices) while a replica is congested, at most
+/// `repl-backpressure-max-delay`. Returns whether it waited.
+pub async fn backpressure_delay() -> bool {
+    if !backpressure_active() {
+        return false;
+    }
+    REPL_BACKPRESSURE_DELAYED_WRITES.fetch_add(1, Ordering::Relaxed);
+    let max =
+        std::time::Duration::from_millis(REPL_BACKPRESSURE_MAX_DELAY_MS.load(Ordering::Relaxed));
+    let start = std::time::Instant::now();
+    while backpressure_active() && start.elapsed() < max {
+        monoio::time::sleep(std::time::Duration::from_millis(1).min(max - start.elapsed())).await;
+    }
+    true
 }
 
 /// Below this many buffered bytes the output limits are not looked up.
@@ -199,6 +251,34 @@ impl ConnectedReplica {
     fn note_buffers(&self, pending_capacity: usize) {
         let bytes = pending_capacity + self.inflight.load(Ordering::Relaxed);
         self.buffers_held.lock().set(bytes as i64);
+        self.note_congestion(bytes);
+    }
+
+    /// Updates whether this replica holds writes back: congested from
+    /// `repl-backpressure-threshold` buffered bytes until it drains to half
+    /// (the gap keeps it from flapping on every append).
+    fn note_congestion(&self, buffered: usize) {
+        let threshold = REPL_BACKPRESSURE_THRESHOLD.load(Ordering::Relaxed) as usize;
+        let congested = self.congested.load(Ordering::Relaxed);
+        let now = if threshold == 0 || self.overflowed.load(Ordering::Relaxed) {
+            false
+        } else if congested {
+            buffered > threshold / 2
+        } else {
+            buffered >= threshold
+        };
+        if now != congested
+            && self
+                .congested
+                .compare_exchange(congested, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            if now {
+                CONGESTED_REPLICAS.fetch_add(1, Ordering::AcqRel);
+            } else {
+                CONGESTED_REPLICAS.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
     }
 
     /// Buffers bytes that must follow the full-sync snapshot; returns true
@@ -211,8 +291,10 @@ impl ConnectedReplica {
         pre.extend_from_slice(bytes);
         if self.over_output_limit(pre.len()) {
             *pre = Vec::new();
+            self.note_congestion(0);
             return true;
         }
+        self.note_congestion(pre.len());
         false
     }
 
@@ -276,6 +358,17 @@ impl ConnectedReplica {
 
     pub fn detach_fd(&self) {
         *self.conn_fd.lock() = None;
+        // The link is gone: whatever is still buffered will never drain,
+        // so it must not keep holding writes back (`Drop` does the same,
+        // but something may still hold the replica for a while).
+        self.release_congestion();
+    }
+
+    /// Stops counting this replica as congested.
+    fn release_congestion(&self) {
+        if self.congested.swap(false, Ordering::AcqRel) {
+            CONGESTED_REPLICAS.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Shuts the replica's socket down; its writer and reader then fail
@@ -326,6 +419,13 @@ impl ConnectedReplica {
         let pending = self.pending.lock();
         self.inflight.store(0, Ordering::Relaxed);
         self.note_buffers(pending.capacity());
+    }
+}
+
+impl Drop for ConnectedReplica {
+    fn drop(&mut self) {
+        // A congested replica that goes away holds writes back no more.
+        self.release_congestion();
     }
 }
 
@@ -1516,6 +1616,7 @@ impl ReplicationHub {
             buffers_held: Mutex::new(crate::shard::SyncImageHeld::default()),
             overflowed: AtomicBool::new(false),
             soft_since_ms: AtomicU64::new(0),
+            congested: AtomicBool::new(false),
             conn_fd: Mutex::new(None),
             disconnected: AtomicBool::new(false),
         });
@@ -2301,10 +2402,14 @@ impl ReplicationHub {
                  connected_slaves:{}\r\n\
                  {}\
                  master_failover_state:{}\r\n\
+                 repl_backpressure_congested_replicas:{}\r\n\
+                 repl_backpressure_delayed_writes:{}\r\n\
                  {}",
                 connected,
                 slaves,
                 self.failover_state_name(),
+                congested_replicas(),
+                REPL_BACKPRESSURE_DELAYED_WRITES.load(Ordering::Relaxed),
                 history
             ),
             ReplicationRole::Slave {
@@ -5465,6 +5570,71 @@ mod tests {
             hub.try_partial_resync(8, tx2, &replid, now as i64 + 1)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn test_replica_congestion_holds_writes_back_until_it_drains() {
+        // The threshold is process-wide: restored (to off) however this ends.
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                REPL_BACKPRESSURE_THRESHOLD.store(0, Ordering::Relaxed);
+                REPL_BACKPRESSURE_MAX_DELAY_MS.store(100, Ordering::Relaxed);
+            }
+        }
+        let _off = Off;
+        let hub = ReplicationHub::new(19993);
+        let replid = hub.replid();
+        let (tx, _rx) = flume::unbounded();
+        let (_, _, rep) = hub.try_partial_resync(1, tx, &replid, 1).unwrap();
+        let congested = || rep.congested.load(Ordering::Relaxed);
+
+        // Off (threshold 0): never congested.
+        rep.note_congestion(1 << 30);
+        assert!(!congested());
+
+        REPL_BACKPRESSURE_THRESHOLD.store(1000, Ordering::Relaxed);
+        rep.note_congestion(999);
+        assert!(!congested());
+        rep.note_congestion(1000);
+        assert!(congested());
+        assert!(backpressure_active());
+        // Stays congested until it drains to half the threshold.
+        rep.note_congestion(600);
+        assert!(congested());
+        rep.note_congestion(500);
+        assert!(!congested());
+
+        // A congested replica that overflowed its output limit (and so is
+        // dropped) no longer holds writes back.
+        rep.note_congestion(5000);
+        assert!(congested());
+        rep.overflowed.store(true, Ordering::Relaxed);
+        rep.note_congestion(5000);
+        assert!(!congested());
+        rep.overflowed.store(false, Ordering::Relaxed);
+
+        // A replica whose link ended holds writes back no more.
+        rep.detach_fd();
+        assert!(!congested());
+        rep.note_congestion(500);
+
+        // A write waits at most repl-backpressure-max-delay.
+        rep.note_congestion(5000);
+        REPL_BACKPRESSURE_MAX_DELAY_MS.store(30, Ordering::Relaxed);
+        let start = std::time::Instant::now();
+        let waited = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(backpressure_delay());
+        assert!(waited);
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(30), "{took:?}");
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        // Turning it off releases writers even while still congested.
+        REPL_BACKPRESSURE_THRESHOLD.store(0, Ordering::Relaxed);
+        assert!(!backpressure_active());
     }
 
     #[test]
