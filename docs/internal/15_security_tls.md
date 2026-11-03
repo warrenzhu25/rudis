@@ -627,8 +627,9 @@ and sorted-set pool lengths. The table recycles a value's storage when a key is 
   synthetic (`addr=127.0.0.1:0 laddr=127.0.0.1:6379 ...` with the real id, database, command and user).
 * **Client certificates do not map to ACL users.** `tls-auth-clients-user` is accepted as a known Redis directive but
   not implemented; an mTLS client still authenticates as `default` or through `AUTH`.
-* **`tls-port` cannot change at runtime**, there is no TLS on the replication link or the cluster bus, and there is no
-  TLS protocol or cipher configuration (rustls defaults apply).
+* **`tls-port` cannot change at runtime**, there is no TLS on the replication link (the cluster bus has it with
+  `tls-cluster yes`, see the cluster topology doc §6.6), and there is no TLS protocol or cipher configuration (rustls
+  defaults apply).
 * **No kernel TLS (kTLS) offload.** Deliberately: it would need rustls secret extraction, per-cipher
   `setsockopt(SOL_TLS, TLS_TX/TLS_RX)` key installation, out-of-band handling of TLS 1.3 control records on receive, and
   the `tls` kernel module; Rudis does not use `sendfile`, so it would mostly move the same AES-GCM work into the kernel.

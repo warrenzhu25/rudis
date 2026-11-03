@@ -280,6 +280,25 @@ not our own, the receiver:
    gossiped role, health and config epoch and **no slots**. Its slots arrive in its own PONGs once
    our tick pings it. This is how a node learns about peers it never meets directly.
 
+### 6.6 TLS on the bus (`tls-cluster`)
+
+`tls-cluster yes` (config file, `--tls-cluster yes` or `CONFIG SET`; default `no`) runs every bus
+connection over TLS with the server's `tls-cert-file`/`tls-key-file`, as Redis does:
+
+* **Accepting**, the bus does a server handshake with the server's TLS config (built from the files
+  whenever they are set, with or without `tls-port`). Under `tls-auth-clients yes` (the default) a
+  peer must present a certificate that `tls-ca-cert-file` signed; a handshake that fails (a
+  plaintext frame included) drops the connection before any frame is applied.
+* **Dialing** (`MEET`, heartbeats, `FAIL`/`FAILOVER` broadcasts, election requests, `MFSTART`, peer
+  refresh), the node presents its own certificate and verifies the peer's chain against
+  `tls-ca-cert-file`, but not its name: nodes dial each other by IP, and node certificates rarely
+  carry those (Redis does not check names on the bus either). The handshake shares the connection's
+  timeout. The two exchanges made from a shard's async runtime (`MFSTART`, refresh) run the TLS
+  dial on a short-lived thread.
+* Every node of the cluster needs the same setting; a TLS node and a plaintext one cannot talk.
+  `tls-ca-cert-file` is required for dialing. A node with `tls-cluster yes` but no certificate files
+  logs a warning at startup and refuses every peer.
+
 ### 6.4 CLUSTER MEET, FORGET and RESET
 
 `CLUSTER MEET` runs synchronously in the client command handler:
@@ -833,9 +852,11 @@ line was found.
   are accepted but ignored.
 * **No bus outside cluster mode.** The bus starts only with `cluster-enabled yes`; a non-cluster node
   can send `CLUSTER MEET` but cannot receive heartbeats.
-* **Unauthenticated, text bus.** Any client that can reach the bus port can send `FAIL`,
-  `FAILOVER_ANNOUNCE`, gossip and so on. Frames are validated (size, slot ranges, ports, node cap) but
-  not authenticated, and TLS is not used on the bus.
+* **Plaintext bus unless `tls-cluster yes`.** Without it, any client that can reach the bus port can
+  send `FAIL`, `FAILOVER_ANNOUNCE`, gossip and so on; frames are validated (size, slot ranges, ports,
+  node cap) but not authenticated. With `tls-cluster yes` (§6.6) peers must complete a TLS handshake,
+  and with `tls-auth-clients yes` present a certificate the CA signed. There is no shared-secret
+  authentication, as in Redis.
 * **Full-state gossip and short-lived connections.** Every tick opens one TCP connection per peer and
   sends the whole node table.
 * **Simplified failover.** There is no replica rank or offset-based delay, no replica migration, and

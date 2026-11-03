@@ -101,6 +101,11 @@ peers connect from, set `cluster-announce-ip` on every node, plus `cluster-annou
 is announced at that port + N) and `cluster-announce-bus-port`. Check with `CLUSTER NODES` on each
 node that every peer shows its reachable address.
 
+**Securing the bus.** The cluster bus (`port + 10000`) is plaintext by default: firewall it, or set
+`tls-cluster yes` on every node with `tls-cert-file`, `tls-key-file` and `tls-ca-cert-file` (node
+certificates signed by that CA). With `tls-auth-clients yes`, the default, only nodes holding such a
+certificate can join or send cluster messages.
+
 `CLUSTER SETSLOT`, `CLUSTER REBALANCE` and `CLUSTER RESHARD` move keys between nodes
 (sequentially, one slot at a time, in batches of 100 keys). Clients that follow `-ASK`/`-MOVED`
 keep working during the move. Gossip resends the full node table on each tick, so it suits

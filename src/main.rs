@@ -559,6 +559,12 @@ fn main() {
         rt.key_file = server_config.tls_key_file.clone();
         rt.ca_cert_file = server_config.tls_ca_cert_file.clone();
         rt.auth_clients = server_config.tls_auth_clients;
+        // From the files whenever they are set, not only with a tls-port:
+        // tls-cluster runs the cluster bus over TLS with them.
+        if let Err(e) = rt.rebuild_server_config() {
+            log_fatal!("FATAL CONFIG: TLS: {}", e);
+            std::process::exit(1);
+        }
     }
 
     let tls_config = if let Some(tls_port) = server_config.tls_port {

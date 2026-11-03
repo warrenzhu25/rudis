@@ -200,6 +200,102 @@ fn is_pem(bytes: &[u8]) -> bool {
     bytes.windows(11).any(|w| w == b"-----BEGIN ")
 }
 
+/// Verifies a peer's certificate chain against the CA, but not its name:
+/// cluster nodes dial each other by IP address, and node certificates
+/// rarely carry those as subject alternative names. Redis does the same
+/// for its cluster bus (OpenSSL checks no hostname by default).
+#[derive(Debug)]
+struct ChainOnlyVerifier(Arc<rustls::client::WebPkiServerVerifier>);
+
+impl rustls::client::danger::ServerCertVerifier for ChainOnlyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        match self
+            .0
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName
+                | rustls::CertificateError::NotValidForNameContext { .. },
+            )) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+            other => other,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
+}
+
+/// A `rustls::ClientConfig` for this server's outbound cluster-bus
+/// connections (`tls-cluster yes`): it trusts `ca_certs` (checking the
+/// chain, not the name, see `ChainOnlyVerifier`) and presents `certs`/`key`
+/// so a peer requiring client certificates (`tls-auth-clients yes`)
+/// accepts us.
+pub fn cluster_client_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    ca_certs: Vec<CertificateDer<'static>>,
+) -> Result<Arc<rustls::ClientConfig>, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in ca_certs {
+        roots
+            .add(ca)
+            .map_err(|e| format!("Invalid CA certificate: {}", e))?;
+    }
+    let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| format!("Failed to build server cert verifier: {}", e))?;
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ChainOnlyVerifier(inner)))
+        .with_client_auth_cert(certs, key)
+        .map_err(|e| format!("Failed to create rustls ClientConfig: {}", e))?;
+    Ok(Arc::new(config))
+}
+
+impl TlsRuntimeState {
+    /// The cluster-bus client config from the configured files: our
+    /// certificate and key, trusting `tls-ca-cert-file` (required).
+    pub fn cluster_client_config(&self) -> Result<Arc<rustls::ClientConfig>, String> {
+        let (Some(cert), Some(key)) = (&self.cert_file, &self.key_file) else {
+            return Err("tls-cluster needs tls-cert-file and tls-key-file".to_string());
+        };
+        let Some(ca) = &self.ca_cert_file else {
+            return Err("tls-cluster needs tls-ca-cert-file to verify peers".to_string());
+        };
+        cluster_client_config(
+            load_certs_from_file(cert)?,
+            load_key_from_file(key)?,
+            load_certs_from_file(ca)?,
+        )
+    }
+}
+
 fn tls_error(e: rustls::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("TLS error: {}", e))
 }
@@ -723,6 +819,88 @@ pub fn active_tls_server_config(base_port: u16) -> Option<Arc<ServerConfig>> {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn test_cluster_client_checks_the_chain_not_the_name() {
+        use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        // Node certificates name a host, not the IP the bus dials.
+        let node = |name: &str, signed: bool| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+            let cert = if signed {
+                params.signed_by(&key, &issuer).unwrap()
+            } else {
+                params.self_signed(&key).unwrap()
+            };
+            let key: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(key.serialize_der()).into();
+            (vec![cert.der().clone()], key)
+        };
+        let ca = vec![ca_cert.der().clone()];
+        let server = |(certs, key)| {
+            server_config_from(certs, key, Some(ca.clone()), TlsAuthClients::Yes).unwrap()
+        };
+        let client = |(certs, key)| cluster_client_config(certs, key, ca.clone()).unwrap();
+
+        // One bus exchange over loopback: Ok(reply) or the handshake error.
+        let exchange = |server_cfg: Arc<ServerConfig>, client_cfg: Arc<rustls::ClientConfig>| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut conn = ServerConnection::new(server_cfg).unwrap();
+                let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+                let mut line = [0u8; 5];
+                if tls.read_exact(&mut line).is_ok() {
+                    let _ = tls.write_all(b"+PONG");
+                }
+            });
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let name = ServerName::IpAddress(addr.ip().into());
+            let mut conn = rustls::ClientConnection::new(client_cfg, name).unwrap();
+            let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+            let res = tls.write_all(b"PING\n").and_then(|_| {
+                let mut reply = [0u8; 5];
+                tls.read_exact(&mut reply)
+                    .map(|_| String::from_utf8_lossy(&reply).into_owned())
+            });
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+            let _ = srv.join();
+            res.map_err(|e| e.to_string())
+        };
+
+        // Both signed by the CA: accepted, though neither names 127.0.0.1.
+        assert_eq!(
+            exchange(
+                server(node("node-a.local", true)),
+                client(node("node-b.local", true))
+            ),
+            Ok("+PONG".to_string())
+        );
+        // A peer the CA did not sign is refused, either way round.
+        assert!(
+            exchange(
+                server(node("evil.local", false)),
+                client(node("node-b.local", true))
+            )
+            .is_err()
+        );
+        assert!(
+            exchange(
+                server(node("node-a.local", true)),
+                client(node("evil.local", false))
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_tls_cert_generation_and_config() {

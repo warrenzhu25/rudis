@@ -4130,3 +4130,104 @@ fn test_cluster_nodes_learn_their_addresses_without_announce_ip_e2e() {
         format!("-MOVED {slot} {a}:{port}\r\n")
     );
 }
+
+/// `tls-cluster yes`: two nodes with CA-signed certificates form a cluster
+/// over a TLS bus (mutual: `tls-auth-clients` defaults to yes), and a
+/// plaintext frame sent to the bus is refused, never applied.
+#[test]
+fn test_cluster_bus_over_tls_e2e() {
+    let (a, b) = (18291u16, 18292u16);
+    let dir = std::env::temp_dir().join(format!("rudis-tls-bus-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+    std::fs::write(dir.join("ca.pem"), ca_cert.pem()).unwrap();
+    let path = |f: &str| dir.join(f).to_str().unwrap().to_string();
+    for node in ["a", "b"] {
+        // Named for a host, not the 127.0.0.1 the bus dials.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec![format!("node-{node}.local")])
+            .unwrap()
+            .signed_by(&key, &issuer)
+            .unwrap();
+        std::fs::write(dir.join(format!("{node}.pem")), cert.pem()).unwrap();
+        std::fs::write(dir.join(format!("{node}.key")), key.serialize_pem()).unwrap();
+        std::fs::create_dir_all(dir.join(node)).unwrap();
+    }
+    let spawn = |port: u16, node: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &path(node),
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "1",
+                "--no-pin",
+                "--tls-cluster",
+                "yes",
+                "--tls-cert-file",
+                &path(&format!("{node}.pem")),
+                "--tls-key-file",
+                &path(&format!("{node}.key")),
+                "--tls-ca-cert-file",
+                &path("ca.pem"),
+            ],
+            port,
+        ))
+    };
+    let _na = spawn(a, "a");
+    let _nb = spawn(b, "b");
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    assert_eq!(
+        cmd(a, &["CONFIG", "GET", "tls-cluster"]),
+        "*2\r\n$11\r\ntls-cluster\r\n$3\r\nyes\r\n"
+    );
+    for (p, (s, e)) in [(a, ("0", "8191")), (b, ("8192", "16383"))] {
+        assert_eq!(
+            cmd(p, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+            "+OK\r\n"
+        );
+        assert_eq!(cmd(p, &["CLUSTER", "ADDSLOTSRANGE", s, e]), "+OK\r\n");
+    }
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let b_id = cmd(b, &["CLUSTER", "MYID"])
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        // Heartbeats both ways over TLS: each knows the other's slots.
+        let (sa, sb) = (cmd(a, &["CLUSTER", "SLOTS"]), cmd(b, &["CLUSTER", "SLOTS"]));
+        if slots_reply_covers_all_slots(&sa) && slots_reply_covers_all_slots(&sb) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "A: {sa}\nB: {sb}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let nodes = cmd(a, &["CLUSTER", "NODES"]);
+    assert!(nodes.contains(&b_id) && !nodes.contains("fail"), "{nodes}");
+
+    // A plaintext peer gets no reply and changes nothing.
+    let mut plain = TcpStream::connect(("127.0.0.1", a + 10000)).unwrap();
+    plain
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let fake = "f".repeat(40);
+    let _ = plain.write_all(format!("MEET 127.0.0.1 7777 {fake} 9 0-16383\r\n").as_bytes());
+    let mut buf = [0u8; 64];
+    let n = plain.read(&mut buf).unwrap_or(0);
+    assert!(!String::from_utf8_lossy(&buf[..n]).contains("PONG"));
+    assert!(!cmd(a, &["CLUSTER", "NODES"]).contains(&fake));
+    let _ = std::fs::remove_dir_all(&dir);
+}

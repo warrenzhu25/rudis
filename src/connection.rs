@@ -3894,6 +3894,9 @@ pub fn apply_config_value(
                 .announce_ip
                 .write() = (!val_str.is_empty()).then(|| val_str.to_string());
         }
+        "tls-cluster" => crate::cluster::get_cluster_hub(base_port)
+            .tls
+            .store(parse_config_bool(name, val_str)?, Ordering::Relaxed),
         "cluster-announce-port" => crate::cluster::get_cluster_hub(base_port)
             .announce_port
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
@@ -4156,7 +4159,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 105] = [
+    let all_configs: [(&str, String); 106] = [
         ("port", port_str),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
@@ -4173,6 +4176,15 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         (
             "cluster-announce-ip",
             cluster_hub.announce_ip.read().clone().unwrap_or_default(),
+        ),
+        (
+            "tls-cluster",
+            if cluster_hub.tls.load(std::sync::atomic::Ordering::Relaxed) {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
         ),
         (
             "cluster-announce-port",
@@ -4614,6 +4626,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 | "replica-ignore-maxmemory"
                 | "slave-ignore-maxmemory"
                 | "stop-writes-on-bgsave-error"
+                | "tls-cluster"
         ) {
             if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
                 out.extend_from_slice(

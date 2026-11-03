@@ -222,6 +222,9 @@ pub struct ClusterHub {
     /// MEET goes over, as Redis does: the address a peer reached us at, or
     /// that we reached a peer from.
     pub learned_ip: RwLock<Option<String>>,
+    /// `tls-cluster`: the bus runs over TLS (see [`bus_dial`],
+    /// [`bus_accept`]), with the server's certificates.
+    pub tls: AtomicBool,
 }
 
 pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
@@ -321,6 +324,7 @@ impl ClusterHub {
             announce_port: std::sync::atomic::AtomicU16::new(0),
             announce_bus_port: std::sync::atomic::AtomicU16::new(0),
             learned_ip: RwLock::new(None),
+            tls: AtomicBool::new(false),
         }
     }
 
@@ -411,7 +415,6 @@ impl ClusterHub {
     /// which we must reach before taking over so no acknowledged write is
     /// lost.
     pub async fn manual_failover_start(&self) -> Result<u64, String> {
-        use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
         let master_id = self.master_id.read().clone();
         let addr = match self.nodes.read().get(&master_id) {
             Some(m) => format!("{}:{}", m.ip, m.cport),
@@ -419,16 +422,8 @@ impl ClusterHub {
         };
         let addr: SocketAddr = addr.parse().map_err(|e| format!("{e}"))?;
         let frame = format!("MFSTART {}\r\n", self.my_id());
-        let exchange = async {
-            let mut stream = monoio::net::TcpStream::connect(addr).await.ok()?;
-            let (res, _) = stream.write_all(frame.into_bytes()).await;
-            res.ok()?;
-            let (res, buf) = stream.read(Vec::with_capacity(128)).await;
-            res.ok()?;
-            Some(String::from_utf8_lossy(&buf).into_owned())
-        };
-        match monoio::time::timeout(Duration::from_secs(2), exchange).await {
-            Ok(Some(reply)) => reply
+        match bus_exchange_async(self.port, addr, frame, Duration::from_secs(2)).await {
+            Some(reply) => reply
                 .strip_prefix("+MFOFFSET ")
                 .and_then(|o| o.trim().parse().ok())
                 .ok_or_else(|| format!("master refused the manual failover: {}", reply.trim())),
@@ -915,7 +910,6 @@ impl ClusterHub {
     /// Exchanges a fresh PING/PONG with `node_id`, so both sides see each
     /// other's current slots and epoch right away instead of on the next tick.
     pub async fn refresh_peer(&self, node_id: &str) {
-        use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
         let addr = match self.nodes.read().get(node_id) {
             Some(n) => format!("{}:{}", n.ip, n.cport),
             None => return,
@@ -923,15 +917,10 @@ impl ClusterHub {
         let Ok(addr) = addr.parse::<SocketAddr>() else {
             return;
         };
-        let exchange = async {
-            let mut stream = monoio::net::TcpStream::connect(addr).await.ok()?;
-            let (res, _) = stream.write_all(self.ping_frame("").into_bytes()).await;
-            res.ok()?;
-            let (res, buf) = stream.read(Vec::with_capacity(512)).await;
-            res.ok()?;
-            Some(String::from_utf8_lossy(&buf).into_owned())
-        };
-        if let Ok(Some(resp)) = monoio::time::timeout(Duration::from_millis(500), exchange).await {
+        let frame = self.ping_frame("");
+        if let Some(resp) =
+            bus_exchange_async(self.port, addr, frame, Duration::from_millis(500)).await
+        {
             self.apply_pong(node_id, &resp);
         }
     }
@@ -1156,7 +1145,7 @@ impl ClusterHub {
 
         // Connect to remote cluster bus (cport = port + 10000)
         let addr = format!("{}:{}", ip, cport);
-        if let Ok(mut stream) = bus_connect(
+        if let Ok(mut stream) = bus_dial(
             self.port,
             addr.parse().map_err(|e| format!("{}", e))?,
             Duration::from_millis(300),
@@ -1328,8 +1317,8 @@ impl ClusterHub {
             let nodes = self.nodes.read();
             for peer in nodes.values() {
                 let addr = format!("{}:{}", peer.ip, peer.cport);
-                if let Ok(mut stream) =
-                    TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
+                if let Ok(parsed) = addr.parse::<SocketAddr>()
+                    && let Ok(mut stream) = bus_dial(self.port, parsed, Duration::from_millis(200))
                 {
                     let mut slots_repr = String::new();
                     for (s, e) in &inherited_slots {
@@ -1794,8 +1783,7 @@ impl ClusterHub {
         for (ip, cport) in peers {
             let addr = format!("{}:{}", ip, cport);
             if let Ok(parsed) = addr.parse::<SocketAddr>()
-                && let Ok(mut stream) =
-                    TcpStream::connect_timeout(&parsed, Duration::from_millis(200))
+                && let Ok(mut stream) = bus_dial(self.port, parsed, Duration::from_millis(200))
             {
                 let _ = stream.write_all(msg.as_bytes());
             }
@@ -2221,8 +2209,7 @@ impl ClusterHub {
         for (ip, cport) in &masters {
             let addr = format!("{}:{}", ip, cport);
             if let Ok(parsed) = addr.parse::<SocketAddr>()
-                && let Ok(mut stream) =
-                    TcpStream::connect_timeout(&parsed, Duration::from_millis(500))
+                && let Ok(mut stream) = bus_dial(self.port, parsed, Duration::from_millis(500))
             {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
                 let _ = stream.set_write_timeout(Some(Duration::from_millis(1000)));
@@ -2479,6 +2466,13 @@ pub fn start_cluster_bus(port: u16) {
     }
 
     let cport = port + 10000;
+    if hub.tls.load(Ordering::Relaxed) && crate::tls::active_tls_server_config(port).is_none() {
+        crate::log_warning!(
+            "[ClusterBus {}] tls-cluster is on but tls-cert-file/tls-key-file are not set: \
+             the bus will refuse every peer",
+            cport
+        );
+    }
     let (cancel_tx, cancel_rx) = flume::bounded(1);
     *hub.cancel_bus.write() = Some(cancel_tx);
 
@@ -2661,6 +2655,164 @@ fn bus_connect(
     Ok(socket.into())
 }
 
+/// A cluster-bus connection: plain TCP, or TLS (`tls-cluster yes`) as the
+/// dialing side or the accepting side.
+pub enum BusConn {
+    Plain(TcpStream),
+    Client(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Server(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
+}
+
+impl BusConn {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            BusConn::Plain(s) => s,
+            BusConn::Client(s) => &s.sock,
+            BusConn::Server(s) => &s.sock,
+        }
+    }
+
+    pub fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.tcp().set_read_timeout(d)
+    }
+
+    pub fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.tcp().set_write_timeout(d)
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.tcp().local_addr()
+    }
+
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.tcp().peer_addr()
+    }
+}
+
+impl Read for BusConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            BusConn::Plain(s) => s.read(buf),
+            BusConn::Client(s) => s.read(buf),
+            BusConn::Server(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for BusConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            BusConn::Plain(s) => s.write(buf),
+            BusConn::Client(s) => s.write(buf),
+            BusConn::Server(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            BusConn::Plain(s) => s.flush(),
+            BusConn::Client(s) => s.flush(),
+            BusConn::Server(s) => s.flush(),
+        }
+    }
+}
+
+/// The TLS client config for this server's outbound bus connections when
+/// `tls-cluster` is on (rebuilt from the configured files each call: bus
+/// connections are short-lived and infrequent).
+fn bus_tls_client(port: u16) -> std::io::Result<Option<Arc<rustls::ClientConfig>>> {
+    if !get_cluster_hub(port).tls.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    crate::tls::get_tls_runtime(port)
+        .read()
+        .cluster_client_config()
+        .map(Some)
+        .map_err(std::io::Error::other)
+}
+
+/// Opens a cluster-bus connection to `addr` (see [`bus_connect`]), over TLS
+/// when `tls-cluster` is on: the handshake completes within `timeout`.
+pub fn bus_dial(port: u16, addr: SocketAddr, timeout: Duration) -> std::io::Result<BusConn> {
+    let stream = bus_connect(port, addr, timeout)?;
+    let Some(config) = bus_tls_client(port)? else {
+        return Ok(BusConn::Plain(stream));
+    };
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let name = rustls::pki_types::ServerName::IpAddress(canonical_ip(addr.ip()).into());
+    let mut conn = rustls::ClientConnection::new(config, name).map_err(std::io::Error::other)?;
+    let mut stream = stream;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut stream)?;
+    }
+    Ok(BusConn::Client(Box::new(rustls::StreamOwned::new(
+        conn, stream,
+    ))))
+}
+
+/// Wraps an accepted bus connection in TLS when `tls-cluster` is on, using
+/// the server's TLS config (so `tls-auth-clients yes` requires peers to
+/// present a certificate the CA signed). A peer that fails the handshake
+/// (plaintext frames included) is refused.
+fn bus_accept(port: u16, stream: TcpStream) -> std::io::Result<BusConn> {
+    if !get_cluster_hub(port).tls.load(Ordering::Relaxed) {
+        return Ok(BusConn::Plain(stream));
+    }
+    let Some(config) = crate::tls::active_tls_server_config(port) else {
+        return Err(std::io::Error::other(
+            "tls-cluster is on but TLS is not configured",
+        ));
+    };
+    let mut conn = rustls::ServerConnection::new(config).map_err(std::io::Error::other)?;
+    let mut stream = stream;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut stream)?;
+    }
+    Ok(BusConn::Server(Box::new(rustls::StreamOwned::new(
+        conn, stream,
+    ))))
+}
+
+/// Sends `frame` to the bus at `addr` and returns the first reply read,
+/// off the shard thread when TLS is on (its handshake blocks); plain
+/// connections stay on the async runtime.
+async fn bus_exchange_async(
+    port: u16,
+    addr: SocketAddr,
+    frame: String,
+    timeout: Duration,
+) -> Option<String> {
+    use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+    if !get_cluster_hub(port).tls.load(Ordering::Relaxed) {
+        let exchange = async {
+            let mut stream = monoio::net::TcpStream::connect(addr).await.ok()?;
+            let (res, _) = stream.write_all(frame.into_bytes()).await;
+            res.ok()?;
+            let (res, buf) = stream.read(Vec::with_capacity(512)).await;
+            res.ok()?;
+            Some(String::from_utf8_lossy(&buf).into_owned())
+        };
+        return monoio::time::timeout(timeout, exchange)
+            .await
+            .ok()
+            .flatten();
+    }
+    let (tx, rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let reply = (|| {
+            let mut conn = bus_dial(port, addr, timeout).ok()?;
+            conn.set_read_timeout(Some(timeout)).ok()?;
+            conn.write_all(frame.as_bytes()).ok()?;
+            let mut buf = vec![0u8; 512];
+            let n = conn.read(&mut buf).ok()?;
+            Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+        })();
+        let _ = tx.send(reply);
+    });
+    rx.recv_async().await.ok().flatten()
+}
+
 /// Whether `ip` may be announced or taken from a peer's announcement: an IP
 /// address (as `cluster-announce-ip` requires in Redis).
 pub fn valid_announced_ip(ip: &str) -> bool {
@@ -2694,6 +2846,13 @@ fn apply_announce(node: &mut ClusterNodeInfo, parts: &[&str]) {
 
 fn handle_cluster_bus_conn(stream: TcpStream, hub: &Arc<ClusterHub>) {
     let ends = stream.peer_addr().ok().zip(stream.local_addr().ok());
+    let stream = match bus_accept(hub.port, stream) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::log_verbose!("[ClusterBus {}] refused a peer: {}", hub.cport, e);
+            return;
+        }
+    };
     let mut reader = std::io::BufReader::new(stream);
     let mut line = Vec::new();
     loop {
@@ -3113,7 +3272,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         let Ok(addr) = format!("{}:{}", ip, cport).parse::<SocketAddr>() else {
             return false;
         };
-        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        let Ok(mut stream) = bus_dial(hub.port, addr, Duration::from_millis(500)) else {
             return false;
         };
         let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
