@@ -217,6 +217,11 @@ pub struct ClusterHub {
     pub announce_port: std::sync::atomic::AtomicU16,
     /// `cluster-announce-bus-port` (0: the announced port + 10000).
     pub announce_bus_port: std::sync::atomic::AtomicU16,
+    /// Our address as the cluster sees it, learned (without
+    /// `cluster-announce-ip`) from the local end of the bus connections a
+    /// MEET goes over, as Redis does: the address a peer reached us at, or
+    /// that we reached a peer from.
+    pub learned_ip: RwLock<Option<String>>,
 }
 
 pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
@@ -315,16 +320,42 @@ impl ClusterHub {
             announce_ip: RwLock::new(None),
             announce_port: std::sync::atomic::AtomicU16::new(0),
             announce_bus_port: std::sync::atomic::AtomicU16::new(0),
+            learned_ip: RwLock::new(None),
         }
     }
 
-    /// The address this node announces (`cluster-announce-ip`, else
-    /// `127.0.0.1`).
+    /// The address this node announces: `cluster-announce-ip`, else the one
+    /// learned from the bus (see `learned_ip`), else `127.0.0.1`.
     pub fn my_ip(&self) -> String {
         self.announce_ip
             .read()
             .clone()
+            .or_else(|| self.learned_ip.read().clone())
             .unwrap_or_else(|| "127.0.0.1".to_string())
+    }
+
+    /// Records `local` (the local end of a bus connection a MEET went over)
+    /// as our address, unless one is announced or `local` is a wildcard.
+    pub fn learn_my_ip(&self, local: std::net::IpAddr) {
+        if local.is_unspecified() || self.announce_ip.read().is_some() {
+            return;
+        }
+        let local = canonical_ip(local);
+        let mut learned = self.learned_ip.write();
+        // A MEET over loopback (an operator on this host) does not replace
+        // an address peers on other hosts reached us at.
+        if local.is_loopback()
+            && learned
+                .as_deref()
+                .and_then(|l| l.parse::<std::net::IpAddr>().ok())
+                .is_some_and(|l| !l.is_loopback())
+        {
+            return;
+        }
+        let ip = local.to_string();
+        if learned.as_deref() != Some(ip.as_str()) {
+            *learned = Some(ip);
+        }
     }
 
     /// The client port this node announces (shard 0's).
@@ -349,7 +380,7 @@ impl ClusterHub {
     /// loopback addresses). Another host may well use the same port, so the
     /// port alone says nothing.
     pub fn is_my_addr(&self, ip: &str, port: u16) -> bool {
-        if port == self.my_port() && self.announce_ip.read().as_deref() == Some(ip) {
+        if port == self.my_port() && self.my_ip() == ip && ip != "127.0.0.1" {
             return true;
         }
         if port != self.port {
@@ -1125,10 +1156,15 @@ impl ClusterHub {
 
         // Connect to remote cluster bus (cport = port + 10000)
         let addr = format!("{}:{}", ip, cport);
-        if let Ok(mut stream) = TcpStream::connect_timeout(
-            &addr.parse().map_err(|e| format!("{}", e))?,
+        if let Ok(mut stream) = bus_connect(
+            self.port,
+            addr.parse().map_err(|e| format!("{}", e))?,
             Duration::from_millis(300),
         ) {
+            // Where we reached the peer from: our address, unless announced.
+            if let Ok(local) = stream.local_addr() {
+                self.learn_my_ip(local.ip());
+            }
             let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
             let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
 
@@ -2571,6 +2607,60 @@ fn pong_reply(hub: &ClusterHub) -> String {
     )
 }
 
+/// `ip` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, as a dual-stack
+/// socket reports IPv4 peers) turned back into IPv4.
+pub fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// The address to record for a peer whose MEET says `frame_ip`, arriving
+/// from `from` (the TCP peer of the bus connection). The frame's address is
+/// what the peer announces or learned; one that is missing, a wildcard or
+/// the 127.0.0.1 default (a peer that knows no better) gives way to the
+/// address the connection came from, as Redis takes a peer's IP from its
+/// link when the header carries none.
+fn meet_peer_ip(frame_ip: &str, from: Option<std::net::IpAddr>) -> String {
+    let defaulted = frame_ip.parse::<std::net::IpAddr>().map_or(true, |ip| {
+        ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST
+    });
+    match from.map(canonical_ip) {
+        Some(from) if defaulted && !from.is_unspecified() => from.to_string(),
+        _ => frame_ip.to_string(),
+    }
+}
+
+/// Opens a cluster-bus connection to `addr`, from this node's first
+/// specific `bind` address of the same family if it has one (Redis does the
+/// same), so the peer sees the address we listen on, not whatever the
+/// kernel picks (another interface, or 127.0.0.1 for a node bound to
+/// another loopback address).
+fn bus_connect(
+    port: u16,
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+) -> std::io::Result<TcpStream> {
+    let source = crate::netsec::bind_addrs(port)
+        .into_iter()
+        .map(|b| b.ip)
+        .find(|ip| !ip.is_unspecified() && ip.is_ipv4() == addr.is_ipv4());
+    let Some(source) = source else {
+        return TcpStream::connect_timeout(&addr, timeout);
+    };
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.bind(&std::net::SocketAddr::new(source, 0).into())?;
+    socket.connect_timeout(&addr.into(), timeout)?;
+    Ok(socket.into())
+}
+
 /// Whether `ip` may be announced or taken from a peer's announcement: an IP
 /// address (as `cluster-announce-ip` requires in Redis).
 pub fn valid_announced_ip(ip: &str) -> bool {
@@ -2603,6 +2693,7 @@ fn apply_announce(node: &mut ClusterNodeInfo, parts: &[&str]) {
 }
 
 fn handle_cluster_bus_conn(stream: TcpStream, hub: &Arc<ClusterHub>) {
+    let ends = stream.peer_addr().ok().zip(stream.local_addr().ok());
     let mut reader = std::io::BufReader::new(stream);
     let mut line = Vec::new();
     loop {
@@ -2617,7 +2708,8 @@ fn handle_cluster_bus_conn(stream: TcpStream, hub: &Arc<ClusterHub>) {
         if line.len() > MAX_BUS_LINE {
             break;
         }
-        if let Some(reply) = handle_cluster_bus_line(&String::from_utf8_lossy(&line), hub)
+        if let Some(reply) =
+            handle_cluster_bus_line_from(&String::from_utf8_lossy(&line), hub, ends)
             && reader.get_mut().write_all(reply.as_bytes()).is_err()
         {
             break;
@@ -2630,6 +2722,18 @@ fn handle_cluster_bus_conn(stream: TcpStream, hub: &Arc<ClusterHub>) {
 /// any bytes may arrive here.
 #[doc(hidden)]
 pub fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
+    handle_cluster_bus_line_from(line, hub, None)
+}
+
+/// [`handle_cluster_bus_line`] for a frame that arrived over a connection
+/// with these (peer, local) addresses: a MEET takes the peer's address from
+/// it when the frame carries none (see `meet_peer_ip`), and teaches us our
+/// own (see `ClusterHub::learn_my_ip`).
+fn handle_cluster_bus_line_from(
+    line: &str,
+    hub: &ClusterHub,
+    ends: Option<(SocketAddr, SocketAddr)>,
+) -> Option<String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     let cmd = *parts.first()?;
     match cmd {
@@ -2638,7 +2742,7 @@ pub fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             if parts.len() < 4 {
                 return None;
             }
-            let peer_ip = parts[1].to_string();
+            let peer_ip = meet_peer_ip(parts[1], ends.map(|(peer, _)| peer.ip()));
             let Some((peer_port, mut peer_cport)) = parts[2]
                 .parse::<u16>()
                 .ok()
@@ -2659,6 +2763,10 @@ pub fn handle_cluster_bus_line(line: &str, hub: &ClusterHub) -> Option<String> {
             if peer_id == hub.my_id() {
                 // Our own MEET, sent to an address of ours.
                 return Some(pong_reply(hub));
+            }
+            // Where the peer reached us: our address, unless announced.
+            if let Some((_, local)) = ends {
+                hub.learn_my_ip(local.ip());
             }
             let peer_epoch: u64 = if parts.len() >= 5 {
                 parts[4].parse().unwrap_or(1)
@@ -3610,6 +3718,56 @@ mod tests {
         assert_eq!(addr(&hub), ("10.3.3.3".to_string(), 27200, 27600));
         assert!(!valid_announced_ip("0.0.0.0"));
         assert!(valid_announced_ip("::1"));
+    }
+
+    #[test]
+    fn test_meet_takes_the_peers_address_from_its_connection_when_unannounced() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        // The frame's own address is kept unless it is the default/wildcard.
+        assert_eq!(meet_peer_ip("10.0.0.9", Some(ip("10.0.0.5"))), "10.0.0.9");
+        assert_eq!(meet_peer_ip("127.0.0.1", Some(ip("10.0.0.5"))), "10.0.0.5");
+        assert_eq!(meet_peer_ip("0.0.0.0", Some(ip("10.0.0.5"))), "10.0.0.5");
+        assert_eq!(meet_peer_ip("garbage", Some(ip("10.0.0.5"))), "10.0.0.5");
+        assert_eq!(
+            meet_peer_ip("127.0.0.1", Some(ip("::ffff:10.0.0.5"))),
+            "10.0.0.5"
+        );
+        assert_eq!(meet_peer_ip("127.0.0.1", None), "127.0.0.1");
+
+        let hub = ClusterHub::new(7150);
+        let peer = "d".repeat(40);
+        let ends = (
+            "10.0.0.5:41000".parse().unwrap(),
+            "10.0.0.7:17150".parse().unwrap(),
+        );
+        handle_cluster_bus_line_from(&format!("MEET 127.0.0.1 7150 {peer} 1"), &hub, Some(ends));
+        assert_eq!(hub.nodes.read()[&peer].ip, "10.0.0.5");
+        // And we learned the address it reached us at.
+        assert_eq!(hub.my_ip(), "10.0.0.7");
+        assert!(hub.cluster_nodes().contains(" 10.0.0.7:7150@17150 myself"));
+    }
+
+    #[test]
+    fn test_learned_address_yields_to_announced_and_keeps_off_loopback() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let hub = ClusterHub::new(7151);
+        assert_eq!(hub.my_ip(), "127.0.0.1");
+        hub.learn_my_ip(ip("10.0.0.7"));
+        assert_eq!(hub.my_ip(), "10.0.0.7");
+        assert!(hub.is_my_addr("10.0.0.7", 7151));
+        // A MEET over loopback does not replace a real address...
+        hub.learn_my_ip(ip("127.0.0.1"));
+        assert_eq!(hub.my_ip(), "10.0.0.7");
+        // ...a wildcard is never learned, another real address is.
+        hub.learn_my_ip(ip("0.0.0.0"));
+        hub.learn_my_ip(ip("::ffff:10.0.0.8"));
+        assert_eq!(hub.my_ip(), "10.0.0.8");
+        // cluster-announce-ip wins, and stops learning.
+        *hub.announce_ip.write() = Some("192.0.2.1".to_string());
+        hub.learn_my_ip(ip("10.0.0.9"));
+        assert_eq!(hub.my_ip(), "192.0.2.1");
+        *hub.announce_ip.write() = None;
+        assert_eq!(hub.my_ip(), "10.0.0.8");
     }
 
     #[test]

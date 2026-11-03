@@ -306,7 +306,7 @@ A node tells peers and clients to reach it at its **announced address**:
 
 | Setting (config file, `--name value`, `CONFIG SET`/`GET`) | Default | Announced as |
 | :--- | :--- | :--- |
-| `cluster-announce-ip` | empty | that IP address, else `127.0.0.1` |
+| `cluster-announce-ip` | empty | that IP address, else the one learned from the bus (below), else `127.0.0.1` |
 | `cluster-announce-port` | 0 | that port, else the port we listen on; shard N at this port + N |
 | `cluster-announce-bus-port` | 0 | that port, else the announced port + 10000 |
 
@@ -314,8 +314,22 @@ It appears in the `MEET` frame, the announce tokens of every PING and PONG (so a
 with the next tick), the `myself` line of `CLUSTER NODES` (and `nodes.conf`), our own entries in
 `CLUSTER SLOTS` and `CLUSTER SHARDS`, the local-shard `-MOVED`, and the rebalance and reshard plans.
 `cluster-announce-ip` must be an IP address (not `0.0.0.0`); `CONFIG SET` refuses anything else.
-Peers learn our address only from what we announce, so **a multi-host cluster needs
-`cluster-announce-ip` on every node**; without it each node calls itself `127.0.0.1`.
+
+**Learning the address.** Without `cluster-announce-ip`, a node learns its address the way Redis
+does, from the bus connections a `MEET` goes over:
+
+* `CLUSTER MEET` connects from the node's first specific `bind` address of the right family (if
+  it has one; otherwise the kernel picks), and takes the local end of that connection as its own
+  address before sending the frame, which then carries it.
+* A node receiving a `MEET` takes the local end of that connection (the address the peer reached
+  it at) as its own. It records the peer at the frame's address, unless that is missing, a
+  wildcard or the `127.0.0.1` default (a peer that knows no better), in which case it uses the
+  connection's remote address.
+* An address learned over loopback never replaces a non-loopback one (an operator's `MEET` from
+  the same host), and IPv4-mapped IPv6 addresses are stored as IPv4.
+
+Behind NAT the learned address is the private one: set `cluster-announce-ip` (and the ports)
+there.
 
 ---
 
@@ -812,10 +826,11 @@ line was found.
 
 ## 17. Limitations and not implemented
 
-* **No address discovery.** Without `cluster-announce-ip` a node announces `127.0.0.1`; unlike
-  Redis it does not learn its address from the connections peers reach it on, so a multi-host
-  cluster must set `cluster-announce-ip` on every node (§6.5). `cluster-announce-hostname`,
-  `cluster-announce-client-ipv4/ipv6` and `cluster-announce-tls-port` are accepted but ignored.
+* **Address learning is MEET-only.** A node learns its address (§6.5) only from `MEET`
+  connections, not from every PING as Redis does, so an address that changes later (a moved
+  container) is picked up at the next `MEET`, or set with `cluster-announce-ip`.
+  `cluster-announce-hostname`, `cluster-announce-client-ipv4/ipv6` and `cluster-announce-tls-port`
+  are accepted but ignored.
 * **No bus outside cluster mode.** The bus starts only with `cluster-enabled yes`; a non-cluster node
   can send `CLUSTER MEET` but cannot receive heartbeats.
 * **Unauthenticated, text bus.** Any client that can reach the bus port can send `FAIL`,

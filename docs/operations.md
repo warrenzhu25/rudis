@@ -88,11 +88,12 @@ A script runs on its shard's thread until it returns. Past `busy-reply-threshold
 
 ## 6. Cluster resharding
 
-**Multi-host clusters: set `cluster-announce-ip` on every node** (the address the other nodes and
-clients reach it at). Without it a node announces itself as `127.0.0.1`, so peers on other hosts
-record it at the wrong address and redirect clients there. Behind NAT or port mapping, also set
-`cluster-announce-port` (shard N is announced at that port + N) and `cluster-announce-bus-port`.
-Check with `CLUSTER NODES` on each node that every peer shows its reachable address.
+**Multi-host clusters.** Nodes learn their addresses from the `CLUSTER MEET` connections (as
+Redis does), so on a flat network nothing needs setting; `bind` a node to the address peers should
+use if it has several. Behind NAT or port mapping, or for an address that differs from the one
+peers connect from, set `cluster-announce-ip` on every node, plus `cluster-announce-port` (shard N
+is announced at that port + N) and `cluster-announce-bus-port`. Check with `CLUSTER NODES` on each
+node that every peer shows its reachable address.
 
 `CLUSTER SETSLOT`, `CLUSTER REBALANCE` and `CLUSTER RESHARD` move keys between nodes
 (sequentially, one slot at a time, in batches of 100 keys). Clients that follow `-ASK`/`-MOVED`

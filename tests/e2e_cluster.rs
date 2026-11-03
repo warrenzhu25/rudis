@@ -4046,3 +4046,87 @@ fn test_rebalance_never_hands_over_a_slot_whose_keys_did_not_move_e2e() {
     );
     assert!(resp_cmd(&mut c1, &["GET", &keys[0]]).starts_with("-MOVED 12000 127.0.0.1:"));
 }
+
+/// Without cluster-announce-ip, nodes learn their addresses from the bus as
+/// Redis does: each node bound to its own address (other loopback addresses
+/// stand in for other hosts, on one port) ends up known, to itself and to
+/// its peer, at that address, and redirects name it.
+#[test]
+fn test_cluster_nodes_learn_their_addresses_without_announce_ip_e2e() {
+    let port = 28403u16;
+    let spawn = |ip: &str| {
+        let dir =
+            std::env::temp_dir().join(format!("rudis_cluster_learn_{}_{}", ip, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ServerGuard(spawn_rudis_listening_at(
+            &[
+                "--port",
+                &port.to_string(),
+                "--bind",
+                ip,
+                "--dir",
+                dir.to_str().unwrap(),
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "1",
+                "--no-pin",
+            ],
+            ip,
+            port,
+            &legacy_driver_env(),
+        ))
+    };
+    let (a, b) = ("127.0.0.2", "127.0.0.3");
+    let _a = spawn(a);
+    let _b = spawn(b);
+    let cmd = |ip: &str, args: &[&str]| {
+        let mut c = TcpStream::connect((ip, port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        resp_cmd(&mut c, args)
+    };
+    let id = |ip: &str| {
+        cmd(ip, &["CLUSTER", "MYID"])
+            .lines()
+            .nth(1)
+            .unwrap()
+            .to_string()
+    };
+    let (a_id, b_id) = (id(a), id(b));
+    for (ip, (s, e)) in [(a, ("0", "8191")), (b, ("8192", "16383"))] {
+        assert_eq!(
+            cmd(ip, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+            "+OK\r\n"
+        );
+        assert_eq!(cmd(ip, &["CLUSTER", "ADDSLOTSRANGE", s, e]), "+OK\r\n");
+    }
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", b, &port.to_string()]),
+        "+OK\r\n"
+    );
+    let bus = port + 10000;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (na, nb) = (cmd(a, &["CLUSTER", "NODES"]), cmd(b, &["CLUSTER", "NODES"]));
+        let ok = na.contains(&format!("{a_id} {a}:{port}@{bus} myself,master"))
+            && na.contains(&format!("{b_id} {b}:{port}@{bus} master"))
+            && nb.contains(&format!("{b_id} {b}:{port}@{bus} myself,master"))
+            && nb.contains(&format!("{a_id} {a}:{port}@{bus} master"))
+            && slots_reply_covers_all_slots(&cmd(b, &["CLUSTER", "SLOTS"]));
+        if ok {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "A:\n{na}\nB:\n{nb}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let key = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| rudis::router::key_slot(k.as_bytes()) < 8192)
+        .unwrap();
+    let slot = rudis::router::key_slot(key.as_bytes());
+    assert_eq!(
+        cmd(b, &["GET", &key]),
+        format!("-MOVED {slot} {a}:{port}\r\n")
+    );
+}
