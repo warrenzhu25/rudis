@@ -867,8 +867,9 @@ positive integer` (`parse_min_idle_time`); `value is not a valid float` (`parse_
 (`write_resp_score`, `write_resp_double_text`), `%` maps (`write_resp_map_len`, e.g. `HELLO`),
 `~` sets (`write_resp_set_len`), `=` verbatim (`src/resp3.rs`), `#` booleans (scripts after
 `redis.setresp(3)`), `>` push frames (`src/pubsub.rs`). Not emitted: `(` big number, `|`
-attribute. Known remaining differences from Redis: HELP replies are bulk strings, not simple
-strings; `MEMORY STATS` has no `db.N` entries; `CLUSTER INFO` answers outside cluster mode.
+attribute. HELP replies are arrays of simple strings (`write_resp_status`), as in Redis. Known
+remaining differences from Redis: `MEMORY STATS` has no `db.N` entries; `CLUSTER INFO` answers
+outside cluster mode.
 
 ### 12.6 Tests that pin the behavior
 

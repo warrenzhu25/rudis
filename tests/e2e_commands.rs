@@ -1618,6 +1618,12 @@ fn test_resp3_reply_types_match_redis_e2e() {
     for (cmd, want) in cases {
         assert_eq!(&resp_cmd(&mut c, cmd), want, "RESP3 {cmd:?}");
     }
+    // HELP lines are simple strings, as Redis sends them (both protocols).
+    for conn in [&mut c, &mut r2] {
+        let help = resp_cmd(conn, &["OBJECT", "HELP"]);
+        assert!(help.starts_with("*6\r\n+OBJECT <subcommand>"), "{help}");
+        assert!(help.ends_with("+HELP -- Print this help.\r\n"), "{help}");
+    }
     let info = send_and_read(&mut c, b"*2\r\n$4\r\nINFO\r\n$6\r\nserver\r\n");
     assert!(
         info.starts_with('=') && info.contains("txt:# Server"),

@@ -766,6 +766,14 @@ pub fn write_resp_double_text(out: &mut Vec<u8>, text: &str) {
     }
 }
 
+/// A simple-string reply line (`+text`), as Redis sends HELP lines.
+#[inline]
+pub fn write_resp_status(out: &mut Vec<u8>, text: &str) {
+    out.push(b'+');
+    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(b"\r\n");
+}
+
 /// A set header of `len` members: RESP3 `~`, or a RESP2 array.
 #[inline]
 pub fn write_resp_set_len(out: &mut Vec<u8>, len: usize) {
@@ -1518,7 +1526,7 @@ pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
             ];
             out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
             for line in help_lines {
-                out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+                write_resp_status(out, line);
             }
         }
     }
@@ -15662,7 +15670,7 @@ async fn execute_command_inner(
                     ];
                     write_resp_array_header(out, HELP.len());
                     for line in HELP {
-                        write_resp_bulk(out, line.as_bytes());
+                        write_resp_status(out, line);
                     }
                 }
             }
@@ -18774,7 +18782,7 @@ async fn execute_command_inner(
             ];
             out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
             for line in help_lines {
-                out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+                write_resp_status(out, line);
             }
             false
         }
@@ -20070,7 +20078,7 @@ async fn execute_command_inner(
             ];
             write_resp_array_header(out, help_items.len());
             for item in help_items {
-                write_resp_bulk(out, item.as_bytes());
+                write_resp_status(out, item);
             }
             false
         }
@@ -20083,7 +20091,7 @@ async fn execute_command_inner(
             ];
             write_resp_array_header(out, help_items.len());
             for item in help_items {
-                write_resp_bulk(out, item.as_bytes());
+                write_resp_status(out, item);
             }
             false
         }
@@ -20108,7 +20116,7 @@ async fn execute_command_inner(
             ];
             write_resp_array_header(out, help_items.len());
             for item in help_items {
-                write_resp_bulk(out, item.as_bytes());
+                write_resp_status(out, item);
             }
             false
         }
@@ -20157,7 +20165,7 @@ async fn execute_command_inner(
                 let help_lines = [first_line.as_str(), "HELP -- Print this help."];
                 write_resp_array_header(out, help_lines.len());
                 for line in help_lines {
-                    write_resp_bulk(out, line.as_bytes());
+                    write_resp_status(out, line);
                 }
                 return false;
             }
@@ -22823,7 +22831,7 @@ pub fn execute_local_command(
                         ];
                         write_resp_array_header(out, help_items.len());
                         for item in help_items {
-                            write_resp_bulk(out, item.as_bytes());
+                            write_resp_status(out, item);
                         }
                     }
                 }
@@ -23073,7 +23081,7 @@ pub fn execute_local_command(
                         ];
                         write_resp_array_header(out, help_items.len());
                         for item in help_items {
-                            write_resp_bulk(out, item.as_bytes());
+                            write_resp_status(out, item);
                         }
                     }
                 }
@@ -23100,7 +23108,7 @@ pub fn execute_local_command(
                 ];
                 write_resp_array_header(out, help_items.len());
                 for item in help_items {
-                    write_resp_bulk(out, item.as_bytes());
+                    write_resp_status(out, item);
                 }
                 false
             }
@@ -27677,7 +27685,7 @@ pub fn execute_local_command(
                 ];
                 out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
                 for line in help_lines {
-                    out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+                    write_resp_status(out, line);
                 }
                 false
             }
@@ -28025,7 +28033,7 @@ pub fn execute_local_command(
                     let help_lines = [first_line.as_str(), "HELP -- Print this help."];
                     write_resp_array_header(out, help_lines.len());
                     for line in help_lines {
-                        write_resp_bulk(out, line.as_bytes());
+                        write_resp_status(out, line);
                     }
                     return false;
                 }
@@ -33037,6 +33045,13 @@ mod tests {
 
         unwatch_keys(watch_port, 200);
         assert!(!is_watch_tainted(watch_port, 200));
+    }
+
+    #[test]
+    fn test_help_lines_are_simple_strings() {
+        let mut out = Vec::new();
+        write_resp_status(&mut out, "HELP -- Print this help.");
+        assert_eq!(out, b"+HELP -- Print this help.\r\n");
     }
 
     #[test]

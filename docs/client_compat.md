@@ -58,6 +58,5 @@ RESP2 reply types. The cause was rudis answering RESP3 clients with RESP2 types:
 (which make redis-py's RESP3 parser wait forever), arrays instead of maps and sets, bulk strings
 instead of doubles. `scripts/client_compat/resp3_diff.py` compares the RESP3 reply shapes of 240
 commands with a reference Redis; it found 54 of the first 162 differing from Redis 7.4.2. After the
-fix 3 of 240 differ, none of which affect these clients: HELP replies are bulk strings rather than
-simple strings, `MEMORY STATS` has no `db.N` entries, and `CLUSTER INFO` answers outside cluster
-mode.
+fixes 2 of 240 differ, neither of which affects these clients: `MEMORY STATS` has no `db.N`
+entries, and `CLUSTER INFO` answers outside cluster mode.
