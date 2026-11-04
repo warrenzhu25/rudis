@@ -42,24 +42,26 @@ This document summarizes the architectural, operational, and semantic difference
 ### Multi-Key Atomicity Across Shards
 * **Redis**: Single-threaded, so every command and `MULTI`/`EXEC` is atomic.
 * **Dragonfly**: Multi-key commands and transactions are scheduled across shards atomically.
-* **Rudis**: A cross-shard `MGET` never sees a cross-shard `MSET` or `MULTI`/`EXEC` half applied
-  (a seqlock check, with a fallback to per-shard VLL locks; see
-  [`design/04_sharding_mesh.md`](design/04_sharding_mesh.md) §4.4), and `EXEC`s are ordered
-  against each other. Some gaps remain:
-  - Two concurrent cross-shard `MSET`s (or an `MSET` and an `EXEC`) of the same keys can apply
-    in a different order on each shard.
-  - A cross-shard `EXEC` isn't isolated from plain single-key commands.
-  - Other multi-key commands spanning shards (`DEL`, `UNLINK`, `EXISTS`, `TOUCH` with several
-    keys) run per shard.
-  - A blocked cross-shard `BLMOVE`/`BRPOPLPUSH` is woken when its source gets an element and
-    then moves it like `LMOVE`; if another client takes the element first, it blocks again for
-    the rest of its timeout (Redis hands the element to the blocked client directly).
+* **Rudis**: multi-key commands whose keys live on different shards all run, but they are **not
+  all atomic**. This is a deliberate trade-off (per-shard execution keeps the thread-per-core fast
+  path); Redis Cluster refuses such commands outright with `CROSSSLOT`. What each kind guarantees:
+
+  | Commands (keys on several shards) | Guarantee |
+  |---|---|
+  | `MGET`, `MSET`, `MULTI`/`EXEC` | Isolated from each other: an `MGET` never sees an `MSET` or `EXEC` half applied (a seqlock check with a fallback to per-shard VLL locks; [`design/04_sharding_mesh.md`](design/04_sharding_mesh.md) §4.4), and `EXEC`s are ordered against each other. Not isolated from plain single-key commands, and two concurrent `MSET`s (or an `MSET` and an `EXEC`) of the same keys can apply in a different order on each shard. |
+  | `RENAME`, `RENAMENX`, `COPY`, `LMOVE`, `RPOPLPUSH`, `SMOVE`, `MSETNX`, `BITOP` | Hold every involved shard's transaction lock, like `EXEC`: serialized with transactions and with each other, never seen half done by them, and replicated as one logical command (moves) or per shard. Like `EXEC`, not isolated from plain single-key commands. |
+  | `DEL`, `UNLINK`, `EXISTS`, `TOUCH` | **Not atomic**: each shard handles its own keys independently and the counts are summed. A concurrent reader can see some keys deleted and others not yet; a concurrent writer can recreate a key between the shards' steps. |
+  | `SINTER`/`SUNION`/`SDIFF` (and `*STORE`), `SINTERCARD`, `ZUNION`/`ZINTER`/`ZDIFF` (and `*STORE`), `ZINTERCARD`, `ZRANGESTORE`, `PFCOUNT`, `PFMERGE`, `LCS`, `SORT … STORE`, `GEOSEARCHSTORE` | **Not atomic**: the source keys are read from their shards one at a time (not one snapshot), then the destination, if any, is written. A write racing the command can be seen in some sources and not others. |
+  | `LMPOP`, `ZMPOP`, `XREAD` over several keys | Each key is read or popped on its own shard; the command acts on the first key that has data, as Redis does, with no snapshot across keys. |
+  | Blocking `BLMOVE`/`BRPOPLPUSH` | Woken when the source gets an element, then moved like `LMOVE`; if another client takes the element first, it blocks again for the rest of its timeout (Redis hands the element to the blocked client directly). |
+  | `EVAL`/`FCALL` | Refused with `CROSSSLOT`: a script runs on one shard. |
 
   To make related keys atomic in every case, put them on one shard with a hash tag
-  (`{user:1}:a`, `{user:1}:b`). To have rudis enforce that, set `cross-shard-strict yes`
-  (config file, `--cross-shard-strict yes`, or `CONFIG SET`): a multi-key command or a
-  transaction whose keys live on different shards then fails with Redis Cluster's `CROSSSLOT`
-  error instead of running with the weaker guarantees above.
+  (`{user:1}:a`, `{user:1}:b`): commands on one shard are fully atomic, as in Redis. To have rudis
+  enforce that, set `cross-shard-strict yes` (config file, `--cross-shard-strict yes`, or
+  `CONFIG SET`): a multi-key command or a transaction whose keys live on different shards then fails
+  with Redis Cluster's `CROSSSLOT` error instead of running with the weaker guarantees above.
+  In cluster mode (`cluster-enabled yes`) such commands always get `CROSSSLOT`, as in Redis Cluster.
 
 ## 3. Replication & High Availability
 

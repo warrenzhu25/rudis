@@ -1194,8 +1194,8 @@ over one connection.
 * **Scripts run on one shard**; key sets spanning shards get `-CROSSSLOT`.
 * **Cross-shard atomicity is not universal.** EXEC, MGET, MSET and the key and element moves of
   §7.7 are isolated from each other, but other multi-key commands spanning shards (for example DEL
-  or EXISTS of several keys) run per shard without isolation. `cross-shard-strict yes` refuses all
-  of them instead.
+  or EXISTS of several keys) run per shard without isolation. This is by design (documented per
+  command in `docs/differences.md`); `cross-shard-strict yes` refuses all of them instead.
 * **A cross-shard element move blocks the source shard's thread**, spinning (and yielding) until
   the destination takes its push, for up to 10 s, after which the move is withdrawn and fails with
   `-TRYAGAIN` (§7.7).

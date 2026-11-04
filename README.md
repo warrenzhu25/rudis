@@ -741,6 +741,7 @@ links go to the corresponding source-verified subsystem specification.
 | **Geospatial commands** | Implemented | Integer geohash encoding, Haversine distance, `GEOSEARCH`. | [17](docs/design/17_geospatial.md) |
 | **Streams & consumer groups** | Implemented | Append-only log, consumer groups, PEL, blocking/non-blocking `XREAD`. | — |
 | **Transactions (`MULTI`/`EXEC`)** | Implemented | Deterministic cross-shard execution ordering to avoid deadlock. | [rudis_internals_guide §5](docs/rudis_internals_guide.md) |
+| **Multi-key commands across shards** | Implemented, not all atomic | `MGET`/`MSET`/`EXEC` are isolated from each other and moves/`MSETNX`/`BITOP` take transaction locks, but `DEL`/`UNLINK`/`EXISTS`/`TOUCH` and set/sorted-set/HLL algebra run per shard without isolation. Use hash tags for atomic groups, or `cross-shard-strict yes` to refuse with `CROSSSLOT`. | [differences.md](docs/differences.md#multi-key-atomicity-across-shards) |
 | **Pub/Sub incl. Sharded Pub/Sub** | Implemented | 16-stripe presence bitmask; CRC16 slot routing for `SPUBLISH`. | [19](docs/design/19_pubsub.md), [pub-sub.md](docs/pub-sub.md) |
 | **Scripting & Functions** | Implemented | `EVAL`/`EVALSHA` and `FUNCTION`/`FCALL` via sandboxed `mlua` (Lua 5.4). | [13](docs/design/13_scripting_functions.md) |
 | **ACL & Security** | Implemented | Per-user permissions, category selectors, `AUTH`. | [15](docs/design/15_security_tls.md) |
