@@ -3405,6 +3405,24 @@ pub static PAUSE_CRON: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// can catch one half done.
 pub static CROSS_SHARD_MOVE_DELAY_US: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// `client-default-resp` (Valkey 8): the protocol a new connection speaks
+/// before any HELLO, and returns to on RESET. `true` = RESP3.
+pub static CLIENT_DEFAULT_RESP3: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `client-default-resp`'s value: `true` for 3, `false` for 2.
+fn parse_client_default_resp(v: &str) -> Result<bool, String> {
+    match v {
+        "2" => Ok(false),
+        "3" => Ok(true),
+        _ => Err("client-default-resp must be 2 or 3".to_string()),
+    }
+}
+
+#[inline]
+fn client_default_resp3() -> bool {
+    CLIENT_DEFAULT_RESP3.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// `DEBUG CROSS-SHARD-PUSH-DELAY <microseconds>` (a test knob): how long
 /// the destination shard of a cross-shard LMOVE / SMOVE stalls before it
 /// claims the push, so a test can make the source give up waiting.
@@ -3930,6 +3948,9 @@ pub fn apply_config_value(
                 .announce_port
                 .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
         }
+        "client-default-resp" => {
+            CLIENT_DEFAULT_RESP3.store(parse_client_default_resp(val_str)?, Ordering::Relaxed);
+        }
         "cluster-allow-reads-when-down" => {
             crate::cluster::get_cluster_hub(base_port)
                 .allow_reads_when_down
@@ -4217,8 +4238,24 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 106] = [
+    let all_configs: [(&str, String); 108] = [
         ("port", port_str),
+        (
+            "client-default-resp",
+            if client_default_resp3() { "3" } else { "2" }.to_string(),
+        ),
+        (
+            "cluster-allow-reads-when-down",
+            if cluster_hub
+                .allow_reads_when_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
         ("tls-auth-clients", tls_auth_clients),
         ("tls-ca-cert-file", tls_ca_cert_file),
         ("tls-cert-file", tls_cert_file),
@@ -4984,6 +5021,18 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET maxclients\r\n");
                 return;
             }
+        } else if p_str == "client-default-resp" && parse_client_default_resp(&val_str).is_err() {
+            out.extend_from_slice(
+                b"-ERR Invalid argument for CONFIG SET client-default-resp (must be 2 or 3)\r\n",
+            );
+            return;
+        } else if p_str == "cluster-allow-reads-when-down"
+            && parse_config_bool(&p_str, &val_str).is_err()
+        {
+            out.extend_from_slice(
+                b"-ERR Invalid argument for CONFIG SET cluster-allow-reads-when-down\r\n",
+            );
+            return;
         } else if p_str == "tracking-table-max-keys" && val_str.parse::<usize>().is_err() {
             out.extend_from_slice(
                 b"-ERR Invalid argument for CONFIG SET tracking-table-max-keys\r\n",
@@ -5576,7 +5625,7 @@ async fn execute_tx_step(
                 unwatch_keys(router.port, client_id);
                 if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                     c.name = None;
-                    c.is_resp3 = false;
+                    c.is_resp3 = client_default_resp3();
                     c.db = 0;
                     c.is_monitor = false;
                     c.stats
@@ -5586,7 +5635,7 @@ async fn execute_tx_step(
                 CURRENT_DB.set(0);
                 router.local_db.borrow_mut().select_db(0);
                 CLIENT_NO_TOUCH.set(false);
-                update_global_client_resp3(router.port, client_id, false);
+                update_global_client_resp3(router.port, client_id, client_default_resp3());
                 update_global_client_auth(router.port, client_id, "default");
                 unregister_client_tracking(router.port, client_id);
                 unregister_monitor_client(router.port, client_id);
@@ -6070,13 +6119,15 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
     let now = Instant::now();
     let stats = std::sync::Arc::new(ClientStats::new(now, client_addr));
     let (track_tx, track_rx) = flume::unbounded::<Vec<u8>>();
+    let default_resp3 = client_default_resp3();
+    CURRENT_CLIENT_RESP3.set(default_resp3);
     register_global_client(
         router.port,
         client_id,
         raw_fd,
         push.clone(),
         track_tx.clone(),
-        false,
+        default_resp3,
         "default".to_string(),
         false,
         stats.clone(),
@@ -6092,7 +6143,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
             connected_at: now,
             last_active: now,
             last_cmd: "NONE",
-            is_resp3: false,
+            is_resp3: default_resp3,
             db: 0,
             track_tx: Some(track_tx),
             raw_fd,
@@ -7139,7 +7190,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                     tx_queue.clear();
                     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                         c.name = None;
-                        c.is_resp3 = false;
+                        c.is_resp3 = client_default_resp3();
                         c.db = 0;
                         c.is_monitor = false;
                     }
@@ -7582,7 +7633,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                 tx_queue.clear();
                 if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                     c.name = None;
-                    c.is_resp3 = false;
+                    c.is_resp3 = client_default_resp3();
                     c.db = 0;
                     c.is_monitor = false;
                 }
@@ -14161,7 +14212,7 @@ async fn execute_command_inner(
                             .pipeline_len_cnt
                             .load(std::sync::atomic::Ordering::Relaxed);
                         let info = format!(
-                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
+                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
                             c.id,
                             c.addr,
                             router.port,
@@ -14174,6 +14225,7 @@ async fn execute_command_inner(
                             qbuf_free,
                             c.omem,
                             c.last_cmd.to_lowercase(),
+                            if c.is_resp3 { 3 } else { 2 },
                             c.lib_name.as_deref().unwrap_or(""),
                             c.lib_ver.as_deref().unwrap_or(""),
                             tot_net_in,
@@ -17232,15 +17284,15 @@ async fn execute_command_inner(
         Command::Reset => {
             if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                 c.name = None;
-                c.is_resp3 = false;
+                c.is_resp3 = client_default_resp3();
                 c.db = 0;
                 c.is_monitor = false;
                 c.reply_mode = crate::resp::ClientReplyMode::On;
             }
-            CURRENT_CLIENT_RESP3.set(false);
+            CURRENT_CLIENT_RESP3.set(client_default_resp3());
             CURRENT_DB.set(0);
             router.local_db.borrow_mut().select_db(0);
-            update_global_client_resp3(router.port, client_id, false);
+            update_global_client_resp3(router.port, client_id, client_default_resp3());
             update_global_client_auth(router.port, client_id, "default");
             unregister_client_tracking(router.port, client_id);
             unregister_monitor_client(router.port, client_id);
@@ -31145,6 +31197,16 @@ mod tests {
         let before = buf.len();
         assert!(matches!(parse_command(&mut buf), Ok(Some(_))));
         assert!(parsed_query_over_limit(before, buf.len(), limit));
+    }
+
+    #[test]
+    fn test_client_default_resp_config_accepts_only_2_or_3() {
+        // The parser only: setting the process-wide default here would race
+        // other tests' connections.
+        assert_eq!(parse_client_default_resp("3"), Ok(true));
+        assert_eq!(parse_client_default_resp("2"), Ok(false));
+        assert!(parse_client_default_resp("4").is_err());
+        assert!(parse_client_default_resp("").is_err());
     }
 
     #[test]

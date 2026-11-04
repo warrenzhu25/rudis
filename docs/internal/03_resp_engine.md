@@ -462,7 +462,9 @@ AOF and replicas see UNLINK.
 argument other than AUTH or SETNAME is recorded as version −1 (invalid). Unknown later words are
 skipped. The connection code then rejects any version other than 2 or 3 with
 `-NOPROTO unsupported protocol version`, switches the client to RESP3 if asked, and replies with a
-7-entry map (a real map in RESP3, a flat array in RESP2).
+7-entry map (a real map in RESP3, a flat array in RESP2). A connection starts in the protocol
+`client-default-resp` names (2 by default; Valkey 8's option, `CLIENT_DEFAULT_RESP3`) and returns to
+it on RESET; CLIENT LIST/INFO show the current one as `resp=`.
 
 **Hash-field TTLs.** HEXPIRE, HPEXPIRE, HEXPIREAT and HPEXPIREAT share one branch:
 `HEXPIRE key time [NX|XX|GT|LT] FIELDS numfields field...`. Seconds are converted to milliseconds

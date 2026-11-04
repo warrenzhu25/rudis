@@ -1541,6 +1541,43 @@ fn test_blocking_operations_e2e() {
     assert!(start.elapsed() >= Duration::from_millis(300));
 }
 
+/// client-default-resp 3 (Valkey 8): connections speak RESP3 before any
+/// HELLO, CLIENT LIST shows resp=3, HELLO 2 switches back, and RESET
+/// returns to the default.
+#[test]
+fn test_client_default_resp_3_starts_connections_in_resp3_e2e() {
+    let port = 15797;
+    let _server = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &port.to_string(),
+            "--threads",
+            "2",
+            "--no-pin",
+            "--save",
+            "",
+            "--client-default-resp",
+            "3",
+        ],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["GET", "missing"]), "_\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HGETALL", "missing"]), "%0\r\n");
+    assert!(resp_cmd(&mut c, &["CLIENT", "INFO"]).contains(" resp=3 "));
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "client-default-resp"]),
+        "%1\r\n$19\r\nclient-default-resp\r\n$1\r\n3\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["HELLO", "2"]).starts_with("*14\r\n"));
+    assert_eq!(resp_cmd(&mut c, &["GET", "missing"]), "$-1\r\n");
+    assert!(resp_cmd(&mut c, &["CLIENT", "INFO"]).contains(" resp=2 "));
+    assert_eq!(resp_cmd(&mut c, &["RESET"]), "+RESET\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "missing"]), "_\r\n");
+    assert!(resp_cmd(&mut c, &["CONFIG", "SET", "client-default-resp", "4"]).starts_with("-ERR"));
+}
+
 /// RESP3 clients (HELLO 3, the default of redis-py 8, go-redis 9 and
 /// Lettuce 6) get Redis's reply types: `_` nulls (a `$-1` hangs their
 /// parsers), maps, sets and doubles, also for cross-shard commands and
