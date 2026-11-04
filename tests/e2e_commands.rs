@@ -1618,6 +1618,10 @@ fn test_resp3_reply_types_match_redis_e2e() {
     for (cmd, want) in cases {
         assert_eq!(&resp_cmd(&mut c, cmd), want, "RESP3 {cmd:?}");
     }
+    // Pipelined (squashed) commands are reshaped too.
+    let xread = "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$2\r\nxs\r\n$1\r\n0\r\n";
+    let piped = send_and_read_reply_n(&mut c, xread.repeat(3).as_bytes(), 3);
+    assert_eq!(piped.matches("%1\r\n$2\r\nxs\r\n").count(), 3, "{piped}");
     // HELP lines are simple strings, as Redis sends them (both protocols).
     for conn in [&mut c, &mut r2] {
         let help = resp_cmd(conn, &["OBJECT", "HELP"]);

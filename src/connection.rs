@@ -28449,7 +28449,11 @@ async fn execute_commands_squashed_inner(
         if cmd.is_write_command() && !dirty_counted_on_change(&cmd) {
             crate::snapshot::note_write();
         }
+        // A reply a RESP3 client gets reshaped (see `crate::resp3`) takes the
+        // per-command path below, through `execute_command`, which does it.
+        let reshaped = is_resp3 && crate::resp3::reshape_for(&cmd).is_some();
         if let Some((mut target, key_hash)) = target_shard_and_hash_of_cmd(&cmd, router.num_shards)
+            && !reshaped
         {
             if !router.slot_owners.borrow().is_empty()
                 && let Some(k) = cmd_primary_key(&cmd)
