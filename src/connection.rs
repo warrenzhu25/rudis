@@ -32,11 +32,6 @@ const MAX_DRAIN_BATCH_BYTES: usize = 1 << 20;
 const SCRATCH_KEEP_ITEMS: usize = 1024;
 const SCRATCH_KEEP_BYTES: usize = 1 << 20;
 
-pub type ResponderChannel = (
-    flume::Sender<(Vec<(usize, Command)>, Vec<(usize, CompactResp)>)>,
-    flume::Receiver<(Vec<(usize, Command)>, Vec<(usize, CompactResp)>)>,
-);
-
 #[derive(Debug)]
 pub struct ClientStats {
     pub connected_at: Instant,
@@ -6160,7 +6155,6 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
         responders,
         mut remote_batches,
         mut items_pool,
-        mut results_pool,
         mut squashed_responses,
         mut commands,
     } = take_conn_scratch(router.num_shards);
@@ -6758,7 +6752,6 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 &responders,
                                 &mut remote_batches,
                                 &mut items_pool,
-                                &mut results_pool,
                                 &mut squashed_responses,
                                 client_id,
                                 &client_registry,
@@ -6873,7 +6866,6 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
         responders,
         remote_batches,
         items_pool,
-        results_pool,
         squashed_responses,
         commands,
     });
@@ -6885,7 +6877,6 @@ struct ConnScratch {
     responders: Vec<std::sync::Arc<crate::mailbox::BatchResponder>>,
     remote_batches: Vec<Vec<(usize, u64, Command)>>,
     items_pool: Vec<Vec<(usize, u64, Command)>>,
-    results_pool: Vec<Vec<(usize, CompactResp)>>,
     squashed_responses: Vec<CompactResp>,
     commands: Vec<Command>,
 }
@@ -6919,7 +6910,6 @@ fn take_conn_scratch(num_shards: usize) -> ConnScratch {
             .collect(),
         remote_batches: (0..num_shards).map(|_| Vec::new()).collect(),
         items_pool: (0..num_shards).map(|_| Vec::new()).collect(),
-        results_pool: (0..num_shards).map(|_| Vec::new()).collect(),
         squashed_responses: Vec::with_capacity(64),
         commands: Vec::with_capacity(64),
     }
@@ -6952,9 +6942,6 @@ fn recycle_conn_scratch(mut s: ConnScratch) {
     for b in &mut s.items_pool {
         b.clear();
     }
-    for b in &mut s.results_pool {
-        b.clear();
-    }
     trim_conn_scratch(&mut s);
     CONN_SCRATCH_POOL.with(|pool| {
         let mut p = pool.borrow_mut();
@@ -6982,9 +6969,6 @@ fn trim_conn_scratch(s: &mut ConnScratch) {
         trim(b, SCRATCH_KEEP_ITEMS, 64);
     }
     for b in &mut s.items_pool {
-        trim(b, SCRATCH_KEEP_ITEMS, 64);
-    }
-    for b in &mut s.results_pool {
         trim(b, SCRATCH_KEEP_ITEMS, 64);
     }
 }
@@ -28139,7 +28123,6 @@ async fn execute_commands_squashed(
     responders: &[std::sync::Arc<crate::mailbox::BatchResponder>],
     remote_batches: &mut [Vec<(usize, u64, Command)>],
     items_pool: &mut Vec<Vec<(usize, u64, Command)>>,
-    results_pool: &mut Vec<Vec<(usize, CompactResp)>>,
     responses: &mut Vec<CompactResp>,
     client_id: u64,
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
@@ -28161,7 +28144,6 @@ async fn execute_commands_squashed(
         responders,
         remote_batches,
         items_pool,
-        results_pool,
         responses,
         client_id,
         client_registry,
@@ -28190,7 +28172,6 @@ async fn execute_commands_squashed_inner(
     responders: &[std::sync::Arc<crate::mailbox::BatchResponder>],
     remote_batches: &mut [Vec<(usize, u64, Command)>],
     items_pool: &mut Vec<Vec<(usize, u64, Command)>>,
-    results_pool: &mut Vec<Vec<(usize, CompactResp)>>,
     responses: &mut Vec<CompactResp>,
     client_id: u64,
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
@@ -29393,7 +29374,6 @@ async fn execute_commands_squashed_inner(
     }
 
     // 2-3. Dispatch the remaining per-shard batches and wait for them.
-    let _ = results_pool;
     let cold_gets = std::mem::take(&mut local_cold_gets);
     flush_remote_batches(
         router,
@@ -32512,7 +32492,6 @@ mod tests {
             &scratch.responders,
             &mut scratch.remote_batches,
             &mut scratch.items_pool,
-            &mut scratch.results_pool,
             &mut scratch.squashed_responses,
             1,
             &client_registry,
@@ -33381,7 +33360,6 @@ mod tests {
             let responders = vec![std::sync::Arc::new(crate::mailbox::BatchResponder::new())];
             let mut remote_batches = vec![Vec::new()];
             let mut items_pool = vec![Vec::new()];
-            let mut results_pool = vec![Vec::new()];
             let mut squashed_responses = Vec::new();
 
             let mut cmds = vec![
@@ -33429,7 +33407,6 @@ mod tests {
                 &responders,
                 &mut remote_batches,
                 &mut items_pool,
-                &mut results_pool,
                 &mut squashed_responses,
                 1,
                 &client_registry,
@@ -33477,7 +33454,6 @@ mod tests {
             let responders = vec![std::sync::Arc::new(crate::mailbox::BatchResponder::new())];
             let mut remote_batches = vec![Vec::new()];
             let mut items_pool = vec![Vec::new()];
-            let mut results_pool = vec![Vec::new()];
             let mut squashed_responses = Vec::new();
 
             let mut cmds = vec![
@@ -33504,7 +33480,6 @@ mod tests {
                 &responders,
                 &mut remote_batches,
                 &mut items_pool,
-                &mut results_pool,
                 &mut squashed_responses,
                 1,
                 &client_registry,
@@ -33551,7 +33526,6 @@ mod tests {
             let responders = vec![std::sync::Arc::new(crate::mailbox::BatchResponder::new())];
             let mut remote_batches = vec![Vec::new()];
             let mut items_pool = vec![Vec::new()];
-            let mut results_pool = vec![Vec::new()];
             let mut squashed_responses = Vec::new();
 
             let mut cmds = vec![
@@ -33615,7 +33589,6 @@ mod tests {
                 &responders,
                 &mut remote_batches,
                 &mut items_pool,
-                &mut results_pool,
                 &mut squashed_responses,
                 1,
                 &client_registry,
@@ -33670,7 +33643,6 @@ mod tests {
             let responders = vec![std::sync::Arc::new(crate::mailbox::BatchResponder::new())];
             let mut remote_batches = vec![Vec::new()];
             let mut items_pool = vec![Vec::new()];
-            let mut results_pool = vec![Vec::new()];
             let mut squashed_responses = Vec::new();
             let b = |s: &'static str| Bytes::from_static(s.as_bytes());
 
@@ -33748,7 +33720,6 @@ mod tests {
                 &responders,
                 &mut remote_batches,
                 &mut items_pool,
-                &mut results_pool,
                 &mut squashed_responses,
                 1,
                 &client_registry,
@@ -33796,7 +33767,6 @@ mod tests {
             let responders = vec![std::sync::Arc::new(crate::mailbox::BatchResponder::new())];
             let mut remote_batches = vec![Vec::new()];
             let mut items_pool = vec![Vec::new()];
-            let mut results_pool = vec![Vec::new()];
             let mut squashed_responses = Vec::new();
 
             let mut cmds = vec![
@@ -33864,7 +33834,6 @@ mod tests {
                 &responders,
                 &mut remote_batches,
                 &mut items_pool,
-                &mut results_pool,
                 &mut squashed_responses,
                 1,
                 &client_registry,

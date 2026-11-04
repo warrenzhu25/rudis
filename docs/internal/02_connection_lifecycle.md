@@ -1199,8 +1199,6 @@ over one connection.
 * **A cross-shard element move blocks the source shard's thread**, spinning (and yielding) until
   the destination takes its push, for up to 10 s, after which the move is withdrawn and fails with
   `-TRYAGAIN` (§7.7).
-* **Dead code.** An unused responder-channel type alias, and a results pool that is carried
-  through the connection scratch and the squashed path but never used.
 
 ---
 
@@ -1301,7 +1299,6 @@ struct ConnScratch {
     responders: Vec<Arc<mailbox::BatchResponder>>,  // one per shard, index = shard id
     remote_batches: Vec<Vec<(usize, u64, Command)>>,// per shard: (slot idx, key hash, cmd)
     items_pool: Vec<Vec<(usize, u64, Command)>>,    // recycled batch Vecs
-    results_pool: Vec<Vec<(usize, CompactResp)>>,   // carried but unused
     squashed_responses: Vec<CompactResp>,           // reply slots for a squashed pipeline
     commands: Vec<Command>,                         // parsed batch
 }
