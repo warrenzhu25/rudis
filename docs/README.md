@@ -20,6 +20,7 @@ agents must uphold when touching this codebase.
 * **[Pub/Sub Architecture](pub-sub.md)**: the striped shard-presence bitmask that avoids broadcasting every `PUBLISH` to every shard, and Redis 7 slot-bound sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE`).
 * **[RDB Snapshotting](rdbsave.md)**: what actually triggers a save, why there is no `fork()`, why the save path is blocking (not `io_uring`-accelerated), and how tiered values get into the RDB.
 * **[Differences from Redis & Dragonfly](differences.md)**: architectural and behavioral comparison covering concurrency model, memory, limits, clustering, and persistence.
+* **[Client library compatibility](client_compat.md)**: redis-py, go-redis, ioredis, node-redis, Jedis and Lettuce against standalone and cluster rudis, in RESP2 and RESP3, and how to rerun the matrix.
 * **[Rudis Internals Guide](rudis_internals_guide.md)**: a narrative, example-driven tour of the same subsystems for contributors who want a single self-contained read before diving into the per-subsystem docs below.
 
 ### Subsystem Specifications & Implementation References
