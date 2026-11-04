@@ -606,13 +606,11 @@ apart from a reply.
   is not re-entrant. Serving a move's destination works because it is a direct call on the
   already-locked hub.
 * **Channels hold one message, and the hub sends with a blocking send.** A command is served at
-  most once because a served client is removed from all queues afterwards, but within one call that
-  relies on bookkeeping. Sorted-set serving skips clients already served in the same call, and
-  stream registration skips duplicates per key, but **list serving has no such check**. By code
-  inspection, a client that names the same list twice (BLPOP q q 0 — the parser does not remove
-  duplicate keys), followed by a push of two or more elements, would be served twice in one call.
-  The second send blocks the shard thread on a full channel: a deadlock if the blocked connection
-  lives on the same shard, otherwise the second element is popped and lost. Not covered by tests.
+  most once because a served client is removed from all queues afterwards, and within one call each
+  serving loop skips clients already served in it (lists, sorted sets) or registers them once per key
+  (streams). The parser keeps duplicate keys, so `BLPOP q q 0` queues the client twice on `q`;
+  without the list check a push of two elements served it twice, losing the second element (or
+  blocking the shard thread on the full channel).
 * **Serving streams leaves the per-thread RESP3 flag** set to the last served waiter's protocol.
   The connection loop resets it before each command, so this is harmless today, but code that runs
   after a notification within the same command should not rely on it.

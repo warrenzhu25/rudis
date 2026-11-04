@@ -291,7 +291,6 @@ The blocking hub coordinates Redis commands that suspend execution until data be
 
 **Gotchas & open issues**
 - **Owner thread execution invariant**: Notifications must run on the thread that owns the key's shard so table access and AOF/replica logging remain local; non-owner threads must forward via `ShardMessage::NotifyList`.
-- **List waiter duplicate-key starvation/deadlock**: Because `notify_list` lacks client deduplication within a single call, listing the same key multiple times (e.g. `BLPOP q q 0`) followed by a multi-element push can cause `send` to block on a full `bounded(1)` channel.
 - **Single-move notification limit**: `notify_list` serves at most one `Move`/`Movem` waiter per write notification, requiring subsequent writes or rechecks to unblock remaining chained move waiters.
 - **Global `has_blocked_waiters` check**: The `TOTAL_BLOCKED_WAITERS` atomic check ignores the `port` argument, forcing writes on unblocked server instances in the same process to take slower lock paths if any waiter exists on another port.
 - **`CLAIM` slice polling latency**: `XREADGROUP ... CLAIM min-idle` polls pending entry eligibility in 1–50 ms slices rather than reactive event notification, introducing up to ~50 ms latency before claiming idle entries.

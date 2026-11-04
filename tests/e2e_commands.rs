@@ -1541,6 +1541,70 @@ fn test_blocking_operations_e2e() {
     assert!(start.elapsed() >= Duration::from_millis(300));
 }
 
+/// A blocking pop naming the same list twice is served once: the other
+/// pushed elements stay in the list (the second queue entry once popped
+/// one more and lost it).
+#[test]
+fn test_blocking_pop_with_a_repeated_key_serves_once_e2e() {
+    let port = 15781;
+    start_test_server(port, 4);
+    let cases: [(&[&str], &str); 4] = [
+        (&["BLPOP", "q", "q", "0"], "*2\r\n$1\r\nq\r\n$1\r\na\r\n"),
+        (
+            &["BRPOP", "q", "other", "q", "0"],
+            "*2\r\n$1\r\nq\r\n$1\r\nb\r\n",
+        ),
+        (
+            &["BLMPOP", "0", "2", "q", "q", "LEFT"],
+            "*2\r\n$1\r\nq\r\n*1\r\n$1\r\na\r\n",
+        ),
+        (
+            &["BLPOP", "q", "q", "q", "0"],
+            "*2\r\n$1\r\nq\r\n$1\r\na\r\n",
+        ),
+    ];
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    // Fresh connections per case land on different shards than the pusher.
+    for _ in 0..2 {
+        for (cmd, want) in cases {
+            resp_cmd(&mut admin, &["DEL", "q"]);
+            let mut blocked = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            blocked
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut req = format!("*{}\r\n", cmd.len());
+            for a in cmd {
+                req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            blocked.write_all(req.as_bytes()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while resp_cmd(&mut admin, &["INFO", "clients"]).contains("blocked_clients:0\r\n") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{cmd:?} never blocked"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            let mut pusher = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            pusher
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            assert_eq!(resp_cmd(&mut pusher, &["RPUSH", "q", "a", "b"]), ":2\r\n");
+            let mut buf = [0u8; 256];
+            let n = blocked.read(&mut buf).unwrap();
+            assert_eq!(String::from_utf8_lossy(&buf[..n]), want, "{cmd:?}");
+            assert_eq!(
+                resp_cmd(&mut admin, &["LLEN", "q"]),
+                ":1\r\n",
+                "{cmd:?} took more than one element"
+            );
+        }
+    }
+}
+
 #[test]
 fn test_multi_key_set_and_zset_e2e() {
     let port = 16406;

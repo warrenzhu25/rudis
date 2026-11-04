@@ -458,7 +458,11 @@ impl BlockHub {
         let mut reserved = 0usize;
         if let Some(waiters) = self.list_waiters.get_mut(&db_key) {
             while let Some(waiter) = waiters.pop_front() {
-                if waiter.sender.is_disconnected() {
+                // A client naming the list twice (BLPOP q q 0) is queued
+                // twice: serve it once, or the second pop's element is lost
+                // (or its send blocks on the one-slot channel).
+                if waiter.sender.is_disconnected() || satisfied_clients.contains(&waiter.client_id)
+                {
                     continue;
                 }
                 // Nothing to serve yet: stay blocked. Without this a move
@@ -976,6 +980,34 @@ mod tests {
             has_blocked_waiters(12348),
             "a push on the busy hub's port must still look for waiters"
         );
+    }
+
+    /// BLPOP q q 0 queues the client twice on `q`; a push of two elements
+    /// must serve it once and leave the second element in the list.
+    #[test]
+    fn test_notify_list_serves_a_client_queued_twice_once() {
+        let mut hub = BlockHub::new(12350);
+        let mut table = crate::table::RudisTable::new();
+        let key = Bytes::from_static(b"q");
+        let (tx, rx) = unbounded();
+        hub.register_list_waiter(500, key.clone(), ListPopType::Left, 1, tx.clone());
+        hub.register_list_waiter(500, key.clone(), ListPopType::Left, 1, tx);
+        table
+            .rpush(
+                key.clone(),
+                vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            )
+            .unwrap();
+        hub.notify_list(&mut table, &key);
+        match rx.try_recv() {
+            Ok(BlockedListResult::Popped(k, vals)) => {
+                assert_eq!(k, key);
+                assert_eq!(vals, vec![Bytes::from_static(b"a")]);
+            }
+            _ => panic!("client not served"),
+        }
+        assert!(rx.try_recv().is_err(), "client served twice");
+        assert_eq!(table.llen(key.as_ref()).unwrap_or(0), 1);
     }
 
     #[test]
