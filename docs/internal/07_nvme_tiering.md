@@ -643,7 +643,6 @@ An unknown subcommand returns an error listing the valid ones. Exact reply forma
   the async I/O runtime handles buffers. By default (variable unset) the file uses normal buffered
   I/O.
 - **Synchronous reads reopen the file** on every miss of the in-memory pages.
-- **TIER INFO always says tiering is enabled,** even on shards whose tier file failed to open.
 - **No per-shard disk quota.** The tier grows until the filesystem is full; after that, write errors
   just make spills fail.
 
@@ -799,7 +798,7 @@ record length"`, `"crc mismatch on tiered read"`. It returns `(key, payload)`; c
 | `TIER DECOMMIT [key]` | `decommit` | `:<count>` |
 | `TIER SPILLALL` | `spill_all` (`spill_local` on every key from `table.keys(b"*")`) | `:<count>` |
 | `TIER GC` | `gc_all` | `:<bytes reclaimed>` |
-| `TIER INFO` | — | Bulk string headed `# Tiered Storage (io_uring NVMe)`: `tier_enabled:1`, `maxmemory`, `maxmemory_human`, `used_memory`, `used_memory_human` (server-wide allocator count after every shard republishes), the 18 counters, `offload_threshold_pct`, `upload_threshold_pct` |
+| `TIER INFO` | — | Bulk string headed `# Tiered Storage (io_uring NVMe)`: `tier_enabled` (1 only if every shard opened its tier file), `tier_shards_open`, `maxmemory`, `maxmemory_human`, `used_memory`, `used_memory_human` (server-wide allocator count after every shard republishes), the 18 counters, `offload_threshold_pct`, `upload_threshold_pct` |
 
 Cross-shard messages: `TierSpill`, `TierCool`, `TierLoad`, `TierDecommit`, `TierSpillAll`,
 `TierAutoSpill` (reply: the shard's table usage), `TierGc`, `StreamColdRead`

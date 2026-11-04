@@ -64,6 +64,9 @@ pub struct TieringStats {
     /// Full-sync snapshots being built or sent to replicas. Eviction
     /// pauses meanwhile (see [`SnapshotEvictionPause`]).
     pub snapshots_in_progress: std::sync::atomic::AtomicUsize,
+    /// Shards whose tier file opened at startup: tiering works only on
+    /// those (TIER INFO `tier_enabled` is 1 only if it is every shard).
+    pub tier_shards_open: std::sync::atomic::AtomicUsize,
     /// Whether shards publish allocator counts into `shard_real`. Set by a
     /// running server; routers built directly (unit tests) publish the
     /// table's estimate there instead, since their thread's allocator
@@ -121,6 +124,7 @@ impl Default for TieringStats {
                 .collect(),
             unattributed: AtomicI64::new(0),
             snapshots_in_progress: std::sync::atomic::AtomicUsize::new(0),
+            tier_shards_open: std::sync::atomic::AtomicUsize::new(0),
             real_accounting: AtomicBool::new(false),
         }
     }
@@ -216,6 +220,13 @@ impl TieringStats {
             .sum();
         self.unattributed
             .store(global_allocated as i64 - nets, Ordering::Relaxed);
+    }
+
+    /// TIER INFO's `tier_enabled` (1 only if every one of `num_shards`
+    /// shards opened its tier file) and the number that did.
+    pub fn tier_enabled(&self, num_shards: usize) -> (u8, usize) {
+        let open = self.tier_shards_open.load(Ordering::Relaxed);
+        (u8::from(open >= num_shards.max(1)), open)
     }
 
     pub fn reset_counters(&self) {
@@ -1222,6 +1233,19 @@ impl Drop for SnapshotEvictionPause {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_tier_enabled_only_when_every_shard_opened_its_file() {
+        let stats = TieringStats::default();
+        assert_eq!(stats.tier_enabled(2), (0, 0));
+        stats.tier_shards_open.store(1, Ordering::Relaxed);
+        assert_eq!(stats.tier_enabled(2), (0, 1));
+        stats.tier_shards_open.store(2, Ordering::Relaxed);
+        assert_eq!(stats.tier_enabled(2), (1, 2));
+        // Counters reset (CONFIG RESETSTAT) keeps it.
+        stats.reset_counters();
+        assert_eq!(stats.tier_enabled(2), (1, 2));
+    }
+
     use super::*;
 
     #[test]

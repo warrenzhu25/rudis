@@ -2334,3 +2334,53 @@ fn test_pipelined_gets_of_spilled_keys_e2e() {
         resp_cmd(&mut c, &["TIER", "SPILLALL"]);
     }
 }
+
+/// TIER INFO (and INFO's Storage section) says tiering is enabled only
+/// when every shard opened its tier file, and how many did.
+#[test]
+fn test_tier_info_reports_shards_whose_tier_file_failed_e2e() {
+    let ok_port = 15791;
+    start_test_server(ok_port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", ok_port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let info = resp_cmd(&mut c, &["TIER", "INFO"]);
+    assert!(
+        info.contains("tier_enabled:1\r\ntier_shards_open:2\r\n"),
+        "{info}"
+    );
+
+    // A tier directory that can't be created: no shard has a tier file.
+    let bad_port = 15793;
+    let _server = ServerGuard(
+        rudis_bin()
+            .args([
+                "--port",
+                &bad_port.to_string(),
+                "--threads",
+                "2",
+                "--no-pin",
+                "--save",
+                "",
+            ])
+            .args(DEBUG_ON)
+            .env("RUDIS_TIER_DIR", "/proc/rudis-no-such-tier-dir")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut b = loop {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", bad_port)) {
+            break s;
+        }
+        assert!(std::time::Instant::now() < deadline, "server never started");
+        thread::sleep(Duration::from_millis(50));
+    };
+    b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let info = resp_cmd(&mut b, &["TIER", "INFO"]);
+    assert!(
+        info.contains("tier_enabled:0\r\ntier_shards_open:0\r\n"),
+        "{info}"
+    );
+}

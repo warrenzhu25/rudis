@@ -390,6 +390,9 @@ pub fn run_shard_worker(
         match crate::tiering::ShardTierManager::open(shard_id, port, &tier_dir).await {
             Ok(tm) => {
                 local_db.borrow_mut().tier_manager = Some(Rc::new(tm));
+                crate::tiering::get_tier_stats(port)
+                    .tier_shards_open
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
                 crate::log_warning!("[Shard {}] Failed to open Tier manager: {}", shard_id, e);
