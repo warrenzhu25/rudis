@@ -749,6 +749,35 @@ pub fn write_resp_null(out: &mut Vec<u8>) {
     }
 }
 
+/// A map header of `pairs` entries: RESP3 `%`, or RESP2's flat array of
+/// twice as many elements.
+#[inline]
+pub fn write_resp_map_len(out: &mut Vec<u8>, pairs: usize) {
+    if CURRENT_CLIENT_RESP3.get() {
+        out.extend_from_slice(format!("%{pairs}\r\n").as_bytes());
+    } else {
+        out.extend_from_slice(format!("*{}\r\n", pairs * 2).as_bytes());
+    }
+}
+
+/// A double already formatted as `text`: RESP3 `,`, or a RESP2 bulk
+/// string (GEO coordinates, which Redis prints with their own precision).
+#[inline]
+pub fn write_resp_double_text(out: &mut Vec<u8>, text: &str) {
+    if CURRENT_CLIENT_RESP3.get() {
+        out.extend_from_slice(format!(",{text}\r\n").as_bytes());
+    } else {
+        write_resp_bulk(out, text.as_bytes());
+    }
+}
+
+/// A set header of `len` members: RESP3 `~`, or a RESP2 array.
+#[inline]
+pub fn write_resp_set_len(out: &mut Vec<u8>, len: usize) {
+    let tag = if CURRENT_CLIENT_RESP3.get() { '~' } else { '*' };
+    out.extend_from_slice(format!("{tag}{len}\r\n").as_bytes());
+}
+
 #[inline]
 pub fn write_resp_null_array(out: &mut Vec<u8>) {
     if CURRENT_CLIENT_RESP3.get() {
@@ -4488,7 +4517,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         }
     }
 
-    out.extend_from_slice(format!("*{}\r\n", matched.len() * 2).as_bytes());
+    write_resp_map_len(out, matched.len());
     for (k, v) in matched {
         out.extend_from_slice(format!("${}\r\n{}\r\n", k.len(), k).as_bytes());
         out.extend_from_slice(format!("${}\r\n{}\r\n", v.len(), v).as_bytes());
@@ -10824,13 +10853,7 @@ async fn fetch_remote_set(
 ) -> Result<hashbrown::HashSet<Bytes>, Vec<u8>> {
     let target = router.target_shard(key);
     let cmd = Command::Smembers(key.clone());
-    let raw = if target == router.shard_id {
-        let mut tmp = Vec::new();
-        execute_local_command(&cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
-        tmp
-    } else {
-        router.execute_remote(target, cmd).await
-    };
+    let raw = exec_on_shard_resp2(router, target, cmd).await;
     if raw.starts_with(b"-") {
         return Err(raw);
     }
@@ -10862,16 +10885,24 @@ async fn fetch_remote_set(
     Ok(set)
 }
 
+/// Runs `cmd` on `shard` with its reply in RESP2, for callers that parse
+/// it (a RESP3 client would otherwise get maps, sets and doubles there).
+async fn exec_on_shard_resp2(router: &Router, shard: usize, cmd: Command) -> Vec<u8> {
+    if shard == router.shard_id {
+        let prev = CURRENT_CLIENT_RESP3.replace(false);
+        let mut out = Vec::new();
+        execute_local_command(&cmd, &mut router.local_db.borrow_mut(), &mut out, None);
+        CURRENT_CLIENT_RESP3.set(prev);
+        out
+    } else {
+        router.execute_remote_proto(shard, cmd, false).await
+    }
+}
+
 async fn fetch_key_type(router: &Router, key: &Bytes) -> String {
     let target = router.target_shard(key);
     let type_cmd = Command::Type(key.clone());
-    let t_raw = if target == router.shard_id {
-        let mut tmp = Vec::new();
-        execute_local_command(&type_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
-        tmp
-    } else {
-        router.execute_remote(target, type_cmd).await
-    };
+    let t_raw = exec_on_shard_resp2(router, target, type_cmd).await;
     if t_raw.starts_with(b"+") {
         String::from_utf8_lossy(&t_raw[1..t_raw.len().saturating_sub(2)]).to_string()
     } else {
@@ -10885,13 +10916,7 @@ async fn fetch_remote_zset(
 ) -> Result<hashbrown::HashMap<Bytes, f64>, Vec<u8>> {
     let target = router.target_shard(key);
     let type_cmd = Command::Type(key.clone());
-    let t_raw = if target == router.shard_id {
-        let mut tmp = Vec::new();
-        execute_local_command(&type_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
-        tmp
-    } else {
-        router.execute_remote(target, type_cmd).await
-    };
+    let t_raw = exec_on_shard_resp2(router, target, type_cmd).await;
     if t_raw.as_slice() == b"+none\r\n" {
         return Ok(hashbrown::HashMap::new());
     }
@@ -10913,18 +10938,7 @@ async fn fetch_remote_zset(
             ..crate::table::ZRangeOpts::default()
         },
     };
-    let raw = if target == router.shard_id {
-        let mut tmp = Vec::new();
-        execute_local_command(
-            &zrange_cmd,
-            &mut router.local_db.borrow_mut(),
-            &mut tmp,
-            None,
-        );
-        tmp
-    } else {
-        router.execute_remote(target, zrange_cmd).await
-    };
+    let raw = exec_on_shard_resp2(router, target, zrange_cmd).await;
     if raw.starts_with(b"-") {
         return Err(raw);
     }
@@ -10968,6 +10982,7 @@ fn extract_stream_blocks(raw: &[u8]) -> Vec<&[u8]> {
     let mut blocks = Vec::new();
     if raw.is_empty()
         || raw.starts_with(b"$-1")
+        || raw.starts_with(b"_\r\n")
         || raw.starts_with(b"*0\r\n")
         || raw.starts_with(b"-")
     {
@@ -11514,10 +11529,16 @@ fn protected_command_denied(
             crate::netsec::enable_debug_command(base_port),
             crate::netsec::DEBUG_COMMAND_NOT_ALLOWED,
         ),
-        Command::Unknown(name) if name.starts_with("MODULE ") => (
-            crate::netsec::enable_module_command(base_port),
-            crate::netsec::MODULE_COMMAND_NOT_ALLOWED,
-        ),
+        // Like Redis, only loading and unloading modules is protected.
+        Command::Unknown(name)
+            if name.starts_with("MODULE ")
+                && !matches!(name.as_str(), "MODULE LIST" | "MODULE HELP") =>
+        {
+            (
+                crate::netsec::enable_module_command(base_port),
+                crate::netsec::MODULE_COMMAND_NOT_ALLOWED,
+            )
+        }
         _ => return None,
     };
     let peer = client_registry
@@ -11615,6 +11636,14 @@ async fn execute_command(
         .map(|c| c.db)
         .unwrap_or_else(|| CURRENT_DB.get());
     let replica_keys = writable_replica_write_keys(router, &cmd);
+    // Replies assembled in RESP2 that RESP3 clients get as maps or
+    // verbatim strings (see `crate::resp3`).
+    let reshape = if CURRENT_CLIENT_RESP3.get() {
+        crate::resp3::reshape_for(&cmd)
+    } else {
+        None
+    };
+    let reply_start = out.len();
     let fut = execute_command_inner(
         cmd,
         router,
@@ -11634,6 +11663,9 @@ async fn execute_command(
     }
     .await
     .1;
+    if let Some(how) = reshape {
+        crate::resp3::apply(how, out, reply_start);
+    }
     if let Some(keys) = replica_keys {
         remember_replica_keys(router, initial_db, keys);
     }
@@ -12223,7 +12255,7 @@ async fn execute_command_inner(
                     write_resp_bulk(out, &v);
                 }
                 None => {
-                    out.extend_from_slice(b"$-1\r\n");
+                    write_resp_null(out);
                 }
             }
             false
@@ -12339,10 +12371,10 @@ async fn execute_command_inner(
                             out.extend_from_slice(&v);
                             out.extend_from_slice(b"\r\n");
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     } else {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                     return false;
                 }
@@ -12359,7 +12391,7 @@ async fn execute_command_inner(
                             out.extend_from_slice(&v);
                             out.extend_from_slice(b"\r\n");
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     } else {
                         out.extend_from_slice(b"+OK\r\n");
@@ -12385,7 +12417,7 @@ async fn execute_command_inner(
                     if let Some(v) = current_val {
                         write_resp_bulk(out, &v);
                     } else {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 } else {
                     out.extend_from_slice(b"+OK\r\n");
@@ -14155,7 +14187,7 @@ async fn execute_command_inner(
                         out.extend_from_slice(info.as_bytes());
                         out.extend_from_slice(b"\r\n");
                     } else {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 ClientSubcommand::SetName(name) => {
@@ -14206,7 +14238,7 @@ async fn execute_command_inner(
                             out.extend_from_slice(b"\r\n");
                         }
                         None => {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     }
                 }
@@ -14899,7 +14931,7 @@ async fn execute_command_inner(
             for val in results {
                 match val {
                     Some(s) => write_resp_bulk(out, s.as_bytes()),
-                    None => out.extend_from_slice(b"$-1\r\n"),
+                    None => write_resp_null(out),
                 }
             }
             false
@@ -14918,7 +14950,7 @@ async fn execute_command_inner(
             ..
         } => {
             if keys.is_empty() {
-                out.extend_from_slice(b"$-1\r\n");
+                write_resp_null(out);
                 return false;
             }
             let first_target = router.target_shard(&keys[0]);
@@ -14944,8 +14976,9 @@ async fn execute_command_inner(
                     Command::Xreadgroup { ids, .. } => ids.iter().all(|id| id == ">"),
                     _ => false,
                 };
-                let produced_empty =
-                    &out[start_len..] == b"$-1\r\n" || &out[start_len..] == b"*0\r\n";
+                let produced_empty = &out[start_len..] == b"$-1\r\n"
+                    || &out[start_len..] == b"_\r\n"
+                    || &out[start_len..] == b"*0\r\n";
                 if let Some(wait_ms) = block_ms
                     && produced_empty
                     && can_block
@@ -15014,7 +15047,7 @@ async fn execute_command_inner(
                                 None => 0,
                             };
                             if deadline.is_some() && remaining_ms == 0 {
-                                out.extend_from_slice(b"$-1\r\n");
+                                write_resp_null(out);
                                 return false;
                             }
                             let mut earliest_pel_wait: Option<u64> = None;
@@ -15053,7 +15086,7 @@ async fn execute_command_inner(
                                 )) => {
                                     match unblock_type {
                                         crate::block::ClientUnblockType::Timeout => {
-                                            out.extend_from_slice(b"$-1\r\n")
+                                            write_resp_null(out)
                                         }
                                         crate::block::ClientUnblockType::Error => {
                                             out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
@@ -15080,6 +15113,7 @@ async fn execute_command_inner(
                                         out.extend_from_slice(&res);
                                     }
                                     let unblocked_produced_empty = &out[read_start..] == b"$-1\r\n"
+                                        || &out[read_start..] == b"_\r\n"
                                         || &out[read_start..] == b"*0\r\n";
                                     if !unblocked_produced_empty {
                                         return false;
@@ -15106,7 +15140,7 @@ async fn execute_command_inner(
                             Some(crate::block::BlockedStreamResult::Unblocked(unblock_type)) => {
                                 match unblock_type {
                                     crate::block::ClientUnblockType::Timeout => {
-                                        out.extend_from_slice(b"$-1\r\n")
+                                        write_resp_null(out)
                                     }
                                     crate::block::ClientUnblockType::Error => {
                                         out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
@@ -15118,7 +15152,7 @@ async fn execute_command_inner(
                                 return false;
                             }
                             _ => {
-                                out.extend_from_slice(b"$-1\r\n");
+                                write_resp_null(out);
                                 return false;
                             }
                         }
@@ -15208,7 +15242,7 @@ async fn execute_command_inner(
                             };
 
                             if deadline.is_some() && remaining_ms == 0 {
-                                out.extend_from_slice(b"$-1\r\n");
+                                write_resp_null(out);
                                 return false;
                             }
 
@@ -15232,7 +15266,7 @@ async fn execute_command_inner(
                                 )) => {
                                     match unblock_type {
                                         crate::block::ClientUnblockType::Timeout => {
-                                            out.extend_from_slice(b"$-1\r\n")
+                                            write_resp_null(out)
                                         }
                                         crate::block::ClientUnblockType::Error => {
                                             out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
@@ -15256,13 +15290,13 @@ async fn execute_command_inner(
                                     }
                                 }
                                 None => {
-                                    out.extend_from_slice(b"$-1\r\n");
+                                    write_resp_null(out);
                                     return false;
                                 }
                             }
                         }
                     } else {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 Err(err) => {
@@ -15328,10 +15362,17 @@ async fn execute_command_inner(
                 }
                 crate::resp::AclSubcommand::GetUser(username) => {
                     if let Some(user) = acl.read().get_user(&username) {
-                        out.extend_from_slice(b"*10\r\n");
+                        // As Redis 7: a map (flat array in RESP2), flags as a
+                        // set, without Redis 6's allkeys/allchannels/allcommands
+                        // (the rules below say that), and no selectors.
+                        write_resp_map_len(out, 6);
                         out.extend_from_slice(b"$5\r\nflags\r\n");
-                        let flags = user.flags();
-                        out.extend_from_slice(format!("*{}\r\n", flags.len()).as_bytes());
+                        let flags: Vec<String> = user
+                            .flags()
+                            .into_iter()
+                            .filter(|f| !matches!(f.as_str(), "allkeys" | "allchannels" | "allcommands"))
+                            .collect();
+                        write_resp_set_len(out, flags.len());
                         for f in flags {
                             out.extend_from_slice(format!("${}\r\n{}\r\n", f.len(), f).as_bytes());
                         }
@@ -15359,8 +15400,9 @@ async fn execute_command_inner(
                         out.extend_from_slice(
                             format!("${}\r\n{}\r\n", chan_str.len(), chan_str).as_bytes(),
                         );
+                        out.extend_from_slice(b"$9\r\nselectors\r\n*0\r\n");
                     } else {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 crate::resp::AclSubcommand::SetUser { username, rules } => {
@@ -17504,7 +17546,7 @@ async fn execute_command_inner(
             match cmd {
                 Command::Sinter(_) => {
                     if sets.iter().any(|s| s.is_empty()) {
-                        out.extend_from_slice(b"*0\r\n");
+                        write_resp_set_len(out, 0);
                         return false;
                     }
                     sets.sort_unstable_by_key(|s| s.len());
@@ -17516,7 +17558,7 @@ async fn execute_command_inner(
                             res.push(m.clone());
                         }
                     }
-                    write_resp_array_header(out, res.len());
+                    write_resp_set_len(out, res.len());
                     for m in res {
                         write_resp_bulk(out, &m);
                     }
@@ -17528,7 +17570,7 @@ async fn execute_command_inner(
                             union_set.insert(m);
                         }
                     }
-                    write_resp_array_header(out, union_set.len());
+                    write_resp_set_len(out, union_set.len());
                     for m in union_set {
                         write_resp_bulk(out, &m);
                     }
@@ -17541,7 +17583,7 @@ async fn execute_command_inner(
                             diff.push(m);
                         }
                     }
-                    write_resp_array_header(out, diff.len());
+                    write_resp_set_len(out, diff.len());
                     for m in diff {
                         write_resp_bulk(out, &m);
                     }
@@ -17834,7 +17876,15 @@ async fn execute_command_inner(
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| m1.cmp(m2))
             });
-            if with_scores {
+            if with_scores && CURRENT_CLIENT_RESP3.get() {
+                // RESP3: [member, score] pairs, as ZRANGE WITHSCORES.
+                write_resp_array_header(out, results.len());
+                for (m, s) in results {
+                    out.extend_from_slice(b"*2\r\n");
+                    write_resp_bulk(out, &m);
+                    write_resp_score(out, s);
+                }
+            } else if with_scores {
                 write_resp_array_header(out, results.len() * 2);
                 for (m, s) in results {
                     write_resp_bulk(out, &m);
@@ -18779,7 +18829,7 @@ async fn execute_command_inner(
                     out.extend_from_slice(b"\r\n");
                 }
                 None => {
-                    out.extend_from_slice(b"$-1\r\n");
+                    write_resp_null(out);
                 }
             }
             false
@@ -19164,7 +19214,12 @@ async fn execute_command_inner(
                     write_resp_bulk(out, b"name");
                     write_resp_bulk(out, f.name.as_bytes());
                     write_resp_bulk(out, b"description");
-                    write_resp_bulk(out, f.description.as_bytes());
+                    // Null when the function has none, as Redis.
+                    if f.description.is_empty() {
+                        write_resp_null(out);
+                    } else {
+                        write_resp_bulk(out, f.description.as_bytes());
+                    }
                     write_resp_bulk(out, b"flags");
                     out.extend_from_slice(format!("*{}\r\n", f.flags.len()).as_bytes());
                     for flag in &f.flags {
@@ -19446,7 +19501,7 @@ async fn execute_command_inner(
                     write_resp_bulk(out, b"hash_indexing_failures");
                     write_resp_integer(out, idx.indexing_failures as i64);
                 } else {
-                    out.extend_from_slice(b"$-1\r\n");
+                    write_resp_null(out);
                 }
             } else {
                 out.extend_from_slice(format!("-ERR Unknown Index name: {}\r\n", index).as_bytes());
@@ -20097,6 +20152,11 @@ async fn execute_command_inner(
             true
         }
         Command::Unknown(cmd_name) => {
+            // No modules can be loaded: the list is always empty.
+            if cmd_name == "MODULE LIST" {
+                write_resp_array_header(out, 0);
+                return false;
+            }
             if let Some(cmd_prefix) = cmd_name.strip_suffix(" HELP") {
                 let first_line = format!(
                     "{} <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
@@ -21026,7 +21086,7 @@ pub fn execute_local_command(
                         write_resp_bulk(out, &v);
                     }
                     Ok(None) => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                     Err(err) => write_resp_err(out, err),
                 }
@@ -21075,7 +21135,7 @@ pub fn execute_local_command(
                         write_resp_bulk(out, &v);
                     }
                     None => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -21188,10 +21248,10 @@ pub fn execute_local_command(
                             out.extend_from_slice(&v);
                             out.extend_from_slice(b"\r\n");
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     } else {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                     return false;
                 }
@@ -21208,7 +21268,7 @@ pub fn execute_local_command(
                             out.extend_from_slice(&v);
                             out.extend_from_slice(b"\r\n");
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     } else {
                         out.extend_from_slice(b"+OK\r\n");
@@ -21238,7 +21298,7 @@ pub fn execute_local_command(
                         out.extend_from_slice(&v);
                         out.extend_from_slice(b"\r\n");
                     } else {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 } else {
                     out.extend_from_slice(b"+OK\r\n");
@@ -21573,7 +21633,7 @@ pub fn execute_local_command(
                         out.extend_from_slice(b"\r\n");
                     }
                     Ok(None) => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                     Err(err) => {
                         write_resp_err(out, err);
@@ -21593,7 +21653,7 @@ pub fn execute_local_command(
                                     out.extend_from_slice(b"\r\n");
                                 }
                                 None => {
-                                    out.extend_from_slice(b"$-1\r\n");
+                                    write_resp_null(out);
                                 }
                             }
                         }
@@ -21651,7 +21711,7 @@ pub fn execute_local_command(
             Command::Hgetall(key) => {
                 match db.hgetall(key) {
                     Ok(pairs) => {
-                        out.extend_from_slice(format!("*{}\r\n", pairs.len() * 2).as_bytes());
+                        write_resp_map_len(out, pairs.len());
                         for (k, v) in pairs {
                             out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
                             out.extend_from_slice(&k);
@@ -21725,7 +21785,7 @@ pub fn execute_local_command(
                                     out.extend_from_slice(b"\r\n");
                                 }
                                 None => {
-                                    out.extend_from_slice(b"$-1\r\n");
+                                    write_resp_null(out);
                                 }
                             }
                         }
@@ -21957,7 +22017,7 @@ pub fn execute_local_command(
                         out.extend_from_slice(b"\r\n");
                     }
                     Ok(None) => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                     Err(err) => {
                         write_resp_err(out, err);
@@ -22008,7 +22068,7 @@ pub fn execute_local_command(
             Command::Smembers(key) => {
                 match db.smembers(key) {
                     Ok(members) => {
-                        out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                        write_resp_set_len(out, members.len());
                         for m in members {
                             out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
                             out.extend_from_slice(&m);
@@ -22066,7 +22126,7 @@ pub fn execute_local_command(
                             notify_del_if_emptied(db, key);
                         }
                         if count.is_some() {
-                            out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                            write_resp_set_len(out, popped.len());
                             for m in popped {
                                 out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
                                 out.extend_from_slice(&m);
@@ -22077,7 +22137,7 @@ pub fn execute_local_command(
                             out.extend_from_slice(&first);
                             out.extend_from_slice(b"\r\n");
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     }
                     Err(err) => {
@@ -22089,7 +22149,7 @@ pub fn execute_local_command(
             Command::Sinter(keys) => {
                 match db.sinter(keys) {
                     Ok(members) => {
-                        out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                        write_resp_set_len(out, members.len());
                         for m in members {
                             out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
                             out.extend_from_slice(&m);
@@ -22105,7 +22165,7 @@ pub fn execute_local_command(
             Command::Sunion(keys) => {
                 match db.sunion(keys) {
                     Ok(members) => {
-                        out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                        write_resp_set_len(out, members.len());
                         for m in members {
                             out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
                             out.extend_from_slice(&m);
@@ -22121,7 +22181,7 @@ pub fn execute_local_command(
             Command::Sdiff(keys) => {
                 match db.sdiff(keys) {
                     Ok(members) => {
-                        out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                        write_resp_set_len(out, members.len());
                         for m in members {
                             out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
                             out.extend_from_slice(&m);
@@ -22232,12 +22292,9 @@ pub fn execute_local_command(
                         }
                         if flags.incr {
                             if let Some(score) = incr_score {
-                                let s = format_score(score);
-                                out.extend_from_slice(
-                                    format!("${}\r\n{}\r\n", s.len(), s).as_bytes(),
-                                );
+                                write_resp_score(out, score);
                             } else {
-                                out.extend_from_slice(b"$-1\r\n");
+                                write_resp_null(out);
                             }
                         } else {
                             write_resp_integer(out, count as i64);
@@ -22270,11 +22327,10 @@ pub fn execute_local_command(
             Command::Zscore { key, member } => {
                 match db.zscore(key, member) {
                     Ok(Some(score)) => {
-                        let s = format_score(score);
-                        out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                        write_resp_score(out, score);
                     }
                     Ok(None) => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                     Err(err) => {
                         write_resp_err(out, err);
@@ -22301,19 +22357,17 @@ pub fn execute_local_command(
                 match db.zrank(key, member, false, *with_score) {
                     Ok(Some((rank, score))) => {
                         if *with_score {
-                            let s = format_score(score.unwrap_or(0.0));
-                            out.extend_from_slice(
-                                format!("*2\r\n:{}\r\n${}\r\n{}\r\n", rank, s.len(), s).as_bytes(),
-                            );
+                            out.extend_from_slice(format!("*2\r\n:{}\r\n", rank).as_bytes());
+                            write_resp_score(out, score.unwrap_or(0.0));
                         } else {
                             out.extend_from_slice(format!(":{}\r\n", rank).as_bytes());
                         }
                     }
                     Ok(None) => {
                         if *with_score {
-                            out.extend_from_slice(b"*-1\r\n");
+                            write_resp_null_array(out);
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     }
                     Err(err) => {
@@ -22330,19 +22384,17 @@ pub fn execute_local_command(
                 match db.zrank(key, member, true, *with_score) {
                     Ok(Some((rank, score))) => {
                         if *with_score {
-                            let s = format_score(score.unwrap_or(0.0));
-                            out.extend_from_slice(
-                                format!("*2\r\n:{}\r\n${}\r\n{}\r\n", rank, s.len(), s).as_bytes(),
-                            );
+                            out.extend_from_slice(format!("*2\r\n:{}\r\n", rank).as_bytes());
+                            write_resp_score(out, score.unwrap_or(0.0));
                         } else {
                             out.extend_from_slice(format!(":{}\r\n", rank).as_bytes());
                         }
                     }
                     Ok(None) => {
                         if *with_score {
-                            out.extend_from_slice(b"*-1\r\n");
+                            write_resp_null_array(out);
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     }
                     Err(err) => {
@@ -22373,8 +22425,7 @@ pub fn execute_local_command(
                     Ok(score) => {
                         record_change!(cmd);
                         notify_zset_or_defer(db, key);
-                        let s = format_score(score);
-                        out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                        write_resp_score(out, score);
                     }
                     Err(err) => {
                         write_resp_err(out, err);
@@ -22738,7 +22789,7 @@ pub fn execute_local_command(
                         if let Some(enc) = db.object_encoding(key) {
                             write_resp_bulk(out, enc.as_bytes());
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     }
                     crate::resp::ObjectSubcommand::Freq(key) => {
@@ -22747,7 +22798,7 @@ pub fn execute_local_command(
                         } else if let Some(freq) = db.lfu_freq(key) {
                             write_resp_integer(out, freq as i64);
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     }
                     crate::resp::ObjectSubcommand::Idletime(_)
@@ -22759,14 +22810,14 @@ pub fn execute_local_command(
                         if let Some(idle) = db.idletime(key) {
                             write_resp_integer(out, idle as i64);
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     }
                     crate::resp::ObjectSubcommand::Refcount(key) => {
                         if db.exists(key) {
                             out.extend_from_slice(b":1\r\n");
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     }
                     crate::resp::ObjectSubcommand::Help => {
@@ -23394,7 +23445,7 @@ pub fn execute_local_command(
                                 out.extend_from_slice(&v);
                                 out.extend_from_slice(b"\r\n");
                             }
-                            None => out.extend_from_slice(b"$-1\r\n"),
+                            None => write_resp_null(out),
                         }
                     }
                     Err(err) => {
@@ -23416,7 +23467,7 @@ pub fn execute_local_command(
                                 out.extend_from_slice(&v);
                                 out.extend_from_slice(b"\r\n");
                             }
-                            None => out.extend_from_slice(b"$-1\r\n"),
+                            None => write_resp_null(out),
                         }
                     }
                     Err(err) => {
@@ -23532,7 +23583,7 @@ pub fn execute_local_command(
                         out.extend_from_slice(b"\r\n");
                     }
                     None => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -23781,7 +23832,7 @@ pub fn execute_local_command(
                         out.extend_from_slice(b"\r\n");
                     }
                     None => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -23931,7 +23982,7 @@ pub fn execute_local_command(
                         out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
                     }
                     Ok(crate::table::StreamAddResult::NoMkStream) => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                     Err(err) => {
                         if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
@@ -24037,7 +24088,7 @@ pub fn execute_local_command(
                 match db.xread(keys, ids, *count, *maxcount, *maxsize) {
                     Ok(streams) => {
                         if streams.is_empty() {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         } else {
                             out.extend_from_slice(format!("*{}\r\n", streams.len()).as_bytes());
                             for (stream_key, entries) in streams {
@@ -24419,7 +24470,7 @@ pub fn execute_local_command(
                             out.extend_from_slice(b"\r\n*0\r\n");
                         }
                     } else {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 } else {
                     out.extend_from_slice(format!("*{}\r\n", all_results.len()).as_bytes());
@@ -24535,7 +24586,7 @@ pub fn execute_local_command(
                                     format!("${}\r\n{}\r\n", s.len(), s).as_bytes(),
                                 );
                             } else {
-                                out.extend_from_slice(b"$-1\r\n");
+                                write_resp_null(out);
                             }
                             if let Some(max) = max_id {
                                 let s = max.to_string();
@@ -24543,7 +24594,7 @@ pub fn execute_local_command(
                                     format!("${}\r\n{}\r\n", s.len(), s).as_bytes(),
                                 );
                             } else {
-                                out.extend_from_slice(b"$-1\r\n");
+                                write_resp_null(out);
                             }
                             out.extend_from_slice(format!("*{}\r\n", consumers.len()).as_bytes());
                             for (c_name, c_cnt) in consumers {
@@ -24551,7 +24602,9 @@ pub fn execute_local_command(
                                     format!("*2\r\n${}\r\n", c_name.len()).as_bytes(),
                                 );
                                 out.extend_from_slice(&c_name);
-                                out.extend_from_slice(format!("\r\n:{}\r\n", c_cnt).as_bytes());
+                                // A bulk string, as Redis sends it.
+                                out.extend_from_slice(b"\r\n");
+                                write_resp_bulk(out, c_cnt.to_string().as_bytes());
                             }
                         }
                         Err(err) => {
@@ -24657,7 +24710,7 @@ pub fn execute_local_command(
                             if let Some(f) = items.first() {
                                 write_resp_bulk(out, f);
                             } else {
-                                out.extend_from_slice(b"$-1\r\n");
+                                write_resp_null(out);
                             }
                         } else if *with_values && CURRENT_CLIENT_RESP3.get() {
                             let num_pairs = items.len() / 2;
@@ -24742,7 +24795,7 @@ pub fn execute_local_command(
                             if let Some(item) = items.first() {
                                 write_resp_bulk(out, item);
                             } else {
-                                out.extend_from_slice(b"$-1\r\n");
+                                write_resp_null(out);
                             }
                         } else {
                             out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
@@ -24830,11 +24883,8 @@ pub fn execute_local_command(
                         out.extend_from_slice(format!("*{}\r\n", scores.len()).as_bytes());
                         for s in scores {
                             match s {
-                                Some(val) => {
-                                    let formatted = format_score(val);
-                                    write_resp_bulk(out, formatted.as_bytes());
-                                }
-                                None => out.extend_from_slice(b"$-1\r\n"),
+                                Some(val) => write_resp_score(out, val),
+                                None => write_resp_null(out),
                             }
                         }
                     }
@@ -24859,7 +24909,7 @@ pub fn execute_local_command(
                             if let Some((m, _)) = items.first() {
                                 write_resp_bulk(out, m);
                             } else {
-                                out.extend_from_slice(b"$-1\r\n");
+                                write_resp_null(out);
                             }
                         } else if *with_scores {
                             if CURRENT_CLIENT_RESP3.get() {
@@ -24867,8 +24917,7 @@ pub fn execute_local_command(
                                 for (m, s) in items {
                                     out.extend_from_slice(b"*2\r\n");
                                     write_resp_bulk(out, &m);
-                                    let formatted = format_score(s);
-                                    write_resp_bulk(out, formatted.as_bytes());
+                                    write_resp_score(out, s);
                                 }
                             } else {
                                 out.extend_from_slice(
@@ -25080,7 +25129,7 @@ pub fn execute_local_command(
                             if let Some(idx) = indices.first() {
                                 write_resp_integer(out, *idx as i64);
                             } else {
-                                out.extend_from_slice(b"$-1\r\n");
+                                write_resp_null(out);
                             }
                         } else {
                             out.extend_from_slice(format!("*{}\r\n", indices.len()).as_bytes());
@@ -25535,7 +25584,7 @@ pub fn execute_local_command(
                         out.extend_from_slice(b"+OK\r\n");
                     }
                     Ok(false) => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                     Err(err) => {
                         write_resp_err(out, err);
@@ -25550,7 +25599,7 @@ pub fn execute_local_command(
                         write_resp_bulk(out, res.as_bytes());
                     }
                     None => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -25577,7 +25626,7 @@ pub fn execute_local_command(
                         out.extend_from_slice(format!("+{}\r\n", t).as_bytes());
                     }
                     None => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -25642,7 +25691,7 @@ pub fn execute_local_command(
                         write_resp_integer(out, len as i64);
                     }
                     None => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -25672,7 +25721,7 @@ pub fn execute_local_command(
                         write_resp_integer(out, len as i64);
                     }
                     None => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -25690,7 +25739,7 @@ pub fn execute_local_command(
                         write_resp_bulk(out, popped.as_bytes());
                     }
                     None => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -25704,7 +25753,7 @@ pub fn execute_local_command(
                         }
                     }
                     None => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -25715,7 +25764,7 @@ pub fn execute_local_command(
                         write_resp_integer(out, len as i64);
                     }
                     None => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -25810,7 +25859,7 @@ pub fn execute_local_command(
                         write_resp_bulk(out, s.as_bytes());
                     }
                     _ => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 false
@@ -25829,13 +25878,11 @@ pub fn execute_local_command(
                         Ok(Some(score)) => {
                             let (lon, lat) = crate::geo::decode_geohash(score as u64);
                             out.extend_from_slice(b"*2\r\n");
-                            let lon_str = format!("{}", lon);
-                            let lat_str = format!("{}", lat);
-                            write_resp_bulk(out, lon_str.as_bytes());
-                            write_resp_bulk(out, lat_str.as_bytes());
+                            write_resp_double_text(out, &format!("{}", lon));
+                            write_resp_double_text(out, &format!("{}", lat));
                         }
                         _ => {
-                            out.extend_from_slice(b"*-1\r\n");
+                            write_resp_null_array(out);
                         }
                     }
                 }
@@ -25857,7 +25904,7 @@ pub fn execute_local_command(
                             write_resp_bulk(out, b32.as_bytes());
                         }
                         _ => {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     }
                 }
@@ -26496,7 +26543,7 @@ pub fn execute_local_command(
                     if let Some(evicted) = tk.add(it.clone(), 1) {
                         write_resp_bulk(out, &evicted);
                     } else {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                 }
                 record_change!(cmd);
@@ -26562,7 +26609,7 @@ pub fn execute_local_command(
                             let size = 24 + key.len() + val.approx_bytes();
                             write_resp_integer(out, size as i64);
                         } else {
-                            out.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(out);
                         }
                     }
                     MemorySubcommand::Stats => {
@@ -26632,7 +26679,7 @@ pub fn execute_local_command(
                         write_resp_bulk(out, digest.as_bytes());
                     }
                     Ok(None) => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                     Err(err) => {
                         write_resp_err(out, err);
@@ -26710,7 +26757,7 @@ pub fn execute_local_command(
                 if let Some(v) = db.crdt_get(key) {
                     write_resp_bulk(out, &v);
                 } else {
-                    out.extend_from_slice(b"$-1\r\n");
+                    write_resp_null(out);
                 }
                 false
             }
@@ -26862,7 +26909,7 @@ pub fn execute_local_command(
                         }
                     }
                     Ok(None) => {
-                        out.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(out);
                     }
                     Err(e) => {
                         write_resp_err(out, &e);
@@ -27737,7 +27784,7 @@ pub fn execute_local_command(
                         for v in vals {
                             match v {
                                 Some(val) => write_resp_bulk(out, &val),
-                                None => out.extend_from_slice(b"$-1\r\n"),
+                                None => write_resp_null(out),
                             }
                         }
                     }
@@ -28546,7 +28593,7 @@ async fn execute_commands_squashed_inner(
                             field.as_ref(),
                         ) {
                             Ok(resp) => {
-                                responses[idx] = resp;
+                                responses[idx] = resp.for_proto(CURRENT_CLIENT_RESP3.get());
                                 break 'local;
                             }
                             Err(err) => {
@@ -28565,7 +28612,7 @@ async fn execute_commands_squashed_inner(
                             &mut local_buf,
                         ) {
                             Ok(resp) => {
-                                responses[idx] = resp;
+                                responses[idx] = resp.for_proto(CURRENT_CLIENT_RESP3.get());
                                 break 'local;
                             }
                             Err(err) => {
@@ -28621,7 +28668,7 @@ async fn execute_commands_squashed_inner(
                             member.as_ref(),
                         ) {
                             Ok(resp) => {
-                                responses[idx] = resp;
+                                responses[idx] = resp.for_proto(CURRENT_CLIENT_RESP3.get());
                                 break 'local;
                             }
                             Err(err) => {
@@ -28640,7 +28687,7 @@ async fn execute_commands_squashed_inner(
                             &mut local_buf,
                         ) {
                             Ok(resp) => {
-                                responses[idx] = resp;
+                                responses[idx] = resp.for_proto(CURRENT_CLIENT_RESP3.get());
                                 break 'local;
                             }
                             Err(err) => {
@@ -28659,7 +28706,7 @@ async fn execute_commands_squashed_inner(
                             &mut local_buf,
                         ) {
                             Ok(resp) => {
-                                responses[idx] = resp;
+                                responses[idx] = resp.for_proto(CURRENT_CLIENT_RESP3.get());
                                 break 'local;
                             }
                             Err(err) => {
@@ -28817,7 +28864,8 @@ async fn execute_commands_squashed_inner(
                                 break 'local;
                             }
                             Ok(None) => {
-                                responses[idx] = crate::shard::CompactResp::NULL;
+                                responses[idx] =
+                                    crate::shard::CompactResp::null(CURRENT_CLIENT_RESP3.get());
                                 break 'local;
                             }
                             Err(err) => {
@@ -28977,7 +29025,7 @@ async fn execute_commands_squashed_inner(
                             &mut local_buf,
                         ) {
                             Ok(resp) => {
-                                responses[idx] = resp;
+                                responses[idx] = resp.for_proto(CURRENT_CLIENT_RESP3.get());
                                 break 'local;
                             }
                             Err(err) => write_resp_err(&mut local_buf, err),
@@ -28991,7 +29039,7 @@ async fn execute_commands_squashed_inner(
                             &mut local_buf,
                         ) {
                             Ok(resp) => {
-                                responses[idx] = resp;
+                                responses[idx] = resp.for_proto(CURRENT_CLIENT_RESP3.get());
                                 break 'local;
                             }
                             Err(err) => write_resp_err(&mut local_buf, err),

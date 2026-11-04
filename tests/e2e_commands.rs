@@ -1541,6 +1541,109 @@ fn test_blocking_operations_e2e() {
     assert!(start.elapsed() >= Duration::from_millis(300));
 }
 
+/// RESP3 clients (HELLO 3, the default of redis-py 8, go-redis 9 and
+/// Lettuce 6) get Redis's reply types: `_` nulls (a `$-1` hangs their
+/// parsers), maps, sets and doubles, also for cross-shard commands and
+/// script replies; RESP2 clients keep the old forms.
+#[test]
+fn test_resp3_reply_types_match_redis_e2e() {
+    let port = 15787;
+    let shards = 4;
+    start_test_server(port, shards);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut r2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    r2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert!(resp_cmd(&mut c, &["HELLO", "3"]).starts_with('%'));
+    // Keys on two different shards, for the cross-shard paths.
+    let (k1, k2) = {
+        let k1 = "r3a".to_string();
+        let k2 = (0..)
+            .map(|i| format!("r3b{i}"))
+            .find(|k| target_shard(k.as_bytes(), shards) != target_shard(k1.as_bytes(), shards))
+            .unwrap();
+        (k1, k2)
+    };
+    resp_cmd(&mut c, &["HSET", "h", "f", "1"]);
+    resp_cmd(&mut c, &["SADD", &k1, "x", "y"]);
+    resp_cmd(&mut c, &["SADD", &k2, "y"]);
+    resp_cmd(&mut c, &["SET", "s", "v"]);
+    let z1 = format!("z{k1}");
+    let z2 = (0..)
+        .map(|i| format!("z2{i}"))
+        .find(|k| target_shard(k.as_bytes(), shards) != target_shard(z1.as_bytes(), shards))
+        .unwrap();
+    resp_cmd(&mut c, &["ZADD", &z1, "1.5", "a"]);
+    resp_cmd(&mut c, &["ZADD", &z2, "2", "b"]);
+    resp_cmd(&mut c, &["XADD", "xs", "1-1", "f", "v"]);
+
+    let cases: &[(&[&str], &str)] = &[
+        (&["GET", "missing"], "_\r\n"),
+        (&["SET", "s", "w", "NX"], "_\r\n"),
+        (&["HGET", "h", "nope"], "_\r\n"),
+        (&["LINDEX", "missing", "0"], "_\r\n"),
+        (&["HGETALL", "h"], "%1\r\n$1\r\nf\r\n$1\r\n1\r\n"),
+        (&["HGETALL", "missing"], "%0\r\n"),
+        (&["SMEMBERS", &k2], "~1\r\n$1\r\ny\r\n"),
+        (&["SINTER", &k1, &k2], "~1\r\n$1\r\ny\r\n"),
+        (&["ZSCORE", &z1, "a"], ",1.5\r\n"),
+        (&["ZINCRBY", &z2, "1", "b"], ",3\r\n"),
+        (&["ZRANK", &z1, "a", "WITHSCORE"], "*2\r\n:0\r\n,1.5\r\n"),
+        (
+            &["ZUNION", "2", &z1, &z2, "WITHSCORES"],
+            "*2\r\n*2\r\n$1\r\na\r\n,1.5\r\n*2\r\n$1\r\nb\r\n,3\r\n",
+        ),
+        (
+            &["CONFIG", "GET", "maxmemory"],
+            "%1\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n",
+        ),
+        (
+            &["XREAD", "STREAMS", "xs", "0"],
+            "%1\r\n$2\r\nxs\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n",
+        ),
+        (&["EVAL", "return nil", "0"], "_\r\n"),
+        (&["EVAL", "return {double=2.5}", "0"], ",2.5\r\n"),
+        // A script still sees RESP2 replies: a missing field is false.
+        (
+            &[
+                "EVAL",
+                "return redis.call('HGET', KEYS[1], 'nope') == false and 1 or 0",
+                "1",
+                "h",
+            ],
+            ":1\r\n",
+        ),
+        (&["MODULE", "LIST"], "*0\r\n"),
+    ];
+    for (cmd, want) in cases {
+        assert_eq!(&resp_cmd(&mut c, cmd), want, "RESP3 {cmd:?}");
+    }
+    let info = send_and_read(&mut c, b"*2\r\n$4\r\nINFO\r\n$6\r\nserver\r\n");
+    assert!(
+        info.starts_with('=') && info.contains("txt:# Server"),
+        "{info}"
+    );
+
+    // RESP2 is unchanged.
+    let resp2: &[(&[&str], &str)] = &[
+        (&["GET", "missing"], "$-1\r\n"),
+        (&["HGETALL", "h"], "*2\r\n$1\r\nf\r\n$1\r\n1\r\n"),
+        (&["SMEMBERS", &k2], "*1\r\n$1\r\ny\r\n"),
+        (&["ZSCORE", &z1, "a"], "$3\r\n1.5\r\n"),
+        (
+            &["ZUNION", "2", &z1, &z2, "WITHSCORES"],
+            "*4\r\n$1\r\na\r\n$3\r\n1.5\r\n$1\r\nb\r\n$1\r\n3\r\n",
+        ),
+        (
+            &["CONFIG", "GET", "maxmemory"],
+            "*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n",
+        ),
+    ];
+    for (cmd, want) in resp2 {
+        assert_eq!(&resp_cmd(&mut r2, cmd), want, "RESP2 {cmd:?}");
+    }
+}
+
 /// A cross-shard LMOVE / SMOVE whose destination shard does not take the
 /// push in time fails with TRYAGAIN and leaves both keys as they were: the
 /// element is put back, and the late destination skips the withdrawn push

@@ -2500,12 +2500,16 @@ fn register_redis_module<'scope, 'env: 'scope>(
         }
         let mut out = Vec::new();
         let aof_ref = aof_call;
+        // The reply is converted to Lua from RESP2, whatever the client
+        // speaks (see `resp_bytes_to_lua`).
+        let prev_resp3 = crate::connection::CURRENT_CLIENT_RESP3.replace(false);
         crate::connection::execute_local_command(
             &cmd,
             &mut db_call.borrow_mut(),
             &mut out,
             aof_ref,
         );
+        crate::connection::CURRENT_CLIENT_RESP3.set(prev_resp3);
 
         if out.starts_with(b"-") {
             crate::connection::record_failed_stat(cmd_name);
@@ -2687,12 +2691,16 @@ fn register_redis_module<'scope, 'env: 'scope>(
         }
         let mut out = Vec::new();
         let aof_ref = aof_pcall;
+        // The reply is converted to Lua from RESP2, whatever the client
+        // speaks (see `resp_bytes_to_lua`).
+        let prev_resp3 = crate::connection::CURRENT_CLIENT_RESP3.replace(false);
         crate::connection::execute_local_command(
             &cmd,
             &mut db_pcall.borrow_mut(),
             &mut out,
             aof_ref,
         );
+        crate::connection::CURRENT_CLIENT_RESP3.set(prev_resp3);
 
         if out.starts_with(b"-") {
             crate::connection::record_failed_stat(cmd_name);
@@ -3046,12 +3054,10 @@ fn lua_val_to_resp_with_depth(
         return Err("reached lua stack limit".to_string());
     }
     match val {
+        // Like Redis, nil, doubles, maps and sets take the client's
+        // protocol; only booleans follow `redis.setresp`.
         Value::Nil => {
-            if crate::connection::CURRENT_CLIENT_RESP3.get() && script_resp_ver == 3 {
-                out.extend_from_slice(b"_\r\n");
-            } else {
-                out.extend_from_slice(b"$-1\r\n");
-            }
+            crate::connection::write_resp_null(out);
             Ok(())
         }
         Value::Boolean(b) => {
@@ -3064,7 +3070,7 @@ fn lua_val_to_resp_with_depth(
             } else if *b {
                 out.extend_from_slice(b":1\r\n");
             } else {
-                out.extend_from_slice(b"$-1\r\n");
+                crate::connection::write_resp_null(out);
             }
             Ok(())
         }
@@ -3103,26 +3109,48 @@ fn lua_val_to_resp_with_depth(
                 return Ok(());
             }
             if let Ok(f) = t.raw_get::<f64>("double") {
-                if crate::connection::CURRENT_CLIENT_RESP3.get() && script_resp_ver == 3 {
-                    out.extend_from_slice(format!(",{}\r\n", f).as_bytes());
+                if crate::connection::CURRENT_CLIENT_RESP3.get() {
+                    crate::connection::write_resp_score(out, f);
                 } else {
                     crate::connection::write_resp_bulk(out, f.to_string().as_bytes());
                 }
                 return Ok(());
             }
+            // Redis's `{set = {member = true, ...}}`.
+            if let Ok(Value::Table(set)) = t.raw_get::<Value>("set") {
+                let mut members = Vec::new();
+                for pair in set.pairs::<Value, Value>() {
+                    members.push(pair.map_err(|e| e.to_string())?.0);
+                }
+                let tag = if crate::connection::CURRENT_CLIENT_RESP3.get() {
+                    '~'
+                } else {
+                    '*'
+                };
+                out.extend_from_slice(format!("{}{}\r\n", tag, members.len()).as_bytes());
+                for m in members {
+                    lua_val_to_resp_with_depth(&m, out, depth + 1, script_resp_ver)?;
+                }
+                return Ok(());
+            }
 
-            let is_resp3_map = if let Some(mt) = t.metatable() {
-                mt.get::<String>("__redis_proto_type").unwrap_or_default() == "map"
-            } else {
-                false
+            // Redis's `{map = {k = v, ...}}`, or a table marked as a map.
+            let (is_resp3_map, map_table) = match t.raw_get::<Value>("map") {
+                Ok(Value::Table(m)) => (true, m),
+                _ => (
+                    t.metatable().is_some_and(|mt| {
+                        mt.get::<String>("__redis_proto_type").unwrap_or_default() == "map"
+                    }),
+                    t.clone(),
+                ),
             };
 
             if is_resp3_map {
                 let mut pairs = Vec::new();
-                for pair in t.clone().pairs::<Value, Value>() {
+                for pair in map_table.pairs::<Value, Value>() {
                     pairs.push(pair.map_err(|e| e.to_string())?);
                 }
-                if crate::connection::CURRENT_CLIENT_RESP3.get() && script_resp_ver == 3 {
+                if crate::connection::CURRENT_CLIENT_RESP3.get() {
                     out.extend_from_slice(format!("%{}\r\n", pairs.len()).as_bytes());
                     for (k, v) in pairs {
                         lua_val_to_resp_with_depth(&k, out, depth + 1, script_resp_ver)?;

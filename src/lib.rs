@@ -39,6 +39,7 @@ pub mod pubsub;
 pub mod redis_rdb;
 pub mod replication;
 pub mod resp;
+pub mod resp3;
 pub mod router;
 pub mod scripting;
 pub mod search;

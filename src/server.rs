@@ -1073,7 +1073,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     {
                                         match db.table.hget_compact_with_hash(key.as_ref(), key_hash, field.as_ref()) {
                                             Ok(resp) => {
-                                                responder.write_slot(idx, resp);
+                                                responder.write_slot(idx, resp.for_proto(is_resp3));
                                                 break 'item;
                                             }
                                             Err(err) => {
@@ -1085,7 +1085,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     {
                                         match db.table.hmget_compact_with_hash(key.as_ref(), key_hash, fields, &mut temp_buf) {
                                             Ok(resp) => {
-                                                responder.write_slot(idx, resp);
+                                                responder.write_slot(idx, resp.for_proto(is_resp3));
                                                 break 'item;
                                             }
                                             Err(err) => {
@@ -1129,7 +1129,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     {
                                         match db.table.sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref()) {
                                             Ok(resp) => {
-                                                responder.write_slot(idx, resp);
+                                                responder.write_slot(idx, resp.for_proto(is_resp3));
                                                 break 'item;
                                             }
                                             Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
@@ -1139,7 +1139,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     {
                                         match db.table.smismember_compact_with_hash(key.as_ref(), key_hash, members, &mut temp_buf) {
                                             Ok(resp) => {
-                                                responder.write_slot(idx, resp);
+                                                responder.write_slot(idx, resp.for_proto(is_resp3));
                                                 break 'item;
                                             }
                                             Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
@@ -1149,7 +1149,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     {
                                         match db.table.zmscore_compact_with_hash(key.as_ref(), key_hash, members, &mut temp_buf) {
                                             Ok(resp) => {
-                                                responder.write_slot(idx, resp);
+                                                responder.write_slot(idx, resp.for_proto(is_resp3));
                                                 break 'item;
                                             }
                                             Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
@@ -1279,7 +1279,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                                 break 'item;
                                             }
                                             Ok(None) => {
-                                                responder.write_slot(idx, crate::shard::CompactResp::NULL);
+                                                responder.write_slot(idx, crate::shard::CompactResp::null(is_resp3));
                                                 break 'item;
                                             }
                                             Err(err) => {
@@ -1395,7 +1395,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     {
                                         match db.table.lrange_compact_with_hash(key.as_ref(), key_hash, start, stop, &mut temp_buf) {
                                             Ok(resp) => {
-                                                responder.write_slot(idx, resp);
+                                                responder.write_slot(idx, resp.for_proto(is_resp3));
                                                 break 'item;
                                             }
                                             Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
@@ -1405,7 +1405,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                     {
                                         match db.table.zrange_compact_with_hash(key.as_ref(), key_hash, opts, is_resp3, &mut temp_buf) {
                                             Ok(resp) => {
-                                                responder.write_slot(idx, resp);
+                                                responder.write_slot(idx, resp.for_proto(is_resp3));
                                                 break 'item;
                                             }
                                             Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),

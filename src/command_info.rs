@@ -97,7 +97,8 @@ fn info3(out: &mut Vec<u8>, i: usize) {
     header(out, b'*', 10);
     out.extend_from_slice(doc.info);
     let subs: Vec<usize> = subcommands(i).collect();
-    header(out, b'*', subs.len());
+    // A set, as Redis sends it.
+    header(out, b'~', subs.len());
     for j in subs {
         info3(out, j);
     }

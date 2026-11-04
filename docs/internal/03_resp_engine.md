@@ -579,9 +579,23 @@ CONFIG RESETSTAT and CONFIG REWRITE are encoded as special CONFIG SET pairs.
 The parser never writes replies. For orientation:
 
 * The connection code's reply writers check a per-thread "this client speaks RESP3" flag and pick
-  RESP3 forms where they differ: `_` for null, `,` for doubles, and `%` maps in a handful of
-  replies such as HELLO. Pub/Sub push frames (`>`) are built in the Pub/Sub module. The other
-  RESP3 types — sets, booleans, verbatim strings, big numbers and attributes — are never sent.
+  the forms Redis 7 sends a RESP3 client: `_` nulls (`write_resp_null`; a RESP2 `$-1` makes RESP3
+  parsers such as redis-py's hang), `%` maps (`write_resp_map_len`: HGETALL, CONFIG GET, ACL
+  GETUSER, HELLO), `~` sets (`write_resp_set_len`: SMEMBERS, SINTER/SUNION/SDIFF, SPOP with a
+  count), `,` doubles (`write_resp_score`, `write_resp_double_text`: ZSCORE, ZINCRBY, ZMSCORE,
+  ZRANK WITHSCORE, WITHSCORES pairs, GEO coordinates). Table fast paths build RESP2 nulls, turned
+  into `_` where a slot is filled (`CompactResp::for_proto`). Pub/Sub push frames (`>`) are built
+  in the Pub/Sub module.
+* Replies assembled in RESP2 by several paths (XREAD/XREADGROUP, XINFO, FUNCTION LIST, MEMORY
+  STATS, LATENCY HISTOGRAM, and the verbatim-string INFO, CLIENT INFO/LIST, LOLWUT and doctors)
+  are reshaped once, as the command returns (`src/resp3.rs`, applied in `execute_command`), so
+  the internals keep parsing RESP2.
+* Anything that parses a reply itself runs the command as RESP2: cross-shard helpers
+  (`exec_on_shard_resp2`, `Router::execute_remote_proto`) and `redis.call`/`pcall` in scripts. A
+  script's own reply still takes the client's protocol (nil, `{double=}`, `{map=}`, `{set=}`), as
+  in Redis.
+* `scripts/client_compat/resp3_diff.py` compares the reply shapes of about 240 commands against a
+  reference Redis.
 * The error writer sends only the first line of an error message. If the message already starts
   with a known error code (ERR, WRONGTYPE, MOVED, OOM and others; [§12.5](#125-error-handling-details)
   lists them), it is sent as is; otherwise `ERR ` is put in front. That is why most parser errors
@@ -850,8 +864,11 @@ positive integer` (`parse_min_idle_time`); `value is not a valid float` (`parse_
 `ERR`. Anything else gets `ERR ` prepended; only the first line is sent.
 
 **RESP3 reply forms:** `_\r\n` null (`write_resp_null`/`write_resp_null_array`), `,` doubles
-(`write_resp_score`), `%` maps (e.g. `HELLO`, `%7`), `>` push frames (`src/pubsub.rs`). Not
-emitted: `~` set, `#` boolean, `=` verbatim, `(` big number, `|` attribute.
+(`write_resp_score`, `write_resp_double_text`), `%` maps (`write_resp_map_len`, e.g. `HELLO`),
+`~` sets (`write_resp_set_len`), `=` verbatim (`src/resp3.rs`), `#` booleans (scripts after
+`redis.setresp(3)`), `>` push frames (`src/pubsub.rs`). Not emitted: `(` big number, `|`
+attribute. Known remaining differences from Redis: HELP replies are bulk strings, not simple
+strings; `MEMORY STATS` has no `db.N` entries; `CLUSTER INFO` answers outside cluster mode.
 
 ### 12.6 Tests that pin the behavior
 

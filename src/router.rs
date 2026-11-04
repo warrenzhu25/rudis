@@ -3557,6 +3557,17 @@ impl Router {
 
     pub async fn execute_remote(&self, target: usize, cmd: Command) -> Vec<u8> {
         let is_resp3 = crate::connection::CURRENT_CLIENT_RESP3.get();
+        self.execute_remote_proto(target, cmd, is_resp3).await
+    }
+
+    /// [`Self::execute_remote`] with the reply in RESP3 or RESP2 as asked,
+    /// whatever the client speaks: for callers that parse the reply.
+    pub async fn execute_remote_proto(
+        &self,
+        target: usize,
+        cmd: Command,
+        is_resp3: bool,
+    ) -> Vec<u8> {
         let responder = self
             .remote_responder_pool
             .borrow_mut()

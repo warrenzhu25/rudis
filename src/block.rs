@@ -804,6 +804,7 @@ impl BlockHub {
                 crate::connection::execute_local_command(&waiter.cmd, db, &mut out, aof.as_deref());
                 let is_xread = matches!(waiter.cmd, crate::resp::Command::Xread { .. });
                 let empty = out == b"$-1\r\n"
+                    || out == b"_\r\n"
                     || out == b"*0\r\n"
                     || (is_xread && out.starts_with(b"-WRONGTYPE"));
                 if !empty {

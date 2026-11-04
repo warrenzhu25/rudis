@@ -128,6 +128,17 @@ impl CompactResp {
         ],
     };
 
+    /// `self`, with a RESP2 null turned into RESP3's `_` for a RESP3
+    /// client (table fast paths build the RESP2 form).
+    #[inline(always)]
+    pub fn for_proto(self, is_resp3: bool) -> Self {
+        if is_resp3 && self == Self::NULL {
+            Self::NULL_RESP3
+        } else {
+            self
+        }
+    }
+
     #[inline(always)]
     pub fn null(is_resp3: bool) -> Self {
         if is_resp3 {

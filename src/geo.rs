@@ -459,10 +459,8 @@ pub fn format_geo_results(out: &mut Vec<u8>, results: &[GeoItemResult], has_opti
             }
             if let Some((lon, lat)) = item.coord {
                 out.extend_from_slice(b"*2\r\n");
-                let lon_str = format!("{}", lon);
-                let lat_str = format!("{}", lat);
-                crate::connection::write_resp_bulk(out, lon_str.as_bytes());
-                crate::connection::write_resp_bulk(out, lat_str.as_bytes());
+                crate::connection::write_resp_double_text(out, &format!("{}", lon));
+                crate::connection::write_resp_double_text(out, &format!("{}", lat));
             }
         }
     }
