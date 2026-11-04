@@ -1201,9 +1201,6 @@ over one connection.
   `-TRYAGAIN` (§7.7).
 * **Dead code.** An unused responder-channel type alias, and a results pool that is carried
   through the connection scratch and the squashed path but never used.
-* **Squashed-path statistics double count.** A squashed batch adds its size to the client's
-  command count after the call, while commands inside it that fell back to the normal path are
-  counted again individually.
 
 ---
 

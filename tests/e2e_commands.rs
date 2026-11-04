@@ -1766,6 +1766,64 @@ fn test_blmove_waiters_are_all_served_by_one_push_e2e() {
     assert_eq!(resp_cmd(&mut admin, &["EXISTS", "{m}src"]), ":0\r\n");
 }
 
+/// CLIENT LIST tot-cmds counts each command once whether it arrived alone
+/// or in a pipeline (a squashed pipeline once counted again the commands
+/// in it that ran through the normal path).
+#[test]
+fn test_tot_cmds_counts_pipelined_commands_once_e2e() {
+    let port = 15795;
+    start_test_server(port, 2);
+    let cmds: &[&[&str]] = &[
+        &["SET", "tc:a", "1"],
+        &["GET", "tc:a"],
+        &["ECHO", "x"],
+        &["DBSIZE"],
+        &["INCR", "tc:n"],
+        &["LPUSH", "tc:l", "v"],
+        &["TYPE", "tc:l"],
+        &["PING"],
+        &["CLIENT", "SETNAME", "tc"],
+        &["EXISTS", "tc:a", "tc:missing"],
+    ];
+    let tot_cmds = |c: &mut TcpStream| -> u64 {
+        let info = resp_cmd(c, &["CLIENT", "INFO"]);
+        let v = info
+            .split_whitespace()
+            .find_map(|f| f.strip_prefix("tot-cmds="))
+            .unwrap_or_else(|| panic!("{info}"));
+        v.parse().unwrap()
+    };
+    // One at a time.
+    let mut single = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    single
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    for c in cmds {
+        resp_cmd(&mut single, c);
+    }
+    let alone = tot_cmds(&mut single);
+    // The same commands as one pipeline.
+    let mut piped = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    piped
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut frame = String::new();
+    for c in cmds {
+        frame.push_str(&format!("*{}\r\n", c.len()));
+        for a in *c {
+            frame.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+    }
+    send_and_read_reply_n(&mut piped, frame.as_bytes(), cmds.len());
+    let pipelined = tot_cmds(&mut piped);
+    assert_eq!(
+        pipelined, alone,
+        "pipelined {pipelined} vs one at a time {alone}"
+    );
+    // As in Redis, a command is counted once it ran: CLIENT INFO not yet.
+    assert_eq!(alone, cmds.len() as u64);
+}
+
 /// A blocking pop naming the same list twice is served once: the other
 /// pushed elements stay in the list (the second queue entry once popped
 /// one more and lost it).

@@ -6727,6 +6727,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         }
                     } else {
                         let cmd_cnt = commands.len() as u64;
+                        let mut fallbacks = 0u64;
                         // With a normal-client output limit set, run the batch
                         // in chunks of 1, 2, 4, ... commands and stop once the
                         // replies pass the hard limit: replies are only checked
@@ -6765,6 +6766,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 &mut asking,
                                 &mut authenticated,
                                 &mut auth_user,
+                                &mut fallbacks,
                             )
                             .await;
                             if quit {
@@ -6776,9 +6778,11 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         }
                         // Applied and replicated: no longer running.
                         drop(batch_running.take());
-                        stats
-                            .tot_cmds
-                            .fetch_add(cmd_cnt, std::sync::atomic::Ordering::Relaxed);
+                        // Those run through `execute_command` counted themselves.
+                        stats.tot_cmds.fetch_add(
+                            cmd_cnt.saturating_sub(fallbacks),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     commands.clear();
                 }
@@ -28139,6 +28143,7 @@ async fn execute_commands_squashed(
     asking: &mut bool,
     authenticated: &mut bool,
     auth_user: &mut String,
+    fallbacks: &mut u64,
 ) -> bool {
     let initial_db = client_registry
         .borrow()
@@ -28160,6 +28165,7 @@ async fn execute_commands_squashed(
         asking,
         authenticated,
         auth_user,
+        fallbacks,
     );
     #[cfg(debug_assertions)]
     let fut = Box::pin(fut);
@@ -28188,6 +28194,8 @@ async fn execute_commands_squashed_inner(
     asking: &mut bool,
     authenticated: &mut bool,
     auth_user: &mut String,
+    // Commands handed to `execute_command`, which counts them itself.
+    fallbacks: &mut u64,
 ) -> bool {
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
         CURRENT_CLIENT_RESP3.set(c.is_resp3);
@@ -28388,6 +28396,7 @@ async fn execute_commands_squashed_inner(
     if !can_squash {
         let mut should_close = false;
         for cmd in commands.drain(..) {
+            *fallbacks += 1;
             if execute_command(
                 cmd,
                 router,
@@ -29343,6 +29352,7 @@ async fn execute_commands_squashed_inner(
                 .await;
             }
             local_buf.clear();
+            *fallbacks += 1;
             if execute_command(
                 cmd,
                 router,
@@ -32506,6 +32516,7 @@ mod tests {
             &mut asking,
             &mut authenticated,
             &mut auth_user,
+            &mut 0,
         )
         .await;
 
@@ -33406,6 +33417,7 @@ mod tests {
                 ]),
             ];
 
+            let mut fallbacks = 0u64;
             let quit = execute_commands_squashed(
                 &mut cmds,
                 false,
@@ -33421,10 +33433,15 @@ mod tests {
                 &mut asking,
                 &mut authenticated,
                 &mut auth_user,
+                &mut fallbacks,
             )
             .await;
             assert!(!quit);
             assert_eq!(out, b"+OK\r\n+OK\r\n:3\r\n:2\r\n:0\r\n");
+            // Commands handed to `execute_command` are counted there; whether
+            // any are depends on process-wide state other tests change, so
+            // only the bound is checked here (the e2e test checks the count).
+            assert!(fallbacks <= 5, "{fallbacks}");
         });
     }
 
@@ -33491,6 +33508,7 @@ mod tests {
                 &mut asking,
                 &mut authenticated,
                 &mut auth_user,
+                &mut 0,
             )
             .await;
             assert!(!quit);
@@ -33601,6 +33619,7 @@ mod tests {
                 &mut asking,
                 &mut authenticated,
                 &mut auth_user,
+                &mut 0,
             )
             .await;
             assert!(!quit);
@@ -33733,6 +33752,7 @@ mod tests {
                 &mut asking,
                 &mut authenticated,
                 &mut auth_user,
+                &mut 0,
             )
             .await;
             assert!(!quit);
@@ -33848,6 +33868,7 @@ mod tests {
                 &mut asking,
                 &mut authenticated,
                 &mut auth_user,
+                &mut 0,
             )
             .await;
             assert!(!quit);
