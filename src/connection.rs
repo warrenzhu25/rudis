@@ -2329,6 +2329,17 @@ fn client_port_span(router: &Router) -> u16 {
     }
 }
 
+/// Whether `port` is one of the client ports of `router`'s server: the base
+/// port, or any shard port in cluster mode. ACL tables are shared across those
+/// ports, so ACL-driven disconnects must cover all of them.
+fn is_server_client_port(router: &Router, port: u16) -> bool {
+    port_in_span(router.base_port, client_port_span(router), port)
+}
+
+fn port_in_span(base_port: u16, span: u16, port: u16) -> bool {
+    port >= base_port && u32::from(port) < u32::from(base_port) + u32::from(span.max(1))
+}
+
 /// Counts a command a script ran towards its calling client's `tot_cmds`.
 pub fn inc_active_client_tot_cmds(port: u16) {
     let cid = requesting_client_id();
@@ -15360,7 +15371,7 @@ async fn execute_command_inner(
                         let count = acl.write().del_user(&usernames);
                         let map = GLOBAL_CLIENTS.read();
                         for (&(p, cid), entry) in map.iter() {
-                            if p == router.port && usernames.iter().any(|u| u == &entry.auth_user) {
+                            if is_server_client_port(router, p) && usernames.iter().any(|u| u == &entry.auth_user) {
                                 if cid == client_id {
                                     close_conn = true;
                                 } else {
@@ -15535,7 +15546,7 @@ async fn execute_command_inner(
                             let guard = acl.read();
                             let map = GLOBAL_CLIENTS.read();
                             for (&(p, cid), entry) in map.iter() {
-                                if p == router.port {
+                                if is_server_client_port(router, p) {
                                     let keep = guard
                                         .users
                                         .get(&entry.auth_user)
@@ -30456,6 +30467,20 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_port_in_span_covers_every_shard_port() {
+        assert!(super::port_in_span(7000, 4, 7000));
+        assert!(super::port_in_span(7000, 4, 7003));
+        assert!(!super::port_in_span(7000, 4, 7004));
+        assert!(!super::port_in_span(7000, 4, 6999));
+        // Non-cluster: only the base port.
+        assert!(super::port_in_span(7000, 1, 7000));
+        assert!(!super::port_in_span(7000, 1, 7001));
+        assert!(super::port_in_span(7000, 0, 7000));
+        // No overflow at the top of the port range.
+        assert!(super::port_in_span(65534, 4, 65535));
+    }
+
     /// A write past the pause gate counts as running until it ends, and a
     /// squashed batch with writes is refused (per-command path) while
     /// writes are paused: so once writes are paused and nothing runs, the

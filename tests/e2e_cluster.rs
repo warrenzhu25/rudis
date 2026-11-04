@@ -1641,6 +1641,75 @@ fn test_cluster_shard_ports_share_requirepass_and_users_e2e() {
     assert_eq!(resp_cmd(&mut c0, &["AUTH", "op", "oppw"]), "+OK\r\n");
 }
 
+/// `ACL DELUSER` and `ACL LOAD` disconnect the affected users on every shard
+/// port, not only on the port the command arrived on: the ACL table is shared.
+#[test]
+fn test_cluster_acl_deluser_and_load_kill_on_every_shard_port_e2e() {
+    let base = 15771;
+    let dir = std::env::temp_dir().join(format!("rudis_acl_kill_shards_{}", base));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let aclfile = dir.join("users.acl");
+    std::fs::write(&aclfile, "user default on nopass ~* &* +@all\n").unwrap();
+    start_test_server_cluster(base, 2);
+    let shard1 = base + 1;
+
+    let connect = |port: u16| {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+    let assert_killed = |s: &mut TcpStream| {
+        s.write_all(b"*1\r\n$4\r\nPING\r\n").ok();
+        let mut buf = [0u8; 64];
+        let n = s.read(&mut buf).unwrap_or(0);
+        assert_eq!(
+            n,
+            0,
+            "client still answered: {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+    };
+
+    let mut admin = connect(base);
+    for user in ["gone", "unlisted"] {
+        assert_eq!(
+            resp_cmd(
+                &mut admin,
+                &["ACL", "SETUSER", user, "on", ">pw", "+@all", "~*"]
+            ),
+            "+OK\r\n"
+        );
+    }
+
+    // DELUSER on the base port kills the user's session on shard 1.
+    let mut victim = connect(shard1);
+    assert_eq!(resp_cmd(&mut victim, &["AUTH", "gone", "pw"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut admin, &["ACL", "DELUSER", "gone"]), ":1\r\n");
+    assert_killed(&mut victim);
+
+    // LOAD of a file without the user kills its session on shard 1 too.
+    let mut victim = connect(shard1);
+    assert_eq!(
+        resp_cmd(&mut victim, &["AUTH", "unlisted", "pw"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["CONFIG", "SET", "aclfile", aclfile.to_str().unwrap()]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut admin, &["ACL", "LOAD"]), "+OK\r\n");
+    assert_killed(&mut victim);
+
+    // The default user's sessions on other shard ports survive.
+    let mut bystander = connect(shard1);
+    assert_eq!(resp_cmd(&mut bystander, &["PING"]), "+PONG\r\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_migrate_never_drops_keys_the_target_did_not_store_e2e() {
     let (src_port, dst_port) = (17075, 17076);

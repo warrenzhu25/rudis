@@ -316,13 +316,13 @@ The reasons are `auth`, `command`, `key` and `channel`. The contexts used are `t
 | `LIST` | Sorted lines per user: `user <name> on\|off nopass\|#hash... sanitize-payload\|skip-sanitize-payload [keys] &*\|resetchannels &pat... <commands>`. The commands part is `+@all` or `-@all` followed by the compacted rule history. Lines are replayable through `ACL SETUSER` (a unit test pins the round trip). |
 | `GETUSER <name>` | A 10-element map: `flags` (`on`/`off`, `nopass`, `allkeys`, `allchannels`, `allcommands`, the sanitize flag), `passwords` (hex digests without `#`), `commands`, `keys` (`~*` or a `~p`/`%R~p`/`%W~p` list), `channels` (`&*` or a `&p` list). An unknown user gives null. There is no `selectors` field. |
 | `SETUSER <name> rules...` | §5.1; `+OK` or `-ERR <message>`. Does not disconnect existing sessions. |
-| `DELUSER <names...>` | Errors if any name is empty or `default`. Otherwise deletes, returns the count, and kills every connection on this port authenticated as a deleted user (the calling connection is closed after the reply). |
+| `DELUSER <names...>` | Errors if any name is empty or `default`. Otherwise deletes, returns the count, and kills every connection authenticated as a deleted user on any of the server's client ports (every shard port in cluster mode, since they share one table; `is_server_client_port`) (the calling connection is closed after the reply). |
 | `CAT [category]` | Without an argument: the 21 categories. With one: the table's commands in it, or `-ERR Unknown category`. |
 | `GENPASS [bits]` | 1–4096 bits (default 256, which is 64 hex characters), from the system secure random generator. |
 | `DRYRUN <user> <cmd> [args...]` | Parses the command and runs the check; `+OK` or a bulk string `This user has no permissions to ...`. If the arguments do not parse, it still checks command (and subcommand or first-argument) permission. |
 | `LOG [count]`, `LOG RESET` | Entries newest first: `count`, `reason`, `context`, `object`, `username`, `age-seconds`, `client-info`, `entry-id`, `timestamp-created`, `timestamp-last-updated` (ms). RESP3 clients get maps. |
 | `SAVE` | Writes the `LIST` lines to `aclfile`; an error if no `aclfile` is configured. |
-| `LOAD` | Loads `aclfile` (below), then kills connections whose user no longer exists or is disabled. |
+| `LOAD` | Loads `aclfile` (below), then kills connections whose user no longer exists or is disabled, on every client port of the server. |
 | `HELP` | Help text. |
 
 ### 6.1 Users from configuration: user directives and aclfile
