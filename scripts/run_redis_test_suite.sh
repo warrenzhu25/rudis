@@ -63,7 +63,7 @@ start_server() {
     # Run in a scratch dir: suites SAVE, and a dump.rdb left in the repo
     # would be loaded by every server later started there (e.g. e2e tests).
     rm -rf "$SERVER_DIR" && mkdir -p "$SERVER_DIR"
-    (cd "$SERVER_DIR" && exec "$REPO_ROOT/target/release/rudis" --port "$PORT" --threads "$threads" --no-pin --enable-debug-command yes --enable-module-command yes) >> "$TEST_LOG" 2>&1 &
+    (cd "$SERVER_DIR" && exec "$REPO_ROOT/target/release/rudis" --port "$PORT" --threads "$threads" --no-pin --enable-debug-command yes --enable-module-command yes ${RUDIS_EXTRA:-}) >> "$TEST_LOG" 2>&1 &
     RUDIS_PID=$!
     for _ in $(seq 1 50); do
         if timeout 1 bash -c "</dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
@@ -75,6 +75,10 @@ start_server() {
     return 1
 }
 THREADS_ARG=${4:-}
+# Extra test_helper.tcl options (TCL_EXTRA) and server options (RUDIS_EXTRA).
+# Every suite over RESP3, as the test suite's own --force-resp3 runs do
+# (it starts its servers with client-default-resp 3):
+#   TCL_EXTRA=--force-resp3 RUDIS_EXTRA="--client-default-resp 3"
 
 CORE_SUITES=(
     "unit/type/string"
@@ -173,6 +177,7 @@ for suite in "${TARGET_SUITES[@]}"; do
         --skiptest "/.*Timedout.*" \
         --skiptest "/.*OOM.*" \
         --clients "$CLIENTS" \
+        ${TCL_EXTRA:-} \
         --single "$suite"; then
         PASSED_SUITES+=("$suite")
     else
