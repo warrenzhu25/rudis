@@ -326,9 +326,8 @@ both the env var is set *and* the filesystem supports it.
 
 **Performance characteristics.** GC reclaims whole 4KB pages, not individual records — a page with even one
 surviving record cannot be punched, so deletion-heavy small-value workloads can accumulate dead-but-unfreed
-bytes. Snapshotting cost depends on filesystem reflink support: instant on btrfs/XFS-with-reflink, an in-kernel
-`copy_file_range` loop otherwise, falling back to a full userspace `std::fs::copy` only if neither
-kernel-assisted path is available.
+bytes. There are no tier-file snapshots: `SAVE`/`BGSAVE` read tiered values into the RDB, which is the backup
+of a tiered dataset.
 
 **Verified findings.** The companion design document [`tiered_storage.md`](tiered_storage.md) — the original
 Dragonfly-inspired deep-dive — has been corrected against the implementation: its proposed 16-byte packed-

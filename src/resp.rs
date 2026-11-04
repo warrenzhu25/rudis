@@ -167,7 +167,6 @@ pub enum TierSubcommand {
     Cool(Bytes),
     Decommit(Option<Bytes>),
     Gc,
-    Snapshot(std::path::PathBuf),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -6931,19 +6930,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "INFO" => Ok(Some(Command::Tier(TierSubcommand::Info))),
                 "SPILLALL" => Ok(Some(Command::Tier(TierSubcommand::SpillAll))),
                 "GC" => Ok(Some(Command::Tier(TierSubcommand::Gc))),
-                "SNAPSHOT" | "BACKUP" => {
-                    if args.len() < 3 {
-                        return Err(
-                            "wrong number of arguments for 'tier snapshot' command".to_string()
-                        );
-                    }
-                    let dir = String::from_utf8_lossy(&args[2]).to_string();
-                    Ok(Some(Command::Tier(TierSubcommand::Snapshot(
-                        std::path::PathBuf::from(dir),
-                    ))))
-                }
                 _ => Err(format!(
-                    "ERR unknown subcommand '{}'. Try TIER SPILL, TIER COOL, TIER DECOMMIT, TIER LOAD, TIER INFO, TIER SPILLALL, TIER GC, TIER SNAPSHOT.",
+                    "ERR unknown subcommand '{}'. Try TIER SPILL, TIER COOL, TIER DECOMMIT, TIER LOAD, TIER INFO, TIER SPILLALL, TIER GC.",
                     sub
                 )),
             }
@@ -14478,6 +14466,28 @@ fn find_newline_at(buf: &[u8], start: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TIER SNAPSHOT / BACKUP were removed; the other subcommands remain.
+    #[test]
+    fn test_tier_snapshot_is_an_unknown_subcommand() {
+        let parse = |args: &[&str]| {
+            let mut frame = format!("*{}\r\n", args.len());
+            for a in args {
+                frame.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            parse_command(&mut BytesMut::from(frame.as_str()))
+        };
+        for sub in ["SNAPSHOT", "BACKUP"] {
+            match parse(&["TIER", sub, "/tmp/x"]) {
+                Err(e) => assert!(e.contains("unknown subcommand"), "{e}"),
+                other => panic!("TIER {sub} parsed: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            parse(&["TIER", "GC"]),
+            Ok(Some(Command::Tier(TierSubcommand::Gc)))
+        ));
+    }
 
     #[test]
     fn test_shutdown_flags_parse_like_redis() {

@@ -18,7 +18,7 @@ agents must uphold when touching this codebase.
 * **[Architecture & Threading Model](architecture.md)**: shared-nothing thread-per-core design on Linux `io_uring` (Monoio runtime), `SO_REUSEPORT` kernel ingress balancing, the lock-free cross-shard mesh, and the life of a command request.
 * **[Replication](replication.md)**: the two independent master-side protocols — standard single-connection `PSYNC` (used for all Rudis-to-Rudis replication) and Dragonfly-compatible per-shard `DFLY FLOW` (master-side only, for Dragonfly-protocol clients).
 * **[Pub/Sub Architecture](pub-sub.md)**: the striped shard-presence bitmask that avoids broadcasting every `PUBLISH` to every shard, and Redis 7 slot-bound sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE`).
-* **[RDB Snapshotting](rdbsave.md)**: what actually triggers a save, why there is no `fork()`, why the save path is blocking (not `io_uring`-accelerated), and why `ioctl(FICLONE)` reflink cloning is a *different* (NVMe-tiering) feature, not part of RDB save.
+* **[RDB Snapshotting](rdbsave.md)**: what actually triggers a save, why there is no `fork()`, why the save path is blocking (not `io_uring`-accelerated), and how tiered values get into the RDB.
 * **[Differences from Redis & Dragonfly](differences.md)**: architectural and behavioral comparison covering concurrency model, memory, limits, clustering, and persistence.
 * **[Rudis Internals Guide](rudis_internals_guide.md)**: a narrative, example-driven tour of the same subsystems for contributors who want a single self-contained read before diving into the per-subsystem docs below.
 

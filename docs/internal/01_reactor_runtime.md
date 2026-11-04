@@ -1217,7 +1217,7 @@ then `sync_durable`. The test failpoint is the `RUDIS_FAILPOINT_SHARD_PANIC` env
 | Pub/Sub | `Publish`, `Spublish`, `Ssubscribe`, `Sunsubscribe`, `PubsubChannels`, `PubsubShardchannels`, `PubsubNumsub`, `PubsubShardnumsub`, `PubsubNumpat`, `RemoveClientPubSub` |
 | Blocking ops | `NotifyList` |
 | Transactions | `AcquireTxLock`, `ReleaseTxLock` |
-| Memory / tiering | `GetUsedMemory`, `MemoryBreakdown`, `EvictUntilUnder`, `TryEvictOneKey`, `TierSpill`, `TierLoad`, `TierSpillAll`, `TierCool`, `TierDecommit`, `TierAutoSpill`, `TierGc`, `TierSnapshot`, `StreamColdRead` |
+| Memory / tiering | `GetUsedMemory`, `MemoryBreakdown`, `EvictUntilUnder`, `TryEvictOneKey`, `TierSpill`, `TierLoad`, `TierSpillAll`, `TierCool`, `TierDecommit`, `TierAutoSpill`, `TierGc`, `StreamColdRead` |
 | Search | `InitSearchIndex`, `DropSearchIndex`, `SearchQuery` |
 | Admin / stats | `ClientList`, `FlushCommandStats`, `ResetCommandStats` |
 

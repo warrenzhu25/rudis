@@ -437,12 +437,14 @@ fn test_rdb_cold_start_restore_e2e() {
 }
 
 #[test]
-fn test_option1_zero_copy_snapshots_e2e() {
+/// TIER SNAPSHOT (and its BACKUP alias) is gone: it copied raw tier files
+/// that nothing could restore. An RDB save reads tiered values back, so it
+/// is the backup of a tiered dataset: a spilled key survives a reload.
+fn test_tier_snapshot_removed_and_rdb_keeps_tiered_keys_e2e() {
     let port = 16510;
     start_test_server(port, 2);
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
-    // 1. Write keys and spill one to tier
     assert_eq!(
         send_and_read(&mut client, b"SET snap_key1 hello\r\n"),
         "+OK\r\n"
@@ -451,23 +453,29 @@ fn test_option1_zero_copy_snapshots_e2e() {
         send_and_read(&mut client, b"SET snap_key2 world\r\n"),
         "+OK\r\n"
     );
-    let spill_resp = send_and_read(&mut client, b"TIER SPILL snap_key1\r\n");
-    assert_eq!(spill_resp, ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TIER SPILL snap_key1\r\n"),
+        ":1\r\n"
+    );
 
-    // 2. Perform zero-copy snapshot
-    let snap_dir = format!("/tmp/rudis_snapshot_test_{}", port);
-    let _ = std::fs::remove_dir_all(&snap_dir);
+    for sub in ["SNAPSHOT", "BACKUP"] {
+        let resp = send_and_read(
+            &mut client,
+            format!("TIER {sub} /tmp/rudis_snapshot_test_{port}\r\n").as_bytes(),
+        );
+        assert!(resp.contains("unknown subcommand"), "TIER {sub}: {resp}");
+    }
+    assert!(!std::path::Path::new(&format!("/tmp/rudis_snapshot_test_{port}")).exists());
 
-    let snap_cmd = format!("TIER SNAPSHOT {}\r\n", snap_dir);
-    let snap_resp = send_and_read(&mut client, snap_cmd.as_bytes());
-    assert!(snap_resp.starts_with("+OK"));
-
-    // Verify snapshot directory exists and has files
-    assert!(std::path::Path::new(&snap_dir).exists());
-    let entries = std::fs::read_dir(&snap_dir).unwrap().count();
-    assert!(entries > 0);
-
-    let _ = std::fs::remove_dir_all(&snap_dir);
+    assert_eq!(send_and_read(&mut client, b"DEBUG RELOAD\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"GET snap_key1\r\n"),
+        "$5\r\nhello\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET snap_key2\r\n"),
+        "$5\r\nworld\r\n"
+    );
 }
 
 #[test]

@@ -332,15 +332,12 @@ size-class pages, and a `BTreeMap`-based free-range tree supporting reuse of pun
   This is a real, verified gap relative to the original allocator proposal — there is no mechanism
   that reclaims a punched offset range for a subsequent `stash_record` call.
 
-### 8.1 Snapshotting — Implemented
+### 8.1 Snapshotting — Removed
 
-`ShardTierManager::snapshot_file` attempts, in order: a `FICLONE` ioctl reflink (instant,
-metadata-only copy-on-write clone, on filesystems like btrfs/XFS-with-reflink that support it);
-falling back to a `copy_file_range` loop in 16MB chunks (in-kernel copy, no userspace round trip);
-falling back again to `std::fs::copy` if both kernel-assisted paths fail. `ShardTierManager::snapshot`
-flushes the active `SmallBins` page and `sync_all`s the file first, then performs the file copy,
-then writes a small plain-text manifest (`version`/`shard_id`/`file_size`/`is_reflink`/
-`current_offset`) alongside the backup.
+`TIER SNAPSHOT <dir>` (alias `BACKUP`) reflink-copied each shard's tier file plus a manifest, but
+nothing could restore the copies: the file means nothing without the in-memory key → record
+pointers, and it is emptied on start. It was removed. `SAVE`/`BGSAVE` read tiered values back into
+the RDB, which is the backup of a tiered dataset.
 
 ---
 
@@ -412,8 +409,7 @@ file size enforcement (§8 describes why the file grows unboundedly under churn 
 ### The `TIER` command family (real, current)
 
 `TIER SPILL <key>` · `TIER LOAD <key>` / `TIER PROMOTE <key>` · `TIER COOL <key>` ·
-`TIER DECOMMIT [key]` · `TIER SPILLALL` · `TIER GC` · `TIER SNAPSHOT <dir>` / `TIER BACKUP <dir>` ·
-`TIER INFO`. See the internal implementation doc §5 for the full mapping to `Router`/
+`TIER DECOMMIT [key]` · `TIER SPILLALL` · `TIER GC` · `TIER INFO`. See the internal implementation doc §5 for the full mapping to `Router`/
 `ShardTierManager` methods.
 
 ### `TIER INFO` output (real field names, from `src/connection.rs`)
@@ -464,7 +460,7 @@ match any current output and has been replaced above with the verified `TIER INF
 | Opportunistic `O_DIRECT` | **Implemented**, opt-in via `RUDIS_DIRECT_IO`, with silent buffered-I/O fallback |
 | CRC64-checked, magic-tagged record format | **Implemented** (§6.1) |
 | `fallocate` hole punching on delete | **Implemented** (§8), but punched space is never reused by future writes |
-| Reflink/`copy_file_range` snapshotting | **Implemented** (§8.1) |
+| Tier-file snapshots | **Removed** (§8.1); back up with `SAVE`/`BGSAVE` |
 | `TIER` operator command family | **Implemented** (§10) |
 | Packed 16-byte `RudisExternalPtr` + union representation | **Not Implemented** — shipped as a plain unpacked `TieredPointer` instead (§4.1–4.2) |
 | Intrusive `CoolRecord` LRU cooling queue | **Not Implemented** — shipped as the `RudisValue::Cooled` enum variant with round-robin/full-sweep eviction instead (§4.2, §5.1–5.2) |

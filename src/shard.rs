@@ -838,10 +838,6 @@ pub enum ShardMessage {
     TierGc {
         responder: flume::Sender<usize>,
     },
-    TierSnapshot {
-        backup_dir: std::path::PathBuf,
-        responder: flume::Sender<Result<(bool, u64), String>>,
-    },
     FlushSlots {
         ranges: Vec<(u16, u16)>,
         responder: flume::Sender<usize>,

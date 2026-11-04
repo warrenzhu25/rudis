@@ -607,9 +607,9 @@ mutex/cache-line-bouncing cost of a traditional shared-memory multi-threaded sto
   an `rdb-writer` thread that does the CRC, buffered `std::fs` writes, fsync and rename. A
   `BGSAVE` therefore adds small latency slices on every shard instead of stalling one shard for
   its whole dataset.
-- Reflink (`ioctl(FICLONE)`) snapshotting is real, working code — but it belongs to the NVMe
-  tiered-storage subsystem (`TIER.SNAPSHOT`), not to `SAVE`/`BGSAVE`. The two are unrelated
-  features that happen to both be called "snapshotting."
+- `SAVE`/`BGSAVE` read tiered (NVMe) values back and write them into the RDB, so an RDB is a
+  complete backup of a tiered dataset. (The former `TIER SNAPSHOT`, a reflink copy of the raw
+  tier files that nothing could restore, was removed.)
 - Full detail, including the save-trigger table, is in [`docs/rdbsave.md`](docs/rdbsave.md).
 
 ### 3. Redis 7 Sharded Pub/Sub & Striped Presence Bitmask
@@ -757,7 +757,6 @@ links go to the corresponding source-verified subsystem specification.
 | **Agent memory, LLM quota & checkpoints** | Implemented | Working + HNSW episodic memory (`AGENT.MEM.*`), DAG checkpoints (`AGENT.CHECKPOINT.*`), tool leases (`AGENT.TOOL.*`), and the RPM/TPM quota governor (`LLM.QUOTA.*`) all get RDB + AOF/replication coverage. | [20](docs/design/20_agent_memory.md) |
 | **MCP server & semantic cache** | Implemented | Built-in MCP JSON-RPC 2.0 server (`MCP.*`, 11 tools) translating into ordinary commands via the normal dispatch path; semantic cache (`SEMANTIC.*`) lives in `src/vector.rs`. | [21](docs/design/21_mcp_server.md), [08](docs/design/08_vector_engine.md) |
 | **NVMe tiered storage** | Implemented | Hot/Cooled/Cold lifecycle, `SmallBins`, Direct I/O; tiered keys are written with their real value and type by `SAVE`/`BGSAVE` and `BGREWRITEAOF`. | [07](docs/design/07_nvme_tiering.md), [tiered_storage.md](docs/design/tiered_storage.md) |
-| **`TIER.SNAPSHOT` reflink checkpoints** | Implemented | Real `ioctl(FICLONE)` cloning of the NVMe tier's backing file — unrelated to `SAVE`/`BGSAVE`. | [tiered_storage.md](docs/design/tiered_storage.md) |
 | **Multi-region CRDTs** | Implemented, manual sync only | LWW-Register, OR-Set, PN-Counter with HLC ordering; export/merge (`CRDT.DUMP`/`CRDT.MERGE`) is explicit and manual — there is no automatic peer discovery or background cross-region streaming. | [12](docs/design/12_crdt_types.md) |
 | **AF_XDP kernel bypass** | Experimental, not on live path | Real, unit-tested data structures; reachable only via `XDP.*` admin commands, not real NIC/eBPF I/O. | [10](docs/design/10_kernel_bypass_xdp.md) |
 | **`SO_ZEROCOPY` send path** | Experimental, not on live path | Correct primitives in `src/zerocopy.rs`; unused by the real connection write path. | [10](docs/design/10_kernel_bypass_xdp.md) |

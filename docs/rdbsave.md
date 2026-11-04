@@ -58,12 +58,10 @@ familiar with real Redis might expect, that is called out explicitly.
 - **CRC64 checksum is a plain bitwise loop, not SIMD.** `crc64`/`crc64_update` in `src/table.rs`
   are a textbook bit-at-a-time CRC-64/XZ implementation (poly `0x42F0E1EBA9EA3693`). There is no
   vectorized/SIMD CRC64 anywhere in the codebase.
-- **Reflink (`FICLONE`) snapshotting is real — but it belongs to a different subsystem.**
-  `ioctl(fd, FICLONE, ...)`-based reflink cloning does exist in `src/tiering.rs` and is real,
-  working code — but it snapshots the NVMe tiered-storage backing file, reachable via the
-  `TIER.SNAPSHOT` command family, not the in-memory keyspace RDB file. `SAVE`/`BGSAVE` never call
-  into `tiering.rs` and never use `FICLONE`. Documentation or tooling that describes RDB
-  snapshotting as reflink-based is describing a different, unrelated feature.
+- **No reflink (`FICLONE`) anywhere.** `SAVE`/`BGSAVE` write the RDB with buffered `std::fs`
+  I/O. Tiered values are read back from the NVMe tier and written into the RDB, which is the
+  backup of a tiered dataset. (A `TIER SNAPSHOT` command that reflink-copied the raw tier files
+  existed but was removed: without the in-memory key index the copies could not be restored.)
 - **Transparent Huge Page disablement is real, general, and not RDB-specific.** `src/main.rs`
   calls `libc::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)` once at process startup, for the whole
   process. It reduces general copy-on-write amplification risk but has no special interaction

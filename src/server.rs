@@ -2231,13 +2231,6 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let reclaimed = cross_shard_router.gc_local();
                         let _ = responder.send(reclaimed);
                     }
-                    ShardMessage::TierSnapshot { backup_dir, responder } => {
-                        let r = cross_shard_router.clone();
-                        monoio::spawn(async move {
-                            let res = r.snapshot_local(&backup_dir).await;
-                            let _ = responder.send(res);
-                        });
-                    }
                     ShardMessage::FlushSlots { ranges, responder } => {
                         let count = cross_shard_db.borrow_mut().flush_slots(&ranges);
                         let _ = responder.send(count);

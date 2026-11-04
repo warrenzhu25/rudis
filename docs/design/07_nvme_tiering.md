@@ -61,10 +61,8 @@ Hot (DRAM)  ──(Memory Pressure)──►  Cooled (DRAM Eviction Candidate)
 - **GC reclaims whole 4KB pages, not individual records** — a page with even one surviving
   record can't be punched; deletion-heavy small-value workloads can accumulate dead-but-unfreed
   bytes (`dead_bytes` stat) until every record sharing a page happens to be deleted.
-- **Snapshotting cost depends entirely on filesystem reflink support** — instant on
-  btrfs/XFS-with-reflink, an in-kernel `copy_file_range` loop otherwise (still avoiding a
-  full userspace read+write round trip), and only falls all the way back to `std::fs::copy`
-  if both kernel-assisted paths are unavailable.
+- **No tier-file snapshots.** Back up a tiered dataset with `SAVE`/`BGSAVE`, which read tiered
+  values into the RDB; the raw tier file is meaningless without the in-memory key index.
 
 ---
 

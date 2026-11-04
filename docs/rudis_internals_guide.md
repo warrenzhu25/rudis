@@ -212,10 +212,9 @@ and offloads cold values to NVMe SSDs, expanding effective capacity beyond physi
 move through a **Hot (DRAM) → Cooled → Cold (NVMe, `RudisValue::Tiered`)** lifecycle, and are
 promoted back to Hot on access. Small values are packed into aligned 4 KB blocks
 (`SmallBinsManager`) before a single `O_DIRECT` write, avoiding the write amplification of many
-tiny writes; space reclamation uses `fallocate(FALLOC_FL_PUNCH_HOLE)`. A real, working
-`ioctl(FICLONE)` reflink-cloning path exists for point-in-time snapshots of the NVMe tier's
-*own* backing file (`TIER.SNAPSHOT`) — this is unrelated to `SAVE`/`BGSAVE`, which only read
-tiered records back to write their values (see [`docs/rdbsave.md`](rdbsave.md)). Full detail:
+tiny writes; space reclamation uses `fallocate(FALLOC_FL_PUNCH_HOLE)`. `SAVE`/`BGSAVE` read tiered records
+back to write their values, so the RDB is the backup of a tiered dataset (see
+[`docs/rdbsave.md`](rdbsave.md)). Full detail:
 [`docs/design/07_nvme_tiering.md`](design/07_nvme_tiering.md) and
 [`docs/design/tiered_storage.md`](design/tiered_storage.md).
 

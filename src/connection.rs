@@ -13538,25 +13538,6 @@ async fn execute_command_inner(
                     let reclaimed = router.gc_all().await;
                     out.extend_from_slice(format!(":{}\r\n", reclaimed).as_bytes());
                 }
-                crate::resp::TierSubcommand::Snapshot(dir) => {
-                    let start = std::time::Instant::now();
-                    match router.tier_snapshot_all(dir).await {
-                        Ok((is_reflink, total_bytes, shards)) => {
-                            let ms = start.elapsed().as_millis();
-                            let msg = format!(
-                                "+OK snapshot created in {}ms, shards:{}, bytes:{}, reflink:{}\r\n",
-                                ms, shards, total_bytes, is_reflink
-                            );
-                            out.extend_from_slice(msg.as_bytes());
-                        }
-                        Err(e) => {
-                            out.extend_from_slice(
-                                format!("-ERR snapshot failed: {}\r\n", e).as_bytes(),
-                            );
-                        }
-                    }
-                }
-
                 crate::resp::TierSubcommand::Info => {
                     let stats = crate::tiering::get_tier_stats(router.base_port);
                     let max_mem = crate::tiering::get_max_memory(router.base_port);

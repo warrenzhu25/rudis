@@ -779,62 +779,6 @@ impl ShardTierManager {
         count * PAGE_SIZE
     }
 
-    /// Performs zero-copy file cloning via Linux FICLONE ioctl (reflink) if supported by the filesystem,
-    /// falling back to copy_file_range or standard copy.
-    pub fn snapshot_file(src_path: &Path, dst_path: &Path) -> io::Result<bool> {
-        use std::fs::OpenOptions;
-        use std::os::unix::io::AsRawFd;
-
-        let mut src_file = OpenOptions::new().read(true).open(src_path)?;
-        let mut dst_file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(dst_path)?;
-
-        const FICLONE: libc::c_ulong = 0x40049409;
-        // SAFETY: FICLONE takes the source fd as its argument and only reads
-        // the two fds, both owned by live `File`s for the whole call. There is
-        // no std wrapper for reflink.
-        let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
-        if ret == 0 {
-            Ok(true) // Instantaneous CoW reflink succeeded!
-        } else {
-            // std's file-to-file copy uses copy_file_range (then sendfile,
-            // then read/write) on Linux.
-            std::io::copy(&mut src_file, &mut dst_file)?;
-            Ok(false)
-        }
-    }
-
-    /// Creates an atomic snapshot of this shard's NVMe tiered storage database and manifest.
-    pub async fn snapshot(&self, backup_dir: &Path) -> io::Result<(bool, u64)> {
-        // 1. Flush any in-flight SmallBin
-        self.flush_active_bin().await?;
-        // 2. Sync underlying file
-        let _ = self.file.sync_all().await;
-        // 3. Ensure backup dir exists
-        std::fs::create_dir_all(backup_dir)?;
-        let backup_file = backup_dir.join(format!("tier_shard_{}.db", self.shard_id));
-        let is_reflink = Self::snapshot_file(&self.path, &backup_file)?;
-        let file_size = std::fs::metadata(&backup_file)
-            .map(|m| m.len())
-            .unwrap_or(0);
-
-        // 4. Write manifest
-        let manifest_path = backup_dir.join(format!("tier_shard_{}.manifest", self.shard_id));
-        let manifest = format!(
-            "version:1\nshard_id:{}\nfile_size:{}\nis_reflink:{}\ncurrent_offset:{}\n",
-            self.shard_id,
-            file_size,
-            is_reflink,
-            self.current_offset.get(),
-        );
-        std::fs::write(&manifest_path, manifest)?;
-
-        Ok((is_reflink, file_size))
-    }
-
     #[inline]
     pub fn ensure_preallocated(&self, needed_end: u64) {
         if needed_end > self.preallocated_len.get() {

@@ -554,22 +554,11 @@ saved data therefore reads tiered values back.
 - **FLUSHDB** queues every tiered or cooled pointer and frees them one by one. The file is not
   truncated.
 
-### 4.12 Snapshots (TIER SNAPSHOT dir)
+### 4.12 Backups
 
-TIER SNAPSHOT copies every shard's tier file into a backup directory as fast as the filesystem
-allows. On each shard:
-
-1. Write out the active bin and flush the file to disk.
-2. Create the backup directory.
-3. Try an instant **reflink** copy — a copy-on-write clone that shares blocks with the original
-   (supported by btrfs and reflink-enabled XFS).
-4. If that fails, fall back to an ordinary file copy, which on Linux uses the kernel's in-kernel copy
-   (then sendfile, then plain read and write).
-5. Write a small manifest file next to the copy: format version, shard number, file size, whether a
-   reflink was used, and the append cursor.
-
-The router runs this on every shard and reports whether all copies were reflinks, the total bytes,
-and the number of shards. Nothing reads these snapshots back today (see §7).
+There is no tier-file snapshot (a former `TIER SNAPSHOT` copied the raw files, which nothing could
+restore). `SAVE`/`BGSAVE` and full syncs read tiered values back and write them into the RDB, so
+the RDB is the backup of a tiered dataset.
 
 ---
 
@@ -585,7 +574,6 @@ and the number of shards. Nothing reads these snapshots back today (see §7).
 | TIER DECOMMIT [*key*] | Decommit one key, or every cooled key on every shard. | count |
 | TIER SPILLALL | Every shard tries to spill every one of its keys. | count |
 | TIER GC | Run garbage collection on every shard. | bytes reclaimed |
-| TIER SNAPSHOT *dir* (alias BACKUP) | Snapshot every shard's tier file (§4.12). | a status line |
 | TIER INFO | A report of the memory cap, memory in use, every counter and both thresholds. | bulk string |
 
 An unknown subcommand returns an error listing the valid ones. Exact reply formats are in
@@ -655,8 +643,6 @@ An unknown subcommand returns an error listing the valid ones. Exact reply forma
   the async I/O runtime handles buffers. By default (variable unset) the file uses normal buffered
   I/O.
 - **Synchronous reads reopen the file** on every miss of the in-memory pages.
-- **Snapshots are write-only.** Nothing reads the manifest or restores a snapshot, and a restored
-  file would be emptied on start anyway; the file means nothing without the in-memory pointers.
 - **TIER INFO always says tiering is enabled,** even on shards whose tier file failed to open.
 - **No per-shard disk quota.** The tier grows until the filesystem is full; after that, write errors
   just make spills fail.
@@ -667,7 +653,7 @@ An unknown subcommand returns an error listing the valid ones. Exact reply forma
 
 | File | Key symbols | What they do |
 | :--- | :--- | :--- |
-| `src/tiering.rs` | `ShardTierManager` (`open`, `stash_record`, `flush_active_bin`, `allocate_page`, `allocate_extent`, `release_extent`, `ensure_preallocated`, `on_key_deleted`, `on_key_overwritten`, `run_gc`, `punch_hole`, `read_ptr_sync`, `reset`, `snapshot`, `snapshot_file`), `claim_tier_file` | Per-shard tier file: allocation, packing, writes, frees, GC, reset, snapshots. |
+| `src/tiering.rs` | `ShardTierManager` (`open`, `stash_record`, `flush_active_bin`, `allocate_page`, `allocate_extent`, `release_extent`, `ensure_preallocated`, `on_key_deleted`, `on_key_overwritten`, `run_gc`, `punch_hole`, `read_ptr_sync`, `reset`), `claim_tier_file` | Per-shard tier file: allocation, packing, writes, frees, GC, reset. |
 | `src/tiering.rs` | `SmallBinsManager` (`bytes_in_memory`, `decrement_page_key`, `retire_if_unused`), `ActiveBin` (`can_fit`, `seal`), `SmallBinItem` | 4 KiB page packing of small records and page liveness tracking. |
 | `src/tiering.rs` | `OpManager` (`read_page_coalesced`, `check_write_backpressure`), `PendingStash` | Read coalescing and 16 MiB write backpressure. |
 | `src/tiering.rs` | `encode_tiered_record`, `decode_tiered_record`, `read_tiered_record`, `read_tiered_record_sync` | Record format, checksums, async/sync reads. |
@@ -676,8 +662,8 @@ An unknown subcommand returns an error listing the valid ones. Exact reply forma
 | `src/table.rs` | `RudisTable::{get_value_for_spill, set_spilled_pointer_if_unchanged, set_tiered_pointer, set_cooled_pointer, restore_tiered_value, decommit_cooled_key, decommit_all_cooled, is_tiered, is_cooled, warm_key, warm_slot, find_entry_mut_warm, get_slot_mut_warm, get_hot_keys_for_spill, copy_with_hydrated, serialize_val_payload, deserialize_val_payload}`, `dropped_tier`, `spill_cursor`, `MIN_SPILL_VALUE_BYTES` | State transitions, victim selection, and the drop queue. |
 | `src/router.rs` | `Router::{spill_local, spill_local_internal, cool_local, load_local, decommit_local, stream_cold_read_local, read_cold_key_local, get_local_direct, get_local_checked, is_memory_constrained}` | Per-key tier operations and the GET cold path. |
 | `src/router.rs` | `Router::{check_auto_tier, check_auto_tier_local, check_auto_tier_after_write, start_auto_tier_if_over, over_maxmemory, over_maxmemory_checked, refresh_published_usage, publish_memory_state, sync_backoff_epoch, set_base_port}`, `MAX_SPILL_ATTEMPTS_PER_CALL` | Automatic tiering and the server-wide limit check. |
-| `src/router.rs` | `Router::{spill_key, cool_key, ensure_loaded, decommit, spill_all, gc_local, gc_all, snapshot_local, tier_snapshot_all}` | Cross-shard wrappers behind TIER. |
-| `src/shard.rs` | `ShardDb::{tier_manager, hydrate_cmd_keys, hydrate_key, hydrate_key_unchecked, hydrate_tiered, get_checked, is_sticky, drain_dropped_tier, copy, rename, dump, flushdb, flushall, save_rdb_chunk, save_rdb_entry, save_rdb_entry_with}`, `AofImage` (`step_walk`), `start_save_image`, `start_sync_image`, `TieredReadError`, `ShardMessage::{TierSpill, TierLoad, TierCool, TierDecommit, TierSpillAll, TierAutoSpill, TierGc, TierSnapshot, StreamColdRead, FastGet, Batch, SaveRdbChunk}` | Hydration, freeing, persistence, and the tier messages. |
+| `src/router.rs` | `Router::{spill_key, cool_key, ensure_loaded, decommit, spill_all, gc_local, gc_all}` | Cross-shard wrappers behind TIER. |
+| `src/shard.rs` | `ShardDb::{tier_manager, hydrate_cmd_keys, hydrate_key, hydrate_key_unchecked, hydrate_tiered, get_checked, is_sticky, drain_dropped_tier, copy, rename, dump, flushdb, flushall, save_rdb_chunk, save_rdb_entry, save_rdb_entry_with}`, `AofImage` (`step_walk`), `start_save_image`, `start_sync_image`, `TieredReadError`, `ShardMessage::{TierSpill, TierLoad, TierCool, TierDecommit, TierSpillAll, TierAutoSpill, TierGc, StreamColdRead, FastGet, Batch, SaveRdbChunk}` | Hydration, freeing, persistence, and the tier messages. |
 | `src/server.rs` | tier directory selection and `ShardTierManager::open` at shard start; 20 ms auto-tier and 2 s GC loops; `Batch` / `FastGet` cold-read handling; `Tier*` and `StreamColdRead` message handlers | Lifecycle and background work. |
 | `src/connection.rs` | `Command::Tier` handler, noeviction OOM gate, `execute_local_command`, `execute_commands_squashed_inner` (`local_cold_gets`, `flush_remote_batches`), `for_each_cmd_key`, `set_max_memory_policy`, `migrate_keys_to_node` | Command surface and pipeline cold reads. |
 | `src/aof.rs` | AOF rewrite hydration of `Tiered` values | Rewrite never writes pointers. |
@@ -800,10 +786,8 @@ record length"`, `"crc mismatch on tiered read"`. It returns `(key, payload)`; c
 | GC timer | 2 s | Per-shard background task calling `Router::gc_local`. |
 | Memory constrained | `real_used_total >= max_memory / 100 * offload_threshold_pct` | `Router::is_memory_constrained`. |
 | Hole punch | `FALLOC_FL_PUNCH_HOLE \| FALLOC_FL_KEEP_SIZE` | Large records on free; dead pages in GC. |
-| Reflink | `ioctl(FICLONE = 0x40049409)` | Fallback `std::io::copy` (`copy_file_range`, `sendfile`, read/write). |
 | Tier directory | `$RUDIS_TIER_DIR` or `<dir>/rudis_tier_<port>` | File `tier_shard_<shard_id>.db`. |
 | Lock error | `"tier file ... is in use by another server"` | From `claim_tier_file` (exclusive non-blocking `flock`). |
-| Manifest | `tier_shard_<id>.manifest` | Lines `version:1`, `shard_id`, `file_size`, `is_reflink`, `current_offset`. |
 
 ### 9.6 TIER replies
 
@@ -815,11 +799,10 @@ record length"`, `"crc mismatch on tiered read"`. It returns `(key, payload)`; c
 | `TIER DECOMMIT [key]` | `decommit` | `:<count>` |
 | `TIER SPILLALL` | `spill_all` (`spill_local` on every key from `table.keys(b"*")`) | `:<count>` |
 | `TIER GC` | `gc_all` | `:<bytes reclaimed>` |
-| `TIER SNAPSHOT <dir>` / `BACKUP` | `tier_snapshot_all` → `(all_reflink, total_bytes, shard_count)` | `+OK snapshot created in <ms>ms, shards:<n>, bytes:<n>, reflink:<bool>` or `-ERR snapshot failed: ...` |
 | `TIER INFO` | — | Bulk string headed `# Tiered Storage (io_uring NVMe)`: `tier_enabled:1`, `maxmemory`, `maxmemory_human`, `used_memory`, `used_memory_human` (server-wide allocator count after every shard republishes), the 18 counters, `offload_threshold_pct`, `upload_threshold_pct` |
 
 Cross-shard messages: `TierSpill`, `TierCool`, `TierLoad`, `TierDecommit`, `TierSpillAll`,
-`TierAutoSpill` (reply: the shard's table usage), `TierGc`, `TierSnapshot`, `StreamColdRead`
+`TierAutoSpill` (reply: the shard's table usage), `TierGc`, `StreamColdRead`
 (handled in `server.rs`, never sent).
 
 ### 9.7 Where things are called from
