@@ -2671,6 +2671,48 @@ fn test_debug_digest_replica_matches_master_e2e() {
     resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
 }
 
+/// A multi-key UNLINK spanning shards deletes every key on the replica too:
+/// each master shard logs an `UNLINK` of its own keys, and the replica must
+/// apply each on the shard owning those keys (it once ran them all on the
+/// shard reading the stream, so other shards' keys survived).
+#[test]
+fn test_multi_key_unlink_across_shards_replicates_e2e() {
+    let (mp, rp) = (18431, 18432);
+    start_test_server(mp, 4);
+    start_test_server(rp, 4);
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    assert_eq!(
+        resp_cmd_all(&mut r, &["REPLICAOF", "127.0.0.1", &mp.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd_all(&mut m, &["WAIT", "1", "100"]) != ":1\r\n" {
+        assert!(std::time::Instant::now() < deadline, "replica never linked");
+    }
+    let keys: Vec<String> = (0..64).map(|i| format!("unl:{}", i)).collect();
+    let mut mset = vec!["MSET".to_string()];
+    for k in &keys {
+        mset.push(k.clone());
+        mset.push("v".to_string());
+    }
+    let mset: Vec<&str> = mset.iter().map(String::as_str).collect();
+    assert_eq!(resp_cmd_all(&mut m, &mset), "+OK\r\n");
+    let mut unlink = vec!["UNLINK"];
+    unlink.extend(keys.iter().map(String::as_str));
+    assert_eq!(resp_cmd_all(&mut m, &unlink), ":64\r\n");
+    // A later write marks the point the replica has applied the UNLINKs by.
+    assert_eq!(resp_cmd_all(&mut m, &["SET", "after", "1"]), "+OK\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd_all(&mut r, &["EXISTS", "after"]) != ":1\r\n" {
+        assert!(std::time::Instant::now() < deadline, "stream never applied");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(resp_cmd_all(&mut r, &["DBSIZE"]), ":1\r\n");
+    assert_eq!(debug_digest(&mut m), debug_digest(&mut r));
+    resp_cmd_all(&mut r, &["REPLICAOF", "NO", "ONE"]);
+}
+
 /// Cross-shard LMOVE / SMOVE replicate as one logical command, from the
 /// destination's shard right after the push. Other clients' writes
 /// meanwhile must still reach the replica (the moves once muted the whole

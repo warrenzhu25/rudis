@@ -5428,6 +5428,22 @@ impl Router {
         }
     }
 
+    /// The shard owning every key of `cmd`, if it has keys and one shard owns
+    /// them all.
+    fn sole_key_owner(&self, cmd: &Command) -> Option<usize> {
+        let mut owner = None;
+        let mut mixed = false;
+        crate::connection::for_each_cmd_key(cmd, |k| {
+            let t = self.target_shard(k);
+            match owner {
+                None => owner = Some(t),
+                Some(o) if o != t => mixed = true,
+                _ => {}
+            }
+        });
+        if mixed { None } else { owner }
+    }
+
     pub async fn execute_replica_command(&self, cmd: Command) {
         if let Some(target) = crate::connection::target_shard_of_cmd(&cmd, self.num_shards) {
             self.apply_replica_on(target, cmd).await;
@@ -5531,6 +5547,9 @@ impl Router {
                         start.elapsed().as_nanos() as u64,
                     );
                 }
+                // Multi-key deletes route each key to its owner: the shard
+                // applying the stream does not own them all (master shards
+                // log `UNLINK` batches of their own keys).
                 Command::Del(keys) => {
                     let start = std::time::Instant::now();
                     for k in keys {
@@ -5538,6 +5557,16 @@ impl Router {
                     }
                     crate::connection::record_replica_cmd_stats(
                         &Command::Del(smallvec::SmallVec::new()),
+                        start.elapsed().as_nanos() as u64,
+                    );
+                }
+                Command::Unlink(keys) => {
+                    let start = std::time::Instant::now();
+                    for k in keys {
+                        self.del(k).await;
+                    }
+                    crate::connection::record_replica_cmd_stats(
+                        &Command::Unlink(smallvec::SmallVec::new()),
                         start.elapsed().as_nanos() as u64,
                     );
                 }
@@ -5558,6 +5587,14 @@ impl Router {
                     }
                 }
                 _ => {
+                    // A command whose keys one other shard owns must run
+                    // there, not on the shard reading the stream.
+                    if let Some(owner) = self.sole_key_owner(&cmd)
+                        && owner != self.shard_id
+                    {
+                        self.apply_replica_on(owner, cmd).await;
+                        return;
+                    }
                     crate::connection::execute_cross_shard_replica_command(self, cmd).await;
                 }
             }
@@ -5955,6 +5992,39 @@ mod tests {
             target_shard_and_hash(b"{u1}:a", 4).0,
             target_shard(b"u1", 4)
         );
+    }
+
+    /// A replicated command whose keys one shard owns is applied by that
+    /// shard: master shards log `UNLINK` batches of their own keys, which
+    /// the shard reading the stream does not own.
+    #[test]
+    fn test_sole_key_owner_routes_replicated_multi_key_commands() {
+        let (senders_mesh, _rx) = crate::mailbox::create_shard_mesh(4);
+        let router = Router::new(
+            0,
+            4,
+            9978,
+            Rc::new(RefCell::new(ShardDb::new(9978))),
+            senders_mesh[0].clone(),
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+        let keys_on = |shard: usize, n: usize| -> Vec<Bytes> {
+            (0..)
+                .map(|i| Bytes::from(format!("k{}", i)))
+                .filter(|k| target_shard(k, 4) == shard)
+                .take(n)
+                .collect()
+        };
+        let on2 = keys_on(2, 3);
+        let unlink = Command::Unlink(SmallVec::from_vec(on2.clone()));
+        assert_eq!(router.sole_key_owner(&unlink), Some(2));
+        let mut mixed = on2;
+        mixed.extend(keys_on(3, 1));
+        let unlink = Command::Unlink(SmallVec::from_vec(mixed));
+        assert_eq!(router.sole_key_owner(&unlink), None);
+        assert_eq!(router.sole_key_owner(&Command::Flushall), None);
     }
 
     fn single_shard_router(port: u16) -> (Router, Rc<RefCell<ShardDb>>) {

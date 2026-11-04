@@ -835,7 +835,9 @@ Lines longer than 64 KB drop the link. The link phase follows the steps for `ROL
         mid-block resumes from its `MULTI`). It waits for every batch before it, is applied command by command and
         flushed, and acked as a whole; a `GETACK` inside it is answered after it.
       * `REPLCONF GETACK` waits for every batch in flight and flushes, then acks.
-      * A command for no single shard waits for every batch in flight first.
+      * A command for no single shard waits for every batch in flight first. Multi-key `DEL`/`UNLINK` delete each
+        key on its owner; any other such command whose keys one shard owns (master shards log `UNLINK` batches of
+        their own keys) runs on that shard (`Router::sole_key_owner`), never on the shard reading the stream.
       * Everything else is applied in batches: commands for the local shard apply at once (under the
         replaying-writes flag, logging error replies as `== CRITICAL ==`); commands for other shards are batched per
         shard.
