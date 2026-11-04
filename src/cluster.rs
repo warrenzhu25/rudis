@@ -206,6 +206,17 @@ pub struct ClusterHub {
     /// `cluster-node-timeout` (ms): a peer silent this long is PFAIL, and
     /// failover starts about this long after a master dies.
     pub node_timeout_ms: AtomicU64,
+    /// The cluster is down from this node's view (Redis's CLUSTER_FAIL for
+    /// a master in a minority partition): it can't reach a majority of the
+    /// masters serving slots, so the majority side may be promoting its
+    /// replicas, and writes taken here would be lost. Keyed commands get
+    /// `-CLUSTERDOWN` (see `update_cluster_state`).
+    pub cluster_down: AtomicBool,
+    /// When this master last found itself in a minority (ms), for the
+    /// rejoin delay before it serves again.
+    pub minority_since: AtomicU64,
+    /// `cluster-allow-reads-when-down`: serve reads while down.
+    pub allow_reads_when_down: AtomicBool,
     /// This master paused its writers for a replica's manual failover
     /// (until it steps down, or the pause times out).
     pub mf_paused: AtomicBool,
@@ -319,6 +330,9 @@ impl ClusterHub {
             config_file: RwLock::new(None),
             follow: parking_lot::Mutex::new(None),
             node_timeout_ms: AtomicU64::new(NODE_TIMEOUT_MS),
+            cluster_down: AtomicBool::new(false),
+            minority_since: AtomicU64::new(0),
+            allow_reads_when_down: AtomicBool::new(false),
             mf_paused: AtomicBool::new(false),
             announce_ip: RwLock::new(None),
             announce_port: std::sync::atomic::AtomicU16::new(0),
@@ -1076,7 +1090,8 @@ impl ClusterHub {
         let uncovered = nodes
             .values()
             .any(|n| n.fail == FailState::Fail && n.is_master() && !n.slots.is_empty());
-        let state = if uncovered { "fail" } else { "ok" };
+        let down = uncovered || self.cluster_down.load(Ordering::Relaxed);
+        let state = if down { "fail" } else { "ok" };
         let cur_epoch = self.current_epoch.load(Ordering::Relaxed);
         let cfg_epoch = self.config_epoch.load(Ordering::Relaxed);
         format!(
@@ -3229,6 +3244,45 @@ fn note_unreachable(hub: &ClusterHub, id: &str, now: u64, quorum: usize) {
     }
 }
 
+/// Redis's minority rule: a master serving slots that can reach fewer than
+/// a majority of the masters serving slots (itself included; PFAIL and FAIL
+/// peers are unreachable) marks the cluster down, so a partitioned master
+/// stops taking writes the majority side will discard when it promotes the
+/// master's replica. Once the majority is reachable again it stays down
+/// for a rejoin delay (the node timeout, within 0.5-5 s), giving it time
+/// to learn whether it was failed over meanwhile.
+fn update_cluster_state(hub: &ClusterHub, now: u64) {
+    let me_serves = *hub.role.read() == "master" && !hub.my_slots.read().is_empty();
+    let minority = me_serves && {
+        let nodes = hub.nodes.read();
+        let masters = nodes
+            .values()
+            .filter(|n| n.is_master() && !n.slots.is_empty());
+        let (size, reachable) = masters.fold((1usize, 1usize), |(size, reach), n| {
+            (size + 1, reach + usize::from(n.fail == FailState::Ok))
+        });
+        reachable < size / 2 + 1
+    };
+    if minority {
+        hub.minority_since.store(now, Ordering::Relaxed);
+        if !hub.cluster_down.swap(true, Ordering::Relaxed) {
+            crate::log_warning!(
+                "Cluster state changed: fail (this master can't reach a majority of masters)"
+            );
+        }
+        return;
+    }
+    if hub.cluster_down.load(Ordering::Relaxed) {
+        let rejoin_delay = hub.node_timeout_ms.load(Ordering::Relaxed).clamp(500, 5000);
+        if !me_serves
+            || now.saturating_sub(hub.minority_since.load(Ordering::Relaxed)) >= rejoin_delay
+        {
+            hub.cluster_down.store(false, Ordering::Relaxed);
+            crate::log_notice!("Cluster state changed: ok");
+        }
+    }
+}
+
 fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3317,6 +3371,8 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
             }
         }
     }
+
+    update_cluster_state(hub, now);
 
     // Automated failover trigger for replicas
     let should_elect = {
@@ -3500,6 +3556,58 @@ mod tests {
         hub.cluster_failover(false).unwrap();
         assert!(hub.config_epoch.load(Ordering::SeqCst) > 5);
         assert_eq!(*hub.my_slots.read(), vec![(0, 5460)]);
+    }
+
+    /// A master that can reach fewer than a majority of the masters
+    /// serving slots marks the cluster down, and serves again only a
+    /// rejoin delay after the majority is reachable again.
+    #[test]
+    fn test_a_master_in_a_minority_marks_the_cluster_down() {
+        let hub = ClusterHub::new(7710);
+        *hub.role.write() = "master".to_string();
+        *hub.my_slots.write() = vec![(0, 5460)];
+        hub.node_timeout_ms.store(1000, Ordering::Relaxed);
+        let node = |id: &str, slots: Vec<(u16, u16)>, fail: FailState| ClusterNodeInfo {
+            id: id.to_string(),
+            ip: "127.0.0.1".to_string(),
+            port: 7711,
+            cport: 17711,
+            flags: "master".to_string(),
+            fail,
+            shards: 0,
+            master_id: "-".to_string(),
+            ping_sent: 0,
+            pong_recv: 0,
+            config_epoch: 0,
+            link_state: "connected".to_string(),
+            slots,
+        };
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        hub.nodes
+            .write()
+            .insert(a.clone(), node(&a, vec![(5461, 10922)], FailState::Ok));
+        hub.nodes
+            .write()
+            .insert(b.clone(), node(&b, vec![(10923, 16383)], FailState::PFail));
+        // Two of three masters reachable (us and A): a majority.
+        update_cluster_state(&hub, 10_000);
+        assert!(!hub.cluster_down.load(Ordering::Relaxed));
+        // Only us: a minority.
+        hub.nodes.write().get_mut(&a).unwrap().fail = FailState::PFail;
+        update_cluster_state(&hub, 11_000);
+        assert!(hub.cluster_down.load(Ordering::Relaxed));
+        assert!(hub.cluster_info().contains("cluster_state:fail"));
+        // Majority back: still down for the rejoin delay (1 s), then up.
+        hub.nodes.write().get_mut(&a).unwrap().fail = FailState::Ok;
+        update_cluster_state(&hub, 11_500);
+        assert!(hub.cluster_down.load(Ordering::Relaxed));
+        update_cluster_state(&hub, 12_000);
+        assert!(!hub.cluster_down.load(Ordering::Relaxed));
+        // A replica, or a master without slots, is never in a minority.
+        *hub.my_slots.write() = Vec::new();
+        hub.nodes.write().get_mut(&a).unwrap().fail = FailState::PFail;
+        update_cluster_state(&hub, 13_000);
+        assert!(!hub.cluster_down.load(Ordering::Relaxed));
     }
 
     #[test]

@@ -345,3 +345,125 @@ fn test_min_replicas_to_write_refuses_writes_while_partitioned_e2e() {
     }
     assert_eq!(cmd(rp, &["EXISTS", "late"]), ":0\r\n");
 }
+
+fn signal(server: &ServerGuard, sig: &str) {
+    let status = std::process::Command::new("kill")
+        .args([sig, &server.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// A cluster master cut off from the majority of masters (here: the other
+/// two are frozen, so it hears from neither) marks the cluster down and
+/// refuses its keys with CLUSTERDOWN after the node timeout, instead of
+/// taking writes the majority side would discard on a failover. With
+/// cluster-allow-reads-when-down it keeps serving reads. Once the majority
+/// answers again it serves again, after the rejoin delay.
+#[test]
+fn test_cluster_master_in_a_minority_refuses_its_keys_e2e() {
+    let ports = [15820u16, 15822, 15824];
+    let ranges = [(0, 5460), (5461, 10922), (10923, 16383)];
+    let servers: Vec<ServerGuard> = ports
+        .iter()
+        .map(|p| {
+            let dir = std::env::temp_dir().join(format!(
+                "rudis_partition_cluster_{}_{}",
+                p,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    dir.to_str().unwrap(),
+                    "--cluster-enabled",
+                    "yes",
+                    "--cluster-node-timeout",
+                    "1000",
+                    "--threads",
+                    "1",
+                    "--no-pin",
+                    "--save",
+                    "",
+                ],
+                *p,
+            ))
+        })
+        .collect();
+    for p in ports {
+        assert_eq!(
+            cmd(p, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
+            "+OK\r\n"
+        );
+    }
+    for (p, (s, e)) in ports.iter().zip(ranges) {
+        let (s, e) = (s.to_string(), e.to_string());
+        assert_eq!(cmd(*p, &["CLUSTER", "ADDSLOTSRANGE", &s, &e]), "+OK\r\n");
+    }
+    for p in &ports[1..] {
+        assert_eq!(
+            cmd(ports[0], &["CLUSTER", "MEET", "127.0.0.1", &p.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    wait_for_slot_views(&ports);
+    let lone = ports[2];
+    let key = (0..)
+        .map(|i| format!("mk{i}"))
+        .find(|k| rudis::router::key_slot(k.as_bytes()) >= 10923)
+        .unwrap();
+    assert_eq!(cmd(lone, &["SET", &key, "v1"]), "+OK\r\n");
+    wait_for("cluster_state ok everywhere", 20, || {
+        ports
+            .iter()
+            .all(|p| cmd(*p, &["CLUSTER", "INFO"]).contains("cluster_state:ok"))
+    });
+
+    // Partition: the lone master hears from neither other master.
+    signal(&servers[0], "-STOP");
+    signal(&servers[1], "-STOP");
+    let cut_at = Instant::now();
+    wait_for("the lone master to refuse writes", 20, || {
+        let r = cmd(lone, &["SET", &key, "minority-write"]);
+        if r == "+OK\r\n" {
+            return false;
+        }
+        assert_eq!(r, "-CLUSTERDOWN The cluster is down\r\n");
+        true
+    });
+    eprintln!("refused after {:?}", cut_at.elapsed());
+    assert_eq!(
+        cmd(lone, &["GET", &key]),
+        "-CLUSTERDOWN The cluster is down\r\n"
+    );
+    assert!(cmd(lone, &["CLUSTER", "INFO"]).contains("cluster_state:fail"));
+    // Keyless commands still work.
+    assert_eq!(cmd(lone, &["PING"]), "+PONG\r\n");
+    // Reads allowed when configured; writes still refused.
+    assert_eq!(
+        cmd(
+            lone,
+            &["CONFIG", "SET", "cluster-allow-reads-when-down", "yes"]
+        ),
+        "+OK\r\n"
+    );
+    let r = cmd(lone, &["GET", &key]);
+    assert!(r == "$2\r\nv1\r\n" || r.starts_with("$14"), "{r}");
+    assert_eq!(
+        cmd(lone, &["SET", &key, "x"]),
+        "-CLUSTERDOWN The cluster is down\r\n"
+    );
+
+    // Heal.
+    signal(&servers[0], "-CONT");
+    signal(&servers[1], "-CONT");
+    wait_for("the lone master to serve again", 30, || {
+        cmd(lone, &["SET", &key, "v2"]) == "+OK\r\n"
+    });
+    assert!(cmd(lone, &["CLUSTER", "INFO"]).contains("cluster_state:ok"));
+    assert_eq!(cmd(lone, &["GET", &key]), "$2\r\nv2\r\n");
+}

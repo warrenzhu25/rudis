@@ -390,8 +390,17 @@ Masters A, B and C each serve slots; the node timeout is 5000 ms. C crashes.
    FAIL and broadcasts `FAIL C`. A marks C FAIL on receipt.
 4. C's replica C' sees its master FAIL with slots and starts an election (§9.1).
 
-`CLUSTER INFO` reports `cluster_state:fail` while any FAIL master still has slots, and counts the
-PFAIL and FAIL nodes.
+**Minority rule** (Redis's `clusterUpdateState`). Every tick, a master serving slots counts the
+masters serving slots that it can reach (itself, plus peers neither PFAIL nor FAIL). Below a
+majority (`n / 2 + 1`), it is in a minority partition: it sets `cluster_down`, logs
+`Cluster state changed: fail`, and stops serving keys (`-CLUSTERDOWN The cluster is down`, §10),
+because the majority side may be promoting its replica and would discard any write taken here. Once
+a majority is reachable again it stays down for a **rejoin delay** (the node timeout, clamped to
+0.5-5 s), long enough to learn whether it was failed over meanwhile. Replicas and masters without
+slots are never in a minority. `cluster-allow-reads-when-down yes` keeps reads served while down.
+
+`CLUSTER INFO` reports `cluster_state:fail` while any FAIL master still has slots or this master is
+in a minority, and counts the PFAIL and FAIL nodes.
 
 ---
 
@@ -566,7 +575,9 @@ For each command, the checks run in this order:
    * **Importing** gives `-MOVED <slot> <source>` unless the command is asking, in which case it
      executes.
    * **Migrating** executes if the key exists locally, else gives `-ASK <slot> <target>`.
-   * **Stable** matters only if cluster mode is on or a cluster is active. The slot is "served here"
+   * **Stable** matters only if cluster mode is on or a cluster is active. If this master is in a
+     minority (§7, `cluster_down`), a write, or any keyed command unless
+     `cluster-allow-reads-when-down yes`, gets `-CLUSTERDOWN The cluster is down`. The slot is "served here"
      if the hub owns it, **or** the command is a read, the client sent `READONLY`, and this node is a
      replica of the slot's master. If it is served here and cluster mode is on, then another local
      shard owning the slot gives `-MOVED <slot> <announced ip>:<announced port + that shard>`, and
@@ -860,8 +871,9 @@ line was found.
 * **Full-state gossip and short-lived connections.** Every tick opens one TCP connection per peer and
   sends the whole node table.
 * **Simplified failover.** There is no replica rank or offset-based delay, no replica migration, and
-  no `cluster-require-full-coverage` or `allow-reads-when-down` handling (`-CLUSTERDOWN` is given only
-  when no live owner is known).
+  no `cluster-require-full-coverage` handling: a slot without a live owner gets
+  `-CLUSTERDOWN Hash slot not served` while the other slots keep working (Redis, by default, refuses
+  every key then). The minority rule (§7) is implemented.
 * **`CLUSTER FAILOVER` holds no vote**, with or without `FORCE`.
 * **Not implemented:** `CLUSTER COUNT-FAILURE-REPORTS`, `REPLICAS` and `SLAVES`, real `CLUSTER LINKS`
   statistics, real `cluster_stats_*` counters, and replication offsets in `CLUSTER SHARDS`. Unknown

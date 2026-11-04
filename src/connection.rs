@@ -3898,6 +3898,11 @@ pub fn apply_config_value(
                 .announce_port
                 .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
         }
+        "cluster-allow-reads-when-down" => {
+            crate::cluster::get_cluster_hub(base_port)
+                .allow_reads_when_down
+                .store(parse_config_bool(name, val_str)?, Ordering::Relaxed);
+        }
         "cluster-node-timeout" => {
             let ms: u64 = parse_config_num(name, val_str)?;
             if ms == 0 {
@@ -12006,6 +12011,18 @@ async fn execute_command_inner(
             crate::shard::SlotState::Stable => {
                 if router.cluster_enabled || crate::cluster::has_active_cluster(router.base_port) {
                     let hub = crate::cluster::get_cluster_hub(router.base_port);
+                    // A master cut off from the majority of masters serves
+                    // no keys (Redis's minority rule; see
+                    // `cluster::update_cluster_state`).
+                    if hub.cluster_down.load(std::sync::atomic::Ordering::Relaxed)
+                        && (cmd.is_write_command()
+                            || !hub
+                                .allow_reads_when_down
+                                .load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        out.extend_from_slice(b"-CLUSTERDOWN The cluster is down\r\n");
+                        return false;
+                    }
                     // Never hold `my_slots` while taking `nodes` below: the
                     // cluster bus takes them the other way round.
                     // Like Redis, a READONLY client of a cluster replica gets
