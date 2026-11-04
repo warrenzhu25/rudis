@@ -3373,6 +3373,16 @@ pub static PAUSE_CRON: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// can catch one half done.
 pub static CROSS_SHARD_MOVE_DELAY_US: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// `DEBUG CROSS-SHARD-PUSH-DELAY <microseconds>` (a test knob): how long
+/// the destination shard of a cross-shard LMOVE / SMOVE stalls before it
+/// claims the push, so a test can make the source give up waiting.
+pub static CROSS_SHARD_PUSH_DELAY_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// `DEBUG CROSS-SHARD-MOVE-TIMEOUT <milliseconds>`: how long the source of
+/// a cross-shard LMOVE / SMOVE waits for the destination to take its push
+/// before withdrawing it and undoing the pop (default 10 s).
+pub static CROSS_SHARD_MOVE_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(10_000);
 pub static ACTIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static MAX_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
 pub static MAX_MEMORY_POLICY: parking_lot::RwLock<String> = parking_lot::RwLock::new(String::new());
@@ -20176,6 +20186,22 @@ async fn execute_command_inner(
                     crate::replication::cached_hub(router.base_port).change_replid();
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
+                } else if sub.eq_ignore_ascii_case(b"cross-shard-push-delay")
+                    || sub.eq_ignore_ascii_case(b"cross-shard-move-timeout")
+                {
+                    let knob = if sub.eq_ignore_ascii_case(b"cross-shard-push-delay") {
+                        &CROSS_SHARD_PUSH_DELAY_US
+                    } else {
+                        &CROSS_SHARD_MOVE_TIMEOUT_MS
+                    };
+                    match args.get(1).and_then(|v| std::str::from_utf8(v).ok()?.parse::<u64>().ok()) {
+                        Some(v) => {
+                            knob.store(v, std::sync::atomic::Ordering::Relaxed);
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                        None => out.extend_from_slice(b"-ERR value is not an integer or out of range\r\n"),
+                    }
+                    return false;
                 } else if sub.eq_ignore_ascii_case(b"cross-shard-move-delay") {
                     match args.get(1).and_then(|v| std::str::from_utf8(v).ok()?.parse::<u64>().ok()) {
                         Some(us) => {
@@ -29650,26 +29676,59 @@ pub(crate) fn move_element_from_source(
     }
     CURRENT_DB.set(prev_db);
     CURRENT_CLIENT_ID.set(prev_cid);
-    let push = match push {
+    // The push, and what puts the popped element back if it never runs.
+    let (push, undo) = match push {
         crate::shard::MovePush::List { key, to } => {
             let Some(elem) = resp_bulk_payload(&popped) else {
                 return popped;
             };
+            let undo_values = smallvec::smallvec![elem.clone()];
+            let undo = match pop {
+                Command::Rpop { key, .. } => Command::Rpush {
+                    key: key.clone(),
+                    values: undo_values,
+                },
+                _ => Command::Lpush {
+                    key: cmd_primary_key(pop).cloned().unwrap_or_default(),
+                    values: undo_values,
+                },
+            };
             let values = smallvec::smallvec![elem];
-            match to {
+            let push = match to {
                 crate::table::ListDirection::Left => Command::Lpush { key, values },
                 crate::table::ListDirection::Right => Command::Rpush { key, values },
-            }
+            };
+            (push, undo)
         }
         crate::shard::MovePush::Set { key, member } => {
             if resp_integer(&popped) != Some(1) {
                 return popped;
             }
-            Command::Sadd {
+            let undo = Command::Sadd {
+                key: cmd_primary_key(pop).cloned().unwrap_or_default(),
+                members: smallvec::smallvec![member.clone()],
+            };
+            let push = Command::Sadd {
                 key,
                 members: smallvec::smallvec![member],
-            }
+            };
+            (push, undo)
         }
+    };
+    // Puts the element back (unreplicated, like the pop) and fails the move.
+    let undo_pop = |why: &str| -> Vec<u8> {
+        let prev_db = CURRENT_DB.replace(db);
+        let prev_cid = CURRENT_CLIENT_ID.replace(client_id);
+        {
+            let _no_repl = crate::replication::SuppressPropagation::new();
+            let mut local = router.local_db.borrow_mut();
+            local.select_db(db);
+            let mut ignored = Vec::new();
+            execute_local_command(&undo, &mut local, &mut ignored, router.aof().as_deref());
+        }
+        CURRENT_DB.set(prev_db);
+        CURRENT_CLIENT_ID.set(prev_cid);
+        format!("-TRYAGAIN cross-shard move {why}; nothing was moved\r\n").into_bytes()
     };
     let delay = CROSS_SHARD_MOVE_DELAY_US.load(std::sync::atomic::Ordering::Relaxed);
     if delay > 0 {
@@ -29678,11 +29737,12 @@ pub(crate) fn move_element_from_source(
     let hash = cmd_primary_key(&push)
         .map(|k| crate::table::hash_key(k))
         .unwrap_or(0);
-    // The reply slot lives on the heap: if the destination never answers,
-    // it is leaked rather than written after this frame is gone.
+    // The reply slot lives on the heap; it is freed only once the
+    // destination finished with it or can no longer touch it.
     let mut slot = Box::new(crate::shard::CompactResp::empty());
     let responder = std::sync::Arc::new(crate::mailbox::BatchResponder::new());
     responder.prepare(&mut *slot as *mut _, 1);
+    responder.make_cancellable();
     let msg = ShardMessage::Batch {
         db,
         items: vec![(0, hash, push)],
@@ -29695,17 +29755,25 @@ pub(crate) fn move_element_from_source(
     };
     if router.senders[dst_shard].send(msg).is_err() {
         crate::log_warning!("cross-shard move: shard {} is not reachable", dst_shard);
-        return popped;
+        return undo_pop("failed: the destination shard is not reachable");
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let timeout_ms = CROSS_SHARD_MOVE_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut waited_out = false;
     while responder.try_take().is_none() {
-        if std::time::Instant::now() >= deadline {
-            crate::log_warning!(
-                "cross-shard move: shard {} did not answer the push",
-                dst_shard
-            );
-            std::mem::forget(slot);
-            return popped;
+        if !waited_out && std::time::Instant::now() >= deadline {
+            waited_out = true;
+            if responder.cancel() {
+                // The destination will skip the push: the element is ours.
+                crate::log_warning!(
+                    "cross-shard move: shard {} did not take the push in {} ms; undoing the pop",
+                    dst_shard,
+                    timeout_ms
+                );
+                drop(slot);
+                return undo_pop("timed out");
+            }
+            // Already running there: it completes, wait for it.
         }
         std::thread::yield_now();
     }
@@ -30528,6 +30596,9 @@ mod tests {
                     panic!("no push");
                 };
                 assert_eq!(replicate_as.as_deref(), Some(&b"LOGICAL"[..]));
+                // Claimed at once, as the real destination does: the source
+                // then waits however long the push takes.
+                assert!(responder.claim());
                 match &items[0].2 {
                     Command::Lpush { key, values } => {
                         assert_eq!(key.as_ref(), b"dst");
@@ -30577,6 +30648,84 @@ mod tests {
             0,
         );
         assert!(reply == b"$-1\r\n" || reply == b"_\r\n", "{reply:?}");
+    }
+
+    /// A destination that does not take the push in time: the source
+    /// withdraws it, puts the popped element back where it was, and fails
+    /// the move; the destination then skips the push. Nothing is lost or
+    /// duplicated.
+    #[test]
+    fn test_move_element_from_source_undoes_the_pop_when_the_push_is_not_taken() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
+        let router = crate::router::Router::new(
+            0,
+            2,
+            9976,
+            Rc::new(RefCell::new(crate::shard::ShardDb::new(9976))),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+        let mut out = Vec::new();
+        execute_local_command(
+            &Command::Rpush {
+                key: Bytes::from_static(b"usrc"),
+                values: smallvec::smallvec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            },
+            &mut router.local_db.borrow_mut(),
+            &mut out,
+            None,
+        );
+        // The fake destination: busy past the source's timeout, then finds
+        // the push withdrawn.
+        let dest = std::thread::spawn(move || {
+            let Ok(ShardMessage::Batch { responder, .. }) = rx1.recv() else {
+                panic!("no push");
+            };
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!responder.claim(), "a withdrawn push must not run");
+        });
+        let prev = CROSS_SHARD_MOVE_TIMEOUT_MS.swap(50, std::sync::atomic::Ordering::Relaxed);
+        let reply = move_element_from_source(
+            &router,
+            0,
+            &Command::Rpop {
+                key: Bytes::from_static(b"usrc"),
+                count: None,
+            },
+            1,
+            crate::shard::MovePush::List {
+                key: Bytes::from_static(b"udst"),
+                to: crate::table::ListDirection::Left,
+            },
+            Bytes::from_static(b"LOGICAL"),
+            0,
+        );
+        CROSS_SHARD_MOVE_TIMEOUT_MS.store(prev, std::sync::atomic::Ordering::Relaxed);
+        dest.join().unwrap();
+        assert!(
+            reply.starts_with(b"-TRYAGAIN"),
+            "{:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        let mut out = Vec::new();
+        execute_local_command(
+            &Command::Lrange {
+                key: Bytes::from_static(b"usrc"),
+                start: 0,
+                stop: -1,
+            },
+            &mut router.local_db.borrow_mut(),
+            &mut out,
+            None,
+        );
+        assert_eq!(out, b"*2\r\n$1\r\na\r\n$1\r\nb\r\n");
     }
 
     #[test]

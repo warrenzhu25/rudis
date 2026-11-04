@@ -596,7 +596,17 @@ pub struct BatchResponder {
     /// with its client's address and name (see `take_slow`).
     slow: parking_lot::Mutex<Vec<(usize, u64, crate::resp::Command)>>,
     has_slow: std::sync::atomic::AtomicBool,
+    /// For a batch its sender may withdraw (a cross-shard move's push): the
+    /// remote shard claims it before running it, the sender cancels it if
+    /// it gives up waiting; exactly one of them wins. `CLAIM_NONE` for
+    /// every other batch.
+    claim: std::sync::atomic::AtomicU8,
 }
+
+const CLAIM_NONE: u8 = 0;
+const CLAIM_PENDING: u8 = 1;
+const CLAIM_TAKEN: u8 = 2;
+const CLAIM_CANCELLED: u8 = 3;
 
 // SAFETY: Every field is Send; `UnsafeCell<T>` is Send for `T: Send`, and the
 // raw pointer lives in an AtomicPtr, which is Send.
@@ -623,7 +633,44 @@ impl BatchResponder {
             bell: Doorbell::new(),
             slow: parking_lot::Mutex::new(Vec::new()),
             has_slow: std::sync::atomic::AtomicBool::new(false),
+            claim: std::sync::atomic::AtomicU8::new(CLAIM_NONE),
         }
+    }
+
+    /// Makes the next batch sent with this responder cancellable (see
+    /// [`Self::claim`] and [`Self::cancel`]). Before sending it.
+    pub fn make_cancellable(&self) {
+        self.claim.store(CLAIM_PENDING, Ordering::Release);
+    }
+
+    /// Called by the remote shard before running the batch: false if the
+    /// sender cancelled it, which must then not run (nor touch the reply
+    /// slots). Always true for a batch not made cancellable.
+    #[inline]
+    pub fn claim(&self) -> bool {
+        match self.claim.compare_exchange(
+            CLAIM_PENDING,
+            CLAIM_TAKEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(state) => state != CLAIM_CANCELLED,
+        }
+    }
+
+    /// Called by the sender of a cancellable batch that stops waiting:
+    /// true if the batch will never run, false if the remote shard already
+    /// claimed it (it runs and completes as usual).
+    pub fn cancel(&self) -> bool {
+        self.claim
+            .compare_exchange(
+                CLAIM_PENDING,
+                CLAIM_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Called by the remote shard for an item that ran at or over the
@@ -1104,6 +1151,27 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exactly one of claim and cancel wins a cancellable batch; batches
+    /// not made cancellable are always claimable and never cancellable.
+    #[test]
+    fn batch_responder_claim_and_cancel_are_exclusive() {
+        let plain = BatchResponder::new();
+        assert!(plain.claim());
+        assert!(!plain.cancel());
+        assert!(plain.claim());
+
+        let claimed = BatchResponder::new();
+        claimed.make_cancellable();
+        assert!(claimed.claim());
+        assert!(!claimed.cancel(), "a claimed batch runs to the end");
+
+        let cancelled = BatchResponder::new();
+        cancelled.make_cancellable();
+        assert!(cancelled.cancel());
+        assert!(!cancelled.claim(), "a cancelled batch must not run");
+        assert!(!cancelled.cancel());
+    }
 
     #[test]
     fn batch_responder_hands_slow_reports_to_the_owner_once() {

@@ -1541,6 +1541,80 @@ fn test_blocking_operations_e2e() {
     assert!(start.elapsed() >= Duration::from_millis(300));
 }
 
+/// A cross-shard LMOVE / SMOVE whose destination shard does not take the
+/// push in time fails with TRYAGAIN and leaves both keys as they were: the
+/// element is put back, and the late destination skips the withdrawn push
+/// (the element was once lost: popped, never pushed).
+#[test]
+fn test_cross_shard_move_withdrawn_when_destination_stalls_e2e() {
+    let port = 15783;
+    let shards = 2;
+    start_test_server(port, shards);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    // Keys on different shards.
+    let src = "mvsrc".to_string();
+    let dst = (0..)
+        .map(|i| format!("mvdst{i}"))
+        .find(|k| target_shard(k.as_bytes(), shards) != target_shard(src.as_bytes(), shards))
+        .unwrap();
+    let ssrc = format!("{src}:set");
+    let sdst = (0..)
+        .map(|i| format!("smvdst{i}"))
+        .find(|k| target_shard(k.as_bytes(), shards) != target_shard(ssrc.as_bytes(), shards))
+        .unwrap();
+    assert_eq!(resp_cmd(&mut c, &["RPUSH", &src, "a", "b"]), ":2\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SADD", &ssrc, "m"]), ":1\r\n");
+
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "CROSS-SHARD-MOVE-TIMEOUT", "100"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "CROSS-SHARD-PUSH-DELAY", "500000"]),
+        "+OK\r\n"
+    );
+    let r = resp_cmd(&mut c, &["LMOVE", &src, &dst, "RIGHT", "LEFT"]);
+    assert!(r.starts_with("-TRYAGAIN"), "{r}");
+    let r = resp_cmd(&mut c, &["SMOVE", &ssrc, &sdst, "m"]);
+    assert!(r.starts_with("-TRYAGAIN"), "{r}");
+    // Past the stalled destinations: still nothing moved.
+    thread::sleep(Duration::from_millis(1200));
+    assert_eq!(
+        resp_cmd(&mut c, &["LRANGE", &src, "0", "-1"]),
+        "*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", &dst]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SISMEMBER", &ssrc, "m"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", &sdst]), ":0\r\n");
+
+    // A destination slower than usual but within the timeout: moved.
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "CROSS-SHARD-MOVE-TIMEOUT", "10000"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "CROSS-SHARD-PUSH-DELAY", "200000"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["LMOVE", &src, &dst, "RIGHT", "LEFT"]),
+        "$1\r\nb\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["SMOVE", &ssrc, &sdst, "m"]), ":1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "CROSS-SHARD-PUSH-DELAY", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["LRANGE", &dst, "0", "-1"]),
+        "*1\r\n$1\r\nb\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["LLEN", &src]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SISMEMBER", &sdst, "m"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", &ssrc]), ":0\r\n");
+}
+
 /// A blocking pop naming the same list twice is served once: the other
 /// pushed elements stay in the list (the second queue entry once popped
 /// one more and lost it).

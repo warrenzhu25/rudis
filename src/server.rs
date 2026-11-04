@@ -904,6 +904,23 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         defer_bcast,
                         replicate_as,
                     } => {
+                        // A cross-shard move's push its source withdrew (it
+                        // gave up waiting and undid its pop) must not run:
+                        // run nothing and replicate nothing.
+                        let (items, replicate_as) = if replicate_as.is_some() {
+                            let delay = crate::connection::CROSS_SHARD_PUSH_DELAY_US
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if delay > 0 {
+                                std::thread::sleep(std::time::Duration::from_micros(delay));
+                            }
+                            if responder.claim() {
+                                (items, replicate_as)
+                            } else {
+                                (Vec::new(), None)
+                            }
+                        } else {
+                            (items, replicate_as)
+                        };
                         let has_tier_manager = cross_shard_db.borrow().tier_manager.is_some();
                         {
                             let no_repl = replicate_as

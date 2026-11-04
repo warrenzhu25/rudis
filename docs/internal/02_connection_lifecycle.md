@@ -725,12 +725,19 @@ client Y sends `MGET a b`.
 1. The source half runs on the source shard's thread. It pops the element without logging the pop.
 2. The source shard sends the destination a one-item batch holding the push, marked to be
    replicated as the logical LMOVE or SMOVE instead.
-3. The source thread spins until the destination answers, for up to 10 s.
+3. The source thread spins until the destination answers. The destination *claims* the push before
+   running it (`BatchResponder::claim`). If it has not claimed it within 10 s
+   (`DEBUG CROSS-SHARD-MOVE-TIMEOUT <ms>`), the source *cancels* it (`BatchResponder::cancel`);
+   exactly one of the two wins. A cancelled push is skipped by the destination, and the source puts
+   the element back where it popped it (unlogged, like the pop) and fails the move with
+   `-TRYAGAIN`; nothing was moved. A claimed push is waited for however long it takes. If the
+   destination's mailbox is gone, the pop is undone the same way.
 4. The destination logs the logical command in its place among that key's writes.
 
 This way no other write of the source shard can slip between the pop and the logical command in
 the replication stream. `DEBUG CROSS-SHARD-MOVE-DELAY <µs>` inserts a sleep between the two
-halves so tests can catch the middle.
+halves so tests can catch the middle. `DEBUG CROSS-SHARD-PUSH-DELAY <µs>` stalls the destination before it
+claims the push, so tests can make the source give up.
 
 **Cross-shard BLMOVE** loops: try the locked move; if the source is empty, register a *wake-only*
 waiter (the source shard wakes the client without handing it an element, keeping one back from the
@@ -1190,8 +1197,8 @@ over one connection.
   or EXISTS of several keys) run per shard without isolation. `cross-shard-strict yes` refuses all
   of them instead.
 * **A cross-shard element move blocks the source shard's thread**, spinning (and yielding) until
-  the destination answers its push, for up to 10 s. If the destination never answers, the pop
-  stays done and the push may be lost; the reply slot is leaked rather than freed.
+  the destination takes its push, for up to 10 s, after which the move is withdrawn and fails with
+  `-TRYAGAIN` (§7.7).
 * **Dead code.** An unused responder-channel type alias, and a results pool that is carried
   through the connection scratch and the squashed path but never used.
 * **Squashed-path statistics double count.** A squashed batch adds its size to the client's

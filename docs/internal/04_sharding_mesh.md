@@ -999,10 +999,13 @@ The move runs like this:
    * if nothing was popped, return that reply;
    * otherwise send the destination shard a one-command batch with the push and the logical
      command as its replication replacement;
-   * **block this thread** — spinning and yielding the CPU — until the destination answers. After
-     10 seconds it gives up; the reply slot is then deliberately leaked rather than freed while the
-     destination might still write to it.
-6. The destination applies the push, streams the logical command instead of LPUSH or SADD, and
+   * **block this thread** — spinning and yielding the CPU — until the destination answers. The
+     batch is cancellable: the destination claims it before running it, and if it has not after
+     10 seconds (`DEBUG CROSS-SHARD-MOVE-TIMEOUT`), the source cancels it, puts the element back
+     (unlogged) and replies `-TRYAGAIN`. Exactly one side wins (`BatchResponder::claim` /
+     `cancel`), so the element is neither lost nor duplicated, and the reply slot is freed: a
+     cancelled batch never touches it. A claimed push is waited for to the end.
+6. The destination claims the push (skipping it if cancelled), applies it, streams the logical command instead of LPUSH or SADD, and
    flushes its stream before answering (see the owner's side of a batch in §7.7).
 7. Back on the requesting shard: wait until the replication streams are flushed, then reply with
    the element (or `:1` for SMOVE).
