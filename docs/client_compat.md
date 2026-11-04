@@ -50,6 +50,22 @@ scripts/client_compat/run.py --binary target/release/rudis --out docs/client_com
 
 Exit status 0 means every scenario passed.
 
+## Redis TCL suite over RESP3
+
+The core TCL suites (`scripts/run_redis_test_suite.sh`, 49 suites) also run with every
+connection in RESP3, the way the test suite's own `--force-resp3` mode works (its servers start
+with `client-default-resp 3`):
+
+```bash
+TCL_EXTRA=--force-resp3 RUDIS_EXTRA="--client-default-resp 3" scripts/run_redis_test_suite.sh 16379 all
+```
+
+48 of 49 pass. `unit/tracking` fails: its tests read RESP2-shaped invalidation messages from a
+redirection client that is RESP3 in this mode (its header notes it "relies heavily on RESP2"),
+while rudis, like Redis's `sendTrackingMessage`, sends a RESP3 redirect target `>2 invalidate
+[keys]`. Running the suites over RESP3 found that pipelined XREAD/XINFO replies skipped the RESP3
+reshaping (fixed) and that `client-default-resp` was ignored (implemented).
+
 ## History
 
 The first run (rudis `6054795`) failed redis-py on `strings`, `collections`, `streams` and
