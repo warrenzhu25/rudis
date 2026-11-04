@@ -452,7 +452,8 @@ impl BlockHub {
         // AOF rewrite's image as of its start (see `shard::AofImage`).
         crate::shard::before_write_table(table, db, key);
         let db_key = (db, key.clone());
-        let mut dest_to_notify: Option<Bytes> = None;
+        // Destinations moves pushed to, served once this key is done.
+        let mut dest_to_notify: Vec<Bytes> = Vec::new();
         let mut satisfied_clients = Vec::new();
         // Elements kept back for woken clients (`WaiterOp::Wake`).
         let mut reserved = 0usize;
@@ -573,8 +574,10 @@ impl BlockHub {
                                 .sender
                                 .send(BlockedListResult::Popped(key.clone(), vec![val]));
                             satisfied_clients.push(waiter.client_id);
-                            dest_to_notify = Some(dest_clone);
-                            break;
+                            // Keep serving: like Redis, each element left
+                            // goes to the next waiter in line.
+                            dest_to_notify.push(dest_clone);
+                            continue;
                         } else {
                             waiters.push_front(waiter);
                             break;
@@ -638,8 +641,8 @@ impl BlockHub {
                                     .sender
                                     .send(BlockedListResult::Popped(key.clone(), vals));
                                 satisfied_clients.push(waiter.client_id);
-                                dest_to_notify = Some(dest_clone);
-                                break;
+                                dest_to_notify.push(dest_clone);
+                                continue;
                             }
                             Ok(None) => {
                                 waiters.push_front(waiter);
@@ -660,8 +663,12 @@ impl BlockHub {
         for cid in satisfied_clients {
             self.remove_waiters_for_client(cid);
         }
-        if let Some(dst) = dest_to_notify {
-            self.notify_list(table, &dst);
+        dest_to_notify.sort_unstable();
+        dest_to_notify.dedup();
+        for dst in dest_to_notify {
+            if dst != *key {
+                self.notify_list(table, &dst);
+            }
         }
     }
 
@@ -1009,6 +1016,45 @@ mod tests {
         }
         assert!(rx.try_recv().is_err(), "client served twice");
         assert_eq!(table.llen(key.as_ref()).unwrap_or(0), 1);
+    }
+
+    /// Two clients in BLMOVE on one list and a push of two elements: both
+    /// are served at once, each to its own destination (the second once
+    /// waited for the next write).
+    #[test]
+    fn test_notify_list_serves_every_move_waiter_an_element() {
+        let mut hub = BlockHub::new(12351);
+        let mut table = crate::table::RudisTable::new();
+        let src = Bytes::from_static(b"src");
+        let (tx1, rx1) = unbounded();
+        let (tx2, rx2) = unbounded();
+        for (cid, dst, tx) in [(601, &b"d1"[..], tx1), (602, &b"d2"[..], tx2)] {
+            hub.register_move_waiter(
+                cid,
+                src.clone(),
+                ListPopType::Left,
+                ListPopType::Right,
+                Bytes::copy_from_slice(dst),
+                false,
+                tx,
+            );
+        }
+        table
+            .rpush(
+                src.clone(),
+                vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            )
+            .unwrap();
+        hub.notify_list(&mut table, &src);
+        assert!(
+            matches!(rx1.try_recv(), Ok(BlockedListResult::Popped(_, v)) if v == [Bytes::from_static(b"a")])
+        );
+        assert!(
+            matches!(rx2.try_recv(), Ok(BlockedListResult::Popped(_, v)) if v == [Bytes::from_static(b"b")])
+        );
+        assert_eq!(table.llen(b"d1").unwrap_or(0), 1);
+        assert_eq!(table.llen(b"d2").unwrap_or(0), 1);
+        assert!(!table.exists(b"src"));
     }
 
     #[test]

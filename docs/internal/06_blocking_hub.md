@@ -256,16 +256,16 @@ makes.
      If nothing came out (or the key is not a list), put the waiter back and stop.
    * **Move**: if the destination exists and is not a list, release the client with "wrong type"
      and continue. Otherwise pop one element, push it onto the destination, log LMOVE (or
-     RPOPLPUSH), invalidate WATCH on the destination, send the element, and **stop**: at most one
-     move is served per notification.
+     RPOPLPUSH), invalidate WATCH on the destination, send the element, and **continue with the
+     next waiter** while the key still exists.
    * **Move-many**: same destination check, then try the multi-element move. If it moved elements,
      log it as an LMOVEM … EXACTLY with the real count, invalidate WATCH on both keys, send, and
-     stop. If there were not enough elements (EXACTLY 5 with only 3 present), put the waiter back
+     continue. If there were not enough elements (EXACTLY 5 with only 3 present), put the waiter back
      and stop. If the move failed with a type error, release the client with "wrong type" and
      continue.
 4. Remove every served client from **all** queues, so a BLPOP on a and b that was served from a
    does not linger on b.
-5. If a move pushed into a destination list, serve that list's waiters too, in the same call. A
+5. For each other list a move pushed into, serve that list's waiters too, in the same call. A
    chain such as "BLMOVE a b" plus "BLPOP b" thus completes in one go.
 
 **Example.** Clients C1, C2 and C3 run BLPOP q 0, in that order, and C4 then runs
@@ -569,11 +569,8 @@ apart from a reply.
 * **Lists and sorted sets are first come, first served per key** (and database). Registration
   appends to the queue, serving takes from the front, and a waiter that cannot be served stays at
   the front.
-* **Pop waiters drain a push.** One notification serves as many queued pop waiters as there are
-  elements.
-* **Move waiters do not.** Serving stops after one successful move. If three clients wait in
-  BLMOVE src dst and RPUSH src a b c arrives, only the first is served by that push; the others are
-  served by later writes to src (or a recheck), even though src still holds elements.
+* **Waiters drain a push.** One notification serves as many queued pop and move waiters as there
+  are elements: three clients in BLMOVE src dst and RPUSH src a b c are all served by that push.
 * **Head-of-line blocking.** A waiter at the front that cannot be served stops the walk. A
   BLMOVEM … EXACTLY 5 waiter in front of a BLPOP waiter keeps the BLPOP waiting while the list has
   fewer than 5 elements.
@@ -639,7 +636,6 @@ apart from a reply.
   behind it but does not cap a COUNT pop that passes the gate, and a non-blocked client's LPOP can
   take it too. The client then blocks again for the rest of its timeout, behind the waiters already
   queued.
-* **Move waiters are served one per notification** (§8).
 * **CLAIM eligibility is polled** in 1–50 ms slices, so a pending entry can be delivered up to
   about 50 ms after it became claimable. For keys on another shard the slice is always 50 ms.
 * **XREAD on a key that becomes a non-stream keeps waiting**: the hub treats a wrong-type error as

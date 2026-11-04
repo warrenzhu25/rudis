@@ -1718,6 +1718,54 @@ fn test_cross_shard_move_withdrawn_when_destination_stalls_e2e() {
     assert_eq!(resp_cmd(&mut c, &["EXISTS", &ssrc]), ":0\r\n");
 }
 
+/// Several clients blocked in BLMOVE on one list are all served by a push
+/// of as many elements, not one per write.
+#[test]
+fn test_blmove_waiters_are_all_served_by_one_push_e2e() {
+    let port = 15789;
+    start_test_server(port, 2);
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut blocked = Vec::new();
+    for dst in ["{m}d1", "{m}d2", "{m}d3"] {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let req = format!(
+            "*6\r\n$6\r\nBLMOVE\r\n$6\r\n{{m}}src\r\n${}\r\n{}\r\n$4\r\nLEFT\r\n$5\r\nRIGHT\r\n$1\r\n0\r\n",
+            dst.len(),
+            dst
+        );
+        c.write_all(req.as_bytes()).unwrap();
+        blocked.push(c);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !resp_cmd(&mut admin, &["INFO", "clients"]).contains("blocked_clients:3\r\n") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "clients never blocked"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        resp_cmd(&mut admin, &["RPUSH", "{m}src", "a", "b", "c"]),
+        ":3\r\n"
+    );
+    let mut got = Vec::new();
+    for c in &mut blocked {
+        let mut buf = [0u8; 64];
+        let n = c.read(&mut buf).expect("a BLMOVE client was not served");
+        got.push(String::from_utf8_lossy(&buf[..n]).to_string());
+    }
+    got.sort();
+    assert_eq!(got, ["$1\r\na\r\n", "$1\r\nb\r\n", "$1\r\nc\r\n"]);
+    for d in ["{m}d1", "{m}d2", "{m}d3"] {
+        assert_eq!(resp_cmd(&mut admin, &["LLEN", d]), ":1\r\n", "{d}");
+    }
+    assert_eq!(resp_cmd(&mut admin, &["EXISTS", "{m}src"]), ":0\r\n");
+}
+
 /// A blocking pop naming the same list twice is served once: the other
 /// pushed elements stay in the list (the second queue entry once popped
 /// one more and lost it).

@@ -291,7 +291,6 @@ The blocking hub coordinates Redis commands that suspend execution until data be
 
 **Gotchas & open issues**
 - **Owner thread execution invariant**: Notifications must run on the thread that owns the key's shard so table access and AOF/replica logging remain local; non-owner threads must forward via `ShardMessage::NotifyList`.
-- **Single-move notification limit**: `notify_list` serves at most one `Move`/`Movem` waiter per write notification, requiring subsequent writes or rechecks to unblock remaining chained move waiters.
 - **Global `has_blocked_waiters` check**: The `TOTAL_BLOCKED_WAITERS` atomic check ignores the `port` argument, forcing writes on unblocked server instances in the same process to take slower lock paths if any waiter exists on another port.
 - **`CLAIM` slice polling latency**: `XREADGROUP ... CLAIM min-idle` polls pending entry eligibility in 1–50 ms slices rather than reactive event notification, introducing up to ~50 ms latency before claiming idle entries.
 - **Bypass of `BlockHub` for `WAIT`/`WAITAOF`**: Replication wait commands do not use `BlockHub`; `wait_acks` polls replica acknowledgements (timeout `0` waits forever, as in Redis), and `WAITAOF` counts only AOF-fsynced copies. They count in INFO `blocked_clients` (`WAIT_BLOCKED_CLIENTS`) but get no `b` flag in `CLIENT LIST`.
