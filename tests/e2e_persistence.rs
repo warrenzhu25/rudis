@@ -4929,8 +4929,9 @@ fn test_bgsave_keeps_keys_evicted_while_it_runs_e2e() {
         "+OK\r\n"
     );
     // Slowed, so the evictions below land while it runs however fast this
-    // build writes it.
-    set_key_save_delay(&mut c, 20_000);
+    // build writes it: a release build saves the keys in a few steps, which
+    // at 20 ms each could end before the writes below (seen in CI).
+    set_key_save_delay(&mut c, 200_000);
     assert!(resp_cmd_all(&mut c, &["BGSAVE"]).starts_with("+Background saving started"));
     // The save starts its images in the background (within a few ms): only
     // keys evicted after that are the save's to keep.
