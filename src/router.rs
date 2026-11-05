@@ -355,6 +355,9 @@ pub fn shard_size_for_eviction(
 /// `SnapshotState::abandon`).
 const SAVE_ABORTED: &str = "save aborted by FLUSHALL";
 
+/// Redis's reply to `BGSAVE` (without `SCHEDULE`) while an AOF rewrite runs.
+pub const BGSAVE_BUSY_ERR: &str = "Another child process is active (AOF?): can't BGSAVE right now. Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever possible.";
+
 struct SaveFlagGuard {
     is_saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
     base_port: u16,
@@ -4993,6 +4996,53 @@ impl Router {
         {
             return Err("Background save already in progress".to_string());
         }
+        self.start_bgsave_locked();
+        Ok(())
+    }
+
+    /// `BGSAVE [SCHEDULE]`, with Redis's replies: an RDB save already
+    /// running is an error; so is an AOF rewrite, unless `schedule`, which
+    /// queues the save to start once the rewrite ends. Returns the status
+    /// line to reply.
+    pub async fn bgsave_command(&self, schedule: bool) -> Result<&'static str, String> {
+        if self
+            .is_saving
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.start_bgsave_locked();
+            return Ok("Background saving started");
+        }
+        if !crate::snapshot::aof_rewrite_state(self.base_port).in_progress() {
+            return Err("Background save already in progress".to_string());
+        }
+        if !schedule {
+            return Err(BGSAVE_BUSY_ERR.to_string());
+        }
+        let scheduled = crate::snapshot::bgsave_scheduled(self.base_port);
+        if !scheduled.swap(true, Ordering::SeqCst) {
+            let router = self.clone();
+            monoio::spawn(async move {
+                while router
+                    .is_saving
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    if crate::shutdown::is_shutting_down() {
+                        scheduled.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    monoio::time::sleep(Duration::from_millis(10)).await;
+                }
+                scheduled.store(false, Ordering::SeqCst);
+                router.start_bgsave_locked();
+            });
+        }
+        Ok("Background saving scheduled")
+    }
+
+    /// Starts a background save; the caller holds `is_saving`.
+    fn start_bgsave_locked(&self) {
         // Begin before replying so INFO right after +OK shows the save.
         let dirty_before = crate::snapshot::state(self.base_port).begin();
         crate::connection::RDB_BGSAVE_ABORTED.store(false, Ordering::SeqCst);
@@ -5007,7 +5057,6 @@ impl Router {
             }
             guard.disarm();
         });
-        Ok(())
     }
 
     pub async fn bgrewriteaof(&self) -> Result<(), String> {

@@ -1857,6 +1857,116 @@ fn test_rewrite_releases_the_replaced_aof_off_thread_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// BGSAVE during an AOF rewrite answers as Redis does: an error naming
+/// the rewrite and `BGSAVE SCHEDULE`, which queues the save to start once
+/// the rewrite ends. A BGSAVE already running is still "already in
+/// progress", and unknown arguments are a syntax error. The 24 h soak's 6
+/// error replies were its own BGSAVEs landing on automatic rewrites.
+#[test]
+fn test_bgsave_schedule_waits_for_an_aof_rewrite_e2e() {
+    let port = 16932;
+    let dir = std::env::temp_dir().join(format!("rudis-bgsave-sched-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let dir_s = dir.to_str().unwrap();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        dir_s,
+        "--appendonly",
+        "yes",
+        "--save",
+        "",
+    ];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for i in 0..100 {
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", &format!("bs:{i}"), "v"]),
+            "+OK\r\n"
+        );
+    }
+    let rdb = dir.join("dump.rdb");
+    assert!(!rdb.exists());
+    let wait_for = |c: &mut TcpStream, what: &str, ok: &dyn Fn(&mut TcpStream) -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ok(c) {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    // A slowed rewrite (each step, also the last, waits this long).
+    let delay = |c: &mut TcpStream, us: &str| {
+        assert_eq!(
+            resp_cmd(c, &["CONFIG", "SET", "rdb-key-save-delay", us]),
+            "+OK\r\n"
+        );
+    };
+    delay(&mut c, "300000");
+    assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+    assert_eq!(info_field(&mut c, "aof_rewrite_in_progress"), "1");
+    assert_eq!(
+        resp_cmd(&mut c, &["BGSAVE"]),
+        "-ERR Another child process is active (AOF?): can't BGSAVE right now. \
+         Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever possible.\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["BGSAVE", "NOW"]),
+        "-ERR syntax error\r\n"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            resp_cmd(&mut c, &["BGSAVE", "SCHEDULE"]),
+            "+Background saving scheduled\r\n"
+        );
+    }
+    assert!(!rdb.exists(), "the save must wait for the rewrite");
+
+    // The rewrite ends, then the scheduled save runs.
+    delay(&mut c, "0");
+    wait_for(&mut c, "rewrite never finished", &|c| {
+        info_field(c, "aof_rewrite_in_progress") == "0"
+    });
+    assert_eq!(info_field(&mut c, "aof_last_bgrewrite_status"), "ok");
+    wait_for(&mut c, "scheduled save never ran", &|_| rdb.exists());
+    wait_for(&mut c, "scheduled save never finished", &|c| {
+        info_field(c, "rdb_bgsave_in_progress") == "0"
+    });
+    assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "ok");
+
+    // An RDB save already running is not scheduled again.
+    delay(&mut c, "300000");
+    assert_eq!(
+        resp_cmd(&mut c, &["BGSAVE"]),
+        "+Background saving started\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["BGSAVE", "SCHEDULE"]),
+        "-ERR Background save already in progress\r\n"
+    );
+    delay(&mut c, "0");
+    wait_for(&mut c, "save never finished", &|c| {
+        resp_cmd(c, &["BGSAVE", "SCHEDULE"]) == "+Background saving started\r\n"
+    });
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_getex_ttl_change_reaches_aof_e2e() {
     let port = 16966;

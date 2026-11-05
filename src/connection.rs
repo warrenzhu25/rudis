@@ -5858,7 +5858,7 @@ async fn execute_tx_step(
                 out_buf.extend_from_slice(b"+OK\r\n");
                 true
             }
-            Command::Save | Command::Bgsave | Command::Shutdown { .. } => {
+            Command::Save | Command::Bgsave { .. } | Command::Shutdown { .. } => {
                 *tx_has_error = true;
                 out_buf.extend_from_slice(b"-ERR Command not allowed inside a transaction\r\n");
                 false
@@ -10224,7 +10224,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Strlen(_) => "STRLEN",
         Command::Msetnx(_) => "MSETNX",
         Command::Save => "SAVE",
-        Command::Bgsave => "BGSAVE",
+        Command::Bgsave { .. } => "BGSAVE",
         Command::Bgrewriteaof => "BGREWRITEAOF",
         Command::Lastsave => "LASTSAVE",
         Command::Ping(_) => "PING",
@@ -18649,13 +18649,15 @@ async fn execute_command_inner(
             }
             false
         }
-        Command::Bgsave => {
+        Command::Bgsave { schedule } => {
             if RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 RDB_BGSAVE_IN_PROGRESS.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            match router.bgsave().await {
-                Ok(_) => {
-                    out.extend_from_slice(b"+Background saving started\r\n");
+            match router.bgsave_command(schedule).await {
+                Ok(status) => {
+                    out.push(b'+');
+                    out.extend_from_slice(status.as_bytes());
+                    out.extend_from_slice(b"\r\n");
                 }
                 Err(e) => {
                     let err = format!("-ERR {}\r\n", e);

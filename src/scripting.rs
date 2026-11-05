@@ -2434,7 +2434,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
             | Command::Replicaof { .. }
             | Command::Shutdown { .. }
             | Command::Save
-            | Command::Bgsave
+            | Command::Bgsave { .. }
             | Command::Bgrewriteaof => {
                 return Err(mlua::Error::RuntimeError(
                     "ERR This Redis command is not allowed from script".to_string(),
@@ -2619,7 +2619,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
             | Command::Replicaof { .. }
             | Command::Shutdown { .. }
             | Command::Save
-            | Command::Bgsave
+            | Command::Bgsave { .. }
             | Command::Bgrewriteaof => {
                 let tbl = lua.create_table()?;
                 tbl.set("err", "ERR This Redis command is not allowed from script")?;

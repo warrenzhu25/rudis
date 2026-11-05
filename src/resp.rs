@@ -835,7 +835,10 @@ pub enum Command {
     Strlen(Bytes),
     Msetnx(Vec<(Bytes, Bytes)>),
     Save,
-    Bgsave,
+    /// `BGSAVE [SCHEDULE]`.
+    Bgsave {
+        schedule: bool,
+    },
     Bgrewriteaof,
     Lastsave,
     Ping(Option<Bytes>),
@@ -6616,7 +6619,13 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Msetnx(pairs)))
         }
         "SAVE" => Ok(Some(Command::Save)),
-        "BGSAVE" => Ok(Some(Command::Bgsave)),
+        "BGSAVE" => match args.len() {
+            1 => Ok(Some(Command::Bgsave { schedule: false })),
+            2 if args[1].eq_ignore_ascii_case(b"SCHEDULE") => {
+                Ok(Some(Command::Bgsave { schedule: true }))
+            }
+            _ => Err("syntax error".to_string()),
+        },
         "BGREWRITEAOF" => Ok(Some(Command::Bgrewriteaof)),
         "LASTSAVE" => Ok(Some(Command::Lastsave)),
         "LATENCY" => {
@@ -14468,6 +14477,33 @@ mod tests {
     use super::*;
 
     /// TIER SNAPSHOT / BACKUP were removed; the other subcommands remain.
+    /// `BGSAVE` takes only `SCHEDULE` (any case), as in Redis; anything
+    /// else is a syntax error rather than ignored.
+    #[test]
+    fn test_bgsave_parses_schedule_and_rejects_other_args() {
+        let parse = |args: &[&str]| {
+            let mut frame = format!("*{}\r\n", args.len());
+            for a in args {
+                frame.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            parse_command(&mut BytesMut::from(frame.as_str()))
+        };
+        assert!(matches!(
+            parse(&["BGSAVE"]),
+            Ok(Some(Command::Bgsave { schedule: false }))
+        ));
+        assert!(matches!(
+            parse(&["bgsave", "schedule"]),
+            Ok(Some(Command::Bgsave { schedule: true }))
+        ));
+        for bad in [&["BGSAVE", "NOW"][..], &["BGSAVE", "SCHEDULE", "SCHEDULE"]] {
+            match parse(bad) {
+                Err(e) => assert_eq!(e, "syntax error"),
+                other => panic!("{bad:?} parsed: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn test_tier_snapshot_is_an_unknown_subcommand() {
         let parse = |args: &[&str]| {

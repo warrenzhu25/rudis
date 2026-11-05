@@ -85,7 +85,11 @@ figures in this file were not traceable to any benchmark artifact in the reposit
 
 `is_saving: AtomicBool` on `Router` guards both `SAVE` and `BGSAVE` (and `BGREWRITEAOF`, which
 shares the same flag) with a compare-and-swap — a `SAVE`/`BGSAVE`/`BGREWRITEAOF` issued while one
-is already in flight is rejected with an error rather than queued.
+is already in flight is rejected with an error rather than queued. The replies are Redis's: a
+`BGSAVE` during an AOF rewrite gets `-ERR Another child process is active (AOF?): can't BGSAVE right
+now...`, and `BGSAVE SCHEDULE` instead replies `+Background saving scheduled` and starts the save as
+soon as the rewrite ends (a second `SCHEDULE` meanwhile changes nothing). A `BGSAVE [SCHEDULE]`
+while an RDB save is running gets `-ERR Background save already in progress`.
 
 `LASTSAVE` returns the real Unix timestamp of the most recent successful save
 (`Router::lastsave`, backed by an `AtomicU64` updated at the end of `perform_save_rdb`). `INFO`'s
