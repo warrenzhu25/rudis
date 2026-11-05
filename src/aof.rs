@@ -593,7 +593,8 @@ impl AofWriter {
     fn swap_after_live_rewrite(&mut self, new_size: u64) -> std::io::Result<()> {
         debug_assert!(self.buffer.is_empty() && self.inflight == 0);
         let std_file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
-        self.file = Some(std::rc::Rc::new(monoio::fs::File::from_std(std_file)?));
+        let new = std::rc::Rc::new(monoio::fs::File::from_std(std_file)?);
+        let old = self.file.replace(new);
         self.offset = new_size;
         self.durable = new_size;
         self.progress
@@ -601,6 +602,7 @@ impl AofWriter {
             .store(self.appended_total, std::sync::atomic::Ordering::Release);
         self.mark_fsynced(self.appended_total);
         self.drop_incremental_file();
+        retire_replaced_file(old);
         Ok(())
     }
 
@@ -619,7 +621,8 @@ impl AofWriter {
         // The rewrite just renamed the new file into place.
         let std_file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
         let new_size = std_file.metadata()?.len();
-        self.file = Some(std::rc::Rc::new(monoio::fs::File::from_std(std_file)?));
+        let new = std::rc::Rc::new(monoio::fs::File::from_std(std_file)?);
+        let old = self.file.replace(new);
         self.offset = new_size;
         // The rewrite fsynced the new file before renaming it in.
         self.durable = new_size;
@@ -630,8 +633,56 @@ impl AofWriter {
             .store(self.appended_total, std::sync::atomic::Ordering::Release);
         self.mark_fsynced(self.appended_total);
         self.drop_incremental_file();
+        retire_replaced_file(old);
         self.current_db = 0;
         Ok(new_size)
+    }
+}
+
+/// Hands an AOF file a rewrite just replaced to the `aof-close` thread.
+///
+/// The old file is unlinked by the rename, so whoever closes it last frees
+/// its blocks and page cache: ~80 ms per 400 MB, which stalled the shard
+/// (io_uring runs the final close on the submitting thread). The thread
+/// truncates the file first, so no close of it is slow any more; it is
+/// what Redis's background close job does.
+fn retire_replaced_file(old: Option<std::rc::Rc<monoio::fs::File>>) {
+    use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+    static CLOSER: std::sync::OnceLock<Option<flume::Sender<OwnedFd>>> = std::sync::OnceLock::new();
+    let Some(old) = old else { return };
+    // SAFETY: `old` keeps the descriptor open for this borrow.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(old.as_raw_fd()) };
+    let Ok(fd) = borrowed.try_clone_to_owned() else {
+        return;
+    };
+    let closer = CLOSER.get_or_init(|| {
+        let (tx, rx) = flume::unbounded::<OwnedFd>();
+        std::thread::Builder::new()
+            .name("aof-close".into())
+            .spawn(move || {
+                for fd in rx.iter() {
+                    release_unlinked(std::fs::File::from(fd));
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    match closer {
+        Some(tx) => {
+            if let Err(e) = tx.send(fd) {
+                release_unlinked(std::fs::File::from(e.into_inner()));
+            }
+        }
+        None => release_unlinked(std::fs::File::from(fd)),
+    }
+}
+
+/// Truncates `file` if no path names it any more (frees its blocks and
+/// cached pages), then closes it. A file still linked is only closed.
+fn release_unlinked(file: std::fs::File) {
+    use std::os::unix::fs::MetadataExt;
+    if file.metadata().is_ok_and(|m| m.nlink() == 0) {
+        let _ = file.set_len(0);
     }
 }
 
@@ -6181,6 +6232,57 @@ mod tests {
             msg.contains("(fast 0.") && msg.contains(", slow step "),
             "{msg}"
         );
+    }
+
+    /// An unlinked file is truncated before it is closed (so its last
+    /// close frees nothing); a file a path still names is left whole.
+    #[test]
+    fn test_release_unlinked_truncates_only_unlinked_files() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (gone, kept) = (dir.join("gone"), dir.join("kept"));
+        std::fs::write(&gone, vec![b'x'; 1 << 20]).unwrap();
+        std::fs::write(&kept, vec![b'y'; 1 << 20]).unwrap();
+        let watch_gone = std::fs::File::open(&gone).unwrap();
+        let rw = |p: &Path| std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        let (h_gone, h_kept) = (rw(&gone), rw(&kept));
+        std::fs::remove_file(&gone).unwrap();
+        release_unlinked(h_gone);
+        release_unlinked(h_kept);
+        assert_eq!(watch_gone.metadata().unwrap().len(), 0);
+        assert_eq!(std::fs::metadata(&kept).unwrap().len(), 1 << 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rewrite's swap hands the replaced file to the `aof-close` thread,
+    /// which empties it, while the writer moves on to the new file.
+    #[monoio::test(timer_enabled = true)]
+    async fn test_swap_after_rewrite_releases_the_replaced_file() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-retire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appendonly-0.aof");
+        let mut w = AofWriter::open(path.clone()).await.unwrap();
+        w.append(&vec![b'z'; 1 << 20]);
+        w.flush().await.unwrap();
+        let old = std::fs::File::open(&path).unwrap();
+        assert_eq!(old.metadata().unwrap().len(), 1 << 20);
+        // A rewrite renames its new file over the old one.
+        let tmp = dir.join("new.tmp");
+        std::fs::write(&tmp, b"*1\r\n$4\r\nPING\r\n").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        assert_eq!(w.swap_after_rewrite().unwrap(), 14);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while old.metadata().unwrap().len() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "old AOF never released"
+            );
+            monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 14);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A live rewrite runs between writes (here: random INCR, LPUSH,

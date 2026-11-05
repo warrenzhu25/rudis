@@ -1771,6 +1771,92 @@ fn test_failed_bgrewriteaof_is_reported_and_does_not_block_later_ones_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The AOF a rewrite replaces is truncated off the shard thread: the last
+/// close of the old, unlinked file freed its blocks and page cache on the
+/// shard (~80 ms per 400 MB stalled every client of it). A handle kept on
+/// the old file sees it emptied; without the background release it kept
+/// its size until the test's own close.
+#[test]
+fn test_rewrite_releases_the_replaced_aof_off_thread_e2e() {
+    let port = 16941;
+    let dir = std::env::temp_dir().join(format!("rudis-aof-release-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let wait_rewrite = |c: &mut TcpStream| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while info_field(c, "aof_rewrite_in_progress") != "0" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rewrite never finished"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        info_field(c, "aof_last_bgrewrite_status")
+    };
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Overwrites: the AOF grows far past what a rewrite keeps.
+    for i in 0..2000 {
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", "rel:k", &format!("v{i}")]),
+            "+OK\r\n"
+        );
+    }
+    let aof = dir.join("appendonly-0.aof");
+    let old = std::fs::File::open(&aof).unwrap();
+    let old_len = old.metadata().unwrap().len();
+    assert!(old_len > 10_000, "AOF too small to tell: {old_len}");
+
+    assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+    assert_eq!(wait_rewrite(&mut c), "ok");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while old.metadata().unwrap().len() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replaced AOF still holds {} bytes",
+            old.metadata().unwrap().len()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    // The live AOF is the new, compact file, and it is complete.
+    let new_len = std::fs::metadata(&aof).unwrap().len();
+    assert!(
+        new_len > 0 && new_len < old_len,
+        "new AOF {new_len} vs old {old_len}"
+    );
+    assert_eq!(resp_cmd(&mut c, &["SET", "rel:after", "1"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["GET", "rel:k"]), "$5\r\nv1999\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "rel:after"]), "$1\r\n1\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_getex_ttl_change_reaches_aof_e2e() {
     let port = 16966;

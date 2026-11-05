@@ -384,6 +384,11 @@ becomes the growth base.
    fsync, `rename` over `appendonly-<n>.aof`, fsync the directory, and swap the writer. No command runs in
    between, so no write is lost or doubled. If this step takes 10 ms or more, a warning logs the time of
    each part (`AOF rewrite switch blocked the shard for ...`).
+6. **Release the old file.** The `rename` unlinked the old AOF, so its last close frees its blocks and page
+   cache: about 80 ms per 400 MB, and with io_uring that runs on the thread that submits the close. The
+   swap therefore gives a duplicate of the old descriptor to the `aof-close` thread, which truncates the
+   file (only if no path names it any more) and closes it. Any later close of the file is then cheap.
+   Redis does the same with a background close job. The blocking variant's swap does this too.
 
 The resulting file is the RDB image of the shard at the start plus every command logged since. The image
 holds everything a snapshot holds, function libraries included.

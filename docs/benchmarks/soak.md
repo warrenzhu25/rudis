@@ -60,8 +60,12 @@ logically expired keys.)
 * **Two ~160 ms latency spikes** (165.6 ms and 161.3 ms single-probe maxima, out of 1439
   samples), each in the minute of an automatic AOF rewrite on the master (12:19 and 02:50 UTC);
   the other 605 rewrites and all 274 BGSAVEs stayed under 20 ms. The host had transparent huge
-  pages set to `always`, which rudis warns about at startup. Worth a closer look; p99 stayed
-  under 5.1 ms in every hour.
+  pages set to `always`, which rudis warns about at startup. p99 stayed under 5.1 ms in every
+  hour. **Cause found and fixed afterwards:** when a shard's rewrite switched to the new file,
+  the final close of the old, unlinked AOF freed its page cache on the shard thread. A repro
+  (1.6 GB AOF over 4 shards, about 50k SET/s, a 1 ms PING probe) showed one 78-99 ms stall per
+  rewrite. Since the old file is released on a background thread, the worst probe across 4
+  rewrites is 4.4 ms. See `docs/internal/14_persistence_replication.md` §4.6, step 6.
 * **6 error replies** on the master over 3.7 billion commands, spread over the day; the load
   generators do not report them individually.
 * Runs found two bugs before this one started, both fixed: a cross-shard multi-key `UNLINK` was
