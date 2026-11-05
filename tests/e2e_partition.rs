@@ -103,6 +103,11 @@ fn pump(mut from: TcpStream, mut to: TcpStream, cut: &AtomicBool, stop: &AtomicB
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                // Bytes that arrived while the read was pending may postdate
+                // the cut: hold them until the heal, as the network would.
+                while cut.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(10));
+                }
                 if to.write_all(&buf[..n]).is_err() {
                     break;
                 }
