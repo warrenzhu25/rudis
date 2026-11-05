@@ -1699,7 +1699,9 @@ fn test_eviction_splits_shards_fairly_across_value_types_e2e() {
         while got < 1000 {
             let r = c.read(&mut buf).unwrap();
             assert!(r > 0);
-            got += buf[..r].windows(2).filter(|w| w == b"\r\n").count();
+            // `\n` bytes, not `\r\n` pairs: a pair split across two reads
+            // would go uncounted and the loop would wait forever.
+            got += buf[..r].iter().filter(|&&b| b == b'\n').count();
         }
     }
     thread::sleep(Duration::from_millis(500));
@@ -1817,7 +1819,9 @@ fn test_zset_churn_keeps_memory_flat_e2e() {
         while got < want {
             let r = c.read(&mut buf).unwrap();
             assert!(r > 0);
-            got += buf[..r].windows(2).filter(|w| w == b"\r\n").count();
+            // `\n` bytes, not `\r\n` pairs: a pair split across two reads
+            // would go uncounted and the loop would wait forever.
+            got += buf[..r].iter().filter(|&&b| b == b'\n').count();
         }
     };
     // Fill each key to 300 members, then churn to a steady state.
@@ -1875,7 +1879,9 @@ fn test_set_churn_on_one_page_keeps_memory_flat_e2e() {
         while got < cmds.len() {
             let r = c.read(&mut buf).unwrap();
             assert!(r > 0);
-            got += buf[..r].windows(2).filter(|w| w == b"\r\n").count();
+            // `\n` bytes, not `\r\n` pairs: a pair split across two reads
+            // would go uncounted and the loop would wait forever.
+            got += buf[..r].iter().filter(|&&b| b == b'\n').count();
         }
     };
     // Set i holds members m{lo..lo+live}; a step drops the oldest and adds
