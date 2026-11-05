@@ -66,8 +66,13 @@ logically expired keys.)
   (1.6 GB AOF over 4 shards, about 50k SET/s, a 1 ms PING probe) showed one 78-99 ms stall per
   rewrite. Since the old file is released on a background thread, the worst probe across 4
   rewrites is 4.4 ms. See `docs/internal/14_persistence_replication.md` §4.6, step 6.
-* **6 error replies** on the master over 3.7 billion commands, spread over the day; the load
-  generators do not report them individually.
+* **6 error replies** on the master over 3.7 billion commands, spread over the day. **Traced
+  afterwards:** each one appeared in the sample right after one of the harness's 10-minute
+  `BGSAVE`s, and at each of those 6 ticks an automatic AOF rewrite was running, so the `BGSAVE`
+  was refused. None came from the memtier load. Redis refuses that `BGSAVE` too, but with a
+  different error that points to `BGSAVE SCHEDULE`. Rudis now gives Redis's reply and supports
+  `SCHEDULE`. The harness uses `BGSAVE SCHEDULE`, logs any error reply to its own commands as an
+  anomaly, and reports `INFO errorstats`.
 * Runs found two bugs before this one started, both fixed: a cross-shard multi-key `UNLINK` was
   only partly applied on replicas (`efa8fd7`), and the harness's digest comparison raced key
   expiry.

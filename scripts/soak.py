@@ -219,6 +219,9 @@ def main():
                     try:
                         i = info(port)
                         row[name] = {k: i.get(k) for k in keep}
+                        # Which errors (e.g. errorstat_ERR:count=3), so error
+                        # replies can be told apart afterwards.
+                        row[name].update({k: v for k, v in i.items() if k.startswith("errorstat_")})
                         row[name].update(latency_probe(port))
                     except Exception as e:  # noqa: BLE001
                         anomalies.append(f"{row['t']}s: {name} probe failed: {e}")
@@ -232,11 +235,19 @@ def main():
                     for name, s in (("master", m), ("replica", r)):
                         if s.get(k) not in (None, "ok"):
                             anomalies.append(f"{row['t']}s: {name} {k}={s.get(k)}")
+                # SCHEDULE: an automatic AOF rewrite may be running; the
+                # save then starts after it instead of failing. Without it,
+                # the harness's own BGSAVEs were the master's only error
+                # replies in the first 24 h run.
                 if now - last_bgsave >= 600:
-                    Conn(mp).cmd("BGSAVE")
+                    reply = Conn(mp).cmd("BGSAVE", "SCHEDULE")
+                    if str(reply).startswith("-"):
+                        anomalies.append(f"{row['t']}s: master BGSAVE SCHEDULE: {reply}")
                     last_bgsave = now
                 if now - last_rewrite >= 1800:
-                    Conn(rp).cmd("BGREWRITEAOF")
+                    reply = Conn(rp).cmd("BGREWRITEAOF")
+                    if str(reply).startswith("-"):
+                        anomalies.append(f"{row['t']}s: replica BGREWRITEAOF: {reply}")
                     last_rewrite = now
                 out.write(json.dumps(row) + "\n")
                 out.flush()
@@ -318,6 +329,9 @@ def write_report(a, samples_path, anomalies, digest):
                     "sync_partial_ok", "client_output_buffer_limit_disconnections",
                     "repl_backpressure_delayed_writes", "total_error_replies",
                 ) if s.get(k) is not None))
+        for who in ("master", "replica"):
+            errs = {k: v for k, v in end.get(who, {}).items() if k.startswith("errorstat_")}
+            lines.append(f"* {who} errorstats: " + (", ".join(f"{k}={v}" for k, v in sorted(errs.items())) or "none"))
         worst = max((float(r[w]["max_ms"]) for r in rows for w in ("master", "replica") if w in r), default=0)
         lines.append(f"* worst single probe latency: {worst:.1f} ms")
     lines += ["", "## Final comparison", "", f"```\n{json.dumps(digest, indent=2)}\n```", ""]
