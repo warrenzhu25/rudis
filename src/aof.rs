@@ -843,6 +843,58 @@ fn open_for_reading(
     std::fs::File::open(path)
 }
 
+/// A rewrite's final switch this long is logged (see [`SwitchTimer`]).
+const SLOW_SWITCH: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Times the steps of a rewrite's final switch, which runs on the shard
+/// thread with no command in between: logs them if it took long.
+struct SwitchTimer {
+    start: std::time::Instant,
+    last: std::time::Instant,
+    laps: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl SwitchTimer {
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        SwitchTimer {
+            start: now,
+            last: now,
+            laps: Vec::new(),
+        }
+    }
+
+    fn lap(&mut self, what: &'static str) {
+        let now = std::time::Instant::now();
+        self.laps.push((what, now - self.last));
+        self.last = now;
+    }
+
+    /// The warning to log, if the switch took `SLOW_SWITCH` or more.
+    fn summary(&self) -> Option<String> {
+        let total = self.last - self.start;
+        if total < SLOW_SWITCH {
+            return None;
+        }
+        let steps: Vec<String> = self
+            .laps
+            .iter()
+            .map(|(what, d)| format!("{what} {:.1} ms", d.as_secs_f64() * 1e3))
+            .collect();
+        Some(format!(
+            "AOF rewrite switch blocked the shard for {:.1} ms ({})",
+            total.as_secs_f64() * 1e3,
+            steps.join(", ")
+        ))
+    }
+
+    fn report(&self) {
+        if let Some(msg) = self.summary() {
+            crate::log_warning!("{}", msg);
+        }
+    }
+}
+
 /// Appends to `file` (the new AOF, holding the image) what the live AOF
 /// received since `mark`, then renames it into place and switches the
 /// writer to it. All but the last `TAIL_SYNC_BYTES` are copied between
@@ -909,13 +961,24 @@ async fn catch_up_and_swap(
         {
             let mut w = aof.borrow_mut();
             if w.inflight == 0 {
+                let mut t = SwitchTimer::start();
                 w.write_pending_sync()?;
+                t.lap("write pending");
                 let end = w.offset;
                 copy(copied, end, &mut copied, &mut out_pos)?;
+                t.lap("copy tail");
                 file.sync_data()?;
+                t.lap("fsync new file");
                 std::fs::rename(tmp_path, target_path)?;
+                t.lap("rename");
                 let _ = sync_parent_dir(target_path);
-                return w.swap_after_live_rewrite(out_pos);
+                t.lap("fsync dir");
+                let res = w.swap_after_live_rewrite(out_pos);
+                t.lap("switch writer");
+                drop(old);
+                t.lap("close old file");
+                t.report();
+                return res;
             }
         }
         monoio::time::sleep(std::time::Duration::from_micros(20)).await;
@@ -6097,6 +6160,27 @@ mod tests {
         assert_eq!(run("GET gone"), "$-1\r\n");
         assert_eq!(run("HGETALL h"), "*2\r\n$1\r\nf\r\n$1\r\nv\r\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A slow switch is reported with each step's time; a fast one is not.
+    #[test]
+    fn test_switch_timer_reports_only_slow_switches() {
+        let mut t = SwitchTimer::start();
+        t.lap("fast");
+        assert_eq!(t.summary(), None);
+        std::thread::sleep(SLOW_SWITCH);
+        t.lap("slow step");
+        let msg = t
+            .summary()
+            .expect("a switch over the threshold is reported");
+        assert!(
+            msg.starts_with("AOF rewrite switch blocked the shard for "),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("(fast 0.") && msg.contains(", slow step "),
+            "{msg}"
+        );
     }
 
     /// A live rewrite runs between writes (here: random INCR, LPUSH,

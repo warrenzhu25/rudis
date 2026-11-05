@@ -382,7 +382,8 @@ becomes the growth base.
    than 1 MB remains.
 5. **Switch (synchronous).** With no chunk in flight: write the writer's pending buffer, copy the last bytes,
    fsync, `rename` over `appendonly-<n>.aof`, fsync the directory, and swap the writer. No command runs in
-   between, so no write is lost or doubled.
+   between, so no write is lost or doubled. If this step takes 10 ms or more, a warning logs the time of
+   each part (`AOF rewrite switch blocked the shard for ...`).
 
 The resulting file is the RDB image of the shard at the start plus every command logged since. The image
 holds everything a snapshot holds, function libraries included.
