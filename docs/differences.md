@@ -25,7 +25,7 @@ This document summarizes the architectural, operational, and semantic difference
 ### String & Value Sizes
 * **Redis**: Strings are limited to 512 MB, enforced by `proto-max-bulk-len`, and client input buffers are bounded by `client-query-buffer-limit` (1 GB default).
 * **Dragonfly**: Strings are limited to 256 MB.
-* **Rudis**: Enforces both `proto-max-bulk-len` (default 512 MB, configurable at runtime via `CONFIG SET proto-max-bulk-len`, minimum 1 MB) and `client-query-buffer-limit` (default 1 GB, configurable via `CONFIG SET client-query-buffer-limit`, minimum 1 KB) in the RESP parser (`src/resp.rs`) and connection read loop (`src/connection.rs`).
+* **Rudis**: Enforces both `proto-max-bulk-len` (default 512 MB, configurable at runtime via `CONFIG SET proto-max-bulk-len`, minimum 1 MB) and `client-query-buffer-limit` (default 1 GB, configurable via `CONFIG SET client-query-buffer-limit`, minimum 1 MB, as in Redis) in the RESP parser (`src/resp.rs`) and connection read loop (`src/connection.rs`).
 
 ### Integer & Numeric Precision
 * **Redis**: Integers in commands like `INCRBY` are signed 64-bit integers (`[-2^63, 2^63 - 1]`).

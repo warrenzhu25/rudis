@@ -481,8 +481,8 @@ Understand what "durable" means here today before relying on it:
 - `SAVE`/`BGSAVE` never `fork()`. Each shard serializes its keyspace in steps of at most ~1ms and
   yields between them, and CRC, file writes and fsync run on a separate `rdb-writer` thread, so a
   `BGSAVE` adds latency in ~1ms slices rather than stalling a shard for its whole dataset. The
-  snapshot is consistent per key, not a single point in time (see
-  [`docs/rdbsave.md`](docs/rdbsave.md)).
+  snapshot is still one point in time across shards, like Redis's forked child: each shard saves
+  from a copy-on-write image started at the same moment (see [`docs/rdbsave.md`](docs/rdbsave.md)).
 
 ### Memory Sizing & Eviction
 
@@ -745,7 +745,7 @@ links go to the corresponding source-verified subsystem specification.
 | **Pub/Sub incl. Sharded Pub/Sub** | Implemented | 16-stripe presence bitmask; CRC16 slot routing for `SPUBLISH`. | [19](docs/design/19_pubsub.md), [pub-sub.md](docs/pub-sub.md) |
 | **Scripting & Functions** | Implemented | `EVAL`/`EVALSHA` and `FUNCTION`/`FCALL` via sandboxed `mlua` (Lua 5.4). | [13](docs/design/13_scripting_functions.md) |
 | **ACL & Security** | Implemented | Per-user permissions, category selectors, `AUTH`. | [15](docs/design/15_security_tls.md) |
-| **RDB persistence** | Implemented, with gaps | No `fork()`; shards serialize in ~1ms yielding steps, I/O on an `rdb-writer` thread; persists KV (including NVMe-tiered keys), Vector Sets, and extended `RDBX` search/vector indexes; the snapshot is not a single point in time. | [rdbsave.md](docs/rdbsave.md) |
+| **RDB persistence** | Implemented, with gaps | No `fork()`; shards serialize in ~1ms yielding steps, I/O on an `rdb-writer` thread; persists KV (including NVMe-tiered keys), Vector Sets, and extended `RDBX` search/vector indexes; the snapshot is one point in time across shards (copy-on-write images). | [rdbsave.md](docs/rdbsave.md) |
 | **AOF persistence** | Implemented | Async (`monoio`) periodic flush, distinct I/O strategy from RDB save. | [14](docs/design/14_persistence_replication.md) |
 | **Replication (`PSYNC`)** | Implemented | Single-connection, used for all Rudis-to-Rudis replication. | [replication.md](docs/replication.md) |
 | **Replication (`DFLY FLOW`)** | Implemented, narrow scope | Master-side only, for Dragonfly-protocol clients; Rudis replicas never use it. | [replication.md](docs/replication.md) |

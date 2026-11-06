@@ -167,19 +167,18 @@ Raw Ingress Bytes: *3\r\n$3\r\nSET\r\n$4\r\nuser\r\n$5\r\nalice\r\n
 
 ## 5. Known Gaps & Future Work
 
-The following are **not** current behavior; they are gaps identified against the file as it
-exists today and are tracked here so contributors don't assume they're already handled:
+The following is **not** current behavior; it is a gap identified against the file as it
+exists today and is tracked here so contributors don't assume it's already handled:
 
-- **No maximum bulk-string/array length is enforced.** `parse_resp_array` trusts the declared
-  `arg_len`/`num_args` off the wire (bounded only by `usize` overflow checks in
-  `parse_decimal_bytes`), so a client claiming a multi-gigabyte bulk string causes the server
-  to attempt to buffer that much data before any rejection occurs. A `proto-max-bulk-len`-style
-  cap is not implemented.
 - **RESP3 input parsing does not exist.** Every command a client sends is still parsed as a
   flat array of `$`-prefixed bulk strings, regardless of the negotiated protocol version. This
   is sufficient because no current Redis command requires a client to send a RESP3-typed
   argument (map, set, double, boolean, or null) — but it means "RESP3 support" in Rudis is
   strictly output-side today.
+
+(Bulk lengths are capped: the parser rejects one above `proto-max-bulk-len` with
+`Protocol error: invalid bulk length` before buffering it, and the connection read loop
+enforces `client-query-buffer-limit`; see [`differences.md`](../differences.md) §2.)
 
 ## 6. Implementation References & Contributor Guide
 

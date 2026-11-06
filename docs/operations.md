@@ -38,8 +38,8 @@ detected` (§4). Alert on:
 ## 3. Backups and restore
 
 - Take a snapshot with `BGSAVE` (it never forks; shards serialize in ~1 ms steps) and copy
-  `dir/dump.rdb` once `rudis_rdb_bgsave_in_progress` is back to 0. A snapshot is consistent
-  per key, not a single point in time across keys (see [rdbsave.md](rdbsave.md)).
+  `dir/dump.rdb` once `rudis_rdb_bgsave_in_progress` is back to 0. A snapshot is one point in
+  time across all shards, as with Redis (see [rdbsave.md](rdbsave.md)).
 - To restore, stop the server, put the RDB at `dir/dump.rdb` and start it with `appendonly no`
   (with `appendonly yes` the AOF is loaded instead). Then `CONFIG SET appendonly yes` (and
   `CONFIG REWRITE` to keep it on).
