@@ -3523,11 +3523,9 @@ impl Router {
     }
 
     pub async fn reset_command_stats(&self) {
-        crate::connection::reset_local_cmd_stats();
-        {
-            let mut map = crate::connection::CMD_STATS.write();
-            map.clear();
-        }
+        // The other shards first: one of them flushes its buffered counts
+        // into CMD_STATS when a connection closes, so clearing CMD_STATS
+        // before they reset let pre-reset counts reappear after it.
         for (shard_id, sender) in self.senders.iter().enumerate() {
             if shard_id != self.shard_id {
                 let (tx, rx) = self.acquire_notify_channel();
@@ -3540,6 +3538,8 @@ impl Router {
                 self.release_notify_channel(tx, rx);
             }
         }
+        crate::connection::reset_local_cmd_stats();
+        crate::connection::CMD_STATS.write().clear();
     }
 
     pub async fn flush_all_command_stats(&self) {
