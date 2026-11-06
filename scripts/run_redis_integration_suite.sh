@@ -36,6 +36,18 @@ sed -i \
 if grep -q '$r himport' "$TEST_DIR/tests/support/util.tcl"; then
     echo "warning: util.tcl still uses HIMPORT; update the patch in $0" >&2
 fi
+# Some suites build arrays (ARSET) and hash templates (HIMPORT) directly,
+# both unreleased Redis types Rudis does not implement, and abort on the
+# unknown command before most of their tests run. ARSET key idx value
+# becomes HSET key idx value (same arity, so deferred-reply counts hold);
+# HIMPORT lines are dropped (the template keys are just absent).
+sed -i \
+    -e 's/^\(\s*\)\(\$rd\|r\) arset /\1\2 hset /' \
+    -e 's/^\(\s*\)r himport .*$/\1# (rudis) no HIMPORT/' \
+    "$TEST_DIR"/tests/integration/*.tcl
+if grep -qiE '^\s*(\$rd|r) (arset|himport) ' "$TEST_DIR"/tests/integration/*.tcl; then
+    echo "warning: integration suites still use ARSET/HIMPORT; update the patch in $0" >&2
+fi
 # psync2-reg drives redis-benchmark through the master's unix socket; Rudis
 # listens on TCP only, so use the master's TCP address.
 sed -i \
