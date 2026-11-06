@@ -1463,7 +1463,7 @@ pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
                     );
                     write_resp_bulk(out, graph.as_bytes());
                 } else {
-                    let err = format!("-ERR No samples available for event '{}'\r\n", ev);
+                    let err = format!("-ERR No samples available for event '{}'\r\n", err_arg(ev));
                     out.extend_from_slice(err.as_bytes());
                 }
             }
@@ -3333,6 +3333,19 @@ pub fn write_resp_array_header_bytesmut(out: &mut BytesMut, len: usize) {
     }
 }
 
+/// A client-supplied string made safe to echo inside an error reply: CR and
+/// LF become spaces, as Redis does (`addReplyErrorFormat`). Left in, they end
+/// the error line early and the rest is read as further replies, so an
+/// argument like `"x\r\n+OK"` could forge a reply to the client's next
+/// command.
+pub fn err_arg(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains(['\r', '\n']) {
+        std::borrow::Cow::Owned(s.replace(['\r', '\n'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 #[inline]
 pub fn write_resp_err(out: &mut Vec<u8>, err: impl AsRef<str>) {
     let err = err.as_ref();
@@ -4603,7 +4616,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
             out.extend_from_slice(
                 format!(
                     "-ERR CONFIG SET failed (possibly related to argument '{}') - can't set immutable config\r\n",
-                    p_str
+                    err_arg(&p_str)
                 )
                 .as_bytes(),
             );
@@ -4617,7 +4630,8 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
             out.extend_from_slice(
                 format!(
                     "-ERR CONFIG SET failed (possibly related to argument '{}') - {}\r\n",
-                    p_str, e
+                    err_arg(&p_str),
+                    err_arg(&e)
                 )
                 .as_bytes(),
             );
@@ -4630,7 +4644,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
             out.extend_from_slice(
                 format!(
                     "-ERR CONFIG SET failed (possibly related to argument '{}') - argument must be greater than 0\r\n",
-                    p_str
+                    err_arg(&p_str)
                 )
                 .as_bytes(),
             );
@@ -4682,7 +4696,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 out.extend_from_slice(
                     format!(
                         "-ERR CONFIG SET failed (possibly related to argument '{}') - argument couldn't be parsed into an integer\r\n",
-                        p_str
+                        err_arg(&p_str)
                     )
                     .as_bytes(),
                 );
@@ -4706,7 +4720,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 out.extend_from_slice(
                     format!(
                         "-ERR CONFIG SET failed (possibly related to argument '{}') - argument couldn't be parsed into an integer\r\n",
-                        p_str
+                        err_arg(&p_str)
                     )
                     .as_bytes(),
                 );
@@ -4727,7 +4741,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 out.extend_from_slice(
                     format!(
                         "-ERR CONFIG SET failed (possibly related to argument '{}') - argument must be 'yes' or 'no'\r\n",
-                        p_str
+                        err_arg(&p_str)
                     )
                     .as_bytes(),
                 );
@@ -4993,7 +5007,8 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
             out.extend_from_slice(
                 format!(
                     "-ERR CONFIG SET failed (possibly related to argument '{}') - {}\r\n",
-                    p_str, e
+                    err_arg(&p_str),
+                    err_arg(&e)
                 )
                 .as_bytes(),
             );
@@ -5874,7 +5889,7 @@ async fn execute_tx_step(
             Command::Unknown(cmd_name) => {
                 *tx_has_error = true;
                 out_buf.extend_from_slice(
-                    format!("-ERR unknown command '{}'\r\n", cmd_name).as_bytes(),
+                    format!("-ERR unknown command '{}'\r\n", err_arg(&cmd_name)).as_bytes(),
                 );
                 false
             }
@@ -7669,7 +7684,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                     out.extend_from_slice(
                         format!(
                             "-ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n",
-                            name
+                            err_arg(name)
                         )
                         .as_bytes(),
                     );
@@ -11307,7 +11322,7 @@ pub fn acl_check_user_cmd(user: &crate::acl::AclUser, cmd: &Command) -> Option<V
         return Some(
             format!(
                 "-NOPERM this user has no permissions to run the '{}' command\r\n",
-                acl_name.to_lowercase()
+                err_arg(&acl_name.to_lowercase())
             )
             .into_bytes(),
         );
@@ -11397,7 +11412,7 @@ pub fn acl_denied_in_context(
             } else {
                 format!(
                     "-NOPERM this user has no permissions to run the '{}' command\r\n",
-                    lower
+                    err_arg(&lower)
                 )
                 .into_bytes()
             };
@@ -11546,7 +11561,7 @@ fn mode_switch_denied(
             let lower = name.to_lowercase();
             let reply = format!(
                 "-NOPERM this user has no permissions to run the '{}' command\r\n",
-                lower
+                err_arg(&lower)
             )
             .into_bytes();
             Some((crate::acl::AclDeniedReason::Command, lower, reply))
@@ -14262,7 +14277,7 @@ async fn execute_command_inner(
                         && !attr.eq_ignore_ascii_case("lib-ver")
                     {
                         let msg =
-                            format!("-ERR Unrecognized option '{}' for CLIENT SETINFO\r\n", attr);
+                            format!("-ERR Unrecognized option '{}' for CLIENT SETINFO\r\n", err_arg(&attr));
                         out.extend_from_slice(msg.as_bytes());
                     } else if val.bytes().any(|b| !(b'!'..=b'~').contains(&b)) {
                         let msg = format!(
@@ -14449,14 +14464,14 @@ async fn execute_command_inner(
                                         filter_type = Some(t);
                                     } else {
                                         err_msg =
-                                            Some(format!("-ERR Unknown client type '{}'\r\n", v));
+                                            Some(format!("-ERR Unknown client type '{}'\r\n", err_arg(&v)));
                                         break;
                                     }
                                 }
                                 "USER" => {
                                     let acl = crate::acl::get_acl_for_port(router.port);
                                     if acl.read().get_user(&v).is_none() {
-                                        err_msg = Some(format!("-ERR No such user '{}'\r\n", v));
+                                        err_msg = Some(format!("-ERR No such user '{}'\r\n", err_arg(&v)));
                                         break;
                                     }
                                     filter_user = Some(v.to_string());
@@ -15518,7 +15533,7 @@ async fn execute_command_inner(
                             }
                             None => {
                                 out.extend_from_slice(
-                                    format!("-ERR Unknown category '{}'\r\n", cat).as_bytes(),
+                                    format!("-ERR Unknown category '{}'\r\n", err_arg(&cat)).as_bytes(),
                                 );
                             }
                         }
@@ -15540,7 +15555,7 @@ async fn execute_command_inner(
                     let user_opt = acl.read().get_user(&username);
                     let Some(user) = user_opt else {
                         out.extend_from_slice(
-                            format!("-ERR User '{}' not found\r\n", username).as_bytes(),
+                            format!("-ERR User '{}' not found\r\n", err_arg(&username)).as_bytes(),
                         );
                         return false;
                     };
@@ -15548,7 +15563,7 @@ async fn execute_command_inner(
                     match crate::resp::build_command(cmd_args.clone()) {
                         Ok(Some(Command::Unknown(_))) | Ok(None) => {
                             out.extend_from_slice(
-                                format!("-ERR Command '{}' not found\r\n", raw_name).as_bytes(),
+                                format!("-ERR Command '{}' not found\r\n", err_arg(&raw_name)).as_bytes(),
                             );
                         }
                         Ok(Some(parsed_cmd)) => {
@@ -15583,7 +15598,7 @@ async fn execute_command_inner(
                             };
                             if crate::acl::command_index(&cand).is_none() {
                                 out.extend_from_slice(
-                                    format!("-ERR Command '{}' not found\r\n", raw_name).as_bytes(),
+                                    format!("-ERR Command '{}' not found\r\n", err_arg(&raw_name)).as_bytes(),
                                 );
                             } else if !user.can_execute_command_with_first_arg(
                                 &cand,
@@ -20226,7 +20241,7 @@ async fn execute_command_inner(
                 }
                 return false;
             }
-            let resp = format!("-ERR unknown command '{}'\r\n", cmd_name);
+            let resp = format!("-ERR unknown command '{}'\r\n", err_arg(&cmd_name));
             out.extend_from_slice(resp.as_bytes());
             false
         }
@@ -28099,7 +28114,7 @@ pub fn execute_local_command(
                     }
                     return false;
                 }
-                let resp = format!("-ERR unknown command '{}'\r\n", cmd_name);
+                let resp = format!("-ERR unknown command '{}'\r\n", err_arg(cmd_name));
                 out.extend_from_slice(resp.as_bytes());
                 false
             }
@@ -30970,6 +30985,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn test_err_arg_keeps_an_error_reply_on_one_line() {
+        assert!(matches!(
+            err_arg("plain"),
+            std::borrow::Cow::Borrowed("plain")
+        ));
+        assert_eq!(err_arg("a\r\n+OK\r\n"), "a  +OK  ");
+        assert_eq!(err_arg("a\nb\rc"), "a b c");
+    }
 
     /// A streamed full sync ends with a valid RDB end and checksum, then
     /// the mark as the very last bytes: Redis replicas detect the end by the

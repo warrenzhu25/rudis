@@ -1075,7 +1075,7 @@ pub fn handle_commandlog(args: &[Bytes], out: &mut Vec<u8>) {
                 out.extend_from_slice(
                     format!(
                         "-ERR Unknown commandlog type '{}'. Valid types are: SLOW, LARGE-REQUEST, LARGE-REPLY\r\n",
-                        raw
+                        crate::connection::err_arg(&raw)
                     )
                     .as_bytes(),
                 );
@@ -1096,7 +1096,7 @@ pub fn handle_commandlog(args: &[Bytes], out: &mut Vec<u8>) {
                 out.extend_from_slice(
                     format!(
                         "-ERR Unknown commandlog type '{}'. Valid types are: SLOW, LARGE-REQUEST, LARGE-REPLY\r\n",
-                        raw
+                        crate::connection::err_arg(&raw)
                     )
                     .as_bytes(),
                 );
@@ -1131,7 +1131,7 @@ pub fn handle_commandlog(args: &[Bytes], out: &mut Vec<u8>) {
                 out.extend_from_slice(
                     format!(
                         "-ERR Unknown commandlog type '{}'. Valid types are: SLOW, LARGE-REQUEST, LARGE-REPLY\r\n",
-                        raw
+                        crate::connection::err_arg(&raw)
                     )
                     .as_bytes(),
                 );
@@ -1145,7 +1145,7 @@ pub fn handle_commandlog(args: &[Bytes], out: &mut Vec<u8>) {
             out.extend_from_slice(
                 format!(
                     "-ERR unknown subcommand '{}'. Try COMMANDLOG HELP.\r\n",
-                    sub_str
+                    crate::connection::err_arg(&sub_str)
                 )
                 .as_bytes(),
             );

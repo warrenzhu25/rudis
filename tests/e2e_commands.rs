@@ -13686,3 +13686,51 @@ fn test_threads_above_the_shard_cap_refuse_to_start_e2e() {
     let err = rudis_startup_error(&["--port", "26472", "--no-pin", "--threads", "0"]);
     assert!(err.contains("'threads' must be at least 1"), "{err}");
 }
+
+/// An argument holding CR/LF that a command echoes in its error reply must
+/// not split the reply: each reply here is one error line, so the client's
+/// next reply is still its PING's. (Found by Redis's corrupt-dump-fuzzer
+/// TCL suite: XGROUP with a random binary subcommand desynced the client.)
+#[test]
+fn test_error_replies_never_echo_cr_lf_e2e() {
+    let port = 18862u16;
+    let ps = port.to_string();
+    let _server = ServerGuard(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "2", "--no-pin"],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let evil = "x\r\n+FORGED\r\n";
+    let cmds: Vec<Vec<&str>> = vec![
+        vec![evil],
+        vec!["XGROUP", evil],
+        vec!["XINFO", evil],
+        vec!["CLIENT", evil],
+        vec!["OBJECT", evil, "k"],
+        vec!["CLUSTER", evil],
+        vec!["PUBSUB", evil],
+        vec!["LATENCY", evil],
+        vec!["COMMANDLOG", evil],
+        vec!["CONFIG", "SET", evil, "1"],
+        vec!["CLIENT", "SETINFO", evil, "v"],
+        vec!["CLIENT", "KILL", "TYPE", evil],
+        vec!["ACL", "CAT", evil],
+        vec!["ACL", "GETUSER", evil],
+    ];
+    for cmd in cmds {
+        let mut req = format_resp_cmd(&cmd);
+        req.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        c.write_all(&req).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !got.ends_with(b"+PONG\r\n") {
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed after {cmd:?}");
+            got.extend_from_slice(&buf[..n]);
+        }
+        let text = String::from_utf8_lossy(&got);
+        assert_eq!(text.matches("\r\n").count(), 2, "{cmd:?} -> {text:?}");
+        assert!(!text.contains("\r\n+FORGED"), "{cmd:?} -> {text:?}");
+    }
+}
