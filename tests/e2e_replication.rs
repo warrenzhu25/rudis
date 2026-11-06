@@ -7673,3 +7673,74 @@ fn test_rolling_restart_under_write_load_loses_no_acked_write_e2e() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `rdb-key-save-delay` slows a streamed full sync as it slows a BGSAVE
+/// (Redis's replication TCL suites rely on it to act mid-sync), and lowering
+/// it lets the sync finish.
+#[test]
+fn test_rdb_key_save_delay_slows_a_full_sync_e2e() {
+    let (mp, rp) = (18860u16, 18861u16);
+    let (mps, rps) = (mp.to_string(), rp.to_string());
+    let _master = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &mps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--enable-debug-command",
+            "yes",
+        ],
+        mp,
+    ));
+    let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(
+        send_and_read_reply(&mut m, b"DEBUG POPULATE 2000 key 1000\r\n"),
+        "+OK\r\n"
+    );
+    // 300 ms per step: without the delay this sync takes a few ms.
+    assert_eq!(
+        send_and_read_reply(&mut m, b"CONFIG SET rdb-key-save-delay 300000\r\n"),
+        "+OK\r\n"
+    );
+    let _replica = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &rps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            "127.0.0.1",
+            &mps,
+        ],
+        rp,
+    ));
+    let mut r = TcpStream::connect(("127.0.0.1", rp)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    thread::sleep(Duration::from_millis(500));
+    let info = send_and_read_reply(&mut r, b"INFO replication\r\n");
+    assert!(
+        info.contains("master_sync_in_progress:1"),
+        "sync not slowed: {info}"
+    );
+
+    assert_eq!(
+        send_and_read_reply(&mut m, b"CONFIG SET rdb-key-save-delay 0\r\n"),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let info = send_and_read_reply(&mut r, b"INFO replication\r\n");
+        if info.contains("master_link_status:up") && info.contains("master_sync_in_progress:0") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sync never finished: {info}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(send_and_read_reply(&mut r, b"DBSIZE\r\n"), ":2000\r\n");
+}

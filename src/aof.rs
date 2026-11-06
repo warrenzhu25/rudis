@@ -835,8 +835,9 @@ async fn rewrite_live_inner(
 }
 
 /// `rdb-key-save-delay` (a test knob, in microseconds) for one step of a
-/// live AOF rewrite or an RDB save (`SAVE`/`BGSAVE`), also the last one, so
-/// even a tiny dataset's save can be caught running. Slept in short slices,
+/// live AOF rewrite, an RDB save (`SAVE`/`BGSAVE`) or a streamed replica
+/// full sync, also the last one, so even a tiny dataset's save can be caught
+/// running. Slept in short slices,
 /// ending early once the knob is lowered, so a test can let a slowed save
 /// finish.
 pub(crate) async fn rewrite_key_save_delay() {

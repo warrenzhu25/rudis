@@ -8362,6 +8362,9 @@ async fn stream_full_sync(
                 hub.unregister_replica(client_id);
                 return Err(None);
             }
+            // `rdb-key-save-delay`, as for SAVE/BGSAVE: lets tests act
+            // (kill the link, read INFO) while a full sync runs.
+            crate::aof::rewrite_key_save_delay().await;
             if done {
                 break;
             }
