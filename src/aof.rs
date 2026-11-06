@@ -4493,6 +4493,11 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
                 .or(max_index.map(|i| i + 1))
                 .unwrap_or(0);
             import_external_aof(&ext_files, num_shards, port, &staging)?;
+            // The import may have cut a torn tail off the newest Redis file
+            // (aof-load-truncated). Record the files as they are now, or the
+            // next start sees them changed and imports them again, over
+            // every write made since.
+            let cur_crc = compute_external_aof_crc(&manifest_opt, &ext_files);
             swap_in_staged_aof(
                 dir,
                 &staging,
@@ -8063,6 +8068,49 @@ mod tests {
         let mut loaded = load_shards(&dir, 3);
         assert_eq!(loaded.get(b"k_base"), Some(Bytes::from_static(b"v_base")));
         assert_eq!(loaded.get(b"after_import"), Some(Bytes::from_static(b"1")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_truncated_redis_aof_is_not_reimported_over_later_writes() {
+        let dir =
+            std::env::temp_dir().join(format!("rudis-aof-trunc-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut incr = Vec::new();
+        for _ in 0..5 {
+            incr.extend_from_slice(&resp_argv(&[b"INCR".as_slice(), b"foo"]));
+        }
+        // A torn final write, cut off by aof-load-truncated on import.
+        let torn = resp_argv(&[b"INCR".as_slice(), b"foo"]);
+        incr.extend_from_slice(&torn[..torn.len() - 1]);
+        let aof_dir = dir.join("appendonlydir");
+        std::fs::create_dir_all(&aof_dir).unwrap();
+        std::fs::write(aof_dir.join("appendonly.aof.1.incr.aof"), &incr).unwrap();
+        std::fs::write(
+            aof_dir.join("appendonly.aof.manifest"),
+            "file appendonly.aof.1.incr.aof seq 1 type i\n",
+        )
+        .unwrap();
+
+        assert_eq!(reshard_aof_dir(&dir, 2, 0).unwrap(), None);
+        let mut loaded = load_shards(&dir, 2);
+        assert_eq!(loaded.get(b"foo"), Some(Bytes::from_static(b"5")));
+
+        // A write after the import, logged to foo's shard file.
+        let shard = crate::router::target_shard(b"foo", 2);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(format!("appendonly-{}.aof", shard)))
+            .unwrap();
+        std::io::Write::write_all(&mut f, &resp_argv(&[b"INCR".as_slice(), b"foo"])).unwrap();
+        drop(f);
+
+        // The restart must keep it: the Redis files are unchanged since the
+        // import truncated them, so they are not imported again.
+        assert_eq!(reshard_aof_dir(&dir, 2, 0).unwrap(), None);
+        let mut loaded = load_shards(&dir, 2);
+        assert_eq!(loaded.get(b"foo"), Some(Bytes::from_static(b"6")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

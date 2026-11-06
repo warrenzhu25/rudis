@@ -2961,6 +2961,10 @@ fn test_redis7_multipart_aof_is_imported_once_e2e() {
     ] {
         incr.extend_from_slice(&resp_argv_bytes(cmd));
     }
+    // Redis was killed mid-write: the import cuts this torn command off
+    // (aof-load-truncated), and must not then see the files as changed.
+    let torn = resp_argv_bytes(&["SET", "torn", "x"]);
+    incr.extend_from_slice(&torn[..torn.len() - 1]);
     std::fs::write(aof_dir.join("appendonly.aof.1.incr.aof"), &incr).unwrap();
     std::fs::write(
         aof_dir.join("appendonly.aof.manifest"),
@@ -2991,6 +2995,7 @@ fn test_redis7_multipart_aof_is_imported_once_e2e() {
     assert_eq!(resp_cmd(&mut c, &["GET", "base:k"]), "$6\r\nbase:v\r\n");
     assert_eq!(resp_cmd(&mut c, &["GET", "tx:a"]), "$1\r\n2\r\n");
     assert_eq!(resp_cmd(&mut c, &["EXISTS", "gone"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "torn"]), ":0\r\n");
     assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":2\r\n");
     assert_eq!(resp_cmd(&mut c, &["SELECT", "3"]), "+OK\r\n");
     assert_eq!(resp_cmd(&mut c, &["GET", "db3:k"]), "$2\r\nv3\r\n");
