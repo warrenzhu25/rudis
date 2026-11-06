@@ -2610,7 +2610,15 @@ fn test_restore_forged_payloads_are_refused_e2e() {
 fn test_restore_accepts_a_zero_crc_and_rejects_a_wrong_one_e2e() {
     let port: u16 = 17089;
     let port_s = port.to_string();
-    let args = ["--port", &port_s, "--threads", "2", "--no-pin"];
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--enable-debug-command",
+        "yes",
+    ];
     let mut child = spawn_rudis_listening(&args, port);
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -2643,6 +2651,23 @@ fn test_restore_accepts_a_zero_crc_and_rejects_a_wrong_one_e2e() {
         "-ERR DUMP payload version or checksum are wrong\r\n"
     );
     assert_eq!(resp_cmd(&mut c, &["EXISTS", "crc:bad"]), ":0\r\n");
+
+    // DEBUG SET-SKIP-CHECKSUM-VALIDATION 1 (a Redis test knob) lets it in;
+    // 0 turns the check back on.
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "SET-SKIP-CHECKSUM-VALIDATION", "1"]),
+        "+OK\r\n"
+    );
+    assert_eq!(restore(&mut c, "crc:skipped", &bad_crc), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "crc:skipped"]), "$1\r\nv\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "SET-SKIP-CHECKSUM-VALIDATION", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        restore(&mut c, "crc:bad", &bad_crc),
+        "-ERR DUMP payload version or checksum are wrong\r\n"
+    );
     drop(c);
     shutdown_and_wait(port, &mut child);
 }

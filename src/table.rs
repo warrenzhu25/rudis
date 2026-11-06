@@ -15285,11 +15285,12 @@ impl RudisTable {
         // Like Redis (verifyDumpPayload), a zero CRC means "no checksum":
         // payloads made by tools that skip it must restore. The decoder
         // below still rejects malformed payloads.
-        if expected_crc != 0 {
-            let actual_crc = crc64(&serialized[..data_len]);
-            if expected_crc != actual_crc {
-                return Err("DUMP payload version or checksum are wrong");
-            }
+        if !dump_crc_ok(
+            &serialized[..data_len],
+            expected_crc,
+            SKIP_DUMP_CHECKSUM.load(std::sync::atomic::Ordering::Relaxed),
+        ) {
+            return Err("DUMP payload version or checksum are wrong");
         }
 
         let rdb_ver = u16::from_le_bytes(
@@ -16671,6 +16672,19 @@ const CRC64_TAB: [u64; 256] = {
     }
     table
 };
+
+/// `DEBUG SET-SKIP-CHECKSUM-VALIDATION <0|1>` (a test knob, as in Redis):
+/// RESTORE skips the payload's CRC64 check, so tests can feed hand-made
+/// corrupt payloads to the decoder without faking a valid checksum.
+pub static SKIP_DUMP_CHECKSUM: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a DUMP payload's trailing CRC64 (`expected`, over `data`) passes:
+/// a zero CRC means none was computed, and `skip` is
+/// [`SKIP_DUMP_CHECKSUM`].
+fn dump_crc_ok(data: &[u8], expected: u64, skip: bool) -> bool {
+    skip || expected == 0 || expected == crc64(data)
+}
 
 pub fn crc64_update(mut crc: u64, data: &[u8]) -> u64 {
     for &b in data {
@@ -19796,6 +19810,17 @@ mod tests {
         );
         assert_eq!(table.get(b"b").unwrap(), None);
         assert_eq!(table.get(b"c").unwrap(), None);
+    }
+
+    #[test]
+    fn test_dump_crc_check_and_its_skip_knob() {
+        let data = b"payload\x0a\x00";
+        let crc = crc64(data);
+        assert!(dump_crc_ok(data, crc, false));
+        assert!(dump_crc_ok(data, 0, false));
+        assert!(!dump_crc_ok(data, crc ^ 1, false));
+        // DEBUG SET-SKIP-CHECKSUM-VALIDATION 1 accepts any CRC.
+        assert!(dump_crc_ok(data, crc ^ 1, true));
     }
 
     #[test]

@@ -20294,6 +20294,11 @@ async fn execute_command_inner(
                     ALLOW_ACCESS_EXPIRED.store(flag, std::sync::atomic::Ordering::Relaxed);
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
+                } else if sub.eq_ignore_ascii_case(b"set-skip-checksum-validation") {
+                    let flag = args.get(1).map(|v| v.as_ref() == b"1").unwrap_or(false);
+                    crate::table::SKIP_DUMP_CHECKSUM.store(flag, std::sync::atomic::Ordering::Relaxed);
+                    out.extend_from_slice(b"+OK\r\n");
+                    return false;
                 } else if sub.eq_ignore_ascii_case(b"change-repl-id") {
                     crate::replication::cached_hub(router.base_port).change_replid();
                     out.extend_from_slice(b"+OK\r\n");
