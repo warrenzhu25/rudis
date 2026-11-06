@@ -48,11 +48,14 @@ sed -i \
 
 mkdir -p "$TEST_DIR/src"
 # Suites also run redis-cli, redis-benchmark and redis-check-{rdb,aof};
-# take them from a Valkey build when one is around (VALKEY_SRC).
+# take them from a Valkey build when one is around (VALKEY_SRC), else from
+# PATH (e.g. Debian/Ubuntu's redis-tools, as CI installs).
 VALKEY_SRC="${VALKEY_SRC:-$HOME/valkey-stable/src}"
 for tool in cli benchmark check-rdb check-aof; do
     if [ -x "$VALKEY_SRC/valkey-$tool" ]; then
         ln -sf "$VALKEY_SRC/valkey-$tool" "$TEST_DIR/src/redis-$tool"
+    elif command -v "redis-$tool" > /dev/null; then
+        ln -sf "$(command -v "redis-$tool")" "$TEST_DIR/src/redis-$tool"
     fi
 done
 cat > "$TEST_DIR/src/redis-server" <<EOF

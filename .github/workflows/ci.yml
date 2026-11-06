@@ -181,8 +181,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-release-
 
-      - name: Install tclsh
-        run: sudo apt-get update && sudo apt-get install -y tcl
+      - name: Install tclsh and the Redis CLI tools
+        # redis-tools: redis-cli, redis-benchmark, redis-check-{rdb,aof}
+        # (no server), which some integration suites drive.
+        run: sudo apt-get update && sudo apt-get install -y tcl redis-tools
 
       - name: Build release binary
         run: cargo build --release
@@ -193,13 +195,21 @@ jobs:
           SKIP_BUILD=1 bash scripts/run_redis_test_suite.sh 16379 all 2>&1 | tee /tmp/rudis_tcl_suites.log
 
       # Replication suites that start their own servers (a master, replicas,
-      # restarts), through the integration wrapper. Only suites that need no
-      # redis-cli / redis-benchmark binaries, which the runner lacks.
+      # restarts), through the integration wrapper.
       - name: Run the replication integration suites
         run: |
           set -o pipefail
           SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
             integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown \
+            2>&1 | tee -a /tmp/rudis_tcl_suites.log
+
+      # Persistence suites: AOF writes racing redis-benchmark load, and
+      # Redis-written RDBs with ziplist encodings loading.
+      - name: Run the persistence integration suites
+        run: |
+          set -o pipefail
+          SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
+            integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load \
             2>&1 | tee -a /tmp/rudis_tcl_suites.log
 
       # Annotations are visible on the run page without downloading logs.
