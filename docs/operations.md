@@ -118,7 +118,24 @@ the cause and run the same command again to finish it.
 
 1. Check `rudis --version` and `INFO server` (`rudis_version`, `redis_git_sha1`) on the old
    and new builds.
-2. Upgrade replicas first, check `INFO replication`, then fail over and upgrade the old master.
+2. Upgrade replicas first, check `INFO replication`, then fail over and upgrade the old master:
+   1. Restart the replica on the new binary (`SIGTERM`, start it with the same config). With
+      `appendonly yes` it loads its AOF, then **full-syncs** from the master: as in Redis, the
+      replication ID and offset are only restored from an RDB, not from the AOF. Budget for one full
+      sync per restarted replica, and wait for `master_link_status:up` and
+      `slave_repl_offset` to reach the master's `master_repl_offset`.
+   2. `FAILOVER TIMEOUT <ms>` on the master. It pauses writes, waits for the replica to catch up
+      and hands over; the old master becomes its replica with a partial resync. Clients still on
+      the old master get `-READONLY` and must reconnect to the new one (as with Redis).
+   3. Restart the old master, now a replica, on the new binary (another full sync).
+   4. Optionally `FAILOVER` back.
+
+   `scripts/rolling_upgrade.py --old <bin> --new <bin>` runs these steps under write load and
+   checks that no acknowledged write is lost and that both nodes end with the same `DEBUG DIGEST`.
+   On a 1M-key dataset with 8 writers, from `6054795` to `2e2f2d4`: each restart resynced
+   in about 2 s with no write gap above 8 ms, each `FAILOVER` held writes for about 25 ms, and
+   about 280k acknowledged writes all survived (3 runs). The same steps run in CI on a small
+   dataset (`test_rolling_restart_under_write_load_loses_no_acked_write_e2e`).
 3. To roll back, keep the previous binary and the last `dump.rdb`/AOF from before the upgrade.
    Rudis writes Redis-format RDB and AOF, so an older build can load what a newer one wrote,
    except for keys of types the older build doesn't know.

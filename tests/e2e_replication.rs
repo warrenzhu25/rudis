@@ -7471,3 +7471,205 @@ fn test_replica_short_load_never_answers_loading_e2e() {
     }
     assert_eq!(loading.load(Ordering::Relaxed), 0, "a client got -LOADING");
 }
+
+/// The rolling restart of docs/operations.md §7 under write load: restart
+/// the replica, FAILOVER to it, restart the old master as its replica.
+/// Writers INCR their own counters on whichever node is the master; no
+/// acknowledged INCR may be lost, and the nodes end with the same data.
+/// (scripts/rolling_upgrade.py runs the same steps from an old binary to
+/// a new one, on a larger dataset.)
+#[test]
+fn test_rolling_restart_under_write_load_loses_no_acked_write_e2e() {
+    use std::sync::Arc;
+    // A field of INFO replication ("" if the reply is cut short).
+    fn repl_field(c: &mut TcpStream, name: &str) -> String {
+        let info = resp_cmd_full(c, &["INFO", "replication"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let (pa, pb) = (29956u16, 29957u16);
+    let base = std::env::temp_dir().join(format!("rudis-rolling-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let start = |port: u16, replicaof: Option<u16>| {
+        let dir = base.join(port.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, d) = (port.to_string(), dir.to_str().unwrap().to_string());
+        let master = replicaof.map(|m| format!("127.0.0.1 {m}"));
+        let mut args = vec![
+            "--port",
+            &p,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--dir",
+            &d,
+            "--appendonly",
+            "yes",
+            "--save",
+            "",
+        ];
+        if let Some(m) = &master {
+            args.extend(["--replicaof", m.as_str()]);
+        }
+        spawn_rudis_listening(&args, port)
+    };
+    struct Nodes(Vec<std::process::Child>);
+    impl Drop for Nodes {
+        fn drop(&mut self) {
+            for c in &mut self.0 {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+    let connect = |port: u16| {
+        let s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        Some(s)
+    };
+    let field = |port: u16, name: &str| -> String {
+        connect(port)
+            .map(|mut c| repl_field(&mut c, name))
+            .unwrap_or_default()
+    };
+    let wait_synced = |master: u16, replica: u16| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let up = field(replica, "master_link_status") == "up";
+            let mo: i64 = field(master, "master_repl_offset").parse().unwrap_or(-1);
+            let ro: i64 = field(replica, "slave_repl_offset").parse().unwrap_or(-2);
+            if up && ro >= mo && mo > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{replica} never caught up with {master}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let mut nodes = Nodes(vec![start(pa, None)]);
+    nodes.0.push(start(pb, Some(pa)));
+    wait_synced(pa, pb);
+
+    // Writers: acked = INCRs answered with an integer; lost = INCRs sent
+    // whose reply never came (applied or not).
+    const WRITERS: usize = 4;
+    let stop = Arc::new(AtomicBool::new(false));
+    let acked: Arc<Vec<AtomicU64>> = Arc::new((0..WRITERS).map(|_| AtomicU64::new(0)).collect());
+    let lost: Arc<Vec<AtomicU64>> = Arc::new((0..WRITERS).map(|_| AtomicU64::new(0)).collect());
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|i| {
+            let (stop, acked, lost) = (stop.clone(), acked.clone(), lost.clone());
+            thread::spawn(move || {
+                let key = format!("roll:{i}");
+                let mut conn: Option<TcpStream> = None;
+                while !stop.load(Ordering::Relaxed) {
+                    if conn.is_none() {
+                        conn = [pa, pb].into_iter().find_map(|p| {
+                            let mut c = TcpStream::connect(("127.0.0.1", p)).ok()?;
+                            c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                            (repl_field(&mut c, "role") == "master").then_some(c)
+                        });
+                        if conn.is_none() {
+                            thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                    }
+                    let c = conn.as_mut().unwrap();
+                    let mut buf = [0u8; 64];
+                    let sent = c.write_all(&format_resp_cmd(&["INCR", &key])).is_ok();
+                    match c.read(&mut buf) {
+                        Ok(n) if n > 0 && buf[0] == b':' => {
+                            acked[i].fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(n) if n > 0 => {
+                            // -READONLY from a demoted master, -LOADING...
+                            conn = None;
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        _ => {
+                            if sent {
+                                lost[i].fetch_add(1, Ordering::Relaxed);
+                            }
+                            conn = None;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    let settle = || thread::sleep(Duration::from_millis(700));
+    settle();
+
+    // 1. Restart the replica.
+    shutdown_and_wait(pb, &mut nodes.0[1]);
+    nodes.0[1] = start(pb, Some(pa));
+    wait_synced(pa, pb);
+    settle();
+    // 2. Fail over to it.
+    let mut a = connect(pa).unwrap();
+    assert_eq!(
+        resp_cmd(&mut a, &["FAILOVER", "TIMEOUT", "10000"]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while field(pb, "role") != "master" || field(pa, "master_failover_state") != "no-failover" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "failover never finished"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    wait_synced(pb, pa);
+    settle();
+    // 3. Restart the old master, now a replica.
+    shutdown_and_wait(pa, &mut nodes.0[0]);
+    nodes.0[0] = start(pa, Some(pb));
+    wait_synced(pb, pa);
+    settle();
+
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.join().unwrap();
+    }
+    wait_synced(pb, pa);
+    let mut m = connect(pb).unwrap();
+    let mut r = connect(pa).unwrap();
+    let mut total = 0;
+    for i in 0..WRITERS {
+        let (lo, hi) = (
+            acked[i].load(Ordering::Relaxed),
+            acked[i].load(Ordering::Relaxed) + lost[i].load(Ordering::Relaxed),
+        );
+        let key = format!("roll:{i}");
+        let v: u64 = resp_cmd(&mut m, &["GET", &key])
+            .lines()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap();
+        assert!(
+            (lo..=hi).contains(&v),
+            "{key} = {v}, acknowledged {lo}, up to {hi}"
+        );
+        let rv: u64 = resp_cmd(&mut r, &["GET", &key])
+            .lines()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap();
+        assert_eq!(rv, v, "replica's {key}");
+        total += lo;
+    }
+    assert!(total > 100, "too few writes acknowledged to tell: {total}");
+    drop((m, r, a));
+    for (port, i) in [(pa, 0), (pb, 1)] {
+        shutdown_and_wait(port, &mut nodes.0[i]);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
