@@ -7744,3 +7744,47 @@ fn test_rdb_key_save_delay_slows_a_full_sync_e2e() {
     }
     assert_eq!(send_and_read_reply(&mut r, b"DBSIZE\r\n"), ":2000\r\n");
 }
+
+/// A client blocked in WAIT / WAITAOF on a master that turns into a replica
+/// gets Redis's -UNBLOCKED error and its connection is closed; it used to
+/// stay blocked forever (with timeout 0), as no write there can reach a
+/// replica any more.
+#[test]
+fn test_demotion_unblocks_wait_and_waitaof_e2e() {
+    let (old_master, new_master) = (16927u16, 16931u16);
+    let spawn = |port: u16| {
+        let p = port.to_string();
+        KillRudisOnDrop(spawn_rudis_listening(
+            &["--port", &p, "--threads", "2", "--no-pin"],
+            port,
+        ))
+    };
+    let _a = spawn(old_master);
+    let _b = spawn(new_master);
+    let block = |cmd: &[u8]| {
+        let mut c = TcpStream::connect(("127.0.0.1", old_master)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c.write_all(cmd).unwrap();
+        c
+    };
+    let mut wait = block(b"WAIT 1 0\r\n");
+    let mut waitaof = block(b"WAITAOF 0 1 0\r\n");
+    thread::sleep(Duration::from_millis(200));
+    let mut admin = TcpStream::connect(("127.0.0.1", old_master)).unwrap();
+    assert_eq!(
+        send_and_read(
+            &mut admin,
+            format!("REPLICAOF 127.0.0.1 {new_master}\r\n").as_bytes()
+        ),
+        "+OK\r\n"
+    );
+    for c in [&mut wait, &mut waitaof] {
+        let mut reply = Vec::new();
+        // The error, then EOF: the connection is closed after it.
+        c.read_to_end(&mut reply).expect("reply then close");
+        assert_eq!(
+            String::from_utf8_lossy(&reply),
+            "-UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)\r\n"
+        );
+    }
+}

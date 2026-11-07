@@ -20089,6 +20089,10 @@ async fn execute_command_inner(
                 .await
             {
                 Ok(count) => write_resp_integer(out, count as i64),
+                Err(crate::replication::WaitError::Demoted) => {
+                    out.extend_from_slice(crate::replication::DEMOTED_UNBLOCK_REPLY);
+                    return true;
+                }
                 Err(_) => out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n"),
             }
             false
@@ -20136,6 +20140,10 @@ async fn execute_command_inner(
                 Err(crate::replication::WaitError::AofOff) => out.extend_from_slice(
                     b"-ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.\r\n",
                 ),
+                Err(crate::replication::WaitError::Demoted) => {
+                    out.extend_from_slice(crate::replication::DEMOTED_UNBLOCK_REPLY);
+                    return true;
+                }
             }
             false
         }

@@ -3023,7 +3023,15 @@ pub enum WaitError {
     Unblocked,
     /// WAITAOF's local copy while AOF was turned off.
     AofOff,
+    /// This master became a replica while the client waited: like Redis,
+    /// it gets `-UNBLOCKED` and its connection is closed (no write it
+    /// could wait for will reach replicas from here any more).
+    Demoted,
 }
+
+/// Redis's reply to a client blocked when its master turns into a replica.
+pub const DEMOTED_UNBLOCK_REPLY: &[u8] =
+    b"-UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)\r\n";
 
 /// Counts a client in [`WAIT_BLOCKED_CLIENTS`] (and makes it unblockable
 /// by id, if it has one) while it lives.
@@ -3185,6 +3193,9 @@ async fn wait_acks(
         let unblock = blocked.as_ref().map_or(0, WaitBlocked::unblock_request);
         if unblock == 2 {
             return Err(WaitError::Unblocked);
+        }
+        if hub.is_slave() {
+            return Err(WaitError::Demoted);
         }
         if done || unblock == 1 || (timeout_ms > 0 && start.elapsed() >= timeout) {
             return Ok((local_ok, count));
@@ -5997,6 +6008,21 @@ mod tests {
         assert!(unblock_waiter(9001, true));
         assert_eq!(waiter.await, Err(WaitError::Unblocked));
         assert!(!unblock_waiter(9001, true), "still registered");
+    }
+
+    /// A master turning into a replica ends its WAIT / WAITAOF waits with
+    /// an error, as Redis does: writes there will never reach replicas.
+    #[monoio::test(timer_enabled = true)]
+    async fn test_demotion_ends_waits() {
+        let port = 19979;
+        let hub = get_replication_hub(port);
+        let waiter = monoio::spawn(wait_replicas_for(9002, port, 1, 0));
+        let aof_waiter = monoio::spawn(wait_aof(9003, port, None, 0, 1, 0, || true));
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+        hub.is_slave_atomic.store(true, Ordering::Release);
+        assert_eq!(waiter.await, Err(WaitError::Demoted));
+        assert_eq!(aof_waiter.await, Err(WaitError::Demoted));
+        hub.make_master();
     }
 
     /// WAIT with no timeout (0) blocks until enough replicas ack, counted
