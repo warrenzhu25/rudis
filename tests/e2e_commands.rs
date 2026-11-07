@@ -6390,6 +6390,18 @@ fn test_hpexpire_hgetex_hsetex_e2e() {
         send_and_read(&mut stream, b"HGET h_prof role\r\n"),
         "$-1\r\n"
     );
+
+    // 6. HSETEX with PX 0 (as in Redis) sets the field and deletes it at
+    // once; a negative time is still refused.
+    assert_eq!(
+        send_and_read(&mut stream, b"HSETEX h_gone PX 0 FIELDS 1 f v\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(send_and_read(&mut stream, b"EXISTS h_gone\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"HSETEX h_gone PX -1 FIELDS 1 f v\r\n"),
+        "-ERR invalid expire time in 'hsetex' command\r\n"
+    );
 }
 
 #[test]

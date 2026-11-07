@@ -9421,7 +9421,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let val = parse_integer(&args[*idx + 1]).map_err(|_| {
                             "ERR value is not an integer or out of range".to_string()
                         })?;
-                        if (opt == "EX" || opt == "PX") && val <= 0 {
+                        // As in Redis (and HGETEX above), only a negative time is
+                        // invalid: an already-passed one (PX 0, an EXAT in the
+                        // past) sets the fields and deletes them at once.
+                        if val < 0 {
                             return Err("ERR invalid expire time in 'hsetex' command".to_string());
                         }
                         expire = match opt.as_str() {
@@ -14877,6 +14880,22 @@ mod tests {
             assert_eq!(
                 parse_command(&mut buf).unwrap_err(),
                 "ERR invalid expire time in 'hgetex' command"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hsetex_zero_expire_accepted_negative_rejected() {
+        for opt in ["EX", "PX", "EXAT", "PXAT"] {
+            let mut buf = BytesMut::from(format!("HSETEX h {} 0 FIELDS 1 f v\r\n", opt).as_str());
+            assert!(
+                matches!(parse_command(&mut buf), Ok(Some(Command::Hsetex { .. }))),
+                "{opt} 0"
+            );
+            let mut buf = BytesMut::from(format!("HSETEX h {} -1 FIELDS 1 f v\r\n", opt).as_str());
+            assert_eq!(
+                parse_command(&mut buf).unwrap_err(),
+                "ERR invalid expire time in 'hsetex' command"
             );
         }
     }
