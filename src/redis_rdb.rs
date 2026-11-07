@@ -893,14 +893,15 @@ pub fn decode_value(t: u8, r: &mut Reader<'_>, now_ms: u64) -> RdbResult<Option<
             let mut list = VecDeque::new();
             for _ in 0..n {
                 let blob = r.string()?;
-                let before = list.len();
+                if blob.is_empty() {
+                    return corrupt("empty quicklist node");
+                }
+                // Like Redis, an empty ziplist node is skipped; a list left
+                // with no elements is an empty key.
                 ziplist_for_each(&blob, |e| {
                     list.push_back(e.to_bytes());
                     Ok(())
                 })?;
-                if list.len() == before {
-                    return corrupt("empty quicklist node");
-                }
             }
             Ok(list_value(list))
         }
@@ -913,7 +914,7 @@ pub fn decode_value(t: u8, r: &mut Reader<'_>, now_ms: u64) -> RdbResult<Option<
                 if blob.is_empty() {
                     return corrupt("empty quicklist node");
                 }
-                let before = list.len();
+                // An empty listpack node is skipped, as in Redis.
                 match container {
                     QUICKLIST_NODE_PLAIN => list.push_back(Bytes::copy_from_slice(&blob)),
                     QUICKLIST_NODE_PACKED => listpack_for_each(&blob, |e| {
@@ -921,9 +922,6 @@ pub fn decode_value(t: u8, r: &mut Reader<'_>, now_ms: u64) -> RdbResult<Option<
                         Ok(())
                     })?,
                     _ => return corrupt("unknown quicklist node container"),
-                }
-                if list.len() == before {
-                    return corrupt("empty quicklist node");
                 }
             }
             Ok(list_value(list))
@@ -1370,6 +1368,31 @@ fn note_repl_aux(key: &[u8], val: &[u8]) {
         }),
         _ => {}
     }
+}
+
+thread_local! {
+    /// Empty keys the loads on this thread skipped (see
+    /// [`take_empty_keys_skipped`]).
+    static EMPTY_KEYS_SKIPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts (and, for the first 10 on this thread, logs as Redis does) an
+/// empty collection a load skipped.
+fn note_empty_key_skipped(key: &[u8]) {
+    let n = EMPTY_KEYS_SKIPPED.get();
+    EMPTY_KEYS_SKIPPED.set(n + 1);
+    if n < 10 {
+        crate::log_notice!(
+            "rdbLoadObject skipping empty key: {}",
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
+/// Returns, and resets, how many empty keys the loads on this thread
+/// skipped since the last call.
+pub fn take_empty_keys_skipped() -> u64 {
+    EMPTY_KEYS_SKIPPED.replace(0)
 }
 
 thread_local! {
@@ -2199,7 +2222,18 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
                     }
                     Some(_) => {}
                     None if ctx.strict => return corrupt("empty collection"),
-                    None => {}
+                    // A hash whose fields all expired: dropped, not empty.
+                    None if matches!(
+                        t,
+                        TYPE_HASH_METADATA
+                            | TYPE_HASH_METADATA_PRE_GA
+                            | TYPE_HASH_LISTPACK_EX
+                            | TYPE_HASH_LISTPACK_EX_PRE_GA
+                    ) => {}
+                    // Old Redis versions could save empty collections
+                    // (redis#8453); like Redis, skip them instead of
+                    // refusing the file.
+                    None => note_empty_key_skipped(&key),
                 }
             }
         }
@@ -3098,5 +3132,23 @@ mod tests {
         assert!(matches!(classify(&data), FileKind::Ambiguous));
         assert!(load_rdb_preamble(&data, &mut db).is_err());
         assert_eq!(db.get(b"keep"), Some(Bytes::from("v")));
+    }
+
+    /// Redis's corrupt_empty_keys.rdb holds 9 empty collections (sets,
+    /// lists, including quicklists of only empty nodes, hashes, zsets), as
+    /// old Redis versions could save. Like Redis, the load skips and counts
+    /// them instead of refusing the file.
+    #[test]
+    fn empty_collections_are_skipped_on_load() {
+        let data = include_bytes!("../tests/redis-tests/assets/corrupt_empty_keys.rdb");
+        let mut db = crate::shard::ShardDb::new(0);
+        let _ = take_empty_keys_skipped();
+        assert_eq!(load_file(data, &mut db, 0, 1, false).unwrap(), 0);
+        assert_eq!(db.dbsize(), 0);
+        assert_eq!(take_empty_keys_skipped(), 9);
+        // A DUMP payload of an empty collection is still refused.
+        let mut empty_set = vec![TYPE_SET];
+        write_len(&mut empty_set, 0);
+        assert!(decode_dump_body(&empty_set, 0).is_err());
     }
 }

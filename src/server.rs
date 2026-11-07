@@ -99,6 +99,8 @@ struct StartupLoad {
     loaded: u64,
     /// Keys the RDB load dropped as already expired.
     expired: Vec<(usize, Vec<u8>)>,
+    /// Empty collections the load skipped.
+    empty_skipped: u64,
 }
 
 /// `rdb_last_load_keys_expired` of INFO persistence, by base port.
@@ -133,17 +135,20 @@ fn note_startup_load(
     loaded: u64,
     expired: Vec<(usize, Vec<u8>)>,
 ) {
+    let empty_skipped = crate::redis_rdb::take_empty_keys_skipped();
     let mut loads = STARTUP_LOADS.lock();
     let entry = loads.entry((base_port, aof)).or_insert(StartupLoad {
         started,
         shards_done: 0,
         loaded: 0,
         expired: Vec::new(),
+        empty_skipped: 0,
     });
     entry.started = entry.started.min(started);
     entry.shards_done += 1;
     entry.loaded += loaded;
     entry.expired.extend(expired);
+    entry.empty_skipped += empty_skipped;
     if entry.shards_done < num_shards {
         return;
     }
@@ -151,6 +156,7 @@ fn note_startup_load(
         started,
         loaded,
         expired,
+        empty_skipped,
         ..
     } = loads.remove(&(base_port, aof)).expect("entry just updated");
     drop(loads);
@@ -162,11 +168,20 @@ fn note_startup_load(
         }
     } else {
         LAST_LOAD_KEYS_LOADED.store(loaded, std::sync::atomic::Ordering::Relaxed);
-        crate::log_notice!(
-            "Done loading RDB, keys loaded: {}, keys expired: {}.",
-            loaded,
-            expired.len()
-        );
+        if empty_skipped > 0 {
+            crate::log_notice!(
+                "Done loading RDB, keys loaded: {}, keys expired: {}, empty keys skipped: {}.",
+                loaded,
+                expired.len(),
+                empty_skipped
+            );
+        } else {
+            crate::log_notice!(
+                "Done loading RDB, keys loaded: {}, keys expired: {}.",
+                loaded,
+                expired.len()
+            );
+        }
         crate::log_notice!("DB loaded from disk: {:.3} seconds", secs);
         LAST_LOAD_KEYS_EXPIRED
             .lock()
@@ -299,6 +314,7 @@ pub fn run_shard_worker(
                 let started = std::time::Instant::now();
                 let _ = crate::redis_rdb::take_loaded_repl_info();
                 crate::redis_rdb::record_expired_on_load(true);
+                let _ = crate::redis_rdb::take_empty_keys_skipped();
                 let loaded = crate::table::load_rdb(&rdb_path, &mut local_db.borrow_mut(), shard_id, num_shards);
                 let expired = crate::redis_rdb::take_expired_on_load();
                 match loaded {

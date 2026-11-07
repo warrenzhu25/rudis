@@ -5328,3 +5328,37 @@ fn test_flushall_aborting_a_bgsave_does_not_fail_it_e2e() {
     assert_eq!(resp_cmd_all(&mut c, &["SET", "k2", "v"]), "+OK\r\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An RDB holding empty collections, as old Redis versions could save
+/// (Redis's corrupt_empty_keys.rdb: 9 of them, including quicklists of only
+/// empty nodes), loads with those keys skipped, as in Redis; rudis refused
+/// to start on it.
+#[test]
+fn test_rdb_with_empty_collections_loads_skipping_them_e2e() {
+    let port = 16923;
+    let dir = std::env::temp_dir().join(format!("rudis-emptykeys-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("dump.rdb"),
+        include_bytes!("redis-tests/assets/corrupt_empty_keys.rdb"),
+    )
+    .unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "k", "v"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
