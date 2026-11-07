@@ -651,6 +651,8 @@ fn main() {
 
     let mut handles = Vec::with_capacity(num_shards);
 
+    // Until a shard has loaded the dataset, SIGTERM exits at once.
+    rudis::shutdown::begin_startup_load();
     for (shard_id, rx) in receivers.into_iter().enumerate() {
         let shard_senders = senders_mesh[shard_id].clone();
         let shard_aof_config = aof_config.clone();

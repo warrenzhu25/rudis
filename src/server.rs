@@ -365,6 +365,10 @@ pub fn run_shard_worker(
             }
         }
 
+        // Loaded: from here on this shard can accept writes, so a shutdown
+        // signal must take the graceful path.
+        crate::shutdown::end_startup_load();
+
         let aof_writer = if aof_config.enabled {
             match crate::aof::AofWriter::open(aof_path).await {
                 Ok(mut w) => {

@@ -5329,6 +5329,78 @@ fn test_flushall_aborting_a_bgsave_does_not_fail_it_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// SIGTERM while the dataset loads at startup exits at once, as in Redis,
+/// leaving the data files as they were; it used to wait for the whole load
+/// (minutes on a big dataset) and then for the save of the shutdown.
+#[test]
+fn test_sigterm_during_startup_load_exits_at_once_e2e() {
+    let port = 16921;
+    let dir = std::env::temp_dir().join(format!("rudis-loadterm-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let base = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&base, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["DEBUG", "POPULATE", "20000"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let rdb = dir.join("dump.rdb");
+    let saved = std::fs::read(&rdb).unwrap();
+
+    // 1 ms per key: the load would take about 10 s on each shard.
+    let conf = dir.join("slow.conf");
+    std::fs::write(&conf, "save 3600 1\nkey-load-delay 1000\n").unwrap();
+    let mut child = rudis_bin()
+        .args(base)
+        .args(["-c", conf.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rudis");
+    thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "rudis exited early");
+    let start = std::time::Instant::now();
+    // SAFETY: kill(2) takes no pointers; the pid is our own child, not yet
+    // reaped, so it cannot have been reused.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let status = wait_exit(&mut child, Duration::from_secs(5)).unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("SIGTERM during the load did not stop rudis")
+    });
+    assert!(status.success(), "{status}");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        std::fs::read(&rdb).unwrap(),
+        saved,
+        "the RDB must be left as it was"
+    );
+
+    // Without the delay the server loads the same file and serves it.
+    std::fs::write(&conf, "save 3600 1\n").unwrap();
+    let mut args = base.to_vec();
+    args.extend(["-c", conf.to_str().unwrap()]);
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":20000\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An RDB holding empty collections, as old Redis versions could save
 /// (Redis's corrupt_empty_keys.rdb: 9 of them, including quicklists of only
 /// empty nodes), loads with those keys skipped, as in Redis; rudis refused
