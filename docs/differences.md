@@ -77,6 +77,16 @@ This document summarizes the architectural, operational, and semantic difference
 ### Replication Backlog Without Replicas
 * As in Redis, a master keeps its backlog for `repl-backlog-ttl` seconds after its last replica leaves, then releases it (new replication id; later replicas full-sync). Every rudis shard appends each write to that one backlog (~2.5x SET throughput on 8 threads), so it is released as soon as it is unused for that long, and after a restart from an RDB a master keeps it only for 60 seconds (at most `repl-backlog-ttl`) unless a replica comes back: Redis keeps it for `repl-backlog-ttl` there too. Replicas returning within the window still continue with a partial resync. `INFO replication`'s `repl_backlog_active` shows the state.
 
+### Loading the Dataset at Startup
+* As in Redis, the server serves clients while it loads its RDB / AOF at startup: `INFO` shows
+  `loading:1`, and commands Redis allows while loading (`INFO`, `CONFIG GET`, `AUTH`, `CLIENT`,
+  pub/sub, ...) run; data commands get `-LOADING` until every shard has loaded its part (each
+  shard's loader thread runs on that shard's core). Rudis also refuses, during the startup load
+  only, the commands that would act on the part loaded so far: `REPLICAOF`, `CONFIG SET
+  appendonly` and `DEBUG` other than `LOG`/`SLEEP`/`HELP`. `SHUTDOWN` or a `SIGTERM` during the
+  load exits at once without saving, as in Redis. The "Ready to accept connections" log line and
+  systemd's `READY=1` come once the load is done.
+
 ### Snapshots Without fork()
 * `SAVE`/`BGSAVE` don't fork, but write one point in time like Redis's forked child: every shard
   starts a copy-on-write image with cross-shard writes held back for that moment, and a key

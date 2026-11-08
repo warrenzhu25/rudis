@@ -5401,6 +5401,123 @@ fn test_sigterm_during_startup_load_exits_at_once_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// While it loads its dataset at startup the server serves clients, as
+/// Redis does: `INFO` shows `loading:1`, data commands get `-LOADING`, and
+/// commands that would act on the dataset part loaded (`DEBUG RELOAD`,
+/// `REPLICAOF`, turning AOF on) are refused too. Clients connected during
+/// the load stay connected and see the whole dataset once it is loaded. A
+/// `SHUTDOWN` during the load exits at once without saving. Rudis used to
+/// load before running its event loops: clients and health checks hung
+/// without a reply until the load ended.
+#[test]
+fn test_server_answers_clients_while_loading_at_startup_e2e() {
+    let port = 16926;
+    let dir = std::env::temp_dir().join(format!("rudis-loadserve-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let base = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&base, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["DEBUG", "POPULATE", "20000"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let rdb = dir.join("dump.rdb");
+
+    let start_slow = |delay_us: u32| {
+        let conf = dir.join("slow.conf");
+        std::fs::write(&conf, format!("save 3600 1\nkey-load-delay {delay_us}\n")).unwrap();
+        let child = rudis_bin()
+            .args(base)
+            .args(["-c", conf.to_str().unwrap()])
+            .args(DEBUG_ON)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn rudis");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let c = loop {
+            if let Ok(c) = TcpStream::connect(("127.0.0.1", port)) {
+                break c;
+            }
+            assert!(std::time::Instant::now() < deadline, "rudis did not listen");
+            thread::sleep(Duration::from_millis(20));
+        };
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        (child, c)
+    };
+
+    // 0.2 ms per key: about 2 s of loading on each shard.
+    let (mut child, mut c) = start_slow(200);
+    assert_eq!(info_field(&mut c, "loading"), "1");
+    for cmd in [
+        &["GET", "key:1"][..],
+        &["SET", "k", "v"],
+        &["DBSIZE"],
+        &["DEBUG", "RELOAD"],
+        &["REPLICAOF", "127.0.0.1", "1"],
+        &["CONFIG", "SET", "appendonly", "yes"],
+    ] {
+        let reply = resp_cmd(&mut c, cmd);
+        assert!(
+            reply.starts_with("-LOADING"),
+            "{cmd:?} during the load: {reply}"
+        );
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "LOG", "still-loading"]),
+        "+OK\r\n"
+    );
+    assert_eq!(info_field(&mut c, "loading"), "1");
+    // The same connection is served once the load is done.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while info_field(&mut c, "loading") != "0" {
+        assert!(std::time::Instant::now() < deadline, "the load did not end");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":20000\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "key:1"]), "$7\r\nvalue:1\r\n");
+    assert_eq!(info_field(&mut c, "rdb_last_load_keys_loaded"), "20000");
+    assert_eq!(resp_cmd(&mut c, &["SET", "k", "v"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["DEL", "k"]), ":1\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    // Saved again by that shutdown (`save` is set).
+    let saved = std::fs::read(&rdb).unwrap();
+
+    // SHUTDOWN during the load: exits at once, the RDB untouched (a save
+    // would write the part loaded so far over it).
+    let (mut child, mut c) = start_slow(1000);
+    assert_eq!(info_field(&mut c, "loading"), "1");
+    let start = std::time::Instant::now();
+    let _ = c.write_all(b"*1\r\n$8\r\nSHUTDOWN\r\n");
+    let status = wait_exit(&mut child, Duration::from_secs(5)).unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("SHUTDOWN during the load did not stop rudis")
+    });
+    assert!(status.success(), "{status}");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        std::fs::read(&rdb).unwrap(),
+        saved,
+        "the RDB must be left as it was"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An RDB holding empty collections, as old Redis versions could save
 /// (Redis's corrupt_empty_keys.rdb: 9 of them, including quicklists of only
 /// empty nodes), loads with those keys skipped, as in Redis; rudis refused

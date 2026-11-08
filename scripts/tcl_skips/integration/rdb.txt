@@ -7,10 +7,6 @@ failed bgsave prevents writes
 rdb_saves_consecutive_failures metric
 #
 # Known gaps (TODO, not deliberate):
-# - Rudis doesn't serve clients while it loads the dataset at startup
-#   (Redis answers INFO and -LOADING between chunks of the load): the
-#   shards load before running their event loops.
-client freed during loading
 # - Hash field deadlines come back 1-2 ms earlier after a save and load:
 #   they are held as Instants and converted through millisecond-truncated
 #   wall-clock samples (table::instant_to_unix_ms / unix_ms_to_instant).

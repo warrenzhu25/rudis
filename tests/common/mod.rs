@@ -512,7 +512,9 @@ pub fn spawn_rudis_listening_at(
     // A bare connect is not enough: right after a previous instance on the
     // same port was SIGKILLed, the kernel may still hold its io_uring
     // listener, which completes handshakes but never answers. Any reply
-    // (`+PONG`, `-NOAUTH`, `-LOADING`, ...) comes from a live server.
+    // (`+PONG`, `-NOAUTH`, ...) comes from a live server; but `-LOADING`
+    // means it is still loading its dataset, which tests wait out (like
+    // the Redis test suite's `wait_done_loading`).
     let ready = || -> bool {
         let Ok(mut s) = TcpStream::connect((ip, port)) else {
             return false;
@@ -520,7 +522,9 @@ pub fn spawn_rudis_listening_at(
         let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
         let mut buf = [0u8; 64];
         s.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok()
-            && matches!(s.read(&mut buf), Ok(n) if n > 0 && matches!(buf[0], b'+' | b'-'))
+            && matches!(s.read(&mut buf), Ok(n) if n > 0
+                && matches!(buf[0], b'+' | b'-')
+                && !buf[..n].starts_with(b"-LOADING"))
     };
     while !ready() {
         if let Some(s) = child.try_wait().unwrap() {

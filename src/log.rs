@@ -356,10 +356,24 @@ pub fn log_args(level: Level, args: std::fmt::Arguments<'_>) {
     }
 }
 
+/// Set once a thread is exiting the process for a fatal error
+/// ([`fatal_exit`]): other threads' lines are dropped from then on, so the
+/// fatal line is the last one in the log, where supervisors and the Redis
+/// test suite look for it.
+static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn write_line(line: &[u8]) {
     let mut sink = SINK.lock();
+    // Checked under the lock `fatal_exit` holds to the end, so no line can
+    // follow the fatal one.
+    if EXITING.load(Ordering::Relaxed) {
+        return;
+    }
+    write_locked(&mut sink, line);
+}
+
+fn write_locked(sink: &mut Sink, line: &[u8]) {
     if sink.path.is_empty() {
-        drop(sink);
         write_stdout(line);
         return;
     }
@@ -406,6 +420,36 @@ pub fn fatal(args: std::fmt::Arguments<'_>) {
     let msg = args.to_string();
     log_str(Level::Warning, &msg);
     eprintln!("{msg}");
+}
+
+/// Logs a fatal error like [`fatal`], as the last line of the log, and
+/// exits the process with `code`. Of several threads failing at once (every
+/// shard loading the same unreadable file), the first logs and exits; the
+/// others wait for it, since exiting from two threads at once is not safe.
+pub fn fatal_exit(args: std::fmt::Arguments<'_>, code: i32) -> ! {
+    let msg = args.to_string();
+    // Held until the process exits: no other line gets in after this one.
+    let mut sink = SINK.lock();
+    if EXITING.swap(true, Ordering::SeqCst) {
+        drop(sink);
+        loop {
+            std::thread::park();
+        }
+    }
+    if enabled(Level::Warning) {
+        let line = format_line(
+            Level::Warning,
+            &msg,
+            std::process::id(),
+            ROLE_REPLICA.load(Ordering::Relaxed),
+            &LocalTime::now(),
+            LOG_FORMAT.load(Ordering::Relaxed),
+            LOG_TIMESTAMP_FORMAT.load(Ordering::Relaxed),
+        );
+        write_locked(&mut sink, line.as_bytes());
+    }
+    eprintln!("{msg}");
+    std::process::exit(code);
 }
 
 /// The message of a caught panic payload.

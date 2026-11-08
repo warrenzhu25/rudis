@@ -81,14 +81,16 @@ pub const SHARD_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 /// like Redis does when it cannot load its data files. Serving an empty
 /// dataset instead would let the next save overwrite the original files.
 fn fatal_startup_error(shard_id: usize, msg: &str) -> ! {
-    // One line, so it is the last one logged whichever shard fails last;
-    // "Fatal error loading" is Redis's wording, which tooling looks for.
-    crate::log_fatal!(
-        "[Shard {}] FATAL: Fatal error loading the DB: {}. Refusing to start so existing data files are not overwritten. Exiting.",
-        shard_id,
-        msg
-    );
-    std::process::exit(1);
+    // One line, kept the last one logged (other shards still log while
+    // their loader runs); "Fatal error loading" is Redis's wording, which
+    // tooling looks for.
+    crate::log::fatal_exit(
+        format_args!(
+            "[Shard {}] FATAL: Fatal error loading the DB: {}. Refusing to start so existing data files are not overwritten. Exiting.",
+            shard_id, msg
+        ),
+        1,
+    )
 }
 
 /// Startup loading of one server, summed over its shards so the summary
@@ -134,8 +136,8 @@ fn note_startup_load(
     started: std::time::Instant,
     loaded: u64,
     expired: Vec<(usize, Vec<u8>)>,
+    empty_skipped: u64,
 ) {
-    let empty_skipped = crate::redis_rdb::take_empty_keys_skipped();
     let mut loads = STARTUP_LOADS.lock();
     let entry = loads.entry((base_port, aof)).or_insert(StartupLoad {
         started,
@@ -189,6 +191,261 @@ fn note_startup_load(
         // Like Redis, a master tells its replicas (through the backlog they
         // continue from) about the keys it dropped as expired while loading.
         crate::replication::propagate_expired_on_load(base_port, &expired);
+    }
+}
+
+/// A shard's dataset, built by its loader thread at startup and handed to
+/// the shard thread.
+struct LoadedDb(ShardDb);
+
+// SAFETY: every field of `ShardDb` is `Send` except `tier_manager`, an
+// `Rc` to the shard thread's tier manager, which a freshly built database
+// doesn't have yet: `LoadedDb::new` checks it is `None`, and the loader
+// thread never sets it. (The test `loaded_db_fields_are_send` checks the
+// other fields' types.)
+unsafe impl Send for LoadedDb {}
+
+impl LoadedDb {
+    fn new(db: ShardDb) -> Self {
+        assert!(
+            db.tier_manager.is_none(),
+            "a loaded database has no tier manager yet"
+        );
+        LoadedDb(db)
+    }
+}
+
+/// What a shard's startup load produced on its loader thread.
+struct StartupLoaded {
+    db: LoadedDb,
+    /// Keys (RDB) or commands (AOF) loaded.
+    loaded: u64,
+    /// Keys the RDB load dropped as already expired.
+    expired: Vec<(usize, Vec<u8>)>,
+    empty_skipped: u64,
+    /// Replication id and offset saved in the RDB, if any.
+    repl_info: Option<(String, u64)>,
+    /// Bytes the loader thread allocated and left allocated: the dataset,
+    /// which the shard thread frees from now on.
+    allocated: i64,
+    started: std::time::Instant,
+}
+
+/// Whether the server's startup has a dataset to load, the same answer on
+/// every shard: an RDB file (AOF off), or any shard's AOF (AOF on).
+fn startup_has_dataset(
+    aof_config: &crate::aof::AofConfig,
+    base_port: u16,
+    num_shards: usize,
+) -> bool {
+    if aof_config.enabled {
+        (0..num_shards).any(|i| {
+            std::fs::metadata(aof_config.dir.join(format!("appendonly-{}.aof", i)))
+                .is_ok_and(|m| m.len() > 0)
+        })
+    } else {
+        aof_config
+            .dir
+            .join(crate::config::dbfilename(base_port))
+            .exists()
+    }
+}
+
+/// Startups of a server whose shards haven't all loaded yet, by base port:
+/// how many have.
+static STARTUP_LOADS_DONE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<u16, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Records that a shard of the server on `base_port` loaded its part of
+/// the dataset; returns true for the last one.
+fn note_shard_loaded(base_port: u16, num_shards: usize) -> bool {
+    let mut done = STARTUP_LOADS_DONE.lock();
+    let n = done.entry(base_port).or_insert(0);
+    *n += 1;
+    if *n < num_shards {
+        return false;
+    }
+    done.remove(&base_port);
+    true
+}
+
+/// Loads this shard's part of the dataset (the RDB, or its AOF) on a
+/// thread of its own, so the shard's event loop serves clients meanwhile
+/// (`INFO` shows `loading:1`, data commands get `-LOADING`), as Redis
+/// serves events between chunks of its load. The thread runs on the
+/// shard's core, which is idle but for those replies. Exits the process on
+/// a load error, like a load on the shard thread did.
+fn spawn_startup_load(
+    shard_id: usize,
+    num_shards: usize,
+    port: u16,
+    base_port: u16,
+    core_id: Option<core_affinity::CoreId>,
+    aof_config: &crate::aof::AofConfig,
+) -> flume::Receiver<StartupLoaded> {
+    let (tx, rx) = flume::bounded(1);
+    let aof_enabled = aof_config.enabled;
+    let rdb_path = aof_config.dir.join(crate::config::dbfilename(base_port));
+    let aof_path = aof_config.dir.join(format!("appendonly-{}.aof", shard_id));
+    std::thread::Builder::new()
+        .name(format!("rudis-load-{}", shard_id))
+        .stack_size(SHARD_THREAD_STACK_SIZE)
+        .spawn(move || {
+            if let Some(core) = core_id {
+                core_affinity::set_for_current(core);
+            }
+            let started = std::time::Instant::now();
+            let before = crate::allocator::raw_thread_net_bytes();
+            let mut db = ShardDb::new(port).with_shard(shard_id);
+            let mut expired = Vec::new();
+            let mut repl_info = None;
+            let _ = crate::redis_rdb::take_empty_keys_skipped();
+            let loaded = if !aof_enabled {
+                let _ = crate::redis_rdb::take_loaded_repl_info();
+                crate::redis_rdb::record_expired_on_load(true);
+                let loaded = crate::table::load_rdb(&rdb_path, &mut db, shard_id, num_shards);
+                expired = crate::redis_rdb::take_expired_on_load();
+                match loaded {
+                    Ok(n) => {
+                        repl_info = crate::redis_rdb::take_loaded_repl_info();
+                        if n > 0 {
+                            crate::log_verbose!(
+                                "[Shard {}/{}] Restored {} keys from {:?}",
+                                shard_id,
+                                num_shards,
+                                n,
+                                rdb_path
+                            );
+                        }
+                        n as u64
+                    }
+                    Err(e) => fatal_startup_error(
+                        shard_id,
+                        &format!("failed to load RDB {:?}: {}", rdb_path, e),
+                    ),
+                }
+            } else {
+                match crate::aof::replay_aof(&aof_path, &mut db) {
+                    Ok(n) => {
+                        if n > 0 {
+                            crate::log_verbose!(
+                                "[Shard {}] Replayed {} commands from {:?}",
+                                shard_id,
+                                n,
+                                aof_path
+                            );
+                        }
+                        n as u64
+                    }
+                    Err(e) => fatal_startup_error(
+                        shard_id,
+                        &format!("failed to replay AOF {:?}: {}", aof_path, e),
+                    ),
+                }
+            };
+            let empty_skipped = crate::redis_rdb::take_empty_keys_skipped();
+            let allocated = crate::allocator::raw_thread_net_bytes().wrapping_sub(before);
+            let _ = tx.send(StartupLoaded {
+                db: LoadedDb::new(db),
+                loaded,
+                expired,
+                empty_skipped,
+                repl_info,
+                allocated,
+                started,
+            });
+        })
+        .expect("Failed to spawn the startup load thread");
+    rx
+}
+
+/// Opens this shard's AOF for appending when AOF is on (exits the process
+/// if it can't, like a failed load).
+async fn open_aof_writer(
+    aof_config: &crate::aof::AofConfig,
+    shard_id: usize,
+    base_port: u16,
+) -> Option<Rc<RefCell<crate::aof::AofWriter>>> {
+    if !aof_config.enabled {
+        return None;
+    }
+    let aof_path = aof_config.dir.join(format!("appendonly-{}.aof", shard_id));
+    match crate::aof::AofWriter::open(aof_path).await {
+        Ok(mut w) => {
+            w.set_progress(crate::aof::aof_progress(base_port, shard_id));
+            Some(Rc::new(RefCell::new(w)))
+        }
+        Err(e) => fatal_startup_error(
+            shard_id,
+            &format!("failed to open AOF for appending: {}", e),
+        ),
+    }
+}
+
+/// Waits for this shard's loader thread ([`spawn_startup_load`]), then
+/// swaps the loaded dataset in and opens the AOF; the last shard to get
+/// there ends the `-LOADING` window. Returns once every shard has loaded.
+#[allow(clippy::too_many_arguments)]
+async fn finish_startup_load(
+    rx: flume::Receiver<StartupLoaded>,
+    router: &Router,
+    aof_config: &crate::aof::AofConfig,
+    aof_slot: &crate::aof::AofSlot,
+    shard_id: usize,
+    num_shards: usize,
+    base_port: u16,
+    shard_port: u16,
+) {
+    let Ok(l) = rx.recv_async().await else {
+        // The loader exits the process on a load error, so it panicked.
+        fatal_startup_error(shard_id, "the load thread died");
+    };
+    {
+        let mut db = router.local_db.borrow_mut();
+        let mut loaded = l.db.0;
+        loaded.tier_manager = db.tier_manager.take();
+        *db = loaded;
+    }
+    // This thread frees the dataset from now on: count it as its memory.
+    crate::allocator::adopt_thread_bytes(l.allocated);
+    // Like Redis, continue the replication history saved with the data
+    // (PSYNC after a restart).
+    if shard_id == 0
+        && let Some((replid, offset)) = l.repl_info
+    {
+        crate::replication::get_replication_hub(shard_port).restore_saved_history(
+            &replid,
+            offset,
+            crate::redis_rdb::last_rdb_repl_stream_db(),
+            crate::replication::has_startup_replicaof(base_port),
+        );
+    }
+    note_startup_load(
+        base_port,
+        num_shards,
+        aof_config.enabled,
+        l.started,
+        l.loaded,
+        l.expired,
+        l.empty_skipped,
+    );
+    if let Some(w) = open_aof_writer(aof_config, shard_id, base_port).await {
+        aof_slot.set(Some(w.clone()));
+        spawn_aof_flusher(aof_slot.clone(), w, base_port);
+    }
+    router.publish_memory_state();
+    if note_shard_loaded(base_port, num_shards) {
+        // Every shard has its data: serve commands, and from now on a
+        // shutdown signal takes the graceful path (writes may come in).
+        crate::replication::end_startup_loading(base_port);
+        crate::shutdown::end_startup_load();
+    }
+    // What the caller starts next (a `replicaof` full sync, the cluster
+    // bus, the save schedule) acts on every shard: a shard still loading
+    // would swap its old data in over a full sync's, so wait for them all.
+    while crate::replication::is_startup_loading(base_port) {
+        monoio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 }
 
@@ -306,81 +563,24 @@ pub fn run_shard_worker(
         // 2. Pure thread-local Shard DB (no Mutex, no Arc)
         let local_db = Rc::new(RefCell::new(ShardDb::new(port).with_shard(shard_id)));
 
-        // 2.5 RDB Snapshot Restore on startup
-        // Follow Redis specification: if AOF is enabled, AOF is authoritative; otherwise load RDB.
-        if !aof_config.enabled {
-            let rdb_path = aof_config.dir.join(crate::config::dbfilename(base_port));
-            if rdb_path.exists() {
-                let started = std::time::Instant::now();
-                let _ = crate::redis_rdb::take_loaded_repl_info();
-                crate::redis_rdb::record_expired_on_load(true);
-                let _ = crate::redis_rdb::take_empty_keys_skipped();
-                let loaded = crate::table::load_rdb(&rdb_path, &mut local_db.borrow_mut(), shard_id, num_shards);
-                let expired = crate::redis_rdb::take_expired_on_load();
-                match loaded {
-                    Ok(n) => {
-                        // Like Redis, continue the replication history
-                        // saved with the data (PSYNC after a restart).
-                        if shard_id == 0
-                            && let Some((replid, offset)) = crate::redis_rdb::take_loaded_repl_info()
-                        {
-                            crate::replication::get_replication_hub(shard_port).restore_saved_history(
-                                &replid,
-                                offset,
-                                crate::redis_rdb::last_rdb_repl_stream_db(),
-                                crate::replication::has_startup_replicaof(base_port),
-                            );
-                        }
-                        if n > 0 {
-                            crate::log_verbose!("[Shard {}/{}] Restored {} keys from {:?}", shard_id, num_shards, n, rdb_path);
-                        }
-                        note_startup_load(base_port, num_shards, false, started, n as u64, expired);
-                    }
-                    Err(e) => fatal_startup_error(
-                        shard_id,
-                        &format!("failed to load RDB {:?}: {}", rdb_path, e),
-                    ),
-                }
-            }
-        }
+        // 2.5 The dataset: the RDB, or with AOF on (authoritative, as in
+        // Redis) this shard's AOF. A loader thread builds it while this
+        // shard serves (`-LOADING` for data commands until every shard has
+        // loaded); see `finish_startup_load`.
+        let pending_load = if startup_has_dataset(&aof_config, base_port, num_shards) {
+            crate::replication::begin_startup_loading(base_port);
+            Some(spawn_startup_load(shard_id, num_shards, port, base_port, core_id, &aof_config))
+        } else {
+            // Nothing to load: this shard can accept writes at once, so a
+            // shutdown signal must take the graceful path.
+            crate::shutdown::end_startup_load();
+            None
+        };
 
-        // 3. AOF Replay on startup & Open AofWriter
-        let aof_path = aof_config.dir.join(format!("appendonly-{}.aof", shard_id));
-        if aof_config.enabled {
-            let started = std::time::Instant::now();
-            match crate::aof::replay_aof(&aof_path, &mut local_db.borrow_mut()) {
-                Ok(n) => {
-                    if n > 0 {
-                        crate::log_verbose!(
-                            "[Shard {}] Replayed {} commands from {:?}",
-                            shard_id, n, aof_path
-                        );
-                    }
-                    note_startup_load(base_port, num_shards, true, started, n as u64, Vec::new());
-                }
-                Err(e) => fatal_startup_error(
-                    shard_id,
-                    &format!("failed to replay AOF {:?}: {}", aof_path, e),
-                ),
-            }
-        }
-
-        // Loaded: from here on this shard can accept writes, so a shutdown
-        // signal must take the graceful path.
-        crate::shutdown::end_startup_load();
-
-        let aof_writer = if aof_config.enabled {
-            match crate::aof::AofWriter::open(aof_path).await {
-                Ok(mut w) => {
-                    w.set_progress(crate::aof::aof_progress(base_port, shard_id));
-                    let writer = Rc::new(RefCell::new(w));
-                    Some(writer)
-                }
-                Err(e) => fatal_startup_error(
-                    shard_id,
-                    &format!("failed to open AOF for appending: {}", e),
-                ),
-            }
+        // 3. The AOF writer, once the AOF is loaded (it appends to the file
+        // the loader reads).
+        let aof_writer = if pending_load.is_none() {
+            open_aof_writer(&aof_config, shard_id, base_port).await
         } else {
             None
         };
@@ -388,18 +588,13 @@ pub fn run_shard_worker(
         // which `CONFIG SET appendonly` can swap.
         let aof_slot = crate::aof::AofSlot::new(aof_writer.clone());
         if shard_id == 0 {
-            crate::aof::set_aof_on(base_port, aof_writer.is_some());
+            crate::aof::set_aof_on(base_port, aof_config.enabled);
         }
         if let Some(w) = &aof_writer {
             spawn_aof_flusher(aof_slot.clone(), w.clone(), base_port);
         }
         // Expired keys are logged as DELs from wherever they expire.
         crate::replication::set_shard_log_context(base_port, shard_id, aof_slot.clone());
-
-        // 4. Background Cluster Bus & Gossip Engine (on Shard 0), cluster mode only.
-        if shard_id == 0 && cluster_enabled {
-            crate::cluster::start_cluster_bus(port);
-        }
 
         // Initialize NVMe Tiered Storage Manager (io_uring)
         // Under `dir` by default, like the RDB and AOF: the system temp dir
@@ -2346,21 +2541,6 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                 .join(", "),
             crate::connection::io_driver_name()
         );
-        // Redis's readiness line (log scrapers, supervisors and the Redis
-        // test harness wait for it), once every shard of this server is up.
-        {
-            static READY: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<u16, usize>>> =
-                std::sync::LazyLock::new(Default::default);
-            let mut ready = READY.lock();
-            let n = ready.entry(base_port).or_insert(0);
-            *n += 1;
-            if *n == num_shards {
-                router.calibrate_real_memory();
-                crate::log_notice!("Ready to accept connections tcp");
-                let _ = crate::shutdown::sd_notify("READY=1\n");
-            }
-        }
-
         // 4.9 Spawn TLS Accept loop if enabled
         if !tls_listeners.is_empty()
             && let Some(tls_cfg) = tls_config
@@ -2459,6 +2639,67 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     }
                 }
             });
+            }
+        }
+
+        // 5. Accept loops: one per bound address, sharing the client id sequence.
+        let next_client_id = Rc::new(std::cell::Cell::new(((shard_id as u64) << 48) + 1));
+        let mut listeners = listeners.into_iter();
+        let primary = listeners.next().expect("bind_all returns at least one listener");
+        for extra in listeners {
+            monoio::spawn(accept_loop(
+                extra,
+                next_client_id.clone(),
+                router.clone(),
+                client_registry.clone(),
+                shard_id,
+                num_shards,
+                cluster_enabled,
+            ));
+        }
+        let primary_accept = monoio::spawn(accept_loop(
+            primary,
+            next_client_id,
+            router.clone(),
+            client_registry.clone(),
+            shard_id,
+            num_shards,
+            cluster_enabled,
+        ));
+
+        // The loaded dataset replaces the empty one this shard served
+        // `-LOADING` from meanwhile.
+        if let Some(rx) = pending_load {
+            finish_startup_load(
+                rx,
+                &router,
+                &aof_config,
+                &aof_slot,
+                shard_id,
+                num_shards,
+                base_port,
+                shard_port,
+            )
+            .await;
+        }
+
+        // 4. Background Cluster Bus & Gossip Engine (on Shard 0), cluster mode only.
+        if shard_id == 0 && cluster_enabled {
+            crate::cluster::start_cluster_bus(port);
+        }
+
+        // Redis's readiness line (log scrapers, supervisors and the Redis
+        // test harness wait for it), once every shard of this server is up.
+        {
+            static READY: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<u16, usize>>> =
+                std::sync::LazyLock::new(Default::default);
+            let mut ready = READY.lock();
+            let n = ready.entry(base_port).or_insert(0);
+            *n += 1;
+            if *n == num_shards {
+                router.calibrate_real_memory();
+                crate::log_notice!("Ready to accept connections tcp");
+                let _ = crate::shutdown::sd_notify("READY=1\n");
             }
         }
 
@@ -2598,31 +2839,8 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             });
         }
 
-        // 5. Accept loops: one per bound address, sharing the client id sequence.
-        let next_client_id = Rc::new(std::cell::Cell::new(((shard_id as u64) << 48) + 1));
-        let mut listeners = listeners.into_iter();
-        let primary = listeners.next().expect("bind_all returns at least one listener");
-        for extra in listeners {
-            monoio::spawn(accept_loop(
-                extra,
-                next_client_id.clone(),
-                router.clone(),
-                client_registry.clone(),
-                shard_id,
-                num_shards,
-                cluster_enabled,
-            ));
-        }
-        accept_loop(
-            primary,
-            next_client_id,
-            router.clone(),
-            client_registry.clone(),
-            shard_id,
-            num_shards,
-            cluster_enabled,
-        )
-        .await;
+        // Until shutdown.
+        let _ = primary_accept.await;
 
         // 6. Drain, then sync the AOF for the last time.
         drain_clients(&client_registry).await;
@@ -2952,6 +3170,51 @@ fn aof_write_after_mailbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `LoadedDb` is `Send` on the grounds that every `ShardDb` field but
+    /// `tier_manager` is. The pattern is exhaustive, so a new field fails to
+    /// compile here until it is checked too.
+    #[test]
+    fn loaded_db_fields_are_send() {
+        fn send<T: Send>(_: &T) {}
+        let ShardDb {
+            table,
+            current_db,
+            tables,
+            port,
+            shard_id,
+            tier_manager: _,
+            vector_indexes,
+            semantic_caches,
+            agent_memories,
+            llm_quotas,
+            agent_checkpoints,
+            agent_tools,
+            crdt_store,
+            json_store,
+            probabilistic_store,
+            sticky_keys,
+            replica_local_keys,
+            search_indices,
+        } = ShardDb::new(1).with_shard(0);
+        send(&table);
+        send(&current_db);
+        send(&tables);
+        send(&port);
+        send(&shard_id);
+        send(&vector_indexes);
+        send(&semantic_caches);
+        send(&agent_memories);
+        send(&llm_quotas);
+        send(&agent_checkpoints);
+        send(&agent_tools);
+        send(&crdt_store);
+        send(&json_store);
+        send(&probabilistic_store);
+        send(&sticky_keys);
+        send(&replica_local_keys);
+        send(&search_indices);
+    }
 
     /// Turning a shard's AOF on puts an incremental writer in the slot and
     /// removes a stale AOF (it must not be loaded before the initial

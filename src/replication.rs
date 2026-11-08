@@ -645,6 +645,9 @@ pub struct ReplicationHub {
     worker_exit: Mutex<Option<flume::Receiver<()>>>,
     /// Set while this server loads a master's full-sync RDB.
     loading: AtomicBool,
+    /// Set while this server loads its RDB / AOF at startup (see
+    /// [`begin_startup_loading`]).
+    startup_loading: AtomicBool,
     /// Address details a connection reported before its PSYNC registered
     /// it as a replica (REPLCONF listening-port comes first), by client id.
     pending_peers: Mutex<HashMap<u64, PendingPeer>>,
@@ -1081,6 +1084,7 @@ impl ReplicationHub {
             has_shard_flows: std::sync::atomic::AtomicBool::new(false),
             psync_holes: Mutex::new(Vec::new()),
             loading: AtomicBool::new(false),
+            startup_loading: AtomicBool::new(false),
             sync_conn: Mutex::new(None),
             worker_exit: Mutex::new(None),
             pending_peers: Mutex::new(HashMap::new()),
@@ -2699,12 +2703,46 @@ pub static HAS_SLAVE_INSTANCE: AtomicBool = AtomicBool::new(false);
 /// load and only look up their server's flag while some load runs.
 static FULL_SYNC_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// True while the server on `port` loads a master's full-sync RDB, when
-/// data commands are refused with `-LOADING` like in Redis.
+/// True while the server on `port` loads a master's full-sync RDB, or its
+/// own RDB / AOF at startup, when data commands are refused with `-LOADING`
+/// like in Redis.
 #[inline]
 pub fn is_loading(port: u16) -> bool {
+    FULL_SYNC_LOADS.load(Ordering::Relaxed) != 0 && {
+        let hub = get_replication_hub(port);
+        hub.loading.load(Ordering::Relaxed) || hub.startup_loading.load(Ordering::Relaxed)
+    }
+}
+
+/// Startup: the server on `port` is about to load its dataset while it
+/// already serves clients (`INFO` shows `loading:1`, data commands get
+/// `-LOADING`). Idempotent: every shard calls it before its load.
+pub fn begin_startup_loading(port: u16) {
+    if !get_replication_hub(port)
+        .startup_loading
+        .swap(true, Ordering::SeqCst)
+    {
+        FULL_SYNC_LOADS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Startup: every shard of the server on `port` loaded its part.
+pub fn end_startup_loading(port: u16) {
+    if get_replication_hub(port)
+        .startup_loading
+        .swap(false, Ordering::SeqCst)
+    {
+        FULL_SYNC_LOADS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether the server on `port` is still loading its dataset at startup.
+#[inline]
+pub fn is_startup_loading(port: u16) -> bool {
     FULL_SYNC_LOADS.load(Ordering::Relaxed) != 0
-        && get_replication_hub(port).loading.load(Ordering::Relaxed)
+        && get_replication_hub(port)
+            .startup_loading
+            .load(Ordering::Relaxed)
 }
 
 /// How long a command waits for a full-sync load to end before it is

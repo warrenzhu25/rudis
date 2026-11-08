@@ -176,11 +176,11 @@ pub fn install_signal_handlers() {
 }
 
 extern "C" fn handle_signal(sig: libc::c_int) {
-    // While the dataset loads at startup and no shard serves clients yet,
-    // nothing can be lost (no write was accepted, no AOF is open) and the
-    // shards can't run their signal task until their load ends: exit now,
-    // as Redis does for a signal during loading, instead of after a load
-    // that can take minutes.
+    // While the dataset loads at startup, nothing can be lost (every write
+    // is refused with -LOADING, no AOF is open) and saving would overwrite
+    // the files being loaded with part of them: exit now, as Redis does for
+    // a signal during loading, instead of after a load that can take
+    // minutes.
     if LOADING_BEFORE_SERVING.load(Ordering::SeqCst) {
         const MSG: &[u8] = b"Received shutdown signal during loading, exiting now.\n";
         // SAFETY: write(2) and _exit(2) are async-signal-safe; MSG is a
@@ -196,8 +196,8 @@ extern "C" fn handle_signal(sig: libc::c_int) {
     SHUTDOWN_SIGNALLED.store(true, Ordering::SeqCst);
 }
 
-/// True from startup until the first shard finished loading the dataset
-/// and may serve clients.
+/// True from startup until every shard has loaded the dataset and the
+/// server accepts writes.
 static LOADING_BEFORE_SERVING: AtomicBool = AtomicBool::new(false);
 
 /// Startup: the shards are about to load the dataset.
@@ -205,13 +205,13 @@ pub fn begin_startup_load() {
     LOADING_BEFORE_SERVING.store(true, Ordering::SeqCst);
 }
 
-/// Startup: a shard finished loading and is about to serve. A shutdown
-/// signal from now on takes the graceful path.
+/// Startup: the dataset is loaded (or there was none) and writes may come
+/// in. A shutdown signal from now on takes the graceful path.
 pub fn end_startup_load() {
     LOADING_BEFORE_SERVING.store(false, Ordering::SeqCst);
 }
 
-/// Whether the server is still loading at startup with no shard serving.
+/// Whether the server is still loading its dataset at startup.
 pub fn loading_before_serving() -> bool {
     LOADING_BEFORE_SERVING.load(Ordering::SeqCst)
 }
@@ -352,17 +352,17 @@ mod tests {
         assert!(!take_shutdown_signal());
     }
 
-    /// Loading before any shard serves: a signal would exit at once. The
-    /// first shard done loading turns that off for good.
+    /// Loading at startup: a signal would exit at once. The end of the load
+    /// turns that off for good.
     #[test]
-    fn test_startup_load_window_closes_when_a_shard_finishes() {
+    fn test_startup_load_window_closes_once_loaded() {
         let _guard = TEST_LOCK.lock();
         assert!(!loading_before_serving());
         begin_startup_load();
         assert!(loading_before_serving());
         end_startup_load();
         assert!(!loading_before_serving());
-        // The other shards finishing later changes nothing.
+        // Ending it again changes nothing.
         end_startup_load();
         assert!(!loading_before_serving());
     }

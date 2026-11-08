@@ -28,6 +28,12 @@ detected` (§4). Alert on:
 - **Crash / `SIGKILL` / dead shard**: on restart the server loads the AOF (`appendonly yes`) or
   else `dump.rdb` from `dir`. With `appendfsync everysec` up to about a second of
   acknowledged writes can be lost; with `always`, none.
+- **Loading at startup**: while the dataset loads, the server answers: `INFO persistence`
+  shows `loading:1`, and data commands, `PING`
+  included, get `-LOADING`. For Kubernetes-style probes, count any reply (`-LOADING` too) as
+  alive, and only `+PONG` (or `loading:0`) as ready; the Dockerfile's `HEALTHCHECK` reports
+  the container unhealthy until the load ends. `SIGTERM` or `SHUTDOWN` during the load exits
+  at once without saving.
 - **Corrupt AOF tail** (torn last write): with `aof-load-truncated yes` (the default) the tail
   is cut and the server starts; with `no` it refuses to start and logs the offset. A corruption
   in the middle of the file always refuses: restore the AOF from a backup, or start from

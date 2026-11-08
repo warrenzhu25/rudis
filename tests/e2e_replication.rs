@@ -7788,3 +7788,107 @@ fn test_demotion_unblocks_wait_and_waitaof_e2e() {
         );
     }
 }
+
+/// A replica restarted on a dataset of its own, with `replicaof` in its
+/// config, starts its full sync only once every shard has loaded. The sync
+/// used to start as soon as shard 0 had loaded: a slower shard then swapped
+/// its old keys in over the ones the sync had just loaded, and the replica
+/// kept keys its master doesn't have.
+#[test]
+fn test_replica_syncs_only_after_every_shard_loaded_e2e() {
+    let (mport, rport) = (17061u16, 17062u16);
+    let base = std::env::temp_dir().join(format!("rudis-loadsync-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (mdir, rdir) = (base.join("m"), base.join("r"));
+    std::fs::create_dir_all(&mdir).unwrap();
+    std::fs::create_dir_all(&rdir).unwrap();
+    let args = |port: &str, dir: &std::path::Path| -> Vec<String> {
+        [
+            "--port",
+            port,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--dir",
+            dir.to_str().unwrap(),
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let (mp, rp) = (mport.to_string(), rport.to_string());
+    let margs = args(&mp, &mdir);
+    let margs: Vec<&str> = margs.iter().map(String::as_str).collect();
+    // Killed if the test fails midway, so no server outlives it.
+    struct Kill(Vec<std::process::Child>);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            for c in &mut self.0 {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+    let mut nodes = Kill(vec![spawn_rudis_listening(&margs, mport)]);
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    assert_eq!(resp_cmd(&mut m, &["SET", "only-on-master", "1"]), "+OK\r\n");
+
+    // The replica's own dataset: keys all on shard 1 (a hash tag), so
+    // shard 0 loads at once and shard 1 slowly.
+    let tag = (0..)
+        .map(|i| format!("{{t{i}}}"))
+        .find(|t| target_shard(t.as_bytes(), 2) == 1)
+        .unwrap();
+    let rargs = args(&rp, &rdir);
+    let rargs: Vec<&str> = rargs.iter().map(String::as_str).collect();
+    nodes.0.push(spawn_rudis_listening(&rargs, rport));
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    for chunk in 0..6 {
+        let keys: Vec<String> = (chunk * 500..(chunk + 1) * 500)
+            .map(|i| format!("{tag}:{i}"))
+            .collect();
+        let mut cmd = vec!["MSET"];
+        for k in &keys {
+            cmd.extend([k.as_str(), "x"]);
+        }
+        assert_eq!(resp_cmd(&mut r, &cmd), "+OK\r\n");
+    }
+    assert_eq!(resp_cmd(&mut r, &["SAVE"]), "+OK\r\n");
+    drop(r);
+    shutdown_and_wait(rport, &mut nodes.0[1]);
+
+    // 1 ms per key: shard 1 loads for about 3 s.
+    let conf = rdir.join("replica.conf");
+    std::fs::write(
+        &conf,
+        format!("key-load-delay 1000\nreplicaof 127.0.0.1 {mport}\n"),
+    )
+    .unwrap();
+    // `-c` first: the values of a config directive like `--dir` run up to
+    // the next `--` option.
+    let rargs: Vec<&str> = ["-c", conf.to_str().unwrap()]
+        .into_iter()
+        .chain(rargs.iter().copied())
+        .collect();
+    nodes.0[1] = spawn_rudis_listening(&rargs, rport);
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let info = resp_cmd_full(&mut r, &["INFO", "replication"]);
+        if info.contains("master_link_status:up") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never synced: {info}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "SET", "key-load-delay", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut r, &["DBSIZE"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut r, &["GET", "only-on-master"]), "$1\r\n1\r\n");
+    drop((m, r));
+    shutdown_and_wait(rport, &mut nodes.0[1]);
+    shutdown_and_wait(mport, &mut nodes.0[0]);
+    let _ = std::fs::remove_dir_all(&base);
+}

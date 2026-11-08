@@ -60,19 +60,40 @@ thread_local! {
         .zip(tikv_jemalloc_ctl::thread::deallocatedp::read().ok());
 }
 
-/// Bytes this thread allocated minus bytes it freed, since it started.
+thread_local! {
+    /// Bytes other threads allocated on this thread's behalf (see
+    /// [`adopt_thread_bytes`]), counted in [`thread_net_bytes`].
+    static ADOPTED_BYTES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes this thread allocated minus bytes it freed, since it started,
+/// plus what it adopted from other threads ([`adopt_thread_bytes`]).
 /// Memory freed by another thread stays charged to the allocating thread
 /// (and goes negative on the freeing one), so only the sum over all
 /// threads is meaningful as a total; the change across a stretch of code
 /// on one thread is exact for what that code allocated and freed.
 #[inline]
 pub fn thread_net_bytes() -> i64 {
+    raw_thread_net_bytes().wrapping_add(ADOPTED_BYTES.try_with(|b| b.get()).unwrap_or(0))
+}
+
+/// [`thread_net_bytes`] without the adopted bytes: what this thread itself
+/// allocated minus what it freed.
+#[inline]
+pub fn raw_thread_net_bytes() -> i64 {
     THREAD_COUNTERS
         .try_with(|c| {
             c.as_ref()
                 .map_or(0, |(a, d)| a.get().wrapping_sub(d.get()) as i64)
         })
         .unwrap_or(0)
+}
+
+/// Charges `bytes` that another thread allocated (and handed over, like a
+/// dataset a loader thread built) to this thread from now on, so its
+/// [`thread_net_bytes`] stays its real share when it frees them.
+pub fn adopt_thread_bytes(bytes: i64) {
+    let _ = ADOPTED_BYTES.try_with(|b| b.set(b.get().wrapping_add(bytes)));
 }
 
 /// Bytes currently allocated by the whole process (jemalloc

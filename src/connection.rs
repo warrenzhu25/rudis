@@ -11652,6 +11652,27 @@ fn allowed_while_loading(cmd: &Command) -> bool {
         )
 }
 
+/// Commands allowed while loading ([`allowed_while_loading`]) that are
+/// still refused during the startup load, because they would act on a
+/// dataset only part loaded or replace it under the load: replication
+/// (a full sync would be overwritten by the load), saving or reloading
+/// (`DEBUG RELOAD`, ...), and turning AOF on (its rewrite would write the
+/// part loaded so far).
+fn refused_during_startup_load(cmd: &Command) -> bool {
+    match cmd {
+        Command::Replicaof { .. } => true,
+        Command::Debug(args) => !args.first().is_some_and(|sub| {
+            [b"log".as_slice(), b"sleep", b"help"]
+                .iter()
+                .any(|ok| sub.eq_ignore_ascii_case(ok))
+        }),
+        Command::ConfigSet(pairs) => pairs
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(b"appendonly")),
+        _ => false,
+    }
+}
+
 pub struct WithCurrentDb<'a, F> {
     pub router: &'a Router,
     pub db: usize,
@@ -12167,7 +12188,9 @@ async fn execute_command_inner(
     }
 
     if crate::replication::is_loading(router.base_port)
-        && !allowed_while_loading(&cmd)
+        && (!allowed_while_loading(&cmd)
+            || (crate::replication::is_startup_loading(router.base_port)
+                && refused_during_startup_load(&cmd)))
         && !crate::replication::wait_out_short_load(router.base_port).await
     {
         out.extend_from_slice(b"-LOADING Redis is loading the dataset in memory\r\n");
@@ -20030,6 +20053,13 @@ async fn execute_command_inner(
             save, now, force, ..
         } => {
             crate::log_warning!("User requested shutdown...");
+            if crate::shutdown::loading_before_serving() {
+                // Like Redis: no save while loading (it would overwrite the
+                // files being loaded with part of them), and nothing to
+                // flush, since every write was refused.
+                crate::log_warning!("Shutting down during loading, exiting now without saving.");
+                std::process::exit(0);
+            }
             let _running = crate::shutdown::ShutdownCommand::begin();
             if !now && !crate::replication::wait_replicas_before_shutdown(router.base_port, router.num_shards).await {
                 // SHUTDOWN ABORT (already logged).
