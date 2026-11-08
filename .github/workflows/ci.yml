@@ -200,16 +200,19 @@ jobs:
         run: |
           set -o pipefail
           SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
-            integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown \
+            integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown,integration/replication-3,integration/replication-4,integration/psync2-reg \
             2>&1 | tee -a /tmp/rudis_tcl_suites.log
 
-      # Persistence suites: AOF writes racing redis-benchmark load, and
-      # Redis-written RDBs with ziplist encodings loading.
+      # Persistence suites: AOF writes racing redis-benchmark load,
+      # Redis-written RDBs loading, corrupt RESTORE payloads and RDBs
+      # (including a fuzzer: the server must never crash), and WAIT/WAITAOF.
+      # Tests that don't apply, and known gaps, are listed with the reason
+      # in scripts/tcl_skips/; scripts/tcl_patches/ adapts some suites.
       - name: Run the persistence integration suites
         run: |
           set -o pipefail
           SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
-            integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load \
+            integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load,integration/rdb,integration/corrupt-dump,integration/corrupt-dump-fuzzer,unit/wait,unit/violations \
             2>&1 | tee -a /tmp/rudis_tcl_suites.log
 
       # Annotations are visible on the run page without downloading logs.

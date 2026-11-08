@@ -71,8 +71,8 @@ full_ci() { # rev
     # Job redis_tcl_suites.
     step "release build" cargo build --release
     step "TCL core suites" netns "SKIP_BUILD=1 bash scripts/run_redis_test_suite.sh 16379 all"
-    step "TCL replication integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown"
-    step "TCL persistence integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load"
+    step "TCL replication integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown,integration/replication-3,integration/replication-4,integration/psync2-reg"
+    step "TCL persistence integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load,integration/rdb,integration/corrupt-dump,integration/corrupt-dump-fuzzer,unit/wait,unit/violations"
     # Job supply_chain.
     step "cargo deny check" cargo deny check
     # The coverage step of build_and_test re-runs the tests instrumented.

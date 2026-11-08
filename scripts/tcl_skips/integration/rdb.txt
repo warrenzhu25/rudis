@@ -1,0 +1,27 @@
+# integration/rdb tests that don't apply to rudis.
+#
+# BGSAVE doesn't fork: there is no child process to report copy-on-write
+# sizes or to kill to make a save fail.
+Test child sending info
+failed bgsave prevents writes
+rdb_saves_consecutive_failures metric
+#
+# Known gaps (TODO, not deliberate):
+# - Rudis doesn't serve clients while it loads the dataset at startup
+#   (Redis answers INFO and -LOADING between chunks of the load): the
+#   shards load before running their event loops.
+client freed during loading
+# - Hash field deadlines come back 1-2 ms earlier after a save and load:
+#   they are held as Instants and converted through millisecond-truncated
+#   wall-clock samples (table::instant_to_unix_ms / unix_ms_to_instant).
+HFE - save and load expired fields, expired soon after, or long after (listpack)
+HFE - save and load expired fields, expired soon after, or long after (dict)
+# - rdb_last_load_keys_loaded is only set by the startup load, not by
+#   DEBUG RELOAD or a replica's full sync.
+save listpack, load dict
+save dict, load listpack
+lazy field expiry after load, (listpack)
+lazy field expiry after load, (dict)
+# - INFO stats has no expired_subkeys (hash fields expired).
+active field expiry after load, (listpack)
+active field expiry after load, (dict)

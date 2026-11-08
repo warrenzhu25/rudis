@@ -1,0 +1,6 @@
+# unit/networking tests that don't apply to rudis.
+#
+# Rudis listens on TCP only (no unixsocket): these start servers on a Unix
+# socket and wait on it forever.
+A second server does not replace an active Unix socket
+A stale Unix socket is replaced and accepts connections

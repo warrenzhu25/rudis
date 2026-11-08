@@ -786,6 +786,14 @@ Rudis is continuously validated against **49 official Redis/Valkey TCL test suit
 | **Auth, ACLs & Protocol** | `unit/auth`, `unit/acl`, `unit/acl-v2`, `unit/protocol`, `unit/quit`, `unit/limits`, `unit/obuf-limits`, `unit/replybufsize`, `unit/querybuf` |
 | **Introspection & Telemetry** | `unit/info`, `unit/info-command`, `unit/introspection`, `unit/introspection-2`, `unit/slowlog`, `unit/latency-monitor`, `unit/pause`, `unit/other`, `unit/printver` |
 
+Suites that start their own servers (replication, persistence, corrupt payloads) run through
+[`scripts/run_redis_integration_suite.sh`](scripts/run_redis_integration_suite.sh); CI runs
+`integration/{replication-2,replication-3,replication-4,replication-psync,block-repl,psync2,psync2-pingoff,psync2-master-restart,psync2-reg,failover,shutdown,aof-race,convert-ziplist-hash-on-load,convert-ziplist-zset-on-load,rdb,corrupt-dump,corrupt-dump-fuzzer}`
+and `unit/{wait,violations}`. Tests that don't apply to rudis (no `fork()`, no Unix socket, ...)
+and known gaps are listed, each with its reason, in [`scripts/tcl_skips/`](scripts/tcl_skips/);
+[`scripts/tcl_patches/`](scripts/tcl_patches/) adapts a suite where rudis's behavior differs on
+purpose (it refuses corrupt `RESTORE` payloads up front instead of crashing on them later).
+
 ---
 
 ## Documentation & Contributor Guides

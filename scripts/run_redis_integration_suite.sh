@@ -13,8 +13,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC_TEST_DIR="$REPO_ROOT/tests/redis-tests"
 # The suites run from a copy of the test tree, so the generated wrapper and
 # the patch below never touch the checked-in tree. Logs end up in
-# $TEST_DIR/tests/tmp.
-TEST_DIR="$REPO_ROOT/target/redis-tests-integ"
+# $TEST_DIR/tests/tmp. Runs at the same time need their own RUDIS_TCL_DIR
+# (each run refreshes the copy).
+TEST_DIR="${RUDIS_TCL_DIR:-$REPO_ROOT/target/redis-tests-integ}"
 SUITES="${1:?usage: $0 suite[,suite...]}"
 CLIENTS="${CLIENTS:-1}"
 THREADS="${RUDIS_THREADS:-4}"
@@ -57,6 +58,11 @@ sed -i \
 sed -i \
     -e 's/redis-benchmark -q -s \[srv unixsocket\]/redis-benchmark -q -h [srv host] -p [srv port]/' \
     "$TEST_DIR/tests/integration/aof-race.tcl"
+# Per-suite adaptations to rudis (each file says why):
+# scripts/tcl_patches/<suite>.sed edits the copy of tests/<suite>.tcl.
+for patch in $(cd "$REPO_ROOT/scripts/tcl_patches" 2> /dev/null && find . -name '*.sed'); do
+    sed -i -f "$REPO_ROOT/scripts/tcl_patches/$patch" "$TEST_DIR/tests/${patch%.sed}.tcl" || exit 1
+done
 
 mkdir -p "$TEST_DIR/src"
 # Suites also run redis-cli, redis-benchmark and redis-check-{rdb,aof};
@@ -102,9 +108,16 @@ PASSED=()
 IFS=',' read -ra LIST <<< "$SUITES"
 for suite in "${LIST[@]}"; do
     echo ">>> Running integration suite: $suite"
+    # Tests skipped for a known, documented reason (each list says why):
+    # scripts/tcl_skips/<suite>.txt, one exact test name per line ('#'
+    # lines are comments: they never match a test name).
+    skips=()
+    if [ -f "$REPO_ROOT/scripts/tcl_skips/$suite.txt" ]; then
+        skips=(--skipfile "$REPO_ROOT/scripts/tcl_skips/$suite.txt")
+    fi
     if tclsh test_helper.tcl --clients "$CLIENTS" --ignore-encoding \
         --tags "-needs:config-rewrite -needs:pfdebug -valgrind -modules" \
-        --single "$suite" ${EXTRA_ARGS:-}; then
+        --single "$suite" "${skips[@]}" ${EXTRA_ARGS:-}; then
         PASSED+=("$suite")
     else
         FAILED+=("$suite")

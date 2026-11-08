@@ -1,0 +1,6 @@
+# integration/replication-4 tests that don't apply to rudis.
+#
+# Relies on DEBUG REPLICATE (sending a made-up command down the replication
+# stream) and Redis's "== CRITICAL ==" log of the replica's error;
+# rudis has neither.
+Data divergence can happen under default conditions

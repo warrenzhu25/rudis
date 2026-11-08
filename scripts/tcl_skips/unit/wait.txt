@@ -1,0 +1,5 @@
+# unit/wait tests that don't apply to rudis.
+#
+# BGSAVE doesn't fork: the test kills the save's child process to let a
+# postponed AOF rewrite start.
+WAITAOF local if AOFRW was postponed
