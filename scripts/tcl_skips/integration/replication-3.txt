@@ -1,9 +1,12 @@
 # integration/replication-3 tests skipped for rudis.
 #
-# Known gap (TODO, not deliberate): on a writable replica
-# (replica-read-only no) reads delete keys from the master once they
-# expire, where Redis only hides them until the master's DEL (as rudis
-# does on a read-only replica: replication::hide_expired_keys).
+# Deliberate: on a writable replica (replica-read-only no) rudis deletes a
+# key from the master once it expires, on reads too, where Redis only
+# hides it from reads until the master's DEL (rudis does hide it on a
+# read-only replica: replication::hide_expired_keys). Rudis's write paths
+# take "not found" to mean the key is absent and insert it afresh, so a
+# write that found a hidden key would store a second entry for it; Redis
+# tells reads from writes at each lookup. See docs/differences.md.
 Writable replica doesn't return expired keys
 #
 # Known gap (TODO, not investigated yet): after PFCOUNT of an expired key

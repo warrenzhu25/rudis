@@ -7892,3 +7892,82 @@ fn test_replica_syncs_only_after_every_shard_loaded_e2e() {
     shutdown_and_wait(mport, &mut nodes.0[0]);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// The first write after a replica turns writable (`CONFIG SET
+/// replica-read-only no`) or is promoted (`REPLICAOF NO ONE`) deletes the
+/// expired key it finds and starts afresh: `INCR` gives 1, with no TTL.
+/// The replica's shards saw the change only at their next cron (100 ms),
+/// so such a write found the key hidden, as on a read-only replica, and
+/// inserted a second entry for it (a debug build panicked).
+#[test]
+fn test_first_write_after_replica_turns_writable_deletes_expired_key_e2e() {
+    let (mport, rport) = (17063u16, 17064u16);
+    struct Kill(Vec<std::process::Child>);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            for c in &mut self.0 {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+    let (mp, rp) = (mport.to_string(), rport.to_string());
+    let master_of = format!("127.0.0.1 {mport}");
+    let mut nodes = Kill(vec![spawn_rudis_listening(
+        &["--port", &mp, "--threads", "2", "--no-pin"],
+        mport,
+    )]);
+    nodes.0.push(spawn_rudis_listening(
+        &[
+            "--port",
+            &rp,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--replicaof",
+            &master_of,
+        ],
+        rport,
+    ));
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    wait_for_master_link(&mut r);
+    // The master doesn't expire (or DEL) them on its own.
+    assert_eq!(
+        resp_cmd(&mut m, &["DEBUG", "SET-ACTIVE-EXPIRE", "0"]),
+        "+OK\r\n"
+    );
+    // Keys on every shard, half for each case below.
+    let keys: Vec<String> = (0..40).map(|i| format!("key{i}")).collect();
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut m, &["SET", k, "5", "PX", "10"]), "+OK\r\n");
+    }
+    wait_for("keys replicated and expired", || {
+        resp_cmd(&mut r, &["DBSIZE"]) == ":40\r\n"
+            && resp_cmd(&mut r, &["EXISTS", "key0", "key39"]) == ":0\r\n"
+    });
+    let (writable, promoted) = keys.split_at(20);
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "SET", "replica-read-only", "no"]),
+        "+OK\r\n"
+    );
+    for k in writable {
+        assert_eq!(resp_cmd(&mut r, &["INCR", k]), ":1\r\n", "{k}");
+        assert_eq!(resp_cmd(&mut r, &["TTL", k]), ":-1\r\n", "{k}");
+    }
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "SET", "replica-read-only", "yes"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut r, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    for k in promoted {
+        assert_eq!(resp_cmd(&mut r, &["INCR", k]), ":1\r\n", "{k}");
+        assert_eq!(resp_cmd(&mut r, &["TTL", k]), ":-1\r\n", "{k}");
+    }
+    assert_eq!(resp_cmd(&mut r, &["DBSIZE"]), ":40\r\n");
+    drop((m, r));
+    shutdown_and_wait(rport, &mut nodes.0[1]);
+    shutdown_and_wait(mport, &mut nodes.0[0]);
+}

@@ -3594,15 +3594,17 @@ thread_local! {
 
 type ShardLog = (u16, usize, crate::aof::AofSlot);
 
+#[cfg(test)]
 thread_local! {
-    /// Whether this shard thread belongs to a read-only replica (refreshed
-    /// by the shard's cron): see [`hide_expired_keys`].
-    static READONLY_REPLICA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: makes [`hide_expired_keys`] true on this thread.
+    static TEST_READONLY_REPLICA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Records whether this shard thread's server is a read-only replica.
+/// Tests: makes this thread behave as a shard of a read-only replica for
+/// [`hide_expired_keys`].
+#[cfg(test)]
 pub fn set_readonly_replica(v: bool) {
-    READONLY_REPLICA.with(|c| c.set(v));
+    TEST_READONLY_REPLICA.with(|c| c.set(v));
 }
 
 /// Whether expired keys are to be hidden rather than deleted: on a
@@ -3610,9 +3612,28 @@ pub fn set_readonly_replica(v: bool) {
 /// key stays until its master's DEL arrives. Deleting it there could race
 /// a PERSIST or EXPIRE from the master sent just before the deadline, and
 /// lose the key the master kept.
+///
+/// Both the role and `replica-read-only` are read as they are now: the
+/// first write after `REPLICAOF NO ONE` or `CONFIG SET replica-read-only
+/// no` must delete the expired key it finds. Write paths take "not found"
+/// to mean the key is absent and insert it afresh, so a write that found a
+/// hidden key would insert a second entry for it. (They used to see a
+/// flag the shard's cron refreshed every 100 ms.) Unlike Redis, a writable
+/// replica deletes expired keys on reads too: see `docs/differences.md`.
 #[inline]
 pub fn hide_expired_keys() -> bool {
-    READONLY_REPLICA.with(|c| c.get())
+    #[cfg(test)]
+    if TEST_READONLY_REPLICA.with(|c| c.get()) {
+        return true;
+    }
+    // On a master (no replica in this process) one load decides.
+    HAS_SLAVE_INSTANCE.load(Ordering::Relaxed)
+        && crate::connection::REPLICA_READ_ONLY.load(Ordering::Relaxed)
+        && SHARD_LOG.with(|l| {
+            l.borrow()
+                .as_ref()
+                .is_some_and(|(port, _, _)| cached_hub(*port).is_slave())
+        })
 }
 
 /// Registers this shard thread's port, shard id and AOF writer (call once at
@@ -5861,6 +5882,29 @@ mod tests {
         hub.make_master();
         assert!(hub.is_master());
         assert!(!hub.is_slave());
+    }
+
+    /// `hide_expired_keys` follows the shard's server as it is now: hidden
+    /// on a read-only replica, not from the moment it is promoted (the
+    /// first write after `REPLICAOF NO ONE` must delete what it finds), and
+    /// never on a thread that isn't a shard.
+    #[test]
+    fn test_hide_expired_keys_follows_the_role_at_once() {
+        std::thread::spawn(|| {
+            assert!(!hide_expired_keys(), "not a shard thread");
+            let port = 19993;
+            let hub = get_replication_hub(port);
+            set_shard_log_context(port, 0, crate::aof::AofSlot::default());
+            assert!(!hide_expired_keys(), "a master");
+            HAS_SLAVE_INSTANCE.store(true, Ordering::Release);
+            hub.is_slave_atomic.store(true, Ordering::Release);
+            // replica-read-only is yes by default.
+            assert!(hide_expired_keys(), "a read-only replica");
+            hub.make_master();
+            assert!(!hide_expired_keys(), "promoted");
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

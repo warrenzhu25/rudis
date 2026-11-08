@@ -653,11 +653,6 @@ pub fn run_shard_worker(
                 // for its master's DEL (its own expiry could race a PERSIST
                 // or EXPIRE from the master and lose the key).
                 let is_replica = crate::replication::get_replication_hub(base_port).is_slave();
-                crate::replication::set_readonly_replica(
-                    is_replica
-                        && crate::connection::REPLICA_READ_ONLY
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                );
                 if !is_replica {
                     let mut db = active_db.borrow_mut();
                     db.active_expire_cycle();

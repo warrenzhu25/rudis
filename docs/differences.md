@@ -77,6 +77,15 @@ This document summarizes the architectural, operational, and semantic difference
 ### Replication Backlog Without Replicas
 * As in Redis, a master keeps its backlog for `repl-backlog-ttl` seconds after its last replica leaves, then releases it (new replication id; later replicas full-sync). Every rudis shard appends each write to that one backlog (~2.5x SET throughput on 8 threads), so it is released as soon as it is unused for that long, and after a restart from an RDB a master keeps it only for 60 seconds (at most `repl-backlog-ttl`) unless a replica comes back: Redis keeps it for `repl-backlog-ttl` there too. Replicas returning within the window still continue with a partial resync. `INFO replication`'s `repl_backlog_active` shows the state.
 
+### Expired Keys on a Writable Replica
+* As in Redis, a read-only replica hides a key from its master once it expires (reads find it
+  gone) but keeps it until the master's `DEL`. On a writable replica (`replica-read-only no`)
+  rudis deletes such a key when any command finds it, reads included, where Redis deletes it
+  only for a write and keeps hiding it from reads. Rudis's write paths take a key they can't
+  find to be absent and insert it afresh, so hiding it from a write would store a second entry
+  for the key. Like Redis, the first write after `REPLICAOF NO ONE` or `CONFIG SET
+  replica-read-only no` starts afresh from an expired key (`INCR` gives 1, with no TTL).
+
 ### Loading the Dataset at Startup
 * As in Redis, the server serves clients while it loads its RDB / AOF at startup: `INFO` shows
   `loading:1`, and commands Redis allows while loading (`INFO`, `CONFIG GET`, `AUTH`, `CLIENT`,
