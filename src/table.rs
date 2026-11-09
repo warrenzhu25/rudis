@@ -21657,9 +21657,13 @@ mod tests {
             Bytes::from_static(b"bf"),
             crate::probabilistic::BloomFilter::new(10, 0.01),
         );
-        replica
-            .load_full_sync_rdb(&body(&chunk), 0, 1, None)
-            .unwrap();
+        // It reports the keys it loaded (INFO rdb_last_load_keys_loaded).
+        assert_eq!(
+            replica
+                .load_full_sync_rdb(&body(&chunk), 0, 1, None)
+                .unwrap(),
+            1
+        );
         assert!(replica.table.exists(b"fresh"));
         assert!(!replica.table.exists(b"stale"));
         assert!(replica.probabilistic_store.bloom_filters.is_empty());

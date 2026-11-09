@@ -5317,15 +5317,21 @@ impl Router {
     /// shard fails to load it, every shard is left empty and the error is
     /// returned, so nothing half loaded is served as in sync.
     pub async fn restore_rdb_bytes(&self, data: Bytes) -> Result<(), String> {
-        let result = self.load_full_sync_rdb_on_all_shards(data).await;
-        if result.is_err() {
-            // Shards that did load drop their part too.
-            let _ = self.load_full_sync_rdb_on_all_shards(Bytes::new()).await;
+        match self.load_full_sync_rdb_on_all_shards(data).await {
+            Ok(loaded) => {
+                crate::server::set_rdb_last_load_keys_loaded(self.base_port, loaded);
+                Ok(())
+            }
+            Err(e) => {
+                // Shards that did load drop their part too.
+                let _ = self.load_full_sync_rdb_on_all_shards(Bytes::new()).await;
+                Err(e)
+            }
         }
-        result
     }
 
-    async fn load_full_sync_rdb_on_all_shards(&self, data: Bytes) -> Result<(), String> {
+    /// Loads `data` on every shard; the keys loaded in all.
+    async fn load_full_sync_rdb_on_all_shards(&self, data: Bytes) -> Result<u64, String> {
         let aof_dir = self.aof().as_ref().map(|_| self.db_dir.clone());
         self.forget_global_search_indices();
         let mut responders = Vec::new();
@@ -5355,7 +5361,7 @@ impl Router {
                 .recv_async()
                 .await
                 .unwrap_or_else(|_| Err("shard dropped the load".to_string()));
-            result = result.and(shard_result);
+            result = result.and_then(|n| shard_result.map(|m| n + m));
         }
         result
     }

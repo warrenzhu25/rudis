@@ -123,9 +123,25 @@ static STARTUP_LOADS: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<(u16, bool), StartupLoad>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// Keys the last startup RDB load restored (INFO rdb_last_load_keys_loaded).
-pub static LAST_LOAD_KEYS_LOADED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+/// `rdb_last_load_keys_loaded` of INFO persistence, by base port.
+static LAST_LOAD_KEYS_LOADED: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<u16, u64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Keys the last RDB load of the server on `port` restored: the startup
+/// load, DEBUG RELOAD, or a replica's full sync (as in Redis).
+pub fn rdb_last_load_keys_loaded(port: u16) -> u64 {
+    LAST_LOAD_KEYS_LOADED
+        .lock()
+        .get(&port)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Records the keys an RDB load of the server on `port` restored.
+pub fn set_rdb_last_load_keys_loaded(port: u16, loaded: u64) {
+    LAST_LOAD_KEYS_LOADED.lock().insert(port, loaded);
+}
 
 /// Records that a shard of the server on `base_port` finished loading
 /// `loaded` keys (RDB) or commands (AOF), having started at `started`.
@@ -169,7 +185,7 @@ fn note_startup_load(
             crate::log_notice!("DB loaded from append only file: {:.3} seconds", secs);
         }
     } else {
-        LAST_LOAD_KEYS_LOADED.store(loaded, std::sync::atomic::Ordering::Relaxed);
+        set_rdb_last_load_keys_loaded(base_port, loaded);
         if empty_skipped > 0 {
             crate::log_notice!(
                 "Done loading RDB, keys loaded: {}, keys expired: {}, empty keys skipped: {}.",
@@ -3164,6 +3180,20 @@ fn aof_write_after_mailbox(
 
 #[cfg(test)]
 mod tests {
+    /// rdb_last_load_keys_loaded is kept per server (base port): servers in
+    /// one process (a master and its replica in tests) don't share it.
+    #[test]
+    fn test_rdb_last_load_keys_loaded_is_per_server() {
+        let (a, b) = (61_001, 61_002);
+        assert_eq!(super::rdb_last_load_keys_loaded(a), 0);
+        super::set_rdb_last_load_keys_loaded(a, 7);
+        super::set_rdb_last_load_keys_loaded(b, 3);
+        assert_eq!(super::rdb_last_load_keys_loaded(a), 7);
+        assert_eq!(super::rdb_last_load_keys_loaded(b), 3);
+        super::set_rdb_last_load_keys_loaded(a, 0);
+        assert_eq!(super::rdb_last_load_keys_loaded(a), 0);
+    }
+
     use super::*;
 
     /// `LoadedDb` is `Send` on the grounds that every `ShardDb` field but

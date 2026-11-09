@@ -769,7 +769,8 @@ pub enum ShardMessage {
         data: Bytes,
         /// The AOF directory when AOF is on, to rewrite it after the load.
         aof_dir: Option<std::path::PathBuf>,
-        responder: flume::Sender<Result<(), String>>,
+        /// The keys loaded.
+        responder: flume::Sender<Result<u64, String>>,
     },
     ExecuteReplicaCmd {
         db: usize,
@@ -2536,14 +2537,14 @@ impl ShardDb {
             &std::path::Path,
             &std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>,
         )>,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         poison_aof_image("a full resync replaced the dataset during the rewrite");
         self.select_db(0);
         self.flushall();
         // The file's index definitions replace ours (a FLUSHALL keeps them).
         self.search_indices.clear();
         let loaded = crate::table::load_rdb_bytes(data, self, shard_id, num_shards)
-            .map(|_| ())
+            .map(|n| n as u64)
             .map_err(|e| {
                 self.select_db(0);
                 self.flushall();

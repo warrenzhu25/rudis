@@ -12,10 +12,6 @@ rdb_saves_consecutive_failures metric
 #   wall-clock samples (table::instant_to_unix_ms / unix_ms_to_instant).
 HFE - save and load expired fields, expired soon after, or long after (listpack)
 HFE - save and load expired fields, expired soon after, or long after (dict)
-# - rdb_last_load_keys_loaded is only set by the startup load, not by
-#   DEBUG RELOAD or a replica's full sync.
-save listpack, load dict
-save dict, load listpack
 lazy field expiry after load, (listpack)
 lazy field expiry after load, (dict)
 # - INFO stats has no expired_subkeys (hash fields expired).

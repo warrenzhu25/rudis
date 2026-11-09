@@ -13257,7 +13257,7 @@ async fn execute_command_inner(
                 snap.last_save_unix(),
                 if snap.last_save_ok() { "ok" } else { "err" },
                 crate::server::rdb_last_load_keys_expired(router.base_port),
-                crate::server::LAST_LOAD_KEYS_LOADED.load(std::sync::atomic::Ordering::Relaxed),
+                crate::server::rdb_last_load_keys_loaded(router.base_port),
                 u8::from(router.aof().is_some()),
                 u8::from(aof_rw.in_progress()),
                 // The initial rewrite of AOF turned on at runtime, waiting

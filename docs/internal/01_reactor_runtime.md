@@ -1023,7 +1023,7 @@ check.
 | :--- | :--- | :--- |
 | `src/main.rs` | `Args`, `RUDIS_FLAGS`, `split_redis_server_args`, `get_process_affinity_cores`, `main` | Command-line parsing (Rudis and redis-server style), config merge, process-wide setup, port probe, mesh creation, supervised shard start and join. |
 | `src/server.rs` | `run_shard_worker`, `supervise_shard`, `SHARD_THREAD_STACK_SIZE`, `shard_uring_builder` | Per-shard event loop, listeners, restore, background tasks, mailbox task, accept loops, shutdown tail; dead-shard detection. |
-| `src/server.rs` | `fatal_startup_error`, `note_startup_load`, `StartupLoad`, `STARTUP_LOADS`, `LAST_LOAD_KEYS_LOADED`, `rdb_last_load_keys_expired`, `READY` | Fatal load handling, the once-per-server load summary, readiness count. |
+| `src/server.rs` | `fatal_startup_error`, `note_startup_load`, `StartupLoad`, `STARTUP_LOADS`, `rdb_last_load_keys_loaded` (any RDB load, per port), `rdb_last_load_keys_expired`, `READY` | Fatal load handling, the once-per-server load summary, readiness count. |
 | `src/server.rs` | `set_shard_appendonly`, `spawn_aof_flusher`, `everysec_fsync` | Runtime AOF on/off per shard; the 5 ms flush / 1 s fsync task. |
 | `src/server.rs` | `accept_loop`, `accept_until_shutdown`, `accept_polling`, `ACCEPT_SHUTDOWN_POLL`, `TLS_HANDSHAKE_TIMEOUT`, `ADOPTED_CLIENT_SEQ`, `handle_connection` | Accepting plain and TLS clients without losing connections; client-id ranges. |
 | `src/server.rs` | `drain_clients`, `aof_write_after_mailbox`, `is_plain_data_message`, `CatchUnwind`, `catch_unwind_async` | Shutdown drain, AOF write-through after a mailbox burst, panic isolation. |

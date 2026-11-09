@@ -2964,6 +2964,30 @@ fn test_absolute_deadlines_survive_reload_and_rewrite_exactly_e2e() {
     check(&mut c, "after BGREWRITEAOF + DEBUG LOADAOF");
 }
 
+/// rdb_last_load_keys_loaded counts the keys of the last RDB load: DEBUG
+/// RELOAD too, not only the startup load (Redis's integration/rdb HFE
+/// tests read it after DEBUG RELOAD).
+#[test]
+fn test_debug_reload_sets_rdb_last_load_keys_loaded_e2e() {
+    let port = 29853;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for i in 0..30 {
+        resp_cmd_all(&mut c, &["SET", &format!("k{i}"), "v"]);
+    }
+    resp_cmd_all(&mut c, &["SELECT", "3"]);
+    resp_cmd_all(&mut c, &["SET", "other-db", "v"]);
+    resp_cmd_all(&mut c, &["SELECT", "0"]);
+    assert_eq!(resp_cmd_all(&mut c, &["DEBUG", "RELOAD"]), "+OK\r\n");
+    let info = resp_cmd_all(&mut c, &["INFO", "persistence"]);
+    assert!(info.contains("rdb_last_load_keys_loaded:31\r\n"), "{info}");
+    resp_cmd_all(&mut c, &["FLUSHALL"]);
+    resp_cmd_all(&mut c, &["SET", "only", "v"]);
+    assert_eq!(resp_cmd_all(&mut c, &["DEBUG", "RELOAD"]), "+OK\r\n");
+    let info = resp_cmd_all(&mut c, &["INFO", "persistence"]);
+    assert!(info.contains("rdb_last_load_keys_loaded:1\r\n"), "{info}");
+}
+
 #[test]
 fn test_debug_reload_and_loadaof_keep_data_e2e() {
     // RDB: DEBUG RELOAD saves, flushes and loads back the same data.

@@ -2330,6 +2330,12 @@ fn test_replica_aof_holds_the_synced_dataset_after_a_restart_e2e() {
         "+OK\r\n"
     );
     wait_for(&mut r, &["INFO", "replication"], "master_link_status:up");
+    // The full sync counts as the replica's last RDB load, as in Redis.
+    let persistence = resp_cmd_all(&mut r, &["INFO", "persistence"]);
+    assert!(
+        persistence.contains("rdb_last_load_keys_loaded:20\r\n"),
+        "{persistence}"
+    );
     // A change streamed after the sync must land in the new AOF too.
     assert_eq!(resp_cmd(&mut m, &["SET", "m:after", "2"]), "+OK\r\n");
     wait_for(&mut r, &["GET", "m:after"], "$1\r\n2\r\n");
