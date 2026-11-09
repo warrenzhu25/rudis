@@ -2898,6 +2898,72 @@ fn test_connections_accepted_at_shutdown_poll_tick_are_served_e2e() {
     assert!(fresh > 0);
 }
 
+/// Absolute millisecond deadlines (PEXPIREAT, HPEXPIREAT) read back as the
+/// same millisecond after DEBUG RELOAD and after an AOF rewrite + DEBUG
+/// LOADAOF. Converting through millisecond-truncated clock samples used to
+/// move them 1-2 ms earlier on each save, load or rewrite.
+#[test]
+fn test_absolute_deadlines_survive_reload_and_rewrite_exactly_e2e() {
+    let port = 29852;
+    let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    start_test_server_with_aof(
+        port,
+        2,
+        rudis::aof::AofConfig {
+            enabled: true,
+            dir,
+            fsync_every_sec: false,
+        },
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let deadline = |i: u64| (2_524_600_800_000 + i * 17).to_string();
+    for i in 0..40u64 {
+        let (h, s, l) = (format!("h{i}"), format!("s{i}"), format!("l{i}"));
+        let t = deadline(i);
+        resp_cmd_all(&mut c, &["HSET", &h, "f", "v", "g", "w"]);
+        assert_eq!(
+            resp_cmd_all(&mut c, &["HPEXPIREAT", &h, &t, "FIELDS", "1", "f"]),
+            "*1\r\n:1\r\n"
+        );
+        resp_cmd_all(&mut c, &["SET", &s, "v", "PXAT", &t]);
+        resp_cmd_all(&mut c, &["RPUSH", &l, "a"]);
+        assert_eq!(resp_cmd_all(&mut c, &["PEXPIREAT", &l, &t]), ":1\r\n");
+    }
+    // A key's PXAT / PEXPIREAT becomes a TTL when the command is parsed, so
+    // what PEXPIRETIME reads back right after can be off by the time the
+    // command took to run: the reference is that first reading.
+    let key_deadlines: Vec<String> = (0..40u64)
+        .flat_map(|i| [format!("s{i}"), format!("l{i}")])
+        .map(|k| resp_cmd_all(&mut c, &["PEXPIRETIME", &k]))
+        .collect();
+    let check = |c: &mut TcpStream, when: &str| {
+        for i in 0..40u64 {
+            let t = deadline(i);
+            assert_eq!(
+                resp_cmd_all(c, &["HPEXPIRETIME", &format!("h{i}"), "FIELDS", "1", "f"]),
+                format!("*1\r\n:{t}\r\n"),
+                "{when}: h{i}"
+            );
+            for (j, k) in [format!("s{i}"), format!("l{i}")].iter().enumerate() {
+                assert_eq!(
+                    resp_cmd_all(c, &["PEXPIRETIME", k]),
+                    key_deadlines[i as usize * 2 + j],
+                    "{when}: {k}"
+                );
+            }
+        }
+    };
+    check(&mut c, "as set");
+    assert_eq!(resp_cmd_all(&mut c, &["DEBUG", "RELOAD"]), "+OK\r\n");
+    check(&mut c, "after DEBUG RELOAD");
+    resp_cmd_all(&mut c, &["BGREWRITEAOF"]);
+    wait_aof_rewrite_done(&mut c);
+    assert_eq!(resp_cmd_all(&mut c, &["DEBUG", "LOADAOF"]), "+OK\r\n");
+    check(&mut c, "after BGREWRITEAOF + DEBUG LOADAOF");
+}
+
 #[test]
 fn test_debug_reload_and_loadaof_keep_data_e2e() {
     // RDB: DEBUG RELOAD saves, flushes and loads back the same data.

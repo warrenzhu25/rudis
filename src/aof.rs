@@ -8,11 +8,9 @@ use crate::shard::ShardDb;
 /// absolute times (like Redis' PEXPIREAT/PXAT propagation) so that downtime
 /// between write and replay does not extend a key's lifetime.
 fn unix_ms_after(d: std::time::Duration) -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        + d.as_millis()
+    // Nearest millisecond of the sum: truncating the clock and `d`
+    // separately wrote a key's absolute deadline up to 2 ms early.
+    ((crate::table::unix_now() + d).as_nanos() + 500_000) / 1_000_000
 }
 
 #[derive(Clone, Debug)]
@@ -4792,10 +4790,7 @@ fn write_canonical_aof(
     use std::io::Write;
     let mut count = 0;
     let now = std::time::Instant::now();
-    let unix_now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let unix_now = crate::table::unix_now();
 
     let orig_db = db.current_db;
     let max_db = db.max_db_len();
@@ -4869,7 +4864,7 @@ fn write_canonical_aof(
                 crate::table::RudisValue::String(val) => {
                     if let Some(exp) = entry.expire_at() {
                         let rem_ms_str =
-                            unix_ms_after(exp.saturating_duration_since(now)).to_string();
+                            crate::table::instant_to_unix_ms(exp, now, unix_now).to_string();
                         writer.write_all(b"*5\r\n$3\r\nSET\r\n$")?;
                         writer.write_all(k.len().to_string().as_bytes())?;
                         writer.write_all(b"\r\n")?;
@@ -5149,7 +5144,7 @@ fn write_canonical_aof(
             if !matches!(val_ref, crate::table::RudisValue::String(_))
                 && let Some(exp) = entry.expire_at()
             {
-                let rem_ms_str = unix_ms_after(exp.saturating_duration_since(now)).to_string();
+                let rem_ms_str = crate::table::instant_to_unix_ms(exp, now, unix_now).to_string();
                 writer.write_all(b"*3\r\n$9\r\nPEXPIREAT\r\n$")?;
                 writer.write_all(k.len().to_string().as_bytes())?;
                 writer.write_all(b"\r\n")?;
@@ -5166,8 +5161,8 @@ fn write_canonical_aof(
             {
                 for (field, &exp) in fmap {
                     if exp > now {
-                        let rem_ms = exp.duration_since(now).as_millis() as u64;
-                        let exp_unix_ms_str = (unix_now + rem_ms).to_string();
+                        let exp_unix_ms_str =
+                            crate::table::instant_to_unix_ms(exp, now, unix_now).to_string();
                         writer.write_all(b"*6\r\n$10\r\nHPEXPIREAT\r\n$")?;
                         writer.write_all(k.len().to_string().as_bytes())?;
                         writer.write_all(b"\r\n")?;

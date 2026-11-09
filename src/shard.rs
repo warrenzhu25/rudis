@@ -3168,7 +3168,7 @@ impl ShardDb {
                 .map(|(f, &exp)| {
                     (
                         f,
-                        crate::table::instant_to_unix_ms(exp, clock.now, clock.unix_ms),
+                        crate::table::instant_to_unix_ms(exp, clock.now, clock.unix),
                     )
                 })
                 .collect();
@@ -3238,7 +3238,7 @@ impl ShardDb {
     ) {
         let expire_unix_ms = entry
             .expire_at()
-            .map(|exp| clock.unix_ms + exp.duration_since(clock.now).as_millis() as u64);
+            .map(|exp| crate::table::instant_to_unix_ms(exp, clock.now, clock.unix));
         crate::redis_rdb::write_record(buf, &entry.key, val, expire_unix_ms);
         let val = match val {
             crate::table::RudisValue::Cooled(cv) => &cv.val,
@@ -4779,7 +4779,8 @@ impl ShardDb {
 /// milliseconds.
 struct RdbClock {
     now: std::time::Instant,
-    unix_ms: u64,
+    /// Wall-clock time at `now`, for [`crate::table::instant_to_unix_ms`].
+    unix: std::time::Duration,
     /// Write keys that already expired too, like Redis: a master with a
     /// replication history has not told its replicas about them yet, and
     /// after a restart it propagates their deletion (see
@@ -4789,13 +4790,12 @@ struct RdbClock {
 
 impl RdbClock {
     fn now(port: u16) -> Self {
+        let now = std::time::Instant::now();
+        let unix = crate::table::unix_now();
         RdbClock {
             keep_expired: crate::replication::snapshots_keep_expired(port),
-            now: std::time::Instant::now(),
-            unix_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            now,
+            unix,
         }
     }
 }

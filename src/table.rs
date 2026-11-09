@@ -1667,27 +1667,39 @@ pub fn key_dir_bits(key: &[u8]) -> u64 {
     mix_hash(hash_key(key)) >> SEG_SHIFT
 }
 
-/// `at` as Unix milliseconds, given the same moment as `now` / `now_unix_ms`;
+/// Wall-clock time since the Unix epoch, to the nanosecond: the `now_unix`
+/// of [`instant_to_unix_ms`] / [`unix_ms_to_instant`].
+pub fn unix_now() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
+/// `at` as Unix milliseconds, given the same moment as `now` / `now_unix`;
 /// a deadline already passed stays in the past (at least 1, 0 meaning none).
-pub fn instant_to_unix_ms(at: Instant, now: Instant, now_unix_ms: u64) -> u64 {
-    if at >= now {
-        now_unix_ms + at.duration_since(now).as_millis() as u64
+///
+/// Rounded to the nearest millisecond, from nanoseconds: an absolute
+/// millisecond deadline (HPEXPIREAT, an RDB load) stored through
+/// [`unix_ms_to_instant`] comes back as the same millisecond. (Truncating
+/// both clock samples to milliseconds lost up to 2 ms per round trip.)
+pub fn instant_to_unix_ms(at: Instant, now: Instant, now_unix: Duration) -> u64 {
+    let now_ns = now_unix.as_nanos();
+    let ns = if at >= now {
+        now_ns + at.duration_since(now).as_nanos()
     } else {
-        now_unix_ms
-            .saturating_sub(now.duration_since(at).as_millis() as u64)
-            .max(1)
-    }
+        now_ns.saturating_sub(now.duration_since(at).as_nanos())
+    };
+    let ms = ((ns + 500_000) / 1_000_000).min(u64::MAX as u128) as u64;
+    if at >= now { ms } else { ms.max(1) }
 }
 
 /// The inverse of [`instant_to_unix_ms`]: a past Unix time maps to a past
 /// instant (clamped where `Instant` cannot go back that far).
-pub fn unix_ms_to_instant(unix_ms: u64, now_unix_ms: u64) -> Instant {
-    let now = Instant::now();
-    match unix_ms.checked_sub(now_unix_ms) {
-        Some(ahead) => now + Duration::from_millis(ahead),
-        None => now
-            .checked_sub(Duration::from_millis(now_unix_ms - unix_ms))
-            .unwrap_or(now),
+pub fn unix_ms_to_instant(unix_ms: u64, now: Instant, now_unix: Duration) -> Instant {
+    let at = Duration::from_millis(unix_ms);
+    match at.checked_sub(now_unix) {
+        Some(ahead) => now + ahead,
+        None => now.checked_sub(now_unix - at).unwrap_or(now),
     }
 }
 
@@ -6698,14 +6710,16 @@ impl RudisTable {
         }
 
         let now = Instant::now();
-        let now_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let delta_ms = if is_at {
-            expire_ms - now_unix_ms
+        let now_unix = unix_now();
+        // An absolute time converts from nanoseconds: truncating the clock
+        // to milliseconds first stored it up to 1 ms early, and
+        // HPEXPIRETIME read it back off by one.
+        let (delta_ms, at) = if is_at {
+            let at = (expire_ms > 0).then(|| unix_ms_to_instant(expire_ms as u64, now, now_unix));
+            let past = at.is_none_or(|at| at <= now);
+            (if past { 0 } else { 1 }, at)
         } else {
-            expire_ms
+            (expire_ms, None)
         };
 
         let mut results = Vec::with_capacity(fields.len());
@@ -6752,7 +6766,8 @@ impl RudisTable {
                     results.push(0);
                 }
             } else {
-                let new_exp = now + Duration::from_millis(delta_ms.max(0) as u64);
+                let new_exp =
+                    at.unwrap_or_else(|| now + Duration::from_millis(delta_ms.max(0) as u64));
                 let cond_ok = match condition {
                     crate::resp::HexpireCondition::None => true,
                     crate::resp::HexpireCondition::Nx => cur_exp.is_none(),
@@ -6812,10 +6827,7 @@ impl RudisTable {
         }
 
         let now = Instant::now();
-        let now_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now_unix = unix_now();
         let mut results = Vec::with_capacity(fields.len());
 
         for f in fields {
@@ -6835,7 +6847,7 @@ impl RudisTable {
             {
                 let rem_ms = exp.saturating_duration_since(now).as_millis() as i64;
                 if is_expiretime {
-                    let abs_ms = now_unix_ms + rem_ms;
+                    let abs_ms = instant_to_unix_ms(exp.max(now), now, now_unix) as i64;
                     results.push(if is_ms { abs_ms } else { (abs_ms + 500) / 1000 });
                 } else {
                     results.push(if is_ms { rem_ms } else { (rem_ms + 500) / 1000 });
@@ -15363,10 +15375,7 @@ impl RudisTable {
 
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
         let now = Instant::now();
-        let unix_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_unix = unix_now();
 
         // Cursor positions cover every segment; see `keys`.
         for cur in 0..self.table.cursor_bound() {
@@ -15380,8 +15389,7 @@ impl RudisTable {
                         if exp <= now {
                             continue;
                         }
-                        let rem_ms = exp.duration_since(now).as_millis() as u64;
-                        let expire_unix_ms = unix_now + rem_ms;
+                        let expire_unix_ms = instant_to_unix_ms(exp, now, now_unix);
                         buf.push(0xFC); // EXPIRETIME_MS opcode
                         buf.extend_from_slice(&expire_unix_ms.to_le_bytes());
                     }
@@ -15396,7 +15404,7 @@ impl RudisTable {
                 // Passed deadlines too (see `ShardDb::write_hash_field_expires_legacy`).
                 let active: Vec<(&Bytes, u64)> = fmap
                     .iter()
-                    .map(|(f, &exp)| (f, instant_to_unix_ms(exp, now, unix_now)))
+                    .map(|(f, &exp)| (f, instant_to_unix_ms(exp, now, now_unix)))
                     .collect();
                 if !active.is_empty() {
                     buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -15414,10 +15422,8 @@ impl RudisTable {
     }
 
     pub fn restore_rdb_chunk(&mut self, mut data: &[u8]) -> Result<(), &'static str> {
-        let unix_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let (now, unix_ns) = (Instant::now(), unix_now());
+        let unix_now = unix_ns.as_millis() as u64;
 
         while !data.is_empty() {
             let mut expire_at = None;
@@ -15480,7 +15486,7 @@ impl RudisTable {
                         self.hash_field_expires
                             .entry(key.clone())
                             .or_default()
-                            .insert(field, unix_ms_to_instant(exp_unix_ms, unix_now));
+                            .insert(field, unix_ms_to_instant(exp_unix_ms, now, unix_ns));
                     } else {
                         expired_on_disk.push(field);
                     }
@@ -16868,10 +16874,8 @@ fn load_legacy_records(
     shard_id: usize,
     num_shards: usize,
 ) -> (usize, bool, usize) {
-    let unix_now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let (now, unix_ns) = (Instant::now(), unix_now());
+    let unix_now = unix_ns.as_millis() as u64;
 
     let mut cursor = start;
     let mut count = 0;
@@ -17228,7 +17232,7 @@ fn load_legacy_records(
                             .hash_field_expires
                             .entry(key.clone())
                             .or_default()
-                            .insert(field, unix_ms_to_instant(exp_unix_ms, unix_now));
+                            .insert(field, unix_ms_to_instant(exp_unix_ms, now, unix_ns));
                     } else {
                         expired_on_disk.push(field);
                     }
@@ -17334,6 +17338,58 @@ fn load_legacy_records(
 mod tests {
     use super::*;
     use std::thread;
+
+    /// An absolute millisecond deadline comes back as the same millisecond:
+    /// through the Unix-ms conversions, HPEXPIREAT + HPEXPIRETIME, and a
+    /// save + restore. Each used to truncate its clock samples to
+    /// milliseconds and lost 1-2 ms per round trip.
+    #[test]
+    fn test_absolute_deadlines_round_trip_exactly() {
+        for i in 0..2000u64 {
+            let ms = 2_524_600_800_000 + i * 7;
+            let at = unix_ms_to_instant(ms, Instant::now(), unix_now());
+            assert_eq!(instant_to_unix_ms(at, Instant::now(), unix_now()), ms);
+        }
+        // A deadline in the past stays in the past, and nonzero.
+        let now = Instant::now();
+        let past = now.checked_sub(Duration::from_millis(5)).unwrap();
+        let unix = unix_now();
+        assert!(instant_to_unix_ms(past, now, unix) < unix.as_millis() as u64);
+        assert_eq!(instant_to_unix_ms(past, now, Duration::ZERO), 1);
+
+        let h = Bytes::from_static(b"h");
+        let f = Bytes::from_static(b"f");
+        for i in 0..200i64 {
+            let ms = 65_755_674_080_852 - i * 13;
+            let mut t = RudisTable::new();
+            t.hset(h.clone(), vec![(f.clone(), Bytes::from_static(b"v"))])
+                .unwrap();
+            let set = t
+                .hexpire(
+                    &h,
+                    ms,
+                    true,
+                    crate::resp::HexpireCondition::None,
+                    std::slice::from_ref(&f),
+                )
+                .unwrap();
+            assert_eq!(set, vec![1]);
+            assert_eq!(
+                t.httl(&h, true, true, std::slice::from_ref(&f)).unwrap(),
+                vec![ms]
+            );
+            let mut buf = Vec::new();
+            t.save_rdb_chunk(&mut buf);
+            let mut loaded = RudisTable::new();
+            loaded.restore_rdb_chunk(&buf).unwrap();
+            assert_eq!(
+                loaded
+                    .httl(&h, true, true, std::slice::from_ref(&f))
+                    .unwrap(),
+                vec![ms]
+            );
+        }
+    }
 
     fn rdb_with_body(body: &[u8]) -> Vec<u8> {
         let mut v = b"REDIS0011".to_vec();

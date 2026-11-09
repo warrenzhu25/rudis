@@ -2060,6 +2060,11 @@ struct LoadCtx<'a> {
     strict: bool,
     load_functions: bool,
     now_ms: u64,
+    /// One moment as an `Instant` and as wall-clock time, sampled together
+    /// when the load starts: loaded deadlines (absolute Unix ms) convert
+    /// against it, so a key loaded a minute into a long load keeps its
+    /// deadline rather than gaining that minute.
+    anchor: (Instant, Duration),
     count: usize,
     /// Keep keys and hash fields whose deadline already passed, with that
     /// deadline: an AOF's RDB preamble, where (as in Redis) nothing expires
@@ -2077,16 +2082,9 @@ impl LoadCtx<'_> {
     }
 
     fn insert(&mut self, key: &[u8], decoded: Decoded, expire_ms: Option<i64>) {
-        let now = Instant::now();
-        let now_ms = self.now_ms;
-        // A deadline already passed stays passed (not `now`, which the
-        // stored millisecond rounding can put just ahead).
-        let at = |ms: u64| match ms.checked_sub(now_ms) {
-            Some(ahead) => now + Duration::from_millis(ahead),
-            None => now
-                .checked_sub(Duration::from_millis(now_ms - ms))
-                .unwrap_or(now),
-        };
+        // A deadline already passed stays passed (not now).
+        let (now, now_unix) = self.anchor;
+        let at = |ms: u64| crate::table::unix_ms_to_instant(ms, now, now_unix);
         let expire_at = expire_ms.map(|ms| at(ms.max(0) as u64));
         let at_field = at;
         self.db.table.insert_entry(crate::table::RudisEntry::new(
@@ -2307,6 +2305,7 @@ pub fn load_file(
         strict,
         load_functions: shard_id == 0,
         now_ms: unix_ms_now(),
+        anchor: (Instant::now(), crate::table::unix_now()),
         count: 0,
         keep_expired: false,
     };
@@ -2337,6 +2336,7 @@ pub fn load_chunk(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResult<usiz
         strict: false,
         load_functions: false,
         now_ms: unix_ms_now(),
+        anchor: (Instant::now(), crate::table::unix_now()),
         count: 0,
         keep_expired: false,
     };
@@ -2371,6 +2371,7 @@ pub fn load_rdb_preamble(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResu
         strict,
         load_functions: true,
         now_ms: unix_ms_now(),
+        anchor: (Instant::now(), crate::table::unix_now()),
         count: 0,
         keep_expired: true,
     };
