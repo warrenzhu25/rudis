@@ -12,6 +12,10 @@ Group=rudis
 ExecStart=/usr/local/bin/rudis -c /etc/rudis/rudis.conf
 Restart=always
 RestartSec=3s
+# READY=1 comes once the dataset is loaded, which can take minutes on a
+# large RDB / AOF: without this, systemd's default 90 s start timeout
+# kills the load and Restart=always loops on it (as Redis's unit does).
+TimeoutStartSec=infinity
 TimeoutStopSec=300s
 KillMode=mixed
 KillSignal=SIGTERM

@@ -33,7 +33,10 @@ detected` (§4). Alert on:
   included, get `-LOADING`. For Kubernetes-style probes, count any reply (`-LOADING` too) as
   alive, and only `+PONG` (or `loading:0`) as ready; the Dockerfile's `HEALTHCHECK` reports
   the container unhealthy until the load ends. `SIGTERM` or `SHUTDOWN` during the load exits
-  at once without saving.
+  at once without saving. systemd gets `READY=1` only once the load is done: the shipped
+  `rudis.service` sets `TimeoutStartSec=infinity`, and a unit of your own needs it too
+  (systemd's default 90 s start timeout kills a longer load, and `Restart=always` retries it
+  forever).
 - **Corrupt AOF tail** (torn last write): with `aof-load-truncated yes` (the default) the tail
   is cut and the server starts; with `no` it refuses to start and logs the offset. A corruption
   in the middle of the file always refuses: restore the AOF from a backup, or start from

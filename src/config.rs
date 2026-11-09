@@ -1658,6 +1658,14 @@ mod tests {
         let service = fs::read_to_string("rudis.service").unwrap();
         assert!(service.contains("Type=notify"));
         assert!(service.contains("TimeoutStopSec=300s"));
+        // READY=1 waits for the dataset load: no start timeout may cut it.
+        assert!(service.contains("\nTimeoutStartSec=infinity\n"));
+        // The README shows the unit as shipped.
+        let readme = fs::read_to_string("README.md").unwrap();
+        assert!(
+            readme.contains(&format!("```ini\n{service}```")),
+            "README.md's copy of rudis.service differs from the file"
+        );
         assert!(Path::new("LICENSE").exists());
         assert_eq!(
             validate_maxmemory_policy("ALLKEYS-LFU").unwrap(),

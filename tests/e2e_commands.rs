@@ -3698,6 +3698,7 @@ fn test_deployment_configuration_and_service_assets_e2e() {
     let service_content = std::fs::read_to_string(service_path).unwrap();
     assert!(service_content.contains("ExecStart="));
     assert!(service_content.contains("LimitNOFILE="));
+    assert!(service_content.contains("TimeoutStartSec=infinity"));
 
     let dockerfile_path = std::path::Path::new("Dockerfile");
     assert!(
