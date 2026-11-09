@@ -4874,6 +4874,74 @@ fn test_restore_refuses_corrupt_payloads_e2e() {
     assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
 }
 
+/// INFO stats expired_subkeys counts hash fields deleted for passing their
+/// deadline, as Redis does: by active expiry, lazily on access, by an
+/// HPEXPIREAT already past, and dropped by a load. CONFIG RESETSTAT zeroes
+/// it. (A process of its own: the counter is process-wide.)
+#[test]
+fn test_info_expired_subkeys_e2e() {
+    let port = 29854u16;
+    let p = port.to_string();
+    let mut server = spawn_rudis_listening(
+        &["--port", &p, "--threads", "2", "--no-pin", "--save", ""],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let subkeys = |c: &mut TcpStream| -> u64 {
+        let info = resp_cmd_all(c, &["INFO", "stats"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix("expired_subkeys:"))
+            .unwrap_or_else(|| panic!("no expired_subkeys: {info}"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(subkeys(&mut c), 0);
+    resp_cmd_all(
+        &mut c,
+        &["HSET", "h", "a", "1", "b", "2", "c", "3", "d", "4"],
+    );
+    // Active expiry.
+    resp_cmd_all(&mut c, &["HPEXPIRE", "h", "20", "FIELDS", "1", "a"]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while subkeys(&mut c) < 1 {
+        assert!(std::time::Instant::now() < deadline, "a never expired");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(subkeys(&mut c), 1);
+    // A deadline already passed deletes the field at once.
+    assert_eq!(
+        resp_cmd_all(&mut c, &["HPEXPIREAT", "h", "1", "FIELDS", "1", "b"]),
+        "*1\r\n:2\r\n"
+    );
+    assert_eq!(subkeys(&mut c), 2);
+    // Lazily, on access, with active expiry paused.
+    resp_cmd_all(&mut c, &["DEBUG", "SET-ACTIVE-EXPIRE", "0"]);
+    resp_cmd_all(&mut c, &["HPEXPIRE", "h", "20", "FIELDS", "1", "c"]);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(subkeys(&mut c), 2);
+    assert_eq!(
+        resp_cmd_all(&mut c, &["HGETALL", "h"]),
+        "*2\r\n$1\r\nd\r\n$1\r\n4\r\n"
+    );
+    assert_eq!(subkeys(&mut c), 3);
+    // Dropped by a load: saved before its deadline, loaded after it.
+    resp_cmd_all(&mut c, &["HSET", "h", "e", "5"]);
+    resp_cmd_all(&mut c, &["HPEXPIRE", "h", "100", "FIELDS", "1", "e"]);
+    assert_eq!(resp_cmd_all(&mut c, &["SAVE"]), "+OK\r\n");
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        resp_cmd_all(&mut c, &["DEBUG", "RELOAD", "NOSAVE"]),
+        "+OK\r\n"
+    );
+    assert_eq!(subkeys(&mut c), 4);
+    assert_eq!(resp_cmd_all(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+    assert_eq!(subkeys(&mut c), 0);
+    drop(c);
+    shutdown_and_wait(port, &mut server);
+}
+
 /// SHUTDOWN waiting for a lagging replica can be cancelled with SHUTDOWN
 /// ABORT, as in Redis: every client waiting in SHUTDOWN (counted in
 /// blocked_clients meanwhile) gets an error and the server keeps serving.

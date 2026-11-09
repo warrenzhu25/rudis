@@ -5,15 +5,3 @@
 Test child sending info
 failed bgsave prevents writes
 rdb_saves_consecutive_failures metric
-#
-# Known gaps (TODO, not deliberate):
-# - Hash field deadlines come back 1-2 ms earlier after a save and load:
-#   they are held as Instants and converted through millisecond-truncated
-#   wall-clock samples (table::instant_to_unix_ms / unix_ms_to_instant).
-HFE - save and load expired fields, expired soon after, or long after (listpack)
-HFE - save and load expired fields, expired soon after, or long after (dict)
-lazy field expiry after load, (listpack)
-lazy field expiry after load, (dict)
-# - INFO stats has no expired_subkeys (hash fields expired).
-active field expiry after load, (listpack)
-active field expiry after load, (dict)

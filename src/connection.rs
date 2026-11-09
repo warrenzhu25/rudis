@@ -13179,7 +13179,7 @@ async fn execute_command_inner(
             let pubsub_patterns = router.pubsub_numpat().await;
             let pubsubshard_channels = router.pubsub_shardchannels(None).await.len();
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_query_buffer_limit_disconnections:{}\r\nclient_output_buffer_limit_disconnections:{}\r\nacl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\nacl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\n",
+                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_subkeys:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_query_buffer_limit_disconnections:{}\r\nclient_output_buffer_limit_disconnections:{}\r\nacl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\nacl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\n",
                 total(Stat::ConnectionsReceived),
                 total(Stat::Commands),
                 ops_per_sec,
@@ -13191,6 +13191,7 @@ async fn execute_command_inner(
                 total(Stat::SyncFull),
                 total(Stat::SyncPartialOk),
                 total(Stat::SyncPartialErr),
+                crate::table::get_expired_subkeys(),
                 crate::table::get_expired_keys(),
                 crate::table::get_expired_keys_active(),
                 crate::table::get_evicted_keys(),

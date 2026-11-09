@@ -3322,6 +3322,9 @@ impl RudisFlatTable {
 static EXPIRED_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXPIRED_KEYS_ACTIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EVICTED_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Hash fields deleted for having passed their deadline (INFO stats
+/// expired_subkeys).
+static EXPIRED_SUBKEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAZYFREED_OBJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
@@ -3356,8 +3359,22 @@ pub fn get_expired_keys_active() -> u64 {
     EXPIRED_KEYS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Counts `n` hash fields deleted as expired: lazily, by active expiry,
+/// by an HEXPIRE with a deadline already passed, or dropped on load (as
+/// Redis's expired_subkeys does).
+#[inline]
+pub fn add_expired_subkeys(n: usize) {
+    EXPIRED_SUBKEYS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn get_expired_subkeys() -> u64 {
+    EXPIRED_SUBKEYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[inline]
 pub fn reset_expired_keys() {
+    EXPIRED_SUBKEYS.store(0, std::sync::atomic::Ordering::Relaxed);
     EXPIRED_KEYS.store(0, std::sync::atomic::Ordering::Relaxed);
     EXPIRED_KEYS_ACTIVE.store(0, std::sync::atomic::Ordering::Relaxed);
     LAZYFREED_OBJECTS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -6679,7 +6696,9 @@ impl RudisTable {
         }
         if !expired.is_empty() {
             crate::replication::log_expired_fields(key, &expired);
-            let _ = self.hdel(key, &expired);
+            if let Ok(n) = self.hdel(key, &expired) {
+                add_expired_subkeys(n);
+            }
         }
     }
 
@@ -6793,8 +6812,10 @@ impl RudisTable {
             }
         }
 
-        if !to_delete.is_empty() {
-            let _ = self.hdel(key, &to_delete);
+        if !to_delete.is_empty()
+            && let Ok(n) = self.hdel(key, &to_delete)
+        {
+            add_expired_subkeys(n);
         }
         Ok(results)
     }
@@ -12451,7 +12472,9 @@ impl RudisTable {
             if !expired.is_empty() {
                 evicted_fields += expired.len();
                 crate::replication::log_expired_fields(&key, &expired);
-                let _ = self.hdel(&key, &expired);
+                if let Ok(n) = self.hdel(&key, &expired) {
+                    add_expired_subkeys(n);
+                }
             }
         }
         evicted_fields
@@ -15491,8 +15514,10 @@ impl RudisTable {
                         expired_on_disk.push(field);
                     }
                 }
-                if !expired_on_disk.is_empty() {
-                    let _ = self.hdel(&key, &expired_on_disk);
+                if !expired_on_disk.is_empty()
+                    && let Ok(n) = self.hdel(&key, &expired_on_disk)
+                {
+                    add_expired_subkeys(n);
                 }
                 continue;
             }
@@ -17238,8 +17263,11 @@ fn load_legacy_records(
                     }
                 }
             }
-            if is_owned && !expired_on_disk.is_empty() {
-                let _ = db.table.hdel(&key, &expired_on_disk);
+            if is_owned
+                && !expired_on_disk.is_empty()
+                && let Ok(n) = db.table.hdel(&key, &expired_on_disk)
+            {
+                add_expired_subkeys(n);
             }
             continue;
         } else if matches!(type_byte, 15..=18 | 21) {
@@ -17338,6 +17366,59 @@ fn load_legacy_records(
 mod tests {
     use super::*;
     use std::thread;
+
+    /// Expired hash fields deleted by an HEXPIRE already past, lazily and by
+    /// active sampling count toward expired_subkeys. (The counter is
+    /// process-wide and other tests run alongside: deltas are lower bounds.)
+    #[test]
+    fn test_expired_hash_fields_count_as_expired_subkeys() {
+        let h = Bytes::from_static(b"h");
+        let fields: Vec<Bytes> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|f| Bytes::from(*f))
+            .collect();
+        let mut t = RudisTable::new();
+        t.hset(
+            h.clone(),
+            fields
+                .iter()
+                .map(|f| (f.clone(), Bytes::from_static(b"v")))
+                .collect(),
+        )
+        .unwrap();
+        let before = get_expired_subkeys();
+        let r = t
+            .hexpire(
+                &h,
+                1,
+                true,
+                crate::resp::HexpireCondition::None,
+                &fields[..1],
+            )
+            .unwrap();
+        assert_eq!(r, vec![2]);
+        assert!(get_expired_subkeys() - before >= 1);
+
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let before = get_expired_subkeys();
+        t.hash_field_expires
+            .entry(h.clone())
+            .or_default()
+            .insert(fields[1].clone(), past);
+        t.purge_expired_hash_fields(&h);
+        assert!(get_expired_subkeys() - before >= 1);
+
+        let before = get_expired_subkeys();
+        t.hash_field_expires
+            .entry(h.clone())
+            .or_default()
+            .insert(fields[2].clone(), past);
+        assert_eq!(t.evict_expired_hash_fields_sample(8), 1);
+        assert!(get_expired_subkeys() - before >= 1);
+        assert_eq!(t.hlen(&h).unwrap(), 1);
+    }
 
     /// An absolute millisecond deadline comes back as the same millisecond:
     /// through the Unix-ms conversions, HPEXPIREAT + HPEXPIRETIME, and a

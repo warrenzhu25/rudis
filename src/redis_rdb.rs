@@ -956,6 +956,7 @@ pub fn decode_value(t: u8, r: &mut Reader<'_>, now_ms: u64) -> RdbResult<Option<
                     return corrupt("hash field TTL beyond the largest expire time");
                 }
                 if at != 0 && at <= now_ms {
+                    crate::table::add_expired_subkeys(1);
                     continue;
                 }
                 if at != 0 {
@@ -992,6 +993,7 @@ pub fn decode_value(t: u8, r: &mut Reader<'_>, now_ms: u64) -> RdbResult<Option<
                 }
                 last_at = at;
                 if at != 0 && at <= now_ms {
+                    crate::table::add_expired_subkeys(1);
                     continue;
                 }
                 let f = c[0].to_bytes();
