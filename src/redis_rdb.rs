@@ -659,7 +659,12 @@ pub fn zipmap_pairs(zm: &[u8]) -> RdbResult<Vec<(Bytes, Bytes)>> {
     fn zm_len(zm: &[u8], p: usize) -> RdbResult<Option<(usize, usize)>> {
         match *zm.get(p).ok_or_else(truncated)? {
             255 => Ok(None),
-            254 => Ok(Some((le_u32(zm, p + 1)? as usize, 5))),
+            // Like Redis's zipmapValidateIntegrity: the 5-byte form is only
+            // for lengths the 1-byte form cannot hold.
+            254 => match le_u32(zm, p + 1)? as usize {
+                n if n < 254 => corrupt("zipmap uses a 5-byte length for a small length"),
+                n => Ok(Some((n, 5))),
+            },
             b => Ok(Some((b as usize, 1))),
         }
     }
@@ -2717,6 +2722,9 @@ mod tests {
             ]
         );
         assert!(zipmap_pairs(&zm[..zm.len() - 1]).is_err());
+        // The same "a" key with its length in the 5-byte form: refused.
+        let zm = [1, 254, 1, 0, 0, 0, b'a', 1, 0, b'1', 0xFF];
+        assert!(zipmap_pairs(&zm).is_err());
     }
 
     fn round_trip(val: &RudisValue) -> RudisValue {
