@@ -763,12 +763,24 @@ fn zset_value(z: RudisZSet) -> Option<Decoded> {
     }
 }
 
-/// A hash value from its pairs, `SmallHash` up to [`SMALL_HASH_MAX`] fields.
+/// A hash value from its pairs: `SmallHash` (reported as `listpack`) when it
+/// fits both [`SMALL_HASH_MAX`] and the current `hash-max-listpack-entries` /
+/// `hash-max-listpack-value`, as Redis converts a loaded listpack that
+/// exceeds them.
 fn hash_value(pairs: Vec<(Bytes, Bytes)>) -> RdbResult<Option<RudisValue>> {
+    use std::sync::atomic::Ordering::Relaxed;
     if pairs.is_empty() {
         return Ok(None);
     }
-    if pairs.len() <= SMALL_HASH_MAX {
+    let max_entries = crate::connection::HASH_MAX_ENTRIES
+        .load(Relaxed)
+        .min(SMALL_HASH_MAX);
+    let max_value = crate::connection::HASH_MAX_VALUE.load(Relaxed);
+    if pairs.len() <= max_entries
+        && pairs
+            .iter()
+            .all(|(f, v)| f.len() <= max_value && v.len() <= max_value)
+    {
         for (i, (f, _)) in pairs.iter().enumerate() {
             if pairs[..i].iter().any(|(g, _)| g == f) {
                 return corrupt("duplicate hash field");
