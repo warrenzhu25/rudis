@@ -1123,8 +1123,10 @@ fn decode_stream(t: u8, r: &mut Reader<'_>) -> RdbResult<RudisStream> {
             it.next()
                 .ok_or_else(|| RdbError::new("truncated stream listpack"))
         };
-        let _count = next()?.as_int()?;
-        let _deleted = next()?.as_int()?;
+        // Live and deleted entry counts: together they are the number of
+        // entries in the node (Redis's streamValidateListpackIntegrity).
+        let count = next()?.as_int()?;
+        let deleted = next()?.as_int()?;
         let master_n = to_usize(next()?.as_int()?.max(0) as u64)?;
         if master_n > lp.len() {
             return corrupt("stream master entry has too many fields");
@@ -1136,11 +1138,13 @@ fn decode_stream(t: u8, r: &mut Reader<'_>) -> RdbResult<RudisStream> {
         if next()?.as_int()? != 0 {
             return corrupt("stream master entry terminator is not 0");
         }
+        let mut node_entries: i64 = 0;
         loop {
             let flags = match it.next() {
                 None => break,
                 Some(e) => e.as_int()?,
             };
+            node_entries += 1;
             let mut next = || {
                 it.next()
                     .ok_or_else(|| RdbError::new("truncated stream entry"))
@@ -1165,10 +1169,25 @@ fn decode_stream(t: u8, r: &mut Reader<'_>) -> RdbResult<RudisStream> {
                 }
                 v
             };
-            next()?; // lp-count
+            // lp-count: the entry's listpack elements before it (flags, the
+            // ID's two deltas, the values, and with their own field names
+            // the names and their count). Reverse iteration steps back by
+            // it, so a wrong one would walk into another entry.
+            let lp_count = next()?.as_int()?;
+            let expected = if flags & STREAM_ITEM_FLAG_SAMEFIELDS != 0 {
+                fields.len() as i64 + 3
+            } else {
+                fields.len() as i64 * 2 + 4
+            };
+            if lp_count != expected {
+                return corrupt("stream entry lp-count does not match its fields");
+            }
             if flags & STREAM_ITEM_FLAG_DELETED == 0 {
                 s.entries.insert(StreamId::new(ms, seq), fields);
             }
+        }
+        if count < 0 || deleted < 0 || count.checked_add(deleted) != Some(node_entries) {
+            return corrupt("stream listpack entry counts do not match its entries");
         }
     }
     let length = r.length()?;
@@ -3086,6 +3105,66 @@ mod tests {
         let alice = g.consumers.get(&b"Alice"[..]).unwrap();
         assert_eq!(alice.seen_time_ms, 1669793405685);
         assert_eq!(alice.active_time_ms, Some(1669793405685));
+    }
+
+    /// A one-node TYPE_STREAM_LISTPACKS body: master ID 1-0, field `f`,
+    /// one live entry 1-1 (`f` = `v`, same fields) and one deleted entry
+    /// 1-2, with the given counts and the live entry's lp-count.
+    fn stream_body(count: i64, deleted: i64, lp_count: i64) -> Vec<u8> {
+        let lp = lp_of(|w| {
+            w.int(count);
+            w.int(deleted);
+            w.int(1);
+            w.str(b"f");
+            w.int(0);
+            w.int(STREAM_ITEM_FLAG_SAMEFIELDS);
+            w.int(0);
+            w.int(1);
+            w.str(b"v");
+            w.int(lp_count);
+            w.int(STREAM_ITEM_FLAG_SAMEFIELDS | STREAM_ITEM_FLAG_DELETED);
+            w.int(0);
+            w.int(2);
+            w.str(b"w");
+            w.int(4);
+        });
+        let mut p = vec![TYPE_STREAM_LISTPACKS];
+        write_len(&mut p, 1);
+        write_raw_string(&mut p, &raw_id(StreamId::new(1, 0)));
+        write_raw_string(&mut p, &lp);
+        write_len(&mut p, 1); // length
+        write_len(&mut p, 1); // last ID
+        write_len(&mut p, 2);
+        write_len(&mut p, 0); // groups
+        p
+    }
+
+    /// Like Redis's deep sanitization, a stream node's entry counts and
+    /// each entry's lp-count must match its entries: a wrong lp-count sends
+    /// reverse iteration into the middle of another entry.
+    #[test]
+    fn stream_listpack_counts_are_validated() {
+        let ok = decode_dump_body(&stream_body(1, 1, 4), 0).unwrap();
+        let RudisValue::Stream(s) = ok.value else {
+            panic!("not a stream");
+        };
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(s.last_id, StreamId::new(1, 2));
+        for (count, deleted, lp_count) in [(1, 1, 5), (1, 1, 3), (2, 1, 4), (1, 0, 4), (2, -1, 4)] {
+            let err = decode_dump_body(&stream_body(count, deleted, lp_count), 0).unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("lp-count") || msg.contains("entry counts"),
+                "{msg}"
+            );
+        }
+        // Redis's own corrupt-dump suite payloads ("stream bad lp_count",
+        // "NPD in streamIteratorGetID"), body only (no version + CRC).
+        let bad_lp_count: &[u8] = b"\x0F\x01\x10\x00\x00\x01\x73\xDE\xDF\x7D\x9B\x00\x00\x00\x00\x00\x00\x00\x00\x40\x42\x42\x00\x00\x00\x18\x00\x03\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x00\x01\x02\x01\x00\x01\x00\x01\x01\x01\x00\x01\x56\x01\x02\x01\x22\x01\x00\x01\x01\x01\x82\x5F\x31\x03\x05\x01\x02\x01\x2C\x01\x00\x01\x01\x01\x02\x01\x05\x01\xFF\x03\x81\x00\x00\x01\x73\xDE\xDF\x7D\xC7\x00\x01\x07\x6D\x79\x67\x72\x6F\x75\x70\x81\x00\x00\x01\x73\xDE\xDF\x7D\x9B\x00\x01\x00\x00\x01\x73\xDE\xDF\x7D\x9B\x00\x00\x00\x00\x00\x00\x00\x00\xF9\x7D\xDF\xDE\x73\x01\x00\x00\x01\x01\x05\x41\x6C\x69\x63\x65\xEB\x7D\xDF\xDE\x73\x01\x00\x00\x01\x00\x00\x01\x73\xDE\xDF\x7D\x9B\x00\x00\x00\x00\x00\x00\x00\x00\x09\x00\xB2\xA8\xA7\x5F\x1B\x61\x72\xD5";
+        let npd: &[u8] = b"\x0F\x01\x10\x00\x00\x01\x73\xBD\x68\x48\x71\x00\x00\x00\x00\x00\x00\x00\x00\x40\x42\x42\x00\x00\x00\x18\x00\x03\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x00\x01\x02\x01\x00\x01\x00\x01\x01\x01\x00\x01\x05\x01\x02\x01\x00\x01\x01\x01\x01\x01\x82\x5F\x31\x03\x05\x01\x02\x01\x00\x01\x02\x01\x01\x01\x02\x01\x48\x01\xFF\x03\x81\x00\x00\x01\x73\xBD\x68\x48\x71\x02\x01\x07\x6D\x79\x67\x72\x6F\x75\x70\x81\x00\x00\x01\x73\xBD\x68\x48\x71\x00\x01\x00\x00\x01\x73\xBD\x68\x48\x71\x00\x00\x00\x00\x00\x00\x00\x00\x72\x48\x68\xBD\x73\x01\x00\x00\x01\x01\x05\x41\x6C\x69\x63\x65\x72\x48\x68\xBD\x73\x01\x00\x00\x01\x00\x00\x01\x73\xBD\x68\x48\x71\x00\x00\x00\x00\x00\x00\x00\x00\x09\x00\x80\xCD\xB0\xD5\x1A\xCE\xFF\x10";
+        for p in [bad_lp_count, npd] {
+            assert!(decode_dump_body(&p[..p.len() - 10], 0).is_err());
+        }
     }
 
     #[test]

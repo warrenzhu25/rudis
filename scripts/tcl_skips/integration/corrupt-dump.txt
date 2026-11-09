@@ -7,15 +7,6 @@
 # integration/rdb's "Server should not start if RDB is corrupted" checks.
 corrupt payload: load corrupted rdb with no CRC - #3505
 #
-# Known gaps (TODO, not deliberate): rudis accepts these stream payloads,
-# whose listpack entry counts (lp_count) disagree with the entries, where
-# Redis refuses them. Neither crashes (integration/corrupt-dump-fuzzer
-# passes), but the stream is restored inconsistent.
-corrupt payload: stream entry with invalid lp_count causing infinite loop in reverse iteration
-corrupt payload: fuzzer findings - NPD in streamIteratorGetID
-corrupt payload: fuzzer findings - stream bad lp_count
-corrupt payload: fuzzer findings - stream bad lp_count - unsanitized
-#
 # With sanitize-dump-payload no, Redis restores a set listpack holding
 # duplicate elements and checks SMEMBERS/SDIFF on it. Rudis validates every
 # payload and refuses it with "Bad data format" (the first half of the test,
