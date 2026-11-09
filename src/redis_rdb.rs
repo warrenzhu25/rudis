@@ -1184,6 +1184,11 @@ fn decode_stream(t: u8, r: &mut Reader<'_>) -> RdbResult<RudisStream> {
     if length != s.entries.len() as u64 {
         return corrupt("stream length does not match its entries");
     }
+    // entries_added counts every entry ever added, so it is at least the
+    // current length; XINFO reports it as a signed 64-bit integer.
+    if s.entries_added < length || s.entries_added > i64::MAX as u64 {
+        return corrupt("stream entries_added inconsistent with length");
+    }
     let ngroups = r.length()?;
     for _ in 0..ngroups {
         let name = r.bytes()?;
