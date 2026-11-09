@@ -3346,6 +3346,21 @@ pub fn err_arg(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// LCS builds an (m+1) x (n+1) table of u32. Like Redis, refuse inputs whose
+/// table would exceed `proto-max-bulk-len` instead of trying to allocate it:
+/// two 400 KB strings already need ~640 GB.
+fn lcs_table_too_big(m: usize, n: usize) -> Option<&'static str> {
+    if m >= u32::MAX as usize - 1 || n >= u32::MAX as usize - 1 {
+        return Some("String too long for LCS");
+    }
+    let cells = (m as u128 + 1) * (n as u128 + 1);
+    let bytes = cells * std::mem::size_of::<u32>() as u128;
+    if bytes > crate::resp::get_proto_max_bulk_len() as u128 {
+        return Some("Insufficient memory, transient memory for LCS exceeds proto-max-bulk-len");
+    }
+    None
+}
+
 #[inline]
 pub fn write_resp_err(out: &mut Vec<u8>, err: impl AsRef<str>) {
     let err = err.as_ref();
@@ -12678,6 +12693,10 @@ async fn execute_command_inner(
             let s2 = val2.as_ref();
             let m = s1.len();
             let n = s2.len();
+            if let Some(err) = lcs_table_too_big(m, n) {
+                write_resp_err(out, err);
+                return false;
+            }
 
             let mut dp = vec![vec![0u32; n + 1]; m + 1];
             for i in 1..=m {
@@ -21493,6 +21512,10 @@ pub fn execute_local_command(
                 let s2 = val2.as_ref();
                 let m = s1.len();
                 let n = s2.len();
+                if let Some(err) = lcs_table_too_big(m, n) {
+                    write_resp_err(out, err);
+                    return false;
+                }
 
                 let mut dp = vec![vec![0u32; n + 1]; m + 1];
                 for i in 1..=m {
