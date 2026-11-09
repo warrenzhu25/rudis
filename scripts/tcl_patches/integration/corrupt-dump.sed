@@ -9,6 +9,15 @@
 # they check instead that the payload was refused, logged, and that the
 # server is still up.
 #
+# 0. "assert_equal {OK} [r restore ...]" (sanitize-dump-payload no, where
+#    Redis accepts the payload and asserts later): rudis may refuse it, so
+#    catch it, and drop the assert_encoding on the next line (the key is not
+#    there); rule 2 then checks it was refused, logged, and the server is up.
+/^\s*assert_equal {OK} \[r restore .*\]$/{
+s/^\(\s*\)assert_equal {OK} \[r restore \(.*\)\]$/\1catch {r restore \2}/
+n
+/^\s*assert_encoding /d
+}
 # 1. A RESTORE Redis accepts without sanitization may fail: wrap it in a
 #    catch, unless it already is the body of one (the previous line, kept
 #    in the hold space, opens it).

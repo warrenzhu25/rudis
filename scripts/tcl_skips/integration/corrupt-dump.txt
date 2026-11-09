@@ -15,3 +15,9 @@ corrupt payload: stream entry with invalid lp_count causing infinite loop in rev
 corrupt payload: fuzzer findings - NPD in streamIteratorGetID
 corrupt payload: fuzzer findings - stream bad lp_count
 corrupt payload: fuzzer findings - stream bad lp_count - unsanitized
+#
+# With sanitize-dump-payload no, Redis restores a set listpack holding
+# duplicate elements and checks SMEMBERS/SDIFF on it. Rudis validates every
+# payload and refuses it with "Bad data format" (the first half of the test,
+# with sanitize yes, passes).
+corrupt payload: fuzzer findings - set with duplicate elements causes sdiff to hang
