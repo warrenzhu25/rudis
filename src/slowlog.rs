@@ -596,11 +596,14 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
             host,
             port,
             key,
+            keys,
             destination_db,
             timeout_ms,
-            ..
+            copy,
+            replace,
+            auth,
         } => {
-            let res = vec![
+            let mut res = vec![
                 Bytes::from_static(b"migrate"),
                 Bytes::from(host.clone()),
                 Bytes::from(port.to_string()),
@@ -608,6 +611,30 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
                 Bytes::from(destination_db.to_string()),
                 Bytes::from(timeout_ms.to_string()),
             ];
+            if *copy {
+                res.push(Bytes::from_static(b"COPY"));
+            }
+            if *replace {
+                res.push(Bytes::from_static(b"REPLACE"));
+            }
+            // Like Redis, the target's credentials never reach SLOWLOG or
+            // MONITOR.
+            match auth {
+                Some((None, _)) => {
+                    res.push(Bytes::from_static(b"AUTH"));
+                    res.push(Bytes::from_static(b"(redacted)"));
+                }
+                Some((Some(_), _)) => {
+                    res.push(Bytes::from_static(b"AUTH2"));
+                    res.push(Bytes::from_static(b"(redacted)"));
+                    res.push(Bytes::from_static(b"(redacted)"));
+                }
+                None => {}
+            }
+            if !keys.is_empty() {
+                res.push(Bytes::from_static(b"KEYS"));
+                res.extend(keys.iter().cloned());
+            }
             let len = res.len();
             (res, len)
         }

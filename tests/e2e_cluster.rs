@@ -4300,3 +4300,87 @@ fn test_cluster_bus_over_tls_e2e() {
     assert!(!cmd(a, &["CLUSTER", "NODES"]).contains(&fake));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// MIGRATE stores the keys in its destination-db on the target (it went to
+/// db 0 whatever was asked), refuses with BUSYKEY to overwrite a key there
+/// without REPLACE (keeping the source key), authenticates with AUTH /
+/// AUTH2, and its credentials never reach SLOWLOG.
+#[test]
+fn test_migrate_honours_destination_db_and_auth_e2e() {
+    let (src_port, dst_port) = (17191u16, 17192u16);
+    let (src_s, dst_s) = (src_port.to_string(), dst_port.to_string());
+    let mut src =
+        spawn_rudis_listening(&["--port", &src_s, "--threads", "2", "--no-pin"], src_port);
+    let mut dst =
+        spawn_rudis_listening(&["--port", &dst_s, "--threads", "2", "--no-pin"], dst_port);
+    let connect = |p: u16| {
+        let s = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+    let mut s = connect(src_port);
+    let mut d = connect(dst_port);
+    let migrate = |s: &mut TcpStream, key: &str, extra: &[&str]| {
+        let mut args = vec!["MIGRATE", "127.0.0.1", &dst_s, key, "9", "5000"];
+        args.extend_from_slice(extra);
+        resp_cmd(s, &args)
+    };
+
+    // Into db 9, not db 0.
+    assert_eq!(resp_cmd(&mut s, &["SET", "k1", "v1"]), "+OK\r\n");
+    assert_eq!(migrate(&mut s, "k1", &[]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut s, &["EXISTS", "k1"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut d, &["EXISTS", "k1"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut d, &["SELECT", "9"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut d, &["GET", "k1"]), "$2\r\nv1\r\n");
+
+    // An existing key in db 9: BUSYKEY without REPLACE, source kept.
+    assert_eq!(resp_cmd(&mut s, &["SET", "k1", "new"]), "+OK\r\n");
+    let r = migrate(&mut s, "k1", &[]);
+    assert!(r.contains("BUSYKEY"), "{r}");
+    assert_eq!(resp_cmd(&mut s, &["GET", "k1"]), "$3\r\nnew\r\n");
+    assert_eq!(migrate(&mut s, "k1", &["REPLACE"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut d, &["GET", "k1"]), "$3\r\nnew\r\n");
+
+    // A password-protected target: refused without AUTH, stored with it.
+    assert_eq!(
+        resp_cmd(&mut d, &["CONFIG", "SET", "requirepass", "sekret"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut s, &["SET", "k2", "v2"]), "+OK\r\n");
+    let r = migrate(&mut s, "k2", &[]);
+    assert!(r.starts_with("-") && r.contains("NOAUTH"), "{r}");
+    assert_eq!(resp_cmd(&mut s, &["EXISTS", "k2"]), ":1\r\n");
+    assert_eq!(migrate(&mut s, "k2", &["AUTH", "sekret"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut s, &["SET", "k3", "v3"]), "+OK\r\n");
+    assert_eq!(
+        migrate(&mut s, "k3", &["AUTH2", "default", "sekret"]),
+        "+OK\r\n"
+    );
+    let mut d = connect(dst_port);
+    assert_eq!(resp_cmd(&mut d, &["AUTH", "sekret"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut d, &["SELECT", "9"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut d, &["MGET", "k2", "k3"]),
+        "*2\r\n$2\r\nv2\r\n$2\r\nv3\r\n"
+    );
+
+    // The password is not in SLOWLOG.
+    assert_eq!(
+        resp_cmd(&mut s, &["CONFIG", "SET", "slowlog-log-slower-than", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut s, &["SET", "k4", "v4"]), "+OK\r\n");
+    assert_eq!(migrate(&mut s, "k4", &["AUTH", "sekret"]), "+OK\r\n");
+    let log = resp_cmd(&mut s, &["SLOWLOG", "GET", "5"]);
+    assert!(!log.contains("sekret"), "{log}");
+    assert!(log.contains("(redacted)"), "{log}");
+
+    drop((s, d));
+    shutdown_and_wait(src_port, &mut src);
+    let mut d = connect(dst_port);
+    resp_cmd(&mut d, &["AUTH", "sekret"]);
+    drop(d);
+    let _ = dst.kill();
+    let _ = dst.wait();
+}

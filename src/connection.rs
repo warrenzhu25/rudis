@@ -9684,8 +9684,13 @@ pub fn cmd_keys(cmd: &Command) -> Vec<&[u8]> {
 }
 
 /// How [`migrate_keys_to_node`] moves keys.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MigrateOpts {
+    /// The target database (MIGRATE's destination-db), selected first;
+    /// `None` for slot migration (a cluster node has database 0 only).
+    db: Option<u32>,
+    /// Credentials for the target (MIGRATE AUTH / AUTH2).
+    auth: Option<(Option<Bytes>, Bytes)>,
     /// Keep the source keys (MIGRATE COPY).
     copy: bool,
     /// Overwrite keys that already exist on the target.
@@ -9764,8 +9769,22 @@ async fn migrate_keys_to_node(
     }
 
     let mut tx_buf = Vec::new();
+    // Replies to these come before the RESTOREs'.
+    let mut prefix = 0;
+    match &opts.auth {
+        Some((None, pass)) => write_resp_command(&mut tx_buf, &[b"AUTH", pass]),
+        Some((Some(user), pass)) => write_resp_command(&mut tx_buf, &[b"AUTH", user, pass]),
+        None => {}
+    }
+    prefix += usize::from(opts.auth.is_some());
+    let db_s = opts.db.map(|d| d.to_string());
+    if let Some(db) = &db_s {
+        write_resp_command(&mut tx_buf, &[b"SELECT", db.as_bytes()]);
+        prefix += 1;
+    }
     // ASKING lets a cluster target accept keys of a slot it is importing.
     write_resp_command(&mut tx_buf, &[b"ASKING"]);
+    prefix += 1;
     for (k, payload, expire_at) in &dumps {
         let ttl = (*expire_at).max(0).to_string();
         let mut args: Vec<&[u8]> = vec![b"RESTORE", k, ttl.as_bytes(), payload];
@@ -9800,8 +9819,8 @@ async fn migrate_keys_to_node(
         return Err(format!("IOERR error sending to destination: {}", e));
     }
 
-    // One reply for ASKING, then one per RESTORE, in order.
-    let expected = dumps.len() + 1;
+    // One reply per prefix command, then one per RESTORE, in order.
+    let expected = dumps.len() + prefix;
     let mut replies = Vec::with_capacity(expected);
     let mut failure = None;
     let mut pending = Vec::new();
@@ -9832,9 +9851,18 @@ async fn migrate_keys_to_node(
         }
     }
 
+    // A refused AUTH or SELECT fails the whole MIGRATE (the RESTOREs then
+    // failed too, or went to the wrong database).
+    if let Some(Err(e)) = replies[..prefix.min(replies.len())]
+        .iter()
+        .find(|r| r.is_err())
+    {
+        failure.get_or_insert_with(|| format!("ERR Target instance replied with error: {}", e));
+        return Err(failure.unwrap_or_default());
+    }
     let mut stored = 0;
     for (i, (k, payload, _)) in dumps.into_iter().enumerate() {
-        match replies.get(i + 1) {
+        match replies.get(i + prefix) {
             Some(Ok(())) => {
                 stored += 1;
                 if !opts.copy {
@@ -9955,6 +9983,8 @@ async fn migrate_slot_to(
             host,
             port,
             MigrateOpts {
+                db: None,
+                auth: None,
                 copy: false,
                 replace: true,
                 timeout: SLOT_MIGRATION_TIMEOUT,
@@ -19022,10 +19052,11 @@ async fn execute_command_inner(
             port,
             key,
             keys,
-            destination_db: _,
+            destination_db,
             timeout_ms,
             copy,
             replace,
+            auth,
         } => {
             let mut migrate_keys = Vec::new();
             if let Some(k) = key
@@ -19047,6 +19078,8 @@ async fn execute_command_inner(
             let timeout =
                 std::time::Duration::from_millis(if timeout_ms == 0 { 1000 } else { timeout_ms });
             let opts = MigrateOpts {
+                db: Some(destination_db),
+                auth,
                 copy,
                 replace,
                 timeout,

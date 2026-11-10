@@ -550,6 +550,8 @@ pub enum Command {
         timeout_ms: u64,
         copy: bool,
         replace: bool,
+        /// AUTH <password> (`None` user) or AUTH2 <username> <password>.
+        auth: Option<(Option<Bytes>, Bytes)>,
     },
     Hset {
         key: Bytes,
@@ -4434,6 +4436,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
 
             let mut copy = false;
             let mut replace = false;
+            let mut auth = None;
             let mut keys = Vec::new();
             let mut i = 6;
             while i < args.len() {
@@ -4446,6 +4449,20 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     "REPLACE" => {
                         replace = true;
                         i += 1;
+                    }
+                    "AUTH" => {
+                        let Some(pass) = args.get(i + 1) else {
+                            return Err("syntax error".to_string());
+                        };
+                        auth = Some((None, pass.clone()));
+                        i += 2;
+                    }
+                    "AUTH2" => {
+                        let (Some(user), Some(pass)) = (args.get(i + 1), args.get(i + 2)) else {
+                            return Err("syntax error".to_string());
+                        };
+                        auth = Some((Some(user.clone()), pass.clone()));
+                        i += 3;
                     }
                     "KEYS" => {
                         i += 1;
@@ -4468,6 +4485,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 timeout_ms,
                 copy,
                 replace,
+                auth,
             }))
         }
         "CLIENT" => {
