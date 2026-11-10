@@ -1784,6 +1784,8 @@ fn encode_command_inner(cmd: &Command, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
             serialized,
             replace,
             absttl,
+            idletime,
+            freq,
             ..
         } => {
             let mut num_args = 4;
@@ -1792,6 +1794,16 @@ fn encode_command_inner(cmd: &Command, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
             }
             if *absttl {
                 num_args += 1;
+            }
+            // Logged as given, as Redis propagates them: a replica or
+            // AOF reload applies them under its own policy.
+            let lru_lfu = match (idletime, freq) {
+                (Some(i), _) => Some(("IDLETIME", i.to_string())),
+                (None, Some(f)) => Some(("FREQ", f.to_string())),
+                _ => None,
+            };
+            if lru_lfu.is_some() {
+                num_args += 2;
             }
             let ttl_str = ttl_ms.to_string();
             let _ = write!(buf, "*{}\r\n$7\r\nRESTORE\r\n${}\r\n", num_args, key.len());
@@ -1810,6 +1822,16 @@ fn encode_command_inner(cmd: &Command, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
             }
             if *absttl {
                 buf.extend_from_slice(b"$6\r\nABSTTL\r\n");
+            }
+            if let Some((opt, val)) = lru_lfu {
+                let _ = write!(
+                    buf,
+                    "${}\r\n{}\r\n${}\r\n{}\r\n",
+                    opt.len(),
+                    opt,
+                    val.len(),
+                    val
+                );
             }
             Some(Vec::new())
         }
@@ -5458,6 +5480,29 @@ pub fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RESTORE is logged with its IDLETIME / FREQ, so a replica or an AOF
+    /// reload restores the key's LRU / LFU data too (as Redis propagates
+    /// the command as given).
+    #[test]
+    fn test_restore_logs_idletime_and_freq() {
+        for (idletime, freq) in [(Some(1000), None), (None, Some(100)), (None, None)] {
+            let cmd = Command::Restore {
+                key: bytes::Bytes::from_static(b"k"),
+                ttl_ms: 5000,
+                serialized: bytes::Bytes::from_static(b"payload"),
+                replace: true,
+                absttl: true,
+                asking: false,
+                idletime,
+                freq,
+            };
+            let resp = command_to_resp(&cmd).unwrap();
+            let mut buf = bytes::BytesMut::from(&resp[..]);
+            let parsed = crate::resp::parse_command(&mut buf).unwrap().unwrap();
+            assert_eq!(parsed, cmd, "{}", String::from_utf8_lossy(&resp));
+        }
+    }
 
     /// The commands after an AOF's preamble are parsed a chunk at a time:
     /// replaying a 64 MB tail that keeps overwriting one key stays far below

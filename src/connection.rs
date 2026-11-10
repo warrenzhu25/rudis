@@ -24507,6 +24507,8 @@ pub fn execute_local_command(
                 serialized,
                 replace,
                 absttl,
+                idletime,
+                freq,
                 ..
             } => {
                 let prev_type = if *replace {
@@ -24516,6 +24518,7 @@ pub fn execute_local_command(
                 };
                 match db.restore(key.clone(), *ttl_ms, serialized, *replace, *absttl) {
                     Ok(()) => {
+                        db.table.set_lru_or_lfu(key, *freq, *idletime);
                         record_change!(cmd);
                         notify_keyspace_event(NOTIFY_GENERIC, "restore", key);
                         if let Some(prev) = prev_type
@@ -30649,6 +30652,8 @@ async fn move_key_across_shards(
                 replace: true,
                 absttl: expire_at > 0,
                 asking: false,
+                idletime: None,
+                freq: None,
             },
         )
         .await;

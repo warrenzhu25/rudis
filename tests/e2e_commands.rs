@@ -14502,3 +14502,68 @@ fn test_info_used_memory_peak_e2e() {
     );
     shutdown_and_wait(port, &mut srv);
 }
+
+/// RESTORE IDLETIME / FREQ set the key's LRU idle time / LFU counter (under
+/// an LRU / LFU policy), as in Redis; bad values are refused with Redis's
+/// errors and the two options exclude each other. They were parsed and
+/// then ignored: a restored key always looked just accessed.
+#[test]
+fn test_restore_idletime_freq_e2e() {
+    let port = 19965u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut q =
+        |args: &[&[u8]]| -> String { send_and_read_reply(&mut c, &format_resp_bytes(args)) };
+    assert_eq!(q(&[b"SET", b"foo", b"bar"]), "+OK\r\n");
+    let dump = send_and_read_bytes(
+        &mut TcpStream::connect(("127.0.0.1", port)).unwrap(),
+        &format_resp_bytes(&[b"DUMP", b"foo"]),
+    );
+    let body = dump.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let payload = dump[body..dump.len() - 2].to_vec();
+    let restore = |q: &mut dyn FnMut(&[&[u8]]) -> String, extra: &[&[u8]]| -> String {
+        let mut args: Vec<&[u8]> = vec![b"RESTORE", b"foo", b"0", &payload, b"REPLACE"];
+        args.extend_from_slice(extra);
+        q(&args)
+    };
+
+    // LRU: IDLETIME back-dates the access clock.
+    assert_eq!(
+        q(&[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lru"]),
+        "+OK\r\n"
+    );
+    assert_eq!(restore(&mut q, &[b"IDLETIME", b"1000"]), "+OK\r\n");
+    let idle: u64 = q(&[b"OBJECT", b"IDLETIME", b"foo"])
+        .trim_start_matches(':')
+        .trim()
+        .parse()
+        .unwrap();
+    assert!((1000..=1010).contains(&idle), "idle {idle}");
+    assert_eq!(q(&[b"GET", b"foo"]), "$3\r\nbar\r\n");
+
+    // LFU: FREQ sets the counter.
+    assert_eq!(
+        q(&[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lfu"]),
+        "+OK\r\n"
+    );
+    assert_eq!(restore(&mut q, &[b"FREQ", b"100"]), "+OK\r\n");
+    let freq = q(&[b"OBJECT", b"FREQ", b"foo"]);
+    assert!(freq == ":100\r\n" || freq == ":99\r\n", "{freq}");
+
+    // Errors, as in Redis.
+    let r = restore(&mut q, &[b"IDLETIME", b"-1"]);
+    assert_eq!(r, "-ERR Invalid IDLETIME value, must be >= 0\r\n");
+    let r = restore(&mut q, &[b"FREQ", b"256"]);
+    assert_eq!(r, "-ERR Invalid FREQ value, must be >= 0 and <= 255\r\n");
+    let r = restore(&mut q, &[b"IDLETIME", b"abc"]);
+    assert_eq!(r, "-ERR value is not an integer or out of range\r\n");
+    let r = restore(&mut q, &[b"IDLETIME", b"10", b"FREQ", b"5"]);
+    assert_eq!(r, "-ERR syntax error\r\n");
+    assert_eq!(
+        q(&[b"CONFIG", b"SET", b"maxmemory-policy", b"noeviction"]),
+        "+OK\r\n"
+    );
+    shutdown_and_wait(port, &mut srv);
+}

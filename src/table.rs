@@ -3034,11 +3034,12 @@ impl RudisFlatTable {
             .unwrap_or(0)
     }
 
-    #[cfg(test)]
     pub fn set_slot_last_access(&mut self, global_idx: usize, access: u16) {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
-        if let Some(a) = self.segments[seg_id].slot_access_mut(local_idx) {
+        if let Some(seg) = self.segments.get_mut(seg_id)
+            && let Some(a) = seg.slot_access_mut(local_idx)
+        {
             *a = access;
         }
     }
@@ -5390,6 +5391,22 @@ impl RudisTable {
             Some(lfu_decayed_counter(self.table.get_slot_last_access(idx)))
         } else {
             None
+        }
+    }
+
+    /// RESTORE IDLETIME / FREQ (Redis `objectSetLRUOrLFU`): under an LFU
+    /// policy `freq` becomes the key's counter; otherwise `idle` seconds
+    /// back-date its access clock (capped at what the 16-bit clock holds).
+    /// A value for the other kind of policy is ignored, as in Redis.
+    pub fn set_lru_or_lfu(&mut self, key: &[u8], freq: Option<u8>, idle: Option<u64>) {
+        let lfu = LFU_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+        let word = match (lfu, freq, idle) {
+            (true, Some(f), _) => ((lfu_minutes() as u16) << 8) | f as u16,
+            (false, _, Some(idle)) => lru_now().wrapping_sub(idle.min(u16::MAX as u64) as u16),
+            _ => return,
+        };
+        if let Some(idx) = self.table.find(key, hash_key(key)) {
+            self.table.set_slot_last_access(idx, word);
         }
     }
 

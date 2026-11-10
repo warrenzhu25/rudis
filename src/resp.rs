@@ -1009,6 +1009,10 @@ pub enum Command {
         replace: bool,
         absttl: bool,
         asking: bool,
+        /// IDLETIME: the key's LRU idle seconds (applied under an LRU policy).
+        idletime: Option<u64>,
+        /// FREQ: the key's LFU counter (applied under an LFU policy).
+        freq: Option<u8>,
     },
     // STREAM COMMANDS
     Xadd {
@@ -7814,6 +7818,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let mut replace = false;
             let mut absttl = false;
             let mut asking = cmd_name == "RESTORE-ASKING";
+            let mut idletime = None;
+            let mut freq = None;
             let mut i = 4;
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
@@ -7830,10 +7836,27 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         asking = true;
                         i += 1;
                     }
-                    "IDLETIME" | "FREQ" => {
-                        if i + 1 >= args.len() {
-                            return Err("syntax error".to_string());
+                    // As in Redis, IDLETIME and FREQ exclude each other.
+                    "IDLETIME" if i + 1 < args.len() && freq.is_none() => {
+                        let v: i64 = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or("value is not an integer or out of range")?;
+                        if v < 0 {
+                            return Err("Invalid IDLETIME value, must be >= 0".to_string());
                         }
+                        idletime = Some(v as u64);
+                        i += 2;
+                    }
+                    "FREQ" if i + 1 < args.len() && idletime.is_none() => {
+                        let v: i64 = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or("value is not an integer or out of range")?;
+                        if !(0..=255).contains(&v) {
+                            return Err("Invalid FREQ value, must be >= 0 and <= 255".to_string());
+                        }
+                        freq = Some(v as u8);
                         i += 2;
                     }
                     _ => return Err("syntax error".to_string()),
@@ -7846,6 +7869,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 replace,
                 absttl,
                 asking,
+                idletime,
+                freq,
             }))
         }
         "XADD" => {
@@ -15271,6 +15296,8 @@ mod tests {
                 replace: false,
                 absttl: false,
                 asking: false,
+                idletime: None,
+                freq: None,
             }
         );
 
@@ -15287,6 +15314,8 @@ mod tests {
                 replace: true,
                 absttl: true,
                 asking: false,
+                idletime: None,
+                freq: None,
             }
         );
 
@@ -15303,6 +15332,8 @@ mod tests {
                 replace: true,
                 absttl: false,
                 asking: true,
+                idletime: None,
+                freq: None,
             }
         );
     }
