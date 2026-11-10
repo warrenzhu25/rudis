@@ -1,0 +1,24 @@
+# unit/info tests that don't apply to rudis.
+#
+# Redis's single-threaded event-loop metrics (eventloop_cycles,
+# eventloop_duration_*, instantaneous_eventloop_*,
+# eventloop_cycles_with_clients_processing, eventloop_cmd_per_cycle_max):
+# rudis runs one monoio loop per thread and does not report them; the
+# expected values (cycles per hz tick, per-cycle durations) describe Redis's
+# ae loop. See docs/differences.md.
+stats: eventloop metrics
+stats: instantaneous metrics
+stats: debug metrics
+stats: client processing and pipeline metrics
+stats: client processing metrics reset with CONFIG RESETSTAT
+# The 128-code cap, ERRORSTATS_DISABLED and the log lines match Redis
+# (e2e: test_errorstats_capped_at_128_codes_e2e); the test then checks that
+# CONFIG RESETSTAT lazy-freed exactly 128 objects, a Redis lazyfree detail.
+errorstats: limit errors will not increase indefinitely
+# Redis dict internals: exact bucket-array sizes (8 then 16 pointers) and
+# incremental-rehash state. Rudis's key tables size and grow differently.
+memory: database and pubsub overhead and rehashing dict count
+# Cluster mode: each rudis shard listens on its own port (base + shard) and
+# MOVED points at it; the test's plain (not cluster-aware) client on node 0
+# gets "MOVED <slot> 127.0.0.1:<base+N>" for keys on other shards.
+Verify that LUT overhead is properly updated when dicts are emptied or reused (issue #13973)

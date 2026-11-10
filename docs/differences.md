@@ -73,6 +73,17 @@ This document summarizes the architectural, operational, and semantic difference
   at all, and with `--threads 1` a script that never ends can be stopped only by killing the
   process. Retry the kill on a new connection, or keep scripts short.
 
+### Event-Loop Metrics in INFO
+
+Redis reports metrics of its single-threaded event loop (`eventloop_cycles`,
+`eventloop_duration_sum`, `eventloop_duration_cmd_sum`,
+`instantaneous_eventloop_cycles_per_sec`, `instantaneous_eventloop_duration_usec`,
+`eventloop_cycles_with_clients_processing`, `total_client_processing_events`, and in
+`INFO debug` the `eventloop_duration_*`/`eventloop_*_max` fields). Rudis runs one event
+loop per thread and does not report these. Per-client pipeline counters are in
+`CLIENT LIST` (`tot-cmds`, `read-events`, `avg-pipeline-len-sum`/`-cnt`). The Redis
+tests for them are skipped (`scripts/tcl_skips/unit/info.txt`).
+
 ## 3. Replication & High Availability
 
 ### Parallel Replication vs. Single Stream
