@@ -5572,6 +5572,37 @@ fn log_oom_rejection(max_mem: u64, policy: &str) {
     }
 }
 
+/// For SUBSCRIBE / PSUBSCRIBE / SSUBSCRIBE (`denyoom` in Redis): whether
+/// used memory is over `maxmemory` after the policy had its chance to free
+/// some, so the subscription is refused. Subscriptions take memory (the
+/// channel names, the registry), and a client could otherwise grow it past
+/// the limit without bound.
+async fn subscribe_over_maxmemory(router: &Router, client_id: u64) -> bool {
+    let max_mem = router
+        .tier_stats
+        .max_memory
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if max_mem == 0 || maxmemory_ignored_as_replica(router.base_port) {
+        return false;
+    }
+    let policy = get_max_memory_policy();
+    let over = if policy != "noeviction" {
+        let mut scratch = Vec::new();
+        !router
+            .evict_until_under_maxmemory(max_mem as usize, &policy, client_id, &mut scratch)
+            .await
+    } else {
+        router.over_maxmemory_checked().await && {
+            router.check_auto_tier().await;
+            router.over_maxmemory()
+        }
+    };
+    if over {
+        log_oom_rejection(max_mem, &policy);
+    }
+    over
+}
+
 pub static ISOLATED_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
@@ -7234,6 +7265,20 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
             .get(&client_id)
             .map(|c| c.is_resp3)
             .unwrap_or(false);
+
+        if !*in_multi
+            && matches!(
+                cmd,
+                Command::Subscribe(_) | Command::Psubscribe(_) | Command::Ssubscribe(_)
+            )
+            && subscribe_over_maxmemory(router, client_id).await
+        {
+            let c_name = get_cmd_name(&cmd);
+            record_rejected_stat(c_name);
+            record_error_stat("OOM", Some(c_name));
+            out.extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+            return false;
+        }
 
         if *in_multi {
             match cmd {

@@ -73,11 +73,6 @@ This document summarizes the architectural, operational, and semantic difference
   at all, and with `--threads 1` a script that never ends can be stopped only by killing the
   process. Retry the kill on a new connection, or keep scripts short.
 
-### Pub/Sub and `maxmemory` (Known Gap)
-* **Redis** (the version under `tests/redis-tests`): `SUBSCRIBE`, `PSUBSCRIBE` and `SSUBSCRIBE` are refused with `-OOM` while used memory
-  is over `maxmemory`.
-* **Rudis**: Subscriptions are accepted regardless of memory use.
-
 ## 3. Replication & High Availability
 
 ### Parallel Replication vs. Single Stream

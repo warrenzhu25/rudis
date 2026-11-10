@@ -177,9 +177,6 @@ for suite in "${TARGET_SUITES[@]}"; do
     # - "Subkey notifications": not implemented (hash-field keyspace
     #   events, notify-keyspace-events S); the tests wait for messages
     #   that never come.
-    # - "OOM": known gap (TODO): SUBSCRIBE / PSUBSCRIBE / SSUBSCRIBE are
-    #   not refused when used memory is over maxmemory. (The other OOM
-    #   tests need maxmemory and are excluded by tag.)
     if tclsh test_helper.tcl \
         --host 127.0.0.1 \
         --port "$PORT" \
@@ -191,7 +188,6 @@ for suite in "${TARGET_SUITES[@]}"; do
         --skiptest "/.*kill not working on.*" \
         --skiptest "/.*Subkey notifications.*" \
         --skiptest "/.*Timedout.*" \
-        --skiptest "/.*OOM.*" \
         --clients "$CLIENTS" \
         ${TCL_EXTRA:-} \
         --single "$suite"; then

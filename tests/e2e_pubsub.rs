@@ -702,3 +702,52 @@ fn test_quit_in_subscribed_mode_closes_the_connection_e2e() {
     }
     shutdown_and_wait(port, &mut srv);
 }
+
+/// SUBSCRIBE, PSUBSCRIBE and SSUBSCRIBE are refused with -OOM while used
+/// memory is over maxmemory (Redis flags them denyoom): subscriptions take
+/// memory, and were accepted however far over the limit the server was.
+#[test]
+fn test_subscribe_refused_over_maxmemory_e2e() {
+    let port = 19953u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+    let mut admin = connect();
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["CONFIG", "SET", "maxmemory-policy", "noeviction"]
+        ),
+        "+OK\r\n"
+    );
+    // Far below what the server itself uses.
+    assert_eq!(
+        resp_cmd(&mut admin, &["CONFIG", "SET", "maxmemory", "1"]),
+        "+OK\r\n"
+    );
+    for cmd in ["SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE"] {
+        let mut c = connect();
+        let r = resp_cmd(&mut c, &[cmd, "ch"]);
+        assert!(r.starts_with("-OOM command not allowed"), "{cmd}: {r}");
+        // Not subscribed: the connection still runs any command.
+        assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    }
+    let stats = resp_cmd(&mut admin, &["INFO", "commandstats"]);
+    let sub = stats
+        .lines()
+        .find(|l| l.starts_with("cmdstat_subscribe:"))
+        .unwrap();
+    assert!(sub.contains("rejected_calls=1,"), "{sub}");
+    // Under the limit again, subscriptions work.
+    assert_eq!(
+        resp_cmd(&mut admin, &["CONFIG", "SET", "maxmemory", "0"]),
+        "+OK\r\n"
+    );
+    let mut c = connect();
+    assert!(resp_cmd(&mut c, &["SUBSCRIBE", "ch"]).contains("subscribe"));
+    shutdown_and_wait(port, &mut srv);
+}
