@@ -5492,6 +5492,16 @@ impl Router {
             self.apply_replica_on(target, cmd).await;
         } else {
             match cmd {
+                // Delivered to this replica's subscribers on every shard.
+                Command::Publish { .. } | Command::Spublish { .. } => {
+                    let mut dummy_out = Vec::new();
+                    crate::connection::apply_replicated_command(
+                        &cmd,
+                        &mut self.local_db.borrow_mut(),
+                        &mut dummy_out,
+                        self.aof().as_deref(),
+                    );
+                }
                 Command::Select(idx) => {
                     let start = std::time::Instant::now();
                     let db_idx = idx as usize;

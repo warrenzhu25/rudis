@@ -5503,6 +5503,22 @@ pub fn script_non_local_target(cmd: &Command) -> Option<usize> {
     })
 }
 
+/// Sends a PUBLISH / SPUBLISH (`name`) to this server's replicas, as Redis
+/// does, so their subscribers get the message too. Not to the AOF: a
+/// message is not data. A replica applying it from its master passes it on
+/// to its own replicas the same way.
+fn propagate_publish(name: &[u8], channel: &[u8], message: &[u8]) {
+    CURRENT_ROUTER.with(|cr| {
+        if let Some(router) = cr.borrow().as_ref()
+            && crate::replication::has_connected_replicas(router.base_port)
+        {
+            let mut bytes = Vec::with_capacity(channel.len() + message.len() + 32);
+            write_resp_command(&mut bytes, &[name, channel, message]);
+            crate::replication::propagate_shard_bytes(router.base_port, router.shard_id, &bytes);
+        }
+    });
+}
+
 pub fn publish_sync(channel: &[u8], message: &[u8]) -> usize {
     CURRENT_ROUTER.with(|cr| {
         if let Some(router) = cr.borrow().as_ref() {
@@ -19123,11 +19139,13 @@ async fn execute_command_inner(
             false
         }
         Command::Publish { channel, message } => {
+            propagate_publish(b"PUBLISH", &channel, &message);
             let count = router.publish(channel, message).await;
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
         }
         Command::Spublish { channel, message } => {
+            propagate_publish(b"SPUBLISH", &channel, &message);
             let count = router.spublish(channel, message).await;
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
@@ -28466,12 +28484,15 @@ pub fn execute_local_command(
                 out.extend_from_slice(b"+OK\r\n");
                 false
             }
+            // From a script, or a replica applying its master's stream.
             Command::Publish { channel, message } => {
+                propagate_publish(b"PUBLISH", channel, message);
                 let count = publish_sync(channel.as_ref(), message.as_ref());
                 write_resp_integer(out, count as i64);
                 false
             }
             Command::Spublish { channel, message } => {
+                propagate_publish(b"SPUBLISH", channel, message);
                 let count = spublish_sync(channel.as_ref(), message.as_ref());
                 write_resp_integer(out, count as i64);
                 false

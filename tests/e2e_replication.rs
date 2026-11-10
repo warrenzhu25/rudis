@@ -7977,3 +7977,65 @@ fn test_first_write_after_replica_turns_writable_deletes_expired_key_e2e() {
     shutdown_and_wait(rport, &mut nodes.0[1]);
     shutdown_and_wait(mport, &mut nodes.0[0]);
 }
+
+/// PUBLISH and SPUBLISH on a master reach subscribers on its replica (and
+/// on the replica's own replica), as in Redis: they were never propagated,
+/// so a subscriber on a read replica got nothing. Not written to the AOF.
+#[test]
+fn test_publish_reaches_subscribers_on_replicas_e2e() {
+    let (m, r1, r2) = (17491u16, 17492u16, 17493u16);
+    let spawn = |p: u16| {
+        let ps = p.to_string();
+        spawn_rudis_listening(&["--port", &ps, "--threads", "2", "--no-pin"], p)
+    };
+    let (mut ms, mut s1, mut s2) = (spawn(m), spawn(r1), spawn(r2));
+    let connect = |p: u16| {
+        let s = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+    let mut c1 = connect(r1);
+    assert_eq!(
+        resp_cmd(&mut c1, &["REPLICAOF", "127.0.0.1", &m.to_string()]),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut c1);
+    let mut c2 = connect(r2);
+    assert_eq!(
+        resp_cmd(&mut c2, &["REPLICAOF", "127.0.0.1", &r1.to_string()]),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut c2);
+
+    let mut subs: Vec<TcpStream> = [r1, r2]
+        .iter()
+        .flat_map(|&p| {
+            let mut a = connect(p);
+            assert!(resp_cmd(&mut a, &["SUBSCRIBE", "news"]).contains("subscribe"));
+            let mut b = connect(p);
+            assert!(resp_cmd(&mut b, &["SSUBSCRIBE", "snews"]).contains("ssubscribe"));
+            [a, b]
+        })
+        .collect();
+    let mut master = connect(m);
+    // No subscriber on the master itself.
+    assert_eq!(
+        resp_cmd(&mut master, &["PUBLISH", "news", "hello"]),
+        ":0\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut master, &["SPUBLISH", "snews", "shi"]),
+        ":0\r\n"
+    );
+    for (i, s) in subs.iter_mut().enumerate() {
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).unwrap();
+        let got = String::from_utf8_lossy(&buf[..n]);
+        let want = if i % 2 == 0 { "hello" } else { "shi" };
+        assert!(got.contains(want), "subscriber {i}: {got}");
+    }
+    drop(subs);
+    shutdown_and_wait(r2, &mut s2);
+    shutdown_and_wait(r1, &mut s1);
+    shutdown_and_wait(m, &mut ms);
+}
