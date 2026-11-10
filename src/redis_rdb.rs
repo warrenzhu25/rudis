@@ -1639,6 +1639,51 @@ pub fn dump_value(val: &RudisValue) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The DUMP payload of a hash with field TTLs (`ttls`: field -> deadline),
+/// as Redis 7.4 writes it: RDB_TYPE_HASH_METADATA, i.e. the earliest
+/// deadline, then each field as (TTL relative to it + 1, or 0 for none,
+/// field, value). Fields whose TTL has passed are left out. `None` for a
+/// value that is not a hash.
+pub fn dump_hash_with_ttls(
+    val: &RudisValue,
+    ttls: &hashbrown::HashMap<Bytes, std::time::Instant>,
+) -> Option<Vec<u8>> {
+    let val = match val {
+        RudisValue::Cooled(cv) => &cv.val,
+        v => v,
+    };
+    let now = std::time::Instant::now();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let deadline_ms = |f: &[u8]| {
+        ttls.get(f)
+            .map(|&at| crate::table::instant_to_unix_ms(at, now, now_unix))
+    };
+    let pairs: Vec<(&[u8], &[u8])> = match val {
+        RudisValue::SmallHash(pairs) => pairs.iter().collect(),
+        RudisValue::Hash(h) => h.iter().collect(),
+        _ => return None,
+    };
+    let now_ms = now_unix.as_millis() as u64;
+    let fields: Vec<(&[u8], &[u8], Option<u64>)> = pairs
+        .into_iter()
+        .map(|(f, v)| (f, v, deadline_ms(f)))
+        .filter(|&(_, _, at)| !at.is_some_and(|at| at <= now_ms))
+        .collect();
+    let min = fields.iter().filter_map(|f| f.2).min().unwrap_or(0);
+    let mut out = vec![TYPE_HASH_METADATA];
+    out.extend_from_slice(&(min as i64).to_le_bytes());
+    write_len(&mut out, fields.len() as u64);
+    for (f, v, at) in fields {
+        write_len(&mut out, at.map_or(0, |at| at - min + 1));
+        write_string(&mut out, f);
+        write_string(&mut out, v);
+    }
+    seal_dump(&mut out);
+    Some(out)
+}
+
 /// A listpack under construction.
 struct LpWriter {
     buf: Vec<u8>,

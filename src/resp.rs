@@ -9091,11 +9091,35 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .map_err(|_| "value is not an integer or out of range")?
                 .parse()
                 .map_err(|_| "value is not an integer or out of range")?;
-            let expire_ms = match cmd_name {
-                "HEXPIRE" | "HEXPIREAT" => raw_time.saturating_mul(1000),
-                _ => raw_time,
+            // As Redis validates it: never negative, and the absolute
+            // deadline at most HFE_MAX_ABS_TIME_MSEC (EB_EXPIRE_TIME_MAX >> 2).
+            const HFE_MAX_ABS_TIME_MSEC: i64 = ((1i64 << 48) - 1) >> 2;
+            if raw_time < 0 {
+                return Err("ERR invalid expire time, must be >= 0".to_string());
+            }
+            let bad_time = || {
+                format!(
+                    "ERR invalid expire time in '{}' command",
+                    cmd_name.to_lowercase()
+                )
             };
+            let seconds = matches!(cmd_name, "HEXPIRE" | "HEXPIREAT");
+            if seconds && raw_time > HFE_MAX_ABS_TIME_MSEC / 1000 {
+                return Err(bad_time());
+            }
+            let expire_ms = if seconds { raw_time * 1000 } else { raw_time };
             let is_at = matches!(cmd_name, "HEXPIREAT" | "HPEXPIREAT");
+            let base_ms = if is_at {
+                0
+            } else {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64
+            };
+            if expire_ms > HFE_MAX_ABS_TIME_MSEC - base_ms {
+                return Err(bad_time());
+            }
 
             let mut idx = 3;
             let mut condition = HexpireCondition::None;

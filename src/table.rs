@@ -5447,6 +5447,21 @@ impl RudisTable {
         let old_key = entry.key.heap_bytes();
         entry.key = CompactKey::with_ttl(&dst, entry.key.ttl());
         self.data_bytes = self.data_bytes.saturating_sub(old_key) + entry.key.heap_bytes();
+        // Hash field TTLs move with the value. They used to stay under the
+        // old name (the renamed hash's fields never expired, and a hash
+        // created later under that name took them on) and the replaced
+        // value's stayed on the new name.
+        if !self.hash_field_expires.is_empty() {
+            let moved = self.hash_field_expires.remove(src);
+            match moved {
+                Some(ttls) => {
+                    self.hash_field_expires.insert(dst.clone(), ttls);
+                }
+                None => {
+                    self.hash_field_expires.remove(dst.as_ref());
+                }
+            }
+        }
         self.table.insert(entry);
 
         Ok(true)
@@ -5504,6 +5519,20 @@ impl RudisTable {
 
         if expire_at.is_some() {
             self.num_expires += 1;
+        }
+        // The copy carries the source's hash field TTLs, and none of the
+        // value it replaced (both used to go wrong: the copy's fields never
+        // expired, and a replaced hash's TTLs applied to the new value).
+        if !self.hash_field_expires.is_empty() {
+            let src_ttls = self.hash_field_expires.get(src).cloned();
+            match src_ttls {
+                Some(ttls) => {
+                    self.hash_field_expires.insert(dst.clone(), ttls);
+                }
+                None => {
+                    self.hash_field_expires.remove(dst.as_ref());
+                }
+            }
         }
         let entry = RudisEntry::new(CompactKey::new(&dst), val, Expiry::from(expire_at));
         self.table.insert(entry);
@@ -15238,7 +15267,21 @@ impl RudisTable {
             return None;
         }
         let entry = self.table.get_slot(idx)?;
-        crate::redis_rdb::dump_value(&entry.val)
+        self.dump_entry_value(key, &entry.val)
+    }
+
+    /// DUMP payload of `val`, the value at `key`: a hash with field TTLs
+    /// keeps them (they used to be dropped, so a RESTOREd, MIGRATEd or
+    /// cross-shard RENAMEd/COPYd hash's fields never expired).
+    pub fn dump_entry_value(&self, key: &[u8], val: &RudisValue) -> Option<Vec<u8>> {
+        if !self.hash_field_expires.is_empty()
+            && let Some(ttls) = self.hash_field_expires.get(key)
+            && !ttls.is_empty()
+            && let Some(out) = crate::redis_rdb::dump_hash_with_ttls(val, ttls)
+        {
+            return Some(out);
+        }
+        crate::redis_rdb::dump_value(val)
     }
 
     /// Appends the legacy DUMP trailer to a `serialize_val_payload`

@@ -13835,3 +13835,126 @@ fn test_blocked_command_refused_after_its_user_loses_key_access_e2e() {
     );
     shutdown_and_wait(port, &mut srv);
 }
+
+/// Hash field TTLs survive DUMP / RESTORE, and so cross-shard RENAME and
+/// COPY (which go through them) and MIGRATE: DUMP used to leave them out,
+/// so the copy's fields never expired. A field already expired is not
+/// dumped. HEXPIRE & co. refuse a negative time and one past Redis's
+/// limit, as Redis does.
+#[test]
+fn test_hash_field_ttls_survive_dump_restore_e2e() {
+    let port = 19954u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let ttls =
+        |c: &mut TcpStream, k: &str| resp_cmd(c, &["HEXPIRETIME", k, "FIELDS", "3", "a", "b", "c"]);
+    let want = "*3\r\n:2524600800\r\n:2524600801\r\n:-1\r\n";
+    assert_eq!(
+        resp_cmd(&mut c, &["HSET", "h", "a", "1", "b", "2", "c", "3"]),
+        ":3\r\n"
+    );
+    resp_cmd(
+        &mut c,
+        &["HEXPIREAT", "h", "2524600800", "FIELDS", "1", "a"],
+    );
+    resp_cmd(
+        &mut c,
+        &["HEXPIREAT", "h", "2524600801", "FIELDS", "1", "b"],
+    );
+    assert_eq!(ttls(&mut c, "h"), want);
+
+    // DUMP / RESTORE.
+    c.write_all(b"*2\r\n$4\r\nDUMP\r\n$1\r\nh\r\n").unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = c.read(&mut buf).unwrap();
+    let reply = &buf[..n];
+    let hdr = reply.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let len: usize = std::str::from_utf8(&reply[1..hdr - 2])
+        .unwrap()
+        .parse()
+        .unwrap();
+    let payload = reply[hdr..hdr + len].to_vec();
+    let mut req = b"*4\r\n$7\r\nRESTORE\r\n$2\r\nh2\r\n$1\r\n0\r\n".to_vec();
+    req.extend_from_slice(format!("${}\r\n", payload.len()).as_bytes());
+    req.extend_from_slice(&payload);
+    req.extend_from_slice(b"\r\n");
+    c.write_all(&req).unwrap();
+    let n = c.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"+OK\r\n");
+    assert_eq!(ttls(&mut c, "h2"), want);
+
+    // COPY and RENAME to keys on every shard (some cross-shard).
+    for i in 0..8 {
+        let dst = format!("copy{i}");
+        assert_eq!(resp_cmd(&mut c, &["COPY", "h", &dst]), ":1\r\n");
+        assert_eq!(ttls(&mut c, &dst), want, "{dst}");
+        let moved = format!("moved{i}");
+        assert_eq!(resp_cmd(&mut c, &["RENAME", &dst, &moved]), "+OK\r\n");
+        assert_eq!(ttls(&mut c, &moved), want, "{moved}");
+    }
+
+    // The old name of a renamed hash keeps no TTLs: a new hash there has
+    // none.
+    for i in 0..8 {
+        let old = format!("copy{i}");
+        assert_eq!(resp_cmd(&mut c, &["HSET", &old, "a", "1"]), ":1\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["HEXPIRETIME", &old, "FIELDS", "1", "a"]),
+            "*1\r\n:-1\r\n",
+            "{old}"
+        );
+    }
+
+    // COPY ... REPLACE over a hash with TTLs: the new value has none.
+    assert_eq!(resp_cmd(&mut c, &["HSET", "plain", "a", "9"]), ":1\r\n");
+    for i in 0..8 {
+        let dst = format!("moved{i}");
+        assert_eq!(
+            resp_cmd(&mut c, &["COPY", "plain", &dst, "REPLACE"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["HEXPIRETIME", &dst, "FIELDS", "1", "a"]),
+            "*1\r\n:-1\r\n",
+            "{dst}"
+        );
+    }
+
+    // A field whose TTL passed is not carried over.
+    assert_eq!(
+        resp_cmd(&mut c, &["HSET", "e", "gone", "1", "kept", "2"]),
+        ":2\r\n"
+    );
+    resp_cmd(&mut c, &["HPEXPIRE", "e", "1", "FIELDS", "1", "gone"]);
+    thread::sleep(Duration::from_millis(20));
+    for i in 0..8 {
+        let dst = format!("ecopy{i}");
+        assert_eq!(resp_cmd(&mut c, &["COPY", "e", &dst]), ":1\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["HGETALL", &dst]),
+            "*2\r\n$4\r\nkept\r\n$1\r\n2\r\n"
+        );
+    }
+
+    // Validation.
+    let r = resp_cmd(&mut c, &["HEXPIRE", "h", "-1", "FIELDS", "1", "c"]);
+    assert_eq!(r, "-ERR invalid expire time, must be >= 0\r\n");
+    let r = resp_cmd(
+        &mut c,
+        &["HPEXPIRE", "h", "70368744177664", "FIELDS", "1", "c"],
+    );
+    assert!(
+        r.starts_with("-ERR invalid expire time in 'hpexpire'"),
+        "{r}"
+    );
+    let r = resp_cmd(&mut c, &["HEXPIRE", "h", "70368744177", "FIELDS", "1", "c"]);
+    assert!(
+        r.starts_with("-ERR invalid expire time in 'hexpire'"),
+        "{r}"
+    );
+    // The field is untouched by the refused commands.
+    assert_eq!(resp_cmd(&mut c, &["HGET", "h", "c"]), "$1\r\n3\r\n");
+    shutdown_and_wait(port, &mut srv);
+}

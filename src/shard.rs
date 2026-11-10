@@ -2918,7 +2918,7 @@ impl ShardDb {
         // allows) is dumped from its record, decoded without promoting it.
         if let Some(ptr) = self.table.is_tiered(key) {
             let val = self.hydrate_tiered(ptr)?;
-            return crate::redis_rdb::dump_value(&val);
+            return self.table.dump_entry_value(key, &val);
         }
         self.table.dump(key)
     }
