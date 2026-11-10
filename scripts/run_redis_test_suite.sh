@@ -172,6 +172,18 @@ for suite in "${TARGET_SUITES[@]}"; do
         continue
     fi
     start_server "$suite" || { FAILED_SUITES+=("$suite"); continue; }
+    # Skipped by name:
+    # - "script timeout", "Timedout", "function kill", "kill not working on":
+    #   known gap (TODO): a shard runs a script to completion, so a
+    #   connection on the busy script's shard gets no reply (not even
+    #   -BUSY) and SCRIPT KILL / FUNCTION KILL / SHUTDOWN NOSAVE work only
+    #   from another shard's connection; with --threads 1, never.
+    # - "Subkey notifications": not implemented (hash-field keyspace
+    #   events, notify-keyspace-events S); the tests wait for messages
+    #   that never come.
+    # - "OOM": known gap (TODO): SUBSCRIBE / PSUBSCRIBE / SSUBSCRIBE are
+    #   not refused when used memory is over maxmemory. (The other OOM
+    #   tests need maxmemory and are excluded by tag.)
     if tclsh test_helper.tcl \
         --host 127.0.0.1 \
         --port "$PORT" \

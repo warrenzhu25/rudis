@@ -50,6 +50,22 @@ own "Future Improvements" section in `docs/design/components.md` and
 **Fix first:** #1. It's a live, reachable data-corruption bug on any deployment with more than
 one connected client per shard where at least one uses RESP3 — not a theoretical edge case.
 
+### Status (re-checked 2026-11-09): all ten findings are resolved
+
+The findings below are kept as a record. Each was re-checked against the current source:
+
+| # | Resolution |
+| :---: | :--- |
+| 1 | Command dispatch sets `CURRENT_CLIENT_RESP3` from the executing client's `is_resp3` before it runs anything (`connection.rs`, in the single-command and batched paths). |
+| 2 | `execute_tx_step` updates `last_active`/`last_cmd` for every command, blocking ones included: `CLIENT LIST` shows `cmd=blpop flags=b` for a client blocked in `BLPOP`. |
+| 3 | `CONFIG RESETSTAT` calls `Router::reset_command_stats`, which sends the reset to every shard; `INFO commandstats` calls `flush_all_command_stats` before it reads. |
+| 4 | `ScatterMgetDescriptor` wraps its per-slot `results`, `notify` and `recycled_keys` cells in `CachePadded`. |
+| 5 | `reset_tier_stats` resets the existing `TieringStats` in place, so a cached `Arc` stays valid (`tiering.rs`, `test_reset_tier_stats_in_place`). |
+| 6 | The channel-pool fields and methods are gone from `router.rs`. |
+| 7, 8 | The cold-tiering checks in `server.rs` no longer call `get_max_memory`/`get_offload_threshold_pct`/`get_tier_stats`; the read paths use the router's cached `r.tier_stats`. |
+| 9 | The no-op `if buf.is_empty() { buf.clear(); }` is gone. |
+| 10 | `mailbox.rs` has unit tests, and the cross-shard `MGET`/`MSET` paths are covered by the e2e tests. |
+
 ---
 
 ## Findings
