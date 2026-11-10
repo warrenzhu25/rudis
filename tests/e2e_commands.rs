@@ -14231,3 +14231,61 @@ fn test_info_clients_pubsub_watch_active_e2e() {
     assert_eq!(field(&mut c, "active_clients"), "1");
     shutdown_and_wait(port, &mut srv);
 }
+
+/// XGROUP and XINFO subcommands are counted under their full names in
+/// INFO commandstats (`cmdstat_xgroup|createconsumer`), as in Redis, both
+/// when called directly and from a script. They were all lumped under
+/// `cmdstat_xgroup`/`cmdstat_xinfo`.
+#[test]
+fn test_xgroup_xinfo_subcommand_stats_e2e() {
+    let port = 19960u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let stat = |c: &mut TcpStream, name: &str| -> String {
+        let info = resp_cmd(c, &["INFO", "commandstats"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("cmdstat_{name}:")))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    assert!(resp_cmd(&mut c, &["XADD", "s1", "*", "f", "v"]).starts_with('$'));
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+
+    // Direct call failing with NOGROUP: a failed call of the subcommand.
+    let r = resp_cmd(&mut c, &["XGROUP", "CREATECONSUMER", "s1", "g", "c"]);
+    assert!(r.starts_with("-NOGROUP"), "{r}");
+    let s = stat(&mut c, "xgroup|createconsumer");
+    assert!(
+        s.starts_with("calls=1,") && s.contains("rejected_calls=0,failed_calls=1"),
+        "{s}"
+    );
+    assert_eq!(stat(&mut c, "xgroup"), "");
+
+    // The same from a script.
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+    let script = "redis.pcall('XGROUP', 'CREATECONSUMER', 's1', 'g', 'c') return 1";
+    assert_eq!(resp_cmd(&mut c, &["EVAL", script, "0"]), ":1\r\n");
+    let s = stat(&mut c, "xgroup|createconsumer");
+    assert!(
+        s.starts_with("calls=1,") && s.contains("rejected_calls=0,failed_calls=1"),
+        "{s}"
+    );
+    let s = stat(&mut c, "eval");
+    assert!(
+        s.starts_with("calls=1,") && s.contains("failed_calls=0"),
+        "{s}"
+    );
+
+    // Successful subcommands.
+    assert_eq!(
+        resp_cmd(&mut c, &["XGROUP", "CREATE", "s1", "g", "$"]),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["XINFO", "GROUPS", "s1"]).starts_with('*'));
+    assert!(stat(&mut c, "xgroup|create").starts_with("calls=1,"));
+    assert!(stat(&mut c, "xinfo|groups").starts_with("calls=1,"));
+    shutdown_and_wait(port, &mut srv);
+}

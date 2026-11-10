@@ -1412,8 +1412,21 @@ pub static LATENCY_EVENTS: std::sync::LazyLock<
 /// Name a command is counted under in INFO commandstats and LATENCY
 /// HISTOGRAM: [`get_cmd_name`], with CONFIG split into its subcommands
 /// like Redis does.
-fn stat_cmd_name(cmd: &Command) -> &'static str {
+pub fn stat_cmd_name(cmd: &Command) -> &'static str {
+    use crate::resp::XinfoSubcommand as XI;
     match cmd {
+        Command::XgroupCreate { .. } => "xgroup|create",
+        Command::XgroupDestroy { .. } => "xgroup|destroy",
+        Command::XgroupCreateConsumer { .. } => "xgroup|createconsumer",
+        Command::XgroupDelConsumer { .. } => "xgroup|delconsumer",
+        Command::XgroupSetId { .. } => "xgroup|setid",
+        Command::XgroupHelp => "xgroup|help",
+        Command::Xinfo(sub) => match sub {
+            XI::Stream(_) | XI::StreamFull { .. } => "xinfo|stream",
+            XI::Groups(_) => "xinfo|groups",
+            XI::Consumers { .. } => "xinfo|consumers",
+            XI::Help => "xinfo|help",
+        },
         Command::ConfigGet(_) => "config|get",
         Command::ConfigSet(pairs) => match pairs.first() {
             Some((p, _)) if p.eq_ignore_ascii_case(b"resetstat") => "config|resetstat",
@@ -6060,7 +6073,7 @@ async fn execute_tx_step(
                 // And memory: a write refused for OOM now aborts the EXEC.
                 if oom_refuses(router, c, client_id, out_buf).await {
                     *tx_has_error = true;
-                    let c_name = get_cmd_name(c);
+                    let c_name = stat_cmd_name(c);
                     record_rejected_stat(c_name);
                     record_error_stat("OOM", Some(c_name));
                     out_buf.extend_from_slice(
@@ -7366,7 +7379,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
             )
             && subscribe_over_maxmemory(router, client_id).await
         {
-            let c_name = get_cmd_name(&cmd);
+            let c_name = stat_cmd_name(&cmd);
             record_rejected_stat(c_name);
             record_error_stat("OOM", Some(c_name));
             out.extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'.\r\n");
@@ -12337,7 +12350,6 @@ async fn execute_command_inner(
         let monitor_argv = crate::slowlog::command_to_monitor_argv(&cmd);
         broadcast_monitor(router.port, &addr_s, &monitor_argv);
     }
-    let cmd_name = get_cmd_name(&cmd);
     // Also feeds LATENCY HISTOGRAM, all in thread-local state.
     let cmd_stat_guard = CmdStatGuard {
         name: stat_cmd_name(&cmd),
@@ -20962,7 +20974,7 @@ async fn execute_command_inner(
             record_error_stat(prefix, None);
         }
     } else {
-        record_reply_error_stat(out, error_stat_start, cmd_name);
+        record_reply_error_stat(out, error_stat_start, cmd_stat_guard.name);
     }
     ret
 }
@@ -21525,7 +21537,7 @@ pub fn apply_replicated_command(
         let _master_write = ReplayingWrites::new();
         execute_local_command(cmd, db, out, aof);
     }
-    let name = get_cmd_name(cmd);
+    let name = stat_cmd_name(cmd);
     record_cmd_stats(name, 1, start.elapsed().as_nanos() as u64);
     if out.first() == Some(&b'-') {
         let end = out.iter().position(|&b| b == b'\r').unwrap_or(out.len());
@@ -29031,7 +29043,7 @@ async fn execute_commands_squashed_inner(
             {
                 target = router.target_shard(k);
             }
-            stat_run.note(get_cmd_name(&cmd));
+            stat_run.note(stat_cmd_name(&cmd));
             if target == router.shard_id {
                 let slow_t0 = slow_threshold.map(|_| crate::cycleclock::now());
                 'local: {
@@ -29940,7 +29952,7 @@ async fn execute_commands_squashed_inner(
             local_db.select_db(CURRENT_DB.get());
             stat_run.restart();
         } else {
-            stat_run.note(get_cmd_name(&cmd));
+            stat_run.note(stat_cmd_name(&cmd));
             local_buf.clear();
             if execute_local_command(&cmd, &mut local_db, &mut local_buf, None) {
                 should_close = true;
@@ -30824,7 +30836,7 @@ async fn blmove_across_shards(
 }
 
 pub fn record_replica_cmd_stats(cmd: &Command, elapsed_ns: u64) {
-    record_cmd_stats(get_cmd_name(cmd), 1, elapsed_ns);
+    record_cmd_stats(stat_cmd_name(cmd), 1, elapsed_ns);
 }
 
 pub async fn execute_cross_shard_replica_command(router: &Router, cmd: Command) {

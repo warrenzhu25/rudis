@@ -2411,7 +2411,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
             return Err(mlua::Error::RuntimeError(err));
         }
         if let Some(err) = script_acl_denied(port, &cmd) {
-            crate::connection::record_rejected_stat(crate::connection::get_cmd_name(&cmd));
+            crate::connection::record_rejected_stat(crate::connection::stat_cmd_name(&cmd));
             crate::connection::record_error_stat("NOPERM", None);
             SCRIPT_RECORDED_ERROR.set(true);
             return Err(mlua::Error::RuntimeError(err));
@@ -2422,7 +2422,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
             ));
         }
         if crate::connection::script_touches_non_local_key(&cmd) {
-            crate::connection::record_rejected_stat(crate::connection::get_cmd_name(&cmd));
+            crate::connection::record_rejected_stat(crate::connection::stat_cmd_name(&cmd));
             crate::connection::record_error_stat("ERR", None);
             SCRIPT_RECORDED_ERROR.set(true);
             return Err(mlua::Error::RuntimeError(
@@ -2450,7 +2450,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
                 "NOREPLICAS Not enough good replicas to write.".to_string(),
             ));
         }
-        let cmd_name = crate::connection::get_cmd_name(&cmd);
+        let cmd_name = crate::connection::stat_cmd_name(&cmd);
         if read_only
             && (cmd.is_write_command()
                 || matches!(
@@ -2594,7 +2594,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
             return Ok(Value::Table(tbl));
         }
         if let Some(err) = script_acl_denied(port, &cmd) {
-            crate::connection::record_rejected_stat(crate::connection::get_cmd_name(&cmd));
+            crate::connection::record_rejected_stat(crate::connection::stat_cmd_name(&cmd));
             crate::connection::record_error_stat("NOPERM", None);
             SCRIPT_RECORDED_ERROR.set(true);
             let tbl = lua.create_table()?;
@@ -2607,7 +2607,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
             return Ok(Value::Table(tbl));
         }
         if crate::connection::script_touches_non_local_key(&cmd) {
-            crate::connection::record_rejected_stat(crate::connection::get_cmd_name(&cmd));
+            crate::connection::record_rejected_stat(crate::connection::stat_cmd_name(&cmd));
             crate::connection::record_error_stat("ERR", None);
             SCRIPT_RECORDED_ERROR.set(true);
             let tbl = lua.create_table()?;
@@ -2635,7 +2635,7 @@ fn register_redis_module<'scope, 'env: 'scope>(
             tbl.set("err", "NOREPLICAS Not enough good replicas to write.")?;
             return Ok(Value::Table(tbl));
         }
-        let cmd_name = crate::connection::get_cmd_name(&cmd);
+        let cmd_name = crate::connection::stat_cmd_name(&cmd);
         if read_only
             && (cmd.is_write_command()
                 || matches!(
