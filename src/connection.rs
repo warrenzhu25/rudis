@@ -8433,6 +8433,9 @@ async fn stream_full_sync(
     // shard, so no piece is freed on this thread mid-transfer. Counted
     // apart from maxmemory while here, like the images' own buffers.
     let mut recycle: Option<Vec<u8>> = None;
+    // The share of the piece last sent (its buffer is `recycle`, then back
+    // in its shard's image): replaced only once the next piece's share is
+    // held, so the count never drops below what is out of the images.
     let mut in_flight = crate::shard::SyncImageHeld::default();
     for sid in 0..router.num_shards {
         loop {
@@ -8461,11 +8464,11 @@ async fn stream_full_sync(
                     .await
                     .unwrap_or_else(|_| Err(format!("shard {sid} did not return its data")))
             };
-            let (piece, done) = match step {
+            let (piece, done, held) = match step {
                 Ok(step) => step,
                 Err(e) => return Err(broke_off(format!("shard {sid}: {e}"))),
             };
-            in_flight.set(piece.capacity() as i64);
+            in_flight = held;
             if !piece.is_empty() {
                 crc = crate::table::crc64_update(crc, &piece);
                 let (res, sent) = writer.write_all(piece).await;

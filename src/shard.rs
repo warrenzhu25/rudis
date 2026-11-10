@@ -649,7 +649,7 @@ pub enum ShardMessage {
         /// The buffer of this shard's previous piece, once sent (see
         /// [`AofImage::give_buffer`]).
         recycle: Option<Vec<u8>>,
-        responder: flume::Sender<Result<(Vec<u8>, bool), String>>,
+        responder: flume::Sender<Result<SyncPiece, String>>,
     },
     /// Abandons that image: the full sync failed.
     DropSyncImage {
@@ -4940,10 +4940,10 @@ pub(crate) static SYNC_IMAGE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mu
 /// A share of [`SYNC_IMAGE_BYTES`] (an image's buffers, or a piece in
 /// flight to the replica), given back when dropped.
 #[derive(Default)]
-pub(crate) struct SyncImageHeld(i64);
+pub struct SyncImageHeld(i64);
 
 impl SyncImageHeld {
-    pub(crate) fn set(&mut self, bytes: i64) {
+    pub fn set(&mut self, bytes: i64) {
         // Usually unchanged (a replica's buffer between growths): skip the
         // write to the counter every shard shares.
         if bytes != self.0 {
@@ -5422,13 +5422,28 @@ const SYNC_IMAGE_PIECE_BYTES: usize = 1 << 20;
 /// Returns the bytes to send and whether this shard's part is complete (the
 /// image is then removed). An error (the image was poisoned, or a spilled
 /// value could not be read) removes it too: the sync must start over.
+///
+/// The piece comes with its share of [`SYNC_IMAGE_BYTES`], taken as the
+/// image lets go of it: the caller holds it until the buffer comes back
+/// (or is freed). The caller used to count the piece itself once the step
+/// reached it, so while the piece crossed from another shard's thread (a
+/// wait that grows on a busy host) it counted as data: ~1.25 MB, enough
+/// to make a master near maxmemory evict hundreds of keys when a replica
+/// attached.
 pub fn sync_image_step(
     db: &ShardDb,
     replica: u64,
     recycle: Option<Vec<u8>>,
-) -> Result<(Vec<u8>, bool), String> {
-    image_step(db, ImageOwner::FullSync(replica), recycle)
+) -> Result<SyncPiece, String> {
+    let (piece, done) = image_step(db, ImageOwner::FullSync(replica), recycle)?;
+    let mut held = SyncImageHeld::default();
+    held.set(piece.capacity() as i64);
+    Ok((piece, done, held))
 }
+
+/// A full-sync piece: its bytes, whether its shard's part is done, and its
+/// share of [`SYNC_IMAGE_BYTES`] (see [`sync_image_step`]).
+pub type SyncPiece = (Vec<u8>, bool, SyncImageHeld);
 
 /// Starts this shard's part of a point-in-time SAVE / BGSAVE (see
 /// [`AofImage::start_chunk`]): the keys as they are now, whatever is
@@ -5492,7 +5507,7 @@ pub fn sync_image_step_published(
     router: &crate::router::Router,
     replica: u64,
     recycle: Option<Vec<u8>>,
-) -> Result<(Vec<u8>, bool), String> {
+) -> Result<SyncPiece, String> {
     let step = sync_image_step(&router.local_db.borrow(), replica, recycle);
     publish_after_image_change(router);
     step
@@ -5734,13 +5749,21 @@ mod tests {
             "a new sync image holds {held} bytes"
         );
         let mut recycle: Option<Vec<u8>> = None;
+        let mut in_flight;
         let mut handed_back = Vec::new();
         let (mut pieces, mut in_reused) = (0, 0);
         loop {
             if let Some(b) = &recycle {
                 handed_back.push(b.as_ptr() as usize);
             }
-            let (piece, done) = sync_image_step(&db, 78, recycle.take()).unwrap();
+            let (piece, done, held) = sync_image_step(&db, 78, recycle.take()).unwrap();
+            // The piece is counted from the moment the image lets it go,
+            // not once the caller gets to it.
+            assert!(
+                SYNC_IMAGE_BYTES.load(Relaxed) - base >= piece.capacity() as i64,
+                "a piece out of its image isn't counted"
+            );
+            in_flight = held;
             if done {
                 break;
             }
@@ -5762,6 +5785,7 @@ mod tests {
             pieces - 2,
             "{in_reused} of {pieces} pieces reused a buffer"
         );
+        drop(in_flight);
         assert_eq!(
             SYNC_IMAGE_BYTES.load(Relaxed),
             base,
@@ -5799,7 +5823,7 @@ mod tests {
         let mut round = 0;
         while !(sync_done && rewrite_done) {
             if !sync_done {
-                let (piece, done) = sync_image_step(&db, 99, None).unwrap();
+                let (piece, done, _held) = sync_image_step(&db, 99, None).unwrap();
                 chunk.extend(piece);
                 sync_done = done;
             }

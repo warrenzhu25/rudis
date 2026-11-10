@@ -8314,7 +8314,7 @@ mod tests {
         router.publish_memory_state();
         let mut recycle = None;
         loop {
-            let (piece, done) =
+            let (piece, done, _held) =
                 crate::shard::sync_image_step_published(&router, 91, recycle.take()).unwrap();
             let published = router.tier_stats.real_used_total(None);
             router.publish_memory_state();
