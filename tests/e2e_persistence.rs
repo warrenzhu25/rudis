@@ -5721,3 +5721,86 @@ fn test_rdb_with_empty_collections_loads_skipping_them_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// NACKed stream entries (XNACK) survive SAVE and a restart, with their
+/// delivery counts and NACK order. They are pending entries without an
+/// owner, which the Redis stream encoding can't hold: the rudis record
+/// written after the stream carried only their NACK order, so every NACKed
+/// entry was lost on reload, and never redelivered.
+#[test]
+fn test_xnack_entries_survive_restart_e2e() {
+    let port = 19957u16;
+    let port_s = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis_xnack_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &dir_s,
+    ];
+    let mut srv = spawn_rudis_listening(&args, port);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+    let mut c = connect();
+    for i in 1..=4 {
+        resp_cmd(&mut c, &["XADD", "s", &format!("{i}-0"), "f", "v"]);
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["XGROUP", "CREATE", "s", "grp", "0"]),
+        "+OK\r\n"
+    );
+    read_full_reply({
+        c.write_all(b"*7\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$3\r\ngrp\r\n$2\r\nc1\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n")
+            .unwrap();
+        &mut c
+    });
+    for (mode, id) in [("FAIL", "1-0"), ("FATAL", "2-0"), ("SILENT", "3-0")] {
+        let r = resp_cmd(&mut c, &["XNACK", "s", "grp", mode, "IDS", "1", id]);
+        assert_eq!(r, ":1\r\n", "{mode}");
+    }
+    let pending = |c: &mut TcpStream| {
+        c.write_all(
+            b"*6\r\n$8\r\nXPENDING\r\n$1\r\ns\r\n$3\r\ngrp\r\n$1\r\n-\r\n$1\r\n+\r\n$2\r\n10\r\n",
+        )
+        .unwrap();
+        read_full_reply(c)
+    };
+    let before = pending(&mut c);
+    assert!(before.starts_with("*4\r\n"), "{before}");
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+
+    let mut srv = spawn_rudis_listening(&args, port);
+    let mut c = connect();
+    let after = pending(&mut c);
+    // The same entries, owners (none for the NACKed ones) and delivery
+    // counts; the idle times differ.
+    let strip_idle = |r: &str| -> Vec<String> {
+        r.lines()
+            .filter(|l| !l.starts_with(':') || l.len() > 12 || l.starts_with(":-1"))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        strip_idle(&after).len(),
+        strip_idle(&before).len(),
+        "{after}"
+    );
+    assert!(after.starts_with("*4\r\n"), "after restart: {after}");
+    for id in ["1-0", "2-0", "3-0", "4-0"] {
+        assert!(after.contains(id), "{id} lost: {after}");
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

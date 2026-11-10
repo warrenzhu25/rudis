@@ -17313,7 +17313,7 @@ fn load_legacy_records(
                 add_expired_subkeys(n);
             }
             continue;
-        } else if matches!(type_byte, 15..=18 | 21) {
+        } else if crate::redis_rdb::AI_NATIVE_RECORD_TYPES.contains(&type_byte) {
             cursor += 1;
             let is_owned = crate::router::target_shard(&key, num_shards) == shard_id;
             let mut slice = &data[cursor..content_len];
@@ -17329,15 +17329,18 @@ fn load_legacy_records(
                 count += 1;
             }
             continue;
-        } else if type_byte == crate::redis_rdb::EXT_TYPE_STREAM_EXTRAS {
+        } else if type_byte == crate::redis_rdb::EXT_TYPE_STREAM_EXTRAS
+            || type_byte == crate::redis_rdb::EXT_TYPE_STREAM_EXTRAS_V2
+        {
             // IDMP / XNACK state of a stream loaded just before.
+            let v2 = type_byte == crate::redis_rdb::EXT_TYPE_STREAM_EXTRAS_V2;
             cursor += 1;
             let stream = if crate::router::target_shard(&key, num_shards) == shard_id {
                 db.table.stream_for_load(&key)
             } else {
                 None
             };
-            match crate::redis_rdb::apply_stream_extras(&data[cursor..content_len], stream) {
+            match crate::redis_rdb::apply_stream_extras(&data[cursor..content_len], stream, v2) {
                 Ok(used) => cursor += used,
                 Err(_) => break,
             }

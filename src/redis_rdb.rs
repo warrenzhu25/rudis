@@ -47,10 +47,21 @@ pub const EXT_AUX_KEY: &[u8] = b"rudis-ext";
 /// Legacy-format record type of a stream's IDMP / XNACK state, written in a
 /// [`EXT_AUX_KEY`] field right after the stream itself.
 pub const EXT_TYPE_STREAM_EXTRAS: u8 = 19;
+/// [`EXT_TYPE_STREAM_EXTRAS`] whose NACKed entries carry their delivery
+/// time and count too: the Redis stream encoding the record follows can't
+/// hold a pending entry without a consumer (as a NACKed one is), so the
+/// loader drops those and this record puts them back. Version 19 carried
+/// only their NACK order, so they were lost on every reload.
+pub const EXT_TYPE_STREAM_EXTRAS_V2: u8 = 22;
 /// Legacy-format record type of a search index definition: the index name
 /// as the key, then the index's canonical `FT.CREATE` command as RESP. The
 /// indexed documents are ordinary keys and are re-indexed after the load.
 pub const EXT_TYPE_SEARCH_INDEX: u8 = 20;
+/// Legacy-format record types of the AI-native structures (written by
+/// `ShardDb`'s RDB save, read by `restore_ai_native_rdb_record`). They share
+/// the record type byte with the value types (0-6), module types (7-14)
+/// and the `EXT_TYPE_*` records above.
+pub const AI_NATIVE_RECORD_TYPES: [u8; 5] = [15, 16, 17, 18, 21];
 
 pub const TYPE_STRING: u8 = 0;
 pub const TYPE_LIST: u8 = 1;
@@ -1943,7 +1954,7 @@ fn put_opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
 /// `s`'s IDMP / XNACK state, for a [`EXT_AUX_KEY`] field.
 pub fn encode_stream_extras(key: &[u8], s: &RudisStream, out: &mut Vec<u8>) {
     put_bytes(out, key);
-    out.push(EXT_TYPE_STREAM_EXTRAS);
+    out.push(EXT_TYPE_STREAM_EXTRAS_V2);
     put_opt_u64(out, s.idmp_duration);
     put_opt_u64(out, s.idmp_maxsize.map(|v| v as u64));
     out.extend_from_slice(&(s.idmp_producers.len() as u32).to_le_bytes());
@@ -1976,6 +1987,8 @@ pub fn encode_stream_extras(key: &[u8], s: &RudisStream, out: &mut Vec<u8>) {
             out.extend_from_slice(&id.ms.to_le_bytes());
             out.extend_from_slice(&id.seq.to_le_bytes());
             out.extend_from_slice(&pe.nack_seq.to_le_bytes());
+            out.extend_from_slice(&pe.delivery_time_ms.to_le_bytes());
+            out.extend_from_slice(&(pe.delivery_count as u64).to_le_bytes());
         }
     }
 }
@@ -2021,9 +2034,13 @@ impl<'a> LeCursor<'a> {
     }
 }
 
-/// Parses a stream-extras payload (after the type byte), applying it to
-/// `stream` when given. Returns the bytes used.
-pub fn apply_stream_extras(data: &[u8], stream: Option<&mut RudisStream>) -> RdbResult<usize> {
+/// Parses a stream-extras payload (after the type byte: version 2 when
+/// `v2`), applying it to `stream` when given. Returns the bytes used.
+pub fn apply_stream_extras(
+    data: &[u8],
+    stream: Option<&mut RudisStream>,
+    v2: bool,
+) -> RdbResult<usize> {
     let mut c = LeCursor { data, pos: 0 };
     let duration = c.opt_u64()?;
     let maxsize = c.opt_u64()?;
@@ -2048,7 +2065,14 @@ pub fn apply_stream_extras(data: &[u8], stream: Option<&mut RudisStream>) -> Rdb
         let next_nack_seq = c.u64()?;
         let mut seqs = Vec::new();
         for _ in 0..c.u32()? {
-            seqs.push((StreamId::new(c.u64()?, c.u64()?), c.u64()?));
+            let id = StreamId::new(c.u64()?, c.u64()?);
+            let seq = c.u64()?;
+            let delivery = if v2 {
+                Some((c.u64()?, to_usize(c.u64()?)?))
+            } else {
+                None
+            };
+            seqs.push((id, seq, delivery));
         }
         nacks.push((name, next_nack_seq, seqs));
     }
@@ -2061,9 +2085,20 @@ pub fn apply_stream_extras(data: &[u8], stream: Option<&mut RudisStream>) -> Rdb
         for (name, next, seqs) in nacks {
             if let Some(g) = s.groups.get_mut(&name) {
                 g.next_nack_seq = next;
-                for (id, seq) in seqs {
+                for (id, seq, delivery) in seqs {
                     if let Some(pe) = g.pel.get_mut(&id) {
                         pe.nack_seq = seq;
+                    } else if let Some((delivery_time_ms, delivery_count)) = delivery {
+                        // Dropped by the Redis-format decoder (no owner).
+                        g.pel.insert(
+                            id,
+                            StreamPelEntry {
+                                consumer: Bytes::new(),
+                                delivery_time_ms,
+                                delivery_count,
+                                nack_seq: seq,
+                            },
+                        );
                     }
                 }
             }
@@ -2958,6 +2993,25 @@ mod tests {
         }
     }
 
+    /// The legacy-format record types share one byte space with the value
+    /// types (0-6) and module types (7-14): a reused byte made the loader
+    /// read one kind of record as another.
+    #[test]
+    fn ext_record_types_are_distinct() {
+        let mut types = vec![
+            EXT_TYPE_STREAM_EXTRAS,
+            EXT_TYPE_STREAM_EXTRAS_V2,
+            EXT_TYPE_SEARCH_INDEX,
+        ];
+        types.extend(AI_NATIVE_RECORD_TYPES);
+        for (i, a) in types.iter().enumerate() {
+            assert!(*a > 14, "type {a} collides with a value or module type");
+            for b in &types[i + 1..] {
+                assert_ne!(a, b, "two record types share byte {a}");
+            }
+        }
+    }
+
     #[test]
     fn stream_extras_round_trip_and_legacy_dump() {
         let mut s = sample_stream();
@@ -2974,13 +3028,20 @@ mod tests {
         s.idmp_producers.insert(Bytes::from_static(b"p1"), prod);
         let g = s.groups.get_mut(&b"g1"[..]).unwrap();
         g.next_nack_seq = 2;
-        g.pel.get_mut(&StreamId::new(1003, 2)).unwrap().nack_seq = 2;
+        // A NACKed entry, as XNACK leaves it: no owner.
+        let nacked = StreamId::new(1003, 2);
+        let pe = g.pel.get_mut(&nacked).unwrap();
+        pe.nack_seq = 2;
+        pe.consumer = Bytes::new();
+        for c in g.consumers.values_mut() {
+            c.pel.remove(&nacked);
+        }
         assert!(stream_has_extras(&s));
 
         let mut rec = Vec::new();
         encode_stream_extras(b"k", &s, &mut rec);
         assert_eq!(&rec[..4], &1u32.to_le_bytes());
-        assert_eq!(rec[5], EXT_TYPE_STREAM_EXTRAS);
+        assert_eq!(rec[5], EXT_TYPE_STREAM_EXTRAS_V2);
         let payload = &rec[6..];
         let mut plain = s.clone();
         plain.idmp_duration = None;
@@ -2992,11 +3053,19 @@ mod tests {
         g.next_nack_seq = 0;
         g.pel.get_mut(&StreamId::new(1003, 2)).unwrap().nack_seq = 0;
         assert!(!stream_has_extras(&plain));
-        let used = apply_stream_extras(payload, Some(&mut plain)).unwrap();
+        // The Redis-format decoder drops pending entries without an owner
+        // (the NACKed ones): the record puts them back.
+        plain
+            .groups
+            .get_mut(&b"g1"[..])
+            .unwrap()
+            .pel
+            .retain(|_, pe| pe.nack_seq == 0);
+        let used = apply_stream_extras(payload, Some(&mut plain), true).unwrap();
         assert_eq!(used, payload.len());
         assert_eq!(plain, s);
         for cut in 0..payload.len() {
-            assert!(apply_stream_extras(&payload[..cut], None).is_err());
+            assert!(apply_stream_extras(&payload[..cut], None, true).is_err());
         }
 
         // Such a stream is dumped in the legacy format (version 10).
