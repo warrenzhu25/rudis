@@ -14269,6 +14269,15 @@ impl RudisTable {
                 s.last_id = last_id;
                 if let Some(ea) = entries_added {
                     s.entries_added = ea;
+                    // A group can't have read more entries than were ever
+                    // added: lowering entries_added below a group's
+                    // entries_read left a negative lag, and an RDB the
+                    // loader refuses (entries_read past entries_added).
+                    for g in s.groups.values_mut() {
+                        if g.entries_read.is_some_and(|r| r > ea) {
+                            g.entries_read = Some(ea);
+                        }
+                    }
                 }
                 if let Some(md) = max_deleted_id
                     && md != StreamId::default()

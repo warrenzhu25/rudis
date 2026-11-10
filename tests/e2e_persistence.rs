@@ -5804,3 +5804,69 @@ fn test_xnack_entries_survive_restart_e2e() {
     shutdown_and_wait(port, &mut srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// XSETID ... ENTRIESADDED below a group's entries_read clamps it, so the
+/// group's lag stays 0 and the dataset still saves and loads (the loader
+/// refuses a group that read more entries than were ever added).
+#[test]
+fn test_xsetid_entriesadded_clamps_group_entries_read_e2e() {
+    let port = 19958u16;
+    let port_s = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis_xsetid_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &dir_s,
+    ];
+    let mut srv = spawn_rudis_listening(&args, port);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+    let mut c = connect();
+    for i in 1..=10 {
+        resp_cmd(&mut c, &["XADD", "s", &format!("{i}-0"), "f", "v"]);
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["XGROUP", "CREATE", "s", "g", "0"]),
+        "+OK\r\n"
+    );
+    read_full_reply({
+        c.write_all(b"*9\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$1\r\ng\r\n$1\r\nc\r\n$5\r\nCOUNT\r\n$2\r\n10\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n>\r\n")
+            .unwrap();
+        &mut c
+    });
+    assert_eq!(resp_cmd(&mut c, &["XTRIM", "s", "MAXLEN", "2"]), ":8\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["XSETID", "s", "10-0", "ENTRIESADDED", "2"]),
+        "+OK\r\n"
+    );
+    let group_info = |c: &mut TcpStream| {
+        c.write_all(b"*3\r\n$5\r\nXINFO\r\n$6\r\nGROUPS\r\n$1\r\ns\r\n")
+            .unwrap();
+        read_full_reply(c)
+    };
+    let check = |info: &str| {
+        assert!(info.contains("entries-read\r\n:2\r\n"), "{info}");
+        assert!(info.contains("lag\r\n:0\r\n"), "{info}");
+    };
+    check(&group_info(&mut c));
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+    let mut srv = spawn_rudis_listening(&args, port);
+    let mut c = connect();
+    assert_eq!(resp_cmd(&mut c, &["XLEN", "s"]), ":2\r\n");
+    check(&group_info(&mut c));
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
