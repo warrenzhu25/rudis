@@ -12426,6 +12426,7 @@ async fn execute_command_inner(
         broadcast_monitor(router.port, &addr_s, &monitor_argv);
     }
     // Also feeds LATENCY HISTOGRAM, all in thread-local state.
+    crate::scripting::SCRIPT_RECORDED_ERROR.set(false);
     let cmd_stat_guard = CmdStatGuard {
         name: stat_cmd_name(&cmd),
         start: (!may_block(&cmd)).then(std::time::Instant::now),
@@ -21073,7 +21074,10 @@ fn record_reply_error_stat(out: &[u8], start_len: usize, cmd_name: &'static str)
             );
             if is_script_cmd {
                 record_failed_stat(cmd_name);
-                if !crate::scripting::SCRIPT_RECORDED_ERROR.get() {
+                // Set by this command's script only: a script command that
+                // failed before running one (EVALSHA NOSCRIPT, ...) must
+                // not see a flag left by an earlier script.
+                if !crate::scripting::SCRIPT_RECORDED_ERROR.replace(false) {
                     record_error_stat(prefix, None);
                 }
             } else {

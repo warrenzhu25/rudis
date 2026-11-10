@@ -14416,3 +14416,26 @@ fn test_errorstats_capped_at_128_codes_e2e() {
     shutdown_and_wait(port, &mut srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// EVALSHA of an unknown script counts its NOSCRIPT error in errorstats
+/// even right after a script that recorded an error of its own (a failed
+/// redis.pcall). A flag left by that script made the NOSCRIPT reply look
+/// already counted, so errorstat_NOSCRIPT stayed empty.
+#[test]
+fn test_noscript_errorstat_after_script_error_e2e() {
+    let port = 19963u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+    let script = "redis.pcall('XGROUP', 'CREATECONSUMER', 'nokey', 'g', 'c') return 1";
+    assert_eq!(resp_cmd(&mut c, &["EVAL", script, "0"]), ":1\r\n");
+    let r = resp_cmd(&mut c, &["EVALSHA", "NotValidShaSUM", "0"]);
+    assert!(r.starts_with("-NOSCRIPT"), "{r}");
+    let info = resp_cmd(&mut c, &["INFO", "errorstats"]);
+    assert!(info.contains("errorstat_NOSCRIPT:count=1\r\n"), "{info}");
+    let stats = resp_cmd(&mut c, &["INFO", "stats"]);
+    assert!(stats.contains("total_error_replies:2\r\n"), "{stats}");
+    shutdown_and_wait(port, &mut srv);
+}
