@@ -20,7 +20,10 @@ step() { # name, command...
     printf '== %s\n' "$name"
     if ! "$@" > "$LOG" 2>&1; then
         tail -40 "$LOG"
-        echo "GATE FAILED at: $name" >&2
+        # The whole log (server output included) for intermittent failures.
+        mkdir -p target/ci-logs
+        cp "$LOG" target/ci-logs/gate-failed.log
+        echo "GATE FAILED at: $name (full log: target/ci-logs/gate-failed.log)" >&2
         exit 1
     fi
     grep -E "^test result|GATE|MT-|  - |\[note\]|miri:" "$LOG" || true

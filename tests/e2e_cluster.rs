@@ -2503,7 +2503,9 @@ fn test_cluster_replicate_copies_the_masters_data_e2e() {
 /// replicates it, instead of serving them too.
 #[test]
 fn test_cluster_master_failure_promotes_its_replica_e2e() {
-    let ports = [18093u16, 18099, 18105, 18111];
+    // Clear of test_redis_rdb_compat's 18100-18199, which the gate runs
+    // just before.
+    let ports = [18593u16, 18599, 18605, 18611];
     let ranges = [(0, 5460), (5461, 10922), (10923, 16383)];
     let dirs: Vec<String> = ports
         .iter()
@@ -2543,7 +2545,25 @@ fn test_cluster_master_failure_promotes_its_replica_e2e() {
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         c
     };
-    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut conn(p), args);
+    // Says which command got no reply (this test failed twice in full CI
+    // runs on a command sent right after the promotion, never alone).
+    let cmd = |p: u16, args: &[&str]| {
+        let mut c = conn(p);
+        let mut req = format!("*{}\r\n", args.len());
+        for a in args {
+            req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        c.write_all(req.as_bytes()).unwrap();
+        let mut buf = [0u8; 16384];
+        let started = std::time::Instant::now();
+        match c.read(&mut buf) {
+            Ok(n) => String::from_utf8_lossy(&buf[..n]).to_string(),
+            Err(e) => panic!(
+                "{args:?} to port {p}: no reply after {:?}: {e}",
+                started.elapsed()
+            ),
+        }
+    };
     let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
     let wait_until = |what: &str, ok: &mut dyn FnMut() -> Option<String>| {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
