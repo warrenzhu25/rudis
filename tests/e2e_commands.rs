@@ -14567,3 +14567,109 @@ fn test_restore_idletime_freq_e2e() {
     );
     shutdown_and_wait(port, &mut srv);
 }
+
+/// RESTORE with a TTL already in the past stores nothing and counts the key
+/// in expired_keys; when it replaced a key, the AOF (and so replicas) get
+/// that key's DEL, or UNLINK under lazyfree-lazy-server-del, never the
+/// RESTORE (as in Redis). The RESTORE itself was logged, and expired_keys
+/// didn't count it.
+#[test]
+fn test_restore_already_expired_logs_del_e2e() {
+    let port = 19966u16;
+    let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ps, ds) = (port.to_string(), dir.to_str().unwrap().to_string());
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+    ];
+    let mut srv = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut q = |args: &[&[u8]]| send_and_read_reply(&mut c, &format_resp_bytes(args));
+    assert_eq!(q(&[b"SET", b"src", b"value"]), "+OK\r\n");
+    let dump = send_and_read_bytes(
+        &mut TcpStream::connect(("127.0.0.1", port)).unwrap(),
+        &format_resp_bytes(&[b"DUMP", b"src"]),
+    );
+    let body = dump.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let payload = dump[body..dump.len() - 2].to_vec();
+    assert_eq!(q(&[b"SET", b"key1", b"old"]), "+OK\r\n");
+    assert_eq!(q(&[b"RPUSH", b"key2", b"a", b"b"]), ":2\r\n");
+    let expired_keys = |q: &mut dyn FnMut(&[&[u8]]) -> String| -> u64 {
+        let info = q(&[b"INFO", b"stats"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix("expired_keys:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let before = expired_keys(&mut q);
+    let past = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        - 5000)
+        .to_string();
+    let restore = |q: &mut dyn FnMut(&[&[u8]]) -> String, key: &[u8]| {
+        q(&[
+            b"RESTORE",
+            key,
+            past.as_bytes(),
+            &payload,
+            b"REPLACE",
+            b"ABSTTL",
+        ])
+    };
+    assert_eq!(
+        q(&[b"CONFIG", b"SET", b"lazyfree-lazy-server-del", b"no"]),
+        "+OK\r\n"
+    );
+    assert_eq!(restore(&mut q, b"key1"), "+OK\r\n");
+    assert_eq!(
+        q(&[b"CONFIG", b"SET", b"lazyfree-lazy-server-del", b"yes"]),
+        "+OK\r\n"
+    );
+    assert_eq!(restore(&mut q, b"key2"), "+OK\r\n");
+    // Nothing replaced: nothing to log.
+    assert_eq!(restore(&mut q, b"key3"), "+OK\r\n");
+    assert_eq!(q(&[b"EXISTS", b"key1", b"key2", b"key3"]), ":0\r\n");
+    assert_eq!(expired_keys(&mut q), before + 3);
+    shutdown_and_wait(port, &mut srv);
+
+    let mut aof = Vec::new();
+    // One AOF per shard: appendonly-<shard>.aof.
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("appendonly-") && name.ends_with(".aof") {
+            aof.extend(std::fs::read(&path).unwrap());
+        }
+    }
+    assert!(!aof.is_empty());
+    let has = |needle: &[u8]| aof.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        has(b"$3\r\nDEL\r\n$4\r\nkey1\r\n"),
+        "{}",
+        String::from_utf8_lossy(&aof)
+    );
+    assert!(
+        has(b"$6\r\nUNLINK\r\n$4\r\nkey2\r\n"),
+        "{}",
+        String::from_utf8_lossy(&aof)
+    );
+    assert!(!has(b"RESTORE"), "{}", String::from_utf8_lossy(&aof));
+    assert!(!has(b"key3"), "{}", String::from_utf8_lossy(&aof));
+    let _ = std::fs::remove_dir_all(&dir);
+}

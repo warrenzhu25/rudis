@@ -3938,6 +3938,8 @@ pub fn apply_config_value(
         "lazyfree-lazy-expire" => {
             crate::table::set_lazyfree_lazy_expire(parse_config_bool(name, val_str)?)
         }
+        "lazyfree-lazy-server-del" => crate::table::LAZYFREE_LAZY_SERVER_DEL
+            .store(parse_config_bool(name, val_str)?, Ordering::Relaxed),
         "tracking-table-max-keys" => {
             TRACKING_TABLE_MAX_KEYS.store(parse_config_num(name, val_str)?, Ordering::Relaxed);
             if !PAUSE_CRON.load(Ordering::Relaxed) {
@@ -4382,7 +4384,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 108] = [
+    let all_configs: [(&str, String); 109] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -4586,6 +4588,15 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         ("proto-max-bulk-len", proto_bulk),
         ("notify-keyspace-events", notify_ev),
         ("lazyfree-lazy-expire", lazy_exp),
+        (
+            "lazyfree-lazy-server-del",
+            if crate::table::LAZYFREE_LAZY_SERVER_DEL.load(std::sync::atomic::Ordering::Relaxed) {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
         ("latency-monitor-threshold", latency_thresh),
         ("tracking-table-max-keys", tracking_max),
         (
@@ -24517,7 +24528,25 @@ pub fn execute_local_command(
                     None
                 };
                 match db.restore(key.clone(), *ttl_ms, serialized, *replace, *absttl) {
-                    Ok(()) => {
+                    Ok(crate::table::RestoreOutcome::Expired { replaced }) => {
+                        // Already expired, so not stored: like Redis, the
+                        // replicas and the AOF see the deletion of the key it
+                        // replaced (if any), never the RESTORE.
+                        if replaced {
+                            let keys = smallvec::smallvec![key.clone()];
+                            let del = if crate::table::LAZYFREE_LAZY_SERVER_DEL
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                Command::Unlink(keys)
+                            } else {
+                                Command::Del(keys)
+                            };
+                            record_change!(&del);
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                        }
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Ok(crate::table::RestoreOutcome::Stored) => {
                         db.table.set_lru_or_lfu(key, *freq, *idletime);
                         record_change!(cmd);
                         notify_keyspace_event(NOTIFY_GENERIC, "restore", key);

@@ -2936,7 +2936,7 @@ impl ShardDb {
         serialized: &[u8],
         replace: bool,
         absttl: bool,
-    ) -> Result<(), &'static str> {
+    ) -> Result<crate::table::RestoreOutcome, &'static str> {
         self.table.restore(key, ttl_ms, serialized, replace, absttl)
     }
 

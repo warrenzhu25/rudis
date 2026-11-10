@@ -3353,6 +3353,17 @@ pub fn get_lazyfreed_objects() -> u64 {
     LAZYFREED_OBJECTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// What a RESTORE did with its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    Stored,
+    /// The TTL had already passed: the key was not stored; `replaced` says
+    /// whether an existing key was deleted (REPLACE).
+    Expired {
+        replaced: bool,
+    },
+}
+
 #[inline]
 pub fn inc_expired_keys() {
     EXPIRED_KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3676,6 +3687,12 @@ fn check_signed_bitfield_overflow(
         (false, (value as u64).wrapping_add(incr as u64) as i64)
     }
 }
+
+/// `lazyfree-lazy-server-del`: deletions the server makes on its own (a
+/// RESTORE of an already-expired key replacing one, ...) are propagated as
+/// UNLINK instead of DEL.
+pub static LAZYFREE_LAZY_SERVER_DEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub static LAZYFREE_LAZY_EXPIRE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -15375,7 +15392,7 @@ impl RudisTable {
         serialized: &[u8],
         replace: bool,
         absttl: bool,
-    ) -> Result<(), &'static str> {
+    ) -> Result<RestoreOutcome, &'static str> {
         if self.exists(&key) && !replace {
             return Err("BUSYKEY Target key name already exists.");
         }
@@ -15424,7 +15441,8 @@ impl RudisTable {
         let payload_len = data_len - 2;
         let decoded = Self::decode_dump_payload(&serialized[..payload_len], rdb_ver, now_unix)?;
 
-        if self.exists(&key) {
+        let replaced = self.exists(&key);
+        if replaced {
             self.del(&key);
         }
 
@@ -15439,7 +15457,9 @@ impl RudisTable {
                 .unwrap_or_default();
             let deadline = Duration::from_millis(ttl_ms);
             if deadline <= now_unix {
-                return Ok(());
+                // Already expired: not stored, counted as expired (Redis).
+                inc_expired_keys();
+                return Ok(RestoreOutcome::Expired { replaced });
             } else {
                 Some(Instant::now() + (deadline - now_unix))
             }
@@ -15467,7 +15487,7 @@ impl RudisTable {
                 );
             }
         }
-        Ok(())
+        Ok(RestoreOutcome::Stored)
     }
 
     /// The stream stored at `key`, for loaders that attach extra state.
