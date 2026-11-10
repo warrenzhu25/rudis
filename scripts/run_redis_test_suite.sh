@@ -151,14 +151,22 @@ for suite in "${TARGET_SUITES[@]}"; do
     echo ""
     echo ">>> Running TCL Suite: $suite ..."
     stop_server
-    # unit/acl and unit/gcra are tagged external:skip throughout, so
-    # --host/--port skips every block; run them through the integration
-    # wrapper so their tests actually run.
+    # Through the integration wrapper (the harness starts rudis) rather
+    # than against this runner's server: unit/acl and unit/gcra are tagged
+    # external:skip throughout, so --host/--port skips every block, and in
+    # the others the tests tagged needs:debug / needs:repl /
+    # needs:config-maxmemory only run that way. Suites move here once they
+    # pass whole through the wrapper.
     #
     # Skipped in unit/acl, "provenance": Redis 8 records which user made
     # each subscription and revokes per originating user after re-AUTH;
     # rudis checks a subscriber's channels against its current user only.
-    if [ "$suite" = "unit/acl" ] || [ "$suite" = "unit/gcra" ]; then
+    case "$suite" in
+        unit/acl | unit/gcra | unit/type/stream | unit/type/stream-cgroups | unit/type/hash | \
+            unit/hyperloglog | unit/protocol | unit/introspection-2) via_wrapper=1 ;;
+        *) via_wrapper=0 ;;
+    esac
+    if [ "$via_wrapper" = 1 ]; then
         if (cd "$REPO_ROOT" && EXTRA_ARGS="--timeout 60 --skiptest /(?i)provenance" SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh "$suite"); then
             PASSED_SUITES+=("$suite")
         else
