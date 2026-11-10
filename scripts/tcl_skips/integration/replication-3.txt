@@ -8,8 +8,3 @@
 # write that found a hidden key would store a second entry for it; Redis
 # tells reads from writes at each lookup. See docs/differences.md.
 Writable replica doesn't return expired keys
-#
-# Known gap (TODO, not investigated yet): after PFCOUNT of an expired key
-# on a read-only replica, the key is gone from the replica (DBSIZE 0)
-# before the master's DEL; Redis keeps it until then.
-PFCOUNT doesn't use expired key on readonly replica
