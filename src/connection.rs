@@ -1264,13 +1264,16 @@ struct CmdStatGuard {
     start: Option<std::time::Instant>,
     port: u16,
     client_id: u64,
+    /// Refused before it ran (NOAUTH, NOPERM, OOM, READONLY, ...): a
+    /// rejected call, as Redis's rejectCommand counts it, not a call.
+    rejected: std::cell::Cell<bool>,
 }
 
 impl Drop for CmdStatGuard {
     fn drop(&mut self) {
         // A blocked command refused by ACL when data arrived is a rejected
         // call, as in Redis (it never ran).
-        if take_blocked_rejected(self.port, self.client_id) {
+        if self.rejected.get() || take_blocked_rejected(self.port, self.client_id) {
             record_rejected_stat(self.name);
             return;
         }
@@ -3367,6 +3370,28 @@ fn lcs_table_too_big(m: usize, n: usize) -> Option<&'static str> {
         return Some("Insufficient memory, transient memory for LCS exceeds proto-max-bulk-len");
     }
     None
+}
+
+/// Error stats for a command the parser refused (wrong arity, unknown
+/// command, bad syntax), as Redis's rejectCommand keeps them: the error in
+/// `errorstat_*` and `total_error_replies`, and a rejected call of the
+/// command when it is a known one with the wrong number of arguments.
+/// These were not counted at all.
+fn record_parse_error_stats(err: &str) {
+    let line = err.lines().next().unwrap_or(err);
+    let mut out = Vec::new();
+    write_resp_err(&mut out, line);
+    let prefix = std::str::from_utf8(&out[1..])
+        .ok()
+        .and_then(|l| l.split([' ', '\r']).next())
+        .unwrap_or("ERR");
+    record_error_stat(prefix, None);
+    let msg = line.strip_prefix("ERR ").unwrap_or(line);
+    if let Some(rest) = msg.strip_prefix("wrong number of arguments for '")
+        && let Some(name) = rest.split('\'').next()
+    {
+        record_rejected_stat(name);
+    }
 }
 
 #[inline]
@@ -6520,6 +6545,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                     }
                                 }
                             }
+                            record_parse_error_stats(&err);
                             write_resp_err(&mut out_buf, &err);
                             if should_quit {
                                 break;
@@ -12262,11 +12288,12 @@ async fn execute_command_inner(
     }
     let cmd_name = get_cmd_name(&cmd);
     // Also feeds LATENCY HISTOGRAM, all in thread-local state.
-    let _cmd_stat_guard = CmdStatGuard {
+    let cmd_stat_guard = CmdStatGuard {
         name: stat_cmd_name(&cmd),
         start: (!may_block(&cmd)).then(std::time::Instant::now),
         port: router.port,
         client_id,
+        rejected: std::cell::Cell::new(false),
     };
     if cmd.is_write_command() && !dirty_counted_on_change(&cmd) {
         crate::snapshot::note_write();
@@ -12374,6 +12401,7 @@ async fn execute_command_inner(
     if let Some(reply) =
         protected_command_denied(&cmd, router.base_port, client_id, client_registry)
     {
+        cmd_stat_guard.rejected.set(true);
         out.extend_from_slice(reply);
         return false;
     }
@@ -12382,6 +12410,7 @@ async fn execute_command_inner(
         && cmd.is_write_command()
         && not_enough_good_replicas(router.base_port)
     {
+        cmd_stat_guard.rejected.set(true);
         out.extend_from_slice(b"-NOREPLICAS Not enough good replicas to write.\r\n");
         return false;
     }
@@ -12392,6 +12421,7 @@ async fn execute_command_inner(
             Command::Auth { .. } | Command::Hello { .. } | Command::Quit
         )
     {
+        cmd_stat_guard.rejected.set(true);
         out.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
         return false;
     }
@@ -12399,6 +12429,7 @@ async fn execute_command_inner(
     if *authenticated
         && let Some(err) = acl_denied(router.port, auth_user, &cmd)
     {
+        cmd_stat_guard.rejected.set(true);
         out.extend_from_slice(&err);
         return false;
     }
@@ -12548,6 +12579,7 @@ async fn execute_command_inner(
         && (cmd.is_write_command() || crate::aof::command_to_resp(&cmd).is_some())
         && !in_tx(client_id)
     {
+        cmd_stat_guard.rejected.set(true);
         out.extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");
         return false;
     }
@@ -12570,9 +12602,7 @@ async fn execute_command_inner(
                     .evict_until_under_maxmemory(max_mem as usize, &policy, client_id, out)
                     .await;
                 if !under && cmd.is_write_command() && !cmd.allows_oom() {
-                    let c_name = get_cmd_name(&cmd);
-                    record_rejected_stat(c_name);
-                    record_error_stat("OOM", Some(c_name));
+                    cmd_stat_guard.rejected.set(true);
                     log_oom_rejection(max_mem, &policy);
                     out.extend_from_slice(
                         b"-OOM command not allowed when used memory > 'maxmemory'.\r\n",
@@ -12590,9 +12620,7 @@ async fn execute_command_inner(
                 router.over_maxmemory()
             };
             if over {
-                let c_name = get_cmd_name(&cmd);
-                record_rejected_stat(c_name);
-                record_error_stat("OOM", Some(c_name));
+                cmd_stat_guard.rejected.set(true);
                 log_oom_rejection(max_mem, &policy);
                 out.extend_from_slice(
                     b"-OOM command not allowed when used memory > 'maxmemory'.\r\n",
@@ -15744,6 +15772,15 @@ async fn execute_command_inner(
             let uname = username.as_deref().unwrap_or("default");
             let pass = password.as_str();
             let acl = crate::acl::get_acl_for_port(router.port);
+            // As Redis does, the one-argument form is an error while the
+            // default user has no password (it used to reply +OK, hiding a
+            // client configured with a password the server doesn't have).
+            if username.is_none() && acl.read().users.get("default").is_some_and(|u| u.nopass) {
+                out.extend_from_slice(
+                    b"-ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?\r\n",
+                );
+                return false;
+            }
             let res = acl.read().check_auth(Some(uname), pass);
             if let Ok(authed_user) = res {
                 *authenticated = true;
@@ -20857,7 +20894,7 @@ async fn execute_command_inner(
         }
     }
     _slowlog_guard.reply_bytes = out.len().saturating_sub(error_stat_start);
-    if blocked_rejected_pending(router.port, client_id) {
+    if cmd_stat_guard.rejected.get() || blocked_rejected_pending(router.port, client_id) {
         // Refused, not failed: `CmdStatGuard` counts it as rejected.
         if let Some(prefix) = out[error_stat_start..]
             .strip_prefix(b"-")

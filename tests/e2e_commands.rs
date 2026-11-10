@@ -14047,3 +14047,108 @@ fn test_swapdb_wakes_blocked_xreadgroup_e2e() {
     assert!(String::from_utf8_lossy(&buf[..n]).contains("new"));
     shutdown_and_wait(port, &mut srv);
 }
+
+/// Commands refused before they run count as Redis counts them: a
+/// rejected call (not a call or a failed one) of the command, and one
+/// error in errorstats. ACL-denied and NOAUTH commands were counted as
+/// failed calls, OOM-refused ones had their error counted twice, and
+/// commands with the wrong number of arguments weren't counted at all.
+/// AUTH <password> with no password configured is an error, as in Redis.
+#[test]
+fn test_rejected_calls_and_errorstats_e2e() {
+    let port = 19956u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let info = |c: &mut TcpStream, section: &str, prefix: &str| -> String {
+        let reply = read_full_reply({
+            c.write_all(
+                format!("*2\r\n$4\r\nINFO\r\n${}\r\n{section}\r\n", section.len()).as_bytes(),
+            )
+            .unwrap();
+            c
+        });
+        reply
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let reset = |c: &mut TcpStream| assert_eq!(resp_cmd(c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+
+    // AUTH with no password configured.
+    reset(&mut c);
+    let r = resp_cmd(&mut c, &["AUTH", "k"]);
+    assert!(
+        r.starts_with("-ERR AUTH <password> called without any password"),
+        "{r}"
+    );
+    assert_eq!(
+        info(&mut c, "errorstats", "errorstat_ERR:").trim_end(),
+        "errorstat_ERR:count=1"
+    );
+    let auth = info(&mut c, "commandstats", "cmdstat_auth:");
+    assert!(
+        auth.contains("calls=1,") && auth.contains("rejected_calls=0,failed_calls=1"),
+        "{auth}"
+    );
+
+    // Wrong number of arguments: rejected, and counted.
+    reset(&mut c);
+    assert!(resp_cmd(&mut c, &["GET"]).starts_with("-ERR wrong number of arguments"));
+    assert_eq!(
+        info(&mut c, "errorstats", "errorstat_ERR:").trim_end(),
+        "errorstat_ERR:count=1"
+    );
+    let get = info(&mut c, "commandstats", "cmdstat_get:");
+    assert!(get.contains("rejected_calls=1,failed_calls=0"), "{get}");
+
+    // ACL-denied: rejected, not failed.
+    reset(&mut c);
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &[
+                "ACL", "SETUSER", "alice", "on", ">p", "~*", "+get", "+info", "+config"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    let mut a = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut a, &["AUTH", "alice", "p"]), "+OK\r\n");
+    assert!(resp_cmd(&mut a, &["SET", "x", "y"]).starts_with("-NOPERM"));
+    assert_eq!(
+        info(&mut c, "errorstats", "errorstat_NOPERM:").trim_end(),
+        "errorstat_NOPERM:count=1"
+    );
+    let set = info(&mut c, "commandstats", "cmdstat_set:");
+    assert!(
+        set.starts_with("cmdstat_set:calls=0,") && set.contains("rejected_calls=1,failed_calls=0"),
+        "{set}"
+    );
+
+    // OOM: one error, a rejected call.
+    reset(&mut c);
+    resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-policy", "noeviction"]);
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "1"]),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["SET", "x", "y"]).starts_with("-OOM"));
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        info(&mut c, "errorstats", "errorstat_OOM:").trim_end(),
+        "errorstat_OOM:count=1"
+    );
+    let set = info(&mut c, "commandstats", "cmdstat_set:");
+    assert!(
+        set.starts_with("cmdstat_set:calls=0,") && set.contains("rejected_calls=1,failed_calls=0"),
+        "{set}"
+    );
+    shutdown_and_wait(port, &mut srv);
+}
