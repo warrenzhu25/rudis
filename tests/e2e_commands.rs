@@ -13958,3 +13958,92 @@ fn test_hash_field_ttls_survive_dump_restore_e2e() {
     assert_eq!(resp_cmd(&mut c, &["HGET", "h", "c"]), "$1\r\n3\r\n");
     shutdown_and_wait(port, &mut srv);
 }
+
+/// SWAPDB away a stream with a blocked XREADGROUP: the client fails with
+/// NOGROUP (or WRONGTYPE if the key swapped in is not a stream), as in
+/// Redis, instead of staying blocked forever. A blocked XREAD keeps
+/// waiting, and gets an entry added to the swapped-in database.
+#[test]
+fn test_swapdb_wakes_blocked_xreadgroup_e2e() {
+    let port = 19955u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+    let mut c = connect();
+    let wait_blocked = |c: &mut TcpStream, n: usize| {
+        for _ in 0..100 {
+            if resp_cmd(c, &["INFO", "clients"]).contains(&format!("blocked_clients:{n}")) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("never {n} blocked clients");
+    };
+    let block = |cmd: &[&str]| {
+        let mut b = connect();
+        assert_eq!(resp_cmd(&mut b, &["SELECT", "9"]), "+OK\r\n");
+        let mut req = format!("*{}\r\n", cmd.len());
+        for a in cmd {
+            req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        b.write_all(req.as_bytes()).unwrap();
+        b
+    };
+    // Several keys, so some live on a shard other than the one that
+    // handles the SWAPDB first (that shard used to answer for them).
+    for key in ["s", "s1", "s2", "s3", "s4", "s5", "s6", "s7"] {
+        let xreadgroup = [
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "alice",
+            "BLOCK",
+            "0",
+            "STREAMS",
+            key,
+            ">",
+        ];
+        for (other_db_value, want) in [(None, "-NOGROUP"), (Some("list"), "-WRONGTYPE")] {
+            assert_eq!(resp_cmd(&mut c, &["SELECT", "4"]), "+OK\r\n");
+            assert_eq!(resp_cmd(&mut c, &["FLUSHDB"]), "+OK\r\n");
+            if other_db_value.is_some() {
+                assert_eq!(resp_cmd(&mut c, &["LPUSH", key, "e1"]), ":1\r\n");
+            }
+            assert_eq!(resp_cmd(&mut c, &["SELECT", "9"]), "+OK\r\n");
+            resp_cmd(&mut c, &["DEL", key]);
+            resp_cmd(&mut c, &["XADD", key, "1-1", "f", "v"]);
+            assert_eq!(
+                resp_cmd(&mut c, &["XGROUP", "CREATE", key, "g", "$"]),
+                "+OK\r\n"
+            );
+            let mut b = block(&xreadgroup);
+            wait_blocked(&mut c, 1);
+            assert_eq!(resp_cmd(&mut c, &["SWAPDB", "4", "9"]), "+OK\r\n");
+            let mut buf = [0u8; 256];
+            let n = b.read(&mut buf).unwrap();
+            let got = String::from_utf8_lossy(&buf[..n]);
+            assert!(got.starts_with(want), "{key} {other_db_value:?}: {got}");
+        }
+    }
+
+    // A blocked XREAD on a key the swap removes keeps waiting.
+    assert_eq!(resp_cmd(&mut c, &["SELECT", "4"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FLUSHDB"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SELECT", "9"]), "+OK\r\n");
+    resp_cmd(&mut c, &["DEL", "s"]);
+    resp_cmd(&mut c, &["XADD", "s", "1-1", "f", "v"]);
+    let mut b = block(&["XREAD", "BLOCK", "0", "STREAMS", "s", "$"]);
+    wait_blocked(&mut c, 1);
+    assert_eq!(resp_cmd(&mut c, &["SWAPDB", "4", "9"]), "+OK\r\n");
+    thread::sleep(Duration::from_millis(100));
+    wait_blocked(&mut c, 1);
+    resp_cmd(&mut c, &["XADD", "s", "5-1", "f", "new"]);
+    let mut buf = [0u8; 256];
+    let n = b.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("new"));
+    shutdown_and_wait(port, &mut srv);
+}

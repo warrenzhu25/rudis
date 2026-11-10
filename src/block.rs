@@ -936,12 +936,24 @@ impl BlockHub {
             }
         }
 
+        // Every stream key with waiters, present or not: after SWAPDB (or
+        // MOVE) a blocked XREADGROUP whose stream is gone must fail with
+        // NOGROUP, as in Redis, not wait forever. Re-running a blocked XREAD
+        // on a missing key just finds nothing and keeps it blocked.
+        // Only the keys this shard owns: every shard of the port shares
+        // the hub and runs this, and a shard that doesn't own a key would
+        // find it missing there (NOGROUP where the owner sees WRONGTYPE).
+        let owned = |k: &Bytes| {
+            crate::connection::CURRENT_ROUTER.with(|cr| {
+                cr.borrow()
+                    .as_ref()
+                    .is_none_or(|r| r.target_shard(k) == r.shard_id)
+            })
+        };
         let stream_keys: Vec<Bytes> = self
             .stream_waiters
             .keys()
-            .filter(|(d, k)| {
-                *d == db_idx && !db.table.is_key_expired(k.as_ref()) && db.table.exists(k.as_ref())
-            })
+            .filter(|(d, k)| *d == db_idx && owned(k))
             .map(|(_, k)| k.clone())
             .collect();
         for k in stream_keys {
