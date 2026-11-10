@@ -695,6 +695,9 @@ pub fn run_shard_worker(
                 mem_router.publish_memory_state();
                 if shard_id == 0 {
                     mem_router.calibrate_real_memory();
+                    mem_router
+                        .tier_stats
+                        .note_used_memory(mem_router.real_used_total() as u64);
                 }
                 // Rates for INFO instantaneous_*; extra calls are no-ops.
                 crate::server_stats::sample();

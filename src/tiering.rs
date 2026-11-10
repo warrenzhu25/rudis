@@ -31,6 +31,9 @@ pub struct TieringStats {
     pub cooled_keys: AtomicU64,
     pub decommit_count: AtomicU64,
     pub max_memory: AtomicU64,
+    /// INFO used_memory_peak and when it was reached (unix seconds).
+    pub peak_used: AtomicU64,
+    pub peak_time: AtomicU64,
     pub ram_hits: AtomicU64,
     pub ram_misses: AtomicU64,
     pub total_stashes: AtomicU64,
@@ -103,6 +106,8 @@ impl Default for TieringStats {
             cooled_keys: AtomicU64::new(0),
             decommit_count: AtomicU64::new(0),
             max_memory: AtomicU64::new(0),
+            peak_used: AtomicU64::new(0),
+            peak_time: AtomicU64::new(0),
             ram_hits: AtomicU64::new(0),
             ram_misses: AtomicU64::new(0),
             total_stashes: AtomicU64::new(0),
@@ -131,6 +136,25 @@ impl Default for TieringStats {
 }
 
 impl TieringStats {
+    /// Raises INFO used_memory_peak to `used` if it is higher.
+    pub fn note_used_memory(&self, used: u64) {
+        if used > self.peak_used.load(Ordering::Relaxed) {
+            let prev = self.peak_used.fetch_max(used, Ordering::Relaxed);
+            if used > prev {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                self.peak_time.store(now, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// CONFIG RESETSTAT: the peak restarts from the current usage.
+    pub fn reset_peak(&self, used: u64) {
+        self.peak_used.store(0, Ordering::Relaxed);
+        self.note_used_memory(used);
+    }
+
     /// Publishes `shard`'s current `used_memory`. Only writes the cache line
     /// when the value changed.
     #[inline]

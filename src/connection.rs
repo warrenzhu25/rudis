@@ -13587,6 +13587,10 @@ async fn execute_command_inner(
             let used_mem = router.get_total_used_memory().await;
             let memory_str = crate::allocator::format_memory_info(
                 used_mem,
+                (
+                    stats.peak_used.load(std::sync::atomic::Ordering::Relaxed),
+                    stats.peak_time.load(std::sync::atomic::Ordering::Relaxed),
+                ),
                 max_mem,
                 stats.cooled_keys.load(std::sync::atomic::Ordering::Relaxed),
                 stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed),
@@ -14258,6 +14262,7 @@ async fn execute_command_inner(
                             crate::slowlog::reset_slowlog_stats();
                             crate::table::reset_expired_keys();
                             crate::server_stats::reset();
+                            router.tier_stats.reset_peak(router.real_used_total() as u64);
                             out.extend_from_slice(b"+OK\r\n");
                             return false;
                         } else if p0 == "rewrite" {

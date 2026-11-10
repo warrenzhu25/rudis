@@ -267,6 +267,7 @@ pub fn memory_doctor(r: &MemoryReport) -> String {
 /// Format memory section for INFO command.
 pub fn format_memory_info(
     used_mem: usize,
+    (peak, peak_time): (u64, u64),
     max_mem: u64,
     cooled_keys: u64,
     tiered_keys: u64,
@@ -290,6 +291,10 @@ pub fn format_memory_info(
         used_memory_human:{}\r\n\
         used_memory_rss:{}\r\n\
         used_memory_rss_human:{}\r\n\
+        used_memory_peak:{}\r\n\
+        used_memory_peak_human:{}\r\n\
+        used_memory_peak_time:{}\r\n\
+        used_memory_peak_perc:{:.2}%\r\n\
         maxmemory:{}\r\n\
         maxmemory_human:{}\r\n\
         mem_not_counted_for_evict:0\r\n\
@@ -312,6 +317,14 @@ pub fn format_memory_info(
         crate::tiering::format_bytes_human(used_mem as u64),
         rss,
         crate::tiering::format_bytes_human(rss as u64),
+        peak,
+        crate::tiering::format_bytes_human(peak),
+        peak_time,
+        if peak > 0 {
+            used_mem as f64 * 100.0 / peak as f64
+        } else {
+            100.0
+        },
         max_mem,
         crate::tiering::format_bytes_human(max_mem),
         frag,

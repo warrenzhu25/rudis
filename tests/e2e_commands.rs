@@ -14439,3 +14439,66 @@ fn test_noscript_errorstat_after_script_error_e2e() {
     assert!(stats.contains("total_error_replies:2\r\n"), "{stats}");
     shutdown_and_wait(port, &mut srv);
 }
+
+/// INFO memory reports used_memory_peak (and _human, _time, _perc), as in
+/// Redis: it rises with usage, stays when usage drops, and CONFIG
+/// RESETSTAT restarts it from current usage. Rudis reported no peak.
+#[test]
+fn test_info_used_memory_peak_e2e() {
+    let port = 19964u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mem = |c: &mut TcpStream, field: &str| -> String {
+        let info = resp_cmd(c, &["INFO", "memory"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{field}:")))
+            .unwrap_or_else(|| panic!("{field} missing in {info}"))
+            .trim()
+            .to_string()
+    };
+    let num = |c: &mut TcpStream, field: &str| -> u64 { mem(c, field).parse().unwrap() };
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+
+    // In one reply the peak is at least the current usage.
+    let info = resp_cmd(&mut c, &["INFO", "memory"]);
+    let field = |name: &str| -> u64 {
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    assert!(field("used_memory_peak") >= field("used_memory"), "{info}");
+    let before = now();
+    let big = "a".repeat(8 << 20);
+    assert_eq!(resp_cmd(&mut c, &["SET", "big", &big]), "+OK\r\n");
+    let peak = num(&mut c, "used_memory_peak");
+    assert!(peak >= 8 << 20, "peak {peak}");
+    assert!(num(&mut c, "used_memory_peak_time") >= before);
+    assert!(!mem(&mut c, "used_memory_peak_human").is_empty());
+
+    // Usage drops, the peak stays.
+    assert_eq!(resp_cmd(&mut c, &["DEL", "big"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "small", "x"]), "+OK\r\n");
+    assert_eq!(num(&mut c, "used_memory_peak"), peak);
+    let perc = mem(&mut c, "used_memory_peak_perc");
+    let perc: f64 = perc.trim_end_matches('%').parse().unwrap();
+    assert!(perc < 100.0, "{perc}");
+
+    // RESETSTAT restarts it from current usage.
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+    let reset = num(&mut c, "used_memory_peak");
+    assert!(
+        reset < peak && reset >= num(&mut c, "used_memory") / 2,
+        "{reset} vs {peak}"
+    );
+    shutdown_and_wait(port, &mut srv);
+}

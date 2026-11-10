@@ -1131,7 +1131,9 @@ impl Router {
         }
         self.publish_memory_state();
         self.calibrate_real_memory();
-        self.real_used_total()
+        let used = self.real_used_total();
+        self.tier_stats.note_used_memory(used as u64);
+        used
     }
 
     /// Server-wide used memory by the allocator's count, from what every
