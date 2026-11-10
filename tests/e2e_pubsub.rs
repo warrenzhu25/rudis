@@ -566,3 +566,32 @@ fn test_unsubscribe_binary_channel_reply_is_well_formed_e2e() {
     assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&got));
     drop(srv);
 }
+
+/// QUIT in subscribed mode gets its +OK and then the server closes the
+/// connection, as Redis does. The connection's writer task held a sender
+/// of its own queue, so it never stopped and the socket stayed open until
+/// the client closed it.
+#[test]
+fn test_quit_in_subscribed_mode_closes_the_connection_e2e() {
+    let port = 19951u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    for resp3 in [false, true] {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        if resp3 {
+            assert!(resp_cmd(&mut c, &["HELLO", "3"]).contains("proto"));
+        }
+        assert!(resp_cmd(&mut c, &["SUBSCRIBE", "chan"]).contains("subscribe"));
+        c.write_all(b"*1\r\n$4\r\nQUIT\r\n").unwrap();
+        let mut buf = [0u8; 64];
+        let n = c.read(&mut buf).unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), "+OK\r\n");
+        match c.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("connection not closed after QUIT (resp3={resp3}): {other:?}"),
+        }
+    }
+    shutdown_and_wait(port, &mut srv);
+}

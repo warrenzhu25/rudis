@@ -7138,6 +7138,18 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
         router: router.clone(),
     };
 
+    // When this loop ends (QUIT, a self-inflicted ACL kill, EOF), tells the
+    // writer to send what is queued and stop: it holds a sender itself, so
+    // its channel never closes, and it would keep the socket open forever.
+    // Dropped before `_ps_cleanup`, so the replies already queued go out.
+    struct StopWriter(crate::pubsub::SubscriberTx);
+    impl Drop for StopWriter {
+        fn drop(&mut self) {
+            let _ = self.0.raw().send(Bytes::new());
+        }
+    }
+    let _stop_writer = StopWriter(write_tx.clone());
+
     let reg_writer = client_registry.clone();
     let writer_tx = write_tx.clone();
     monoio::spawn(async move {
@@ -7149,7 +7161,12 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
         // behind and hit the output limit.
         const WRITE_BATCH: usize = 256 * 1024;
         let mut batch = bytes::BytesMut::new();
+        // An empty message is `StopWriter`'s: nothing else queues one.
+        let mut stop = false;
         while let Ok(first) = write_rx.recv_async().await {
+            if first.is_empty() {
+                break;
+            }
             let data = if write_rx.is_empty() {
                 first
             } else {
@@ -7157,6 +7174,10 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                 while batch.len() < WRITE_BATCH
                     && let Ok(more) = write_rx.try_recv()
                 {
+                    if more.is_empty() {
+                        stop = true;
+                        break;
+                    }
                     batch.extend_from_slice(&more);
                 }
                 batch.split().freeze()
@@ -7172,6 +7193,9 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
             writer_tx.written(data_len);
             if let Some(c) = reg_writer.borrow_mut().get_mut(&client_id) {
                 c.omem = writer_tx.queued();
+            }
+            if stop {
+                break;
             }
         }
     });
