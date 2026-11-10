@@ -14289,3 +14289,59 @@ fn test_xgroup_xinfo_subcommand_stats_e2e() {
     assert!(stat(&mut c, "xinfo|groups").starts_with("calls=1,"));
     shutdown_and_wait(port, &mut srv);
 }
+
+/// CONFIG SET is all-or-nothing: a value rejected while applying it (here
+/// a percentile over 100 or not a number) fails the command and leaves
+/// every parameter as it was. It replied +OK and silently kept the old
+/// value, and parameters set earlier in the same call stayed changed.
+#[test]
+fn test_config_set_apply_error_rolls_back_e2e() {
+    let port = 19961u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let get = |c: &mut TcpStream, name: &str| resp_cmd(c, &["CONFIG", "GET", name]);
+    let pcts = get(&mut c, "latency-tracking-info-percentiles");
+    let policy = get(&mut c, "maxmemory-policy");
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+
+    for bad in ["10.0 50.0 a", "10.0 50.0 101.0"] {
+        let r = resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "latency-tracking-info-percentiles", bad],
+        );
+        assert!(r.starts_with("-ERR CONFIG SET failed"), "{bad}: {r}");
+        assert_eq!(get(&mut c, "latency-tracking-info-percentiles"), pcts);
+    }
+    let r = resp_cmd(
+        &mut c,
+        &[
+            "CONFIG",
+            "SET",
+            "maxmemory-policy",
+            "allkeys-lru",
+            "latency-tracking-info-percentiles",
+            "101",
+        ],
+    );
+    assert!(r.starts_with("-ERR CONFIG SET failed"), "{r}");
+    assert_eq!(get(&mut c, "maxmemory-policy"), policy);
+    assert_eq!(get(&mut c, "latency-tracking-info-percentiles"), pcts);
+    let info = resp_cmd(&mut c, &["INFO", "stats"]);
+    assert!(info.contains("total_error_replies:3\r\n"), "{info}");
+
+    // Good values still apply.
+    let r = resp_cmd(
+        &mut c,
+        &[
+            "CONFIG",
+            "SET",
+            "latency-tracking-info-percentiles",
+            "0 50 100",
+        ],
+    );
+    assert_eq!(r, "+OK\r\n");
+    assert!(get(&mut c, "latency-tracking-info-percentiles").contains("0 50 100"));
+    shutdown_and_wait(port, &mut srv);
+}

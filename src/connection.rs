@@ -5164,13 +5164,65 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
         }
     }
 
-    // Phase 2: Apply all validated config parameters
+    // Phase 2: Apply all validated config parameters. Some values are only
+    // checked by `apply_config_value`; on such an error the parameters
+    // already applied get their previous values back and the command
+    // fails, so CONFIG SET is all-or-nothing as in Redis.
+    let mut applied: Vec<(String, Option<String>)> = Vec::new();
     for (param, val) in pairs {
         let p_str = String::from_utf8_lossy(param).to_lowercase();
         let val_str = String::from_utf8_lossy(val);
-        let _ = apply_config_value(router.port, router.base_port, &p_str, &val_str);
+        let old = config_value_string(router, &p_str);
+        if let Err(e) = apply_config_value(router.port, router.base_port, &p_str, &val_str) {
+            for (name, old) in applied.iter().rev() {
+                if let Some(old) = old {
+                    let _ = apply_config_value(router.port, router.base_port, name, old);
+                }
+            }
+            let msg = if e.starts_with("ERR ") {
+                e
+            } else {
+                format!(
+                    "ERR CONFIG SET failed (possibly related to argument '{}') - {}",
+                    err_arg(&p_str),
+                    e
+                )
+            };
+            out.extend_from_slice(b"-");
+            out.extend_from_slice(msg.replace(['\r', '\n'], " ").as_bytes());
+            out.extend_from_slice(b"\r\n");
+            return;
+        }
+        applied.push((p_str, old));
     }
     out.extend_from_slice(b"+OK\r\n");
+}
+
+/// The current value of config parameter `name`, as CONFIG GET reports it.
+fn config_value_string(router: &Router, name: &str) -> Option<String> {
+    let mut buf = Vec::new();
+    write_config_get_reply(router, &[Bytes::copy_from_slice(name.as_bytes())], &mut buf);
+    let mut lines = buf
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let header = lines.next()?;
+    if header != b"*2" && header != b"%1" {
+        return None;
+    }
+    let _name_len = lines.next()?;
+    let _name = lines.next()?;
+    let val_len: usize = std::str::from_utf8(lines.next()?.strip_prefix(b"$")?)
+        .ok()?
+        .parse()
+        .ok()?;
+    // The value starts right after its `$len\r\n` line.
+    let header_len: usize = buf
+        .split_inclusive(|&b| b == b'\n')
+        .take(4)
+        .map(|l| l.len())
+        .sum();
+    let val = buf.get(header_len..header_len + val_len)?;
+    Some(String::from_utf8_lossy(val).into_owned())
 }
 
 pub fn set_max_clients(limit: usize) {
