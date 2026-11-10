@@ -1,0 +1,91 @@
+name: Fuzz
+
+# Runs every cargo-fuzz target in fuzz/ for a fixed time each night and on
+# demand. It doesn't gate pushes: a fuzz run finds new inputs at random, so a
+# failure here is a new bug to fix, not a regression in the pushed commit.
+# The corpus is kept in the Actions cache from one run to the next, so
+# coverage builds up over nights. Crashing inputs are uploaded as an
+# artifact. To reproduce one locally:
+#   cargo +nightly fuzz run <target> <crash file>
+#
+# One job builds the targets once (an ASan build of rudis takes several
+# minutes) and runs them in turn, each for `seconds`.
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to fuzz each target"
+        default: "600"
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGETS: parse_command dump_payload load_rdb load_aof cluster_bus
+
+jobs:
+  fuzz:
+    name: Fuzz all targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # cargo-fuzz needs nightly for -Zsanitizer=address.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: Build targets
+        run: cargo +nightly fuzz build
+
+      # -rss_limit_mb and -malloc_limit_mb make an input that allocates
+      # without bound (as LCS on two 400 KB strings once did) a failure
+      # instead of an OOM kill of the runner. Every target runs even if an
+      # earlier one fails; the step fails if any did.
+      - name: Fuzz
+        run: |
+          failed=""
+          for t in $TARGETS; do
+            mkdir -p "fuzz/corpus/$t"
+            echo "::group::$t"
+            if ! cargo +nightly fuzz run "$t" -- \
+                -max_total_time=${{ inputs.seconds || '600' }} \
+                -rss_limit_mb=4096 -malloc_limit_mb=2048 -timeout=30; then
+              failed="$failed $t"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::fuzz targets failed:$failed"
+            exit 1
+          fi
+
+      - name: Minimize corpus
+        if: success()
+        run: for t in $TARGETS; do cargo +nightly fuzz cmin "$t"; done
+
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

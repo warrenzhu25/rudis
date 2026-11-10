@@ -798,6 +798,18 @@ and known gaps are listed, each with its reason, in [`scripts/tcl_skips/`](scrip
 [`scripts/tcl_patches/`](scripts/tcl_patches/) adapts a suite where rudis's behavior differs on
 purpose (it refuses corrupt `RESTORE` payloads up front instead of crashing on them later).
 
+### Fuzzing
+
+`fuzz/` holds cargo-fuzz targets for the untrusted inputs: the RESP/inline framer
+(`parse_command`), `RESTORE` payloads (`dump_payload`), RDB and AOF files (`load_rdb`,
+`load_aof`) and cluster bus lines (`cluster_bus`). The [Fuzz workflow](.github/workflows/fuzz.yml)
+runs each of them every night (one build, then each target in turn), keeping the corpus in the Actions cache from night to night
+and uploading any crashing input. To run one locally:
+
+```bash
+cargo +nightly fuzz run load_rdb -- -max_total_time=600 -rss_limit_mb=4096 -malloc_limit_mb=2048
+```
+
 ---
 
 ## Documentation & Contributor Guides
