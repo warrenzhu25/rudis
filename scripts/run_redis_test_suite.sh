@@ -154,8 +154,16 @@ for suite in "${TARGET_SUITES[@]}"; do
     # unit/acl and unit/gcra are tagged external:skip throughout, so
     # --host/--port skips every block; run them through the integration
     # wrapper so their tests actually run.
+    #
+    # Skipped in unit/acl:
+    # - "provenance": Redis 8 records which user made each subscription and
+    #   revokes per originating user after re-AUTH; rudis checks a
+    #   subscriber's channels against its current user only.
+    # - "blocked command gets rejected ...": known gap (TODO): a command
+    #   blocked before an ACL change is served when it wakes up, where Redis
+    #   checks its permissions again and replies NOPERM.
     if [ "$suite" = "unit/acl" ] || [ "$suite" = "unit/gcra" ]; then
-        if (cd "$REPO_ROOT" && EXTRA_ARGS="--timeout 60 --skiptest /Subscribers.are --skiptest /Provenance --skiptest /ACL.LOAD.only.disconnects --skiptest /ACL.LOAD.disconnects.affected.subscriber --skiptest /ACL.LOAD.re-key --skiptest /ACL.LOAD.kills --skiptest /ACL.LOAD.twice --skiptest /blocked.command.gets.rejected" SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh "$suite"); then
+        if (cd "$REPO_ROOT" && EXTRA_ARGS="--timeout 60 --skiptest /(?i)provenance --skiptest /blocked.command.gets.rejected" SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh "$suite"); then
             PASSED_SUITES+=("$suite")
         else
             echo "!!! Suite $suite failed!"

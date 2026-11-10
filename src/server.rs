@@ -796,6 +796,7 @@ pub fn run_shard_worker(
         let cross_shard_slot_owners = router.slot_owners.clone();
         let cross_shard_aof_slot = aof_slot.clone();
         let cross_shard_pubsub = pubsub.clone();
+        let cross_shard_port = router.port;
         let cross_shard_tx_lock = router.tx_lock.clone();
         let cross_shard_tx_waiters = router.tx_waiters.clone();
         monoio::spawn(async move {
@@ -2360,6 +2361,16 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     }
                     ShardMessage::ResetCommandStats { responder } => {
                         crate::connection::reset_local_cmd_stats();
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::KillRevokedSubscribers { responder } => {
+                        // The ACL command ran on another shard: no client
+                        // here is the one that ran it.
+                        crate::connection::kill_revoked_subscribers(
+                            cross_shard_port,
+                            &cross_shard_pubsub.borrow(),
+                            0,
+                        );
                         let _ = responder.send(());
                     }
                     ShardMessage::NotifyList { db: target_db, keys } => {

@@ -624,6 +624,11 @@ pub enum ShardMessage {
     ResetCommandStats {
         responder: flume::Sender<()>,
     },
+    /// Disconnect this shard's clients subscribed to a channel their user
+    /// may no longer access (after ACL SETUSER / ACL LOAD).
+    KillRevokedSubscribers {
+        responder: flume::Sender<()>,
+    },
     SaveRdbChunk {
         /// The chunk, or the failure that makes the snapshot unusable.
         responder: flume::Sender<Result<Vec<u8>, TieredReadError>>,

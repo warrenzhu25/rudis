@@ -3522,6 +3522,26 @@ impl Router {
         out
     }
 
+    /// After ACL SETUSER / ACL LOAD: every shard disconnects its clients
+    /// subscribed to a channel their user may no longer access (each shard
+    /// holds its own connections' subscriptions). Returns whether
+    /// `self_id`, the client that ran the ACL command, is to be closed.
+    pub async fn kill_revoked_subscribers(&self, self_id: u64) -> bool {
+        for (shard_id, sender) in self.senders.iter().enumerate() {
+            if shard_id != self.shard_id {
+                let (tx, rx) = self.acquire_notify_channel();
+                let msg = ShardMessage::KillRevokedSubscribers {
+                    responder: tx.clone(),
+                };
+                if sender.send(msg).is_ok() {
+                    let _ = rx.recv_async().await;
+                }
+                self.release_notify_channel(tx, rx);
+            }
+        }
+        crate::connection::kill_revoked_subscribers(self.port, &self.pubsub.borrow(), self_id)
+    }
+
     pub async fn reset_command_stats(&self) {
         // The other shards first: one of them flushes its buffered counts
         // into CMD_STATS when a connection closes, so clearing CMD_STATS

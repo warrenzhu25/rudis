@@ -567,6 +567,113 @@ fn test_unsubscribe_binary_channel_reply_is_well_formed_e2e() {
     drop(srv);
 }
 
+/// `ACL SETUSER` (and `ACL LOAD`) that revokes a channel disconnects the
+/// user's clients subscribed to it, on every shard, as Redis does: they
+/// kept receiving its messages. A subscriber whose own SETUSER revokes its
+/// channel gets the +OK, then is disconnected. Clients whose subscriptions
+/// are all still allowed stay connected.
+#[test]
+fn test_acl_revoking_a_channel_disconnects_its_subscribers_e2e() {
+    let port = 19950u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+    // The server closed the connection: EOF (or a reset), not a read that
+    // times out on a socket nobody serves any more.
+    let assert_killed = |s: &mut TcpStream| {
+        let mut buf = [0u8; 256];
+        match s.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Ok(n) => panic!(
+                "subscriber still connected: {:?}",
+                String::from_utf8_lossy(&buf[..n])
+            ),
+            Err(e) => panic!("connection not closed: {e}"),
+        }
+    };
+    let mut admin = connect();
+    for (user, chans) in [("ps", "&news:*"), ("keep", "&news:*")] {
+        assert_eq!(
+            resp_cmd(
+                &mut admin,
+                &[
+                    "ACL",
+                    "SETUSER",
+                    user,
+                    "on",
+                    ">pw",
+                    "~*",
+                    "+@all",
+                    "resetchannels",
+                    chans
+                ]
+            ),
+            "+OK\r\n"
+        );
+    }
+    let subscribe = |user: &str, cmd: &str, chan: &str| {
+        let mut s = connect();
+        assert_eq!(resp_cmd(&mut s, &["AUTH", user, "pw"]), "+OK\r\n");
+        let r = resp_cmd(&mut s, &[cmd, chan]);
+        assert!(r.contains(":1\r\n"), "{cmd} {chan}: {r}");
+        s
+    };
+    // Enough connections that the 4 shards each get some.
+    let mut victims: Vec<TcpStream> = (0..6)
+        .map(|_| subscribe("ps", "SUBSCRIBE", "news:1"))
+        .chain((0..3).map(|_| subscribe("ps", "SSUBSCRIBE", "news:2")))
+        .chain((0..3).map(|_| subscribe("ps", "PSUBSCRIBE", "news:*")))
+        .collect();
+    let mut survivors: Vec<TcpStream> = (0..6)
+        .map(|_| subscribe("keep", "SUBSCRIBE", "news:1"))
+        .collect();
+
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["ACL", "SETUSER", "ps", "resetchannels", "&other"]
+        ),
+        "+OK\r\n"
+    );
+    for v in &mut victims {
+        assert_killed(v);
+    }
+    assert_eq!(resp_cmd(&mut admin, &["PUBLISH", "news:1", "hi"]), ":6\r\n");
+    for s in &mut survivors {
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).contains("hi"),
+            "survivor lost its subscription"
+        );
+    }
+
+    // A subscriber revoking its own channel (RESP3, where a subscribed
+    // client may run any command) gets +OK, then is disconnected.
+    let mut me = connect();
+    assert!(resp_cmd(&mut me, &["HELLO", "3", "AUTH", "keep", "pw"]).contains("proto"));
+    let r = resp_cmd(&mut me, &["SUBSCRIBE", "news:1"]);
+    assert!(r.contains("subscribe"), "{r}");
+    me.write_all(b"*4\r\n$3\r\nACL\r\n$7\r\nSETUSER\r\n$4\r\nkeep\r\n$13\r\nresetchannels\r\n")
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let n = me.read(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "+OK\r\n");
+    assert_killed(&mut me);
+    // ... and so are the user's other subscribers.
+    for s in &mut survivors {
+        assert_killed(s);
+    }
+    assert_eq!(resp_cmd(&mut admin, &["PING"]), "+PONG\r\n");
+    drop(admin);
+    shutdown_and_wait(port, &mut srv);
+}
+
 /// QUIT in subscribed mode gets its +OK and then the server closes the
 /// connection, as Redis does. The connection's writer task held a sender
 /// of its own queue, so it never stopped and the socket stayed open until

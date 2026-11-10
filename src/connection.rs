@@ -11525,6 +11525,98 @@ pub fn acl_channels_denied(user: &crate::acl::AclUser, cmd: &Command) -> bool {
     acl_first_denied_channel(user, cmd).is_some()
 }
 
+/// Disconnects another client of the server on `port` (ACL DELUSER, ACL
+/// LOAD, a revoked subscription): marks it killed, shuts its socket down so
+/// its task ends, and drops any blocked-command wait it has.
+fn kill_registered_client(port: u16, cid: u64, entry: &GlobalClientEntry) {
+    if entry
+        .stats
+        .killed
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    // SAFETY: shutdown(2) takes no pointers; the caller holds the
+    // GLOBAL_CLIENTS lock, under which raw_fd is the client's open socket.
+    unsafe {
+        libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
+    }
+    crate::block::get_block_hub_for_port(port)
+        .lock()
+        .remove_waiters_for_client(cid);
+}
+
+/// The clients in `hub` (one shard's Pub/Sub registry) subscribed to a
+/// channel, pattern or shard channel their user may no longer access, or
+/// whose user is gone.
+fn revoked_subscribers(port: u16, hub: &crate::pubsub::PubSubHub) -> Vec<u64> {
+    let acl = crate::acl::get_acl_for_port(port);
+    let acl = acl.read();
+    let clients = GLOBAL_CLIENTS.read();
+    let denied = |subs: &hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
+                  cid: u64,
+                  user: &crate::acl::AclUser,
+                  is_pattern: bool| {
+        subs.get(&cid)
+            .is_some_and(|s| s.iter().any(|c| !user.can_access_channel(c, is_pattern)))
+    };
+    let mut ids: Vec<u64> = hub
+        .client_channels
+        .keys()
+        .chain(hub.client_patterns.keys())
+        .chain(hub.client_shard_channels.keys())
+        .copied()
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.retain(|&cid| {
+        let Some(entry) = clients.get(&(port, cid)) else {
+            return false;
+        };
+        match acl.users.get(&entry.auth_user) {
+            None => true,
+            Some(user) if user.all_channels => false,
+            Some(user) => {
+                denied(&hub.client_channels, cid, user, false)
+                    || denied(&hub.client_shard_channels, cid, user, false)
+                    || denied(&hub.client_patterns, cid, user, true)
+            }
+        }
+    });
+    ids
+}
+
+/// Redis ACLKillPubsubClientsIfNeeded, for one shard: after ACL SETUSER or
+/// ACL LOAD, disconnects the clients in `hub` subscribed to anything their
+/// user may no longer access, so a revoked user stops receiving messages.
+/// Returns whether `self_id`, the client that ran the ACL command, is one of
+/// them: it gets its reply first, then its caller closes it.
+pub fn kill_revoked_subscribers(port: u16, hub: &crate::pubsub::PubSubHub, self_id: u64) -> bool {
+    if hub.client_channels.is_empty()
+        && hub.client_patterns.is_empty()
+        && hub.client_shard_channels.is_empty()
+    {
+        return false;
+    }
+    let revoked = revoked_subscribers(port, hub);
+    let mut kill_self = false;
+    let clients = GLOBAL_CLIENTS.read();
+    for cid in revoked {
+        if cid == self_id {
+            kill_self = true;
+        } else if let Some(entry) = clients.get(&(port, cid)) {
+            kill_registered_client(port, cid, entry);
+        }
+    }
+    kill_self
+}
+
 /// `appendfsync always`: if any AOF was appended to since this connection
 /// last checked, makes every shard's AOF durable before its replies go out.
 /// One relaxed load when no server in the process runs `always`.
@@ -15544,8 +15636,14 @@ async fn execute_command_inner(
                 }
                 crate::resp::AclSubcommand::SetUser { username, rules } => {
                     flush_pending_bcast(router.port);
-                    match acl.write().set_user(&username, &rules) {
-                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                    let res = acl.write().set_user(&username, &rules);
+                    match res {
+                        Ok(()) => {
+                            out.extend_from_slice(b"+OK\r\n");
+                            if router.kill_revoked_subscribers(client_id).await {
+                                close_conn = true;
+                            }
+                        }
                         Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
                     }
                 }
@@ -15562,27 +15660,7 @@ async fn execute_command_inner(
                                 if cid == client_id {
                                     close_conn = true;
                                 } else {
-                                    if entry
-                                        .stats
-                                        .killed
-                                        .compare_exchange(
-                                            false,
-                                            true,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        )
-                                        .is_ok()
-                                    {
-                                        ACTIVE_CLIENTS
-                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    // SAFETY: shutdown(2) takes no pointers; raw_fd is valid under GLOBAL_CLIENTS lock.
-                                    unsafe {
-                                        libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
-                                    }
-                                    crate::block::get_block_hub_for_port(router.port)
-                                        .lock()
-                                        .remove_waiters_for_client(cid);
+                                    kill_registered_client(router.port, cid, entry);
                                 }
                             }
                         }
@@ -15730,47 +15808,27 @@ async fn execute_command_inner(
                     let res = acl.write().load_from_aclfile();
                     match res {
                         Ok(()) => {
-                            let guard = acl.read();
-                            let map = GLOBAL_CLIENTS.read();
-                            for (&(p, cid), entry) in map.iter() {
-                                if is_server_client_port(router, p) {
+                            {
+                                let guard = acl.read();
+                                let map = GLOBAL_CLIENTS.read();
+                                for (&(p, cid), entry) in map.iter() {
                                     let keep = guard
                                         .users
                                         .get(&entry.auth_user)
-                                        .map(|u| u.enabled)
-                                        .unwrap_or(false);
-                                    if !keep {
+                                        .is_some_and(|u| u.enabled);
+                                    if is_server_client_port(router, p) && !keep {
                                         if cid == client_id {
                                             close_conn = true;
                                         } else {
-                                            if entry
-                                                .stats
-                                                .killed
-                                                .compare_exchange(
-                                                    false,
-                                                    true,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                )
-                                                .is_ok()
-                                            {
-                                                ACTIVE_CLIENTS.fetch_sub(
-                                                    1,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
-                                            }
-                                            // SAFETY: shutdown(2) takes no pointers; raw_fd is valid under GLOBAL_CLIENTS lock.
-                                            unsafe {
-                                                libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
-                                            }
-                                            crate::block::get_block_hub_for_port(router.port)
-                                                .lock()
-                                                .remove_waiters_for_client(cid);
+                                            kill_registered_client(router.port, cid, entry);
                                         }
                                     }
                                 }
                             }
                             out.extend_from_slice(b"+OK\r\n");
+                            if router.kill_revoked_subscribers(client_id).await {
+                                close_conn = true;
+                            }
                         }
                         Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
                     }
