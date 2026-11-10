@@ -1853,6 +1853,21 @@ pub fn access_word_touched(old: u16) -> u16 {
     }
 }
 
+/// Milliseconds on the coarse monotonic clock (a few ms resolution, a
+/// vDSO read): for per-request timestamps that only need ~10 ms accuracy.
+#[inline(always)]
+pub fn coarse_now_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable local; clock_gettime only writes into it.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut ts);
+    }
+    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
+}
+
 #[inline(always)]
 pub fn coarse_now_secs() -> u32 {
     let mut ts = libc::timespec {

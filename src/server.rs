@@ -1099,7 +1099,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             let pipe_sum = client.stats.pipeline_len_sum.load(std::sync::atomic::Ordering::Relaxed);
                             let pipe_cnt = client.stats.pipeline_len_cnt.load(std::sync::atomic::Ordering::Relaxed);
                             out.push_str(&format!(
-                                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
+                                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch={watch} qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
                                 client.id,
                                 client.addr,
                                 port,
@@ -1120,6 +1120,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                 read_events,
                                 pipe_sum,
                                 pipe_cnt,
+                                watch = crate::connection::client_watch_count(port, client.id),
                             ));
                         }
                         let _ = responder.send(out);
@@ -2143,6 +2144,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     ShardMessage::PubsubNumpat { responder } => {
                         let pats = cross_shard_pubsub.borrow().patterns.keys().cloned().collect();
                         let _ = responder.send(pats);
+                    }
+                    ShardMessage::PubsubClientIds { responder } => {
+                        let _ = responder.send(cross_shard_pubsub.borrow().subscribed_client_ids());
                     }
                     ShardMessage::RemoveClientPubSub { client_id } => {
                         cross_shard_pubsub

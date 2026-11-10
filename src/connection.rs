@@ -40,6 +40,9 @@ pub struct ClientStats {
     pub tot_net_out: std::sync::atomic::AtomicU64,
     pub tot_cmds: std::sync::atomic::AtomicU64,
     pub read_events: std::sync::atomic::AtomicU64,
+    /// When the client last sent anything, by [`crate::table::coarse_now_ms`]
+    /// (INFO clients' `active_clients`).
+    pub last_read_ms: std::sync::atomic::AtomicU64,
     pub pipeline_len_sum: std::sync::atomic::AtomicU64,
     pub pipeline_len_cnt: std::sync::atomic::AtomicU64,
     pub killed: std::sync::atomic::AtomicBool,
@@ -57,6 +60,7 @@ impl ClientStats {
             tot_net_out: std::sync::atomic::AtomicU64::new(0),
             tot_cmds: std::sync::atomic::AtomicU64::new(0),
             read_events: std::sync::atomic::AtomicU64::new(0),
+            last_read_ms: std::sync::atomic::AtomicU64::new(crate::table::coarse_now_ms()),
             pipeline_len_sum: std::sync::atomic::AtomicU64::new(0),
             pipeline_len_cnt: std::sync::atomic::AtomicU64::new(0),
             killed: std::sync::atomic::AtomicBool::new(false),
@@ -1045,6 +1049,49 @@ pub async fn wait_for_stream_result(
             }
         }
     }
+}
+
+/// INFO clients' `watching_clients` (clients watching at least one key)
+/// and `total_watched_keys` (keys watched, by database and name).
+fn watch_counts(port: u16) -> (usize, usize) {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return (0, 0);
+    }
+    let map = WATCHED_KEYS.read();
+    let Some(port_map) = map.get(&node_port(port)) else {
+        return (0, 0);
+    };
+    let watchers: hashbrown::HashSet<u64> = port_map.values().flatten().copied().collect();
+    let keys = port_map.values().filter(|c| !c.is_empty()).count();
+    (watchers.len(), keys)
+}
+
+/// CLIENT LIST/INFO `watch=`: how many keys client `id` is watching.
+pub(crate) fn client_watch_count(port: u16, id: u64) -> usize {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    let map = WATCHED_KEYS.read();
+    map.get(&node_port(port))
+        .map_or(0, |m| m.values().filter(|c| c.contains(&id)).count())
+}
+
+/// INFO clients' `active_clients`: the server's clients that sent
+/// something in the last 512 ms.
+fn active_clients(router: &Router) -> usize {
+    let now = crate::table::coarse_now_ms();
+    GLOBAL_CLIENTS
+        .read()
+        .iter()
+        .filter(|((p, _), e)| {
+            is_server_client_port(router, *p)
+                && now.saturating_sub(
+                    e.stats
+                        .last_read_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ) < 512
+        })
+        .count()
 }
 
 static WATCHED_KEYS: std::sync::LazyLock<
@@ -6387,6 +6434,10 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                     stats
                         .read_events
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stats.last_read_ms.store(
+                        crate::table::coarse_now_ms(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 stats
                     .tot_net_in
@@ -13573,12 +13624,18 @@ async fn execute_command_inner(
             let shard_conns: Vec<String> = (0..router.num_shards)
                 .map(|s| crate::conn_balance::conn_count(s).to_string())
                 .collect();
+            let pubsub_clients = router.pubsub_clients().await;
+            let (watching_clients, total_watched_keys) = watch_counts(router.port);
             let clients_str = format!(
-                "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\ntracking_clients:{}\r\ntotal_blocking_keys:{}\r\ntotal_blocking_keys_on_nokey:{}\r\nisolated_panics:{}\r\nshard_connections:{}\r\n",
+                "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\ntracking_clients:{}\r\npubsub_clients:{}\r\nwatching_clients:{}\r\ntotal_watched_keys:{}\r\nactive_clients:{}\r\ntotal_blocking_keys:{}\r\ntotal_blocking_keys_on_nokey:{}\r\nisolated_panics:{}\r\nshard_connections:{}\r\n",
                 connected_clients(router.base_port),
                 get_max_clients(),
                 blocked_clients_count,
                 tracking_clients,
+                pubsub_clients,
+                watching_clients,
+                total_watched_keys,
+                active_clients(router),
                 total_blocking_keys,
                 total_blocking_keys_on_nokey,
                 get_isolated_panics(),
@@ -14614,7 +14671,7 @@ async fn execute_command_inner(
                             .pipeline_len_cnt
                             .load(std::sync::atomic::Ordering::Relaxed);
                         let info = format!(
-                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
+                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch={watch} qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
                             c.id,
                             c.addr,
                             router.port,
@@ -14636,6 +14693,7 @@ async fn execute_command_inner(
                             read_events,
                             pipe_sum,
                             pipe_cnt,
+                            watch = crate::connection::client_watch_count(router.port, c.id),
                         );
                         out.extend_from_slice(format!("${}\r\n", info.len()).as_bytes());
                         out.extend_from_slice(info.as_bytes());

@@ -3481,7 +3481,7 @@ impl Router {
                 .pipeline_len_cnt
                 .load(std::sync::atomic::Ordering::Relaxed);
             out.push_str(&format!(
-                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
+                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch={watch} qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
                 client.id,
                 client.addr,
                 self.port,
@@ -3502,6 +3502,7 @@ impl Router {
                 read_events,
                 pipe_sum,
                 pipe_cnt,
+                watch = crate::connection::client_watch_count(self.port, client.id),
             ));
         }
 
@@ -4216,6 +4217,36 @@ impl Router {
                 (ch, cnt)
             })
             .collect()
+    }
+
+    /// Clients subscribed to anything, on any shard (INFO clients'
+    /// `pubsub_clients`). A client's subscriptions can sit on several shards
+    /// (shard channels live with their slot): counted once.
+    pub async fn pubsub_clients(&self) -> usize {
+        let mut unique: hashbrown::HashSet<u64> = self
+            .pubsub
+            .borrow()
+            .subscribed_client_ids()
+            .into_iter()
+            .collect();
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender
+                    .send(ShardMessage::PubsubClientIds { responder: tx })
+                    .is_ok()
+                {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            if let Ok(ids) = rx.recv_async().await {
+                unique.extend(ids);
+            }
+        }
+        unique.len()
     }
 
     pub async fn pubsub_numpat(&self) -> usize {

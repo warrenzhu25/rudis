@@ -436,6 +436,22 @@ impl PubSubHub {
         Self::default()
     }
 
+    /// The clients with at least one channel, pattern or shard channel
+    /// subscription here (`pubsub_clients` in INFO clients).
+    pub fn subscribed_client_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .client_channels
+            .iter()
+            .chain(self.client_patterns.iter())
+            .chain(self.client_shard_channels.iter())
+            .filter(|(_, subs)| !subs.is_empty())
+            .map(|(&cid, _)| cid)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     pub fn total_subscriptions(&self, client_id: u64) -> usize {
         let ch_count = self
             .client_channels

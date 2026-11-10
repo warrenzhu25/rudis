@@ -14152,3 +14152,82 @@ fn test_rejected_calls_and_errorstats_e2e() {
     );
     shutdown_and_wait(port, &mut srv);
 }
+
+/// INFO clients reports `pubsub_clients`, `watching_clients`,
+/// `total_watched_keys` and `active_clients`, and CLIENT INFO/LIST show
+/// each client's watched-key count in `watch=`. The INFO fields were
+/// missing and `watch=` was always 0.
+#[test]
+fn test_info_clients_pubsub_watch_active_e2e() {
+    let port = 19959u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let field = |c: &mut TcpStream, name: &str| -> String {
+        let info = resp_cmd(c, &["INFO", "clients"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("{name} missing in {info}"))
+            .trim()
+            .to_string()
+    };
+    let mut c = connect();
+    assert_eq!(field(&mut c, "pubsub_clients"), "0");
+
+    // A shard subscriber and a plain subscriber count once each.
+    let mut s1 = connect();
+    let mut s2 = connect();
+    assert!(resp_cmd(&mut s1, &["SSUBSCRIBE", "chan1"]).contains("chan1"));
+    assert!(resp_cmd(&mut s2, &["SUBSCRIBE", "chan2", "chan3"]).contains("chan3"));
+    assert_eq!(field(&mut c, "pubsub_clients"), "2");
+    // Unsubscribing one of two channels keeps the client counted.
+    assert!(resp_cmd(&mut s2, &["UNSUBSCRIBE", "chan2"]).contains("chan2"));
+    assert_eq!(field(&mut c, "pubsub_clients"), "2");
+    assert!(resp_cmd(&mut s2, &["UNSUBSCRIBE", "chan3"]).contains("chan3"));
+    assert_eq!(field(&mut c, "pubsub_clients"), "1");
+    drop(s1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while field(&mut c, "pubsub_clients") != "0" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pubsub_clients did not clear"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // WATCH: clients watching, keys watched and the per-client count.
+    let mut w = connect();
+    let watch_of = |c: &mut TcpStream| -> String {
+        let info = resp_cmd(c, &["CLIENT", "INFO"]);
+        info.split_whitespace()
+            .find_map(|f| f.strip_prefix("watch="))
+            .unwrap_or_else(|| panic!("watch= missing in {info}"))
+            .to_string()
+    };
+    assert_eq!(field(&mut c, "watching_clients"), "0");
+    assert_eq!(field(&mut c, "total_watched_keys"), "0");
+    assert_eq!(resp_cmd(&mut w, &["WATCH", "k1", "k2"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["WATCH", "k2"]), "+OK\r\n");
+    assert_eq!(field(&mut c, "watching_clients"), "2");
+    assert_eq!(field(&mut c, "total_watched_keys"), "2");
+    assert_eq!(watch_of(&mut w), "2");
+    assert_eq!(watch_of(&mut c), "1");
+    let list = resp_cmd(&mut c, &["CLIENT", "LIST"]);
+    assert!(list.contains(" watch=2 "), "{list}");
+    assert_eq!(resp_cmd(&mut c, &["UNWATCH"]), "+OK\r\n");
+    assert_eq!(watch_of(&mut c), "0");
+    assert_eq!(field(&mut c, "watching_clients"), "1");
+    assert_eq!(resp_cmd(&mut w, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut w, &["EXEC"]), "*0\r\n");
+    assert_eq!(field(&mut c, "watching_clients"), "0");
+    assert_eq!(field(&mut c, "total_watched_keys"), "0");
+
+    // The client asking is active; idle ones stop counting.
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(field(&mut c, "active_clients"), "1");
+    shutdown_and_wait(port, &mut srv);
+}

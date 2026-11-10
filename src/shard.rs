@@ -707,6 +707,11 @@ pub enum ShardMessage {
     PubsubNumpat {
         responder: flume::Sender<Vec<Bytes>>,
     },
+    /// This shard's subscribed client ids (see
+    /// [`crate::pubsub::PubSubHub::subscribed_client_ids`]).
+    PubsubClientIds {
+        responder: flume::Sender<Vec<u64>>,
+    },
     RemoveClientPubSub {
         client_id: u64,
     },
