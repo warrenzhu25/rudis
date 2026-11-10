@@ -13747,3 +13747,91 @@ fn test_error_replies_never_echo_cr_lf_e2e() {
         assert!(!text.contains("\r\n+FORGED"), "{cmd:?} -> {text:?}");
     }
 }
+
+/// A command blocked before its user lost access to the key is refused
+/// with NOPERM when data arrives, as Redis does when it reprocesses it,
+/// and the data stays for others; it counts as a rejected call. Blocked
+/// commands used to be served regardless (list, sorted set and stream).
+#[test]
+fn test_blocked_command_refused_after_its_user_loses_key_access_e2e() {
+    let port = 19952u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+    let mut admin = connect();
+    let cases: [(&str, &[&str], &[&str], &str); 4] = [
+        ("l1", &["BLPOP", "l1", "0"], &["RPUSH", "l1", "a"], "LLEN"),
+        (
+            "l2",
+            &["BLMOVE", "l2", "l2dst", "LEFT", "RIGHT", "0"],
+            &["RPUSH", "l2", "a"],
+            "LLEN",
+        ),
+        (
+            "z1",
+            &["BZPOPMIN", "z1", "0"],
+            &["ZADD", "z1", "1", "a"],
+            "ZCARD",
+        ),
+        (
+            "s1",
+            &["XREAD", "BLOCK", "0", "STREAMS", "s1", "$"],
+            &["XADD", "s1", "*", "f", "v"],
+            "XLEN",
+        ),
+    ];
+    for (key, block, feed, len_cmd) in cases {
+        assert_eq!(
+            resp_cmd(
+                &mut admin,
+                &[
+                    "ACL", "SETUSER", "bu", "reset", "on", "nopass", "+@all", "allkeys"
+                ]
+            ),
+            "+OK\r\n"
+        );
+        let mut c = connect();
+        assert_eq!(resp_cmd(&mut c, &["AUTH", "bu", "x"]), "+OK\r\n");
+        let mut req = format!("*{}\r\n", block.len());
+        for a in block {
+            req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        c.write_all(req.as_bytes()).unwrap();
+        // Until it is blocked.
+        for _ in 0..100 {
+            let info = resp_cmd(&mut admin, &["INFO", "clients"]);
+            if info.contains("blocked_clients:1") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            resp_cmd(&mut admin, &["ACL", "SETUSER", "bu", "resetkeys"]),
+            "+OK\r\n"
+        );
+        resp_cmd(&mut admin, feed);
+        let mut buf = [0u8; 256];
+        let n = c.read(&mut buf).unwrap();
+        let got = String::from_utf8_lossy(&buf[..n]);
+        assert!(got.starts_with("-NOPERM"), "{block:?}: {got}");
+        // Nothing was taken for it.
+        assert_eq!(resp_cmd(&mut admin, &[len_cmd, key]), ":1\r\n", "{block:?}");
+        // And the connection still works.
+        assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    }
+    let stats = resp_cmd(&mut admin, &["INFO", "commandstats"]);
+    let blpop = stats
+        .lines()
+        .find(|l| l.starts_with("cmdstat_blpop:"))
+        .unwrap();
+    assert!(
+        blpop.starts_with("cmdstat_blpop:calls=0,")
+            && blpop.contains("rejected_calls=1,failed_calls=0"),
+        "{blpop}"
+    );
+    shutdown_and_wait(port, &mut srv);
+}

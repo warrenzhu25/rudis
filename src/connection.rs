@@ -1262,10 +1262,18 @@ fn may_block(cmd: &Command) -> bool {
 struct CmdStatGuard {
     name: &'static str,
     start: Option<std::time::Instant>,
+    port: u16,
+    client_id: u64,
 }
 
 impl Drop for CmdStatGuard {
     fn drop(&mut self) {
+        // A blocked command refused by ACL when data arrived is a rejected
+        // call, as in Redis (it never ran).
+        if take_blocked_rejected(self.port, self.client_id) {
+            record_rejected_stat(self.name);
+            return;
+        }
         let nanos = self.start.map_or(0, |s| s.elapsed().as_nanos() as u64);
         record_cmd_stats(self.name, 1, nanos);
     }
@@ -10940,6 +10948,11 @@ async fn handle_bzpop(
             }
         }
         Some(crate::block::BlockedZSetResult::Unblocked(
+            crate::block::ClientUnblockType::NoPerm,
+        )) => {
+            out.extend_from_slice(BLOCKED_NOPERM_REPLY);
+        }
+        Some(crate::block::BlockedZSetResult::Unblocked(
             crate::block::ClientUnblockType::Error,
         )) => {
             out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
@@ -11617,6 +11630,94 @@ pub fn kill_revoked_subscribers(port: u16, hub: &crate::pubsub::PubSubHub, self_
     kill_self
 }
 
+/// Clients whose blocked command was refused when data arrived: their
+/// command counts as a rejected call, not a call (`CmdStatGuard`).
+static BLOCKED_REJECTED: std::sync::LazyLock<parking_lot::Mutex<Vec<(u16, u64)>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+static ANY_BLOCKED_REJECTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Notes that client `cid`'s blocked command was refused (see
+/// [`BLOCKED_REJECTED`]).
+fn note_blocked_rejected(port: u16, cid: u64) {
+    BLOCKED_REJECTED.lock().push((port, cid));
+    ANY_BLOCKED_REJECTED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether client `cid`'s blocked command was refused (the note stays).
+fn blocked_rejected_pending(port: u16, cid: u64) -> bool {
+    ANY_BLOCKED_REJECTED.load(std::sync::atomic::Ordering::Acquire)
+        && BLOCKED_REJECTED.lock().contains(&(port, cid))
+}
+
+/// Whether client `cid`'s blocked command was refused; clears the note.
+fn take_blocked_rejected(port: u16, cid: u64) -> bool {
+    if !ANY_BLOCKED_REJECTED.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let mut v = BLOCKED_REJECTED.lock();
+    let Some(i) = v.iter().position(|&e| e == (port, cid)) else {
+        return false;
+    };
+    v.swap_remove(i);
+    if v.is_empty() {
+        ANY_BLOCKED_REJECTED.store(false, std::sync::atomic::Ordering::Release);
+    }
+    true
+}
+
+/// The ACL user client `cid` of the server on `port` is authenticated as,
+/// for the block hub's checks: `None` when no ACL beyond the default
+/// all-access user exists (nothing to check).
+fn blocked_client_user(port: u16, cid: u64) -> Option<String> {
+    if !crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    GLOBAL_CLIENTS
+        .read()
+        .get(&(port, cid))
+        .map(|e| e.auth_user.clone())
+}
+
+/// For the block hub, about to serve a client blocked on list or sorted
+/// set `keys`: whether its user lost read/write access to one of them since
+/// it blocked (an ACL SETUSER in between). Redis reprocesses the command
+/// when data arrives, ACL check included; the client is refused with
+/// NOPERM instead of being served. (Only keys are checked: the waiter
+/// doesn't record which blocking command it runs.)
+pub fn blocked_client_denied<'a>(
+    port: u16,
+    cid: u64,
+    mut keys: impl Iterator<Item = &'a [u8]>,
+) -> bool {
+    let Some(user) = blocked_client_user(port, cid) else {
+        return false;
+    };
+    let acl = crate::acl::get_acl_for_port(port);
+    let acl = acl.read();
+    let denied = match acl.users.get(&user) {
+        None => true,
+        Some(u) => keys.any(|k| !u.can_access_key(k, crate::acl::KEY_READ | crate::acl::KEY_WRITE)),
+    };
+    if denied {
+        note_blocked_rejected(port, cid);
+    }
+    denied
+}
+
+/// [`blocked_client_denied`] for a blocked XREAD / XREADGROUP, whose full
+/// command the waiter keeps: the NOPERM reply if its user may no longer
+/// run it.
+pub fn blocked_stream_client_denied(port: u16, cid: u64, cmd: &Command) -> Option<Vec<u8>> {
+    let user = blocked_client_user(port, cid)?;
+    let err = acl_denied_in_context(port, &user, cmd, Some(("toplevel", acl_cmd_name(cmd))))?;
+    note_blocked_rejected(port, cid);
+    Some(err)
+}
+
+/// The reply of a blocked command its user lost key access for.
+pub const BLOCKED_NOPERM_REPLY: &[u8] = b"-NOPERM No permissions to access a key\r\n";
+
 /// `appendfsync always`: if any AOF was appended to since this connection
 /// last checked, makes every shard's AOF durable before its replies go out.
 /// One relaxed load when no server in the process runs `always`.
@@ -12070,6 +12171,8 @@ async fn execute_command_inner(
     let _cmd_stat_guard = CmdStatGuard {
         name: stat_cmd_name(&cmd),
         start: (!may_block(&cmd)).then(std::time::Instant::now),
+        port: router.port,
+        client_id,
     };
     if cmd.is_write_command() && !dirty_counted_on_change(&cmd) {
         crate::snapshot::note_write();
@@ -15317,6 +15420,9 @@ async fn execute_command_inner(
                                         crate::block::ClientUnblockType::Timeout => {
                                             write_resp_null(out)
                                         }
+                                        crate::block::ClientUnblockType::NoPerm => {
+                                            out.extend_from_slice(BLOCKED_NOPERM_REPLY)
+                                        }
                                         crate::block::ClientUnblockType::Error => {
                                             out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
                                         }
@@ -15370,6 +15476,9 @@ async fn execute_command_inner(
                                 match unblock_type {
                                     crate::block::ClientUnblockType::Timeout => {
                                         write_resp_null(out)
+                                    }
+                                    crate::block::ClientUnblockType::NoPerm => {
+                                        out.extend_from_slice(BLOCKED_NOPERM_REPLY)
                                     }
                                     crate::block::ClientUnblockType::Error => {
                                         out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
@@ -15496,6 +15605,9 @@ async fn execute_command_inner(
                                     match unblock_type {
                                         crate::block::ClientUnblockType::Timeout => {
                                             write_resp_null(out)
+                                        }
+                                        crate::block::ClientUnblockType::NoPerm => {
+                                            out.extend_from_slice(BLOCKED_NOPERM_REPLY)
                                         }
                                         crate::block::ClientUnblockType::Error => {
                                             out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
@@ -16006,6 +16118,11 @@ async fn execute_command_inner(
                     );
                 }
                 Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::NoPerm,
+                )) => {
+                    out.extend_from_slice(BLOCKED_NOPERM_REPLY);
+                }
+                Some(crate::block::BlockedListResult::Unblocked(
                     crate::block::ClientUnblockType::Error,
                 )) => {
                     out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
@@ -16148,6 +16265,11 @@ async fn execute_command_inner(
                     out.extend_from_slice(
                         b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
                     );
+                }
+                Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::NoPerm,
+                )) => {
+                    out.extend_from_slice(BLOCKED_NOPERM_REPLY);
                 }
                 Some(crate::block::BlockedListResult::Unblocked(
                     crate::block::ClientUnblockType::Error,
@@ -16587,6 +16709,11 @@ async fn execute_command_inner(
                     );
                 }
                 Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::NoPerm,
+                )) => {
+                    out.extend_from_slice(BLOCKED_NOPERM_REPLY);
+                }
+                Some(crate::block::BlockedListResult::Unblocked(
                     crate::block::ClientUnblockType::Error,
                 )) => {
                     out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
@@ -16810,6 +16937,11 @@ async fn execute_command_inner(
                     out.extend_from_slice(
                         b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
                     );
+                }
+                Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::NoPerm,
+                )) => {
+                    out.extend_from_slice(BLOCKED_NOPERM_REPLY);
                 }
                 Some(crate::block::BlockedListResult::Unblocked(
                     crate::block::ClientUnblockType::Error,
@@ -17070,6 +17202,11 @@ async fn execute_command_inner(
                     }
                 }
                 Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::NoPerm,
+                )) => {
+                    out.extend_from_slice(BLOCKED_NOPERM_REPLY);
+                }
+                Some(crate::block::BlockedListResult::Unblocked(
                     crate::block::ClientUnblockType::Error,
                 )) => {
                     out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
@@ -17310,6 +17447,11 @@ async fn execute_command_inner(
                     // The block hub logged and replicated the pop on the
                     // key's shard.
                     format_zmpop_response(out, &key, &items);
+                }
+                Some(crate::block::BlockedZSetResult::Unblocked(
+                    crate::block::ClientUnblockType::NoPerm,
+                )) => {
+                    out.extend_from_slice(BLOCKED_NOPERM_REPLY);
                 }
                 Some(crate::block::BlockedZSetResult::Unblocked(
                     crate::block::ClientUnblockType::Error,
@@ -20616,7 +20758,18 @@ async fn execute_command_inner(
         }
     }
     _slowlog_guard.reply_bytes = out.len().saturating_sub(error_stat_start);
-    record_reply_error_stat(out, error_stat_start, cmd_name);
+    if blocked_rejected_pending(router.port, client_id) {
+        // Refused, not failed: `CmdStatGuard` counts it as rejected.
+        if let Some(prefix) = out[error_stat_start..]
+            .strip_prefix(b"-")
+            .and_then(|e| e.split(|&b| b == b' ').next())
+            .and_then(|p| std::str::from_utf8(p).ok())
+        {
+            record_error_stat(prefix, None);
+        }
+    } else {
+        record_reply_error_stat(out, error_stat_start, cmd_name);
+    }
     ret
 }
 
@@ -30451,6 +30604,12 @@ async fn blmove_across_shards(
                 out.extend_from_slice(
                     b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
                 );
+                return false;
+            }
+            Some(crate::block::BlockedListResult::Unblocked(
+                crate::block::ClientUnblockType::NoPerm,
+            )) => {
+                out.extend_from_slice(BLOCKED_NOPERM_REPLY);
                 return false;
             }
             Some(crate::block::BlockedListResult::Unblocked(

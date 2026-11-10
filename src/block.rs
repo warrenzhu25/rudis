@@ -15,6 +15,10 @@ pub enum ClientUnblockType {
     Timeout,
     Error,
     WrongType,
+    /// Its user lost access to a key it waits on since it blocked: it
+    /// fails with NOPERM, as Redis rejects it when it reprocesses the
+    /// command, and nothing is popped for it.
+    NoPerm,
 }
 
 #[derive(Clone, Debug)]
@@ -476,6 +480,23 @@ impl BlockHub {
                     waiters.push_front(waiter);
                     break;
                 }
+                let dest = match &waiter.op {
+                    WaiterOp::Move { destination, .. } | WaiterOp::Movem { destination, .. } => {
+                        Some(destination.as_ref())
+                    }
+                    _ => None,
+                };
+                if crate::connection::blocked_client_denied(
+                    self.port,
+                    waiter.client_id,
+                    std::iter::once(key.as_ref()).chain(dest),
+                ) {
+                    let _ = waiter
+                        .sender
+                        .send(BlockedListResult::Unblocked(ClientUnblockType::NoPerm));
+                    satisfied_clients.push(waiter.client_id);
+                    continue;
+                }
                 match waiter.op {
                     WaiterOp::Wake => {
                         let _ = waiter
@@ -712,6 +733,19 @@ impl BlockHub {
                 {
                     continue;
                 }
+                if table.exists(key.as_ref())
+                    && crate::connection::blocked_client_denied(
+                        self.port,
+                        waiter.client_id,
+                        std::iter::once(key.as_ref()),
+                    )
+                {
+                    let _ = waiter
+                        .sender
+                        .send(BlockedZSetResult::Unblocked(ClientUnblockType::NoPerm));
+                    satisfied_clients.push(waiter.client_id);
+                    continue;
+                }
                 let popped = match waiter.pop_type {
                     ZSetPopType::Min => table.zpopmin(key.as_ref(), waiter.count).ok(),
                     ZSetPopType::Max => table.zpopmax(key.as_ref(), waiter.count).ok(),
@@ -800,6 +834,15 @@ impl BlockHub {
                 }
                 if waiter.is_cross_shard {
                     let _ = waiter.sender.send(BlockedStreamResult::CrossShard);
+                    satisfied.push(idx);
+                    continue;
+                }
+                if let Some(err) = crate::connection::blocked_stream_client_denied(
+                    self.port,
+                    waiter.client_id,
+                    &waiter.cmd,
+                ) {
+                    let _ = waiter.sender.send(BlockedStreamResult::Error(err));
                     satisfied.push(idx);
                     continue;
                 }
