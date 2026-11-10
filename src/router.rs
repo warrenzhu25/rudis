@@ -6131,6 +6131,13 @@ mod tests {
         crate::connection::set_max_memory_policy("noeviction");
         let (router, db) = single_shard_router(port);
         fill_and_limit(&router, &db, port);
+        // Far below usage, not 128 KB below it: the total subtracts the
+        // process-wide replication buffer bytes, which replication tests
+        // running in parallel hold without the lock above (replicas'
+        // output buffers), and a few hundred KB of them made this test see
+        // itself under the limit. With nothing able to spill, any limit
+        // below usage must make it give up.
+        crate::tiering::set_max_memory(port, 1);
         let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
