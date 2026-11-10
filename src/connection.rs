@@ -2095,11 +2095,33 @@ pub fn record_failed_stat(cmd_name: &str) {
     }
 }
 
+/// Distinct error codes INFO errorstats tracks, as in Redis. Scripts can
+/// reply errors with any code (`redis.error_reply`), so without a cap the
+/// table grows without bound.
+const ERROR_STATS_NUMBER: usize = 128;
+/// Cleared when the cap is hit; CONFIG RESETSTAT sets it again.
+static ERRORSTATS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub fn record_error_stat(prefix: &str, cmd_name: Option<&str>) {
     TOTAL_ERROR_REPLIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    {
+    if ERRORSTATS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         let mut map = ERROR_STATS.write();
-        bump_stat(&mut map, prefix, false);
+        if !ERRORSTATS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            // Disabled by another thread while we waited for the lock.
+        } else if map.len() >= ERROR_STATS_NUMBER && !map.contains_key(prefix) {
+            let mut codes: Vec<&str> = map.keys().map(String::as_str).collect();
+            codes.sort_unstable();
+            crate::log_warning!(
+                "Errorstats stopped adding new errors because the number of different errors reached {}; new errors will be reported as 'ERRORSTATS_DISABLED'. Use CONFIG RESETSTAT to reset errorstats.",
+                ERROR_STATS_NUMBER
+            );
+            crate::log_warning!("Current errors code list: {}", codes.join(", "));
+            map.clear();
+            map.insert("ERRORSTATS_DISABLED".to_string(), 1);
+            ERRORSTATS_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            bump_stat(&mut map, prefix, false);
+        }
     }
     if let Some(cmd) = cmd_name {
         bump_stat(&mut FAILED_CMD_STATS.write(), cmd, true);
@@ -2111,6 +2133,7 @@ pub fn reset_error_stats() {
     {
         let mut map = ERROR_STATS.write();
         map.clear();
+        ERRORSTATS_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     {
         let mut map = FAILED_CMD_STATS.write();

@@ -14345,3 +14345,74 @@ fn test_config_set_apply_error_rolls_back_e2e() {
     assert!(get(&mut c, "latency-tracking-info-percentiles").contains("0 50 100"));
     shutdown_and_wait(port, &mut srv);
 }
+
+/// INFO errorstats tracks at most 128 distinct error codes, as in Redis.
+/// Scripts can reply errors with any code, so the table grew without
+/// bound. At the cap the table is replaced by ERRORSTATS_DISABLED, the
+/// codes are logged, and CONFIG RESETSTAT turns tracking back on.
+#[test]
+fn test_errorstats_capped_at_128_codes_e2e() {
+    let port = 19962u16;
+    let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("rudis.log");
+    let conf = dir.join("rudis.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "dir {}\nsave \"\"\nlogfile \"{}\"\n",
+            dir.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    let mut srv = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let errorstats = |c: &mut TcpStream| -> Vec<String> {
+        resp_cmd(c, &["INFO", "errorstats"])
+            .lines()
+            .filter(|l| l.starts_with("errorstat_"))
+            .map(str::to_string)
+            .collect()
+    };
+    let script = "return redis.error_reply(string.format('%s my error message', ARGV[1]))";
+    for j in 1..=300 {
+        let r = resp_cmd(&mut c, &["EVAL", script, "0", &j.to_string()]);
+        assert_eq!(r, format!("-{j} my error message\r\n"));
+    }
+    assert_eq!(
+        errorstats(&mut c),
+        ["errorstat_ERRORSTATS_DISABLED:count=1"]
+    );
+    let info = resp_cmd(&mut c, &["INFO", "stats"]);
+    assert!(info.contains("total_error_replies:300\r\n"), "{info}");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        text.matches("Errorstats stopped adding new errors").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("Current errors code list").count(),
+        1,
+        "{text}"
+    );
+
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+    let _ = resp_cmd(&mut c, &["EVAL", script, "0", "x"]);
+    assert_eq!(errorstats(&mut c), ["errorstat_x:count=1"]);
+    shutdown_and_wait(port, &mut srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
