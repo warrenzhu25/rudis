@@ -712,6 +712,17 @@ pub enum ShardMessage {
     PubsubClientIds {
         responder: flume::Sender<Vec<u64>>,
     },
+    /// A script command (EVAL/EVALSHA/FCALL) whose keys this shard owns,
+    /// run in a task of its own so that, past `busy-reply-threshold`, it can
+    /// hand the shard's event loop a turn like a local one (see
+    /// [`crate::scripting::run_script_command`]).
+    RunScript {
+        db: usize,
+        cmd: Box<crate::resp::Command>,
+        is_resp3: bool,
+        client_id: u64,
+        responder: flume::Sender<Vec<u8>>,
+    },
     RemoveClientPubSub {
         client_id: u64,
     },

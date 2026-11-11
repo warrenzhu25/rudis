@@ -179,22 +179,12 @@ for suite in "${TARGET_SUITES[@]}"; do
         continue
     fi
     start_server "$suite" || { FAILED_SUITES+=("$suite"); continue; }
-    # Skipped by name:
-    # - "script timeout", "Timedout", "function kill", "kill not working on":
-    #   known gap (TODO): a shard runs a script to completion, so a
-    #   connection on the busy script's shard gets no reply (not even
-    #   -BUSY) and SCRIPT KILL / FUNCTION KILL / SHUTDOWN NOSAVE work only
-    #   from another shard's connection; with --threads 1, never.
     if tclsh test_helper.tcl \
         --host 127.0.0.1 \
         --port "$PORT" \
         --ignore-encoding \
         --ignore-digest \
         --tags "-needs:repl -needs:debug -needs:config-rewrite -needs:pfdebug -needs:config-maxmemory" \
-        --skiptest "/.*script timeout.*" \
-        --skiptest "/.*test function kill$" \
-        --skiptest "/.*kill not working on.*" \
-        --skiptest "/.*Timedout.*" \
         --clients "$CLIENTS" \
         ${TCL_EXTRA:-} \
         --single "$suite"; then

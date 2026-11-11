@@ -63,15 +63,16 @@ This document summarizes the architectural, operational, and semantic difference
   with Redis Cluster's `CROSSSLOT` error instead of running with the weaker guarantees above.
   In cluster mode (`cluster-enabled yes`) such commands always get `CROSSSLOT`, as in Redis Cluster.
 
-### Long-Running Scripts (Known Gap)
+### Long-Running Scripts
 * **Redis**: While a script runs past `busy-reply-threshold`, Redis keeps processing events from
   inside the script's hook: every other client gets `-BUSY`, and `SCRIPT KILL`, `FUNCTION KILL`
   and `SHUTDOWN NOSAVE` are served.
-* **Rudis**: A shard runs a script to completion before it serves anything else. Clients on other
-  shards get `-BUSY`, and `SCRIPT KILL` / `FUNCTION KILL` / `SHUTDOWN NOSAVE` sent from them stop
-  it. But a connection on the busy script's shard (about 1 in `--threads` of them) gets no reply
-  at all, and with `--threads 1` a script that never ends can be stopped only by killing the
-  process. Retry the kill on a new connection, or keep scripts short.
+* **Rudis**: The same, from every connection, on any shard and with `--threads 1`. Past the
+  threshold the script is suspended every 10 ms so its shard can answer (`-BUSY`, the kill
+  commands, `SHUTDOWN NOSAVE`, `FUNCTION STATS`); nothing else touches the shard's data until the
+  script ends, so it still looks atomic. One limit: Lua cannot suspend inside a C call, so a
+  script stuck inside one (for example a `table.sort` comparator that never returns) holds its
+  shard until it returns from it; other shards still answer `-BUSY` and accept the kill.
 
 ### Event-Loop Metrics in INFO
 

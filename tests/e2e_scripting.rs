@@ -743,3 +743,332 @@ fn test_script_kill_ends_endless_script_e2e() {
         "+OK\r\n"
     );
 }
+
+/// Server on `port` with `threads` shards, its busy-reply-threshold at
+/// 100 ms, and a connection to it.
+fn busy_script_server(port: u16, threads: &str) -> (KillRudisOnDrop, TcpStream) {
+    let ps = port.to_string();
+    let args = ["--port", &ps, "--threads", threads, "--no-pin"];
+    let srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let c = connect_busy(port, 5);
+    let mut c2 = c.try_clone().unwrap();
+    assert_eq!(
+        resp_cmd(&mut c2, &["CONFIG", "SET", "busy-reply-threshold", "100"]),
+        "+OK\r\n"
+    );
+    (srv, c)
+}
+
+fn connect_busy(port: u16, timeout_s: u64) -> TcpStream {
+    let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(timeout_s)))
+        .unwrap();
+    c
+}
+
+/// Sends `args` without waiting for the reply.
+fn send_cmd(c: &mut TcpStream, args: &[&str]) {
+    c.write_all(&format_resp_cmd(args)).unwrap();
+}
+
+/// Waits (up to 5 s) until a fresh connection gets -BUSY for PING. Not
+/// before the script is past its 100 ms threshold: until then it runs
+/// without handing its shard a turn (as in Redis), and a PING to that shard
+/// would wait for the whole script.
+fn wait_busy(port: u16) {
+    thread::sleep(Duration::from_millis(300));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut c = connect_busy(port, 2);
+        if resp_cmd(&mut c, &["PING"]).starts_with("-BUSY") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server never reported BUSY"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A script past busy-reply-threshold doesn't freeze its shard: every
+/// connection (on its shard too, and with one thread: all of them) gets
+/// -BUSY at once, SCRIPT KILL from any of them ends it, and the server then
+/// serves normally. Before, connections on the script's shard got no reply
+/// at all and, with --threads 1, only kill -9 ended a runaway script. Also
+/// with the script's key on another shard than its connection.
+#[test]
+fn test_runaway_script_busy_and_killable_from_any_connection_e2e() {
+    for (port, threads) in [(20300u16, "1"), (20301u16, "4")] {
+        for key in ["k1", "k2", "k3", "k4"] {
+            let (mut srv, mut c) = busy_script_server(port, threads);
+            assert_eq!(resp_cmd(&mut c, &["SET", key, "v"]), "+OK\r\n");
+            let mut runner = connect_busy(port, 10);
+            send_cmd(
+                &mut runner,
+                &[
+                    "EVAL",
+                    "redis.call('GET', KEYS[1]) while true do end",
+                    "1",
+                    key,
+                ],
+            );
+            wait_busy(port);
+            for _ in 0..8 {
+                let mut o = connect_busy(port, 2);
+                let t0 = std::time::Instant::now();
+                let r = resp_cmd(&mut o, &["GET", key]);
+                assert!(
+                    r.starts_with("-BUSY Redis is busy running a script"),
+                    "{threads}/{key}: {r}"
+                );
+                assert!(
+                    t0.elapsed() < Duration::from_secs(1),
+                    "{threads}/{key}: slow -BUSY"
+                );
+            }
+            let mut k = connect_busy(port, 5);
+            assert_eq!(
+                resp_cmd(&mut k, &["SCRIPT", "KILL"]),
+                "+OK\r\n",
+                "{threads}/{key}"
+            );
+            let r = read_full_reply(&mut runner);
+            assert!(r.contains("Script killed by user with SCRIPT KILL"), "{r}");
+            assert_eq!(resp_cmd(&mut k, &["PING"]), "+PONG\r\n");
+            assert_eq!(resp_cmd(&mut k, &["GET", key]), "$1\r\nv\r\n");
+            shutdown_and_wait(port, &mut srv.0);
+        }
+    }
+}
+
+/// A runaway script that already wrote can't be killed (UNKILLABLE), and
+/// SHUTDOWN NOSAVE from another connection, on its shard too, stops the
+/// server, as in Redis.
+#[test]
+fn test_runaway_script_that_wrote_unkillable_shutdown_nosave_e2e() {
+    for (port, threads) in [(20302u16, "1"), (20303u16, "4")] {
+        let (mut srv, _c) = busy_script_server(port, threads);
+        let mut runner = connect_busy(port, 10);
+        send_cmd(
+            &mut runner,
+            &[
+                "EVAL",
+                "redis.call('SET', KEYS[1], 'x') while true do end",
+                "1",
+                "w",
+            ],
+        );
+        wait_busy(port);
+        let mut k = connect_busy(port, 5);
+        let r = resp_cmd(&mut k, &["SCRIPT", "KILL"]);
+        assert!(r.starts_with("-UNKILLABLE"), "{threads}: {r}");
+        send_cmd(&mut k, &["SHUTDOWN", "NOSAVE"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(Some(_)) = srv.0.try_wait() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{threads}: server did not stop"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// FUNCTION KILL ends a looping function the same way, and the -BUSY reply
+/// names FUNCTION KILL.
+#[test]
+fn test_runaway_function_busy_and_function_kill_e2e() {
+    let port = 20304u16;
+    let (mut srv, mut c) = busy_script_server(port, "1");
+    let lib = "#!lua name=spin\nredis.register_function('spin', function() while true do end end)";
+    assert_eq!(
+        resp_cmd(&mut c, &["FUNCTION", "LOAD", lib]),
+        "$4\r\nspin\r\n"
+    );
+    let mut runner = connect_busy(port, 10);
+    send_cmd(&mut runner, &["FCALL", "spin", "0"]);
+    wait_busy(port);
+    let mut o = connect_busy(port, 2);
+    let r = resp_cmd(&mut o, &["PING"]);
+    assert!(
+        r.contains("You can only call FUNCTION KILL or SHUTDOWN NOSAVE"),
+        "{r}"
+    );
+    assert_eq!(resp_cmd(&mut o, &["FUNCTION", "KILL"]), "+OK\r\n");
+    let r = read_full_reply(&mut runner);
+    assert!(
+        r.contains("Script killed by user with FUNCTION KILL"),
+        "{r}"
+    );
+    assert_eq!(resp_cmd(&mut o, &["PING"]), "+PONG\r\n");
+    shutdown_and_wait(port, &mut srv.0);
+}
+
+/// A script past its time limit still looks atomic: while it runs (and
+/// hands its shard turns), a write from another connection to a key it
+/// reads gets -BUSY and is not seen by the script; the script reads the
+/// same value before and after.
+#[test]
+fn test_slow_script_stays_atomic_e2e() {
+    for (port, threads) in [(20305u16, "1"), (20306u16, "4")] {
+        let (mut srv, mut c) = busy_script_server(port, threads);
+        assert_eq!(resp_cmd(&mut c, &["SET", "a", "before"]), "+OK\r\n");
+        let script = "local first = redis.call('GET', KEYS[1]) \
+                      local t = redis.call('TIME') local start = t[1] * 1000000 + t[2] \
+                      repeat t = redis.call('TIME') until t[1] * 1000000 + t[2] - start > 800000 \
+                      return {first, redis.call('GET', KEYS[1])}";
+        let mut runner = connect_busy(port, 10);
+        send_cmd(&mut runner, &["EVAL", script, "1", "a"]);
+        wait_busy(port);
+        let mut w = connect_busy(port, 2);
+        let r = resp_cmd(&mut w, &["SET", "a", "during"]);
+        assert!(r.starts_with("-BUSY"), "{threads}: {r}");
+        let r = read_full_reply(&mut runner);
+        assert_eq!(r, "*2\r\n$6\r\nbefore\r\n$6\r\nbefore\r\n", "{threads}");
+        assert_eq!(resp_cmd(&mut w, &["GET", "a"]), "$6\r\nbefore\r\n");
+        shutdown_and_wait(port, &mut srv.0);
+    }
+}
+
+/// FUNCTION STATS names the function running past its threshold, with its
+/// FCALL command and run time, as FUNCTION KILL users look for it. Before,
+/// `running_script` was always null.
+#[test]
+fn test_function_stats_shows_running_function_e2e() {
+    let port = 20307u16;
+    let (mut srv, mut c) = busy_script_server(port, "1");
+    let lib = "#!lua name=spin\nredis.register_function('spin', function() while true do end end)";
+    assert_eq!(
+        resp_cmd(&mut c, &["FUNCTION", "LOAD", lib]),
+        "$4\r\nspin\r\n"
+    );
+    assert!(
+        resp_cmd(&mut c, &["FUNCTION", "STATS"])
+            .starts_with("*4\r\n$14\r\nrunning_script\r\n$-1\r\n")
+    );
+    let mut runner = connect_busy(port, 10);
+    send_cmd(&mut runner, &["FCALL", "spin", "0", "arg1"]);
+    wait_busy(port);
+    let mut o = connect_busy(port, 2);
+    let r = read_full_reply({
+        send_cmd(&mut o, &["FUNCTION", "STATS"]);
+        &mut o
+    });
+    assert!(
+        r.to_ascii_lowercase().starts_with(
+            "*4\r\n$14\r\nrunning_script\r\n*6\r\n$4\r\nname\r\n$4\r\nspin\r\n\
+             $7\r\ncommand\r\n*4\r\n$5\r\nfcall\r\n$4\r\nspin\r\n$1\r\n0\r\n$4\r\narg1\r\n\
+             $11\r\nduration_ms\r\n:"
+        ),
+        "{r}"
+    );
+    assert_eq!(resp_cmd(&mut o, &["FUNCTION", "KILL"]), "+OK\r\n");
+    read_full_reply(&mut runner);
+    shutdown_and_wait(port, &mut srv.0);
+}
+
+/// A script looping on slow `redis.call`s is flagged busy on time too (the
+/// instruction hook alone noticed late), CLIENT LIST works from a script
+/// (it returned nil), and a client blocked on a list the script pushes to
+/// twice is served once the script is done, with its last push (it popped
+/// the first push mid-run). Mirrors Redis' "Timedout scripts and unblocked
+/// command".
+#[test]
+fn test_busy_redis_call_loop_serves_blocked_client_after_script_e2e() {
+    for (port, threads) in [(20308u16, "1"), (20309u16, "4")] {
+        let (mut srv, _c) = busy_script_server(port, threads);
+        let mut blocked = connect_busy(port, 10);
+        send_cmd(&mut blocked, &["BLPOP", "x", "0"]);
+        thread::sleep(Duration::from_millis(200));
+        let script = "local clients \
+                      redis.call('lpush', KEYS[1], 'y') \
+                      while true do \
+                          clients = redis.call('client', 'list') \
+                          if string.find(clients, 'abortscript') ~= nil then break end \
+                      end \
+                      redis.call('lpush', KEYS[1], 'z') \
+                      return clients";
+        let mut runner = connect_busy(port, 10);
+        send_cmd(&mut runner, &["EVAL", script, "1", "x"]);
+        wait_busy(port);
+        let mut namer = connect_busy(port, 5);
+        assert_eq!(
+            resp_cmd(&mut namer, &["CLIENT", "SETNAME", "abortscript"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            read_full_reply(&mut blocked),
+            "*2\r\n$1\r\nx\r\n$1\r\nz\r\n",
+            "{threads}"
+        );
+        let r = read_full_reply(&mut runner);
+        assert!(r.contains("name=abortscript"), "{threads}: {r}");
+        assert_eq!(
+            resp_cmd(&mut namer, &["LRANGE", "x", "0", "-1"]),
+            "*1\r\n$1\r\ny\r\n"
+        );
+        shutdown_and_wait(port, &mut srv.0);
+    }
+}
+
+/// Clients blocked on keys a script changes are served after the script,
+/// as in Redis, even for a quick script: a BLPOP sees the list as the
+/// script left it, not its first push (which it popped mid-script).
+#[test]
+fn test_quick_script_serves_blocked_client_after_it_ends_e2e() {
+    for (port, threads) in [(20310u16, "1"), (20311u16, "4")] {
+        let ps = port.to_string();
+        let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+            &["--port", &ps, "--threads", threads, "--no-pin"],
+            port,
+        ));
+        let mut blocked = connect_busy(port, 5);
+        send_cmd(&mut blocked, &["BLPOP", "x", "0"]);
+        thread::sleep(Duration::from_millis(200));
+        let mut c = connect_busy(port, 5);
+        assert_eq!(
+            resp_cmd(
+                &mut c,
+                &[
+                    "EVAL",
+                    "redis.call('lpush', KEYS[1], 'y') redis.call('lpush', KEYS[1], 'z')",
+                    "1",
+                    "x"
+                ]
+            ),
+            "$-1\r\n"
+        );
+        assert_eq!(
+            read_full_reply(&mut blocked),
+            "*2\r\n$1\r\nx\r\n$1\r\nz\r\n",
+            "{threads}"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["LRANGE", "x", "0", "-1"]),
+            "*1\r\n$1\r\ny\r\n"
+        );
+        shutdown_and_wait(port, &mut srv.0);
+    }
+}
+
+/// Once SHUTDOWN has replied, new clients are refused, as Redis (which
+/// exits first) refuses them. Before, the listeners accepted for up to
+/// 200 ms more and dropped the connections ("I/O error reading reply").
+#[test]
+fn test_shutdown_refuses_new_connections_once_replied_e2e() {
+    let port = 20312u16;
+    let ps = port.to_string();
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "2", "--no-pin"],
+        port,
+    ));
+    let mut c = connect_busy(port, 5);
+    assert_eq!(resp_cmd(&mut c, &["SHUTDOWN", "NOSAVE"]), "+OK\r\n");
+    let r = TcpStream::connect(("127.0.0.1", port));
+    assert!(r.is_err(), "connected after SHUTDOWN replied");
+    let _ = srv.0.wait();
+}

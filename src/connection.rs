@@ -326,6 +326,22 @@ thread_local! {
     /// let other clients skip cross-shard locks).
     static TX_CLIENTS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
     pub static CURRENT_ROUTER: std::cell::RefCell<Option<std::rc::Rc<Router>>> = const { std::cell::RefCell::new(None) };
+    /// This shard thread's connections, for commands run without a
+    /// connection's state (CLIENT LIST from a script).
+    pub static SHARD_CLIENTS: std::cell::RefCell<Option<Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// CLIENT LIST run by a script: every shard's clients, as a bulk string.
+#[inline(never)]
+pub fn script_client_list(filter_ids: &[u64], out: &mut Vec<u8>) {
+    let router = CURRENT_ROUTER.with(|r| r.borrow().clone());
+    let clients = SHARD_CLIENTS.with(|c| c.borrow().clone());
+    let list = match (router, clients) {
+        (Some(router), Some(clients)) => router.client_list_blocking(&clients, filter_ids),
+        _ => String::new(),
+    };
+    write_resp_bulk(out, list.as_bytes());
 }
 
 /// The client whose command this shard thread is running, from
@@ -387,34 +403,66 @@ impl Drop for ExecCleanup<'_> {
             self.router.release_tx_locks_now(&shards, tx_id);
         }
         if let Some(hub_arc) = self.hub.take() {
-            let pending = hub_arc.lock().resume();
-            let prev_cur_db = CURRENT_DB.get();
-            for (db_id, k) in pending {
-                let shard_id = self.router.target_shard(&k);
-                // `try_borrow_mut`: when unwinding, a borrow may still be
-                // live higher up; hand the key to the shard's own mailbox.
-                let local = (shard_id == self.router.shard_id)
-                    .then(|| self.router.local_db.try_borrow_mut().ok())
-                    .flatten();
-                if let Some(mut local_db) = local {
-                    let prev_local_db = local_db.current_db;
-                    CURRENT_DB.set(db_id);
-                    local_db.select_db(db_id);
-                    let mut hub = hub_arc.lock();
-                    hub.notify_stream(&mut local_db, &k);
-                    hub.notify_list(&mut local_db.table, &k);
-                    hub.notify_zset(&mut local_db.table, &k);
-                    drop(hub);
-                    local_db.select_db(prev_local_db);
-                } else {
-                    let _ = self.router.senders[shard_id].send(ShardMessage::NotifyList {
-                        db: db_id,
-                        keys: vec![k],
-                    });
-                }
-            }
-            CURRENT_DB.set(prev_cur_db);
+            resume_blocked_serving(self.router, &hub_arc);
         }
+    }
+}
+
+/// Ends one pause of `hub_arc` (EXEC's, or a script's): once none is left,
+/// serves the blocked clients whose keys changed meanwhile.
+fn resume_blocked_serving(router: &Router, hub_arc: &parking_lot::Mutex<crate::block::BlockHub>) {
+    let pending = hub_arc.lock().resume();
+    let prev_cur_db = CURRENT_DB.get();
+    for (db_id, k) in pending {
+        let shard_id = router.target_shard(&k);
+        // `try_borrow_mut`: when unwinding, a borrow may still be
+        // live higher up; hand the key to the shard's own mailbox.
+        let local = (shard_id == router.shard_id)
+            .then(|| router.local_db.try_borrow_mut().ok())
+            .flatten();
+        if let Some(mut local_db) = local {
+            let prev_local_db = local_db.current_db;
+            CURRENT_DB.set(db_id);
+            local_db.select_db(db_id);
+            let mut hub = hub_arc.lock();
+            hub.notify_stream(&mut local_db, &k);
+            hub.notify_list(&mut local_db.table, &k);
+            hub.notify_zset(&mut local_db.table, &k);
+            drop(hub);
+            local_db.select_db(prev_local_db);
+        } else {
+            let _ = router.senders[shard_id].send(ShardMessage::NotifyList {
+                db: db_id,
+                keys: vec![k],
+            });
+        }
+    }
+    CURRENT_DB.set(prev_cur_db);
+}
+
+/// Holds back serving blocked clients while a script runs, as Redis
+/// serves them only once the script is done: a BLPOP waiting on a list
+/// the script pushes to and then pushes to again must see the script's
+/// final list, not pop its first push mid-run (which a suspended script
+/// would also show other clients).
+pub struct BlockedServingPause {
+    router: Rc<Router>,
+    hub: std::sync::Arc<parking_lot::Mutex<crate::block::BlockHub>>,
+}
+
+impl BlockedServingPause {
+    /// `None` off a shard thread (AOF replay, unit tests): no clients.
+    pub fn start() -> Option<Self> {
+        let router = CURRENT_ROUTER.with(|r| r.borrow().clone())?;
+        let hub = crate::block::get_block_hub_for_port(router.port);
+        hub.lock().pause();
+        Some(Self { router, hub })
+    }
+}
+
+impl Drop for BlockedServingPause {
+    fn drop(&mut self) {
+        resume_blocked_serving(&self.router, &self.hub);
     }
 }
 
@@ -757,6 +805,26 @@ pub fn write_resp_map_len(out: &mut Vec<u8>, pairs: usize) {
     } else {
         out.extend_from_slice(format!("*{}\r\n", pairs * 2).as_bytes());
     }
+}
+
+/// FUNCTION STATS `running_script`: null, or the running function's
+/// `name`, `command` and `duration_ms`.
+#[inline(never)]
+fn write_function_stats_running(out: &mut Vec<u8>, port: u16) {
+    let Some((name, argv, ms)) = crate::scripting::running_function(port) else {
+        write_resp_null(out);
+        return;
+    };
+    write_resp_map_len(out, 3);
+    write_resp_bulk(out, b"name");
+    write_resp_bulk(out, name.as_bytes());
+    write_resp_bulk(out, b"command");
+    write_resp_array_header(out, argv.len());
+    for a in &argv {
+        write_resp_bulk(out, a);
+    }
+    write_resp_bulk(out, b"duration_ms");
+    write_resp_integer(out, ms.min(i64::MAX as u128) as i64);
 }
 
 /// A double already formatted as `text`: RESP3 `,`, or a RESP2 bulk
@@ -20064,7 +20132,7 @@ async fn execute_command_inner(
                 let target = router.target_shard(first_key);
                 if target != router.shard_id {
                     let res = router
-                        .execute_remote(
+                        .run_script_remote(
                             target,
                             Command::Eval {
                                 script,
@@ -20085,14 +20153,15 @@ async fn execute_command_inner(
                 crate::scripting::arm_script_redirect();
             }
             let saved_db = CURRENT_DB.get();
-            let result = crate::scripting::eval_script(
+            let result = crate::scripting::eval_script_yielding(
                 &script_str,
                 &keys,
                 &args,
                 &router.local_db,
-                router.aof().as_deref(),
+                router.aof(),
                 read_only,
-            );
+            )
+            .await;
             CURRENT_DB.set(saved_db);
             router.local_db.borrow_mut().select_db(saved_db);
             if let Some(target) = crate::scripting::take_script_redirect() {
@@ -20103,7 +20172,7 @@ async fn execute_command_inner(
                     read_only,
                     auth_user: effective_user,
                 };
-                out.extend_from_slice(&router.execute_remote(target, cmd).await);
+                out.extend_from_slice(&router.run_script_remote(target, cmd).await);
                 return false;
             }
             match result {
@@ -20135,7 +20204,7 @@ async fn execute_command_inner(
                 let target = router.target_shard(first_key);
                 if target != router.shard_id {
                     let res = router
-                        .execute_remote(
+                        .run_script_remote(
                             target,
                             Command::Evalsha {
                                 sha,
@@ -20156,14 +20225,15 @@ async fn execute_command_inner(
                     crate::scripting::arm_script_redirect();
                 }
                 let saved_db = CURRENT_DB.get();
-                let result = crate::scripting::eval_script(
+                let result = crate::scripting::eval_script_yielding(
                     &script,
                     &keys,
                     &args,
                     &router.local_db,
-                    router.aof().as_deref(),
+                    router.aof(),
                     read_only,
-                );
+                )
+                .await;
                 CURRENT_DB.set(saved_db);
                 router.local_db.borrow_mut().select_db(saved_db);
                 if let Some(target) = crate::scripting::take_script_redirect() {
@@ -20174,7 +20244,7 @@ async fn execute_command_inner(
                         read_only,
                         auth_user: effective_user,
                     };
-                    out.extend_from_slice(&router.execute_remote(target, cmd).await);
+                    out.extend_from_slice(&router.run_script_remote(target, cmd).await);
                     return false;
                 }
                 match result {
@@ -20316,7 +20386,7 @@ async fn execute_command_inner(
                 let target = router.target_shard(first_key);
                 if target != router.shard_id {
                     let res = router
-                        .execute_remote(
+                        .run_script_remote(
                             target,
                             Command::Fcall {
                                 function,
@@ -20335,14 +20405,15 @@ async fn execute_command_inner(
                 crate::scripting::arm_script_redirect();
             }
             let saved_db = CURRENT_DB.get();
-            let result = crate::scripting::call_function(
+            let result = crate::scripting::call_function_yielding(
                 &function,
                 &keys,
                 &args,
                 &router.local_db,
-                router.aof().as_deref(),
+                router.aof(),
                 read_only,
-            );
+            )
+            .await;
             CURRENT_DB.set(saved_db);
             router.local_db.borrow_mut().select_db(saved_db);
             if let Some(target) = crate::scripting::take_script_redirect() {
@@ -20353,7 +20424,7 @@ async fn execute_command_inner(
                     read_only,
                     auth_user: effective_user,
                 };
-                out.extend_from_slice(&router.execute_remote(target, cmd).await);
+                out.extend_from_slice(&router.run_script_remote(target, cmd).await);
                 return false;
             }
             match result {
@@ -20461,7 +20532,7 @@ async fn execute_command_inner(
                 out.extend_from_slice(b"*4\r\n");
             }
             write_resp_bulk(out, b"running_script");
-            write_resp_null(out);
+            write_function_stats_running(out, router.port);
             write_resp_bulk(out, b"engines");
             if CURRENT_CLIENT_RESP3.get() {
                 out.extend_from_slice(b"%1\r\n");
@@ -21177,6 +21248,7 @@ async fn execute_command_inner(
                 false
             } else {
                 crate::shutdown::request_shutdown();
+                crate::shutdown::stop_listening();
                 out.extend_from_slice(b"+OK\r\n");
                 true
             }
@@ -28941,7 +29013,7 @@ pub fn execute_local_command(
                     out.extend_from_slice(b"*4\r\n");
                 }
                 write_resp_bulk(out, b"running_script");
-                write_resp_null(out);
+                write_function_stats_running(out, db.port);
                 write_resp_bulk(out, b"engines");
                 if CURRENT_CLIENT_RESP3.get() {
                     out.extend_from_slice(b"%1\r\n");
@@ -29482,6 +29554,12 @@ async fn execute_commands_squashed_inner(
     }
     // While persistence fails, `execute_command` answers writes -MISCONF.
     if can_squash && persistence_misconf(router).is_some() {
+        can_squash = false;
+    }
+    // While a script runs past its time limit, `execute_command` answers
+    // -BUSY; batched, the commands would also run on a shard whose script
+    // is only suspended, breaking its atomicity.
+    if can_squash && crate::scripting::script_busy(router.port) {
         can_squash = false;
     }
     // With keyspace notifications on, a pipeline is batched only if every

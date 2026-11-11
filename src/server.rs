@@ -665,6 +665,11 @@ pub fn run_shard_worker(
         monoio::spawn(async move {
             loop {
                 monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // A script suspended past its time limit must look atomic:
+                // no expiry, eviction or compaction on its shard meanwhile.
+                if crate::scripting::script_suspended() {
+                    continue;
+                }
                 // Like Redis, a replica does not expire keys itself: it waits
                 // for its master's DEL (its own expiry could race a PERSIST
                 // or EXPIRE from the master and lose the key).
@@ -718,6 +723,9 @@ pub fn run_shard_worker(
         monoio::spawn(async move {
             loop {
                 monoio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if crate::scripting::script_suspended() {
+                    continue;
+                }
                 offload_router.check_auto_tier_local().await;
             }
         });
@@ -727,6 +735,9 @@ pub fn run_shard_worker(
         monoio::spawn(async move {
             loop {
                 monoio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if crate::scripting::script_suspended() {
+                    continue;
+                }
                 gc_router.gc_local();
             }
         });
@@ -796,6 +807,7 @@ pub fn run_shard_worker(
         let cross_shard_db = local_db.clone();
         let cross_shard_router = router.clone();
         let cross_shard_clients = client_registry.clone();
+        crate::connection::SHARD_CLIENTS.with(|c| *c.borrow_mut() = Some(client_registry.clone()));
         let cross_shard_slot_states = router.slot_states.clone();
         let cross_shard_slot_owners = router.slot_owners.clone();
         let cross_shard_aof_slot = aof_slot.clone();
@@ -810,6 +822,14 @@ pub fn run_shard_worker(
                 // once (see `replication::begin_stream_batch`).
                 crate::replication::begin_stream_batch(port, shard_id);
                 loop {
+                    // Messages that touch the data wait while a script on
+                    // this shard is suspended past its time limit: it must
+                    // look atomic. The rest (a connection handed to this
+                    // shard, pub/sub, stats, slot updates) go on, or new
+                    // connections would hang until the script ended.
+                    if crate::scripting::script_suspended() && !runs_while_script_suspended(&msg) {
+                        crate::scripting::wait_script_done().await;
+                    }
                     // Per message: AOF can be turned on or off meanwhile.
                     let cross_shard_aof = cross_shard_aof_slot.get();
                     // Held bytes go out before any message but the plain
@@ -1690,7 +1710,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                             keys,
                                             args,
                                             &cross_shard_db,
-                                            cross_shard_aof.as_deref(),
+                                            cross_shard_aof.clone(),
                                             *read_only,
                                         ) {
                                             Ok(resp) => temp_buf.extend_from_slice(&resp),
@@ -1712,7 +1732,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                                 keys,
                                                 args,
                                                 &cross_shard_db,
-                                                cross_shard_aof.as_deref(),
+                                                cross_shard_aof.clone(),
                                                 *read_only,
                                             ) {
                                                 Ok(resp) => temp_buf.extend_from_slice(&resp),
@@ -1735,7 +1755,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                             keys,
                                             args,
                                             &cross_shard_db,
-                                            cross_shard_aof.as_deref(),
+                                            cross_shard_aof.clone(),
                                             *read_only,
                                         ) {
                                             Ok(res) => temp_buf.extend_from_slice(&res),
@@ -2151,6 +2171,17 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     }
                     ShardMessage::PubsubClientIds { responder } => {
                         let _ = responder.send(cross_shard_pubsub.borrow().subscribed_client_ids());
+                    }
+                    ShardMessage::RunScript { db, cmd, is_resp3, client_id, responder } => {
+                        let r = cross_shard_router.clone();
+                        monoio::spawn(async move {
+                            crate::connection::CURRENT_DB.set(db);
+                            r.local_db.borrow_mut().select_db(db);
+                            crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
+                            crate::connection::CURRENT_CLIENT_ID.set(client_id);
+                            let res = crate::scripting::run_script_command(&r, *cmd).await;
+                            let _ = responder.send(res);
+                        });
                     }
                     ShardMessage::RemoveClientPubSub { client_id } => {
                         cross_shard_pubsub
@@ -2586,6 +2617,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             let tls_cfg = tls_cfg.clone();
             let next_tls_client_id = next_tls_client_id.clone();
             monoio::spawn(async move {
+                let _listening = crate::shutdown::ListeningSocket::register(
+                    std::os::unix::io::AsRawFd::as_raw_fd(&tls_listener),
+                );
                 loop {
                     let Some(accept_res) = accept_until_shutdown(&tls_listener).await else {
                         break;
@@ -3065,6 +3099,9 @@ async fn accept_loop(
     num_shards: usize,
     cluster_enabled: bool,
 ) {
+    let _listening = crate::shutdown::ListeningSocket::register(
+        std::os::unix::io::AsRawFd::as_raw_fd(&listener),
+    );
     loop {
         let Some(accept_res) = accept_until_shutdown(&listener).await else {
             break;
@@ -3174,7 +3211,9 @@ async fn accept_loop(
                 }
             }
             Err(e) => {
-                crate::log_warning!("[Shard {}] Accept error: {}", shard_id, e);
+                if !crate::shutdown::is_shutting_down() {
+                    crate::log_warning!("[Shard {}] Accept error: {}", shard_id, e);
+                }
             }
         }
     }
@@ -3195,6 +3234,33 @@ fn aof_write_after_mailbox(
     {
         let _ = aof.borrow_mut().write_pending_sync();
     }
+}
+
+/// Shard messages that don't read or change the shard's data, so they run
+/// even while a script on the shard is suspended past its time limit.
+fn runs_while_script_suspended(msg: &ShardMessage) -> bool {
+    matches!(
+        msg,
+        ShardMessage::AdoptConnection { .. }
+            | ShardMessage::ClientList { .. }
+            | ShardMessage::SetSlotState { .. }
+            | ShardMessage::SetSlotOwner { .. }
+            | ShardMessage::SlotBarrier { .. }
+            | ShardMessage::FlushCommandStats { .. }
+            | ShardMessage::ResetCommandStats { .. }
+            | ShardMessage::KillRevokedSubscribers { .. }
+            | ShardMessage::Publish { .. }
+            | ShardMessage::Spublish { .. }
+            | ShardMessage::Ssubscribe { .. }
+            | ShardMessage::Sunsubscribe { .. }
+            | ShardMessage::PubsubChannels { .. }
+            | ShardMessage::PubsubShardchannels { .. }
+            | ShardMessage::PubsubNumsub { .. }
+            | ShardMessage::PubsubShardnumsub { .. }
+            | ShardMessage::PubsubNumpat { .. }
+            | ShardMessage::PubsubClientIds { .. }
+            | ShardMessage::RemoveClientPubSub { .. }
+    )
 }
 
 #[cfg(test)]

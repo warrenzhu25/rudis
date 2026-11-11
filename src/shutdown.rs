@@ -34,6 +34,43 @@ pub fn shutdown_command_running() -> bool {
     SHUTDOWN_COMMANDS.load(Ordering::SeqCst) > 0
 }
 
+/// The listening sockets accepting clients now (see [`ListeningSocket`]).
+static LISTENERS: parking_lot::Mutex<Vec<i32>> = parking_lot::const_mutex(Vec::new());
+
+/// Registers a listening socket for [`stop_listening`] until dropped. Drop
+/// it before the socket is closed, so a reused fd is never shut down.
+pub struct ListeningSocket(i32);
+
+impl ListeningSocket {
+    pub fn register(fd: i32) -> Self {
+        LISTENERS.lock().push(fd);
+        Self(fd)
+    }
+}
+
+impl Drop for ListeningSocket {
+    fn drop(&mut self) {
+        let mut fds = LISTENERS.lock();
+        if let Some(i) = fds.iter().position(|&fd| fd == self.0) {
+            fds.swap_remove(i);
+        }
+    }
+}
+
+/// Stops accepting clients on every listening socket at once, as Redis
+/// does by exiting before SHUTDOWN replies: a client connecting after the
+/// reply is refused instead of accepted and dropped. The accept loops see
+/// an error, then the shutdown, and end.
+pub fn stop_listening() {
+    for &fd in LISTENERS.lock().iter() {
+        // SAFETY: `fd` is a listening socket that stays open while it is
+        // registered (the registration is dropped before the socket).
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_RDWR);
+        }
+    }
+}
+
 /// Initiates a graceful server shutdown.
 pub fn request_shutdown() {
     if !SHUTDOWN_REQUESTED.swap(true, Ordering::SeqCst) {

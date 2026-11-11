@@ -3426,6 +3426,57 @@ impl Router {
         local_registry: &RefCell<hashbrown::HashMap<u64, crate::connection::ClientInfo>>,
         filter_ids: &[u64],
     ) -> String {
+        let mut out = self.local_client_list(local_registry, filter_ids);
+        for (shard_id, sender) in self.senders.iter().enumerate() {
+            if shard_id != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::ClientList {
+                    filter_ids: filter_ids.to_vec(),
+                    responder: tx,
+                };
+                if sender.send(msg).is_ok()
+                    && let Ok(peer_list) = rx.recv_async().await
+                {
+                    out.push_str(&peer_list);
+                }
+            }
+        }
+        out
+    }
+
+    /// CLIENT LIST from a script, which cannot await: blocks this shard
+    /// thread for the other shards' lists. A shard that does not answer
+    /// within a second (say, one running its own script that asks this
+    /// shard the same) is left out rather than deadlocking both.
+    pub fn client_list_blocking(
+        &self,
+        local_registry: &RefCell<hashbrown::HashMap<u64, crate::connection::ClientInfo>>,
+        filter_ids: &[u64],
+    ) -> String {
+        let mut out = self.local_client_list(local_registry, filter_ids);
+        for (shard_id, sender) in self.senders.iter().enumerate() {
+            if shard_id != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::ClientList {
+                    filter_ids: filter_ids.to_vec(),
+                    responder: tx,
+                };
+                if sender.send(msg).is_ok()
+                    && let Ok(peer_list) = rx.recv_timeout(std::time::Duration::from_secs(1))
+                {
+                    out.push_str(&peer_list);
+                }
+            }
+        }
+        out
+    }
+
+    /// CLIENT LIST lines for this shard's own connections.
+    fn local_client_list(
+        &self,
+        local_registry: &RefCell<hashbrown::HashMap<u64, crate::connection::ClientInfo>>,
+        filter_ids: &[u64],
+    ) -> String {
         let mut out = String::new();
         let now = std::time::Instant::now();
         for client in local_registry.borrow().values() {
@@ -3507,21 +3558,6 @@ impl Router {
                 watch = crate::connection::client_watch_count(self.port, client.id),
             ));
         }
-
-        for (shard_id, sender) in self.senders.iter().enumerate() {
-            if shard_id != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
-                let msg = ShardMessage::ClientList {
-                    filter_ids: filter_ids.to_vec(),
-                    responder: tx,
-                };
-                if sender.send(msg).is_ok()
-                    && let Ok(peer_list) = rx.recv_async().await
-                {
-                    out.push_str(&peer_list);
-                }
-            }
-        }
         out
     }
 
@@ -3579,6 +3615,28 @@ impl Router {
                 self.release_notify_channel(tx, rx);
             }
         }
+    }
+
+    /// Runs a script command (EVAL/EVALSHA/FCALL) on shard `target`, which
+    /// owns its keys, and returns the reply. Unlike [`Self::execute_remote`]
+    /// the script runs in a task there, so it can yield past
+    /// `busy-reply-threshold` (that shard then answers -BUSY and SCRIPT
+    /// KILL instead of freezing).
+    pub async fn run_script_remote(&self, target: usize, cmd: Command) -> Vec<u8> {
+        let (tx, rx) = flume::bounded(1);
+        let msg = ShardMessage::RunScript {
+            db: crate::connection::CURRENT_DB.get(),
+            cmd: Box::new(cmd),
+            is_resp3: crate::connection::CURRENT_CLIENT_RESP3.get(),
+            client_id: crate::connection::requesting_client_id(),
+            responder: tx,
+        };
+        if self.senders[target].send(msg).is_err() {
+            return b"-ERR internal shard routing error\r\n".to_vec();
+        }
+        rx.recv_async()
+            .await
+            .unwrap_or_else(|_| b"-ERR internal shard routing error\r\n".to_vec())
     }
 
     pub async fn execute_remote(&self, target: usize, cmd: Command) -> Vec<u8> {

@@ -1,6 +1,6 @@
 use crate::resp::Command;
 use bytes::Bytes;
-use mlua::{Lua, MultiValue, Value};
+use mlua::{IntoLuaMulti, Lua, MultiValue, Value};
 use parking_lot::RwLock;
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
@@ -58,16 +58,24 @@ pub fn cached_scripts_count() -> usize {
 /// busy, one clock read: noise next to 10k instructions.
 const SCRIPT_HOOK_INSTRUCTIONS: u32 = 10_000;
 
+/// How long a script past `busy-reply-threshold` runs, at least, between
+/// two turns it hands its shard's event loop (see [`run_yielding`]).
+const SCRIPT_YIELD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// A script (EVAL/EVALSHA/FCALL) running on some shard thread. A shard runs
-/// one script at a time, synchronously, so while it runs that shard serves
-/// nothing else: SCRIPT KILL / FUNCTION KILL / SHUTDOWN reach it from
-/// another shard's connection through this registry, and the script's own
-/// instruction hook acts on them.
+/// one script at a time. Until the script is past `busy-reply-threshold` it
+/// runs synchronously; from then on its instruction hook suspends it every
+/// [`SCRIPT_YIELD_INTERVAL`] so the shard's event loop answers -BUSY and
+/// runs SCRIPT KILL / FUNCTION KILL / SHUTDOWN NOSAVE (see
+/// [`run_yielding`]). Those reach the script through this registry, from
+/// any shard, and its hook acts on them.
 pub struct RunningScript {
     /// Base (node) port of the server running it.
     port: u16,
     /// EVAL/EVALSHA (killed by SCRIPT KILL) or FCALL (FUNCTION KILL).
     is_eval: bool,
+    /// For FUNCTION STATS: the function's name and the FCALL command.
+    function: Option<(String, Vec<Bytes>)>,
     start: std::time::Instant,
     /// Set by SCRIPT KILL / FUNCTION KILL; the hook then fails the script.
     killed: std::sync::atomic::AtomicBool,
@@ -144,10 +152,11 @@ thread_local! {
 struct ScriptRunGuard(std::sync::Arc<RunningScript>);
 
 impl ScriptRunGuard {
-    fn start(port: u16, is_eval: bool) -> Self {
+    fn start(port: u16, is_eval: bool, function: Option<(String, Vec<Bytes>)>) -> Self {
         let run = std::sync::Arc::new(RunningScript {
             port: crate::connection::node_port(port),
             is_eval,
+            function,
             start: std::time::Instant::now(),
             killed: std::sync::atomic::AtomicBool::new(false),
             wrote: std::sync::atomic::AtomicBool::new(false),
@@ -172,6 +181,21 @@ impl Drop for ScriptRunGuard {
     }
 }
 
+/// Runs one `redis.call` / `redis.pcall` command on this shard.
+#[inline]
+fn script_execute(
+    cmd: &Command,
+    db: &mut crate::shard::ShardDb,
+    out: &mut Vec<u8>,
+    aof: Option<&RefCell<crate::aof::AofWriter>>,
+) {
+    if let Command::Client(crate::resp::ClientSubcommand::List(ids)) = cmd {
+        crate::connection::script_client_list(ids, out);
+    } else {
+        crate::connection::execute_local_command(cmd, db, out, aof);
+    }
+}
+
 /// Notes that the running script issued a write command.
 fn note_script_write() {
     CURRENT_SCRIPT.with(|c| {
@@ -181,11 +205,61 @@ fn note_script_write() {
     });
 }
 
+/// Marks the running script busy once past `busy-reply-threshold` on its
+/// `redis.call`s too: a loop of slow calls runs few Lua instructions, so
+/// the instruction hook alone may notice late.
+#[inline(never)]
+fn note_script_call() {
+    CURRENT_SCRIPT.with(|c| {
+        if let Some(run) = c.borrow().as_ref()
+            && !run.busy.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let limit_ms = crate::connection::busy_reply_threshold_ms();
+            if limit_ms != 0 && run.start.elapsed().as_millis() >= limit_ms as u128 {
+                run.mark_busy();
+            }
+        }
+    });
+}
+
+/// Lets the instruction hook suspend a script run by [`run_yielding`].
+struct YieldControl {
+    /// The coroutine running the script's body (null until it exists).
+    /// Only it is suspended: a yield inside a coroutine the script made
+    /// would return to the script's own `coroutine.resume` instead.
+    main: std::cell::Cell<*const std::ffi::c_void>,
+    /// When the script last got the CPU back (or started).
+    resumed_at: std::cell::Cell<std::time::Instant>,
+    /// The hook asked for the latest yield (else the script yielded itself).
+    hook_yielded: std::cell::Cell<bool>,
+    /// Yielding is allowed (an async caller can suspend the script).
+    enabled: bool,
+}
+
+impl YieldControl {
+    fn new(enabled: bool) -> Rc<Self> {
+        Rc::new(Self {
+            main: std::cell::Cell::new(std::ptr::null()),
+            resumed_at: std::cell::Cell::new(std::time::Instant::now()),
+            hook_yielded: std::cell::Cell::new(false),
+            enabled,
+        })
+    }
+}
+
 /// Installs the hook that ends `run` on SCRIPT KILL / FUNCTION KILL or
-/// shutdown, and marks it busy past `busy-reply-threshold`. A global hook,
-/// so coroutines the script creates inherit it.
-fn install_script_hook(lua: &Lua, run: &std::sync::Arc<RunningScript>) -> Result<(), String> {
+/// shutdown, marks it busy past `busy-reply-threshold`, and from then on
+/// (if `ctl` allows) suspends it every [`SCRIPT_YIELD_INTERVAL`]. A global
+/// hook, so coroutines the script creates inherit it. Lua ignores the yield
+/// where it can't suspend (inside a C call such as a `table.sort`
+/// comparator): the script then keeps the shard until it returns from it.
+fn install_script_hook(
+    lua: &Lua,
+    run: &std::sync::Arc<RunningScript>,
+    ctl: &Rc<YieldControl>,
+) -> Result<(), String> {
     let run = run.clone();
+    let ctl = ctl.clone();
     lua.set_global_hook(
         mlua::HookTriggers::new().every_nth_instruction(SCRIPT_HOOK_INSTRUCTIONS),
         move |lua, _| {
@@ -204,14 +278,125 @@ fn install_script_hook(lua: &Lua, run: &std::sync::Arc<RunningScript>) -> Result
             }
             if !run.busy.load(Ordering::Relaxed) {
                 let limit_ms = crate::connection::busy_reply_threshold_ms();
-                if limit_ms > 0 && run.start.elapsed().as_millis() >= limit_ms as u128 {
-                    run.mark_busy();
+                if limit_ms == 0 || run.start.elapsed().as_millis() < limit_ms as u128 {
+                    return Ok(mlua::VmState::Continue);
                 }
+                run.mark_busy();
+            }
+            ctl.hook_yielded.set(false);
+            if ctl.enabled
+                && ctl.resumed_at.get().elapsed() >= SCRIPT_YIELD_INTERVAL
+                && lua.current_thread().to_pointer() == ctl.main.get()
+            {
+                ctl.hook_yielded.set(true);
+                return Ok(mlua::VmState::Yield);
             }
             Ok(mlua::VmState::Continue)
         },
     )
     .map_err(|e| e.to_string())
+}
+
+thread_local! {
+    /// A script on this shard thread is suspended mid-run (see
+    /// [`run_yielding`]): until it ends, nothing else may touch the shard's
+    /// data. Set from its first suspension to its end.
+    static SCRIPT_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tasks waiting in [`wait_script_done`].
+    static SCRIPT_DONE_WAITERS: RefCell<Vec<std::task::Waker>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whether a script on this shard thread is suspended mid-run. Anything
+/// that changes (or reads, for a reply) the shard's data outside the
+/// command path must wait for [`wait_script_done`] or skip its turn: the
+/// script must look atomic.
+#[inline(always)]
+pub fn script_suspended() -> bool {
+    SCRIPT_SUSPENDED.get()
+}
+
+/// Waits until no script is suspended on this shard thread (at once if
+/// none is).
+pub async fn wait_script_done() {
+    std::future::poll_fn(|cx| {
+        if !SCRIPT_SUSPENDED.get() {
+            return std::task::Poll::Ready(());
+        }
+        SCRIPT_DONE_WAITERS.with(|w| w.borrow_mut().push(cx.waker().clone()));
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// Marks this shard thread's script suspended until dropped (the script's
+/// end), then wakes [`wait_script_done`].
+struct ShardSuspended;
+
+impl ShardSuspended {
+    fn enter() -> Self {
+        SCRIPT_SUSPENDED.set(true);
+        ShardSuspended
+    }
+}
+
+impl Drop for ShardSuspended {
+    fn drop(&mut self) {
+        SCRIPT_SUSPENDED.set(false);
+        for w in SCRIPT_DONE_WAITERS.with(|w| std::mem::take(&mut *w.borrow_mut())) {
+            w.wake();
+        }
+    }
+}
+
+/// The per-command thread state a script runs with, which the shard's
+/// other tasks set while it is suspended: saved when it yields, put back
+/// before it resumes.
+struct ScriptThreadState {
+    db: usize,
+    selected: usize,
+    auth_user: String,
+    client_id: u64,
+    executing_client_id: u64,
+    resp3: bool,
+    no_touch: bool,
+    defer_bcast: bool,
+    recorded_error: bool,
+    redirect: ScriptRedirect,
+    script: Option<std::sync::Arc<RunningScript>>,
+}
+
+impl ScriptThreadState {
+    fn save(db: &Rc<RefCell<crate::shard::ShardDb>>) -> Self {
+        use crate::connection as c;
+        Self {
+            db: c::CURRENT_DB.get(),
+            selected: db.borrow().current_db,
+            auth_user: c::CURRENT_AUTH_USER.with(|u| u.borrow().clone()),
+            client_id: c::CURRENT_CLIENT_ID.get(),
+            executing_client_id: c::EXECUTING_CLIENT_ID.get(),
+            resp3: c::CURRENT_CLIENT_RESP3.get(),
+            no_touch: c::CLIENT_NO_TOUCH.get(),
+            defer_bcast: c::DEFER_BCAST_FLUSH.get(),
+            recorded_error: SCRIPT_RECORDED_ERROR.get(),
+            redirect: SCRIPT_REDIRECT.get(),
+            script: CURRENT_SCRIPT.with(|s| s.borrow().clone()),
+        }
+    }
+
+    fn restore(self, db: &Rc<RefCell<crate::shard::ShardDb>>) {
+        use crate::connection as c;
+        c::CURRENT_DB.set(self.db);
+        db.borrow_mut().select_db(self.selected);
+        c::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = self.auth_user);
+        c::CURRENT_CLIENT_ID.set(self.client_id);
+        c::EXECUTING_CLIENT_ID.set(self.executing_client_id);
+        c::CURRENT_CLIENT_RESP3.set(self.resp3);
+        c::CLIENT_NO_TOUCH.set(self.no_touch);
+        c::DEFER_BCAST_FLUSH.set(self.defer_bcast);
+        SCRIPT_RECORDED_ERROR.set(self.recorded_error);
+        SCRIPT_REDIRECT.set(self.redirect);
+        CURRENT_SCRIPT.with(|s| *s.borrow_mut() = self.script);
+    }
 }
 
 /// The `-BUSY` reply for a command arriving while a script on `port` runs
@@ -256,6 +441,33 @@ pub fn kill_running_script(port: u16, is_eval: bool) -> &'static [u8] {
     }
     run.killed.store(true, Ordering::Relaxed);
     b"+OK\r\n"
+}
+
+/// Ends every script running on the server on `port`, written or not: for
+/// SHUTDOWN NOSAVE, which must not wait for a script that never returns.
+pub fn stop_running_scripts(port: u16) {
+    let port = crate::connection::node_port(port);
+    for run in RUNNING_SCRIPTS.lock().iter().filter(|r| r.port == port) {
+        run.killed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a script on the server on `port` runs past
+/// `busy-reply-threshold` (the server answers -BUSY).
+pub fn script_busy(port: u16) -> bool {
+    busy_script_reply(port).is_some()
+}
+
+/// FUNCTION STATS `running_script`: the running function's name, its
+/// FCALL command and how long it has run, in ms.
+pub fn running_function(port: u16) -> Option<(String, Vec<Bytes>, u128)> {
+    let port = crate::connection::node_port(port);
+    let scripts = RUNNING_SCRIPTS.lock();
+    scripts.iter().find(|r| r.port == port).and_then(|r| {
+        r.function
+            .as_ref()
+            .map(|(name, argv)| (name.clone(), argv.clone(), r.start.elapsed().as_millis()))
+    })
 }
 
 /// A registered Redis 7 Function definition
@@ -1026,14 +1238,15 @@ fn format_eval_error(err: &str, sha: &str) -> String {
 }
 
 /// Execute a registered Redis 7 Function via FCALL
-pub fn call_function(
+fn prepare_function(
     func_name: &str,
     keys: &[Bytes],
     args: &[Bytes],
     db: &Rc<RefCell<crate::shard::ShardDb>>,
-    aof: Option<&RefCell<crate::aof::AofWriter>>,
+    aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
     read_only: bool,
-) -> Result<Vec<u8>, String> {
+    can_yield: bool,
+) -> Result<ScriptRun, String> {
     SCRIPT_RECORDED_ERROR.set(false);
     let (lib, func_def) = {
         let cache = FUNCTION_LIBS.read();
@@ -1058,138 +1271,376 @@ pub fn call_function(
     let effective_read_only = read_only || func_def.flags.iter().any(|f| f == "no-writes");
 
     let lua = Lua::new();
-    let run = ScriptRunGuard::start(db.borrow().port, false);
-    install_script_hook(&lua, &run.0)?;
-    // A scope lets `redis.call`/`redis.pcall` borrow `aof` for exactly this
-    // run instead of smuggling it in as a raw pointer.
-    #[allow(clippy::redundant_closure_call)]
-    lua.scope(|scope| {
-        Ok((|| -> Result<Vec<u8>, String> {
-            let script_resp_ver = Rc::new(RefCell::new(2u8));
-            setup_redis_lua_env(
-                &lua,
-                scope,
-                db,
-                aof,
-                effective_read_only,
-                script_resp_ver.clone(),
-            )?;
+    // FUNCTION STATS shows the running function and its FCALL command.
+    let mut argv = vec![
+        Bytes::from_static(if read_only { b"fcall_ro" } else { b"fcall" }),
+        Bytes::copy_from_slice(func_name.as_bytes()),
+        Bytes::from(keys.len().to_string()),
+    ];
+    argv.extend(keys.iter().cloned());
+    argv.extend(args.iter().cloned());
+    let run = ScriptRunGuard::start(db.borrow().port, false, Some((func_def.name.clone(), argv)));
+    let ctl = YieldControl::new(can_yield);
+    install_script_hook(&lua, &run.0, &ctl)?;
+    let script_resp_ver = Rc::new(RefCell::new(2u8));
+    setup_redis_lua_env(&lua, db, aof, effective_read_only, script_resp_ver.clone())?;
 
-            // Set KEYS table
-            let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
-            for (i, k) in keys.iter().enumerate() {
-                let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
-                keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+    // Set KEYS table
+    let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    for (i, k) in keys.iter().enumerate() {
+        let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
+        keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+    }
+
+    // Set ARGV table
+    let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    for (i, a) in args.iter().enumerate() {
+        let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
+        argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+    }
+
+    // Capture target function during library load phase
+    let target_fn = Rc::new(RefCell::new(None));
+    let target_fn_clone = target_fn.clone();
+    let target_name_lower = func_name.to_lowercase();
+    let in_load_phase = Rc::new(std::cell::Cell::new(true));
+    let in_load_phase_clone = in_load_phase.clone();
+
+    let reg_fn = lua
+        .create_function(move |lua, margs: MultiValue| {
+            if !in_load_phase_clone.get() {
+                return Err(mlua::Error::RuntimeError(
+                    "redis.register_function can only be called on FUNCTION LOAD command"
+                        .to_string(),
+                ));
             }
-
-            // Set ARGV table
-            let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
-            for (i, a) in args.iter().enumerate() {
-                let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
-                argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
-            }
-
-            // Capture target function during library load phase
-            let target_fn = Rc::new(RefCell::new(None));
-            let target_fn_clone = target_fn.clone();
-            let target_name_lower = func_name.to_lowercase();
-            let in_load_phase = Rc::new(std::cell::Cell::new(true));
-            let in_load_phase_clone = in_load_phase.clone();
-
-            let reg_fn = lua
-                .create_function(move |lua, margs: MultiValue| {
-                    if !in_load_phase_clone.get() {
-                        return Err(mlua::Error::RuntimeError(
-                            "redis.register_function can only be called on FUNCTION LOAD command"
-                                .to_string(),
-                        ));
-                    }
-                    let mut name_opt = None;
-                    let mut func_opt = None;
-                    if let Some(first) = margs.iter().next() {
-                        match first {
-                            Value::String(s) => {
-                                if let Ok(name_str) = s.to_str() {
-                                    name_opt = Some(name_str.to_string());
-                                }
-                                if let Some(Value::Function(f)) = margs.iter().nth(1) {
-                                    func_opt = Some(f.clone());
-                                }
-                            }
-                            Value::Table(t) => {
-                                if let Ok(name_str) = t
-                                    .raw_get::<String>("function_name")
-                                    .or_else(|_| t.raw_get::<String>("name"))
-                                {
-                                    name_opt = Some(name_str);
-                                }
-                                if let Ok(f) = t.raw_get::<mlua::Function>("callback") {
-                                    func_opt = Some(f);
-                                }
-                            }
-                            _ => {}
+            let mut name_opt = None;
+            let mut func_opt = None;
+            if let Some(first) = margs.iter().next() {
+                match first {
+                    Value::String(s) => {
+                        if let Ok(name_str) = s.to_str() {
+                            name_opt = Some(name_str.to_string());
+                        }
+                        if let Some(Value::Function(f)) = margs.iter().nth(1) {
+                            func_opt = Some(f.clone());
                         }
                     }
-                    if let (Some(name), Some(f)) = (name_opt, func_opt)
-                        && name.to_lowercase() == target_name_lower
-                    {
-                        let key = lua.create_registry_value(f)?;
-                        *target_fn_clone.borrow_mut() = Some(key);
+                    Value::Table(t) => {
+                        if let Ok(name_str) = t
+                            .raw_get::<String>("function_name")
+                            .or_else(|_| t.raw_get::<String>("name"))
+                        {
+                            name_opt = Some(name_str);
+                        }
+                        if let Ok(f) = t.raw_get::<mlua::Function>("callback") {
+                            func_opt = Some(f);
+                        }
                     }
-                    Ok(())
-                })
-                .map_err(|e| e.to_string())?;
+                    _ => {}
+                }
+            }
+            if let (Some(name), Some(f)) = (name_opt, func_opt)
+                && name.to_lowercase() == target_name_lower
+            {
+                let key = lua.create_registry_value(f)?;
+                *target_fn_clone.borrow_mut() = Some(key);
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
 
-            let load_redis_proxy =
-                create_load_redis_proxy(&lua, reg_fn).map_err(|e| e.to_string())?;
-            let real_g: mlua::Table = lua
-                .named_registry_value("__real_G")
-                .map_err(|e| e.to_string())?;
-            let runtime_redis: Value = real_g.get("redis").map_err(|e| e.to_string())?;
-            real_g
-                .set("redis", load_redis_proxy)
-                .map_err(|e| e.to_string())?;
+    let load_redis_proxy = create_load_redis_proxy(&lua, reg_fn).map_err(|e| e.to_string())?;
+    let real_g: mlua::Table = lua
+        .named_registry_value("__real_G")
+        .map_err(|e| e.to_string())?;
+    let runtime_redis: Value = real_g.get("redis").map_err(|e| e.to_string())?;
+    real_g
+        .set("redis", load_redis_proxy)
+        .map_err(|e| e.to_string())?;
 
-            // Run library script to define functions
-            lua.load(&lib.raw_code)
-                .exec()
-                .map_err(|e| format!("ERR Failed to compile library: {}", e))?;
+    // Run library script to define functions
+    lua.load(&lib.raw_code)
+        .exec()
+        .map_err(|e| format!("ERR Failed to compile library: {}", e))?;
 
-            in_load_phase.set(false);
-            real_g
-                .set("redis", runtime_redis)
-                .map_err(|e| e.to_string())?;
+    in_load_phase.set(false);
+    real_g
+        .set("redis", runtime_redis)
+        .map_err(|e| e.to_string())?;
 
-            let fn_key = target_fn.borrow_mut().take().ok_or_else(|| {
-                format!(
-                    "ERR Function '{}' registered but failed to capture",
-                    func_name
-                )
-            })?;
-            let f: mlua::Function = lua.registry_value(&fn_key).map_err(|e| e.to_string())?;
+    let fn_key = target_fn.borrow_mut().take().ok_or_else(|| {
+        format!(
+            "ERR Function '{}' registered but failed to capture",
+            func_name
+        )
+    })?;
+    let f: mlua::Function = lua.registry_value(&fn_key).map_err(|e| e.to_string())?;
 
-            let res: Value = f
-                .call((keys_tbl, argv_tbl))
-                .map_err(|e| format_lua_error(&e.to_string()))?;
-
-            let mut out = Vec::new();
-            let cur_resp_ver = *script_resp_ver.borrow();
-            lua_val_to_resp_with_depth(&res, &mut out, 0, cur_resp_ver)?;
-            Ok(out)
-        })())
+    let thread = lua.create_thread(f).map_err(|e| e.to_string())?;
+    ctl.main.set(thread.to_pointer());
+    let first_args = (keys_tbl, argv_tbl)
+        .into_lua_multi(&lua)
+        .map_err(|e| e.to_string())?;
+    Ok(ScriptRun {
+        thread,
+        first_args: Some(first_args),
+        resp_ver: script_resp_ver,
+        kind: ScriptKind::Function,
+        ctl,
+        run,
+        lua,
+        _blocked: crate::connection::BlockedServingPause::start(),
     })
-    .map_err(|e| e.to_string())?
-    .map_err(|e| run.0.error_or_killed(e))
 }
 
-pub fn eval_script(
+/// Runs an FCALL to its end on this thread: it never yields.
+pub fn call_function(
+    func_name: &str,
+    keys: &[Bytes],
+    args: &[Bytes],
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
+    aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
+    read_only: bool,
+) -> Result<Vec<u8>, String> {
+    prepare_function(func_name, keys, args, db, aof, read_only, false)?.run_to_end()
+}
+
+/// Runs an FCALL for a connection, yielding past `busy-reply-threshold`
+/// (see [`drive_script`]).
+pub async fn call_function_yielding(
+    func_name: &str,
+    keys: &[Bytes],
+    args: &[Bytes],
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
+    aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
+    read_only: bool,
+) -> Result<Vec<u8>, String> {
+    let run = prepare_function(func_name, keys, args, db, aof, read_only, true)?;
+    drive_script(run, db).await
+}
+
+/// What a [`ScriptRun`] runs: an EVAL script (its source, for the SHA in
+/// error replies) or a function.
+enum ScriptKind {
+    Eval(String),
+    Function,
+}
+
+/// A script prepared to run in its own Lua thread, resumed until it
+/// finishes. Its instruction hook may suspend it (see [`install_script_hook`]).
+/// Field order is drop order: the thread and its pending arguments go
+/// before the guard (which unregisters the run) and the Lua state.
+struct ScriptRun {
+    thread: mlua::Thread,
+    first_args: Option<MultiValue>,
+    resp_ver: Rc<RefCell<u8>>,
+    kind: ScriptKind,
+    ctl: Rc<YieldControl>,
+    run: ScriptRunGuard,
+    lua: Lua,
+    /// Blocked clients are served once the script is done (Redis too).
+    _blocked: Option<crate::connection::BlockedServingPause>,
+}
+
+/// One resumption of a [`ScriptRun`].
+enum ScriptStep {
+    /// The hook suspended it: resume it later.
+    Yielded,
+    Done(Result<Vec<u8>, String>),
+}
+
+impl ScriptRun {
+    fn step(&mut self) -> ScriptStep {
+        let args = self.first_args.take().unwrap_or_default();
+        self.ctl.hook_yielded.set(false);
+        self.ctl.resumed_at.set(std::time::Instant::now());
+        let res = match self.thread.resume::<MultiValue>(args) {
+            Err(e) => Err(format_lua_error(&e.to_string())),
+            Ok(vals) => {
+                if self.thread.status() == mlua::thread::ThreadStatus::Resumable {
+                    if self.ctl.hook_yielded.get() {
+                        return ScriptStep::Yielded;
+                    }
+                    // The script's own `coroutine.yield()` at top level.
+                    Err("ERR attempt to yield from outside a coroutine".to_string())
+                } else {
+                    self.finish(vals)
+                }
+            }
+        };
+        ScriptStep::Done(res.map_err(|e| self.run.0.error_or_killed(e)))
+    }
+
+    /// The reply for the values the script's thread returned.
+    fn finish(&self, vals: MultiValue) -> Result<Vec<u8>, String> {
+        let res = match &self.kind {
+            ScriptKind::Eval(src) => {
+                let (ok, res): (bool, Value) = self
+                    .lua
+                    .unpack_multi(vals)
+                    .map_err(|e| format_lua_error(&e.to_string()))?;
+                if !ok {
+                    let err_msg = match res {
+                        Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
+                        _ => format!("{:?}", res),
+                    };
+                    let sha = load_script(src.as_bytes());
+                    return Err(format_eval_error(&err_msg, &sha));
+                }
+                res
+            }
+            ScriptKind::Function => vals.into_iter().next().unwrap_or(Value::Nil),
+        };
+        let mut out = Vec::new();
+        let ver = *self.resp_ver.borrow();
+        lua_val_to_resp_with_depth(&res, &mut out, 0, ver)?;
+        Ok(out)
+    }
+
+    fn run_to_end(mut self) -> Result<Vec<u8>, String> {
+        loop {
+            if let ScriptStep::Done(res) = self.step() {
+                return res;
+            }
+        }
+    }
+}
+
+/// Runs a script command another shard sent here (its keys live on this
+/// shard): EVAL, EVALSHA or FCALL as `auth_user`, yielding past
+/// `busy-reply-threshold` like a local script. Returns the reply.
+pub async fn run_script_command(
+    router: &crate::router::Router,
+    cmd: crate::resp::Command,
+) -> Vec<u8> {
+    use crate::resp::Command;
+    let mut out = Vec::new();
+    let saved_db = crate::connection::CURRENT_DB.get();
+    let res = match cmd {
+        Command::Eval {
+            script,
+            keys,
+            args,
+            read_only,
+            auth_user,
+        } => {
+            crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user);
+            let script_str = String::from_utf8_lossy(&script).into_owned();
+            load_script(&script);
+            Some(
+                eval_script_yielding(
+                    &script_str,
+                    &keys,
+                    &args,
+                    &router.local_db,
+                    router.aof(),
+                    read_only,
+                )
+                .await,
+            )
+        }
+        Command::Evalsha {
+            sha,
+            keys,
+            args,
+            read_only,
+            auth_user,
+        } => {
+            crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user);
+            match get_script(&String::from_utf8_lossy(&sha)) {
+                Some(script) => Some(
+                    eval_script_yielding(
+                        &script,
+                        &keys,
+                        &args,
+                        &router.local_db,
+                        router.aof(),
+                        read_only,
+                    )
+                    .await,
+                ),
+                None => {
+                    out.extend_from_slice(b"-NOSCRIPT No matching script. Please use EVAL.\r\n");
+                    None
+                }
+            }
+        }
+        Command::Fcall {
+            function,
+            keys,
+            args,
+            read_only,
+            auth_user,
+        } => {
+            crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user);
+            Some(
+                call_function_yielding(
+                    &function,
+                    &keys,
+                    &args,
+                    &router.local_db,
+                    router.aof(),
+                    read_only,
+                )
+                .await,
+            )
+        }
+        _ => {
+            out.extend_from_slice(b"-ERR internal error: not a script command\r\n");
+            None
+        }
+    };
+    match res {
+        Some(Ok(resp)) => out.extend_from_slice(&resp),
+        Some(Err(e)) => crate::connection::write_resp_err(&mut out, e),
+        None => {}
+    }
+    crate::connection::CURRENT_DB.set(saved_db);
+    router.local_db.borrow_mut().select_db(saved_db);
+    out
+}
+
+/// How long a suspended script waits before it resumes: the shard's event
+/// loop runs meanwhile (connections get -BUSY, SCRIPT KILL arrives).
+const SCRIPT_YIELD_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Runs `run` to its end, handing the shard's event loop a turn whenever
+/// its hook suspends it (only past `busy-reply-threshold`). While it is
+/// suspended the shard counts as busy with it ([`script_suspended`]): the
+/// connections' -BUSY gate, the shard's mailbox and its cron hold off, so
+/// the script stays atomic. The per-command thread state other tasks set
+/// meanwhile is put back before it resumes.
+async fn drive_script(
+    mut run: ScriptRun,
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
+) -> Result<Vec<u8>, String> {
+    let mut suspended: Option<ShardSuspended> = None;
+    loop {
+        match run.step() {
+            ScriptStep::Done(res) => {
+                drop(suspended);
+                return res;
+            }
+            ScriptStep::Yielded => {
+                suspended.get_or_insert_with(ShardSuspended::enter);
+                let state = ScriptThreadState::save(db);
+                monoio::time::sleep(SCRIPT_YIELD_PAUSE).await;
+                state.restore(db);
+            }
+        }
+    }
+}
+
+fn prepare_eval(
     script_content: &str,
     keys: &[Bytes],
     args: &[Bytes],
     db: &Rc<RefCell<crate::shard::ShardDb>>,
-    aof: Option<&RefCell<crate::aof::AofWriter>>,
+    aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
     read_only: bool,
-) -> Result<Vec<u8>, String> {
+    can_yield: bool,
+) -> Result<ScriptRun, String> {
     SCRIPT_RECORDED_ERROR.set(false);
     let mut effective_read_only = read_only;
     let mut processed_script = script_content.to_string();
@@ -1245,50 +1696,39 @@ pub fn eval_script(
     }
 
     let lua = Lua::new();
-    let run = ScriptRunGuard::start(db.borrow().port, true);
-    install_script_hook(&lua, &run.0)?;
-    // A scope lets `redis.call`/`redis.pcall` borrow `aof` for exactly this
-    // run instead of smuggling it in as a raw pointer.
-    #[allow(clippy::redundant_closure_call)]
-    lua.scope(|scope| {
-        Ok((|| -> Result<Vec<u8>, String> {
-            let script_resp_ver = Rc::new(RefCell::new(2u8));
-            setup_redis_lua_env(
-                &lua,
-                scope,
-                db,
-                aof,
-                effective_read_only,
-                script_resp_ver.clone(),
-            )?;
+    let run = ScriptRunGuard::start(db.borrow().port, true, None);
+    let ctl = YieldControl::new(can_yield);
+    install_script_hook(&lua, &run.0, &ctl)?;
+    let script_resp_ver = Rc::new(RefCell::new(2u8));
+    setup_redis_lua_env(&lua, db, aof, effective_read_only, script_resp_ver.clone())?;
 
-            // Set KEYS table (1-indexed)
-            let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
-            for (i, k) in keys.iter().enumerate() {
-                let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
-                keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
-            }
+    // Set KEYS table (1-indexed)
+    let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    for (i, k) in keys.iter().enumerate() {
+        let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
+        keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+    }
 
-            // Set ARGV table (1-indexed)
-            let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
-            for (i, a) in args.iter().enumerate() {
-                let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
-                argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
-            }
+    // Set ARGV table (1-indexed)
+    let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    for (i, a) in args.iter().enumerate() {
+        let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
+        argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+    }
 
-            if let Ok(real_g) = lua.named_registry_value::<mlua::Table>("__real_G") {
-                real_g.set("KEYS", keys_tbl).map_err(|e| e.to_string())?;
-                real_g.set("ARGV", argv_tbl).map_err(|e| e.to_string())?;
-            }
+    if let Ok(real_g) = lua.named_registry_value::<mlua::Table>("__real_G") {
+        real_g.set("KEYS", keys_tbl).map_err(|e| e.to_string())?;
+        real_g.set("ARGV", argv_tbl).map_err(|e| e.to_string())?;
+    }
 
-            let chunk_func = lua
-                .load(&processed_script)
-                .set_name("@user_script")
-                .into_function()
-                .map_err(|e| format_lua_error(&e.to_string()))?;
-            let runner: mlua::Function = lua
-                .load(
-                    r#"
+    let chunk_func = lua
+        .load(&processed_script)
+        .set_name("@user_script")
+        .into_function()
+        .map_err(|e| format_lua_error(&e.to_string()))?;
+    let runner: mlua::Function = lua
+        .load(
+            r#"
         local f = ...
         return xpcall(f, function(err)
             if type(err) == "table" then
@@ -1301,38 +1741,55 @@ pub fn eval_script(
             return tostring(err)
         end)
         "#,
-                )
-                .into_function()
-                .map_err(|e| e.to_string())?;
-
-            let (ok, res): (bool, Value) = runner
-                .call(chunk_func)
-                .map_err(|e| format_lua_error(&e.to_string()))?;
-
-            if !ok {
-                let err_msg = match res {
-                    Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
-                    _ => format!("{:?}", res),
-                };
-                let sha = load_script(script_content.as_bytes());
-                return Err(format_eval_error(&err_msg, &sha));
-            }
-
-            let mut resp = Vec::new();
-            let cur_resp_ver = *script_resp_ver.borrow();
-            lua_val_to_resp_with_depth(&res, &mut resp, 0, cur_resp_ver)?;
-            Ok(resp)
-        })())
+        )
+        .into_function()
+        .map_err(|e| e.to_string())?;
+    let thread = lua.create_thread(runner).map_err(|e| e.to_string())?;
+    ctl.main.set(thread.to_pointer());
+    let first_args = chunk_func.into_lua_multi(&lua).map_err(|e| e.to_string())?;
+    Ok(ScriptRun {
+        thread,
+        first_args: Some(first_args),
+        resp_ver: script_resp_ver,
+        kind: ScriptKind::Eval(script_content.to_string()),
+        ctl,
+        run,
+        lua,
+        _blocked: crate::connection::BlockedServingPause::start(),
     })
-    .map_err(|e| e.to_string())?
-    .map_err(|e| run.0.error_or_killed(e))
 }
 
-fn setup_redis_lua_env<'scope, 'env: 'scope>(
-    lua: &Lua,
-    scope: &'scope mlua::Scope<'scope, 'env>,
+/// Runs an EVAL script to its end on this thread (AOF replay, scripts
+/// another shard sent here): it never yields.
+pub fn eval_script(
+    script_content: &str,
+    keys: &[Bytes],
+    args: &[Bytes],
     db: &Rc<RefCell<crate::shard::ShardDb>>,
-    aof: Option<&'env RefCell<crate::aof::AofWriter>>,
+    aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
+    read_only: bool,
+) -> Result<Vec<u8>, String> {
+    prepare_eval(script_content, keys, args, db, aof, read_only, false)?.run_to_end()
+}
+
+/// Runs an EVAL script for a connection: past `busy-reply-threshold` it
+/// hands the shard's event loop a turn now and then (see [`drive_script`]).
+pub async fn eval_script_yielding(
+    script_content: &str,
+    keys: &[Bytes],
+    args: &[Bytes],
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
+    aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
+    read_only: bool,
+) -> Result<Vec<u8>, String> {
+    let run = prepare_eval(script_content, keys, args, db, aof, read_only, true)?;
+    drive_script(run, db).await
+}
+
+fn setup_redis_lua_env(
+    lua: &Lua,
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
+    aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
     read_only: bool,
     script_resp_ver: Rc<RefCell<u8>>,
 ) -> Result<(), String> {
@@ -1392,9 +1849,8 @@ fn setup_redis_lua_env<'scope, 'env: 'scope>(
     register_cjson_module(lua, &real_g).map_err(|e| e.to_string())?;
     register_cmsgpack_module(lua, &real_g).map_err(|e| e.to_string())?;
 
-    let real_redis =
-        register_redis_module(lua, scope, &real_g, db, aof, read_only, script_resp_ver)
-            .map_err(|e| e.to_string())?;
+    let real_redis = register_redis_module(lua, &real_g, db, aof, read_only, script_resp_ver)
+        .map_err(|e| e.to_string())?;
     lua.set_named_registry_value("__real_redis", real_redis)
         .map_err(|e| e.to_string())?;
 
@@ -2341,12 +2797,11 @@ fn unpack_msgpack_val(lua: &Lua, buf: &[u8], offset: &mut usize) -> mlua::Result
     }
 }
 
-fn register_redis_module<'scope, 'env: 'scope>(
+fn register_redis_module(
     lua: &Lua,
-    scope: &'scope mlua::Scope<'scope, 'env>,
     real_g: &mlua::Table,
     db: &Rc<RefCell<crate::shard::ShardDb>>,
-    aof: Option<&'env RefCell<crate::aof::AofWriter>>,
+    aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
     read_only: bool,
     script_resp_ver: Rc<RefCell<u8>>,
 ) -> mlua::Result<mlua::Table> {
@@ -2362,10 +2817,11 @@ fn register_redis_module<'scope, 'env: 'scope>(
     )?;
 
     let db_call = db.clone();
-    let aof_call = aof;
+    let aof_call = aof.clone();
     let srv_call = script_resp_ver.clone();
     let port = db.borrow().port;
-    let call_fn = scope.create_function(move |lua, margs: MultiValue| {
+    let call_fn = lua.create_function(move |lua, margs: MultiValue| {
+        note_script_call();
         let mut cmd_args = Vec::with_capacity(margs.len());
         for v in margs {
             match v {
@@ -2499,16 +2955,11 @@ fn register_redis_module<'scope, 'env: 'scope>(
             crate::connection::broadcast_monitor(port, "lua", &monitor_argv);
         }
         let mut out = Vec::new();
-        let aof_ref = aof_call;
+        let aof_ref = aof_call.as_deref();
         // The reply is converted to Lua from RESP2, whatever the client
         // speaks (see `resp_bytes_to_lua`).
         let prev_resp3 = crate::connection::CURRENT_CLIENT_RESP3.replace(false);
-        crate::connection::execute_local_command(
-            &cmd,
-            &mut db_call.borrow_mut(),
-            &mut out,
-            aof_ref,
-        );
+        script_execute(&cmd, &mut db_call.borrow_mut(), &mut out, aof_ref);
         crate::connection::CURRENT_CLIENT_RESP3.set(prev_resp3);
 
         if out.starts_with(b"-") {
@@ -2535,7 +2986,8 @@ fn register_redis_module<'scope, 'env: 'scope>(
     let db_pcall = db.clone();
     let aof_pcall = aof;
     let srv_pcall = script_resp_ver.clone();
-    let pcall_fn = scope.create_function(move |lua, margs: MultiValue| {
+    let pcall_fn = lua.create_function(move |lua, margs: MultiValue| {
+        note_script_call();
         let mut cmd_args = Vec::with_capacity(margs.len());
         for v in margs {
             match v {
@@ -2690,16 +3142,11 @@ fn register_redis_module<'scope, 'env: 'scope>(
             crate::connection::broadcast_monitor(port, "lua", &monitor_argv);
         }
         let mut out = Vec::new();
-        let aof_ref = aof_pcall;
+        let aof_ref = aof_pcall.as_deref();
         // The reply is converted to Lua from RESP2, whatever the client
         // speaks (see `resp_bytes_to_lua`).
         let prev_resp3 = crate::connection::CURRENT_CLIENT_RESP3.replace(false);
-        crate::connection::execute_local_command(
-            &cmd,
-            &mut db_pcall.borrow_mut(),
-            &mut out,
-            aof_ref,
-        );
+        script_execute(&cmd, &mut db_pcall.borrow_mut(), &mut out, aof_ref);
         crate::connection::CURRENT_CLIENT_RESP3.set(prev_resp3);
 
         if out.starts_with(b"-") {
@@ -3331,14 +3778,14 @@ mod tests {
         assert_eq!(lib_name, "testlib");
 
         let db = Rc::new(RefCell::new(ShardDb::new(6379)));
-        let aof = RefCell::new(AofWriter::new_in_memory());
+        let aof = Rc::new(RefCell::new(AofWriter::new_in_memory()));
 
         let res = call_function(
             "test_set",
             &[Bytes::from("test_key")],
             &[Bytes::from("test_val")],
             &db,
-            Some(&aof),
+            Some(aof.clone()),
             false,
         );
         assert!(res.is_ok());
