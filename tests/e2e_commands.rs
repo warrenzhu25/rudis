@@ -14447,7 +14447,10 @@ fn test_noscript_errorstat_after_script_error_e2e() {
 fn test_info_used_memory_peak_e2e() {
     let port = 19964u16;
     let port_s = port.to_string();
-    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &port_s, "--threads", "2", "--no-pin"],
+        port,
+    ));
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mem = |c: &mut TcpStream, field: &str| -> String {
@@ -14480,19 +14483,21 @@ fn test_info_used_memory_peak_e2e() {
     let before = now();
     let big = "a".repeat(8 << 20);
     assert_eq!(resp_cmd(&mut c, &["SET", "big", &big]), "+OK\r\n");
-    // The 100 ms cron samples usage too: let it see the settled usage
-    // (query buffer released, value counted) before reading the peak, or a
-    // later sample may still raise it while `big` exists.
-    thread::sleep(Duration::from_millis(350));
     let peak = num(&mut c, "used_memory_peak");
     assert!(peak >= 8 << 20, "peak {peak}");
     assert!(num(&mut c, "used_memory_peak_time") >= before);
     assert!(!mem(&mut c, "used_memory_peak_human").is_empty());
 
-    // Usage drops, the peak stays.
+    // Usage drops, the peak stays. Within a few KB: the big value may be
+    // freed a moment after DEL replies (deferred drop), so the SET of
+    // `small` can land while it is still counted and nudge the peak.
     assert_eq!(resp_cmd(&mut c, &["DEL", "big"]), ":1\r\n");
     assert_eq!(resp_cmd(&mut c, &["SET", "small", "x"]), "+OK\r\n");
-    assert_eq!(num(&mut c, "used_memory_peak"), peak);
+    let after = num(&mut c, "used_memory_peak");
+    assert!(
+        after >= peak && after - peak < 64 << 10,
+        "peak {peak} -> {after}"
+    );
     let perc = mem(&mut c, "used_memory_peak_perc");
     let perc: f64 = perc.trim_end_matches('%').parse().unwrap();
     assert!(perc < 100.0, "{perc}");
@@ -14504,7 +14509,7 @@ fn test_info_used_memory_peak_e2e() {
         reset < peak && reset >= num(&mut c, "used_memory") / 2,
         "{reset} vs {peak}"
     );
-    shutdown_and_wait(port, &mut srv);
+    shutdown_and_wait(port, &mut srv.0);
 }
 
 /// RESTORE IDLETIME / FREQ set the key's LRU idle time / LFU counter (under
