@@ -9925,6 +9925,30 @@ fn take_simple_replies(buf: &[u8], replies: &mut Vec<Result<(), String>>) -> usi
     pos
 }
 
+/// Like Redis (`flushAllDataAndResetRDB`), with save points configured
+/// FLUSHALL saves the now-empty dataset right away: otherwise the snapshot
+/// on disk still held the flushed keys, and a crash or kill before the
+/// next save brought them all back on restart. A BGSAVE that FLUSHALL just
+/// aborted may still be winding down, so this waits for it briefly.
+async fn save_empty_rdb_after_flushall(router: &Router) {
+    if crate::config::save_points(router.base_port).is_empty() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match router.save_rdb().await {
+            Ok(()) => return,
+            Err(e) if e.contains("in progress") && std::time::Instant::now() < deadline => {
+                monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Err(e) => {
+                crate::log_warning!("FLUSHALL: saving the empty dataset failed: {}", e);
+                return;
+            }
+        }
+    }
+}
+
 /// How a deletion the server makes on its own (SET with a past expiry,
 /// RESTORE of an expired key, SPOP of a whole set) is replicated: DEL, or
 /// UNLINK under `lazyfree-lazy-server-del`, as in Redis.
@@ -18903,6 +18927,7 @@ async fn execute_command_inner(
                 // in-progress BGSAVE and clears the synthetic delay flag.
                 RDB_BGSAVE_ABORTED.store(true, std::sync::atomic::Ordering::SeqCst);
                 RDB_BGSAVE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
+                save_empty_rdb_after_flushall(router).await;
             } else {
                 router.flushdb().await;
             }

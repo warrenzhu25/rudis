@@ -5870,3 +5870,56 @@ fn test_xsetid_entriesadded_clamps_group_entries_read_e2e() {
     shutdown_and_wait(port, &mut srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// With RDB save points configured, FLUSHALL saves the empty dataset right
+/// away, as Redis does: a crash after it doesn't bring the flushed keys
+/// back from the previous snapshot. The old snapshot stayed on disk, so
+/// kill -9 + restart restored everything FLUSHALL had removed (also when
+/// FLUSHALL ran inside MULTI/EXEC).
+#[test]
+fn test_flushall_with_save_points_survives_crash_e2e() {
+    let port = 19976u16;
+    let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ps, ds) = (port.to_string(), dir.to_str().unwrap().to_string());
+    let args = ["--port", &ps, "--threads", "2", "--no-pin", "--dir", &ds];
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    for in_multi in [false, true] {
+        let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+        let mut c = connect();
+        let save = resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "save", "3600 1 300 100 60 10000"],
+        );
+        assert_eq!(save, "+OK\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SET", "k1", "v"]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SET", "k2", "v"]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+        if in_multi {
+            assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+            assert_eq!(resp_cmd(&mut c, &["FLUSHALL"]), "+QUEUED\r\n");
+            assert_eq!(resp_cmd(&mut c, &["EXEC"]), "*1\r\n+OK\r\n");
+        } else {
+            assert_eq!(resp_cmd(&mut c, &["FLUSHALL"]), "+OK\r\n");
+        }
+        let info = resp_cmd(&mut c, &["INFO", "persistence"]);
+        assert!(info.contains("rdb_changes_since_last_save:0\r\n"), "{info}");
+        // Crash.
+        let _ = srv.0.kill();
+        let _ = srv.0.wait();
+        let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+        let mut c = connect();
+        assert_eq!(
+            resp_cmd(&mut c, &["DBSIZE"]),
+            ":0\r\n",
+            "in_multi={in_multi}"
+        );
+        shutdown_and_wait(port, &mut srv.0);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
