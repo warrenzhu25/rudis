@@ -934,3 +934,65 @@ fn test_config_set_maxmemory_evicts_immediately_e2e() {
     );
     shutdown_and_wait(port, &mut srv.0);
 }
+
+/// CLIENT REPLY OFF / SKIP hold for a subscribed client too, as in Redis:
+/// subscription confirmations and messages (pushes) still arrive, other
+/// replies (PING) don't. A subscribed client ignored its reply mode.
+#[test]
+fn test_client_reply_off_skip_in_subscribed_mode_e2e() {
+    let port = 19981u16;
+    let ps = port.to_string();
+    let args = ["--port", &ps, "--threads", "2", "--no-pin"];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut sub = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sub.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let send = |s: &mut TcpStream, args: &[&str]| {
+        s.write_all(&format_resp_cmd(args)).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+    };
+    let drain = |s: &mut TcpStream| -> String {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = s.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+    send(&mut sub, &["HELLO", "3"]);
+    drain(&mut sub);
+    send(&mut sub, &["SSUBSCRIBE", "ch"]);
+    assert!(drain(&mut sub).contains("ssubscribe"));
+
+    send(&mut sub, &["CLIENT", "REPLY", "OFF"]);
+    send(&mut sub, &["PING"]);
+    assert_eq!(resp_cmd(&mut c, &["SPUBLISH", "ch", "hello"]), ":1\r\n");
+    send(&mut sub, &["PING"]);
+    let got = drain(&mut sub);
+    assert!(!got.contains("PONG") && !got.contains("pong"), "{got}");
+    assert!(got.contains("smessage") && got.contains("hello"), "{got}");
+
+    // SKIP drops just the next reply.
+    send(&mut sub, &["CLIENT", "REPLY", "ON"]);
+    assert_eq!(drain(&mut sub), "+OK\r\n");
+    send(&mut sub, &["CLIENT", "REPLY", "SKIP"]);
+    send(&mut sub, &["PING"]);
+    send(&mut sub, &["PING"]);
+    let got = drain(&mut sub);
+    assert_eq!(
+        got.matches("PONG").count() + got.matches("pong").count(),
+        1,
+        "{got}"
+    );
+
+    // Unsubscribing still confirms under OFF.
+    send(&mut sub, &["CLIENT", "REPLY", "OFF"]);
+    send(&mut sub, &["SUNSUBSCRIBE", "ch"]);
+    assert!(drain(&mut sub).contains("sunsubscribe"));
+    shutdown_and_wait(port, &mut srv.0);
+}

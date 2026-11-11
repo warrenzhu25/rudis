@@ -7439,7 +7439,68 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
     let mut authenticated = true;
     let mut auth_user = auth_user;
 
+    /// [`handle_pubsub_cmd_inner`] under CLIENT REPLY OFF/SKIP, as in
+    /// Redis: subscription confirmations are pushes and always go out, every
+    /// other reply (PING's PONG, errors) is dropped. A subscribed client
+    /// ignored its reply mode and still got PONG.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_pubsub_cmd(
+        cmd: Command,
+        router: &Router,
+        client_id: u64,
+        client_registry: &Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+        write_tx: &crate::pubsub::SubscriberTx,
+        in_multi: &mut bool,
+        tx_queue: &mut Vec<Command>,
+        out: &mut Vec<u8>,
+        asking: &mut bool,
+        authenticated: &mut bool,
+        auth_user: &mut String,
+    ) -> bool {
+        let mode = client_registry
+            .borrow()
+            .get(&client_id)
+            .map_or(crate::resp::ClientReplyMode::On, |c| c.reply_mode);
+        let sets_mode = matches!(cmd, Command::Client(ClientSubcommand::Reply(_)));
+        let pushes = matches!(
+            cmd,
+            Command::Subscribe(_)
+                | Command::Psubscribe(_)
+                | Command::Ssubscribe(_)
+                | Command::Unsubscribe(_)
+                | Command::Punsubscribe(_)
+                | Command::Sunsubscribe(_)
+        );
+        let start = out.len();
+        let close = handle_pubsub_cmd_inner(
+            cmd,
+            router,
+            client_id,
+            client_registry,
+            write_tx,
+            in_multi,
+            tx_queue,
+            out,
+            asking,
+            authenticated,
+            auth_user,
+        )
+        .await;
+        if mode != crate::resp::ClientReplyMode::On && !sets_mode {
+            if !pushes {
+                out.truncate(start);
+            }
+            if mode == crate::resp::ClientReplyMode::Skip
+                && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
+            {
+                c.reply_mode = crate::resp::ClientReplyMode::On;
+            }
+        }
+        close
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_pubsub_cmd_inner(
         cmd: Command,
         router: &Router,
         client_id: u64,
