@@ -163,7 +163,7 @@ for suite in "${TARGET_SUITES[@]}"; do
     # rudis checks a subscriber's channels against its current user only.
     case "$suite" in
         unit/acl | unit/gcra | unit/type/stream | unit/type/stream-cgroups | unit/type/hash | \
-            unit/hyperloglog | unit/protocol | unit/introspection-2 | unit/info) via_wrapper=1 ;;
+            unit/hyperloglog | unit/protocol | unit/introspection-2 | unit/info | unit/dump) via_wrapper=1 ;;
         *) via_wrapper=0 ;;
     esac
     if [ "$via_wrapper" = 1 ]; then

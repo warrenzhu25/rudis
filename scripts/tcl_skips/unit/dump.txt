@@ -1,0 +1,5 @@
+# unit/dump tests that don't apply to rudis.
+#
+# Hash templates (HIMPORT, hash-min-template-entries; Redis's
+# unit/type/hash-templates) are not implemented.
+MIGRATE can correctly transfer template-encoded hashes
