@@ -751,3 +751,144 @@ fn test_subscribe_refused_over_maxmemory_e2e() {
     assert!(resp_cmd(&mut c, &["SUBSCRIBE", "ch"]).contains("subscribe"));
     shutdown_and_wait(port, &mut srv);
 }
+
+/// Hash field TTL commands publish their keyspace events, as in Redis 7.4+:
+/// HEXPIRE & co `hexpire` (or `hdel` when a past time deletes fields, then
+/// `del` if the hash went), HPERSIST `hpersist`, HGETEX the event of what it
+/// changed, HSETEX `hset` then `hexpire`/`hdel`, HGETDEL `hdel` (+ `del`),
+/// and fields removed by expiry one `hexpired` per key (+ `del`), lazily or
+/// by the active cycle. None of these were published, so subscribers (and
+/// the Redis unit/pubsub suite) waited forever.
+#[test]
+fn test_hash_field_ttl_keyspace_events_e2e() {
+    let port = 19977u16;
+    let ps = port.to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--enable-debug-command",
+        "yes",
+    ];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "notify-keyspace-events", "Khg"]),
+        "+OK\r\n"
+    );
+    let mut sub = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sub.set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
+    let r = resp_cmd(&mut sub, &["SUBSCRIBE", "__keyspace@0__:h"]);
+    assert!(r.contains("subscribe"), "{r}");
+    // The events published since the last call, in order.
+    let mut events = || -> Vec<String> {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 65536];
+        while let Ok(n) = sub.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let parts: Vec<&str> = text.split("\r\n").collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 6 < parts.len() {
+            if parts[i] == "*3" && parts[i + 2] == "message" {
+                out.push(parts[i + 6].to_string());
+                i += 7;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    };
+    let run = |c: &mut TcpStream, args: &[&str]| {
+        let r = resp_cmd(c, args);
+        assert!(!r.starts_with('-'), "{args:?}: {r}");
+    };
+    let far = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 999_999)
+        .to_string();
+
+    run(
+        &mut c,
+        &["HSET", "h", "a", "1", "b", "2", "c", "3", "d", "4"],
+    );
+    assert_eq!(events(), ["hset"]);
+    run(&mut c, &["HEXPIRE", "h", "999999", "FIELDS", "1", "a"]);
+    run(&mut c, &["HEXPIREAT", "h", &far, "NX", "FIELDS", "1", "b"]);
+    run(&mut c, &["HPEXPIRE", "h", "999999", "FIELDS", "1", "a"]);
+    run(&mut c, &["HPERSIST", "h", "FIELDS", "1", "a"]);
+    run(&mut c, &["HPEXPIRE", "h", "0", "FIELDS", "1", "a"]);
+    assert_eq!(
+        events(),
+        ["hexpire", "hexpire", "hexpire", "hpersist", "hdel"]
+    );
+    // Nothing changed: no event.
+    run(&mut c, &["HPERSIST", "h", "FIELDS", "1", "c"]);
+    run(&mut c, &["HEXPIRE", "h", "100", "NX", "FIELDS", "1", "b"]);
+    assert!(events().is_empty());
+
+    // Active expiry: one hexpired.
+    run(&mut c, &["HPEXPIRE", "h", "500", "FIELDS", "2", "b", "c"]);
+    assert_eq!(events(), ["hexpire"]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut got = Vec::new();
+    while got.is_empty() && std::time::Instant::now() < deadline {
+        got = events();
+    }
+    assert_eq!(got, ["hexpired"]);
+
+    // HSETEX / HGETEX / HGETDEL.
+    run(
+        &mut c,
+        &["HSETEX", "h", "PX", "999999", "FIELDS", "1", "e", "5"],
+    );
+    assert_eq!(events(), ["hset", "hexpire"]);
+    run(&mut c, &["HGETEX", "h", "PERSIST", "FIELDS", "1", "e"]);
+    run(&mut c, &["HGETEX", "h", "EXAT", &far, "FIELDS", "1", "e"]);
+    run(&mut c, &["HGETEX", "h", "PX", "0", "FIELDS", "1", "e"]);
+    assert_eq!(events(), ["hpersist", "hexpire", "hdel"]);
+    run(&mut c, &["HGETDEL", "h", "FIELDS", "1", "d"]);
+    assert_eq!(events(), ["hdel", "del"]);
+
+    // Lazy expiry inside a command: hexpired first, then the command's own
+    // event; the last field going takes the key with it.
+    run(&mut c, &["HSETEX", "h", "FIELDS", "2", "x", "1", "y", "2"]);
+    run(&mut c, &["HSETEX", "h", "PX", "0", "FIELDS", "1", "z", "3"]);
+    assert_eq!(events(), ["hset", "hset", "hdel"]);
+    run(&mut c, &["DEBUG", "SET-ACTIVE-EXPIRE", "0"]);
+    run(&mut c, &["HPEXPIRE", "h", "5", "FIELDS", "1", "x"]);
+    std::thread::sleep(Duration::from_millis(30));
+    run(&mut c, &["HGETDEL", "h", "FIELDS", "1", "y"]);
+    assert_eq!(events(), ["hexpire", "hexpired", "hdel", "del"]);
+    // HGET lazily expiring the last field reports only `del` (as Redis).
+    run(&mut c, &["HSET", "h", "only", "1"]);
+    run(&mut c, &["HPEXPIRE", "h", "5", "FIELDS", "1", "only"]);
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(resp_cmd(&mut c, &["HGET", "h", "only"]), "$-1\r\n");
+    assert_eq!(events(), ["hset", "hexpire", "del"]);
+    // HSETEX FNX over the only (expired) field recreates the hash: no `del`.
+    run(&mut c, &["HSET", "h", "f", "1"]);
+    run(&mut c, &["HPEXPIRE", "h", "5", "FIELDS", "1", "f"]);
+    std::thread::sleep(Duration::from_millis(30));
+    let r = resp_cmd(
+        &mut c,
+        &[
+            "HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "2",
+        ],
+    );
+    assert_eq!(r, ":1\r\n");
+    assert_eq!(events(), ["hset", "hexpire", "hexpired", "hset", "hexpire"]);
+    run(&mut c, &["DEBUG", "SET-ACTIVE-EXPIRE", "1"]);
+    shutdown_and_wait(port, &mut srv.0);
+}

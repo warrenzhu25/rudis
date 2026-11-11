@@ -9949,6 +9949,59 @@ async fn save_empty_rdb_after_flushall(router: &Router) {
     }
 }
 
+// Keyspace events of the hash commands. Kept out of line: in debug builds
+// `execute_local_command` reserves stack for every arm's locals, and
+// inlining these pushed deep call chains over the test threads' stack.
+
+/// HEXPIRE & co: one event, `hdel` if a past time deleted fields (then
+/// `del` if the hash went), else `hexpire` if any deadline was set (Redis).
+#[inline(never)]
+fn notify_hexpire_result(db: &mut ShardDb, key: &[u8], res: &[i64]) {
+    if res.contains(&2) {
+        notify_hash_event_then_del(db, key, "hdel");
+    } else if res.contains(&1) {
+        notify_keyspace_event(NOTIFY_HASH, "hexpire", key);
+    }
+}
+
+/// `event` on hash `key`, then `del` if it was an `hdel` that emptied it.
+#[inline(never)]
+fn notify_hash_event_then_del(db: &mut ShardDb, key: &[u8], event: &str) {
+    notify_keyspace_event(NOTIFY_HASH, event, key);
+    if event == "hdel" {
+        notify_del_if_gone(db, key);
+    }
+}
+
+/// `del` for `key` if it no longer exists.
+#[inline(never)]
+fn notify_del_if_gone(db: &mut ShardDb, key: &[u8]) {
+    if !db.exists(key) {
+        notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+    }
+}
+
+/// HSETEX that set its fields: `hset`, then the deadline's event, `hexpire`,
+/// or for a time already passed `hdel` (+ `del`): the fields are gone.
+#[inline(never)]
+fn notify_hsetex_applied(db: &mut ShardDb, key: &[u8], expire: &crate::resp::HFieldExpireOpt) {
+    notify_keyspace_event(NOTIFY_HASH, "hset", key);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let past = match expire {
+        crate::resp::HFieldExpireOpt::ExMs(ms) => Some(*ms <= 0),
+        crate::resp::HFieldExpireOpt::ExAtMs(ms) => Some(*ms <= now_ms),
+        _ => None,
+    };
+    match past {
+        Some(true) => notify_hash_event_then_del(db, key, "hdel"),
+        Some(false) => notify_keyspace_event(NOTIFY_HASH, "hexpire", key),
+        None => {}
+    }
+}
+
 /// How a deletion the server makes on its own (SET with a past expiry,
 /// RESTORE of an expired key, SPOP of a whole set) is replicated: DEL, or
 /// UNLINK under `lazyfree-lazy-server-del`, as in Redis.
@@ -22478,10 +22531,7 @@ pub fn execute_local_command(
                     Ok(count) => {
                         if count > 0 {
                             record_change!(cmd);
-                            notify_keyspace_event(NOTIFY_HASH, "hdel", key);
-                            if !db.exists(key) {
-                                notify_keyspace_event(NOTIFY_GENERIC, "del", key);
-                            }
+                            notify_hash_event_then_del(db, key, "hdel");
                         }
                         out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                     }
@@ -22584,6 +22634,7 @@ pub fn execute_local_command(
                     Ok((vals, deleted_fields)) => {
                         if !deleted_fields.is_empty() {
                             record_change!(cmd);
+                            notify_hash_event_then_del(db, key, "hdel");
                         }
                         out.extend_from_slice(format!("*{}\r\n", vals.len()).as_bytes());
                         for v in vals {
@@ -28561,6 +28612,7 @@ pub fn execute_local_command(
                 {
                     Ok(res) => {
                         record_change!(cmd);
+                        notify_hexpire_result(db, key, &res);
                         write_resp_array_header(out, res.len());
                         for code in res {
                             write_resp_integer(out, code);
@@ -28591,6 +28643,9 @@ pub fn execute_local_command(
                 match db.table.hpersist(key, fields) {
                     Ok(res) => {
                         record_change!(cmd);
+                        if res.contains(&1) {
+                            notify_hash_event_then_del(db, key, "hpersist");
+                        }
                         write_resp_array_header(out, res.len());
                         for code in res {
                             write_resp_integer(out, code);
@@ -28606,9 +28661,10 @@ pub fn execute_local_command(
                 fields,
             } => {
                 match db.table.hgetex(key, *expire, fields) {
-                    Ok((vals, modified)) => {
-                        if modified {
+                    Ok((vals, event)) => {
+                        if let Some(event) = event {
                             record_change!(cmd);
+                            notify_hash_event_then_del(db, key, event);
                         }
                         write_resp_array_header(out, vals.len());
                         for v in vals {
@@ -28628,6 +28684,7 @@ pub fn execute_local_command(
                 expire,
                 pairs,
             } => {
+                let existed = db.exists(key);
                 match db
                     .table
                     .hsetex(key.clone(), *condition, *expire, pairs.clone())
@@ -28635,8 +28692,14 @@ pub fn execute_local_command(
                     Ok(applied) => {
                         if applied {
                             record_change!(cmd);
+                            notify_hsetex_applied(db, key, expire);
                             write_resp_integer(out, 1);
                         } else {
+                            // Nothing set, but expired fields may have been
+                            // the last ones: the hash is gone.
+                            if existed {
+                                notify_del_if_gone(db, key);
+                            }
                             write_resp_integer(out, 0);
                         }
                     }
