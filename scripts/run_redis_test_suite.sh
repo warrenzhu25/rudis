@@ -185,9 +185,6 @@ for suite in "${TARGET_SUITES[@]}"; do
     #   connection on the busy script's shard gets no reply (not even
     #   -BUSY) and SCRIPT KILL / FUNCTION KILL / SHUTDOWN NOSAVE work only
     #   from another shard's connection; with --threads 1, never.
-    # - "Subkey notifications": not implemented (hash-field keyspace
-    #   events, notify-keyspace-events S); the tests wait for messages
-    #   that never come.
     if tclsh test_helper.tcl \
         --host 127.0.0.1 \
         --port "$PORT" \
@@ -197,7 +194,6 @@ for suite in "${TARGET_SUITES[@]}"; do
         --skiptest "/.*script timeout.*" \
         --skiptest "/.*test function kill$" \
         --skiptest "/.*kill not working on.*" \
-        --skiptest "/.*Subkey notifications.*" \
         --skiptest "/.*Timedout.*" \
         --clients "$CLIENTS" \
         ${TCL_EXTRA:-} \
