@@ -1072,3 +1072,141 @@ fn test_shutdown_refuses_new_connections_once_replied_e2e() {
     assert!(r.is_err(), "connected after SHUTDOWN replied");
     let _ = srv.0.wait();
 }
+
+/// Scripts share one Lua state per thread now, so nothing one script does
+/// may reach the next: library tables, globals (also via rawset and
+/// setmetatable) and redis.setresp are protected or reset per run.
+#[test]
+fn test_reused_lua_state_does_not_leak_between_scripts_e2e() {
+    for (port, threads) in [(20314u16, "1"), (20315u16, "2")] {
+        let ps = port.to_string();
+        let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+            &["--port", &ps, "--threads", threads, "--no-pin"],
+            port,
+        ));
+        let mut c = connect_busy(port, 5);
+        for script in [
+            "string.rep = nil",
+            "table.insert = nil",
+            "rawset(_G, 'leak', 1)",
+            "rawset(string, 'rep', nil)",
+            "setmetatable(string, {})",
+            "getmetatable(string).__index = {}",
+            "getmetatable('').__index = {}",
+            "rawset(getmetatable(''), 'leak', 1)",
+        ] {
+            let r = resp_cmd(&mut c, &["EVAL", script, "0"]);
+            assert!(
+                r.contains("Attempt to modify a readonly table"),
+                "{threads}: {script}: {r}"
+            );
+        }
+        assert_eq!(
+            resp_cmd(&mut c, &["EVAL", "return string.rep('ab', 2)", "0"]),
+            "$4\r\nabab\r\n"
+        );
+        let r = resp_cmd(&mut c, &["EVAL", "return leak", "0"]);
+        assert!(r.contains("nonexistent global variable 'leak'"), "{r}");
+        // RESP3 set by one script is gone in the next: a map reply comes
+        // back as a RESP2 flat array again.
+        let resp3 = "redis.setresp(3) return redis.call('HGETALL', KEYS[1])";
+        let resp2 = "return redis.call('HGETALL', KEYS[1])";
+        assert_eq!(resp_cmd(&mut c, &["HSET", "h", "f", "v"]), ":1\r\n");
+        resp_cmd(&mut c, &["EVAL", resp3, "1", "h"]);
+        assert_eq!(
+            resp_cmd(&mut c, &["EVAL", resp2, "1", "h"]),
+            "*2\r\n$1\r\nf\r\n$1\r\nv\r\n"
+        );
+        // KEYS / ARGV are each run's own.
+        assert_eq!(
+            resp_cmd(
+                &mut c,
+                &["EVAL", "return {KEYS[1], ARGV[1]}", "1", "h", "a1"]
+            ),
+            "*2\r\n$1\r\nh\r\n$2\r\na1\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["EVAL", "return {#KEYS, #ARGV}", "0"]),
+            "*2\r\n:0\r\n:0\r\n"
+        );
+        shutdown_and_wait(port, &mut srv.0);
+    }
+}
+
+/// FCALL runs a library's current code: a library replaced by FUNCTION
+/// LOAD REPLACE, deleted, or restored is not served from a stale copy in
+/// a thread's reused Lua state; and a killed script leaves the state fit
+/// for the next one.
+#[test]
+fn test_reused_lua_state_follows_library_changes_and_kills_e2e() {
+    let port = 20316u16;
+    let (mut srv, mut c) = busy_script_server(port, "1");
+    let v1 = "#!lua name=lib\nredis.register_function('f', function() return 1 end)";
+    let v2 = "#!lua name=lib\nredis.register_function('f', function() return 2 end)";
+    assert_eq!(resp_cmd(&mut c, &["FUNCTION", "LOAD", v1]), "$3\r\nlib\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FCALL", "f", "0"]), ":1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["FUNCTION", "LOAD", "REPLACE", v2]),
+        "$3\r\nlib\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["FCALL", "f", "0"]), ":2\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FUNCTION", "DELETE", "lib"]), "+OK\r\n");
+    assert!(resp_cmd(&mut c, &["FCALL", "f", "0"]).starts_with("-ERR Function not found"));
+    assert_eq!(resp_cmd(&mut c, &["FUNCTION", "LOAD", v1]), "$3\r\nlib\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FCALL", "f", "0"]), ":1\r\n");
+
+    let mut runner = connect_busy(port, 10);
+    send_cmd(&mut runner, &["EVAL", "while true do end", "0"]);
+    wait_busy(port);
+    let mut k = connect_busy(port, 5);
+    assert_eq!(resp_cmd(&mut k, &["SCRIPT", "KILL"]), "+OK\r\n");
+    read_full_reply(&mut runner);
+    assert_eq!(resp_cmd(&mut k, &["EVAL", "return 7", "0"]), ":7\r\n");
+    assert_eq!(resp_cmd(&mut k, &["FCALL", "f", "0"]), ":1\r\n");
+    shutdown_and_wait(port, &mut srv.0);
+}
+
+/// A script flagged `allow-oom` (a function's flag, or EVAL's shebang)
+/// may write over maxmemory, as in Redis. Before, its redis.call writes
+/// still got -OOM.
+#[test]
+fn test_allow_oom_script_writes_over_maxmemory_e2e() {
+    let port = 20317u16;
+    let ps = port.to_string();
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "1", "--no-pin"],
+        port,
+    ));
+    let mut c = connect_busy(port, 5);
+    let lib = "#!lua name=f1\nredis.register_function{function_name='f1', \
+               callback=function() return redis.call('set', 'x', '1') end, flags={'allow-oom'}}";
+    assert_eq!(resp_cmd(&mut c, &["FUNCTION", "LOAD", lib]), "$2\r\nf1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "1"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["FCALL", "f1", "1", "x"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &[
+                "EVAL",
+                "#!lua flags=allow-oom\nreturn redis.call('set', KEYS[1], '2')",
+                "1",
+                "y"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    let r = resp_cmd(
+        &mut c,
+        &["EVAL", "return redis.call('set', KEYS[1], '3')", "1", "z"],
+    );
+    assert!(r.contains("OOM"), "{r}");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["GET", "y"]), "$1\r\n2\r\n");
+    shutdown_and_wait(port, &mut srv.0);
+}
