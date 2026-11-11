@@ -14929,3 +14929,58 @@ fn test_set_past_expiry_logs_del_not_set_e2e() {
     shutdown_and_wait(port, &mut srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A hash field past its deadline but not yet removed by active expiry is
+/// gone for writes too: HINCRBY / HINCRBYFLOAT start from 0 instead of
+/// resurrecting the expired value, and HSETNX sets it. They saw the old
+/// field (HINCRBY 10 -> 11, HSETNX refused) while reads hid it.
+#[test]
+fn test_hash_writes_ignore_expired_fields_e2e() {
+    let port = 19978u16;
+    let ps = port.to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--enable-debug-command",
+        "yes",
+    ];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "SET-ACTIVE-EXPIRE", "0"]),
+        "+OK\r\n"
+    );
+    let cases: [(&[&str], &str); 3] = [
+        (&["HINCRBY", "h", "f", "1"], ":1\r\n"),
+        (&["HINCRBYFLOAT", "h", "f", "1"], "$1\r\n1\r\n"),
+        (&["HSETNX", "h", "f", "new"], ":1\r\n"),
+    ];
+    // With another field left, and with the expired field the only one.
+    for only in [false, true] {
+        for (cmd, want) in cases {
+            resp_cmd(&mut c, &["DEL", "h"]);
+            assert_eq!(resp_cmd(&mut c, &["HSET", "h", "f", "10"]), ":1\r\n");
+            if !only {
+                assert_eq!(resp_cmd(&mut c, &["HSET", "h", "other", "1"]), ":1\r\n");
+            }
+            let r = resp_cmd(&mut c, &["HPEXPIRE", "h", "10", "FIELDS", "1", "f"]);
+            assert_eq!(r, "*1\r\n:1\r\n");
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(resp_cmd(&mut c, cmd), want, "{cmd:?} only={only}");
+            // The new value has no TTL.
+            assert_eq!(
+                resp_cmd(&mut c, &["HTTL", "h", "FIELDS", "1", "f"]),
+                "*1\r\n:-1\r\n"
+            );
+        }
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "SET-ACTIVE-EXPIRE", "1"]),
+        "+OK\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
+}

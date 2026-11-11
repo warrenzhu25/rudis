@@ -6677,6 +6677,11 @@ impl RudisTable {
         field: Bytes,
         value: Bytes,
     ) -> Result<usize, &'static str> {
+        // A field past its deadline is gone: it neither blocks HSETNX nor
+        // lends HINCRBY its old value (reads already skip it).
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(&key);
+        }
         let max_entries =
             crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
         let max_value =
@@ -8172,6 +8177,11 @@ impl RudisTable {
     }
 
     pub fn hincrby(&mut self, key: Bytes, field: Bytes, delta: i64) -> Result<i64, &'static str> {
+        // A field past its deadline is gone: it neither blocks HSETNX nor
+        // lends HINCRBY its old value (reads already skip it).
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(&key);
+        }
         let max_entries =
             crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
         let max_value =
@@ -8248,6 +8258,9 @@ impl RudisTable {
         field: Bytes,
         delta: f64,
     ) -> Result<f64, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(&key);
+        }
         let max_entries =
             crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
         let max_value =
