@@ -996,3 +996,407 @@ fn test_client_reply_off_skip_in_subscribed_mode_e2e() {
     assert!(drain(&mut sub).contains("sunsubscribe"));
     shutdown_and_wait(port, &mut srv.0);
 }
+
+/// The next pub/sub push on `s` (`message` / `pmessage` / `subscribe` and
+/// its parts; integers as their digits).
+fn next_push(s: &mut TcpStream) -> Vec<String> {
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut byte = [0u8; 1];
+    let mut read_line = |s: &mut TcpStream| -> Vec<u8> {
+        let mut line = Vec::new();
+        while !line.ends_with(b"\r\n") {
+            assert_eq!(s.read(&mut byte).unwrap(), 1, "connection closed");
+            line.push(byte[0]);
+        }
+        line.truncate(line.len() - 2);
+        line
+    };
+    let head = read_line(s);
+    assert_eq!(head[0], b'*', "{:?}", String::from_utf8_lossy(&head));
+    let n: usize = std::str::from_utf8(&head[1..]).unwrap().parse().unwrap();
+    let mut parts = Vec::new();
+    for _ in 0..n {
+        let line = read_line(s);
+        match line[0] {
+            b':' => parts.push(String::from_utf8(line[1..].to_vec()).unwrap()),
+            b'$' => {
+                let len: usize = std::str::from_utf8(&line[1..]).unwrap().parse().unwrap();
+                let mut arg = vec![0u8; len + 2];
+                s.read_exact(&mut arg).unwrap();
+                arg.truncate(len);
+                parts.push(String::from_utf8(arg).unwrap());
+            }
+            _ => panic!("unexpected {:?}", String::from_utf8_lossy(&line)),
+        }
+    }
+    parts
+}
+
+/// Asserts nothing more arrives on `s` for a moment.
+fn assert_no_push(s: &mut TcpStream) {
+    s.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut buf = [0u8; 4096];
+    match s.read(&mut buf) {
+        Ok(n) => panic!("unexpected push: {:?}", String::from_utf8_lossy(&buf[..n])),
+        Err(e) => assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "{e}"
+        ),
+    }
+}
+
+/// `<event>|<len>:<f>,...` for fields `<prefix>0..<prefix>{n-1}`.
+fn subkey_payload(event: &str, prefix: &str, n: usize) -> String {
+    let fields: Vec<String> = (0..n)
+        .map(|i| {
+            let f = format!("{prefix}{i}");
+            format!("{}:{f}", f.len())
+        })
+        .collect();
+    format!("{event}|{}", fields.join(","))
+}
+
+fn subscribed(port: u16, cmd: &str, channel: &str) -> TcpStream {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.write_all(&format_resp_cmd(&[cmd, channel])).unwrap();
+    let r = next_push(&mut s);
+    assert_eq!(r[0], cmd.to_lowercase(), "{r:?}");
+    s
+}
+
+/// Subkey notifications (Redis 8.8, `S`/`T`/`I`/`V`): each channel class's
+/// name and payload, one `subkeyspaceitem` message per field (also through
+/// a pattern), no item channel for a key holding a newline, and the flags'
+/// CONFIG GET round trip. Rudis published none of them.
+#[test]
+fn test_subkey_notification_channels_e2e() {
+    let port = 20500u16;
+    let ps = port.to_string();
+    let args = ["--port", &ps, "--threads", "2", "--no-pin"];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let cfg = |c: &mut TcpStream, flags: &str| {
+        assert_eq!(
+            resp_cmd(c, &["CONFIG", "SET", "notify-keyspace-events", flags]),
+            "+OK\r\n"
+        );
+        let r = resp_cmd(c, &["CONFIG", "GET", "notify-keyspace-events"]);
+        r.split("\r\n").nth(4).unwrap_or_default().to_string()
+    };
+    assert_eq!(cfg(&mut c, "Sh"), "hS");
+    assert_eq!(cfg(&mut c, "KEA$STIV"), "AKESTIV");
+    assert_eq!(cfg(&mut c, "VhIT"), "hTIV");
+    assert_eq!(cfg(&mut c, "STIVh"), "hSTIV");
+
+    let mut s = subscribed(port, "SUBSCRIBE", "__subkeyspace@0__:myhash");
+    let mut t = subscribed(port, "SUBSCRIBE", "__subkeyevent@0__:hset");
+    let mut v = subscribed(port, "SUBSCRIBE", "__subkeyspaceevent@0__:hset|myhash");
+    let mut i = subscribed(port, "SUBSCRIBE", "__subkeyspaceitem@0__:myhash\nf2");
+    let mut pi = subscribed(port, "PSUBSCRIBE", "__subkeyspaceitem@0__:*");
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["HSET", "myhash", "f1", "v1", "f2", "v2", "f1", "v3"]
+        ),
+        ":2\r\n"
+    );
+    assert_eq!(
+        next_push(&mut s),
+        ["message", "__subkeyspace@0__:myhash", "hset|2:f1,2:f2"]
+    );
+    assert_eq!(
+        next_push(&mut t),
+        ["message", "__subkeyevent@0__:hset", "6:myhash|2:f1,2:f2"]
+    );
+    assert_eq!(
+        next_push(&mut v),
+        ["message", "__subkeyspaceevent@0__:hset|myhash", "2:f1,2:f2"]
+    );
+    assert_eq!(
+        next_push(&mut i),
+        ["message", "__subkeyspaceitem@0__:myhash\nf2", "hset"]
+    );
+    for f in ["f1", "f2"] {
+        assert_eq!(
+            next_push(&mut pi),
+            [
+                "pmessage",
+                "__subkeyspaceitem@0__:*",
+                &format!("__subkeyspaceitem@0__:myhash\n{f}"),
+                "hset"
+            ]
+        );
+    }
+    // A key with a newline: no item channel, the others still publish.
+    assert_eq!(resp_cmd(&mut c, &["HSET", "a\nb", "x", "1"]), ":1\r\n");
+    assert_eq!(
+        next_push(&mut t),
+        ["message", "__subkeyevent@0__:hset", "3:a\nb|1:x"]
+    );
+    assert_no_push(&mut pi);
+    // Hash events only (`h`), and with `S` off nothing reaches it.
+    assert_eq!(cfg(&mut c, "TIVh"), "hTIV");
+    assert_eq!(resp_cmd(&mut c, &["HSET", "myhash", "f3", "v"]), ":1\r\n");
+    assert_eq!(
+        next_push(&mut t),
+        ["message", "__subkeyevent@0__:hset", "6:myhash|2:f3"]
+    );
+    assert_no_push(&mut s);
+    assert_eq!(cfg(&mut c, "STIVg"), "gSTIV");
+    assert_eq!(resp_cmd(&mut c, &["HSET", "myhash", "f4", "v"]), ":1\r\n");
+    assert_no_push(&mut t);
+    shutdown_and_wait(port, &mut srv.0);
+}
+
+/// The fields each hash command reports on `__subkeyspace@<db>__:<key>`:
+/// all fields given (HSET, HSETEX), the ones deleted (HDEL, HGETDEL, a past
+/// deadline), the ones whose deadline was set or removed (HEXPIRE, HPERSIST,
+/// HGETEX), the incremented one; each once, beyond the 16 kept inline.
+#[test]
+fn test_subkey_notification_hash_commands_e2e() {
+    let port = 20501u16;
+    let ps = port.to_string();
+    let args = ["--port", &ps, "--threads", "2", "--no-pin"];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "notify-keyspace-events", "Sh"]),
+        "+OK\r\n"
+    );
+    let mut s = subscribed(port, "SUBSCRIBE", "__subkeyspace@0__:h");
+    let mut run = |args: &[&str]| {
+        let r = resp_cmd(&mut c, args);
+        assert!(!r.starts_with('-'), "{args:?}: {r}");
+    };
+    let mut expect = |payload: &str| {
+        assert_eq!(
+            next_push(&mut s),
+            ["message", "__subkeyspace@0__:h", payload]
+        );
+    };
+    for n in [3usize, 32] {
+        let names: Vec<String> = (0..n).map(|i| format!("f{i}")).collect();
+        let fields: Vec<&str> = names.iter().map(String::as_str).collect();
+        let pairs: Vec<&str> = fields.iter().flat_map(|f| [*f, "v"]).collect();
+        let nstr = n.to_string();
+        let with = |head: &[&str], tail: &[&str]| -> Vec<String> {
+            head.iter().chain(tail).map(|x| x.to_string()).collect()
+        };
+        let call = |run: &mut dyn FnMut(&[&str]), v: Vec<String>| {
+            let v: Vec<&str> = v.iter().map(String::as_str).collect();
+            run(&v);
+        };
+        call(&mut run, with(&["HSET", "h"], &pairs));
+        expect(&subkey_payload("hset", "f", n));
+        call(
+            &mut run,
+            with(&["HEXPIRE", "h", "1000", "FIELDS", &nstr], &fields),
+        );
+        expect(&subkey_payload("hexpire", "f", n));
+        call(&mut run, with(&["HPERSIST", "h", "FIELDS", &nstr], &fields));
+        expect(&subkey_payload("hpersist", "f", n));
+        call(
+            &mut run,
+            with(&["HGETEX", "h", "EX", "1000", "FIELDS", &nstr], &fields),
+        );
+        expect(&subkey_payload("hexpire", "f", n));
+        call(
+            &mut run,
+            with(&["HGETEX", "h", "PERSIST", "FIELDS", &nstr], &fields),
+        );
+        expect(&subkey_payload("hpersist", "f", n));
+        call(
+            &mut run,
+            with(&["HGETEX", "h", "PX", "0", "FIELDS", &nstr], &fields),
+        );
+        expect(&subkey_payload("hdel", "f", n));
+        call(
+            &mut run,
+            with(&["HSETEX", "h", "EX", "1000", "FIELDS", &nstr], &pairs),
+        );
+        expect(&subkey_payload("hset", "f", n));
+        expect(&subkey_payload("hexpire", "f", n));
+        call(
+            &mut run,
+            with(&["HEXPIREAT", "h", "1", "FIELDS", &nstr], &fields),
+        );
+        expect(&subkey_payload("hdel", "f", n));
+        call(
+            &mut run,
+            with(&["HSETEX", "h", "PX", "0", "FIELDS", &nstr], &pairs),
+        );
+        expect(&subkey_payload("hset", "f", n));
+        expect(&subkey_payload("hdel", "f", n));
+        call(&mut run, with(&["HSET", "h"], &pairs));
+        expect(&subkey_payload("hset", "f", n));
+        call(&mut run, with(&["HGETDEL", "h", "FIELDS", &nstr], &fields));
+        expect(&subkey_payload("hdel", "f", n));
+        call(&mut run, with(&["HSET", "h"], &pairs));
+        expect(&subkey_payload("hset", "f", n));
+        call(&mut run, with(&["HDEL", "h"], &fields));
+        expect(&subkey_payload("hdel", "f", n));
+    }
+    // HDEL lists what it deleted, each field once.
+    run(&["HSET", "h", "a", "1", "b", "2", "c", "3"]);
+    expect("hset|1:a,1:b,1:c");
+    run(&["HDEL", "h", "a", "a", "nope", "b"]);
+    expect("hdel|1:a,1:b");
+    run(&["HDEL", "h", "nope"]);
+    run(&["HINCRBY", "h", "counter", "5"]);
+    expect("hincrby|7:counter");
+    run(&["HINCRBYFLOAT", "h", "counter", "2.5"]);
+    expect("hincrbyfloat|7:counter");
+    run(&["HSETNX", "h", "c", "x"]);
+    run(&["HSETNX", "h", "newfield", "x"]);
+    expect("hset|8:newfield");
+    run(&["HMSET", "h", "m", "1"]);
+    expect("hset|1:m");
+    // Mixed HEXPIRE results: only the fields whose deadline was set.
+    run(&[
+        "HEXPIRE", "h", "1000", "NX", "FIELDS", "3", "c", "nope", "m",
+    ]);
+    expect("hexpire|1:c,1:m");
+    run(&["HEXPIRE", "h", "2000", "NX", "FIELDS", "2", "c", "counter"]);
+    expect("hexpire|7:counter");
+    run(&["HPERSIST", "h", "FIELDS", "2", "c", "newfield"]);
+    expect("hpersist|1:c");
+    drop(run);
+    assert_no_push(&mut s);
+    shutdown_and_wait(port, &mut srv.0);
+}
+
+/// Fields that expire report `hexpired` with their names, lazily (on
+/// access, in a stable order) and actively.
+#[test]
+fn test_subkey_notification_field_expiry_e2e() {
+    let port = 20502u16;
+    let ps = port.to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--enable-debug-command",
+        "yes",
+    ];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "notify-keyspace-events", "Sh"]),
+        "+OK\r\n"
+    );
+    let mut s = subscribed(port, "SUBSCRIBE", "__subkeyspace@0__:h");
+    let n = 32usize;
+    let names: Vec<String> = (0..n).map(|i| format!("f{i}")).collect();
+    let nstr = n.to_string();
+    let mut hset: Vec<&str> = vec!["HSET", "h", "keep", "v"];
+    hset.extend(names.iter().flat_map(|f| [f.as_str(), "v"]));
+    let mut hpexpire: Vec<&str> = vec!["HPEXPIRE", "h", "10", "FIELDS", &nstr];
+    hpexpire.extend(names.iter().map(String::as_str));
+    let mut hmget: Vec<&str> = vec!["HMGET", "h"];
+    hmget.extend(names.iter().map(String::as_str));
+    let skip = |s: &mut TcpStream, k: usize| {
+        for _ in 0..k {
+            next_push(s);
+        }
+    };
+
+    // Lazy.
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "SET-ACTIVE-EXPIRE", "0"]),
+        "+OK\r\n"
+    );
+    resp_cmd(&mut c, &hset);
+    resp_cmd(&mut c, &hpexpire);
+    skip(&mut s, 2);
+    thread::sleep(Duration::from_millis(100));
+    resp_cmd(&mut c, &hmget);
+    assert_eq!(
+        next_push(&mut s),
+        [
+            "message",
+            "__subkeyspace@0__:h",
+            &subkey_payload("hexpired", "f", n)
+        ]
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "SET-ACTIVE-EXPIRE", "1"]),
+        "+OK\r\n"
+    );
+
+    // Active.
+    resp_cmd(&mut c, &hset);
+    resp_cmd(&mut c, &hpexpire);
+    skip(&mut s, 2);
+    let msg = next_push(&mut s);
+    let (event, list) = msg[2].split_once('|').unwrap();
+    assert_eq!(event, "hexpired");
+    let mut got: Vec<&str> = list.split(',').collect();
+    got.sort();
+    let want_s = subkey_payload("hexpired", "f", n);
+    let mut want: Vec<&str> = want_s.split_once('|').unwrap().1.split(',').collect();
+    want.sort();
+    assert_eq!(got, want);
+    assert_eq!(resp_cmd(&mut c, &["HLEN", "h"]), ":1\r\n");
+    shutdown_and_wait(port, &mut srv.0);
+}
+
+/// A replica publishes subkey events for the writes its master sends,
+/// `hexpired` (not `hdel`) for the master's expiry of fields.
+#[test]
+fn test_subkey_notification_on_replica_e2e() {
+    let (mport, rport) = (20503u16, 20504u16);
+    let (mps, rps) = (mport.to_string(), rport.to_string());
+    let mut master = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &mps, "--threads", "2", "--no-pin"],
+        mport,
+    ));
+    let mut replica = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &rps, "--threads", "2", "--no-pin"],
+        rport,
+    ));
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &mps]),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut r);
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "SET", "notify-keyspace-events", "Sh"]),
+        "+OK\r\n"
+    );
+    let mut s = subscribed(rport, "SUBSCRIBE", "__subkeyspace@0__:myhash");
+    assert_eq!(
+        resp_cmd(
+            &mut m,
+            &["HSET", "myhash", "f1", "v1", "f2", "v2", "f3", "v3"]
+        ),
+        ":3\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut m,
+            &["HPEXPIRE", "myhash", "100", "FIELDS", "2", "f1", "f2"]
+        ),
+        "*2\r\n:1\r\n:1\r\n"
+    );
+    let ch = "__subkeyspace@0__:myhash";
+    assert_eq!(next_push(&mut s), ["message", ch, "hset|2:f1,2:f2,2:f3"]);
+    assert_eq!(next_push(&mut s), ["message", ch, "hexpire|2:f1,2:f2"]);
+    assert_eq!(next_push(&mut s), ["message", ch, "hexpired|2:f1,2:f2"]);
+    assert_eq!(resp_cmd(&mut m, &["HDEL", "myhash", "f3"]), ":1\r\n");
+    assert_eq!(next_push(&mut s), ["message", ch, "hdel|2:f3"]);
+    shutdown_and_wait(rport, &mut replica.0);
+    shutdown_and_wait(mport, &mut master.0);
+}

@@ -3365,6 +3365,21 @@ enum ExpiredFieldsEvents {
     NoDel,
 }
 
+/// Puts hash fields that expired together in a stable order (shortest
+/// first, then bytewise: `f2` before `f10`), rather than the per-key TTL
+/// map's arbitrary one. The HDEL replicated for them and the `hexpired`
+/// subkey events list them in this order, so a replica reports the same
+/// list as its master.
+fn sort_expired_fields(fields: &mut [Bytes]) {
+    if fields.len() > 1 {
+        fields.sort_unstable_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    }
+}
+
+/// HGETEX's values, and the keyspace event of the change it made with the
+/// fields changed (only collected with subkey notifications on).
+pub type HgetexOutcome = (Vec<Option<Bytes>>, Option<(&'static str, Vec<Bytes>)>);
+
 /// What a RESTORE did with its key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreOutcome {
@@ -6801,11 +6816,12 @@ impl RudisTable {
             self.hash_field_expires.remove(key);
         }
         if !expired.is_empty() {
+            sort_expired_fields(&mut expired);
             crate::replication::log_expired_fields(key, &expired);
             if let Ok(n) = self.hdel(key, &expired) {
                 add_expired_subkeys(n);
             }
-            self.notify_hash_fields_expired(key, events);
+            self.notify_hash_fields_expired(key, events, &expired);
         }
     }
 
@@ -6813,14 +6829,16 @@ impl RudisTable {
     /// one `hexpired` however many fields went, then `del` if that emptied
     /// the hash (as Redis does, on lazy and active expiry alike; HGET leaves
     /// out `hexpired` when the hash went, see `purge_expired_hash_fields_hget`).
-    fn notify_hash_fields_expired(&mut self, key: &[u8], events: ExpiredFieldsEvents) {
+    /// The subkey events list the `fields` that went.
+    fn notify_hash_fields_expired(
+        &mut self,
+        key: &[u8],
+        events: ExpiredFieldsEvents,
+        fields: &[Bytes],
+    ) {
         let gone = !self.exists(key);
         if !gone || events != ExpiredFieldsEvents::DelOnlyIfEmptied {
-            crate::connection::notify_keyspace_event(
-                crate::connection::NOTIFY_HASH,
-                "hexpired",
-                key,
-            );
+            crate::connection::notify_hash_fields_event("hexpired", key, fields);
         }
         if gone && events != ExpiredFieldsEvents::NoDel {
             crate::connection::notify_keyspace_event(crate::connection::NOTIFY_GENERIC, "del", key);
@@ -7052,7 +7070,7 @@ impl RudisTable {
         key: &[u8],
         expire: crate::resp::HFieldExpireOpt,
         fields: &[Bytes],
-    ) -> Result<(Vec<Option<Bytes>>, Option<&'static str>), &'static str> {
+    ) -> Result<HgetexOutcome, &'static str> {
         if !self.hash_field_expires.is_empty() {
             self.purge_expired_hash_fields(key);
         }
@@ -7096,8 +7114,11 @@ impl RudisTable {
             return Ok((vals, None));
         }
 
-        // The keyspace event of the change made, if any (Redis's HGETEX).
+        // The keyspace event of the change made, if any (Redis's HGETEX),
+        // and with subkey notifications on, the fields it changed.
+        let subkeys = crate::connection::subkey_notify_enabled(crate::connection::NOTIFY_HASH);
         let mut event = None;
+        let mut changed = Vec::new();
         match expire {
             crate::resp::HFieldExpireOpt::None | crate::resp::HFieldExpireOpt::KeepTtl => {}
             crate::resp::HFieldExpireOpt::Persist => {
@@ -7105,6 +7126,9 @@ impl RudisTable {
                     for f in &existing_fields {
                         if fmap.remove(f).is_some() {
                             event = Some("hpersist");
+                            if subkeys {
+                                changed.push(f.clone());
+                            }
                         }
                     }
                     if fmap.is_empty() {
@@ -7122,8 +7146,14 @@ impl RudisTable {
                 if delta_ms <= 0 {
                     event = Some("hdel");
                     let _ = self.hdel(key, &existing_fields);
+                    if subkeys {
+                        changed = existing_fields;
+                    }
                 } else {
                     event = Some("hexpire");
+                    if subkeys {
+                        changed.clone_from(&existing_fields);
+                    }
                     let new_exp = Instant::now() + Duration::from_millis(delta_ms as u64);
                     let fmap = self
                         .hash_field_expires
@@ -7136,7 +7166,7 @@ impl RudisTable {
             }
         }
 
-        Ok((vals, event))
+        Ok((vals, event.map(|e| (e, changed))))
     }
 
     pub fn hsetex(
@@ -7896,6 +7926,51 @@ impl RudisTable {
         } else {
             Ok(0)
         }
+    }
+
+    /// The `fields` of hash `key` an HDEL would delete right now, in
+    /// argument order, repeats included (for subkey notifications). Purges expired fields
+    /// first, as HDEL does, so the HDEL that follows finds the same ones.
+    pub fn hash_fields_present(&mut self, key: &[u8], fields: &[Bytes]) -> Vec<Bytes> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
+        let h = hash_key(key);
+        let Some(idx) = self.table.find(key, h) else {
+            return Vec::new();
+        };
+        if self.check_expired_slot(idx) {
+            return Vec::new();
+        }
+        let Some(entry) = self.table.get_slot(idx) else {
+            return Vec::new();
+        };
+        let mut present: Vec<Bytes> = Vec::with_capacity(fields.len());
+        for f in fields {
+            let exists = match &entry.val {
+                RudisValue::SmallHash(pairs) => pairs.get(f).is_some(),
+                RudisValue::Hash(map) => map.contains_key(f),
+                _ => return Vec::new(),
+            };
+            if exists {
+                present.push(f.clone());
+            }
+        }
+        present
+    }
+
+    /// Whether every one of `fields` of hash `key` has a deadline already
+    /// past. A read-only replica keeps such fields until
+    /// its master's HDEL for them arrives: that HDEL is their expiry.
+    pub fn hash_fields_all_past_deadline(&self, key: &[u8], fields: &[Bytes]) -> bool {
+        let Some(fmap) = self.hash_field_expires.get(key) else {
+            return false;
+        };
+        let now = Instant::now();
+        !fields.is_empty()
+            && fields
+                .iter()
+                .all(|f| fmap.get(f).is_some_and(|exp| now >= *exp))
     }
 
     pub fn hexists(&mut self, key: &[u8], field: &[u8]) -> Result<bool, &'static str> {
@@ -12608,11 +12683,12 @@ impl RudisTable {
             }
             if !expired.is_empty() {
                 evicted_fields += expired.len();
+                sort_expired_fields(&mut expired);
                 crate::replication::log_expired_fields(&key, &expired);
                 if let Ok(n) = self.hdel(&key, &expired) {
                     add_expired_subkeys(n);
                 }
-                self.notify_hash_fields_expired(&key, ExpiredFieldsEvents::Full);
+                self.notify_hash_fields_expired(&key, ExpiredFieldsEvents::Full, &expired);
             }
         }
         evicted_fields

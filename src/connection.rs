@@ -5410,6 +5410,14 @@ pub const NOTIFY_MODULE: u32 = 1 << 12; // d
 pub const NOTIFY_NEW: u32 = 1 << 13; // n
 pub const NOTIFY_OVERWRITTEN: u32 = 1 << 14; // o
 pub const NOTIFY_TYPE_CHANGED: u32 = 1 << 15; // c
+/// Subkey (hash field) notification channels. Like `K`/`E` they select
+/// where events go; the type letters (`h`) still select which events.
+pub const NOTIFY_SUBKEYSPACE: u32 = 1 << 16; // S: __subkeyspace@<db>__:<key>
+pub const NOTIFY_SUBKEYEVENT: u32 = 1 << 17; // T: __subkeyevent@<db>__:<event>
+pub const NOTIFY_SUBKEYSPACEITEM: u32 = 1 << 18; // I: __subkeyspaceitem@<db>__:<key>\n<field>
+pub const NOTIFY_SUBKEYSPACEEVENT: u32 = 1 << 19; // V: __subkeyspaceevent@<db>__:<event>|<key>
+pub const NOTIFY_SUBKEY_CHANNELS: u32 =
+    NOTIFY_SUBKEYSPACE | NOTIFY_SUBKEYEVENT | NOTIFY_SUBKEYSPACEITEM | NOTIFY_SUBKEYSPACEEVENT;
 
 pub const NOTIFY_ALL: u32 = NOTIFY_GENERIC
     | NOTIFY_STRING
@@ -5481,6 +5489,18 @@ pub fn notify_keyspace_flags_to_string(flags: u32) -> String {
     if flags & NOTIFY_KEYEVENT != 0 {
         res.push('E');
     }
+    if flags & NOTIFY_SUBKEYSPACE != 0 {
+        res.push('S');
+    }
+    if flags & NOTIFY_SUBKEYEVENT != 0 {
+        res.push('T');
+    }
+    if flags & NOTIFY_SUBKEYSPACEITEM != 0 {
+        res.push('I');
+    }
+    if flags & NOTIFY_SUBKEYSPACEEVENT != 0 {
+        res.push('V');
+    }
     if flags & NOTIFY_KEY_MISS != 0 {
         res.push('m');
     }
@@ -5511,6 +5531,10 @@ pub fn set_notify_keyspace_events_str(s: &str) {
             'n' => flags |= NOTIFY_NEW,
             'o' => flags |= NOTIFY_OVERWRITTEN,
             'c' => flags |= NOTIFY_TYPE_CHANGED,
+            'S' => flags |= NOTIFY_SUBKEYSPACE,
+            'T' => flags |= NOTIFY_SUBKEYEVENT,
+            'I' => flags |= NOTIFY_SUBKEYSPACEITEM,
+            'V' => flags |= NOTIFY_SUBKEYSPACEEVENT,
             'A' => flags |= NOTIFY_ALL,
             _ => {}
         }
@@ -5576,6 +5600,168 @@ pub fn notify_keyspace_event_sync_in_db(
             }
         }
     }
+}
+
+/// Whether events of `event_type` go to any subkey channel (`S`, `T`, `I`,
+/// `V`). One relaxed load: callers check it before collecting the fields a
+/// command touched, so with subkey notifications off nothing is collected.
+#[inline(always)]
+pub fn subkey_notify_enabled(event_type: u32) -> bool {
+    let flags = NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed);
+    flags & NOTIFY_SUBKEY_CHANNELS != 0 && flags & event_type != 0
+}
+
+/// Publishes `message` on `channel` here and on every other shard that has
+/// a subscriber (or pattern) for it, as keyspace events do.
+fn publish_notification(router: &Router, channel: &[u8], message: &[u8]) {
+    let _ = router.pubsub.borrow().publish(channel, message);
+    for (sid, sender) in router.senders.iter().enumerate() {
+        if sid != router.shard_id && router.presence_table.is_shard_interested(sid, channel) {
+            let (tx, _rx) = flume::bounded(1);
+            let _ = sender.send(ShardMessage::Publish {
+                channel: Bytes::copy_from_slice(channel),
+                message: Bytes::copy_from_slice(message),
+                responder: tx,
+            });
+        }
+    }
+}
+
+/// Appends `<len>:<bytes>`, the length-prefixed form subkey payloads use so
+/// that names holding `,` or `|` still parse.
+fn push_len_prefixed(buf: &mut Vec<u8>, s: &[u8]) {
+    use std::io::Write as _;
+    let _ = write!(buf, "{}:", s.len());
+    buf.extend_from_slice(s);
+}
+
+/// Subkey events for this thread's current db: see
+/// [`notify_subkey_event_sync_in_db`].
+pub fn notify_subkey_event<F: AsRef<[u8]>>(event_type: u32, event: &str, key: &[u8], fields: &[F]) {
+    if fields.is_empty() || !subkey_notify_enabled(event_type) {
+        return;
+    }
+    CURRENT_ROUTER.with(|cr| {
+        if let Some(router) = cr.borrow().as_ref() {
+            notify_subkey_event_sync_in_db(
+                router,
+                CURRENT_DB.get(),
+                event_type,
+                event,
+                key,
+                fields,
+            );
+        }
+    });
+}
+
+/// Subkey events (Redis 8.8): `event` changed `fields` of `key`. Each
+/// enabled channel class gets one message, listing every field once in
+/// first-seen order as `<len>:<field>` joined by `,`:
+/// - `S`: `__subkeyspace@<db>__:<key>` <- `<event>|<fields>`
+/// - `T`: `__subkeyevent@<db>__:<event>` <- `<keylen>:<key>|<fields>`
+/// - `V`: `__subkeyspaceevent@<db>__:<event>|<key>` <- `<fields>`
+/// - `I`: `__subkeyspaceitem@<db>__:<key>\n<field>` <- `<event>`, one per
+///   field; skipped for keys holding a newline, which would make the channel
+///   name ambiguous.
+///
+/// Nothing is published without fields.
+#[inline(never)]
+pub fn notify_subkey_event_sync_in_db<F: AsRef<[u8]>>(
+    router: &Router,
+    db_id: usize,
+    event_type: u32,
+    event: &str,
+    key: &[u8],
+    fields: &[F],
+) {
+    let flags = NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed);
+    if flags & NOTIFY_SUBKEY_CHANNELS == 0 || flags & event_type == 0 || fields.is_empty() {
+        return;
+    }
+    // Each field once (HDEL f f, HSET f a f b), keeping first-seen order.
+    let mut uniq: smallvec::SmallVec<[&[u8]; 16]> = smallvec::SmallVec::with_capacity(fields.len());
+    if fields.len() <= 16 {
+        for f in fields {
+            let f = f.as_ref();
+            if !uniq.contains(&f) {
+                uniq.push(f);
+            }
+        }
+    } else {
+        let mut seen: hashbrown::HashSet<&[u8]> = hashbrown::HashSet::with_capacity(fields.len());
+        for f in fields {
+            let f = f.as_ref();
+            if seen.insert(f) {
+                uniq.push(f);
+            }
+        }
+    }
+    let mut list = Vec::with_capacity(uniq.iter().map(|f| f.len() + 4).sum());
+    for (i, f) in uniq.iter().enumerate() {
+        if i > 0 {
+            list.push(b',');
+        }
+        push_len_prefixed(&mut list, f);
+    }
+    let db = db_id.to_string();
+    if flags & NOTIFY_SUBKEYSPACE != 0 {
+        let mut channel = Vec::with_capacity(20 + key.len());
+        channel.extend_from_slice(b"__subkeyspace@");
+        channel.extend_from_slice(db.as_bytes());
+        channel.extend_from_slice(b"__:");
+        channel.extend_from_slice(key);
+        let mut msg = Vec::with_capacity(event.len() + 1 + list.len());
+        msg.extend_from_slice(event.as_bytes());
+        msg.push(b'|');
+        msg.extend_from_slice(&list);
+        publish_notification(router, &channel, &msg);
+    }
+    if flags & NOTIFY_SUBKEYEVENT != 0 {
+        let mut channel = Vec::with_capacity(20 + event.len());
+        channel.extend_from_slice(b"__subkeyevent@");
+        channel.extend_from_slice(db.as_bytes());
+        channel.extend_from_slice(b"__:");
+        channel.extend_from_slice(event.as_bytes());
+        let mut msg = Vec::with_capacity(key.len() + 8 + list.len());
+        push_len_prefixed(&mut msg, key);
+        msg.push(b'|');
+        msg.extend_from_slice(&list);
+        publish_notification(router, &channel, &msg);
+    }
+    if flags & NOTIFY_SUBKEYSPACEEVENT != 0 {
+        let mut channel = Vec::with_capacity(26 + event.len() + key.len());
+        channel.extend_from_slice(b"__subkeyspaceevent@");
+        channel.extend_from_slice(db.as_bytes());
+        channel.extend_from_slice(b"__:");
+        channel.extend_from_slice(event.as_bytes());
+        channel.push(b'|');
+        channel.extend_from_slice(key);
+        publish_notification(router, &channel, &list);
+    }
+    if flags & NOTIFY_SUBKEYSPACEITEM != 0 && !key.contains(&b'\n') {
+        let mut channel = Vec::with_capacity(26 + key.len());
+        channel.extend_from_slice(b"__subkeyspaceitem@");
+        channel.extend_from_slice(db.as_bytes());
+        channel.extend_from_slice(b"__:");
+        channel.extend_from_slice(key);
+        channel.push(b'\n');
+        let prefix = channel.len();
+        for f in &uniq {
+            channel.truncate(prefix);
+            channel.extend_from_slice(f);
+            publish_notification(router, &channel, event.as_bytes());
+        }
+    }
+}
+
+/// `event` on hash `key` that touched `fields`: the keyspace event, then
+/// the subkey events. Callers pass no fields when
+/// [`subkey_notify_enabled`] is off.
+#[inline(never)]
+pub fn notify_hash_fields_event<F: AsRef<[u8]>>(event: &str, key: &[u8], fields: &[F]) {
+    notify_keyspace_event(NOTIFY_HASH, event, key);
+    notify_subkey_event(NOTIFY_HASH, event, key, fields);
 }
 
 pub fn notify_set_key_events(router: &Router, prev_kind: &str, new_kind: &str, key: &[u8]) {
@@ -10016,22 +10202,70 @@ async fn save_empty_rdb_after_flushall(router: &Router) {
 
 /// HEXPIRE & co: one event, `hdel` if a past time deleted fields (then
 /// `del` if the hash went), else `hexpire` if any deadline was set (Redis).
+/// The subkey events list the fields with that result.
 #[inline(never)]
-fn notify_hexpire_result(db: &mut ShardDb, key: &[u8], res: &[i64]) {
+fn notify_hexpire_result(db: &mut ShardDb, key: &[u8], fields: &[Bytes], res: &[i64]) {
+    let subkeys = subkey_notify_enabled(NOTIFY_HASH);
+    let with_code = |code: i64| -> smallvec::SmallVec<[&[u8]; 16]> {
+        if !subkeys {
+            return smallvec::SmallVec::new();
+        }
+        fields
+            .iter()
+            .zip(res)
+            .filter(|(_, c)| **c == code)
+            .map(|(f, _)| f.as_ref())
+            .collect()
+    };
     if res.contains(&2) {
-        notify_hash_event_then_del(db, key, "hdel");
+        notify_hash_event_then_del(db, key, "hdel", &with_code(2));
     } else if res.contains(&1) {
-        notify_keyspace_event(NOTIFY_HASH, "hexpire", key);
+        notify_hash_fields_event("hexpire", key, &with_code(1));
     }
 }
 
-/// `event` on hash `key`, then `del` if it was an `hdel` that emptied it.
+/// `event` on hash `key` (subkey events for `fields`), then `del` if it
+/// was an `hdel` or `hexpired` that emptied it.
 #[inline(never)]
-fn notify_hash_event_then_del(db: &mut ShardDb, key: &[u8], event: &str) {
-    notify_keyspace_event(NOTIFY_HASH, event, key);
-    if event == "hdel" {
+fn notify_hash_event_then_del<F: AsRef<[u8]>>(
+    db: &mut ShardDb,
+    key: &[u8],
+    event: &str,
+    fields: &[F],
+) {
+    notify_hash_fields_event(event, key, fields);
+    if event == "hdel" || event == "hexpired" {
         notify_del_if_gone(db, key);
     }
+}
+
+/// What the HDEL of `fields` about to run reports: its event, and with
+/// subkey notifications on, the fields it deletes. A read-only replica
+/// reports `hexpired` for its master's HDEL of fields already past their
+/// deadline: that is how their expiry reaches it.
+#[inline(never)]
+fn hdel_event_and_fields(
+    db: &mut ShardDb,
+    key: &[u8],
+    fields: &[Bytes],
+) -> (&'static str, Vec<Bytes>) {
+    if NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return ("hdel", Vec::new());
+    }
+    let event = if !db.table.hash_field_expires.is_empty()
+        && crate::replication::hide_expired_keys()
+        && db.table.hash_fields_all_past_deadline(key, fields)
+    {
+        "hexpired"
+    } else {
+        "hdel"
+    };
+    let present = if subkey_notify_enabled(NOTIFY_HASH) {
+        db.table.hash_fields_present(key, fields)
+    } else {
+        Vec::new()
+    };
+    (event, present)
 }
 
 /// `del` for `key` if it no longer exists.
@@ -10043,10 +10277,21 @@ fn notify_del_if_gone(db: &mut ShardDb, key: &[u8]) {
 }
 
 /// HSETEX that set its fields: `hset`, then the deadline's event, `hexpire`,
-/// or for a time already passed `hdel` (+ `del`): the fields are gone.
+/// or for a time already passed `hdel` (+ `del`): the fields are gone. The
+/// subkey events list all the fields set.
 #[inline(never)]
-fn notify_hsetex_applied(db: &mut ShardDb, key: &[u8], expire: &crate::resp::HFieldExpireOpt) {
-    notify_keyspace_event(NOTIFY_HASH, "hset", key);
+fn notify_hsetex_applied(
+    db: &mut ShardDb,
+    key: &[u8],
+    expire: &crate::resp::HFieldExpireOpt,
+    pairs: &[(Bytes, Bytes)],
+) {
+    let fields: smallvec::SmallVec<[&[u8]; 16]> = if subkey_notify_enabled(NOTIFY_HASH) {
+        pairs.iter().map(|(f, _)| f.as_ref()).collect()
+    } else {
+        smallvec::SmallVec::new()
+    };
+    notify_hash_fields_event("hset", key, &fields);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -10057,9 +10302,38 @@ fn notify_hsetex_applied(db: &mut ShardDb, key: &[u8], expire: &crate::resp::HFi
         _ => None,
     };
     match past {
-        Some(true) => notify_hash_event_then_del(db, key, "hdel"),
-        Some(false) => notify_keyspace_event(NOTIFY_HASH, "hexpire", key),
+        Some(true) => notify_hash_event_then_del(db, key, "hdel", &fields),
+        Some(false) => notify_hash_fields_event("hexpire", key, &fields),
         None => {}
+    }
+}
+
+/// HPERSIST that removed deadlines: `hpersist`, the subkey events listing
+/// the fields that lost theirs.
+#[inline(never)]
+fn notify_hpersist_result(key: &[u8], fields: &[Bytes], res: &[i64]) {
+    let persisted: smallvec::SmallVec<[&[u8]; 16]> = if subkey_notify_enabled(NOTIFY_HASH) {
+        fields
+            .iter()
+            .zip(res)
+            .filter(|(_, c)| **c == 1)
+            .map(|(f, _)| f.as_ref())
+            .collect()
+    } else {
+        smallvec::SmallVec::new()
+    };
+    notify_hash_fields_event("hpersist", key, &persisted);
+}
+
+/// HSET / HMSET: `hset`, the subkey events listing every field given.
+#[inline(never)]
+fn notify_hset_fields(key: &[u8], pairs: &[(Bytes, Bytes)]) {
+    if subkey_notify_enabled(NOTIFY_HASH) {
+        let fields: smallvec::SmallVec<[&[u8]; 16]> =
+            pairs.iter().map(|(f, _)| f.as_ref()).collect();
+        notify_hash_fields_event("hset", key, &fields);
+    } else {
+        notify_keyspace_event(NOTIFY_HASH, "hset", key);
     }
 }
 
@@ -22530,7 +22804,7 @@ pub fn execute_local_command(
                 match db.hset_slice_fast(key, fields) {
                     Ok(count) => {
                         record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_HASH, "hset", key);
+                        notify_hset_fields(key, fields);
                         if db.has_search_indices() || crate::search::has_active_search_indices() {
                             reindex_hash_for_search(db, key);
                         }
@@ -22547,7 +22821,7 @@ pub fn execute_local_command(
                     Ok(count) => {
                         if count > 0 {
                             record_change!(cmd);
-                            notify_keyspace_event(NOTIFY_HASH, "hset", key);
+                            notify_hash_fields_event("hset", key, std::slice::from_ref(field));
                         }
                         write_resp_integer(out, count as i64);
                     }
@@ -22561,7 +22835,7 @@ pub fn execute_local_command(
                 match db.hset_slice_fast(key, fields) {
                     Ok(_) => {
                         record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_HASH, "hset", key);
+                        notify_hset_fields(key, fields);
                         if db.has_search_indices() || crate::search::has_active_search_indices() {
                             reindex_hash_for_search(db, key);
                         }
@@ -22613,11 +22887,12 @@ pub fn execute_local_command(
                 false
             }
             Command::Hdel { key, fields } => {
+                let (event, deleted) = hdel_event_and_fields(db, key, fields);
                 match db.hdel(key, fields) {
                     Ok(count) => {
                         if count > 0 {
                             record_change!(cmd);
-                            notify_hash_event_then_del(db, key, "hdel");
+                            notify_hash_event_then_del(db, key, event, &deleted);
                         }
                         out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                     }
@@ -22720,7 +22995,7 @@ pub fn execute_local_command(
                     Ok((vals, deleted_fields)) => {
                         if !deleted_fields.is_empty() {
                             record_change!(cmd);
-                            notify_hash_event_then_del(db, key, "hdel");
+                            notify_hash_event_then_del(db, key, "hdel", &deleted_fields);
                         }
                         out.extend_from_slice(format!("*{}\r\n", vals.len()).as_bytes());
                         for v in vals {
@@ -25632,7 +25907,7 @@ pub fn execute_local_command(
                 match db.hincrby(key.clone(), field.clone(), *increment) {
                     Ok(val) => {
                         record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_HASH, "hincrby", key);
+                        notify_hash_fields_event("hincrby", key, std::slice::from_ref(field));
                         write_resp_integer(out, val);
                     }
                     Err(err) => {
@@ -25653,7 +25928,7 @@ pub fn execute_local_command(
                 match db.hincrbyfloat(key.clone(), field.clone(), *increment) {
                     Ok(val) => {
                         record_change!(cmd);
-                        notify_keyspace_event(NOTIFY_HASH, "hincrbyfloat", key);
+                        notify_hash_fields_event("hincrbyfloat", key, std::slice::from_ref(field));
                         write_resp_bulk(out, val.to_string().as_bytes());
                     }
                     Err(err) => {
@@ -28698,7 +28973,7 @@ pub fn execute_local_command(
                 {
                     Ok(res) => {
                         record_change!(cmd);
-                        notify_hexpire_result(db, key, &res);
+                        notify_hexpire_result(db, key, fields, &res);
                         write_resp_array_header(out, res.len());
                         for code in res {
                             write_resp_integer(out, code);
@@ -28730,7 +29005,7 @@ pub fn execute_local_command(
                     Ok(res) => {
                         record_change!(cmd);
                         if res.contains(&1) {
-                            notify_hash_event_then_del(db, key, "hpersist");
+                            notify_hpersist_result(key, fields, &res);
                         }
                         write_resp_array_header(out, res.len());
                         for code in res {
@@ -28748,9 +29023,9 @@ pub fn execute_local_command(
             } => {
                 match db.table.hgetex(key, *expire, fields) {
                     Ok((vals, event)) => {
-                        if let Some(event) = event {
+                        if let Some((event, changed)) = event {
                             record_change!(cmd);
-                            notify_hash_event_then_del(db, key, event);
+                            notify_hash_event_then_del(db, key, event, &changed);
                         }
                         write_resp_array_header(out, vals.len());
                         for v in vals {
@@ -28778,7 +29053,7 @@ pub fn execute_local_command(
                     Ok(applied) => {
                         if applied {
                             record_change!(cmd);
-                            notify_hsetex_applied(db, key, expire);
+                            notify_hsetex_applied(db, key, expire, pairs);
                             write_resp_integer(out, 1);
                         } else {
                             // Nothing set, but expired fields may have been

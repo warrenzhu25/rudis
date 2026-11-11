@@ -25,7 +25,10 @@ Rudis implements the three Redis flavours:
 | Sharded ("shard channel") | `SSUBSCRIBE`, `SUNSUBSCRIBE` | `SPUBLISH` | `smessage` |
 
 Plus the introspection commands `PUBSUB CHANNELS`, `PUBSUB NUMSUB`, `PUBSUB NUMPAT`, `PUBSUB SHARDCHANNELS`, `PUBSUB SHARDNUMSUB` and `PUBSUB HELP`. Keyspace notifications
-(`__keyspace@<db>__:<key>` and `__keyevent@<db>__:<event>`) are published through the same hub.
+(`__keyspace@<db>__:<key>` and `__keyevent@<db>__:<event>`) are published through the same hub, as are
+the subkey (hash field) notifications of flags `S`/`T`/`I`/`V` (`__subkeyspace@`, `__subkeyevent@`,
+`__subkeyspaceitem@`, `__subkeyspaceevent@`; see `notify_subkey_event_sync_in_db`). Commands only
+collect the fields they touched when `subkey_notify_enabled` says a subkey channel is on.
 
 The hard part is that Rudis is **shared-nothing and thread-per-core**: each shard (one OS thread) owns its own state and talks to other shards only through message mailboxes. A subscriber's TCP
 connection lives on one shard (its **home shard**), but a publisher may be on any other shard. This subsystem bridges that gap cheaply: it keeps a tiny lock-free "who might care" bitmask so a
@@ -392,7 +395,7 @@ So a client that unsubscribes from everything (or uses RESP3) can run normal com
 | `src/router.rs` | `Router::publish`, `pubsub_channels`, `pubsub_numsub`, `pubsub_numpat`, `spublish`, `ssubscribe`, `sunsubscribe`, `sunsubscribe_all`, `pubsub_shardchannels`, `pubsub_shardnumsub`, `acquire_pubsub_responder`, `release_pubsub_responder`, `set_base_port`, `target_shard_for_slot`, `key_slot`, `slot_to_shard` | Cross-shard fan-out, slot routing, the responder pool, selection of the node-wide presence table. |
 | `src/connection.rs` | `run_pubsub_loop`, `handle_pubsub_cmd`, `PubsubCleanup`, `reset_client_pubsub`, `is_mode_switch_cmd`, `mode_switch_denied`, `unsubscribe_reply`, `update_global_client_pubsub` | The subscribed-mode connection state machine, the writer task, auth and ACL on entry, cleanup. |
 | `src/connection.rs` | `close_client_over_output_limit`, `client_output_limit_reached`, `BufferLimit`, `PUBSUB_BUFFER_LIMIT`, `get_client_output_buffer_limit` | Output-limit configuration and the cross-thread disconnect. |
-| `src/connection.rs` | `publish_sync`, `spublish_sync`, `collect_publish_counts`, `SYNC_PUBLISH_COUNT_WAIT`, `notify_keyspace_event_sync_in_db` | Publishing from synchronous contexts (scripts, keyspace notifications). |
+| `src/connection.rs` | `publish_sync`, `spublish_sync`, `collect_publish_counts`, `SYNC_PUBLISH_COUNT_WAIT`, `notify_keyspace_event_sync_in_db`, `notify_subkey_event_sync_in_db` | Publishing from synchronous contexts (scripts, keyspace and subkey notifications). |
 | `src/shard.rs` | `ShardMessage::{Publish, Spublish, Ssubscribe, Sunsubscribe, PubsubChannels, PubsubShardchannels, PubsubNumsub, PubsubShardnumsub, PubsubNumpat, RemoveClientPubSub}` | Inter-shard Pub/Sub messages. |
 | `src/server.rs` | Shard worker setup (`PubSubHub::new`), the cross-shard message loop | Creates each shard's hub and executes remote Pub/Sub requests against it. |
 

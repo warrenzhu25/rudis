@@ -149,6 +149,19 @@ tests for them are skipped (`scripts/tcl_skips/unit/info.txt`).
   point-to-point CRC16 slot routing with zero-copy `bytes::Bytes` delivery and bounded
   subscriber queue backpressure. See [pub-sub.md](pub-sub.md).
 
+### Subkey (Hash Field) Notifications
+
+Rudis publishes the Redis 8.8 subkey notifications (`notify-keyspace-events` flags `S`, `T`,
+`I`, `V` with `h`) with the same channels and payloads. Two details differ in how they are
+produced:
+
+* Hash fields that expire are removed per key, all expired fields at once (not one by one as
+  each is read). The `hexpired` event, and the `HDEL` replicated for them, lists those fields
+  shortest name first, then bytewise (`f2` before `f10`), rather than in access order.
+* A read-only replica does not expire fields itself; its master's `HDEL` for them is their
+  expiry. When every field such an `HDEL` names is already past its deadline on the replica, it
+  reports `hexpired` (keyspace and subkey events) instead of `hdel`, as the master did.
+
 ---
 
 ## 6. Document Store & RediSearch Engine
