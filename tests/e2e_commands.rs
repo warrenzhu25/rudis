@@ -14673,3 +14673,63 @@ fn test_restore_already_expired_logs_del_e2e() {
     assert!(!has(b"key3"), "{}", String::from_utf8_lossy(&aof));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// MIGRATE caches its connection to a target, as Redis does: the next
+/// MIGRATE to it reuses the connection (INFO migrate_cached_sockets), a
+/// cached connection that died (target restarted) is replaced
+/// transparently, and an idle one is closed after 10 s. Every MIGRATE
+/// opened a new connection, so resharding tools paid a connect per batch.
+#[test]
+fn test_migrate_caches_target_connection_e2e() {
+    let (src_port, dst_port) = (19967u16, 19968u16);
+    let (sp, dp) = (src_port.to_string(), dst_port.to_string());
+    let mut src = spawn_rudis_listening(&["--port", &sp, "--threads", "2", "--no-pin"], src_port);
+    let dst_args = ["--port", &dp, "--threads", "2", "--no-pin"];
+    let mut dst = spawn_rudis_listening(&dst_args, dst_port);
+    let mut s = TcpStream::connect(("127.0.0.1", src_port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let stat = |c: &mut TcpStream, field: &str| -> u64 {
+        let info = resp_cmd(c, &["INFO", "stats"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{field}:")))
+            .unwrap_or_else(|| panic!("{field} missing"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let migrate = |s: &mut TcpStream, key: &str| {
+        assert_eq!(resp_cmd(s, &["SET", key, "v"]), "+OK\r\n");
+        let r = resp_cmd(s, &["MIGRATE", "127.0.0.1", &dp, key, "0", "1000"]);
+        assert_eq!(r, "+OK\r\n", "{key}");
+    };
+    assert_eq!(stat(&mut s, "migrate_cached_sockets"), 0);
+    let mut d = TcpStream::connect(("127.0.0.1", dst_port)).unwrap();
+    d.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let conns = stat(&mut d, "total_connections_received");
+    migrate(&mut s, "k1");
+    assert_eq!(stat(&mut s, "migrate_cached_sockets"), 1);
+    migrate(&mut s, "k2");
+    migrate(&mut s, "k3");
+    // One connection for all three.
+    assert_eq!(stat(&mut d, "total_connections_received"), conns + 1);
+    assert_eq!(resp_cmd(&mut d, &["EXISTS", "k1", "k2", "k3"]), ":3\r\n");
+    drop(d);
+
+    // The target restarts: the cached connection is dead, MIGRATE reconnects.
+    shutdown_and_wait(dst_port, &mut dst);
+    let mut dst = spawn_rudis_listening(&dst_args, dst_port);
+    migrate(&mut s, "k4");
+    assert_eq!(stat(&mut s, "migrate_cached_sockets"), 1);
+
+    // Unused for 10 s: closed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while stat(&mut s, "migrate_cached_sockets") != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cached socket never released"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    shutdown_and_wait(dst_port, &mut dst);
+    shutdown_and_wait(src_port, &mut src);
+}

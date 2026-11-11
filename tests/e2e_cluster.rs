@@ -4367,6 +4367,13 @@ fn test_migrate_honours_destination_db_and_auth_e2e() {
         resp_cmd(&mut d, &["CONFIG", "SET", "requirepass", "sekret"]),
         "+OK\r\n"
     );
+    // MIGRATE's cached connection, opened before the password, would stay
+    // authenticated (as in Redis): close it, so MIGRATE reconnects.
+    let killed = resp_cmd(
+        &mut d,
+        &["CLIENT", "KILL", "TYPE", "normal", "SKIPME", "yes"],
+    );
+    assert_eq!(killed, ":1\r\n");
     assert_eq!(resp_cmd(&mut s, &["SET", "k2", "v2"]), "+OK\r\n");
     let r = migrate(&mut s, "k2", &[]);
     assert!(r.starts_with("-") && r.contains("NOAUTH"), "{r}");

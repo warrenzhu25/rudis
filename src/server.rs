@@ -701,6 +701,7 @@ pub fn run_shard_worker(
                 }
                 // Rates for INFO instantaneous_*; extra calls are no-ops.
                 crate::server_stats::sample();
+                crate::connection::migrate_cache_prune();
             }
         });
 

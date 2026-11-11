@@ -9925,6 +9925,64 @@ fn take_simple_replies(buf: &[u8], replies: &mut Vec<Result<(), String>>) -> usi
     pos
 }
 
+/// Seconds a cached MIGRATE connection may stay unused (Redis
+/// `MIGRATE_SOCKET_CACHE_TTL`).
+const MIGRATE_SOCKET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Cached MIGRATE connections, server-wide (Redis `MIGRATE_SOCKET_CACHE_ITEMS`).
+const MIGRATE_SOCKET_CACHE_ITEMS: usize = 64;
+/// INFO `migrate_cached_sockets`.
+static MIGRATE_CACHED_SOCKETS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// This thread's idle connections to MIGRATE targets, by "host:port"
+    /// and credentials, with when each was last used. Like Redis, MIGRATE reuses them so a
+    /// resharding tool calling it batch after batch doesn't reconnect
+    /// every time.
+    static MIGRATE_CACHE: RefCell<hashbrown::HashMap<Vec<u8>, (TcpStream, std::time::Instant)>> =
+        RefCell::new(hashbrown::HashMap::new());
+}
+
+/// Takes the cached connection to `target`, if any and not idle too long.
+fn migrate_cache_take(target: &[u8]) -> Option<TcpStream> {
+    let (stream, last) = MIGRATE_CACHE.with(|c| c.borrow_mut().remove(target))?;
+    MIGRATE_CACHED_SOCKETS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    (last.elapsed() < MIGRATE_SOCKET_CACHE_TTL).then_some(stream)
+}
+
+/// Caches `stream` to `target` for the next MIGRATE, unless the cache is
+/// full.
+fn migrate_cache_put(target: Vec<u8>, stream: TcpStream) {
+    if MIGRATE_CACHED_SOCKETS.load(std::sync::atomic::Ordering::Relaxed)
+        >= MIGRATE_SOCKET_CACHE_ITEMS
+    {
+        return;
+    }
+    let old = MIGRATE_CACHE.with(|c| {
+        c.borrow_mut()
+            .insert(target, (stream, std::time::Instant::now()))
+    });
+    if old.is_none() {
+        MIGRATE_CACHED_SOCKETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Closes this thread's MIGRATE connections unused for
+/// `MIGRATE_SOCKET_CACHE_TTL` (from the shard cron).
+pub fn migrate_cache_prune() {
+    MIGRATE_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let before = c.len();
+        c.retain(|_, (_, last)| last.elapsed() < MIGRATE_SOCKET_CACHE_TTL);
+        MIGRATE_CACHED_SOCKETS.fetch_sub(before - c.len(), std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// INFO `migrate_cached_sockets`.
+pub fn migrate_cached_sockets() -> usize {
+    MIGRATE_CACHED_SOCKETS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Moves `keys` to the node at `host:port` the way Redis MIGRATE does:
 /// each key goes as its DUMP payload plus absolute expiry and is RESTOREd
 /// there. Unless `copy`, a source key is deleted only after the target
@@ -13674,7 +13732,7 @@ async fn execute_command_inner(
             let pubsub_patterns = router.pubsub_numpat().await;
             let pubsubshard_channels = router.pubsub_shardchannels(None).await.len();
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_subkeys:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_query_buffer_limit_disconnections:{}\r\nclient_output_buffer_limit_disconnections:{}\r\nacl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\nacl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\n",
+                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_subkeys:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:{migrate_cached_sockets}\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_query_buffer_limit_disconnections:{}\r\nclient_output_buffer_limit_disconnections:{}\r\nacl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\nacl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\n",
                 total(Stat::ConnectionsReceived),
                 total(Stat::Commands),
                 ops_per_sec,
@@ -13708,6 +13766,7 @@ async fn execute_command_inner(
                 total(Stat::AclAccessDeniedCmd),
                 total(Stat::AclAccessDeniedKey),
                 total(Stat::AclAccessDeniedChannel),
+                migrate_cached_sockets = migrate_cached_sockets(),
             );
             let (blocked_clients_count, total_blocking_keys, total_blocking_keys_on_nokey) = {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
@@ -19312,7 +19371,32 @@ async fn execute_command_inner(
                 replace,
                 timeout,
             };
-            match migrate_keys_to_node(router, &migrate_keys, &host, port, opts, &mut None).await {
+            // Like Redis, connections to MIGRATE targets are cached (see
+            // `migrate_cache_take`); a cached one that turns out to be dead
+            // is replaced once. Unlike Redis, by credentials too: a
+            // connection authenticated for one MIGRATE ... AUTH is never
+            // reused by a MIGRATE with other (or no) credentials.
+            let mut target = format!("{host}:{port}").into_bytes();
+            if let Some((user, pass)) = &opts.auth {
+                target.push(0);
+                target.extend_from_slice(user.as_deref().unwrap_or(b"default"));
+                target.push(0);
+                target.extend_from_slice(pass);
+            }
+            let mut conn = migrate_cache_take(&target);
+            let was_cached = conn.is_some();
+            let mut res =
+                migrate_keys_to_node(router, &migrate_keys, &host, port, opts.clone(), &mut conn)
+                    .await;
+            if was_cached && matches!(&res, Err(e) if e.starts_with("IOERR")) {
+                conn = None;
+                res = migrate_keys_to_node(router, &migrate_keys, &host, port, opts, &mut conn)
+                    .await;
+            }
+            if let Some(c) = conn {
+                migrate_cache_put(target, c);
+            }
+            match res {
                 Ok(0) => out.extend_from_slice(b"+NOKEY\r\n"),
                 Ok(_) => out.extend_from_slice(b"+OK\r\n"),
                 Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
