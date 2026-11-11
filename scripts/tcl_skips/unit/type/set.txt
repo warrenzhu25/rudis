@@ -1,0 +1,6 @@
+# unit/type/set tests that don't apply to rudis.
+#
+# Builds a Redis dict with a long bucket chain by holding off rehashing
+# while a BGSAVE fork child runs (get_child_pid). Rudis snapshots without
+# fork() (docs/differences.md) and its set tables don't chain.
+SRANDMEMBER with a dict containing long chain
