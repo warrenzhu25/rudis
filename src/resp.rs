@@ -4469,15 +4469,18 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         i += 3;
                     }
                     "KEYS" => {
+                        if key.is_some() {
+                            return Err("When using MIGRATE KEYS option, the key argument must be set to the empty string".to_string());
+                        }
                         i += 1;
                         while i < args.len() {
                             keys.push(args[i].clone());
                             i += 1;
                         }
                     }
-                    _ => {
-                        i += 1;
-                    }
+                    // Unknown options were skipped: a typo (e.g. REPLCE)
+                    // silently changed what MIGRATE did.
+                    _ => return Err("syntax error".to_string()),
                 }
             }
             Ok(Some(Command::Migrate {

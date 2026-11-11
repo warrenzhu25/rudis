@@ -14733,3 +14733,43 @@ fn test_migrate_caches_target_connection_e2e() {
     shutdown_and_wait(dst_port, &mut dst);
     shutdown_and_wait(src_port, &mut src);
 }
+
+/// MIGRATE refuses a non-empty key argument together with KEYS, and
+/// unknown options, with Redis's errors. Both were accepted: the key was
+/// migrated along with the KEYS list, and a misspelled option (REPLCE)
+/// was ignored, so MIGRATE ran without it.
+#[test]
+fn test_migrate_rejects_key_with_keys_and_unknown_options_e2e() {
+    let port = 19973u16;
+    let ps = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &ps, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "a", "1"]), "+OK\r\n");
+    let r = resp_cmd(
+        &mut c,
+        &[
+            "MIGRATE",
+            "127.0.0.1",
+            "6379",
+            "NotEmpty",
+            "9",
+            "5000",
+            "KEYS",
+            "a",
+            "b",
+        ],
+    );
+    assert_eq!(
+        r,
+        "-ERR When using MIGRATE KEYS option, the key argument must be set to the empty string\r\n"
+    );
+    let r = resp_cmd(
+        &mut c,
+        &["MIGRATE", "127.0.0.1", "6379", "a", "0", "5000", "REPLCE"],
+    );
+    assert_eq!(r, "-ERR syntax error\r\n");
+    // Nothing was migrated.
+    assert_eq!(resp_cmd(&mut c, &["GET", "a"]), "$1\r\n1\r\n");
+    shutdown_and_wait(port, &mut srv);
+}
