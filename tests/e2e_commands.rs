@@ -14849,3 +14849,83 @@ fn test_spop_whole_set_logs_del_or_unlink_e2e() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// SET with an expiry already in the past deletes an existing key, and that
+/// deletion is what reaches the AOF and replicas: DEL, or UNLINK under
+/// lazyfree-lazy-server-del. On one path it was logged as a plain SET
+/// without the expiry, so an AOF reload (or a replica) kept the key for
+/// good. 8 keys over 4 shards, so both code paths run.
+#[test]
+fn test_set_past_expiry_logs_del_not_set_e2e() {
+    let port = 19975u16;
+    let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ps, ds) = (port.to_string(), dir.to_str().unwrap().to_string());
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+    ];
+    let mut srv = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let keys: Vec<String> = (0..8).map(|i| format!("px{i}")).collect();
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut c, &["SET", k, "v"]), "+OK\r\n");
+    }
+    let past = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        - 3000)
+        .to_string();
+    for (i, k) in keys.iter().enumerate() {
+        let lazy = if i < 4 { "no" } else { "yes" };
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "lazyfree-lazy-server-del", lazy]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", k, "new", "PXAT", &past]),
+            "+OK\r\n"
+        );
+    }
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":0\r\n");
+    shutdown_and_wait(port, &mut srv);
+
+    let mut aof = String::new();
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("appendonly-") && name.ends_with(".aof") {
+            aof.push_str(&String::from_utf8_lossy(&std::fs::read(&path).unwrap()));
+        }
+    }
+    for (i, k) in keys.iter().enumerate() {
+        let del = if i < 4 { "$3\r\nDEL" } else { "$6\r\nUNLINK" };
+        assert!(
+            aof.contains(&format!("{del}\r\n$3\r\n{k}\r\n")),
+            "{k}: {aof}"
+        );
+        // Only the first SET; the expired one is never logged as a SET.
+        let sets = aof.matches(&format!("SET\r\n$3\r\n{k}\r\n")).count();
+        assert_eq!(sets, 1, "{k}: {aof}");
+    }
+
+    // An AOF reload brings none of them back.
+    let mut srv = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":0\r\n");
+    shutdown_and_wait(port, &mut srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

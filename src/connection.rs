@@ -9925,6 +9925,18 @@ fn take_simple_replies(buf: &[u8], replies: &mut Vec<Result<(), String>>) -> usi
     pos
 }
 
+/// How a deletion the server makes on its own (SET with a past expiry,
+/// RESTORE of an expired key, SPOP of a whole set) is replicated: DEL, or
+/// UNLINK under `lazyfree-lazy-server-del`, as in Redis.
+fn server_del_cmd(key: &Bytes) -> Command {
+    let keys = smallvec![key.clone()];
+    if crate::table::LAZYFREE_LAZY_SERVER_DEL.load(std::sync::atomic::Ordering::Relaxed) {
+        Command::Unlink(keys)
+    } else {
+        Command::Del(keys)
+    }
+}
+
 /// Seconds a cached MIGRATE connection may stay unused (Redis
 /// `MIGRATE_SOCKET_CACHE_TTL`).
 const MIGRATE_SOCKET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -13035,7 +13047,7 @@ async fn execute_command_inner(
                     crate::table::inc_expired_keys();
                     if exists {
                         db.del(&key);
-                        router.log_mutation(|| Command::Del(smallvec![key.clone()]));
+                        router.log_mutation(|| server_del_cmd(&key));
                     }
                     if get {
                         if let Some(v) = current_val {
@@ -22025,7 +22037,10 @@ pub fn execute_local_command(
                     crate::table::inc_expired_keys();
                     if exists {
                         db.del(key);
-                        record_change!(cmd);
+                        // Logged as the deletion: the SET itself would be
+                        // encoded without its (past) expiry, and replicas
+                        // and AOF reloads would keep the key for good.
+                        record_change!(&server_del_cmd(key));
                     }
                     if *get {
                         if let Some(v) = current_val {
@@ -22886,15 +22901,7 @@ pub fn execute_local_command(
                                 // replicate the set's deletion, DEL (UNLINK
                                 // under lazyfree-lazy-server-del), not every
                                 // member.
-                                let keys = smallvec::smallvec![key.clone()];
-                                let del = if crate::table::LAZYFREE_LAZY_SERVER_DEL
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                {
-                                    Command::Unlink(keys)
-                                } else {
-                                    Command::Del(keys)
-                                };
-                                record_change!(&del);
+                                record_change!(&server_del_cmd(key));
                             } else {
                                 // Like Redis, replicate as SREMs of at most
                                 // 1024 members each, so no single propagated
@@ -24643,15 +24650,7 @@ pub fn execute_local_command(
                         // replicas and the AOF see the deletion of the key it
                         // replaced (if any), never the RESTORE.
                         if replaced {
-                            let keys = smallvec::smallvec![key.clone()];
-                            let del = if crate::table::LAZYFREE_LAZY_SERVER_DEL
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                            {
-                                Command::Unlink(keys)
-                            } else {
-                                Command::Del(keys)
-                            };
-                            record_change!(&del);
+                            record_change!(&server_del_cmd(key));
                             notify_keyspace_event(NOTIFY_GENERIC, "del", key);
                         }
                         out.extend_from_slice(b"+OK\r\n");
