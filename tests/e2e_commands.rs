@@ -14480,6 +14480,10 @@ fn test_info_used_memory_peak_e2e() {
     let before = now();
     let big = "a".repeat(8 << 20);
     assert_eq!(resp_cmd(&mut c, &["SET", "big", &big]), "+OK\r\n");
+    // The 100 ms cron samples usage too: let it see the settled usage
+    // (query buffer released, value counted) before reading the peak, or a
+    // later sample may still raise it while `big` exists.
+    thread::sleep(Duration::from_millis(350));
     let peak = num(&mut c, "used_memory_peak");
     assert!(peak >= 8 << 20, "peak {peak}");
     assert!(num(&mut c, "used_memory_peak_time") >= before);
