@@ -14462,12 +14462,22 @@ async fn execute_command_inner(
                         let hub = crate::cluster::get_cluster_hub(router.base_port);
                         hub.slot_states.write().remove(&slot);
                         if is_myself {
-                            let shard = (0..router.num_shards)
-                                .find(|&s| node == format!("{:040x}", s + 1))
-                                .unwrap_or_else(|| {
+                            let named_shard =
+                                (0..router.num_shards).find(|&s| node == format!("{:040x}", s + 1));
+                            // A shard owner only means something where keys
+                            // are routed by slot. A server that isn't in a
+                            // cluster routes keys by hash: recording an owner
+                            // switched every key to slot routing, so keys
+                            // stored before (the slot's own, just imported)
+                            // were looked up on the wrong shard.
+                            let slot_routed = router.cluster_enabled
+                                || crate::cluster::has_active_cluster(router.base_port);
+                            if slot_routed || named_shard.is_some() {
+                                let shard = named_shard.unwrap_or_else(|| {
                                     crate::router::slot_to_shard(slot, router.num_shards)
                                 });
-                            router.set_slot_owner(slot, shard);
+                                router.set_slot_owner(slot, shard);
+                            }
                             router.set_slot_state(slot, crate::shard::SlotState::Stable);
                             // Also drops the slot from the previous owner in
                             // our view, so the cluster never shows it twice.

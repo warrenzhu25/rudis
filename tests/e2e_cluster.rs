@@ -4404,3 +4404,46 @@ fn test_migrate_honours_destination_db_and_auth_e2e() {
     let _ = dst.kill();
     let _ = dst.wait();
 }
+
+/// Keys moved with CLUSTER MIGRATE-SLOT onto a server that is not in
+/// cluster mode stay readable from every connection. Taking the slot
+/// (SETSLOT NODE myself) recorded a shard owner for it, which switched the
+/// whole server from hash to slot routing: keys stored by hash (the ones
+/// just imported) were then looked up on another shard and read as
+/// missing, depending on which shards the key and the connection were on.
+/// One key per slot over 8 slots, so it doesn't hinge on one key's luck.
+#[test]
+fn test_migrate_slot_keys_readable_on_non_cluster_target_e2e() {
+    let (p1, p2) = (19971u16, 19972u16);
+    let (s1, s2) = (p1.to_string(), p2.to_string());
+    let mut srv1 = spawn_rudis_listening(&["--port", &s1, "--threads", "2", "--no-pin"], p1);
+    let mut srv2 = spawn_rudis_listening(&["--port", &s2, "--threads", "2", "--no-pin"], p2);
+    let connect = |p: u16| {
+        let c = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let mut c1 = connect(p1);
+    let keys: Vec<String> = (0..8).map(|i| format!("mk:{i}")).collect();
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut c1, &["SET", k, "v"]), "+OK\r\n");
+        let slot = rudis::router::key_slot(k.as_bytes()).to_string();
+        let r = resp_cmd(
+            &mut c1,
+            &["CLUSTER", "MIGRATE-SLOT", &slot, "127.0.0.1", &s2],
+        );
+        assert_eq!(r, "+OK\r\n", "{k}");
+    }
+    // Connections spread over the target's shards.
+    for _ in 0..6 {
+        let mut c = connect(p2);
+        for k in &keys {
+            assert_eq!(resp_cmd(&mut c, &["GET", k]), "$1\r\nv\r\n", "{k}");
+        }
+        let mut exists = vec!["EXISTS"];
+        exists.extend(keys.iter().map(String::as_str));
+        assert_eq!(resp_cmd(&mut c, &exists), ":8\r\n");
+    }
+    shutdown_and_wait(p2, &mut srv2);
+    shutdown_and_wait(p1, &mut srv1);
+}
