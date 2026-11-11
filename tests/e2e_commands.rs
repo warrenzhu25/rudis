@@ -14773,3 +14773,79 @@ fn test_migrate_rejects_key_with_keys_and_unknown_options_e2e() {
     assert_eq!(resp_cmd(&mut c, &["GET", "a"]), "$1\r\n1\r\n");
     shutdown_and_wait(port, &mut srv);
 }
+
+/// SPOP with a count covering the whole set logs the set's deletion, DEL
+/// or UNLINK under lazyfree-lazy-server-del (as Redis propagates it), not
+/// SREMs of every member; a partial SPOP still logs SREM. It logged SREM
+/// batches either way.
+#[test]
+fn test_spop_whole_set_logs_del_or_unlink_e2e() {
+    let port = 19974u16;
+    let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ps, ds) = (port.to_string(), dir.to_str().unwrap().to_string());
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+    ];
+    let mut srv = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let members: Vec<String> = (0..65).map(|i| i.to_string()).collect();
+    let sadd = |c: &mut TcpStream, key: &str, n: usize| {
+        let mut a = vec!["SADD", key];
+        a.extend(members[..n].iter().map(String::as_str));
+        assert_eq!(resp_cmd(c, &a), format!(":{n}\r\n"));
+    };
+    sadd(&mut c, "set1", 5);
+    sadd(&mut c, "set2", 65);
+    sadd(&mut c, "set3", 5);
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "lazyfree-lazy-server-del", "no"]),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["SPOP", "set1", "5"]).starts_with("*5\r\n"));
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CONFIG", "SET", "lazyfree-lazy-server-del", "yes"]
+        ),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["SPOP", "set2", "100"]).starts_with("*65\r\n"));
+    assert!(resp_cmd(&mut c, &["SPOP", "set3", "2"]).starts_with("*2\r\n"));
+    assert_eq!(
+        resp_cmd(&mut c, &["EXISTS", "set1", "set2", "set3"]),
+        ":1\r\n"
+    );
+    shutdown_and_wait(port, &mut srv);
+
+    let mut aof = Vec::new();
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("appendonly-") && name.ends_with(".aof") {
+            aof.extend(std::fs::read(&path).unwrap());
+        }
+    }
+    let text = String::from_utf8_lossy(&aof).into_owned();
+    let has = |needle: &str| text.contains(needle);
+    assert!(has("$3\r\nDEL\r\n$4\r\nset1\r\n"), "{text}");
+    assert!(has("$6\r\nUNLINK\r\n$4\r\nset2\r\n"), "{text}");
+    assert!(has("$4\r\nSREM\r\n$4\r\nset3\r\n"), "{text}");
+    assert!(
+        !has("SREM\r\n$4\r\nset1\r\n") && !has("SREM\r\n$4\r\nset2\r\n"),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

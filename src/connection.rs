@@ -22881,15 +22881,31 @@ pub fn execute_local_command(
                 match db.spop(key, n) {
                     Ok(popped) => {
                         if !popped.is_empty() {
-                            // Like Redis, replicate as SREMs of at most
-                            // 1024 members each, so no single propagated
-                            // command grows with the count.
-                            for chunk in popped.chunks(1024) {
-                                let srem_cmd = Command::Srem {
-                                    key: key.clone(),
-                                    members: chunk.iter().cloned().collect(),
+                            if count.is_some() && !db.exists(key) {
+                                // A count covering the whole set: like Redis,
+                                // replicate the set's deletion, DEL (UNLINK
+                                // under lazyfree-lazy-server-del), not every
+                                // member.
+                                let keys = smallvec::smallvec![key.clone()];
+                                let del = if crate::table::LAZYFREE_LAZY_SERVER_DEL
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    Command::Unlink(keys)
+                                } else {
+                                    Command::Del(keys)
                                 };
-                                record_change!(&srem_cmd);
+                                record_change!(&del);
+                            } else {
+                                // Like Redis, replicate as SREMs of at most
+                                // 1024 members each, so no single propagated
+                                // command grows with the count.
+                                for chunk in popped.chunks(1024) {
+                                    let srem_cmd = Command::Srem {
+                                        key: key.clone(),
+                                        members: chunk.iter().cloned().collect(),
+                                    };
+                                    record_change!(&srem_cmd);
+                                }
                             }
                             notify_keyspace_event(NOTIFY_SET, "spop", key);
                             notify_del_if_emptied(db, key);
