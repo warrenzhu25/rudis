@@ -530,6 +530,25 @@ pub fn is_function_read_only(name: &str) -> bool {
     false
 }
 
+/// Whether FCALL of `name` may start over maxmemory, as Redis decides from
+/// its flags: a `no-writes` or `allow-oom` function may; any other is
+/// refused up front, before it writes part of its work. Unknown functions
+/// are let through to fail with "Function not found".
+pub fn function_allows_oom(name: &str) -> bool {
+    let cache = FUNCTION_LIBS.read();
+    for l in cache.values() {
+        for f in &l.functions {
+            if f.name.eq_ignore_ascii_case(name) {
+                return f
+                    .flags
+                    .iter()
+                    .any(|flag| flag == "no-writes" || flag == "allow-oom");
+            }
+        }
+    }
+    true
+}
+
 pub fn count_functions() -> usize {
     let cache = FUNCTION_LIBS.read();
     cache.values().map(|l| l.functions.len()).sum()

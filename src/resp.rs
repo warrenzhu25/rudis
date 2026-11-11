@@ -1954,6 +1954,7 @@ impl Command {
             // Like Redis, MIGRATE is not denied over maxmemory: it only removes
             // local keys, so it is one way to get back under the limit.
             Command::Migrate { .. } => true,
+            Command::Fcall { function, .. } => crate::scripting::function_allows_oom(function),
             // Redis' `denyoom` flag (unknown commands stay refused).
             _ => {
                 !crate::command_info::denyoom(crate::connection::acl_cmd_name(self)).unwrap_or(true)

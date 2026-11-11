@@ -1210,3 +1210,44 @@ fn test_allow_oom_script_writes_over_maxmemory_e2e() {
     assert_eq!(resp_cmd(&mut c, &["GET", "y"]), "$1\r\n2\r\n");
     shutdown_and_wait(port, &mut srv.0);
 }
+
+/// Over maxmemory, FCALL of a function that may write (neither
+/// `no-writes` nor `allow-oom`) is refused up front with -OOM, as in
+/// Redis, instead of starting and failing at its first write with a
+/// script runtime error. A `no-writes` function still runs.
+#[test]
+fn test_fcall_of_writing_function_refused_over_maxmemory_e2e() {
+    let port = 20318u16;
+    let ps = port.to_string();
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "1", "--no-pin"],
+        port,
+    ));
+    let mut c = connect_busy(port, 5);
+    let lib = "#!lua name=t\n\
+               redis.register_function('w', function() return redis.call('set', 'x', '1') end)\n\
+               redis.register_function{function_name='r', callback=function() return 'hello' end, flags={'no-writes'}}";
+    assert_eq!(resp_cmd(&mut c, &["FUNCTION", "LOAD", lib]), "$1\r\nt\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "1"]),
+        "+OK\r\n"
+    );
+    let r = resp_cmd(&mut c, &["FCALL", "w", "1", "x"]);
+    assert!(
+        r.starts_with("-OOM command not allowed when used memory > 'maxmemory'"),
+        "{r}"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["FCALL", "r", "1", "x"]),
+        "$5\r\nhello\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["FCALL_RO", "r", "1", "x"]),
+        "$5\r\nhello\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "0"]),
+        "+OK\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
+}
