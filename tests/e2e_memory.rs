@@ -2390,3 +2390,47 @@ fn test_tier_info_reports_shards_whose_tier_file_failed_e2e() {
         "{info}"
     );
 }
+
+/// Over `maxmemory` (noeviction), writes that only free memory still run,
+/// as Redis runs every command without its `denyoom` flag: DEL, EXPIRE,
+/// LPOP, FUNCTION FLUSH, FLUSHALL... Before, all of them got -OOM, so a
+/// full server could not be emptied without raising maxmemory.
+#[test]
+fn test_writes_that_free_memory_run_over_maxmemory_e2e() {
+    let port = 20313u16;
+    let ps = port.to_string();
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "2", "--no-pin"],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "a", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "b", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["RPUSH", "l", "x", "y"]), ":2\r\n");
+    let lib = "#!lua name=lib\nredis.register_function('f', function() return 1 end)";
+    assert_eq!(
+        resp_cmd(&mut c, &["FUNCTION", "LOAD", lib]),
+        "$3\r\nlib\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-policy", "noeviction"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "1"]),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["SET", "c", "1"]).starts_with("-OOM"));
+    assert!(resp_cmd(&mut c, &["RPUSH", "l", "z"]).starts_with("-OOM"));
+    assert_eq!(resp_cmd(&mut c, &["DEL", "a"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXPIRE", "b", "100"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["LPOP", "l"]), "$1\r\nx\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FUNCTION", "FLUSH"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FLUSHALL"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "0"]),
+        "+OK\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
+}

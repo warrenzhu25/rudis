@@ -1954,7 +1954,10 @@ impl Command {
             // Like Redis, MIGRATE is not denied over maxmemory: it only removes
             // local keys, so it is one way to get back under the limit.
             Command::Migrate { .. } => true,
-            _ => false,
+            // Redis' `denyoom` flag (unknown commands stay refused).
+            _ => {
+                !crate::command_info::denyoom(crate::connection::acl_cmd_name(self)).unwrap_or(true)
+            }
         }
     }
 
@@ -14880,6 +14883,49 @@ mod tests {
         assert!(migrate.allows_oom());
         let mut buf = BytesMut::from("SET k v\r\n");
         assert!(!parse_command(&mut buf).unwrap().unwrap().allows_oom());
+    }
+
+    /// Redis' `denyoom` flag decides: writes that only free memory run
+    /// over `maxmemory`, writes that may grow it do not.
+    #[test]
+    fn test_allows_oom_follows_denyoom() {
+        let allows = |line: &str| {
+            let mut buf = BytesMut::from(format!("{line}\r\n").as_str());
+            parse_command(&mut buf).unwrap().unwrap().allows_oom()
+        };
+        for line in [
+            "DEL k",
+            "UNLINK k",
+            "FLUSHALL",
+            "FLUSHDB",
+            "EXPIRE k 10",
+            "PERSIST k",
+            "LPOP k",
+            "SREM k m",
+            "HDEL k f",
+            "ZREM k m",
+            "XDEL k 1-1",
+            "FUNCTION FLUSH",
+            "FUNCTION DELETE lib",
+            "SCRIPT FLUSH",
+        ] {
+            assert!(allows(line), "{line} must run over maxmemory");
+        }
+        for line in [
+            "SET k v",
+            "LPUSH k v",
+            "HSET k f v",
+            "SADD k m",
+            "ZADD k 1 m",
+            "XADD k * f v",
+            "INCR k",
+            "APPEND k v",
+            "RESTORE k 0 x",
+            "FUNCTION LOAD x",
+            "FUNCTION RESTORE x",
+        ] {
+            assert!(!allows(line), "{line} must be refused over maxmemory");
+        }
     }
 
     #[test]

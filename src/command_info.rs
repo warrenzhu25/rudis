@@ -33,6 +33,27 @@ fn parser_knows(name: &str) -> bool {
     })
 }
 
+/// Whether Redis refuses `name` (`cmd` or `container|sub`, any case) over
+/// `maxmemory` (its `denyoom` flag); `None` if the table lacks it. Writes
+/// that only free memory (DEL, FLUSHALL, EXPIRE, LPOP, FUNCTION FLUSH, ...)
+/// are not `denyoom`, so a full server can still be emptied.
+pub fn denyoom(name: &str) -> Option<bool> {
+    static DENYOOM: OnceLock<Vec<Option<bool>>> = OnceLock::new();
+    let i = crate::acl::command_index(name)?;
+    DENYOOM
+        .get_or_init(|| {
+            DOCS.iter()
+                .map(|d| {
+                    d.as_ref()
+                        .map(|d| d.info.windows(10).any(|w| w == b"+denyoom\r\n"))
+                })
+                .collect()
+        })
+        .get(i)
+        .copied()
+        .flatten()
+}
+
 /// `listed()[i]`: `COMMANDS[i]` is shown by COMMAND and friends.
 fn listed() -> &'static [bool] {
     static LISTED: OnceLock<Vec<bool>> = OnceLock::new();
