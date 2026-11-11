@@ -892,3 +892,45 @@ fn test_hash_field_ttl_keyspace_events_e2e() {
     run(&mut c, &["DEBUG", "SET-ACTIVE-EXPIRE", "1"]);
     shutdown_and_wait(port, &mut srv.0);
 }
+
+/// Lowering maxmemory with CONFIG SET evicts right away, as in Redis: the
+/// `evicted` event arrives before any other command runs. Eviction waited
+/// for the next command, so an idle server gave no memory back.
+#[test]
+fn test_config_set_maxmemory_evicts_immediately_e2e() {
+    let port = 19980u16;
+    let ps = port.to_string();
+    let args = ["--port", &ps, "--threads", "2", "--no-pin"];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for (k, v) in [
+        ("notify-keyspace-events", "Ee"),
+        ("maxmemory-policy", "allkeys-lru"),
+    ] {
+        assert_eq!(resp_cmd(&mut c, &["CONFIG", "SET", k, v]), "+OK\r\n");
+    }
+    assert_eq!(resp_cmd(&mut c, &["SET", "foo", "bar"]), "+OK\r\n");
+    let mut sub = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sub.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    assert!(resp_cmd(&mut sub, &["PSUBSCRIBE", "*"]).contains("psubscribe"));
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "1"]),
+        "+OK\r\n"
+    );
+    // No other command: the event must come from CONFIG SET itself.
+    let mut buf = [0u8; 4096];
+    let n = sub
+        .read(&mut buf)
+        .expect("no evicted event after CONFIG SET maxmemory");
+    let msg = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        msg.contains("__keyevent@0__:evicted") && msg.contains("foo"),
+        "{msg}"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "0"]),
+        "+OK\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
+}

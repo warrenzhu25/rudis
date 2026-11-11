@@ -14442,6 +14442,31 @@ async fn execute_command_inner(
                         .map(|(_, v)| v.eq_ignore_ascii_case(b"yes"));
                     let start = out.len();
                     apply_config_set_pairs(router, &pairs, out);
+                    // A limit (or policy) that leaves the server over
+                    // maxmemory evicts now, as in Redis, not only when the
+                    // next command arrives: an idle server got no memory
+                    // back, and `evicted` events came late.
+                    if pairs.iter().any(|(p, _)| {
+                        p.eq_ignore_ascii_case(b"maxmemory")
+                            || p.eq_ignore_ascii_case(b"maxmemory-policy")
+                    }) && out[start..].starts_with(b"+OK")
+                    {
+                        let max_mem = crate::tiering::get_max_memory(router.base_port) as usize;
+                        let policy = get_max_memory_policy();
+                        // A replica leaves maxmemory to its master (by
+                        // default), as the per-command gate does.
+                        if max_mem > 0
+                            && policy != "noeviction"
+                            && !maxmemory_ignored_as_replica(router.base_port)
+                        {
+                            let mut track = Vec::new();
+                            router
+                                .evict_until_under_maxmemory(max_mem, &policy, client_id, &mut track)
+                                .await;
+                            // Tracking invalidations go ahead of the reply.
+                            out.splice(start..start, track);
+                        }
+                    }
                     // AOF on or off at runtime, once the rest applied.
                     if let Some(on) = appendonly
                         && out[start..].starts_with(b"+OK")
