@@ -74,6 +74,19 @@ This document summarizes the architectural, operational, and semantic difference
   script stuck inside one (for example a `table.sort` comparator that never returns) holds its
   shard until it returns from it; other shards still answer `-BUSY` and accept the kill.
 
+### Hash Templates (HIMPORT)
+* **Redis** (8.6): `HIMPORT PREPARE` / `SET` / `DISCARD` / `DISCARDALL` build hashes from a
+  per-connection field list, stored in a shared-template encoding (`template-listpack` /
+  `template-array`, counted by INFO `hash_templates` / `hash_template_keys`) that keeps one copy
+  of the field names for all keys using them.
+* **Rudis**: The commands behave the same (per-connection fieldsets, cleared by `RESET` or
+  disconnect; each script run its own session; `SET` replaces an existing hash, refuses other
+  types; fields listed in template order), but they build ordinary hashes: no memory is saved,
+  `OBJECT ENCODING` reports `listpack` / `hashtable`, and the template INFO fields and
+  `hash-min-template-entries` have no effect. `HIMPORT SET` reaches the AOF and replicas as
+  `DEL` + `HSET`. Redis' `unit/type/hash-templates` suite is not run, since most of it checks the
+  encoding.
+
 ### Event-Loop Metrics in INFO
 
 Redis reports metrics of its single-threaded event loop (`eventloop_cycles`,

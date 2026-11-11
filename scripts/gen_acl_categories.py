@@ -50,6 +50,7 @@ EXTRA = {
     "topk": ["write", "slow"],
     # Single commands.
     "blmovem": ["write", "list", "slow", "blocking"],
+    "himport": ["write", "hash", "slow"],
     "lmovem": ["write", "list", "slow"],
     "delex": ["write", "keyspace", "slow"],
     "increx": ["write", "string", "slow"],

@@ -14993,3 +14993,203 @@ fn test_hash_writes_ignore_expired_fields_e2e() {
     );
     shutdown_and_wait(port, &mut srv.0);
 }
+
+/// HIMPORT (Redis 8.6): PREPARE a fieldset once per connection, then SET
+/// whole hashes from values alone. Fieldsets are the connection's own
+/// (until DISCARD / DISCARDALL / RESET), SET replaces an existing hash but
+/// not another type, and works inside MULTI. Before, HIMPORT was unknown.
+#[test]
+fn test_himport_builds_hashes_from_session_fieldsets_e2e() {
+    let port = 20400u16;
+    let ps = port.to_string();
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "2", "--no-pin"],
+        port,
+    ));
+    let conn = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let mut c = conn();
+    for (args, err) in [
+        (&["HIMPORT"][..], "wrong number of arguments"),
+        (&["HIMPORT", "foobar"][..], "unknown subcommand"),
+        (
+            &["HIMPORT", "PREPARE", "fs"][..],
+            "wrong number of arguments",
+        ),
+        (
+            &["HIMPORT", "SET", "k", "fs"][..],
+            "wrong number of arguments",
+        ),
+        (&["HIMPORT", "DISCARD"][..], "wrong number of arguments"),
+        (
+            &["HIMPORT", "DISCARDALL", "x"][..],
+            "wrong number of arguments",
+        ),
+        (
+            &["HIMPORT", "PREPARE", "fs", "a", "b", "a"][..],
+            "duplicate field name",
+        ),
+        (
+            &["HIMPORT", "SET", "k", "nope", "v"][..],
+            "no such fieldset",
+        ),
+    ] {
+        let r = resp_cmd(&mut c, args);
+        assert!(r.starts_with("-") && r.contains(err), "{args:?}: {r}");
+    }
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["HIMPORT", "PREPARE", "user", "name", "email", "age"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["HIMPORT", "SET", "u:1", "user", "alice", "a@x", "25"]
+        ),
+        "+OK\r\n"
+    );
+    // Listed in Redis' template order: shorter field names first.
+    assert_eq!(
+        resp_cmd(&mut c, &["HGETALL", "u:1"]),
+        "*6\r\n$3\r\nage\r\n$2\r\n25\r\n$4\r\nname\r\n$5\r\nalice\r\n$5\r\nemail\r\n$3\r\na@x\r\n"
+    );
+    let r = resp_cmd(&mut c, &["HIMPORT", "SET", "u:2", "user", "bob", "b@x"]);
+    assert!(r.contains("value count does not match"), "{r}");
+    // Replaces an existing hash whole; refuses another type.
+    assert_eq!(resp_cmd(&mut c, &["HSET", "u:3", "old", "1"]), ":1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["HIMPORT", "SET", "u:3", "user", "c", "c@x", "3"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["HEXISTS", "u:3", "old"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HLEN", "u:3"]), ":3\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "s", "x"]), "+OK\r\n");
+    assert!(
+        resp_cmd(&mut c, &["HIMPORT", "SET", "s", "user", "a", "b", "c"]).starts_with("-WRONGTYPE")
+    );
+    // Another connection can't see this one's fieldset.
+    let mut other = conn();
+    assert!(
+        resp_cmd(
+            &mut other,
+            &["HIMPORT", "SET", "u:4", "user", "a", "b", "c"]
+        )
+        .contains("no such fieldset")
+    );
+    // Inside MULTI.
+    assert_eq!(resp_cmd(&mut other, &["MULTI"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut other, &["HIMPORT", "PREPARE", "p", "x", "y"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut other, &["HIMPORT", "SET", "m", "p", "1", "2"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(resp_cmd_all(&mut other, &["EXEC"]), "*2\r\n+OK\r\n+OK\r\n");
+    assert_eq!(resp_cmd(&mut other, &["HGET", "m", "y"]), "$1\r\n2\r\n");
+    // DISCARD / DISCARDALL / RESET; keys stay.
+    assert_eq!(
+        resp_cmd(&mut c, &["HIMPORT", "PREPARE", "t", "f"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["HIMPORT", "DISCARD", "user"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HIMPORT", "DISCARD", "user"]), ":0\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["HGET", "u:1", "name"]),
+        "$5\r\nalice\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["HIMPORT", "DISCARDALL"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut other, &["RESET"]), "+RESET\r\n");
+    assert!(
+        resp_cmd(&mut other, &["HIMPORT", "SET", "m", "p", "1", "2"]).contains("no such fieldset")
+    );
+    shutdown_and_wait(port, &mut srv.0);
+}
+
+/// HIMPORT SET reaches the AOF (as DEL + HSET, since the fieldset is the
+/// client's): after a restart the replaced hash is as it was, without the
+/// fields it had before.
+#[test]
+fn test_himport_set_survives_aof_restart_e2e() {
+    let port = 20401u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-himport-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+    ];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["HSET", "h", "old", "1"]), ":1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["HIMPORT", "PREPARE", "fs", "a", "b"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["HIMPORT", "SET", "h", "fs", "1", "2"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["HIMPORT", "SET", "h2", "fs", "3", "4"]),
+        "+OK\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["HGETALL", "h"]),
+        "*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["HGET", "h2", "b"]), "$1\r\n4\r\n");
+    shutdown_and_wait(port, &mut srv.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Each script run is its own HIMPORT session: a fieldset prepared in one
+/// EVAL is gone in the next, and works within the same one.
+#[test]
+fn test_himport_fieldsets_are_per_script_run_e2e() {
+    let port = 20402u16;
+    let ps = port.to_string();
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "1", "--no-pin"],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let prepare = "return redis.call('HIMPORT', 'PREPARE', 'fs', 'a')";
+    let set = "return redis.call('HIMPORT', 'SET', KEYS[1], 'fs', '1')";
+    let both = "redis.call('HIMPORT', 'PREPARE', 'fs', 'a') \
+                return redis.call('HIMPORT', 'SET', KEYS[1], 'fs', '1')";
+    assert_eq!(resp_cmd(&mut c, &["EVAL", prepare, "0"]), "+OK\r\n");
+    assert!(resp_cmd(&mut c, &["EVAL", set, "1", "k"]).contains("no such fieldset"));
+    assert_eq!(resp_cmd(&mut c, &["EVAL", both, "1", "k"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["HGETALL", "k"]),
+        "*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+    );
+    // The connection's own fieldsets are not the script's.
+    assert!(resp_cmd(&mut c, &["HIMPORT", "SET", "k", "fs", "1"]).contains("no such fieldset"));
+    shutdown_and_wait(port, &mut srv.0);
+}

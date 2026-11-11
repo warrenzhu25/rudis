@@ -169,6 +169,26 @@ pub enum TierSubcommand {
     Gc,
 }
 
+/// HIMPORT: builds hashes from a field list prepared once per connection
+/// (a "fieldset") and values sent per key.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum HimportSubcommand {
+    /// `PREPARE <fieldset> <field>...`: defines (or redefines) a fieldset
+    /// for this connection.
+    Prepare { name: Bytes, fields: Vec<Bytes> },
+    /// `SET <key> <fieldset> <value>...`: replaces `key` with the hash of
+    /// the fieldset's fields and these values.
+    Set {
+        key: Bytes,
+        fieldset: Bytes,
+        values: Vec<Bytes>,
+    },
+    /// `DISCARD <fieldset>`
+    Discard(Bytes),
+    /// `DISCARDALL`
+    DiscardAll,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClientSubcommand {
     List(Vec<u64>),
@@ -561,6 +581,13 @@ pub enum Command {
         key: Bytes,
         field: Bytes,
         value: Bytes,
+    },
+    Himport(HimportSubcommand),
+    /// HIMPORT SET with its fieldset resolved on the client's connection:
+    /// what the key's shard runs (replace `key` with this hash).
+    HimportSet {
+        key: Bytes,
+        fields: SmallVec<[(Bytes, Bytes); 1]>,
     },
     Hmset {
         key: Bytes,
@@ -2005,6 +2032,8 @@ impl Command {
                 }
                 !crate::scripting::is_function_read_only(function)
             }
+            Command::Himport(sub) => matches!(sub, HimportSubcommand::Set { .. }),
+            Command::HimportSet { .. } => true,
             _ => {
                 matches!(
                     crate::connection::get_cmd_name(self),
@@ -4782,6 +4811,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Hset { key, fields }))
         }
+        "HIMPORT" => parse_himport(&args).map(Some),
         "HSETNX" => {
             if args.len() != 4 {
                 return Err("wrong number of arguments for 'hsetnx' command".to_string());
@@ -14547,6 +14577,67 @@ fn find_newline_at(buf: &[u8], start: usize) -> Option<(usize, usize)> {
     } else {
         None
     }
+}
+
+/// HIMPORT PREPARE | SET | DISCARD | DISCARDALL.
+fn parse_himport(args: &[Bytes]) -> Result<Command, String> {
+    let arity = |sub: &str| format!("wrong number of arguments for 'himport|{sub}' command");
+    let Some(sub) = args.get(1) else {
+        return Err("wrong number of arguments for 'himport' command".to_string());
+    };
+    let sub_str = String::from_utf8_lossy(sub).to_ascii_lowercase();
+    let sub = match sub_str.as_str() {
+        "prepare" => {
+            if args.len() < 4 {
+                return Err(arity("prepare"));
+            }
+            let fields = args[3..].to_vec();
+            {
+                let mut seen = hashbrown::HashSet::with_capacity(fields.len());
+                for f in &fields {
+                    if !seen.insert(f) {
+                        return Err(format!(
+                            "duplicate field name '{}' in fieldset",
+                            String::from_utf8_lossy(f)
+                        ));
+                    }
+                }
+            }
+            HimportSubcommand::Prepare {
+                name: args[2].clone(),
+                fields,
+            }
+        }
+        "set" => {
+            if args.len() < 5 {
+                return Err(arity("set"));
+            }
+            HimportSubcommand::Set {
+                key: args[2].clone(),
+                fieldset: args[3].clone(),
+                values: args[4..].to_vec(),
+            }
+        }
+        "discard" => {
+            if args.len() != 3 {
+                return Err(arity("discard"));
+            }
+            HimportSubcommand::Discard(args[2].clone())
+        }
+        "discardall" => {
+            if args.len() != 2 {
+                return Err(arity("discardall"));
+            }
+            HimportSubcommand::DiscardAll
+        }
+        _ => {
+            return Err(format!(
+                "unknown subcommand '{}'. Try HIMPORT HELP.",
+                String::from_utf8_lossy(&args[1])
+            ));
+        }
+    };
+    Ok(Command::Himport(sub))
 }
 
 #[cfg(test)]

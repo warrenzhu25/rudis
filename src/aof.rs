@@ -6819,6 +6819,10 @@ mod tests {
                 "PFDEBUG TODENSE h",
                 "changes the encoding only, not the value",
             ),
+            (
+                "HIMPORT SET h fs v",
+                "the connection resolves the fieldset; logged as DEL + HSET",
+            ),
         ];
         // Known gaps, kept failing loudly once fixed: FT.ADD documents live
         // only in the global search registry (not in the keyspace, and not

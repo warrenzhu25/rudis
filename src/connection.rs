@@ -94,6 +94,9 @@ pub struct ClientInfo {
     pub stats: std::sync::Arc<ClientStats>,
     /// How other threads deliver MONITOR output to this client.
     pub push: crate::transport::PushTarget,
+    /// HIMPORT PREPARE's fieldsets: field lists by name, this connection's
+    /// own until DISCARD, RESET or disconnect.
+    pub himport_fieldsets: hashbrown::HashMap<Bytes, Vec<Bytes>>,
 }
 
 impl ClientInfo {
@@ -6665,6 +6668,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
             readonly: false,
             stats: stats.clone(),
             push,
+            himport_fieldsets: hashbrown::HashMap::new(),
         },
     );
 
@@ -9517,6 +9521,8 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Persist(key)
         | Command::Ttl(key, _)
         | Command::Hsetnx { key, .. }
+        | Command::HimportSet { key, .. }
+        | Command::Himport(crate::resp::HimportSubcommand::Set { key, .. })
         | Command::Hmset { key, .. }
         | Command::Hmget { key, .. }
         | Command::Hdel { key, .. }
@@ -9807,6 +9813,8 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::Append { key, .. }
         | Command::Hset { key, .. }
         | Command::Hsetnx { key, .. }
+        | Command::HimportSet { key, .. }
+        | Command::Himport(crate::resp::HimportSubcommand::Set { key, .. })
         | Command::Hmset { key, .. }
         | Command::Hexists { key, .. }
         | Command::Hstrlen { key, .. }
@@ -10993,6 +11001,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Migrate { .. } => "MIGRATE",
         Command::Hset { .. } => "HSET",
         Command::Hsetnx { .. } => "HSETNX",
+        Command::Himport(_) | Command::HimportSet { .. } => "HIMPORT",
         Command::Hmset { .. } => "HMSET",
         Command::Hget { .. } => "HGET",
         Command::Hmget { .. } => "HMGET",
@@ -15822,6 +15831,36 @@ async fn execute_command_inner(
             }
             close_conn
         }
+        // Only connections' resolved HIMPORT SETs (above) reach a shard.
+        Command::HimportSet { .. } => {
+            out.extend_from_slice(b"-ERR HIMPORT SET must name a fieldset\r\n");
+            false
+        }
+        Command::Himport(ref sub) => {
+            let resolved = {
+                let mut reg = client_registry.borrow_mut();
+                match reg.get_mut(&client_id) {
+                    Some(c) => himport_session(&mut c.himport_fieldsets, sub, out),
+                    None => himport_session(&mut hashbrown::HashMap::new(), sub, out),
+                }
+            };
+            if let Some(set) = resolved
+                && let Some(target) = target_shard_of_cmd(&set, router.num_shards)
+            {
+                if target == router.shard_id {
+                    execute_local_command(
+                        &set,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof().as_deref(),
+                    );
+                } else {
+                    let res = router.execute_remote(target, set).await;
+                    out.extend_from_slice(&res);
+                }
+            }
+            false
+        }
         Command::Hset { .. }
         | Command::Hsetnx { .. }
         | Command::Hmset { .. }
@@ -18447,6 +18486,7 @@ async fn execute_command_inner(
         }
         Command::Reset => {
             if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                c.himport_fieldsets.clear();
                 c.name = None;
                 c.is_resp3 = client_default_resp3();
                 c.db = 0;
@@ -21719,6 +21759,79 @@ fn record_reply_error_stat(out: &[u8], start_len: usize, cmd_name: &'static str)
     }
 }
 
+/// Runs the part of a HIMPORT subcommand that works on the session's
+/// `fieldsets` (a connection's, or a script run's). For SET, returns the
+/// resolved [`Command::HimportSet`] for the key's shard to run; anything
+/// else is answered in `out`.
+#[inline(never)]
+pub fn himport_session(
+    fieldsets: &mut hashbrown::HashMap<Bytes, Vec<Bytes>>,
+    sub: &crate::resp::HimportSubcommand,
+    out: &mut Vec<u8>,
+) -> Option<Command> {
+    use crate::resp::HimportSubcommand as H;
+    match sub {
+        H::Prepare { name, fields } => {
+            fieldsets.insert(name.clone(), fields.clone());
+            out.extend_from_slice(b"+OK\r\n");
+            None
+        }
+        H::Discard(name) => {
+            write_resp_integer(out, fieldsets.remove(name).is_some() as i64);
+            None
+        }
+        H::DiscardAll => {
+            let n = fieldsets.len();
+            fieldsets.clear();
+            write_resp_integer(out, n as i64);
+            None
+        }
+        H::Set {
+            key,
+            fieldset,
+            values,
+        } => {
+            let Some(fields) = fieldsets.get(fieldset) else {
+                write_resp_err(
+                    out,
+                    format!(
+                        "ERR no such fieldset '{}'",
+                        String::from_utf8_lossy(fieldset)
+                    ),
+                );
+                return None;
+            };
+            if fields.len() != values.len() {
+                write_resp_err(
+                    out,
+                    format!(
+                        "ERR value count does not match the fieldset ({} fields, {} values)",
+                        fields.len(),
+                        values.len()
+                    ),
+                );
+                return None;
+            }
+            // In Redis' template order (shorter field names first, then
+            // bytewise), so HGETALL lists them as Redis does.
+            let mut pairs: smallvec::SmallVec<[(Bytes, Bytes); 1]> =
+                fields.iter().cloned().zip(values.iter().cloned()).collect();
+            pairs.sort_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+            Some(Command::HimportSet {
+                key: key.clone(),
+                fields: pairs,
+            })
+        }
+    }
+}
+
+thread_local! {
+    /// HIMPORT fieldsets of the script running on this thread: each script
+    /// run starts with none, as each EVAL / FCALL is its own session.
+    pub static SCRIPT_FIELDSETS: RefCell<hashbrown::HashMap<Bytes, Vec<Bytes>>> =
+        RefCell::new(hashbrown::HashMap::new());
+}
+
 pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
     match cmd {
         Command::Exists(keys) if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
@@ -21741,6 +21854,8 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Persist(key)
         | Command::Ttl(key, _)
         | Command::Hsetnx { key, .. }
+        | Command::HimportSet { key, .. }
+        | Command::Himport(crate::resp::HimportSubcommand::Set { key, .. })
         | Command::Hmset { key, .. }
         | Command::Hmget { key, .. }
         | Command::Hdel { key, .. }
@@ -22885,6 +23000,44 @@ pub fn execute_local_command(
                     Err(err) => {
                         write_resp_err(out, err);
                     }
+                }
+                false
+            }
+            Command::Himport(sub) => {
+                // From a script (connections resolve fieldsets first).
+                let set = SCRIPT_FIELDSETS.with(|f| himport_session(&mut f.borrow_mut(), sub, out));
+                if let Some(set) = set {
+                    execute_local_command(&set, db, out, aof);
+                }
+                false
+            }
+            Command::HimportSet { key, fields } => {
+                let ty = db.type_of(key);
+                if ty != "none" && ty != "hash" {
+                    out.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                    return false;
+                }
+                // Replaces the key, so it goes to the AOF and replicas as
+                // DEL + HSET (the fieldset is the client's, not theirs).
+                if db.del(key) {
+                    record_change!(&Command::Del(smallvec::smallvec![key.clone()]));
+                }
+                match db.hset_slice_fast(key, fields) {
+                    Ok(_) => {
+                        let as_hset = Command::Hset {
+                            key: key.clone(),
+                            fields: fields.clone(),
+                        };
+                        record_change!(&as_hset);
+                        notify_hset_fields(key, fields);
+                        if db.has_search_indices() || crate::search::has_active_search_indices() {
+                            reindex_hash_for_search(db, key);
+                        }
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(err) => write_resp_err(out, err),
                 }
                 false
             }

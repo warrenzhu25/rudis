@@ -233,6 +233,7 @@ const REDIS_CONFIG_NAMES: &[&str] = &[
     "hash-max-listpack-value",
     "hash-max-ziplist-entries",
     "hash-max-ziplist-value",
+    "hash-min-template-entries",
     "hash-seed",
     "hide-user-data-from-log",
     "hll-sparse-max-bytes",

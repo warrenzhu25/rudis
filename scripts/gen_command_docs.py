@@ -71,6 +71,8 @@ GROUPS = {"sorted_set": "sorted-set"}
 RUDIS_ONLY = {
     "blmovem": (-6, ["BLOCKING"], (1, 2, 1), ["RW", "ACCESS", "DELETE", "INSERT"],
                 "Pops elements from a list and pushes them to another, blocking until available."),
+    "himport": (-2, [], None, [],
+                "Builds hashes from a field list prepared once per connection."),
     "lmovem": (-5, [], (1, 2, 1), ["RW", "ACCESS", "DELETE", "INSERT"],
                "Pops elements from a list and pushes them to another."),
     "delex": (-2, [], (1, 1, 1), ["RW", "DELETE"],

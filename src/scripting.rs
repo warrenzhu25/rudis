@@ -1337,6 +1337,7 @@ impl Drop for VmLease {
         }
         *self.0.ctx.db.borrow_mut() = None;
         *self.0.ctx.aof.borrow_mut() = None;
+        crate::connection::SCRIPT_FIELDSETS.with(|f| f.borrow_mut().clear());
         self.0.in_use.set(false);
     }
 }
@@ -1406,6 +1407,7 @@ impl ScriptVm {
             }
         })?;
         vm.in_use.set(true);
+        crate::connection::SCRIPT_FIELDSETS.with(|f| f.borrow_mut().clear());
         *vm.ctx.db.borrow_mut() = Some(db.clone());
         *vm.ctx.aof.borrow_mut() = aof;
         vm.ctx.read_only.set(read_only);
