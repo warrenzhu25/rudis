@@ -30,7 +30,6 @@ pub const OK_SUBCOMMANDS: &[&[u8]] = &[
     b"replybuffer",
     b"sdslen",
     b"segfault",
-    b"set-disable-deny-scripts",
     // Integration suites.
     b"aof-flush-sleep",
     b"allocsize-slots-assert",
@@ -385,6 +384,10 @@ pub fn execute_shard_debug(
         write_error_reply(out, &args[1]);
     } else if sub.eq_ignore_ascii_case(b"log") && args.len() == 2 {
         println!("DEBUG LOG: {}", String::from_utf8_lossy(&args[1]));
+        out.extend_from_slice(b"+OK\r\n");
+    } else if sub.eq_ignore_ascii_case(b"set-disable-deny-scripts") && args.len() == 2 {
+        let on = args[1].as_ref() != b"0";
+        crate::scripting::DENY_SCRIPTS_DISABLED.store(on, std::sync::atomic::Ordering::Relaxed);
         out.extend_from_slice(b"+OK\r\n");
     } else if is_ok_subcommand(sub) {
         out.extend_from_slice(b"+OK\r\n");

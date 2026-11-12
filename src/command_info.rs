@@ -54,6 +54,28 @@ pub fn denyoom(name: &str) -> Option<bool> {
         .flatten()
 }
 
+/// Whether Redis refuses `name` (`cmd` or `container|sub`, any case) in a
+/// script (its `noscript` flag): connection state, transactions, other
+/// scripts, admin commands... False for names the table lacks.
+pub fn noscript(name: &str) -> bool {
+    static NOSCRIPT: OnceLock<Vec<bool>> = OnceLock::new();
+    let Some(i) = crate::acl::command_index(name) else {
+        return false;
+    };
+    NOSCRIPT
+        .get_or_init(|| {
+            DOCS.iter()
+                .map(|d| {
+                    d.as_ref()
+                        .is_some_and(|d| d.info.windows(11).any(|w| w == b"+noscript\r\n"))
+                })
+                .collect()
+        })
+        .get(i)
+        .copied()
+        .unwrap_or(false)
+}
+
 /// `listed()[i]`: `COMMANDS[i]` is shown by COMMAND and friends.
 fn listed() -> &'static [bool] {
     static LISTED: OnceLock<Vec<bool>> = OnceLock::new();

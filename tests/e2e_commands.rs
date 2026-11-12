@@ -9844,6 +9844,19 @@ fn test_enable_debug_command_gates_debug_e2e() {
     let mut child = spawn_rudis_debug_setting(port, &["--enable-debug-command", "yes"]);
     let mut c = connect(port);
     assert_eq!(resp_cmd(&mut c, &["DEBUG", "SLEEP", "0"]), "+OK\r\n");
+    // From a script, DEBUG is a noscript command as in Redis: refused
+    // until DEBUG set-disable-deny-scripts 1, then the debug gate lets it.
+    assert!(
+        resp_cmd(
+            &mut c,
+            &["EVAL", "return redis.call('DEBUG','SLEEP','0')", "0"]
+        )
+        .contains("not allowed from script"),
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "set-disable-deny-scripts", "1"]),
+        "+OK\r\n"
+    );
     assert!(
         !resp_cmd(
             &mut c,

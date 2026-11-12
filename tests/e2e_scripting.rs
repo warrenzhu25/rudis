@@ -748,7 +748,15 @@ fn test_script_kill_ends_endless_script_e2e() {
 /// 100 ms, and a connection to it.
 fn busy_script_server(port: u16, threads: &str) -> (KillRudisOnDrop, TcpStream) {
     let ps = port.to_string();
-    let args = ["--port", &ps, "--threads", threads, "--no-pin"];
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        threads,
+        "--no-pin",
+        "--enable-debug-command",
+        "yes",
+    ];
     let srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
     let c = connect_busy(port, 5);
     let mut c2 = c.try_clone().unwrap();
@@ -980,7 +988,12 @@ fn test_function_stats_shows_running_function_e2e() {
 #[test]
 fn test_busy_redis_call_loop_serves_blocked_client_after_script_e2e() {
     for (port, threads) in [(20308u16, "1"), (20309u16, "4")] {
-        let (mut srv, _c) = busy_script_server(port, threads);
+        let (mut srv, mut c) = busy_script_server(port, threads);
+        // CLIENT is refused in scripts unless allowed (Redis' test does this).
+        assert_eq!(
+            resp_cmd(&mut c, &["DEBUG", "set-disable-deny-scripts", "1"]),
+            "+OK\r\n"
+        );
         let mut blocked = connect_busy(port, 10);
         send_cmd(&mut blocked, &["BLPOP", "x", "0"]);
         thread::sleep(Duration::from_millis(200));
@@ -1328,4 +1341,53 @@ fn test_runaway_script_in_pipeline_busy_and_killable_e2e() {
         assert_eq!(resp_cmd(&mut k, &["GET", "b"]), "$1\r\n2\r\n");
         shutdown_and_wait(port, &mut srv.0);
     }
+}
+
+/// Redis' noscript commands (CLIENT, CONFIG, MULTI, SUBSCRIBE, EVAL, ...)
+/// are refused in scripts unless DEBUG set-disable-deny-scripts 1. Before,
+/// rudis refused only a handful (SHUTDOWN, SAVE, ...) and let scripts
+/// change connection or server state.
+#[test]
+fn test_noscript_commands_refused_in_scripts_e2e() {
+    let port = 20323u16;
+    let (mut srv, mut c) = busy_script_server(port, "1");
+    for call in [
+        "redis.call('client', 'list')",
+        "redis.call('config', 'set', 'maxclients', '100')",
+        "redis.call('multi')",
+        "redis.call('eval', 'return 1', '0')",
+        "redis.call('subscribe', 'ch')",
+    ] {
+        let r = resp_cmd(&mut c, &["EVAL", &format!("return {call}"), "0"]);
+        assert!(
+            r.contains("This Redis command is not allowed from script"),
+            "{call}: {r}"
+        );
+    }
+    let r = resp_cmd(
+        &mut c,
+        &["EVAL", "return redis.pcall('client', 'list')", "0"],
+    );
+    assert!(
+        r.contains("This Redis command is not allowed from script"),
+        "{r}"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["EVAL", "return redis.call('echo', 'x')", "0"]),
+        "$1\r\nx\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "set-disable-deny-scripts", "1"]),
+        "+OK\r\n"
+    );
+    let r = resp_cmd(
+        &mut c,
+        &["EVAL", "return redis.call('client', 'list')", "0"],
+    );
+    assert!(r.contains("id="), "{r}");
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "set-disable-deny-scripts", "0"]),
+        "+OK\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
 }

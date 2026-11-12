@@ -197,6 +197,22 @@ fn script_execute(
     }
 }
 
+/// `DEBUG set-disable-deny-scripts 1`: scripts may run `noscript`
+/// commands (Redis keeps it for tests that need, say, CLIENT LIST).
+pub static DENY_SCRIPTS_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a script may not run `cmd`: Redis' `noscript` commands
+/// (CLIENT, CONFIG, MULTI, EVAL, SUBSCRIBE, ...), plus CLUSTER, which
+/// rudis can't run from a script either.
+fn script_denies(cmd: &Command) -> bool {
+    if matches!(cmd, Command::Cluster(_)) {
+        return true;
+    }
+    !DENY_SCRIPTS_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::command_info::noscript(crate::connection::acl_cmd_name(cmd))
+}
+
 /// Notes that the running script issued a write command.
 fn note_script_write() {
     CURRENT_SCRIPT.with(|c| {
@@ -3149,18 +3165,10 @@ fn register_redis_module(
                 crate::connection::SCRIPT_STALE_ERR.to_string(),
             ));
         }
-        match &cmd {
-            Command::Cluster(_)
-            | Command::Replicaof { .. }
-            | Command::Shutdown { .. }
-            | Command::Save
-            | Command::Bgsave { .. }
-            | Command::Bgrewriteaof => {
-                return Err(mlua::Error::RuntimeError(
-                    "ERR This Redis command is not allowed from script".to_string(),
-                ));
-            }
-            _ => {}
+        if script_denies(&cmd) {
+            return Err(mlua::Error::RuntimeError(
+                "ERR This Redis command is not allowed from script".to_string(),
+            ));
         }
         if crate::connection::MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0
             && cmd.is_write_command()
@@ -3340,18 +3348,10 @@ fn register_redis_module(
             tbl.set("err", crate::connection::SCRIPT_STALE_ERR)?;
             return Ok(Value::Table(tbl));
         }
-        match &cmd {
-            Command::Cluster(_)
-            | Command::Replicaof { .. }
-            | Command::Shutdown { .. }
-            | Command::Save
-            | Command::Bgsave { .. }
-            | Command::Bgrewriteaof => {
-                let tbl = lua.create_table()?;
-                tbl.set("err", "ERR This Redis command is not allowed from script")?;
-                return Ok(Value::Table(tbl));
-            }
-            _ => {}
+        if script_denies(&cmd) {
+            let tbl = lua.create_table()?;
+            tbl.set("err", "ERR This Redis command is not allowed from script")?;
+            return Ok(Value::Table(tbl));
         }
         if crate::connection::MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0
             && cmd.is_write_command()
