@@ -1379,6 +1379,7 @@ impl Drop for VmLease {
         *self.0.ctx.db.borrow_mut() = None;
         *self.0.ctx.aof.borrow_mut() = None;
         crate::connection::SCRIPT_FIELDSETS.with(|f| f.borrow_mut().clear());
+        crate::connection::SCRIPT_REPL_TARGETS.set(3);
         self.0.in_use.set(false);
     }
 }
@@ -1448,6 +1449,7 @@ impl ScriptVm {
             }
         })?;
         vm.in_use.set(true);
+        crate::connection::SCRIPT_REPL_TARGETS.set(3);
         crate::connection::SCRIPT_FIELDSETS.with(|f| f.borrow_mut().clear());
         *vm.ctx.db.borrow_mut() = Some(db.clone());
         *vm.ctx.aof.borrow_mut() = aof;
@@ -3491,6 +3493,29 @@ fn register_redis_module(
     redis.set("LOG_VERBOSE", 1)?;
     redis.set("LOG_NOTICE", 2)?;
     redis.set("LOG_WARNING", 3)?;
+    // Effects replication is always on (Redis 7): kept for old scripts.
+    redis.set("replicate_commands", lua.create_function(|_, ()| Ok(true))?)?;
+    redis.set(
+        "set_repl",
+        lua.create_function(|_, flags: i64| {
+            if !(0..=3).contains(&flags) {
+                return Err(mlua::Error::RuntimeError(
+                    "ERR Invalid replication flags. Use REPL_AOF, REPL_REPLICA, REPL_ALL or REPL_NONE."
+                        .to_string(),
+                ));
+            }
+            crate::connection::SCRIPT_REPL_TARGETS.set(flags as u8);
+            Ok(())
+        })?,
+    )?;
+    redis.set("REPL_NONE", 0)?;
+    redis.set("REPL_AOF", 1)?;
+    redis.set("REPL_SLAVE", 2)?;
+    redis.set("REPL_REPLICA", 2)?;
+    redis.set("REPL_ALL", 3)?;
+    // The script debugger (SCRIPT DEBUG) is not supported: no-ops.
+    redis.set("breakpoint", lua.create_function(|_, ()| Ok(false))?)?;
+    redis.set("debug", lua.create_function(|_, _: MultiValue| Ok(()))?)?;
     redis.set("REDIS_VERSION", "7.2.0")?;
     redis.set("REDIS_VERSION_NUM", 0x00070200i64)?;
 

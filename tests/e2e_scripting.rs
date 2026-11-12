@@ -1391,3 +1391,86 @@ fn test_noscript_commands_refused_in_scripts_e2e() {
     );
     shutdown_and_wait(port, &mut srv.0);
 }
+
+/// redis.set_repl() picks where a script's following writes propagate
+/// (REPL_NONE / REPL_AOF / REPL_REPLICA / REPL_ALL), as in Redis: here a
+/// write made under REPL_NONE is gone after an AOF restart while one under
+/// REPL_AOF stays. redis.replicate_commands() answers true. Before, both
+/// were missing (scripts calling them failed).
+#[test]
+fn test_script_set_repl_controls_propagation_e2e() {
+    let port = 20324u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-setrepl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+        "--enable-debug-command",
+        "yes",
+    ];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = connect_busy(port, 5);
+    // A key a REPL_NONE script finds expired is still logged as DEL: an
+    // expiry is the server's decision, not the script's write.
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "set-active-expire", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["SET", "expkey", "v", "PX", "1"]),
+        "+OK\r\n"
+    );
+    thread::sleep(Duration::from_millis(20));
+    // Not in KEYS, so nothing looks at it before the script does.
+    let lazy = "redis.set_repl(redis.REPL_NONE) return redis.call('get', 'expkey')";
+    assert_eq!(resp_cmd(&mut c, &["EVAL", lazy, "0"]), "$-1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["EVAL", "return redis.replicate_commands()", "0"]),
+        ":1\r\n"
+    );
+    let r = resp_cmd(&mut c, &["EVAL", "redis.set_repl(12345)", "0"]);
+    assert!(r.contains("Invalid replication flags"), "{r}");
+    let script = "redis.call('set','a','1') \
+                  redis.set_repl(redis.REPL_NONE) redis.call('set','b','2') \
+                  redis.set_repl(redis.REPL_AOF) redis.call('set','c','3') \
+                  redis.set_repl(redis.REPL_ALL) redis.call('set','d','4')";
+    assert_eq!(
+        resp_cmd(&mut c, &["EVAL", script, "4", "a", "b", "c", "d"]),
+        "$-1\r\n"
+    );
+    // The next script starts back at REPL_ALL.
+    assert_eq!(
+        resp_cmd(&mut c, &["EVAL", "redis.call('set','e','5')", "1", "e"]),
+        "$-1\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
+    let mut aof_bytes = Vec::new();
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.extension().is_some_and(|x| x == "aof") {
+            aof_bytes.extend(std::fs::read(path).unwrap());
+        }
+    }
+    let aof_text = String::from_utf8_lossy(&aof_bytes);
+    assert!(aof_text.contains("DEL\r\n$6\r\nexpkey"), "{aof_text}");
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = connect_busy(port, 5);
+    assert_eq!(
+        resp_cmd_all(&mut c, &["MGET", "a", "b", "c", "d", "e"]),
+        "*5\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n$1\r\n4\r\n$1\r\n5\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

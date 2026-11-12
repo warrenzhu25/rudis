@@ -3654,6 +3654,9 @@ pub fn log_expired_key(key: &[u8]) {
     if crate::connection::REPLAYING_WRITES.get() {
         return;
     }
+    // An expiry is the server's own decision: it propagates whatever a
+    // running script asked with redis.set_repl().
+    let _all = ScriptReplAll::enter();
     SHARD_LOG.with(|l| {
         if let Some((port, shard_id, aof)) = &*l.borrow() {
             log_shard_mutation(*port, *shard_id, aof.get().as_deref(), || {
@@ -3670,6 +3673,9 @@ pub fn log_expired_fields(key: &[u8], fields: &[bytes::Bytes]) {
     if crate::connection::REPLAYING_WRITES.get() || fields.is_empty() {
         return;
     }
+    // An expiry is the server's own decision: it propagates whatever a
+    // running script asked with redis.set_repl().
+    let _all = ScriptReplAll::enter();
     SHARD_LOG.with(|l| {
         if let Some((port, shard_id, aof)) = &*l.borrow() {
             log_shard_mutation(*port, *shard_id, aof.get().as_deref(), || {
@@ -3680,6 +3686,22 @@ pub fn log_expired_fields(key: &[u8], fields: &[bytes::Bytes]) {
             });
         }
     });
+}
+
+/// Propagates to the AOF and replicas until dropped, whatever the running
+/// script's redis.set_repl() targets are.
+struct ScriptReplAll(u8);
+
+impl ScriptReplAll {
+    fn enter() -> Self {
+        Self(crate::connection::SCRIPT_REPL_TARGETS.replace(3))
+    }
+}
+
+impl Drop for ScriptReplAll {
+    fn drop(&mut self) {
+        crate::connection::SCRIPT_REPL_TARGETS.set(self.0);
+    }
 }
 
 /// Appends the mutation built by `make` to this shard's AOF and replicates
@@ -3693,7 +3715,9 @@ pub fn log_shard_mutation(
     aof: Option<&std::cell::RefCell<crate::aof::AofWriter>>,
     make: impl FnOnce() -> crate::resp::Command,
 ) {
-    let replicate = has_connected_replicas(port);
+    let targets = crate::connection::SCRIPT_REPL_TARGETS.get();
+    let replicate = targets & 2 != 0 && has_connected_replicas(port);
+    let aof = if targets & 1 != 0 { aof } else { None };
     if aof.is_none() && !replicate {
         return;
     }

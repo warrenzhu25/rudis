@@ -22401,6 +22401,12 @@ pub fn apply_replicated_command(
     }
 }
 
+thread_local! {
+    /// Where the running script's writes propagate (redis.set_repl): bit 1
+    /// the AOF, bit 2 the replicas. 3 (both) outside scripts.
+    pub static SCRIPT_REPL_TARGETS: std::cell::Cell<u8> = const { std::cell::Cell::new(3) };
+}
+
 /// Appends a change to the AOF and replicates it (see `record_change!` in
 /// [`execute_local_command`]). Out of line: expanded at every write site,
 /// this grew that function's stack frame enough to overflow test threads.
@@ -22412,7 +22418,11 @@ fn log_change(
     shard_id: usize,
     warn: bool,
 ) {
-    let need_rep = crate::replication::has_connected_replicas(port);
+    // A script's redis.set_repl() may leave out the AOF, the replicas or
+    // both (bit 1: AOF, bit 2: replicas; both outside scripts).
+    let targets = SCRIPT_REPL_TARGETS.get();
+    let need_rep = targets & 2 != 0 && crate::replication::has_connected_replicas(port);
+    let aof = if targets & 1 != 0 { aof } else { None };
     if let Some(aof_w) = aof {
         // Encoded straight into the AOF buffer; replicas get the same bytes
         // from there.
