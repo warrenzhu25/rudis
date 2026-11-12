@@ -5,7 +5,7 @@ use hashbrown::HashMap;
 pub type RudisHashMap = crate::packedhash::PackedHash;
 use crate::compact::{CompactKey, CompactStr};
 use crate::resp::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 pub const GROUP_SIZE: usize = 16;
 pub const EMPTY: u8 = 0xFF;
@@ -1528,8 +1528,8 @@ pub fn heap_len(n: usize) -> usize {
 fn expiry_base() -> Instant {
     static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     *BASE.get_or_init(|| {
-        let now = Instant::now();
-        let sub_ms = std::time::SystemTime::now()
+        let now = crate::clock::now();
+        let sub_ms = crate::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos() % 1_000_000);
         let back = Duration::from_secs(3600) + Duration::from_nanos(sub_ms as u64);
@@ -1670,7 +1670,7 @@ pub fn key_dir_bits(key: &[u8]) -> u64 {
 /// Wall-clock time since the Unix epoch, to the nanosecond: the `now_unix`
 /// of [`instant_to_unix_ms`] / [`unix_ms_to_instant`].
 pub fn unix_now() -> Duration {
-    SystemTime::now()
+    crate::clock::system_now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
 }
@@ -3852,7 +3852,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 return None;
@@ -4083,7 +4083,7 @@ impl RudisTable {
         }
         let is_exp = if let Some(entry) = self.table.get_slot(slot_idx) {
             if let Some(expire_at) = entry.expire_at() {
-                Instant::now() >= expire_at
+                crate::clock::now() >= expire_at
             } else {
                 false
             }
@@ -4228,7 +4228,7 @@ impl RudisTable {
         match self.table.find_entry(key, hash_key(key)) {
             Some((_, entry)) => match entry.expire_at() {
                 Some(expire_at) => {
-                    crate::connection::access_expired_allowed() || Instant::now() < expire_at
+                    crate::connection::access_expired_allowed() || crate::clock::now() < expire_at
                 }
                 None => true,
             },
@@ -4264,7 +4264,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::server_stats::note_key_lookup(false);
@@ -4321,7 +4321,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::server_stats::note_key_lookup(false);
@@ -4375,7 +4375,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::server_stats::note_key_lookup(false);
@@ -4421,7 +4421,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 let ttl = entry.expire_at().and_then(|exp| {
-                    let now = Instant::now();
+                    let now = crate::clock::now();
                     if exp > now {
                         Some(exp.duration_since(now))
                     } else {
@@ -4590,7 +4590,7 @@ impl RudisTable {
                 } else if !had_exp && will_exp {
                     self.num_expires += 1;
                 }
-                entry.set_expire_at(expire_in.map(|d| Instant::now() + d));
+                entry.set_expire_at(expire_in.map(|d| crate::clock::now() + d));
             }
             self.data_bytes = self.data_bytes.saturating_sub(old_bytes + old_key)
                 + val_bytes
@@ -4604,7 +4604,7 @@ impl RudisTable {
         let expire_at = if keepttl {
             None
         } else {
-            expire_in.map(|d| Instant::now() + d)
+            expire_in.map(|d| crate::clock::now() + d)
         };
         if expire_at.is_some() {
             self.num_expires += 1;
@@ -4651,7 +4651,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, hash) {
             if let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 return false;
@@ -4688,7 +4688,7 @@ impl RudisTable {
         if let Some((idx, entry)) = self.table.find_entry(key, hash) {
             if let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 return false;
@@ -4731,7 +4731,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
             } else {
@@ -4794,7 +4794,7 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return false;
             }
-            let target_instant = Instant::now() + duration;
+            let target_instant = crate::clock::now() + duration;
             if let Some(entry) = self.table.get_slot_mut(idx) {
                 if opts.nx && entry.expire_at().is_some() {
                     return false;
@@ -4867,7 +4867,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match entry.expire_at() {
                     Some(expire_at) => {
-                        let now = Instant::now();
+                        let now = crate::clock::now();
                         if now >= expire_at {
                             self.check_expired_slot(idx);
                             -2
@@ -4899,13 +4899,13 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match entry.expire_at() {
                     Some(expire_at) => {
-                        let now = Instant::now();
+                        let now = crate::clock::now();
                         if now >= expire_at {
                             self.check_expired_slot(idx);
                             -2
                         } else {
                             let diff = expire_at.duration_since(now);
-                            let now_epoch = std::time::SystemTime::now()
+                            let now_epoch = crate::clock::system_now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or(Duration::ZERO);
                             let target_epoch = now_epoch + diff;
@@ -5947,11 +5947,11 @@ impl RudisTable {
         expire: Option<crate::resp::IncrexExpire>,
         enx: bool,
     ) -> Result<IncrexOutput, &'static str> {
-        let now_ms = std::time::SystemTime::now()
+        let now_ms = crate::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let now_instant = Instant::now();
+        let now_instant = crate::clock::now();
 
         let h = hash_key(&key);
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
@@ -6524,7 +6524,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
             } else {
@@ -6606,7 +6606,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
             } else {
@@ -6771,7 +6771,7 @@ impl RudisTable {
         let Some(fmap) = self.hash_field_expires.get(key) else {
             return HiddenFields::default();
         };
-        let now = Instant::now();
+        let now = crate::clock::now();
         HiddenFields(
             fmap.iter()
                 .filter(|(_, exp)| now >= **exp)
@@ -6798,7 +6798,7 @@ impl RudisTable {
         if crate::connection::access_expired_allowed() || crate::replication::hide_expired_keys() {
             return;
         }
-        let now = Instant::now();
+        let now = crate::clock::now();
         let mut expired = Vec::new();
         let mut empty_map = false;
         if let Some(fmap) = self.hash_field_expires.get_mut(key) {
@@ -6871,7 +6871,7 @@ impl RudisTable {
             _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
         }
 
-        let now = Instant::now();
+        let now = crate::clock::now();
         let now_unix = unix_now();
         // An absolute time converts from nanoseconds: truncating the clock
         // to milliseconds first stored it up to 1 ms early, and
@@ -6990,7 +6990,7 @@ impl RudisTable {
             _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
         }
 
-        let now = Instant::now();
+        let now = crate::clock::now();
         let now_unix = unix_now();
         let mut results = Vec::with_capacity(fields.len());
 
@@ -7138,7 +7138,7 @@ impl RudisTable {
             }
             crate::resp::HFieldExpireOpt::ExMs(ms) | crate::resp::HFieldExpireOpt::ExAtMs(ms) => {
                 let is_at = matches!(expire, crate::resp::HFieldExpireOpt::ExAtMs(_));
-                let now_unix_ms = std::time::SystemTime::now()
+                let now_unix_ms = crate::clock::system_now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64;
@@ -7154,7 +7154,7 @@ impl RudisTable {
                     if subkeys {
                         changed.clone_from(&existing_fields);
                     }
-                    let new_exp = Instant::now() + Duration::from_millis(delta_ms as u64);
+                    let new_exp = crate::clock::now() + Duration::from_millis(delta_ms as u64);
                     let fmap = self
                         .hash_field_expires
                         .entry(Bytes::copy_from_slice(key))
@@ -7261,7 +7261,7 @@ impl RudisTable {
             }
             crate::resp::HFieldExpireOpt::ExMs(ms) | crate::resp::HFieldExpireOpt::ExAtMs(ms) => {
                 let is_at = matches!(expire, crate::resp::HFieldExpireOpt::ExAtMs(_));
-                let now_unix_ms = std::time::SystemTime::now()
+                let now_unix_ms = crate::clock::system_now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64;
@@ -7269,7 +7269,7 @@ impl RudisTable {
                 if delta_ms <= 0 {
                     let _ = self.hdel(&key, &fields);
                 } else {
-                    let new_exp = Instant::now() + Duration::from_millis(delta_ms as u64);
+                    let new_exp = crate::clock::now() + Duration::from_millis(delta_ms as u64);
                     let fmap = self.hash_field_expires.entry(key).or_default();
                     for f in fields {
                         fmap.insert(f, new_exp);
@@ -7327,7 +7327,7 @@ impl RudisTable {
             sids.push(StreamId::parse_exact(s).map_err(|e| e.to_string())?);
         }
 
-        let now_ms = std::time::SystemTime::now()
+        let now_ms = crate::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
@@ -7455,7 +7455,7 @@ impl RudisTable {
             return Err("NOGROUP No such key or consumer group".to_string());
         };
 
-        let now_ms = std::time::SystemTime::now()
+        let now_ms = crate::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
@@ -7626,7 +7626,7 @@ impl RudisTable {
         {
             if let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 return Ok(None);
@@ -7668,7 +7668,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::server_stats::note_key_lookup(false);
@@ -7713,7 +7713,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::connection::write_resp_null(out);
@@ -7804,7 +7804,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::server_stats::note_key_lookup(false);
@@ -7966,7 +7966,7 @@ impl RudisTable {
         let Some(fmap) = self.hash_field_expires.get(key) else {
             return false;
         };
-        let now = Instant::now();
+        let now = crate::clock::now();
         !fields.is_empty()
             && fields
                 .iter()
@@ -8589,7 +8589,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
             } else {
@@ -8680,7 +8680,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
             } else {
@@ -8808,7 +8808,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 if count.is_some() {
@@ -8901,7 +8901,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 if count.is_some() {
@@ -8998,7 +8998,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 return Ok(None);
@@ -9058,7 +9058,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 return Ok(None);
@@ -9286,7 +9286,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
@@ -9344,7 +9344,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::connection::write_resp_array_header(out, 0);
@@ -9930,7 +9930,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
             } else {
@@ -10018,7 +10018,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
             } else {
@@ -10181,7 +10181,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 return Ok(false);
@@ -10219,7 +10219,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::server_stats::note_key_lookup(false);
@@ -10255,7 +10255,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 out.extend_from_slice(b":0\r\n");
@@ -10739,7 +10739,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::server_stats::note_key_lookup(false);
@@ -11443,7 +11443,7 @@ impl RudisTable {
         if self.num_expires == 0 {
             return slot_count;
         }
-        let now = Instant::now();
+        let now = crate::clock::now();
         let mut count = 0;
         let mut expired_indices = Vec::new();
         for (idx, opt) in self.table.enumerate_slots() {
@@ -11476,7 +11476,7 @@ impl RudisTable {
         let mut result = Vec::new();
         let mut expired_indices = Vec::new();
         let now = if self.num_expires > 0 {
-            Some(Instant::now())
+            Some(crate::clock::now())
         } else {
             None
         };
@@ -11607,7 +11607,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
             } else {
@@ -11903,7 +11903,7 @@ impl RudisTable {
                 if self.num_expires > 0
                     && let Some(expire_at) = entry.expire_at()
                     && !crate::connection::access_expired_allowed()
-                    && Instant::now() >= expire_at
+                    && crate::clock::now() >= expire_at
                 {
                     self.expire_slot(idx);
                     return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
@@ -12041,7 +12041,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::connection::write_resp_array_header(out, 0);
@@ -12372,7 +12372,7 @@ impl RudisTable {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at()
                 && !crate::connection::access_expired_allowed()
-                && Instant::now() >= expire_at
+                && crate::clock::now() >= expire_at
             {
                 self.expire_slot(idx);
                 crate::server_stats::note_key_lookup(false);
@@ -12651,7 +12651,7 @@ impl RudisTable {
         {
             return 0;
         }
-        let now = Instant::now();
+        let now = crate::clock::now();
         let total = self.hash_field_expires.len();
         let start = self.sample_cursor % total;
         let sample_keys: smallvec::SmallVec<[Bytes; 8]> = self
@@ -13715,7 +13715,7 @@ impl RudisTable {
         stream: &mut RudisStream,
         add_id: StreamAddId,
     ) -> Result<StreamId, &'static str> {
-        let now_ms = SystemTime::now()
+        let now_ms = crate::clock::system_now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
@@ -13964,7 +13964,7 @@ impl RudisTable {
         idmp: Option<StreamIdmpOption>,
         limit: Option<usize>,
     ) -> Result<StreamAddResult, &'static str> {
-        let now_ms = SystemTime::now()
+        let now_ms = crate::clock::system_now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
@@ -14706,7 +14706,7 @@ impl RudisTable {
                 if !s.entries.contains_key(&stream_id) {
                     return Err("ERR No such message in stream");
                 }
-                let now_ms = SystemTime::now()
+                let now_ms = crate::clock::system_now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
@@ -15533,7 +15533,7 @@ impl RudisTable {
             return Err("BUSYKEY Target key name already exists.");
         }
 
-        let now_unix = SystemTime::now()
+        let now_unix = crate::clock::system_now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
@@ -15588,7 +15588,7 @@ impl RudisTable {
             // Sub-millisecond "now": truncating it to whole milliseconds
             // pushed the deadline up to 1 ms late, so PTTL right after a
             // cross-shard RENAME/COPY could report more than was set.
-            let now_unix = SystemTime::now()
+            let now_unix = crate::clock::system_now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
             let deadline = Duration::from_millis(ttl_ms);
@@ -15597,10 +15597,10 @@ impl RudisTable {
                 inc_expired_keys();
                 return Ok(RestoreOutcome::Expired { replaced });
             } else {
-                Some(Instant::now() + (deadline - now_unix))
+                Some(crate::clock::now() + (deadline - now_unix))
             }
         } else {
-            Some(Instant::now() + Duration::from_millis(ttl_ms))
+            Some(crate::clock::now() + Duration::from_millis(ttl_ms))
         };
 
         if expire_at.is_some() {
@@ -15614,7 +15614,7 @@ impl RudisTable {
         self.table.insert(entry);
         if !decoded.field_expires.is_empty() {
             // Redis 7.4 hash field TTLs.
-            let now = Instant::now();
+            let now = crate::clock::now();
             let fmap = self.hash_field_expires.entry(key).or_default();
             for (field, at_ms) in decoded.field_expires {
                 fmap.insert(
@@ -15637,7 +15637,7 @@ impl RudisTable {
     }
 
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
-        let now = Instant::now();
+        let now = crate::clock::now();
         let now_unix = unix_now();
 
         // Cursor positions cover every segment; see `keys`.
@@ -15685,7 +15685,7 @@ impl RudisTable {
     }
 
     pub fn restore_rdb_chunk(&mut self, mut data: &[u8]) -> Result<(), &'static str> {
-        let (now, unix_ns) = (Instant::now(), unix_now());
+        let (now, unix_ns) = (crate::clock::now(), unix_now());
         let unix_now = unix_ns.as_millis() as u64;
 
         while !data.is_empty() {
@@ -15712,7 +15712,7 @@ impl RudisTable {
                     continue;
                 }
                 let rem_ms = exp_unix_ms - unix_now;
-                expire_at = Some(Instant::now() + Duration::from_millis(rem_ms));
+                expire_at = Some(crate::clock::now() + Duration::from_millis(rem_ms));
             }
             if data.len() < 4 {
                 return Err("Truncated RDB key");
@@ -15933,7 +15933,7 @@ impl RudisTable {
                         if grp.consumers.contains_key(&consumer) {
                             Ok(false)
                         } else {
-                            let now = SystemTime::now()
+                            let now = crate::clock::system_now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis() as u64;
@@ -16033,7 +16033,7 @@ impl RudisTable {
             }
         };
 
-        let now = SystemTime::now()
+        let now = crate::clock::system_now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
@@ -16365,7 +16365,7 @@ impl RudisTable {
         group: &[u8],
         min_idle: u64,
     ) -> Option<u64> {
-        let now = SystemTime::now()
+        let now = crate::clock::system_now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
@@ -16497,7 +16497,7 @@ impl RudisTable {
             None => return Err("NOGROUP No such key or consumer group"),
         };
 
-        let now = SystemTime::now()
+        let now = crate::clock::system_now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
@@ -16561,7 +16561,7 @@ impl RudisTable {
             RudisValue::Stream(s) => {
                 let first_entry = s.entries.iter().next().map(|(id, f)| (*id, f.clone()));
                 let last_entry = s.entries.iter().next_back().map(|(id, f)| (*id, f.clone()));
-                let now_ms = SystemTime::now()
+                let now_ms = crate::clock::system_now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
@@ -16655,7 +16655,7 @@ impl RudisTable {
                     .groups
                     .get(group)
                     .ok_or("NOGROUP No such key or consumer group")?;
-                let now = SystemTime::now()
+                let now = crate::clock::system_now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
@@ -16697,7 +16697,7 @@ impl RudisTable {
         let entry = self.table.get_slot_mut(idx).unwrap();
         match &mut entry.val {
             RudisValue::Stream(s) => {
-                let now_ms = SystemTime::now()
+                let now_ms = crate::clock::system_now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
@@ -17139,7 +17139,7 @@ fn load_legacy_records(
     shard_id: usize,
     num_shards: usize,
 ) -> (usize, bool, usize) {
-    let (now, unix_ns) = (Instant::now(), unix_now());
+    let (now, unix_ns) = (crate::clock::now(), unix_now());
     let unix_now = unix_ns.as_millis() as u64;
 
     let mut cursor = start;
@@ -17201,7 +17201,7 @@ fn load_legacy_records(
                 }
                 continue;
             }
-            expire_at = Some(Instant::now() + Duration::from_millis(exp_unix_ms - unix_now));
+            expire_at = Some(crate::clock::now() + Duration::from_millis(exp_unix_ms - unix_now));
         } else if op == 0xFD {
             // EXPIRETIME_SEC
             cursor += 1;
@@ -17232,7 +17232,7 @@ fn load_legacy_records(
                 }
                 continue;
             }
-            expire_at = Some(Instant::now() + Duration::from_millis(exp_unix_ms - unix_now));
+            expire_at = Some(crate::clock::now() + Duration::from_millis(exp_unix_ms - unix_now));
         }
 
         if cursor + 4 > content_len {
@@ -17642,7 +17642,7 @@ mod tests {
         assert_eq!(r, vec![2]);
         assert!(get_expired_subkeys() - before >= 1);
 
-        let past = Instant::now()
+        let past = crate::clock::now()
             .checked_sub(Duration::from_millis(1))
             .unwrap();
         let before = get_expired_subkeys();
@@ -17671,11 +17671,11 @@ mod tests {
     fn test_absolute_deadlines_round_trip_exactly() {
         for i in 0..2000u64 {
             let ms = 2_524_600_800_000 + i * 7;
-            let at = unix_ms_to_instant(ms, Instant::now(), unix_now());
-            assert_eq!(instant_to_unix_ms(at, Instant::now(), unix_now()), ms);
+            let at = unix_ms_to_instant(ms, crate::clock::now(), unix_now());
+            assert_eq!(instant_to_unix_ms(at, crate::clock::now(), unix_now()), ms);
         }
         // A deadline in the past stays in the past, and nonzero.
-        let now = Instant::now();
+        let now = crate::clock::now();
         let past = now.checked_sub(Duration::from_millis(5)).unwrap();
         let unix = unix_now();
         assert!(instant_to_unix_ms(past, now, unix) < unix.as_millis() as u64);
@@ -17744,7 +17744,7 @@ mod tests {
         t.hash_field_expires
             .entry(h.clone())
             .or_default()
-            .insert(gone.clone(), Instant::now() - Duration::from_millis(5));
+            .insert(gone.clone(), crate::clock::now() - Duration::from_millis(5));
         let picks = t.hrandfield(&h, Some(-200), false).unwrap();
         assert_eq!(picks.len(), 200);
         assert!(!picks.contains(&gone));
@@ -17786,7 +17786,7 @@ mod tests {
         t.hash_field_expires
             .entry(h.clone())
             .or_default()
-            .insert(f1.clone(), Instant::now() - Duration::from_millis(5));
+            .insert(f1.clone(), crate::clock::now() - Duration::from_millis(5));
         crate::replication::set_readonly_replica(true);
         let v2 = Some(Bytes::from_static(b"v2"));
         assert_eq!(t.hget(&h, &f1).unwrap(), None);
@@ -17867,7 +17867,7 @@ mod tests {
         assert_eq!(Expiry::from(None).get(), None);
         assert_eq!(Expiry::default(), Expiry::NONE);
 
-        let now = Instant::now();
+        let now = crate::clock::now();
         // Exact round trip (nanosecond resolution) for past, present, future.
         for at in [
             now,
@@ -18638,7 +18638,7 @@ mod tests {
             .map(|i| Bytes::from(format!("key:{i:010}")))
             .collect();
         let val = Bytes::from_static(b"0123456789abcdef");
-        let t0 = std::time::Instant::now();
+        let t0 = crate::clock::now();
         for k in &keys {
             t.set(k.clone(), val.clone(), None);
         }
@@ -18655,14 +18655,14 @@ mod tests {
         let mut best_get = f64::MAX;
         let mut best_set = f64::MAX;
         for _ in 0..5 {
-            let t0 = std::time::Instant::now();
+            let t0 = crate::clock::now();
             let mut hits = 0usize;
             for &i in &order {
                 hits += t.get(&keys[i]).unwrap().is_some() as usize;
             }
             assert_eq!(hits, order.len());
             best_get = best_get.min(t0.elapsed().as_nanos() as f64 / order.len() as f64);
-            let t0 = std::time::Instant::now();
+            let t0 = crate::clock::now();
             for &i in &order {
                 t.set(keys[i].clone(), val.clone(), None);
             }
@@ -18670,7 +18670,7 @@ mod tests {
         }
         let mut best_del = f64::MAX;
         {
-            let t0 = std::time::Instant::now();
+            let t0 = crate::clock::now();
             for k in keys.iter().take(n / 2) {
                 t.del(k);
             }
@@ -19072,7 +19072,7 @@ mod tests {
             let left = e
                 .expire_at()
                 .expect("TTL kept")
-                .saturating_duration_since(Instant::now());
+                .saturating_duration_since(crate::clock::now());
             assert!(left > Duration::from_secs(95), "{src}->{dst}: {left:?}");
             assert_eq!(e.key.as_slice(), dst.as_bytes());
         }
@@ -20455,7 +20455,7 @@ mod tests {
                 .pel
                 .contains_key(&id(1))
         );
-        let before = SystemTime::now()
+        let before = crate::clock::system_now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;

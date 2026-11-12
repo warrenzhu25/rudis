@@ -1129,7 +1129,7 @@ impl ShardDb {
         let global_idx = crate::search::get_search_index(&index_name);
 
         if on_type == "HASH" {
-            let now = std::time::Instant::now();
+            let now = crate::clock::now();
             let matching_keys: Vec<Bytes> = self
                 .table
                 .entries()
@@ -2501,7 +2501,7 @@ impl ShardDb {
 
     /// Per-DB `(db_idx, keys, expires, ttl_sum_ms)` for `INFO keyspace`.
     pub fn keyspace_stats_by_db(&self) -> Vec<(usize, usize, usize, u64)> {
-        let now = std::time::Instant::now();
+        let now = crate::clock::now();
         let max_db = self.max_db_len();
         let mut out = Vec::new();
         for db_idx in 0..max_db {
@@ -3563,8 +3563,8 @@ impl ShardDb {
 
         // 9. Semantic caches (SEMANTIC.*)
         if !self.semantic_caches.is_empty() {
-            let now = std::time::Instant::now();
-            let unix_now = std::time::SystemTime::now()
+            let now = crate::clock::now();
+            let unix_now = crate::clock::system_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
@@ -3671,8 +3671,8 @@ impl ShardDb {
 
         // 12. Agent tool registries (AGENT.TOOL.*)
         if !self.agent_tools.is_empty() {
-            let now = std::time::Instant::now();
-            let unix_now = std::time::SystemTime::now()
+            let now = crate::clock::now();
+            let unix_now = crate::clock::system_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
@@ -3732,8 +3732,8 @@ impl ShardDb {
 
         // 14. LLM quota buckets (LLM.QUOTA.*)
         if !self.llm_quotas.is_empty() {
-            let now = std::time::Instant::now();
-            let unix_now = std::time::SystemTime::now()
+            let now = crate::clock::now();
+            let unix_now = crate::clock::system_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
@@ -4000,7 +4000,7 @@ impl ShardDb {
             }
             18 => {
                 let calls_len = read_u32(data)? as usize;
-                let now = std::time::Instant::now();
+                let now = crate::clock::now();
                 let mut reg = crate::agent::AgentToolRegistry::new();
                 for _ in 0..calls_len {
                     let call_id = read_bytes(data)?;
@@ -4042,7 +4042,7 @@ impl ShardDb {
                 let window_ms = read_u64(data)?.max(1);
                 let next_reservation_id = read_u64(data)?;
                 let reqs_len = read_u32(data)? as usize;
-                let now = std::time::Instant::now();
+                let now = crate::clock::now();
                 let mut bucket = crate::agent::LlmQuotaBucket::new(window_ms);
                 bucket.next_reservation_id = next_reservation_id;
                 for _ in 0..reqs_len {
@@ -4812,7 +4812,7 @@ struct RdbClock {
 
 impl RdbClock {
     fn now(port: u16) -> Self {
-        let now = std::time::Instant::now();
+        let now = crate::clock::now();
         let unix = crate::table::unix_now();
         RdbClock {
             keep_expired: crate::replication::snapshots_keep_expired(port),
@@ -5195,7 +5195,7 @@ impl AofImage {
                         // finish the segment in a later step.
                         if written > 0
                             && matches!(entry.val, crate::table::RudisValue::Tiered(_))
-                            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+                            && deadline.is_some_and(|d| crate::clock::now() >= d)
                         {
                             paused = true;
                             break;

@@ -925,9 +925,10 @@ fn test_slow_script_stays_atomic_e2e() {
     for (port, threads) in [(20305u16, "1"), (20306u16, "4")] {
         let (mut srv, mut c) = busy_script_server(port, threads);
         assert_eq!(resp_cmd(&mut c, &["SET", "a", "before"]), "+OK\r\n");
+        // os.clock (CPU time): TIME is frozen for the script, as in Redis.
         let script = "local first = redis.call('GET', KEYS[1]) \
-                      local t = redis.call('TIME') local start = t[1] * 1000000 + t[2] \
-                      repeat t = redis.call('TIME') until t[1] * 1000000 + t[2] - start > 800000 \
+                      local start = os.clock() \
+                      repeat redis.call('GET', KEYS[1]) until os.clock() - start > 0.8 \
                       return {first, redis.call('GET', KEYS[1])}";
         let mut runner = connect_busy(port, 10);
         send_cmd(&mut runner, &["EVAL", script, "1", "a"]);
@@ -1499,4 +1500,71 @@ fn test_info_from_script_e2e() {
         assert!(r.contains("db0:keys=20,"), "{threads}: {r}");
         shutdown_and_wait(port, &mut srv.0);
     }
+}
+
+/// Script replies follow Redis' RESP3 rules: `{big_number=}` and
+/// `{verbatim_string=}` tables become big numbers / verbatim strings (bulk
+/// strings for RESP2 clients); after redis.setresp(3), redis.call results
+/// arrive as Redis gives them (a map reply as `{map=...}`, doubles as
+/// `{double=}`, booleans as booleans), and a RESP3 script's false reaches a
+/// RESP2 client as :0. Before, those tables came back as empty arrays and
+/// redis.call results were always converted from RESP2.
+#[test]
+fn test_script_resp3_conversions_e2e() {
+    let port = 20327u16;
+    let (mut srv, mut c) = busy_script_server(port, "1");
+    let big = "return {big_number='123\\r\\n123'}";
+    assert_eq!(resp_cmd(&mut c, &["EVAL", big, "0"]), "$8\r\n123  123\r\n");
+    let verb = "return {verbatim_string={format='txt', string='hi'}}";
+    assert_eq!(resp_cmd(&mut c, &["EVAL", verb, "0"]), "$2\r\nhi\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HSET", "h", "f", "v"]), ":1\r\n");
+    let map = "redis.setresp(3) return redis.call('hgetall', KEYS[1]).map.f";
+    assert_eq!(resp_cmd(&mut c, &["EVAL", map, "1", "h"]), "$1\r\nv\r\n");
+    let dbl = "redis.setresp(3) return tostring(redis.call('zincrby', KEYS[1], 1.5, 'm').double)";
+    assert_eq!(resp_cmd(&mut c, &["EVAL", dbl, "1", "z"]), "$3\r\n1.5\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["EVAL", "redis.setresp(3) return false", "0"]),
+        ":0\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["EVAL", "return false", "0"]), "$-1\r\n");
+    // RESP3 client.
+    assert!(resp_cmd_all(&mut c, &["HELLO", "3"]).starts_with('%'));
+    assert_eq!(resp_cmd(&mut c, &["EVAL", big, "0"]), "(123  123\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EVAL", verb, "0"]), "=6\r\ntxt:hi\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["EVAL", "redis.setresp(3) return false", "0"]),
+        "#f\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
+}
+
+/// Time is frozen while a script runs, as in Redis: a key set with PX 1
+/// still exists after a 10 ms sleep inside the same script, TIME returns
+/// the same value throughout, and TTLs set at different moments agree.
+/// Before, keys expired mid-script and TIME moved.
+#[test]
+fn test_script_time_is_frozen_e2e() {
+    let port = 20328u16;
+    let (mut srv, mut c) = busy_script_server(port, "1");
+    // DEBUG SLEEP from a script (Redis' test does the same).
+    assert_eq!(
+        resp_cmd(&mut c, &["DEBUG", "set-disable-deny-scripts", "1"]),
+        "+OK\r\n"
+    );
+    let px = "redis.call('SET', KEYS[1], 'v', 'PX', 1) redis.call('DEBUG', 'SLEEP', 0.01) \
+              return redis.call('EXISTS', KEYS[1])";
+    assert_eq!(resp_cmd(&mut c, &["EVAL", px, "1", "k"]), ":1\r\n");
+    thread::sleep(Duration::from_millis(5));
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "k"]), ":0\r\n");
+    let time = "local a = redis.call('TIME') redis.call('DEBUG', 'SLEEP', 0.01) \
+                local b = redis.call('TIME') return a[1] == b[1] and a[2] == b[2]";
+    assert_eq!(resp_cmd(&mut c, &["EVAL", time, "0"]), ":1\r\n");
+    let ttl = "redis.call('SET', KEYS[1], 'v', 'PX', 1000) redis.call('DEBUG', 'SLEEP', 0.01) \
+               redis.call('SET', KEYS[2], 'v') redis.call('PEXPIRE', KEYS[2], 1000) \
+               return {redis.call('PTTL', KEYS[1]), redis.call('PTTL', KEYS[2])}";
+    let r = resp_cmd(&mut c, &["EVAL", ttl, "2", "a{t}", "b{t}"]);
+    let nums: Vec<&str> = r.lines().filter(|l| l.starts_with(':')).collect();
+    assert_eq!(nums.len(), 2, "{r}");
+    assert_eq!(nums[0], nums[1], "{r}");
+    shutdown_and_wait(port, &mut srv.0);
 }

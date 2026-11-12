@@ -13,6 +13,7 @@ pub mod block;
 pub mod cluster;
 #[rustfmt::skip]
 pub mod command_docs;
+pub mod clock;
 pub mod command_info;
 pub mod compact;
 pub mod config;

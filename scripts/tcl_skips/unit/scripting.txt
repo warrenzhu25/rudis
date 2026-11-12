@@ -5,3 +5,7 @@
 # Atomicity Across Shards). These use keys like foo1, x, z or a, b, c, d.
 Lua scripts using SELECT are replicated correctly
 Test selective replication of certain Redis commands from Lua
+#
+# Scripts using keys not declared in KEYS: refused when the key is on
+# another shard than the script (docs/differences.md).
+Using side effects is not a problem with command replication

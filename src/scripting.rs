@@ -1690,6 +1690,7 @@ fn prepare_function(
         ctl,
         run,
         vm,
+        frozen: crate::clock::snapshot(),
         _blocked: crate::connection::BlockedServingPause::start(),
     })
 }
@@ -1740,6 +1741,8 @@ struct ScriptRun {
     run: ScriptRunGuard,
     /// The Lua state it runs in, held until it ends.
     vm: VmLease,
+    /// The time its commands see (Redis freezes time for a script).
+    frozen: (std::time::Instant, std::time::SystemTime),
     /// Blocked clients are served once the script is done (Redis too).
     _blocked: Option<crate::connection::BlockedServingPause>,
 }
@@ -1753,6 +1756,9 @@ enum ScriptStep {
 
 impl ScriptRun {
     fn step(&mut self) -> ScriptStep {
+        // Only while it runs: tasks this thread runs while it is suspended
+        // see the real time.
+        let _frozen = crate::clock::Frozen::at(self.frozen);
         let args = self.first_args.take().unwrap_or_default();
         self.ctl.hook_yielded.set(false);
         self.ctl.resumed_at.set(std::time::Instant::now());
@@ -2026,6 +2032,7 @@ fn prepare_eval(
         ctl,
         run,
         vm,
+        frozen: crate::clock::snapshot(),
         _blocked: crate::connection::BlockedServingPause::start(),
     })
 }
@@ -3275,7 +3282,7 @@ fn register_redis_module(
         let aof_ref = aof_call.as_deref();
         // The reply is converted to Lua from RESP2, whatever the client
         // speaks (see `resp_bytes_to_lua`).
-        let prev_resp3 = crate::connection::CURRENT_CLIENT_RESP3.replace(false);
+        let prev_resp3 = crate::connection::CURRENT_CLIENT_RESP3.replace(*srv_call.borrow() == 3);
         script_execute(&cmd, &db_call, &mut out, aof_ref);
         crate::connection::CURRENT_CLIENT_RESP3.set(prev_resp3);
 
@@ -3295,8 +3302,10 @@ fn register_redis_module(
             }
         }
 
-        let is_hgetall = matches!(cmd, Command::Hgetall(_));
-        resp_bytes_to_lua(lua, &out, is_hgetall && *srv_call.borrow() == 3)
+        if *srv_call.borrow() == 3 {
+            return resp3_bytes_to_lua(lua, &out);
+        }
+        resp_bytes_to_lua(lua, &out, false)
     })?;
     redis.set("call", call_fn)?;
 
@@ -3464,7 +3473,7 @@ fn register_redis_module(
         let aof_ref = aof_pcall.as_deref();
         // The reply is converted to Lua from RESP2, whatever the client
         // speaks (see `resp_bytes_to_lua`).
-        let prev_resp3 = crate::connection::CURRENT_CLIENT_RESP3.replace(false);
+        let prev_resp3 = crate::connection::CURRENT_CLIENT_RESP3.replace(*srv_pcall.borrow() == 3);
         script_execute(&cmd, &db_pcall, &mut out, aof_ref);
         crate::connection::CURRENT_CLIENT_RESP3.set(prev_resp3);
 
@@ -3483,8 +3492,10 @@ fn register_redis_module(
             tbl.set("err", err_str)?;
             Ok(Value::Table(tbl))
         } else {
-            let is_hgetall = matches!(cmd, Command::Hgetall(_));
-            resp_bytes_to_lua(lua, &out, is_hgetall && *srv_pcall.borrow() == 3)
+            if *srv_pcall.borrow() == 3 {
+                return resp3_bytes_to_lua(lua, &out);
+            }
+            resp_bytes_to_lua(lua, &out, false)
         }
     })?;
     redis.set("pcall", pcall_fn)?;
@@ -3643,6 +3654,128 @@ fn script_acl_denied(port: u16, cmd: &Command) -> Option<String> {
             .trim_end_matches("\r\n")
             .to_string(),
     )
+}
+
+/// A command's RESP3 reply as the Lua value Redis gives a script that
+/// called `redis.setresp(3)`: null is nil, booleans are booleans, and
+/// doubles, big numbers, maps, sets and verbatim strings are tables
+/// (`{double=}`, `{big_number=}`, `{map=}`, `{set=}`,
+/// `{verbatim_string={format=, string=}}`). Attributes are skipped.
+fn resp3_bytes_to_lua(lua: &Lua, out: &[u8]) -> mlua::Result<Value> {
+    if out.first() == Some(&b'-') {
+        let end = out.len().saturating_sub(2);
+        return Err(mlua::Error::RuntimeError(
+            String::from_utf8_lossy(&out[1..end]).into_owned(),
+        ));
+    }
+    let mut pos = 0;
+    parse_resp3_value(lua, out, &mut pos)
+}
+
+fn parse_resp3_value(lua: &Lua, buf: &[u8], pos: &mut usize) -> mlua::Result<Value> {
+    let bad = || mlua::Error::RuntimeError("ERR bad reply from command".to_string());
+    let Some(&tag) = buf.get(*pos) else {
+        return Ok(Value::Nil);
+    };
+    let line_end = buf[*pos..]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|p| *pos + p)
+        .ok_or_else(bad)?;
+    let line = &buf[*pos + 1..line_end];
+    *pos = line_end + 2;
+    let num = |line: &[u8]| -> mlua::Result<i64> {
+        std::str::from_utf8(line)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(bad)
+    };
+    let blob = |len: i64, pos: &mut usize| -> mlua::Result<&[u8]> {
+        let len = usize::try_from(len).map_err(|_| bad())?;
+        let data = buf.get(*pos..*pos + len).ok_or_else(bad)?;
+        *pos += len + 2;
+        Ok(data)
+    };
+    let tagged = |key: &str, v: Value| -> mlua::Result<Value> {
+        let t = lua.create_table()?;
+        t.raw_set(key, v)?;
+        Ok(Value::Table(t))
+    };
+    match tag {
+        b'+' => tagged("ok", Value::String(lua.create_string(line)?)),
+        b'-' => tagged("err", Value::String(lua.create_string(line)?)),
+        b':' => Ok(Value::Integer(num(line)?)),
+        b'_' => Ok(Value::Nil),
+        b'#' => Ok(Value::Boolean(line == b"t")),
+        b',' => {
+            let s = std::str::from_utf8(line).map_err(|_| bad())?;
+            let d = match s {
+                "inf" => f64::INFINITY,
+                "-inf" => f64::NEG_INFINITY,
+                _ => s.parse().map_err(|_| bad())?,
+            };
+            tagged("double", Value::Number(d))
+        }
+        b'(' => tagged("big_number", Value::String(lua.create_string(line)?)),
+        b'$' => {
+            let len = num(line)?;
+            if len < 0 {
+                return Ok(Value::Nil);
+            }
+            Ok(Value::String(lua.create_string(blob(len, pos)?)?))
+        }
+        b'=' => {
+            let data = blob(num(line)?, pos)?;
+            let (fmt, text) = if data.len() >= 4 && data[3] == b':' {
+                (&data[..3], &data[4..])
+            } else {
+                (&b"txt"[..], data)
+            };
+            let v = lua.create_table()?;
+            v.raw_set("format", lua.create_string(fmt)?)?;
+            v.raw_set("string", lua.create_string(text)?)?;
+            tagged("verbatim_string", Value::Table(v))
+        }
+        b'*' | b'>' => {
+            let n = num(line)?;
+            if n < 0 {
+                return Ok(Value::Nil);
+            }
+            let t = lua.create_table_with_capacity(n as usize, 0)?;
+            for i in 0..n {
+                t.raw_set(i + 1, parse_resp3_value(lua, buf, pos)?)?;
+            }
+            Ok(Value::Table(t))
+        }
+        b'%' => {
+            let m = lua.create_table()?;
+            for _ in 0..num(line)? {
+                let k = parse_resp3_value(lua, buf, pos)?;
+                let v = parse_resp3_value(lua, buf, pos)?;
+                if k != Value::Nil {
+                    m.raw_set(k, v)?;
+                }
+            }
+            tagged("map", Value::Table(m))
+        }
+        b'~' => {
+            let set = lua.create_table()?;
+            for _ in 0..num(line)? {
+                let k = parse_resp3_value(lua, buf, pos)?;
+                if k != Value::Nil {
+                    set.raw_set(k, true)?;
+                }
+            }
+            tagged("set", Value::Table(set))
+        }
+        b'|' => {
+            for _ in 0..num(line)? * 2 {
+                parse_resp3_value(lua, buf, pos)?;
+            }
+            parse_resp3_value(lua, buf, pos)
+        }
+        _ => Err(bad()),
+    }
 }
 
 fn resp_bytes_to_lua(lua: &Lua, out: &[u8], is_hgetall_map: bool) -> mlua::Result<Value> {
@@ -3851,12 +3984,16 @@ fn lua_val_to_resp_with_depth(
             Ok(())
         }
         Value::Boolean(b) => {
-            if crate::connection::CURRENT_CLIENT_RESP3.get() && script_resp_ver == 3 {
-                if *b {
-                    out.extend_from_slice(b"#t\r\n");
-                } else {
-                    out.extend_from_slice(b"#f\r\n");
-                }
+            // A RESP3 script's booleans are RESP3 booleans, which a RESP2
+            // client gets as :1 / :0; a RESP2 script's false is null.
+            if script_resp_ver == 3 {
+                let r: &[u8] = match (crate::connection::CURRENT_CLIENT_RESP3.get(), *b) {
+                    (true, true) => b"#t\r\n",
+                    (true, false) => b"#f\r\n",
+                    (false, true) => b":1\r\n",
+                    (false, false) => b":0\r\n",
+                };
+                out.extend_from_slice(r);
             } else if *b {
                 out.extend_from_slice(b":1\r\n");
             } else {
@@ -3896,6 +4033,40 @@ fn lua_val_to_resp_with_depth(
                     sanitized
                 };
                 out.extend_from_slice(format!("-{}\r\n", final_err).as_bytes());
+                return Ok(());
+            }
+            // Redis' `{big_number = "..."}` (CR / LF become spaces).
+            if let Ok(Value::String(n)) = t.raw_get::<Value>("big_number") {
+                let n: Vec<u8> = n
+                    .as_bytes()
+                    .iter()
+                    .map(|&b| if b == b'\r' || b == b'\n' { b' ' } else { b })
+                    .collect();
+                if crate::connection::CURRENT_CLIENT_RESP3.get() {
+                    out.push(b'(');
+                    out.extend_from_slice(&n);
+                    out.extend_from_slice(b"\r\n");
+                } else {
+                    crate::connection::write_resp_bulk(out, &n);
+                }
+                return Ok(());
+            }
+            // Redis' `{verbatim_string = {format = "txt", string = "..."}}`.
+            if let Ok(Value::Table(v)) = t.raw_get::<Value>("verbatim_string")
+                && let (Ok(Value::String(fmt)), Ok(Value::String(text))) =
+                    (v.raw_get::<Value>("format"), v.raw_get::<Value>("string"))
+            {
+                let text = text.as_bytes();
+                if crate::connection::CURRENT_CLIENT_RESP3.get() {
+                    let fmt = fmt.as_bytes();
+                    out.extend_from_slice(format!("={}\r\n", text.len() + 4).as_bytes());
+                    out.extend_from_slice(&fmt[..fmt.len().min(3)]);
+                    out.push(b':');
+                    out.extend_from_slice(&text);
+                    out.extend_from_slice(b"\r\n");
+                } else {
+                    crate::connection::write_resp_bulk(out, &text);
+                }
                 return Ok(());
             }
             if let Ok(f) = t.raw_get::<f64>("double") {

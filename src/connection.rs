@@ -27053,7 +27053,7 @@ pub fn execute_local_command(
                 false
             }
             Command::Time => {
-                let now = std::time::SystemTime::now()
+                let now = crate::clock::system_now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
                 let secs = now.as_secs();
