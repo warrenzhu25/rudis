@@ -1729,20 +1729,46 @@ pub static REPLICA_SERVE_STALE_DATA: std::sync::atomic::AtomicBool =
 /// replica with `replica-serve-stale-data no` and its master link down,
 /// must refuse `cmd`; None otherwise.
 pub(crate) fn masterdown_refuses(router: &Router, cmd: &Command) -> Option<&'static [u8]> {
-    if REPLICA_SERVE_STALE_DATA.load(std::sync::atomic::Ordering::Relaxed)
-        || !crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if !serving_stale_data(router.base_port) {
         return None;
     }
-    let hub = crate::replication::cached_hub(router.base_port);
-    if !hub.is_slave()
-        || hub.can_serve_replicas()
-        || crate::command_info::serves_stale(acl_cmd_name(cmd))
-    {
+    let served = match cmd {
+        // A script runs on a stale replica only if it says it may
+        // (Redis decides from the script's flags, not FCALL's).
+        Command::Fcall { function, .. } => {
+            crate::scripting::function_has_flag(function, "allow-stale")
+        }
+        Command::Eval { script, .. } => crate::scripting::shebang_has_flag(script, "allow-stale"),
+        Command::Evalsha { sha, .. } => crate::scripting::get_script(&String::from_utf8_lossy(sha))
+            .is_some_and(|src| crate::scripting::shebang_has_flag(src.as_bytes(), "allow-stale")),
+        _ => crate::command_info::serves_stale(acl_cmd_name(cmd)),
+    };
+    if served {
         return None;
     }
     Some(b"MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n")
 }
+
+/// Whether the server on `base_port` is a replica whose master link is
+/// down with `replica-serve-stale-data no`: only commands flagged `stale`
+/// (and scripts flagged `allow-stale`) may run.
+pub(crate) fn serving_stale_data(base_port: u16) -> bool {
+    if REPLICA_SERVE_STALE_DATA.load(std::sync::atomic::Ordering::Relaxed)
+        || !crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return false;
+    }
+    let hub = crate::replication::cached_hub(base_port);
+    hub.is_slave() && !hub.can_serve_replicas()
+}
+
+/// Inside an `allow-stale` script on such a replica: the error for a
+/// command not flagged `stale`, as Redis refuses it there.
+pub(crate) fn script_stale_refuses(port: u16, cmd: &Command) -> bool {
+    serving_stale_data(node_port(port)) && !crate::command_info::serves_stale(acl_cmd_name(cmd))
+}
+
+pub(crate) const SCRIPT_STALE_ERR: &str = "ERR Can not execute the command on a stale replica. Please use a non-stale replica or the master";
 
 pub static REPLICA_READ_ONLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);

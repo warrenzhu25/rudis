@@ -1251,3 +1251,81 @@ fn test_fcall_of_writing_function_refused_over_maxmemory_e2e() {
     );
     shutdown_and_wait(port, &mut srv.0);
 }
+
+/// On a replica whose master link is down with replica-serve-stale-data
+/// no, a script runs only if flagged allow-stale (function flag or EVAL /
+/// EVALSHA shebang), as in Redis; inside it, commands not flagged stale
+/// get "Can not execute the command on a stale replica" while ECHO runs. Before, FCALL and EVAL always ran there, reading stale data.
+#[test]
+fn test_scripts_on_stale_replica_need_allow_stale_e2e() {
+    let port = 20319u16;
+    let ps = port.to_string();
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "2", "--no-pin"],
+        port,
+    ));
+    let mut c = connect_busy(port, 5);
+    let lib = "#!lua name=t\n\
+        redis.register_function{function_name='f1', callback=function() return 'hello' end, flags={'no-writes'}}\n\
+        redis.register_function{function_name='f2', callback=function() return 'hello' end, flags={'allow-stale', 'no-writes'}}\n\
+        redis.register_function{function_name='f3', callback=function() return redis.call('get', 'x') end, flags={'allow-stale', 'no-writes'}}\n\
+        redis.register_function{function_name='f4', callback=function() return redis.call('echo', 'foobar') end, flags={'allow-stale', 'no-writes'}}";
+    assert_eq!(resp_cmd(&mut c, &["FUNCTION", "LOAD", lib]), "$1\r\nt\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "replica-serve-stale-data", "no"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["REPLICAOF", "127.0.0.1", "1"]),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["FCALL", "f1", "0"]).starts_with("-MASTERDOWN"));
+    assert_eq!(resp_cmd(&mut c, &["FCALL", "f2", "0"]), "$5\r\nhello\r\n");
+    assert!(
+        resp_cmd(&mut c, &["FCALL", "f3", "1", "x"])
+            .contains("Can not execute the command on a stale replica")
+    );
+    assert_eq!(resp_cmd(&mut c, &["FCALL", "f4", "0"]), "$6\r\nfoobar\r\n");
+    assert!(resp_cmd(&mut c, &["EVAL", "return 1", "0"]).starts_with("-MASTERDOWN"));
+    let stale_ok = "#!lua flags=allow-stale,no-writes\nreturn redis.call('echo','foobar')";
+    assert_eq!(
+        resp_cmd(&mut c, &["EVAL", stale_ok, "0"]),
+        "$6\r\nfoobar\r\n"
+    );
+    let sha = resp_cmd(&mut c, &["SCRIPT", "LOAD", stale_ok]);
+    let sha = sha.lines().nth(1).unwrap().to_string();
+    assert_eq!(
+        resp_cmd(&mut c, &["EVALSHA", &sha, "0"]),
+        "$6\r\nfoobar\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FCALL", "f1", "0"]), "$5\r\nhello\r\n");
+    shutdown_and_wait(port, &mut srv.0);
+}
+
+/// A runaway script sent pipelined with other commands is suspended past
+/// its threshold like one sent alone: other connections get -BUSY and
+/// SCRIPT KILL ends it; the commands after it in the pipeline then run.
+#[test]
+fn test_runaway_script_in_pipeline_busy_and_killable_e2e() {
+    for (port, threads) in [(20320u16, "1"), (20321u16, "4")] {
+        let (mut srv, _c) = busy_script_server(port, threads);
+        let mut runner = connect_busy(port, 10);
+        let mut req = format_resp_cmd(&["SET", "a", "1"]);
+        req.extend(format_resp_cmd(&["EVAL", "while true do end", "1", "k"]));
+        req.extend(format_resp_cmd(&["SET", "b", "2"]));
+        runner.write_all(&req).unwrap();
+        wait_busy(port);
+        let mut k = connect_busy(port, 5);
+        assert_eq!(resp_cmd(&mut k, &["SCRIPT", "KILL"]), "+OK\r\n");
+        let mut got = String::new();
+        let mut buf = [0u8; 1024];
+        while !got.ends_with("+OK\r\n-ERR Script killed by user with SCRIPT KILL...\r\n+OK\r\n") {
+            let n = runner.read(&mut buf).unwrap();
+            assert!(n > 0, "{threads}: closed after {got:?}");
+            got.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert_eq!(resp_cmd(&mut k, &["GET", "b"]), "$1\r\n2\r\n");
+        shutdown_and_wait(port, &mut srv.0);
+    }
+}

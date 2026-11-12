@@ -530,6 +530,31 @@ pub fn is_function_read_only(name: &str) -> bool {
     false
 }
 
+/// Whether function `name` has `flag` (false if there is no such function).
+pub fn function_has_flag(name: &str, flag: &str) -> bool {
+    let cache = FUNCTION_LIBS.read();
+    cache.values().any(|l| {
+        l.functions
+            .iter()
+            .any(|f| f.name.eq_ignore_ascii_case(name) && f.flags.iter().any(|x| x == flag))
+    })
+}
+
+/// Whether an EVAL script's `#!lua flags=...` shebang lists `flag`. A
+/// script without a shebang has no flags.
+pub fn shebang_has_flag(script: &[u8], flag: &str) -> bool {
+    let first = script.split(|&b| b == b'\n').next().unwrap_or_default();
+    let Ok(first) = std::str::from_utf8(first) else {
+        return false;
+    };
+    let Some(rest) = first.trim().strip_prefix("#!") else {
+        return false;
+    };
+    rest.split_whitespace()
+        .filter_map(|opt| opt.strip_prefix("flags="))
+        .any(|v| v.trim_matches('"').split(',').any(|f| f.trim() == flag))
+}
+
 /// Whether FCALL of `name` may start over maxmemory, as Redis decides from
 /// its flags: a `no-writes` or `allow-oom` function may; any other is
 /// refused up front, before it writes part of its work. Unknown functions
@@ -3116,6 +3141,14 @@ fn register_redis_module(
                 crate::connection::SCRIPT_NON_LOCAL_KEY_ERR.to_string(),
             ));
         }
+        if crate::connection::script_stale_refuses(port, &cmd) {
+            crate::connection::record_rejected_stat(crate::connection::stat_cmd_name(&cmd));
+            crate::connection::record_error_stat("ERR", None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            return Err(mlua::Error::RuntimeError(
+                crate::connection::SCRIPT_STALE_ERR.to_string(),
+            ));
+        }
         match &cmd {
             Command::Cluster(_)
             | Command::Replicaof { .. }
@@ -3297,6 +3330,14 @@ fn register_redis_module(
             SCRIPT_RECORDED_ERROR.set(true);
             let tbl = lua.create_table()?;
             tbl.set("err", crate::connection::SCRIPT_NON_LOCAL_KEY_ERR)?;
+            return Ok(Value::Table(tbl));
+        }
+        if crate::connection::script_stale_refuses(port, &cmd) {
+            crate::connection::record_rejected_stat(crate::connection::stat_cmd_name(&cmd));
+            crate::connection::record_error_stat("ERR", None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            let tbl = lua.create_table()?;
+            tbl.set("err", crate::connection::SCRIPT_STALE_ERR)?;
             return Ok(Value::Table(tbl));
         }
         match &cmd {
