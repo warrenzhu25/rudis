@@ -186,14 +186,56 @@ impl Drop for ScriptRunGuard {
 #[inline]
 fn script_execute(
     cmd: &Command,
-    db: &mut crate::shard::ShardDb,
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
     out: &mut Vec<u8>,
     aof: Option<&RefCell<crate::aof::AofWriter>>,
 ) {
-    if let Command::Client(crate::resp::ClientSubcommand::List(ids)) = cmd {
-        crate::connection::script_client_list(ids, out);
+    match cmd {
+        Command::Client(crate::resp::ClientSubcommand::List(ids)) => {
+            crate::connection::script_client_list(ids, out);
+        }
+        // Not under the database borrow: INFO reads this shard's keyspace.
+        Command::Info(section) => script_info(section.clone(), out),
+        _ => {
+            crate::connection::execute_local_command(cmd, &mut db.borrow_mut(), out, aof);
+        }
+    }
+}
+
+/// How long INFO from a script waits for the other shards' parts.
+const SCRIPT_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// INFO from a script, which can't await: runs the connection path's
+/// `info_reply` here, polling it while the other shards answer (it only
+/// waits on their replies). A shard that doesn't answer in time (say, one
+/// running a script that is waiting on this shard the same way) makes it
+/// fail instead of deadlocking both. Before, INFO from a script returned
+/// nil.
+#[inline(never)]
+fn script_info(section: Option<Bytes>, out: &mut Vec<u8>) {
+    let Some(router) = crate::connection::CURRENT_ROUTER.with(|r| r.borrow().clone()) else {
+        crate::connection::write_resp_err(out, "ERR INFO is not available here");
+        return;
+    };
+    let mut reply = Vec::new();
+    let done = {
+        let mut fut = std::pin::pin!(crate::connection::info_reply(&router, section, &mut reply));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let deadline = std::time::Instant::now() + SCRIPT_INFO_TIMEOUT;
+        loop {
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    };
+    if done {
+        out.extend_from_slice(&reply);
     } else {
-        crate::connection::execute_local_command(cmd, db, out, aof);
+        crate::connection::write_resp_err(out, "ERR INFO timed out waiting for other shards");
     }
 }
 
@@ -3234,7 +3276,7 @@ fn register_redis_module(
         // The reply is converted to Lua from RESP2, whatever the client
         // speaks (see `resp_bytes_to_lua`).
         let prev_resp3 = crate::connection::CURRENT_CLIENT_RESP3.replace(false);
-        script_execute(&cmd, &mut db_call.borrow_mut(), &mut out, aof_ref);
+        script_execute(&cmd, &db_call, &mut out, aof_ref);
         crate::connection::CURRENT_CLIENT_RESP3.set(prev_resp3);
 
         if out.starts_with(b"-") {
@@ -3423,7 +3465,7 @@ fn register_redis_module(
         // The reply is converted to Lua from RESP2, whatever the client
         // speaks (see `resp_bytes_to_lua`).
         let prev_resp3 = crate::connection::CURRENT_CLIENT_RESP3.replace(false);
-        script_execute(&cmd, &mut db_pcall.borrow_mut(), &mut out, aof_ref);
+        script_execute(&cmd, &db_pcall, &mut out, aof_ref);
         crate::connection::CURRENT_CLIENT_RESP3.set(prev_resp3);
 
         if out.starts_with(b"-") {

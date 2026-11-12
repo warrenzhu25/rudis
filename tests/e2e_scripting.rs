@@ -1474,3 +1474,29 @@ fn test_script_set_repl_controls_propagation_e2e() {
     shutdown_and_wait(port, &mut srv.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// INFO works from a script, with every shard's part, as in Redis (unit/
+/// functions' "allow stale" calls INFO server from a function). Before,
+/// redis.call('info') returned nil: INFO only ran on the connection path.
+#[test]
+fn test_info_from_script_e2e() {
+    for (port, threads) in [(20325u16, "1"), (20326u16, "4")] {
+        let ps = port.to_string();
+        let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+            &["--port", &ps, "--threads", threads, "--no-pin"],
+            port,
+        ));
+        let mut c = connect_busy(port, 5);
+        for i in 0..20 {
+            resp_cmd(&mut c, &["SET", &format!("k{i}"), "v"]);
+        }
+        let r = resp_cmd_all(
+            &mut c,
+            &["EVAL", "return redis.call('info', 'server')", "0"],
+        );
+        assert!(r.contains("redis_version:"), "{threads}: {r}");
+        let r = resp_cmd_all(&mut c, &["EVAL", "return redis.call('info')", "0"]);
+        assert!(r.contains("db0:keys=20,"), "{threads}: {r}");
+        shutdown_and_wait(port, &mut srv.0);
+    }
+}
