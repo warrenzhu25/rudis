@@ -1568,3 +1568,78 @@ fn test_script_time_is_frozen_e2e() {
     assert_eq!(nums[0], nums[1], "{r}");
     shutdown_and_wait(port, &mut srv.0);
 }
+
+/// INCRBYFLOAT reaches the AOF (and replicas) as SET of its result with
+/// KEEPTTL, as in Redis, so a replay or a replica can't round the float
+/// differently; FUNCTION LOAD goes as `function load [replace]`, the way
+/// clients send it. Before, INCRBYFLOAT was logged as itself.
+#[test]
+fn test_incrbyfloat_logged_as_set_keepttl_e2e() {
+    let port = 20329u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-ibf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+    ];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = connect_busy(port, 5);
+    assert_eq!(
+        resp_cmd(&mut c, &["INCRBYFLOAT", "k", "1.5"]),
+        "$3\r\n1.5\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &[
+                "EVAL",
+                "return redis.call('incrbyfloat', KEYS[1], 1)",
+                "1",
+                "k"
+            ]
+        ),
+        "$3\r\n2.5\r\n"
+    );
+    let lib = "#!lua name=l\nredis.register_function('f', function() return 1 end)";
+    assert_eq!(
+        resp_cmd(&mut c, &["FUNCTION", "LOAD", "REPLACE", lib]),
+        "$1\r\nl\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
+    let mut aof = Vec::new();
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.extension().is_some_and(|x| x == "aof") {
+            aof.extend(std::fs::read(path).unwrap());
+        }
+    }
+    let aof = String::from_utf8_lossy(&aof);
+    assert!(!aof.to_ascii_uppercase().contains("INCRBYFLOAT"), "{aof}");
+    assert!(
+        aof.contains("SET\r\n$1\r\nk\r\n$3\r\n1.5\r\n$7\r\nKEEPTTL"),
+        "{aof}"
+    );
+    assert!(
+        aof.contains("SET\r\n$1\r\nk\r\n$3\r\n2.5\r\n$7\r\nKEEPTTL"),
+        "{aof}"
+    );
+    assert!(aof.contains("$4\r\nload\r\n$7\r\nreplace\r\n"), "{aof}");
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = connect_busy(port, 5);
+    assert_eq!(resp_cmd(&mut c, &["GET", "k"]), "$3\r\n2.5\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FCALL", "f", "0"]), ":1\r\n");
+    shutdown_and_wait(port, &mut srv.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

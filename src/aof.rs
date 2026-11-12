@@ -2846,9 +2846,9 @@ fn encode_command_inner(cmd: &Command, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
         // Function libraries are server-wide; like Redis, the commands that
         // change them are replicated and written to the AOF as sent.
         Command::FunctionLoad { replace, code } => Some(if *replace {
-            resp_argv(&[b"FUNCTION".as_slice(), b"LOAD", b"REPLACE", code])
+            resp_argv(&[b"FUNCTION".as_slice(), b"load", b"replace", code])
         } else {
-            resp_argv(&[b"FUNCTION".as_slice(), b"LOAD", code])
+            resp_argv(&[b"FUNCTION".as_slice(), b"load", code])
         }),
         Command::FunctionDelete(lib) => Some(resp_argv(&[
             b"FUNCTION".as_slice(),

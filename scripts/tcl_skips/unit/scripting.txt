@@ -9,3 +9,13 @@ Test selective replication of certain Redis commands from Lua
 # Scripts using keys not declared in KEYS: refused when the key is on
 # another shard than the script (docs/differences.md).
 Using side effects is not a problem with command replication
+#
+# Lua 5.1's getfenv / setfenv / newproxy (lua-enable-deprecated-api)
+# don't exist in the Lua 5.4 rudis embeds.
+Test getfenv availability lua-enable-deprecated-api=yes
+Test setfenv availability lua-enable-deprecated-api=yes
+Test newproxy availability lua-enable-deprecated-api=yes
+#
+# Redis wraps a script's propagated effects in MULTI / EXEC; rudis sends
+# them one by one, so this replication-stream shape check differs.
+Test implicit deletions are replicated despite set_repl(REPL_NONE)

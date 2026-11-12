@@ -26948,9 +26948,20 @@ pub fn execute_local_command(
             Command::Incrbyfloat { key, increment } => {
                 match db.incrbyfloat(key.clone(), *increment) {
                     Ok(val) => {
-                        record_change!(cmd);
+                        // Replicated as SET of the result, as Redis does: a
+                        // replica re-adding the float could round differently.
+                        let value = Bytes::from(val.to_string());
+                        record_change!(&Command::Set {
+                            key: key.clone(),
+                            value: value.clone(),
+                            expire_in: None,
+                            condition: crate::resp::SetCondition::None,
+                            get: false,
+                            keepttl: true,
+                            past_expired: false,
+                        });
                         notify_keyspace_event(NOTIFY_STRING, "incrbyfloat", key);
-                        write_resp_bulk(out, val.to_string().as_bytes());
+                        write_resp_bulk(out, &value);
                     }
                     Err(err) => {
                         if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
