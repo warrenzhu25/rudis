@@ -17671,8 +17671,12 @@ mod tests {
     fn test_absolute_deadlines_round_trip_exactly() {
         for i in 0..2000u64 {
             let ms = 2_524_600_800_000 + i * 7;
-            let at = unix_ms_to_instant(ms, crate::clock::now(), unix_now());
-            assert_eq!(instant_to_unix_ms(at, crate::clock::now(), unix_now()), ms);
+            // One clock sample for both ways: two samples of the monotonic
+            // and the wall clock drift apart by up to a millisecond between
+            // them (this failed once in CI by 1 ms).
+            let (now, unix) = (crate::clock::now(), unix_now());
+            let at = unix_ms_to_instant(ms, now, unix);
+            assert_eq!(instant_to_unix_ms(at, now, unix), ms);
         }
         // A deadline in the past stays in the past, and nonzero.
         let now = crate::clock::now();
