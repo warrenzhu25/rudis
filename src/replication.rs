@@ -690,6 +690,9 @@ pub struct ReplicationHub {
     pub announce_port: AtomicU16,
     /// Unix timestamp (seconds) of the last successful read from our master (0 if never).
     pub last_master_io_secs: AtomicU64,
+    /// Bytes read from our master and not applied yet: INFO's
+    /// `slave_read_repl_offset` is `slave_repl_offset` plus these.
+    pub master_read_ahead: AtomicU64,
     /// What the replica worker's link is doing while not up (a `LINK_*`),
     /// for ROLE.
     pub link_phase: std::sync::atomic::AtomicU8,
@@ -1097,6 +1100,7 @@ impl ReplicationHub {
             announce_ip: RwLock::new(None),
             announce_port: AtomicU16::new(0),
             last_master_io_secs: AtomicU64::new(0),
+            master_read_ahead: AtomicU64::new(0),
             link_phase: std::sync::atomic::AtomicU8::new(LINK_CONNECTING),
             failover: Mutex::new(Failover::default()),
             restart_grace: AtomicBool::new(false),
@@ -2424,6 +2428,11 @@ impl ReplicationHub {
                 } else {
                     0
                 };
+                let read_ahead = if self.cached_master.load(Ordering::Relaxed) {
+                    self.master_read_ahead.load(Ordering::Relaxed)
+                } else {
+                    0
+                };
                 let last_io = self.last_master_io_secs.load(Ordering::Relaxed);
                 let last_io_ago: i64 = if last_io > 0 {
                     unix_secs().saturating_sub(last_io) as i64
@@ -2457,7 +2466,7 @@ impl ReplicationHub {
                     link_status,
                     last_io_ago,
                     if sync_in_progress { 1 } else { 0 },
-                    processed,
+                    processed + read_ahead,
                     processed,
                     priority,
                     ro,
@@ -5223,7 +5232,11 @@ async fn run_replica_worker(
             crate::connection::CURRENT_DB.set(replica_selected_db);
             router.local_db.borrow_mut().select_db(replica_selected_db);
 
-            if !buf.is_empty() {
+            // CLIENT PAUSE (WRITE or ALL) pauses applying the master's
+            // stream too, as Redis' PAUSE_ACTION_REPLICA does: what was read
+            // waits in `buf`.
+            let paused = crate::connection::is_client_paused().is_some();
+            if !buf.is_empty() && !paused {
                 // Applying a read and feeding it to our backlog and
                 // sub-replicas is atomic with respect to snapshots taken on
                 // this server (see `ReplicationHub::apply_token`); a snapshot
@@ -5374,6 +5387,19 @@ async fn run_replica_worker(
                 break;
             }
 
+            hub.master_read_ahead
+                .store(buf.len() as u64, Ordering::Relaxed);
+            if paused && !buf.is_empty() {
+                // Not read further while paused (a read would hold an
+                // unpause until the master's next bytes).
+                while crate::connection::is_client_paused().is_some()
+                    && !is_sync_cancelled(&cancel_rx)
+                {
+                    monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                continue;
+            }
+
             // Straight into `buf`, up to 4 MB: a replica applying the stream
             // waits for its shards once per read, so 64 KB reads held it at
             // ~0.4 GB/s.
@@ -5388,9 +5414,12 @@ async fn run_replica_worker(
                 Ok(_) => {
                     hub.last_master_io_secs
                         .store(unix_secs(), Ordering::Relaxed);
+                    hub.master_read_ahead
+                        .store(buf.len() as u64, Ordering::Relaxed);
                 }
             }
         }
+        hub.master_read_ahead.store(0, Ordering::Relaxed);
 
         // Applied before a reconnect resumes from the offset.
         drain_replica_batches(&in_flight, &applied).await;

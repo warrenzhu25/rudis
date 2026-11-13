@@ -8039,3 +8039,67 @@ fn test_publish_reaches_subscribers_on_replicas_e2e() {
     shutdown_and_wait(r1, &mut s1);
     shutdown_and_wait(m, &mut ms);
 }
+
+#[test]
+fn test_client_pause_write_pauses_applying_master_stream_e2e() {
+    // Redis' unit/pause: CLIENT PAUSE WRITE on a replica pauses applying the
+    // master's stream (read but not applied: slave_read_repl_offset grows,
+    // slave_repl_offset doesn't) until CLIENT UNPAUSE.
+    let (m, r) = (20601u16, 20602u16);
+    let spawn = |p: u16| {
+        let ps = p.to_string();
+        spawn_rudis_listening(&["--port", &ps, "--threads", "2", "--no-pin"], p)
+    };
+    let (mut ms, mut rs) = (spawn(m), spawn(r));
+    let connect = |p: u16| {
+        let s = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+    let (mut mc, mut rc) = (connect(m), connect(r));
+    assert_eq!(
+        resp_cmd(&mut rc, &["REPLICAOF", "127.0.0.1", &m.to_string()]),
+        "+OK\r\n"
+    );
+    wait_for_master_link(&mut rc);
+    let master_off = |c: &mut TcpStream| info_field_u64(c, "replication", "master_repl_offset");
+    let wait_for = |rc: &mut TcpStream, field: &str, want: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = info_field_u64(rc, "replication", field);
+            if got == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{field} {got} != {want}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    assert_eq!(resp_cmd(&mut mc, &["SET", "foo", "bar"]), "+OK\r\n");
+    let old = master_off(&mut mc);
+    wait_for(&mut rc, "slave_repl_offset", old);
+
+    assert_eq!(
+        resp_cmd(&mut rc, &["CLIENT", "PAUSE", "100000", "WRITE"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut mc, &["SET", "foo2", "bar2"]), "+OK\r\n");
+    let new = master_off(&mut mc);
+    assert!(new > old);
+    wait_for(&mut rc, "slave_read_repl_offset", new);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        info_field_u64(&mut rc, "replication", "slave_repl_offset"),
+        old
+    );
+    assert_eq!(resp_cmd(&mut rc, &["GET", "foo2"]), "$-1\r\n");
+
+    assert_eq!(resp_cmd(&mut rc, &["CLIENT", "UNPAUSE"]), "+OK\r\n");
+    wait_for(&mut rc, "slave_repl_offset", new);
+    assert_eq!(resp_cmd(&mut rc, &["GET", "foo2"]), "$4\r\nbar2\r\n");
+    shutdown_and_wait(r, &mut rs);
+    shutdown_and_wait(m, &mut ms);
+}
