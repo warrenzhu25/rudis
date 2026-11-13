@@ -29,7 +29,6 @@ pub const OK_SUBCOMMANDS: &[&[u8]] = &[
     b"quicklist-packed-threshold",
     b"replybuffer",
     b"sdslen",
-    b"segfault",
     // Integration suites.
     b"aof-flush-sleep",
     b"allocsize-slots-assert",

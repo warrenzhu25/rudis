@@ -344,6 +344,48 @@ pub fn log_str(level: Level, msg: &str) {
     write_line(line.as_bytes());
 }
 
+/// One log line for `msg` at `level`, as it would be written now
+/// (whatever `loglevel`).
+pub fn format_now(level: Level, msg: &str) -> String {
+    format_line(
+        level,
+        msg,
+        std::process::id(),
+        ROLE_REPLICA.load(Ordering::Relaxed),
+        &LocalTime::now(),
+        LOG_FORMAT.load(Ordering::Relaxed),
+        LOG_TIMESTAMP_FORMAT.load(Ordering::Relaxed),
+    )
+}
+
+/// Writes a crash report (`crate::crash`) to the log (the log file, or
+/// stdout) with raw write(2)s, also to stderr when the log is a file. It
+/// never waits for the log lock, which the crashing thread may hold: if
+/// the lock is taken, the report goes to stderr only.
+pub(crate) fn write_crash_report(text: &[u8]) {
+    use std::os::unix::io::AsRawFd;
+    fn write_all(fd: libc::c_int, mut buf: &[u8]) {
+        while !buf.is_empty() {
+            // SAFETY: write(2) of `buf.len()` bytes from a live slice.
+            let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                return;
+            }
+            buf = &buf[n as usize..];
+        }
+    }
+    match SINK.try_lock() {
+        Some(sink) if sink.path.is_empty() => write_all(1, text),
+        Some(sink) => {
+            if let Some((f, _, _)) = sink.file.as_ref() {
+                write_all(f.as_raw_fd(), text);
+            }
+            write_all(2, text);
+        }
+        None => write_all(2, text),
+    }
+}
+
 /// Logs formatted arguments; use the `log_*!` macros, which check
 /// [`enabled`] before formatting anything.
 pub fn log_args(level: Level, args: std::fmt::Arguments<'_>) {

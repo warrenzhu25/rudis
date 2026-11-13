@@ -216,6 +216,7 @@ fn main() {
     rudis::cycleclock::init();
     rudis::telemetry::init_telemetry();
     rudis::shutdown::install_signal_handlers();
+    rudis::crash::install();
     let (clap_args, positional_config, extra_directives) =
         split_redis_server_args(std::env::args().collect());
     let mut args = Args::parse_from(clap_args);
@@ -669,6 +670,7 @@ fn main() {
             .name(format!("rudis-shard-{}", shard_id))
             .stack_size(rudis::server::SHARD_THREAD_STACK_SIZE)
             .spawn(move || {
+                rudis::crash::install_thread_stack();
                 let res = rudis::server::supervise_shard(shard_id, || {
                     run_shard_worker(
                         shard_id,

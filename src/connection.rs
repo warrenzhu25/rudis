@@ -21712,6 +21712,17 @@ async fn execute_command_inner(
                         None => out.extend_from_slice(b"-ERR value is not an integer or out of range\r\n"),
                     }
                     return false;
+                } else if sub.eq_ignore_ascii_case(b"segfault") {
+                    // As in Redis: crash, to test the crash report
+                    // (`crate::crash`). DEBUG is refused unless
+                    // enable-debug-command allows it.
+                    crate::log_warning!("DEBUG SEGFAULT: crashing the server on request");
+                    // SAFETY: raise(3) with a valid signal; the crash
+                    // handler reports it and the process dies by it.
+                    unsafe {
+                        libc::raise(libc::SIGSEGV);
+                    }
+                    return true;
                 } else if sub.eq_ignore_ascii_case(b"set-active-expire") {
                     let enabled = args.get(1).map(|v| v.as_ref() != b"0").unwrap_or(true);
                     PAUSE_CRON.store(!enabled, std::sync::atomic::Ordering::Relaxed);

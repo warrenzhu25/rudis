@@ -6,12 +6,12 @@ or a container, AOF on, and a supervisor that restarts the process.
 
 ## 1. What to alert on
 
-Scrape `--metrics-port` (`GET /metrics`), and watch the log for `FATAL` and `Slow script
+Scrape `--metrics-port` (`GET /metrics`), and watch the log for `FATAL`, `crashed by signal` and `Slow script
 detected` (§4). Alert on:
 
 | Metric | Condition | Meaning |
 | :--- | :--- | :--- |
-| `up` (scrape fails) / process restarts | any | Crash, OOM kill, or a dead shard thread (the process exits 1, logging `FATAL: shard N panicked`). |
+| `up` (scrape fails) / process restarts | any | Crash, OOM kill, or a dead shard thread (the process exits 1, logging `FATAL: shard N panicked`). A fatal signal (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT) logs a crash report first, from `=== RUDIS BUG REPORT START` to `END`, with the signal and a backtrace: attach it to the bug. `kill -ALRM <pid>` logs a backtrace of one thread and leaves the server running. |
 | `rudis_aof_last_write_ok` | `== 0` | AOF writes are failing (disk full, I/O error); writes get `-MISCONF`. |
 | `rudis_rdb_last_bgsave_ok` | `== 0` | The last snapshot failed; the previous `dump.rdb` is kept. |
 | `rudis_used_memory_bytes / rudis_max_memory_bytes` | `> 0.9` | Close to `maxmemory`: eviction (or `-OOM` under `noeviction`) is near. |

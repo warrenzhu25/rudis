@@ -19,6 +19,7 @@ pub mod compact;
 pub mod config;
 pub mod conn_balance;
 pub mod connection;
+pub mod crash;
 pub mod crdt;
 pub mod cycleclock;
 pub mod debug_cmd;
