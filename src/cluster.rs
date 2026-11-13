@@ -1116,13 +1116,43 @@ impl ClusterHub {
     }
 
     pub fn cluster_info(&self) -> String {
+        // The slot list before the node table (lock order).
+        let my_slots = if *self.role.read() == "master" {
+            self.my_slots.read().clone()
+        } else {
+            Vec::new()
+        };
         let nodes = self.nodes.read();
         let total_nodes = nodes.len() + 1; // peers + self
-        let pfail_count = nodes
+        // Slot counts as Redis reports them: assigned to some master, and
+        // of those, held by a master in PFAIL or FAIL (the rest are ok).
+        // Every slot used to be reported assigned and ok, unassigned ones
+        // included.
+        let mut slot_state = vec![0u8; 16384]; // 0 none, 1 ok, 2 pfail, 3 fail
+        let mut mark = |ranges: &[(u16, u16)], st: u8| {
+            for &(s, e) in ranges {
+                for v in &mut slot_state[s as usize..=e as usize] {
+                    *v = (*v).max(st);
+                }
+            }
+        };
+        mark(&my_slots, 1);
+        let mut size = usize::from(!my_slots.is_empty());
+        for n in nodes
             .values()
-            .filter(|n| n.fail == FailState::PFail)
-            .count();
-        let fail_count = nodes.values().filter(|n| n.fail == FailState::Fail).count();
+            .filter(|n| n.is_master() && !n.slots.is_empty())
+        {
+            size += 1;
+            let st = match n.fail {
+                FailState::Ok => 1,
+                FailState::PFail => 2,
+                FailState::Fail => 3,
+            };
+            mark(&n.slots, st);
+        }
+        let count = |st: u8| slot_state.iter().filter(|&&v| v == st).count();
+        let (slots_ok, slots_pfail, slots_fail) = (count(1), count(2), count(3));
+        let slots_assigned = slots_ok + slots_pfail + slots_fail;
         // Down while a failed master still serves slots (no replica took
         // them over yet).
         let uncovered = nodes
@@ -1133,8 +1163,16 @@ impl ClusterHub {
         let cur_epoch = self.current_epoch.load(Ordering::Relaxed);
         let cfg_epoch = self.config_epoch.load(Ordering::Relaxed);
         format!(
-            "cluster_state:{}\r\ncluster_slots_assigned:16384\r\ncluster_slots_ok:16384\r\ncluster_slots_pfail:{}\r\ncluster_slots_fail:{}\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\ncluster_current_epoch:{}\r\ncluster_my_epoch:{}\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n",
-            state, pfail_count, fail_count, total_nodes, total_nodes, cur_epoch, cfg_epoch
+            "cluster_state:{}\r\ncluster_slots_assigned:{}\r\ncluster_slots_ok:{}\r\ncluster_slots_pfail:{}\r\ncluster_slots_fail:{}\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\ncluster_current_epoch:{}\r\ncluster_my_epoch:{}\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n",
+            state,
+            slots_assigned,
+            slots_ok,
+            slots_pfail,
+            slots_fail,
+            total_nodes,
+            size,
+            cur_epoch,
+            cfg_epoch
         )
     }
 
@@ -4149,6 +4187,54 @@ mod tests {
         assert!(!restarted.has_default_slots());
         assert_eq!(*restarted.my_slots.read(), vec![(0, 16383)]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cluster_info_counts_slots_by_their_masters_health() {
+        let hub = ClusterHub::new(7994);
+        assert!(
+            hub.cluster_info()
+                .contains("cluster_slots_assigned:16384\r\n")
+        );
+        hub.cluster_addslotsrange(&[(0, 99)]).unwrap();
+        let peer = |id: &str, slots: Vec<(u16, u16)>, flags: &str, fail| ClusterNodeInfo {
+            id: id.to_string(),
+            ip: "127.0.0.1".to_string(),
+            port: 7995,
+            cport: 17995,
+            flags: flags.to_string(),
+            fail,
+            shards: 1,
+            master_id: "-".to_string(),
+            ping_sent: 0,
+            pong_recv: 0,
+            config_epoch: 1,
+            link_state: "connected".to_string(),
+            slots,
+        };
+        {
+            let mut nodes = hub.nodes.write();
+            for n in [
+                peer("a", vec![(100, 199)], "master", FailState::PFail),
+                peer("b", vec![(200, 299), (300, 309)], "master", FailState::Fail),
+                peer("c", vec![(400, 499)], "master", FailState::Ok),
+                peer("d", Vec::new(), "slave", FailState::Ok),
+                peer("e", Vec::new(), "master", FailState::Ok),
+            ] {
+                nodes.insert(n.id.clone(), n);
+            }
+        }
+        let info = hub.cluster_info();
+        for field in [
+            "cluster_slots_assigned:410\r\n",
+            "cluster_slots_ok:200\r\n",
+            "cluster_slots_pfail:100\r\n",
+            "cluster_slots_fail:110\r\n",
+            "cluster_known_nodes:6\r\n",
+            "cluster_size:4\r\n",
+        ] {
+            assert!(info.contains(field), "{field} in {info}");
+        }
     }
 
     #[test]
