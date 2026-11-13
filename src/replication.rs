@@ -666,7 +666,7 @@ pub struct ReplicationHub {
     /// batch of its master's stream, and by a full sync or save on a
     /// replica while it snapshots: the snapshot then matches one offset of
     /// the stream exactly.
-    apply_token: (flume::Sender<()>, flume::Receiver<()>),
+    apply_token: std::sync::Arc<crate::mailbox::AsyncToken>,
     /// Replicated batches sent to this server's shards and not applied yet
     /// (see `Router::send_replica_batch`): the stream loop reads on while
     /// they apply, so whoever takes the apply token for a snapshot waits
@@ -674,7 +674,7 @@ pub struct ReplicationHub {
     pub replica_batches_in_flight: std::sync::atomic::AtomicUsize,
     /// Held by an EXEC while its `MULTI` ... `EXEC` block is open in the
     /// stream, so blocks never nest (see [`Self::lock_tx_stream`]).
-    tx_stream_token: (flume::Sender<()>, flume::Receiver<()>),
+    tx_stream_token: std::sync::Arc<crate::mailbox::AsyncToken>,
     /// A task sends `repl-ping-replica-period` PINGs to the replicas.
     pinger_running: AtomicBool,
     /// Selected DB index of the replication stream from our master. Preserved
@@ -704,12 +704,13 @@ pub struct ReplicationHub {
     failover_in_progress: AtomicBool,
 }
 
-/// Holds `ReplicationHub::apply_token` until dropped.
-pub struct ApplyGuard(flume::Sender<()>);
+/// Holds `ReplicationHub::apply_token` (or the tx stream token) until
+/// dropped.
+pub struct ApplyGuard(std::sync::Arc<crate::mailbox::AsyncToken>);
 
 impl Drop for ApplyGuard {
     fn drop(&mut self) {
-        let _ = self.0.try_send(());
+        self.0.release();
     }
 }
 
@@ -1060,10 +1061,6 @@ const REPL_PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 
 impl ReplicationHub {
     pub fn new(port: u16) -> Self {
-        let (token_tx, token_rx) = flume::bounded(1);
-        let _ = token_tx.try_send(());
-        let (tx_stream_tx, tx_stream_rx) = flume::bounded(1);
-        let _ = tx_stream_tx.try_send(());
         Self {
             port,
             role: RwLock::new(ReplicationRole::Master),
@@ -1091,9 +1088,9 @@ impl ReplicationHub {
             rdb_claims: Mutex::new(HashMap::new()),
             no_replicas_since: AtomicU64::new(0),
             cached_master: AtomicBool::new(false),
-            apply_token: (token_tx, token_rx),
+            apply_token: std::sync::Arc::new(crate::mailbox::AsyncToken::new()),
             replica_batches_in_flight: std::sync::atomic::AtomicUsize::new(0),
-            tx_stream_token: (tx_stream_tx, tx_stream_rx),
+            tx_stream_token: std::sync::Arc::new(crate::mailbox::AsyncToken::new()),
             pinger_running: AtomicBool::new(false),
             replica_selected_db: std::sync::atomic::AtomicUsize::new(0),
             replica_priority: AtomicU64::new(100),
@@ -1144,8 +1141,8 @@ impl ReplicationHub {
     /// it only waits for shards to stream what they hold, so it can't
     /// deadlock.
     pub async fn lock_tx_stream(&self) -> ApplyGuard {
-        let _ = self.tx_stream_token.1.recv_async().await;
-        ApplyGuard(self.tx_stream_token.0.clone())
+        self.tx_stream_token.acquire().await;
+        ApplyGuard(self.tx_stream_token.clone())
     }
 
     /// Waits for the apply token (see `ReplicationHub::apply_token`).
@@ -1163,8 +1160,8 @@ impl ReplicationHub {
     /// The apply token for the replica's stream loop, which applies a read
     /// under it and leaves the read's batches applying when it lets go.
     pub async fn lock_apply_for_stream(&self) -> ApplyGuard {
-        let _ = self.apply_token.1.recv_async().await;
-        ApplyGuard(self.apply_token.0.clone())
+        self.apply_token.acquire().await;
+        ApplyGuard(self.apply_token.clone())
     }
 
     /// Redis's `shiftReplicationId`: the current id becomes replid2, valid

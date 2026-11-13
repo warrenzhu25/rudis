@@ -43,6 +43,73 @@ pub async fn yield_now() {
     .await
 }
 
+/// A token that tasks on any thread take in turn (a binary semaphore).
+///
+/// Replaces a `flume::bounded(1)` channel holding one `()` that every
+/// waiter `recv_async`'d on. flume's `RecvFut` misbehaves with several
+/// receivers: when a send wakes one waiter but another takes the token
+/// first, the woken future's hook stays marked as woken, and from then on
+/// each poll re-queues the hook (growing the channel's waiter list without
+/// bound) and, since monoio hands it a fresh waker each time, wakes its
+/// own task, which monoio runs again at once. That task then spun its
+/// shard at 100% CPU forever: the shard served nothing else (a master
+/// stopped answering, its replicas timed out) while memory grew by
+/// ~100 MB/s, until a 62 GB test process was OOM-killed.
+pub struct AsyncToken {
+    held: AtomicBool,
+    waiters: parking_lot::Mutex<Vec<std::task::Waker>>,
+}
+
+impl Default for AsyncToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AsyncToken {
+    /// A token nobody holds.
+    pub fn new() -> Self {
+        Self {
+            held: AtomicBool::new(false),
+            waiters: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Takes the token if nobody holds it.
+    pub fn try_acquire(&self) -> bool {
+        !self.held.swap(true, Ordering::AcqRel)
+    }
+
+    /// Waits for the token and takes it.
+    pub async fn acquire(&self) {
+        std::future::poll_fn(|cx| {
+            if self.try_acquire() {
+                return std::task::Poll::Ready(());
+            }
+            self.waiters.lock().push(cx.waker().clone());
+            // Released between the first try and the push: the release
+            // didn't see this waker, so take the token now.
+            if self.try_acquire() {
+                return std::task::Poll::Ready(());
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+
+    /// Gives the token back and wakes every waiter (they race for it; the
+    /// losers wait again). Waking all of them keeps a waiter that already
+    /// took the token on its re-check, or went away, from swallowing the
+    /// only wake.
+    pub fn release(&self) {
+        self.held.store(false, Ordering::Release);
+        let waiters = std::mem::take(&mut *self.waiters.lock());
+        for w in waiters {
+            w.wake();
+        }
+    }
+}
+
 /// `cross-shard-spin`: how many times a connection polls for a cross-shard
 /// reply before parking its task. Polling burns the shard's CPU while other
 /// connections on it wait, so the default is 0 (park immediately and let the
@@ -1188,6 +1255,54 @@ mod tests {
     }
     use std::sync::Arc;
     use std::thread;
+
+    /// Many tasks on several threads taking one AsyncToken in turn: each
+    /// gets it exactly when nobody else holds it, and every acquire ends.
+    /// With the flume-channel token this replaced, a waiter woken while
+    /// another took the token could spin its thread forever.
+    #[test]
+    fn test_async_token_is_exclusive_across_threads() {
+        let token = std::sync::Arc::new(AsyncToken::new());
+        let inside = std::sync::Arc::new(AtomicUsize::new(0));
+        let done = std::sync::Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let (token, inside, done) = (token.clone(), inside.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                        .enable_timer()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let tasks: Vec<_> = (0..4)
+                            .map(|_| {
+                                let (token, inside, done) =
+                                    (token.clone(), inside.clone(), done.clone());
+                                monoio::spawn(async move {
+                                    for _ in 0..2000 {
+                                        token.acquire().await;
+                                        assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0);
+                                        yield_now().await;
+                                        assert_eq!(inside.fetch_sub(1, Ordering::SeqCst), 1);
+                                        token.release();
+                                    }
+                                    done.fetch_add(1, Ordering::SeqCst);
+                                })
+                            })
+                            .collect();
+                        for t in tasks {
+                            t.await;
+                        }
+                    });
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 16);
+        assert!(token.try_acquire());
+    }
 
     #[test]
     fn test_cache_padded_alignment() {
