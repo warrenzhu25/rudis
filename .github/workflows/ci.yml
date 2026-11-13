@@ -215,6 +215,16 @@ jobs:
             integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load,integration/rdb,integration/corrupt-dump,integration/corrupt-dump-fuzzer,unit/wait,unit/violations \
             2>&1 | tee -a /tmp/rudis_tcl_suites.log
 
+      # Cluster suites (and dismiss-mem, which ends with a one-node
+      # cluster), one shard per node: in cluster mode shard N listens on
+      # port + N, and the harness puts nodes on consecutive ports.
+      - name: Run the cluster integration suites
+        run: |
+          set -o pipefail
+          RUDIS_THREADS=1 SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
+            unit/cluster/failure-marking,unit/cluster/internal-secret,integration/dismiss-mem \
+            2>&1 | tee -a /tmp/rudis_tcl_suites.log
+
       # Annotations are visible on the run page without downloading logs.
       - name: Report failing TCL tests
         if: failure()
