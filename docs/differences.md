@@ -141,6 +141,12 @@ tests for them are skipped (`scripts/tcl_skips/unit/info.txt`).
 ### Turning AOF On at Runtime
 * `CONFIG SET appendonly yes` works as in Redis (writes logged at once, initial AOF written by a background rewrite, `SHUTDOWN` refused until it is done). Until then the writes go to `appendonly-<shard>.aof.incr` and no `appendonly-<shard>.aof` exists, so a crash in between never leaves an AOF without the dataset. Redis 7 tracks this in its multi-part AOF manifest, which rudis doesn't have.
 
+### Turning AOF Off During a Rewrite
+* `CONFIG SET appendonly no` during an AOF rewrite stops logging at once, as in Redis, but the rewrite runs to its end (its result is not used); Redis kills the rewriting child. A `BGREWRITEAOF` meanwhile gets "Background append only file rewriting already in progress" until it ends.
+
+### Cluster Slots Not Covered
+* `cluster-require-full-coverage` is accepted but ignored: a rudis cluster node always behaves as with `no`. While some slots are unassigned, or held by a failed master no replica has taken over, it keeps serving the slots it owns, and only commands on the uncovered slots get `-CLUSTERDOWN Hash slot not served`. Redis's default (`yes`) refuses every key with `-CLUSTERDOWN The cluster is down` then. `CLUSTER INFO` reports the slot counts as Redis does (`cluster_slots_assigned`, `_ok`, `_pfail`, `_fail`). A master cut off from the majority of masters refuses its keys, as in Redis.
+
 ---
 
 ## 4. Multi-Protocol Engine (Redis + Memcached)
