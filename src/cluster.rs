@@ -902,13 +902,24 @@ impl ClusterHub {
 
     /// The `PING` this node sends on the cluster bus.
     fn ping_frame(&self, gossip: &str) -> String {
+        // Each lock is taken and released on its own: the guards of
+        // `format!` arguments live to the end of the statement, and
+        // `announce_tokens` reads `role` again. A second read of a
+        // parking_lot RwLock waits behind a queued writer (claim_slots
+        // demoting this master), which waits for the first read: the bus
+        // thread hung holding nothing, then every thread needing `nodes`
+        // behind the PONG handler that held it, shards included (the node
+        // stopped answering during a manual failover).
+        let role = self.role.read().clone();
+        let slots = slots_repr(&self.announced_slots());
+        let tokens = self.announce_tokens();
         format!(
             "PING {} {} {} {} {} GOSSIP {}\r\n",
             self.my_id(),
             self.config_epoch.load(Ordering::Relaxed),
-            self.role.read(),
-            slots_repr(&self.announced_slots()),
-            self.announce_tokens(),
+            role,
+            slots,
+            tokens,
             gossip
         )
     }
