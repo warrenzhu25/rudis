@@ -222,7 +222,7 @@ jobs:
         run: |
           set -o pipefail
           RUDIS_THREADS=1 SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
-            unit/cluster/failure-marking,unit/cluster/internal-secret,integration/dismiss-mem \
+            unit/cluster/failure-marking,unit/cluster/internal-secret,unit/cluster/multi-slot-operations,integration/dismiss-mem \
             2>&1 | tee -a /tmp/rudis_tcl_suites.log
 
       # Annotations are visible on the run page without downloading logs.
