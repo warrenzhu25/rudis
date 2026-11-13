@@ -1844,12 +1844,55 @@ impl ClusterHub {
         }
     }
 
-    pub fn cluster_addslots(&self, slots: &[u16]) -> Result<(), String> {
-        for &s in slots {
-            if s >= 16384 {
-                return Err(format!("ERR Slot {} out of range", s));
+    /// Who holds each slot in this node's view: `Some(true)` this node
+    /// (its default slots don't count), `Some(false)` a peer, None nobody.
+    fn slot_holders(&self) -> Vec<Option<bool>> {
+        let mut holders = vec![None; 16384];
+        // The slot list before the node table (lock order).
+        if !self.has_default_slots() {
+            for &(s, e) in self.my_slots.read().iter() {
+                holders[s as usize..=e as usize].fill(Some(true));
             }
         }
+        for n in self.nodes.read().values() {
+            for &(s, e) in &n.slots {
+                for h in &mut holders[s as usize..=e as usize] {
+                    h.get_or_insert(false);
+                }
+            }
+        }
+        holders
+    }
+
+    /// Redis's checks for CLUSTER ADDSLOTS / DELSLOTS (and the ranges),
+    /// all before any change: a slot named twice, a slot to add that some
+    /// node holds already ("busy": two owners of one slot), a slot to
+    /// delete that nobody holds.
+    fn check_slot_args(&self, slots: &[u16], adding: bool) -> Result<(), String> {
+        let mut seen = vec![false; 16384];
+        for &s in slots {
+            if std::mem::replace(&mut seen[s as usize], true) {
+                return Err(format!("ERR Slot {s} specified multiple times"));
+            }
+        }
+        let holders = self.slot_holders();
+        for &s in slots {
+            match (adding, holders[s as usize]) {
+                (true, Some(_)) => return Err(format!("ERR Slot {s} is already busy")),
+                (false, None) if !self.has_default_slots() => {
+                    return Err(format!("ERR Slot {s} is already unassigned"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn cluster_addslots(&self, slots: &[u16]) -> Result<(), String> {
+        if let Some(&s) = slots.iter().find(|&&s| s >= 16384) {
+            return Err(format!("ERR Slot {s} out of range"));
+        }
+        self.check_slot_args(slots, true)?;
         {
             let mut my_slots = self.my_slots.write();
             self.end_default_slots(&mut my_slots);
@@ -1863,6 +1906,7 @@ impl ClusterHub {
     }
 
     pub fn cluster_delslots(&self, slots: &[u16]) -> Result<(), String> {
+        self.check_slot_args(slots, false)?;
         {
             let mut my_slots = self.my_slots.write();
             // The rest of the default slots are now assigned to us.
@@ -1874,40 +1918,23 @@ impl ClusterHub {
         Ok(())
     }
 
-    pub fn cluster_addslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
+    fn expand_ranges(ranges: &[(u16, u16)]) -> Result<Vec<u16>, String> {
+        let mut slots = Vec::new();
         for &(start, end) in ranges {
             if start > end || end >= 16384 {
-                return Err(format!("ERR Invalid slot range {}-{}", start, end));
+                return Err(format!("ERR Invalid slot range {start}-{end}"));
             }
+            slots.extend(start..=end);
         }
-        {
-            let mut my_slots = self.my_slots.write();
-            self.end_default_slots(&mut my_slots);
-            for &(start, end) in ranges {
-                my_slots.push((start, end));
-            }
-            compact_slots(&mut my_slots);
-        }
-        let _ = self.save_config();
-        Ok(())
+        Ok(slots)
+    }
+
+    pub fn cluster_addslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
+        self.cluster_addslots(&Self::expand_ranges(ranges)?)
     }
 
     pub fn cluster_delslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
-        let mut to_remove = Vec::new();
-        for &(start, end) in ranges {
-            for s in start..=end {
-                to_remove.push(s);
-            }
-        }
-        {
-            let mut my_slots = self.my_slots.write();
-            // The rest of the default slots are now assigned to us.
-            self.slots_default.store(false, Ordering::Release);
-            remove_slots(&mut my_slots, &to_remove);
-        }
-        self.unblock_lost_slots(&to_remove);
-        let _ = self.save_config();
-        Ok(())
+        self.cluster_delslots(&Self::expand_ranges(ranges)?)
     }
 
     pub fn broadcast_to_peers(&self, msg: &str) {
@@ -4270,6 +4297,57 @@ mod tests {
         ] {
             assert!(info.contains(field), "{field} in {info}");
         }
+    }
+
+    #[test]
+    fn test_slot_assignment_is_checked_as_in_redis() {
+        let hub = ClusterHub::new(7996);
+        hub.cluster_addslotsrange(&[(0, 99)]).unwrap();
+        hub.nodes.write().insert(
+            "peer".to_string(),
+            ClusterNodeInfo {
+                id: "peer".to_string(),
+                ip: "127.0.0.1".to_string(),
+                port: 7997,
+                cport: 17997,
+                flags: "master".to_string(),
+                fail: FailState::Ok,
+                shards: 1,
+                master_id: "-".to_string(),
+                ping_sent: 0,
+                pong_recv: 0,
+                config_epoch: 1,
+                link_state: "connected".to_string(),
+                slots: vec![(200, 299)],
+            },
+        );
+        // A slot some node holds can't be added: it would have two owners.
+        assert_eq!(
+            hub.cluster_addslots(&[150, 50]).unwrap_err(),
+            "ERR Slot 50 is already busy"
+        );
+        assert_eq!(
+            hub.cluster_addslotsrange(&[(150, 250)]).unwrap_err(),
+            "ERR Slot 200 is already busy"
+        );
+        assert_eq!(
+            hub.cluster_addslots(&[150, 151, 150]).unwrap_err(),
+            "ERR Slot 150 specified multiple times"
+        );
+        assert_eq!(
+            hub.cluster_delslotsrange(&[(90, 99), (95, 96)])
+                .unwrap_err(),
+            "ERR Slot 95 specified multiple times"
+        );
+        assert_eq!(
+            hub.cluster_delslots(&[50, 150]).unwrap_err(),
+            "ERR Slot 150 is already unassigned"
+        );
+        // Nothing changed on an error.
+        assert_eq!(*hub.my_slots.read(), vec![(0, 99)]);
+        hub.cluster_addslotsrange(&[(150, 199)]).unwrap();
+        hub.cluster_delslots(&[0]).unwrap();
+        assert_eq!(*hub.my_slots.read(), vec![(1, 99), (150, 199)]);
     }
 
     #[test]

@@ -4205,11 +4205,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     let mut slots = Vec::with_capacity(args.len() - 2);
                     for a in &args[2..] {
-                        let s: u16 = std::str::from_utf8(a)
-                            .ok()
-                            .and_then(|val| val.parse().ok())
-                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        slots.push(s);
+                        slots.push(parse_cluster_slot(a)?);
                     }
                     Ok(Some(Command::Cluster(ClusterSubcommand::AddSlots(slots))))
                 }
@@ -4221,11 +4217,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     let mut slots = Vec::with_capacity(args.len() - 2);
                     for a in &args[2..] {
-                        let s: u16 = std::str::from_utf8(a)
-                            .ok()
-                            .and_then(|val| val.parse().ok())
-                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        slots.push(s);
+                        slots.push(parse_cluster_slot(a)?);
                     }
                     Ok(Some(Command::Cluster(ClusterSubcommand::DelSlots(slots))))
                 }
@@ -4238,15 +4230,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     let mut ranges = Vec::new();
                     for chunk in args[2..].chunks(2) {
-                        let start: u16 = std::str::from_utf8(&chunk[0])
-                            .ok()
-                            .and_then(|val| val.parse().ok())
-                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        let end: u16 = std::str::from_utf8(&chunk[1])
-                            .ok()
-                            .and_then(|val| val.parse().ok())
-                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        ranges.push((start, end));
+                        ranges.push(parse_cluster_slot_range(&chunk[0], &chunk[1])?);
                     }
                     Ok(Some(Command::Cluster(ClusterSubcommand::AddSlotsRange(
                         ranges,
@@ -4261,15 +4245,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     let mut ranges = Vec::new();
                     for chunk in args[2..].chunks(2) {
-                        let start: u16 = std::str::from_utf8(&chunk[0])
-                            .ok()
-                            .and_then(|val| val.parse().ok())
-                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        let end: u16 = std::str::from_utf8(&chunk[1])
-                            .ok()
-                            .and_then(|val| val.parse().ok())
-                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        ranges.push((start, end));
+                        ranges.push(parse_cluster_slot_range(&chunk[0], &chunk[1])?);
                     }
                     Ok(Some(Command::Cluster(ClusterSubcommand::DelSlotsRange(
                         ranges,
@@ -14640,8 +14616,48 @@ fn parse_himport(args: &[Bytes]) -> Result<Command, String> {
     Ok(Command::Himport(sub))
 }
 
+/// A slot argument of CLUSTER ADDSLOTS / DELSLOTS (and the ranges): an
+/// integer in 0..16384, else Redis's error.
+fn parse_cluster_slot(arg: &[u8]) -> Result<u16, String> {
+    std::str::from_utf8(arg)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|s| (0..16384).contains(s))
+        .map(|s| s as u16)
+        .ok_or_else(|| "Invalid or out of range slot".to_string())
+}
+
+/// A `<start> <end>` pair of CLUSTER ADDSLOTSRANGE / DELSLOTSRANGE.
+fn parse_cluster_slot_range(start: &[u8], end: &[u8]) -> Result<(u16, u16), String> {
+    let (s, e) = (parse_cluster_slot(start)?, parse_cluster_slot(end)?);
+    if s > e {
+        return Err(format!(
+            "start slot number {s} is greater than end slot number {e}"
+        ));
+    }
+    Ok((s, e))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{parse_cluster_slot, parse_cluster_slot_range};
+
+    #[test]
+    fn test_cluster_slot_args_are_checked_as_in_redis() {
+        assert_eq!(parse_cluster_slot(b"16383"), Ok(16383));
+        for bad in [&b"aaa"[..], b"-1000", b"16384", b"70000"] {
+            assert_eq!(
+                parse_cluster_slot(bad).unwrap_err(),
+                "Invalid or out of range slot"
+            );
+        }
+        assert_eq!(parse_cluster_slot_range(b"3020", b"3030"), Ok((3020, 3030)));
+        assert_eq!(
+            parse_cluster_slot_range(b"3030", b"3025").unwrap_err(),
+            "start slot number 3030 is greater than end slot number 3025"
+        );
+    }
+
     use super::*;
 
     /// TIER SNAPSHOT / BACKUP were removed; the other subcommands remain.

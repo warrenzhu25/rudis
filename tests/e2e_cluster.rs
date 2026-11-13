@@ -435,11 +435,8 @@ fn test_cluster_bus_gossip_failover_e2e() {
     );
 
     // 4. Test CLUSTER REPLICATE (like Redis, only a node without slots may
-    // become a replica: its keys would be replaced by the master's)
-    assert_eq!(
-        send_and_read(&mut c2, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"),
-        "+OK\r\n"
-    );
+    // become a replica: its keys would be replaced by the master's). Node 2
+    // gave up its default slots when it met node 1, so it has none.
     let rep_resp = send_and_read(
         &mut c2,
         format!("CLUSTER REPLICATE {}\r\n", myid1).as_bytes(),
