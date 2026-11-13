@@ -1643,3 +1643,70 @@ fn test_incrbyfloat_logged_as_set_keepttl_e2e() {
     shutdown_and_wait(port, &mut srv.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// HINCRBYFLOAT reaches the AOF (and replicas) as HSETEX ... KEEPTTL of
+/// its result, as Redis does: no float re-rounding on replay, and the
+/// field keeps its TTL. Before, it was logged as itself.
+#[test]
+fn test_hincrbyfloat_logged_as_hsetex_keepttl_e2e() {
+    let port = 20330u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-hibf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = [
+        "--port",
+        &ps,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--dir",
+        &ds,
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+    ];
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = connect_busy(port, 5);
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["HSETEX", "h", "EX", "100", "FIELDS", "1", "f1", "1"]
+        ),
+        ":1\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["HINCRBYFLOAT", "h", "f1", "1.5"]),
+        "$3\r\n2.5\r\n"
+    );
+    shutdown_and_wait(port, &mut srv.0);
+    let mut aof = Vec::new();
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.extension().is_some_and(|x| x == "aof") {
+            aof.extend(std::fs::read(path).unwrap());
+        }
+    }
+    let aof = String::from_utf8_lossy(&aof);
+    assert!(!aof.to_ascii_uppercase().contains("HINCRBYFLOAT"), "{aof}");
+    assert!(
+        aof.contains("KEEPTTL\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n$3\r\n2.5"),
+        "{aof}"
+    );
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = connect_busy(port, 5);
+    assert_eq!(resp_cmd(&mut c, &["HGET", "h", "f1"]), "$3\r\n2.5\r\n");
+    let ttl = resp_cmd_all(&mut c, &["HTTL", "h", "FIELDS", "1", "f1"]);
+    let secs: i64 = ttl
+        .lines()
+        .nth(1)
+        .unwrap()
+        .trim_start_matches(':')
+        .parse()
+        .unwrap();
+    assert!(secs > 0 && secs <= 100, "{ttl}");
+    shutdown_and_wait(port, &mut srv.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -26194,9 +26194,18 @@ pub fn execute_local_command(
             } => {
                 match db.hincrbyfloat(key.clone(), field.clone(), *increment) {
                     Ok(val) => {
-                        record_change!(cmd);
+                        // Replicated as HSETEX ... KEEPTTL of the result, as
+                        // Redis does: the float can't round differently on a
+                        // replica, and the field keeps its TTL there.
+                        let value = Bytes::from(val.to_string());
+                        record_change!(&Command::Hsetex {
+                            key: key.clone(),
+                            condition: crate::resp::HsetexCondition::None,
+                            expire: crate::resp::HFieldExpireOpt::KeepTtl,
+                            pairs: vec![(field.clone(), value.clone())],
+                        });
                         notify_hash_fields_event("hincrbyfloat", key, std::slice::from_ref(field));
-                        write_resp_bulk(out, val.to_string().as_bytes());
+                        write_resp_bulk(out, &value);
                     }
                     Err(err) => {
                         if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
