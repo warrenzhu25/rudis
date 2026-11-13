@@ -8103,3 +8103,51 @@ fn test_client_pause_write_pauses_applying_master_stream_e2e() {
     shutdown_and_wait(r, &mut rs);
     shutdown_and_wait(m, &mut ms);
 }
+
+/// A `CONFIG SET repl-timeout` applies to a read the replica is already
+/// waiting on, as in Redis (its cron reads the current value). It used to
+/// apply only from the next read: a replica waiting on a stalled master
+/// kept the old timeout, 60 s by default (Redis' integration/replication,
+/// "Slave is able to detect timeout during handshake").
+#[test]
+fn test_repl_timeout_change_applies_to_a_waiting_read_e2e() {
+    let port = 26651u16;
+    // A "master" that accepts the replica and never answers.
+    let master = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mport = master.local_addr().unwrap().port();
+    let ps = port.to_string();
+    let mut replica = ServerGuard(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "1", "--no-pin"],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["REPLICAOF", "127.0.0.1", &mport.to_string()]),
+        "+OK\r\n"
+    );
+    let (mut link, _) = master.accept().unwrap();
+    // The replica's PING arrives; it then waits (repl-timeout is 60 s).
+    link.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 256];
+    assert!(link.read(&mut buf).unwrap() > 0);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "repl-timeout", "1"]),
+        "+OK\r\n"
+    );
+    // Within about a second the replica gives up on the link.
+    let start = std::time::Instant::now();
+    link.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    loop {
+        match link.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    let waited = start.elapsed();
+    assert!(waited < Duration::from_secs(4), "{waited:?}");
+    drop(c);
+    let _ = replica.0.kill();
+}

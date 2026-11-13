@@ -764,6 +764,31 @@ pub(crate) fn repl_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(REPL_TIMEOUT_SECS.load(Ordering::Relaxed).max(1))
 }
 
+/// Runs `fut` (a read from the master) until it ends or `repl-timeout`
+/// passes without it ending: None then. The timeout is read again as it
+/// runs, as Redis's cron does, so a `CONFIG SET repl-timeout` applies to a
+/// read already waiting (it used to apply only from the next read: a
+/// replica waiting on a stalled master kept the old timeout, 60 s by
+/// default).
+async fn within_repl_timeout<F: std::future::Future>(fut: F) -> Option<F::Output> {
+    let start = std::time::Instant::now();
+    let expired = async {
+        loop {
+            let left = repl_timeout().saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return;
+            }
+            monoio::time::sleep(left.min(std::time::Duration::from_millis(250))).await;
+        }
+    };
+    let fut = std::pin::pin!(fut);
+    let expired = std::pin::pin!(expired);
+    monoio::select! {
+        out = fut => Some(out),
+        _ = expired => None,
+    }
+}
+
 /// One read from the master, failing with `TimedOut` after `repl-timeout`
 /// without data. On a timeout `buf` is left empty: the caller reconnects.
 /// How much a replica reads of its master's stream at once (see
@@ -781,12 +806,12 @@ async fn read_stream_into<R: monoio::io::AsyncReadRent>(
     buf.reserve(STREAM_READ_BYTES);
     let (len, cap) = (buf.len(), buf.capacity());
     let owned = std::mem::take(buf);
-    match monoio::time::timeout(repl_timeout(), stream.read(owned.slice_mut(len..cap))).await {
-        Ok((res, slice)) => {
+    match within_repl_timeout(stream.read(owned.slice_mut(len..cap))).await {
+        Some((res, slice)) => {
             *buf = slice.into_inner();
             res
         }
-        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+        None => Err(std::io::ErrorKind::TimedOut.into()),
     }
 }
 
@@ -983,9 +1008,16 @@ async fn read_from_master<R: monoio::io::AsyncReadRent>(
     stream: &mut R,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<usize> {
-    read_within(stream, buf, repl_timeout()).await
+    match within_repl_timeout(stream.read(std::mem::take(buf))).await {
+        Some((res, returned)) => {
+            *buf = returned;
+            res
+        }
+        None => Err(std::io::ErrorKind::TimedOut.into()),
+    }
 }
 
+#[cfg(test)]
 async fn read_within<R: monoio::io::AsyncReadRent>(
     stream: &mut R,
     buf: &mut Vec<u8>,
