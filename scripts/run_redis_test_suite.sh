@@ -166,7 +166,7 @@ for suite in "${TARGET_SUITES[@]}"; do
             unit/hyperloglog | unit/protocol | unit/introspection-2 | unit/info | unit/dump | unit/type/set | \
             unit/type/list-2 | unit/type/list-3 | unit/keyspace | unit/type/incr | unit/type/increx | \
             unit/bitops | unit/bitfield | unit/quit | unit/geo | unit/limits | unit/latency-monitor | \
-            unit/lazyfree | unit/info-command | unit/querybuf | unit/pubsub | unit/pubsubshard | unit/tracking) via_wrapper=1 ;;
+            unit/lazyfree | unit/info-command | unit/querybuf | unit/pubsub | unit/pubsubshard | unit/tracking | unit/slowlog | unit/pause) via_wrapper=1 ;;
         *) via_wrapper=0 ;;
     esac
     if [ "$via_wrapper" = 1 ]; then
