@@ -3858,6 +3858,92 @@ fn test_cluster_moved_points_at_the_peers_shard_port_e2e() {
     let _ = std::fs::remove_dir_all(&db);
 }
 
+/// A client blocked on a key whose slot is resharded to another node gets
+/// -MOVED to it, as in Redis, rather than waiting forever for pushes that
+/// now go to the other node (Redis' unit/cluster/cli, "Verify command got
+/// unblocked after resharding").
+#[test]
+fn test_cluster_blocked_client_is_redirected_when_its_slot_moves_e2e() {
+    let (a, b) = (18341u16, 18347u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_unblk_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "2",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (da, db) = (mk_dir(a), mk_dir(b));
+    let _na = spawn(a, &da);
+    let _nb = spawn(b, &db);
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let b_id = bulk(cmd(b, &["CLUSTER", "MYID"]));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(a, &["CLUSTER", "NODES"]).contains(&b_id) {
+        assert!(std::time::Instant::now() < deadline, "a never learned b");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // A key of shard 0's half, served on a's own port.
+    let k = (0..1000)
+        .map(|i| format!("unblk{i}"))
+        .find(|k| rudis::router::key_slot(k.as_bytes()) < 8192)
+        .unwrap();
+    let slot = rudis::router::key_slot(k.as_bytes());
+    let mut blocked = connect_ready(a);
+    blocked
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    blocked
+        .write_all(format!("*3\r\n$5\r\nBRPOP\r\n${}\r\n{}\r\n$1\r\n0\r\n", k.len(), k).as_bytes())
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !cmd(a, &["INFO", "clients"]).contains("blocked_clients:1\r\n") {
+        assert!(std::time::Instant::now() < deadline, "never blocked");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // The slot moves to b: the blocked client is redirected there.
+    assert_eq!(
+        cmd(a, &["CLUSTER", "SETSLOT", &slot.to_string(), "NODE", &b_id]),
+        "+OK\r\n"
+    );
+    let mut buf = [0u8; 256];
+    let n = blocked
+        .read(&mut buf)
+        .expect("the blocked client got no reply");
+    let reply = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        reply.starts_with(&format!("-MOVED {slot} 127.0.0.1:")),
+        "{reply:?}"
+    );
+    assert!(cmd(a, &["INFO", "clients"]).contains("blocked_clients:0\r\n"));
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}
+
 /// Two nodes on one port at different addresses (other loopback addresses
 /// stand in for other hosts): CLUSTER MEET of the peer must not be taken
 /// for a MEET of ourselves, as when the port alone identified a node.

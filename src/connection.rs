@@ -11824,6 +11824,11 @@ async fn handle_bzpop(
         )) => {
             out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
         }
+        Some(crate::block::BlockedZSetResult::Unblocked(
+            crate::block::ClientUnblockType::Moved(slot),
+        )) => {
+            blocked_moved_reply(router, slot, out);
+        }
         _ => {
             write_resp_null_array(out);
         }
@@ -12584,6 +12589,31 @@ pub fn blocked_stream_client_denied(port: u16, cid: u64, cmd: &Command) -> Optio
 
 /// The reply of a blocked command its user lost key access for.
 pub const BLOCKED_NOPERM_REPLY: &[u8] = b"-NOPERM No permissions to access a key\r\n";
+
+/// The reply to a client unblocked because its key's `slot` moved to
+/// another node (`ClientUnblockType::Moved`): -MOVED to the slot's owner
+/// as this node knows it, as Redis answers when it reprocesses the
+/// command, or -CLUSTERDOWN if no node serves it.
+pub(crate) fn blocked_moved_reply(router: &Router, slot: u16, out: &mut Vec<u8>) {
+    let hub = crate::cluster::get_cluster_hub(router.base_port);
+    let nodes = hub.nodes.read();
+    match nodes.values().find(|n| {
+        n.is_master()
+            && n.fail != crate::cluster::FailState::Fail
+            && n.slots.iter().any(|&(s, e)| slot >= s && slot <= e)
+    }) {
+        Some(peer) => out.extend_from_slice(
+            format!(
+                "-MOVED {} {}:{}\r\n",
+                slot,
+                peer.ip,
+                peer.port_for_slot(slot)
+            )
+            .as_bytes(),
+        ),
+        None => out.extend_from_slice(b"-CLUSTERDOWN Hash slot not served\r\n"),
+    }
+}
 
 /// `appendfsync always`: if any AOF was appended to since this connection
 /// last checked, makes every shard's AOF durable before its replies go out.
@@ -16396,6 +16426,9 @@ async fn execute_command_inner(
                                         crate::block::ClientUnblockType::Error => {
                                             out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
                                         }
+                                        crate::block::ClientUnblockType::Moved(slot) => {
+                                            blocked_moved_reply(router, slot, out)
+                                        }
                                         crate::block::ClientUnblockType::WrongType => {
                                             out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
                                         }
@@ -16452,6 +16485,9 @@ async fn execute_command_inner(
                                     }
                                     crate::block::ClientUnblockType::Error => {
                                         out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
+                                    }
+                                    crate::block::ClientUnblockType::Moved(slot) => {
+                                        blocked_moved_reply(router, slot, out)
                                     }
                                     crate::block::ClientUnblockType::WrongType => {
                                         out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
@@ -16581,6 +16617,9 @@ async fn execute_command_inner(
                                         }
                                         crate::block::ClientUnblockType::Error => {
                                             out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
+                                        }
+                                        crate::block::ClientUnblockType::Moved(slot) => {
+                                            blocked_moved_reply(router, slot, out)
                                         }
                                         crate::block::ClientUnblockType::WrongType => {
                                             out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
@@ -17106,6 +17145,11 @@ async fn execute_command_inner(
                 )) => {
                     out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
                 }
+                Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::Moved(slot),
+                )) => {
+                    blocked_moved_reply(router, slot, out);
+                }
                 _ => {
                     write_resp_null_array(out);
                 }
@@ -17254,6 +17298,11 @@ async fn execute_command_inner(
                     crate::block::ClientUnblockType::Error,
                 )) => {
                     out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
+                }
+                Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::Moved(slot),
+                )) => {
+                    blocked_moved_reply(router, slot, out);
                 }
                 _ => {
                     write_resp_null_array(out);
@@ -17697,6 +17746,11 @@ async fn execute_command_inner(
                 )) => {
                     out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
                 }
+                Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::Moved(slot),
+                )) => {
+                    blocked_moved_reply(router, slot, out);
+                }
                 _ => {
                     write_resp_null(out);
                 }
@@ -17926,6 +17980,11 @@ async fn execute_command_inner(
                     crate::block::ClientUnblockType::Error,
                 )) => {
                     out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
+                }
+                Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::Moved(slot),
+                )) => {
+                    blocked_moved_reply(router, slot, out);
                 }
                 _ => {
                     write_resp_null_array(out);
@@ -18190,6 +18249,11 @@ async fn execute_command_inner(
                 )) => {
                     out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
                 }
+                Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::Moved(slot),
+                )) => {
+                    blocked_moved_reply(router, slot, out);
+                }
                 _ => {
                     write_resp_null_array(out);
                 }
@@ -18436,6 +18500,11 @@ async fn execute_command_inner(
                     crate::block::ClientUnblockType::Error,
                 )) => {
                     out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
+                }
+                Some(crate::block::BlockedZSetResult::Unblocked(
+                    crate::block::ClientUnblockType::Moved(slot),
+                )) => {
+                    blocked_moved_reply(router, slot, out);
                 }
                 _ => {
                     write_resp_null_array(out);
@@ -31823,6 +31892,12 @@ async fn blmove_across_shards(
                 crate::block::ClientUnblockType::Error,
             )) => {
                 out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
+                return false;
+            }
+            Some(crate::block::BlockedListResult::Unblocked(
+                crate::block::ClientUnblockType::Moved(slot),
+            )) => {
+                blocked_moved_reply(router, slot, out);
                 return false;
             }
             _ => {

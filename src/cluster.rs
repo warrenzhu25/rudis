@@ -569,6 +569,7 @@ impl ClusterHub {
             remove_slots(&mut mine, &lost);
             mine.is_empty()
         };
+        self.unblock_lost_slots(&lost);
         crate::log_warning!(
             "Cluster: {} slots now belong to {} (config epoch {:?} > ours {})",
             lost.len(),
@@ -873,17 +874,19 @@ impl ClusterHub {
     /// now serves `slot`, and that no other node does.
     pub fn assign_slot(&self, slot: u16, owner_id: &str) {
         let me = owner_id == self.my_id();
-        {
+        let lost = {
             let mut my_slots = self.my_slots.write();
+            let had = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
             if me {
-                if !my_slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
+                if !had {
                     my_slots.push((slot, slot));
                     compact_slots(&mut my_slots);
                 }
             } else {
                 remove_slots(&mut my_slots, &[slot]);
             }
-        }
+            had && !me
+        };
         {
             let mut nodes = self.nodes.write();
             for (id, node) in nodes.iter_mut() {
@@ -897,7 +900,37 @@ impl ClusterHub {
                 }
             }
         }
+        // After the new owner is recorded: the -MOVED names it.
+        if lost {
+            self.unblock_lost_slots(&[slot]);
+        }
         let _ = self.save_config();
+    }
+
+    /// Clients blocked on keys of `lost` slots, which this node no longer
+    /// serves, get -MOVED instead of waiting for pushes that now go to
+    /// another node (see [`crate::block::unblock_lost_slots`]). Callers
+    /// hold no cluster lock.
+    fn unblock_lost_slots(&self, lost: &[u16]) {
+        if lost.is_empty() || !crate::block::has_blocked_waiters(self.port) {
+            return;
+        }
+        let mut set = vec![false; 16384];
+        for &s in lost {
+            set[s as usize] = true;
+        }
+        let ports = if self.cluster_enabled.load(Ordering::Relaxed) {
+            self.num_shards.load(Ordering::Relaxed).max(1)
+        } else {
+            1
+        };
+        let n = crate::block::unblock_lost_slots(self.port, ports, &|s| set[s as usize]);
+        if n > 0 {
+            crate::log_notice!(
+                "Cluster: unblocked {} client(s) blocked on slots now served elsewhere",
+                n
+            );
+        }
     }
 
     /// The `PING` this node sends on the cluster bus.
@@ -1836,6 +1869,7 @@ impl ClusterHub {
             self.slots_default.store(false, Ordering::Release);
             remove_slots(&mut my_slots, slots);
         }
+        self.unblock_lost_slots(slots);
         let _ = self.save_config();
         Ok(())
     }
@@ -1859,18 +1893,19 @@ impl ClusterHub {
     }
 
     pub fn cluster_delslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
+        let mut to_remove = Vec::new();
+        for &(start, end) in ranges {
+            for s in start..=end {
+                to_remove.push(s);
+            }
+        }
         {
             let mut my_slots = self.my_slots.write();
             // The rest of the default slots are now assigned to us.
             self.slots_default.store(false, Ordering::Release);
-            let mut to_remove = Vec::new();
-            for &(start, end) in ranges {
-                for s in start..=end {
-                    to_remove.push(s);
-                }
-            }
             remove_slots(&mut my_slots, &to_remove);
         }
+        self.unblock_lost_slots(&to_remove);
         let _ = self.save_config();
         Ok(())
     }

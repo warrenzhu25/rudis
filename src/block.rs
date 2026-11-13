@@ -19,6 +19,10 @@ pub enum ClientUnblockType {
     /// fails with NOPERM, as Redis rejects it when it reprocesses the
     /// command, and nothing is popped for it.
     NoPerm,
+    /// The key's slot (this one) moved to another cluster node, by a
+    /// reshard or a failover: it fails with -MOVED, as Redis answers when
+    /// it reprocesses the command, and nothing is popped for it.
+    Moved(u16),
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +133,21 @@ static TOTAL_BLOCKED_WAITERS: std::sync::atomic::AtomicUsize =
 #[inline(always)]
 pub fn has_blocked_waiters(_port: u16) -> bool {
     TOTAL_BLOCKED_WAITERS.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// Unblocks, with -MOVED, every client blocked on a key of a slot `lost`
+/// says this node no longer serves, on each of the node's shard ports
+/// (`base_port` and the `num_ports - 1` after it). Without this, a client
+/// blocked with no timeout on a slot resharded away waited forever: the
+/// key's pushes now go to another node. Returns how many were unblocked.
+pub fn unblock_lost_slots(base_port: u16, num_ports: usize, lost: &dyn Fn(u16) -> bool) -> usize {
+    let hubs: Vec<_> = {
+        let map = PORT_BLOCK_HUBS.lock();
+        (0..num_ports.max(1))
+            .filter_map(|i| map.get(&base_port.wrapping_add(i as u16)).cloned())
+            .collect()
+    };
+    hubs.iter().map(|h| h.lock().unblock_slots(lost)).sum()
 }
 
 pub fn get_block_hub_for_port(port: u16) -> Arc<Mutex<BlockHub>> {
@@ -339,6 +358,32 @@ impl BlockHub {
         ids.dedup();
         ids.into_iter()
             .filter(|&id| self.unblock_client(id, ClientUnblockType::Error))
+            .count()
+    }
+
+    /// Unblocks, with -MOVED, the clients blocked on a key of a slot in
+    /// `lost` (see [`unblock_lost_slots`]).
+    pub fn unblock_slots(&mut self, lost: &dyn Fn(u16) -> bool) -> usize {
+        let mut ids: Vec<(u64, u16)> = Vec::new();
+        let mut collect = |key: &Bytes, clients: &mut dyn Iterator<Item = u64>| {
+            let slot = crate::router::key_slot(key);
+            if lost(slot) {
+                ids.extend(clients.map(|id| (id, slot)));
+            }
+        };
+        for ((_, key), ws) in &self.list_waiters {
+            collect(key, &mut ws.iter().map(|w| w.client_id));
+        }
+        for ((_, key), ws) in &self.zset_waiters {
+            collect(key, &mut ws.iter().map(|w| w.client_id));
+        }
+        for ((_, key), ws) in &self.stream_waiters {
+            collect(key, &mut ws.iter().map(|w| w.client_id));
+        }
+        ids.sort_unstable();
+        ids.dedup_by_key(|(id, _)| *id);
+        ids.into_iter()
+            .filter(|&(id, slot)| self.unblock_client(id, ClientUnblockType::Moved(slot)))
             .count()
     }
 

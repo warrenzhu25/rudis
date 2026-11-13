@@ -556,6 +556,7 @@ A blocked client can end without receiving data in several ways:
 | CLIENT KILL | The victim's socket is shut down and its waiters are removed. | The connection closes; the victim's wait loop notices within one 20 ms round. |
 | Client closes the connection | The wait loop's socket check notices; the connection's cleanup unregisters the client (when anyone is blocked). | — |
 | REPLICAOF host port | Every list and sorted-set waiter, and every XREADGROUP waiter, is released with an error. Served on a replica they would change its data behind its master's back. Plain XREAD keeps waiting, as in Redis. | UNBLOCKED |
+| A cluster slot leaves this node (`CLUSTER SETSLOT ... NODE`, a reshard, `DELSLOTS`, a newer claim after a failover) | Every waiter on a key of that slot, on each of the node's shard ports, is released with `Moved(slot)` (`unblock_lost_slots`), after the new owner is recorded. Before, a client blocked with no timeout waited forever for pushes that go to the other node. | `-MOVED <slot> <owner>`, or `-CLUSTERDOWN Hash slot not served` if no node serves it |
 | A move's destination is not a list | Serving sends a "wrong type" release (§5.1). | WRONGTYPE |
 
 The hub uses a blocking send for list and sorted-set channels and a non-blocking send for stream
@@ -761,6 +762,7 @@ and `publish_waiters(count)` applies `fetch_add`/`fetch_sub` of the difference f
 | `unregister_blocked_client(id)` | Alias of `remove_waiters_for_client`; used by `BlockedClientGuard` and connection cleanup. |
 | `unblock_client(id, type)` | Send `Unblocked(type)` through whichever senders the client has (`send` for list/zset, `try_send` for stream), remove its waiters, return whether it was blocked. |
 | `unblock_writers()` | Release with `Error` all list and zset waiters plus `XREADGROUP` stream waiters. Called on `REPLICAOF host port`. |
+| `unblock_slots(lost)` / `unblock_lost_slots(base, ports, lost)` | Release with `Moved(slot)` every waiter on a key of a slot `lost` says moved away; the second does it for each shard port's hub. Called by the cluster hub when this node loses slots. |
 | `is_blocked(id)` | Membership in any `blocked_*` map — the CLIENT LIST / CLIENT INFO `b` flag. |
 | `blocked_clients_count()` | Sum of the three `blocked_*` map sizes — INFO `blocked_clients` (plus clients held by CLIENT PAUSE and `replication::WAIT_BLOCKED_CLIENTS`). |
 | `blocking_keys_count()` | Distinct `(db, key)` pairs with at least one waiter — INFO `total_blocking_keys`. |
