@@ -948,12 +948,11 @@ fn test_cluster_mode_moved_redirection_and_per_shard_ports_e2e() {
     let resp = send_and_read(&mut client1, format!("GET {}\r\n", k1).as_bytes());
     assert_eq!(resp, "$4\r\nval1\r\n");
 
-    // 7. Verify CLUSTER NODES shows all 4 shards
+    // 7. CLUSTER NODES shows the node alone, without the default slots it
+    // starts with (as a fresh Redis node, for redis-cli --cluster create)
     let nodes_resp = send_and_read(&mut client0, b"CLUSTER NODES\r\n");
     assert!(nodes_resp.contains("myself,master"));
-    assert!(nodes_resp.contains(&format!("127.0.0.1:{}", base_port + 1)));
-    assert!(nodes_resp.contains(&format!("127.0.0.1:{}", base_port + 2)));
-    assert!(nodes_resp.contains(&format!("127.0.0.1:{}", base_port + 3)));
+    assert!(!nodes_resp.contains(&format!("127.0.0.1:{}", base_port + 1)));
 
     // 8. Verify CLUSTER SHARDS shows 4 shards with dedicated ports
     let shards_resp = send_and_read(&mut client0, b"CLUSTER SHARDS\r\n");
@@ -1890,7 +1889,7 @@ fn test_cluster_bumpepoch_and_set_config_epoch_e2e() {
     // 3. Reject setting when epoch is already non-zero
     let resp = send_and_read(&mut client, b"CLUSTER SET-CONFIG-EPOCH 6\r\n");
     assert!(
-        resp.starts_with("-ERR Node config epoch is already set"),
+        resp.starts_with("-ERR Node config epoch is already non-zero"),
         "Expected already set error, got: {}",
         resp
     );
@@ -2405,6 +2404,12 @@ fn test_cluster_replicate_copies_the_masters_data_e2e() {
     let mut m1 = conn(mport + 1);
     let mut r0 = conn(rport);
     let master_id = bulk(resp_cmd(&mut m0, &["CLUSTER", "MYID"]));
+    // The master serves every slot (a fresh node drops its default slots
+    // when it meets another).
+    assert_eq!(
+        resp_cmd(&mut m0, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
 
     // Writes each key on the port of the master shard that owns it.
     let mut write = |from: usize, to: usize| {
@@ -2743,9 +2748,10 @@ fn test_cluster_master_failure_promotes_its_replica_e2e() {
     }
 }
 
-/// A fresh cluster-mode node shows its shards as pseudo nodes, but must
-/// not persist them: after a restart they came back as peers that never
-/// answer (and claimed slots), visible once the node meets a real peer.
+/// A fresh cluster-mode node's shards must never come back as peers after
+/// a restart (older versions showed them as pseudo nodes and saved them:
+/// peers that never answer, and claimed slots), and its default slots,
+/// kept across the restart, go once it meets a real peer.
 #[test]
 fn test_cluster_restart_does_not_resurrect_pseudo_shard_nodes_e2e() {
     let (port, peer) = (18117u16, 18123u16);
@@ -2779,7 +2785,9 @@ fn test_cluster_restart_does_not_resurrect_pseudo_shard_nodes_e2e() {
     let (dir, peer_dir) = (mk_dir(port), mk_dir(peer));
     let pseudo = format!("{:040x}", 2);
     let first = spawn(port, &dir);
-    assert!(cmd(port, &["CLUSTER", "NODES"]).contains(&pseudo));
+    // Clients see the shards in CLUSTER SLOTS, not as nodes.
+    assert!(!cmd(port, &["CLUSTER", "NODES"]).contains(&pseudo));
+    assert!(cmd(port, &["CLUSTER", "SLOTS"]).contains(&format!(":{}\r\n", port + 1)));
     assert_eq!(cmd(port, &["CLUSTER", "SAVECONFIG"]), "+OK\r\n");
     drop(first);
     let _node = spawn(port, &dir);
@@ -2799,7 +2807,7 @@ fn test_cluster_restart_does_not_resurrect_pseudo_shard_nodes_e2e() {
     );
     assert!(nodes.contains(&format!("127.0.0.1:{peer}@")), "{nodes}");
     let mine = nodes.lines().find(|l| l.contains("myself")).unwrap();
-    assert!(mine.ends_with(" 0-16383"), "{mine}");
+    assert!(mine.ends_with(" connected"), "{mine}");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&peer_dir);
 }
@@ -3384,6 +3392,12 @@ fn test_cluster_replica_serves_readonly_reads_e2e() {
         .nth(1)
         .unwrap()
         .to_string();
+    // The master serves every slot (a fresh node drops its default slots
+    // when it meets another).
+    assert_eq!(
+        cmd(mport, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
     assert_eq!(
         cmd(rport, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
         "+OK\r\n"
@@ -3572,6 +3586,12 @@ fn test_cluster_manual_failover_loses_no_acknowledged_write_e2e() {
         .nth(1)
         .unwrap()
         .to_string();
+    // The master serves every slot (a fresh node drops its default slots
+    // when it meets another).
+    assert_eq!(
+        cmd(mport, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
     assert_eq!(
         cmd(rport, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
         "+OK\r\n"
@@ -3794,6 +3814,10 @@ fn test_cluster_moved_points_at_the_peers_shard_port_e2e() {
     let _na = spawn(a, &da);
     let _nb = spawn(b, &db);
     let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
     assert_eq!(
         cmd(b, &["CLUSTER", "DELSLOTSRANGE", "0", "16383"]),
         "+OK\r\n"

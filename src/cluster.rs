@@ -191,6 +191,13 @@ pub struct ClusterHub {
     pub has_nodes: AtomicBool,
     pub nodes: RwLock<HashMap<String, ClusterNodeInfo>>,
     pub my_slots: RwLock<Vec<(u16, u16)>>,
+    /// `my_slots` still holds the slots a node starts with: all 16384, so
+    /// that a lone cluster-mode node serves every key without any setup.
+    /// Nobody assigned them: they are never announced to peers, and the
+    /// node gives them up when it first hears from another node (see
+    /// [`ClusterHub::leave_default_slots`]), as a fresh Redis node owns no
+    /// slots. Any explicit slot assignment ends this state.
+    pub slots_default: AtomicBool,
     pub pfail_reports: RwLock<HashMap<String, HashSet<String>>>,
     pub bus_running: AtomicBool,
     pub cancel_bus: RwLock<Option<flume::Sender<()>>>,
@@ -320,6 +327,7 @@ impl ClusterHub {
             has_nodes: AtomicBool::new(false),
             nodes: RwLock::new(HashMap::new()),
             my_slots: RwLock::new(vec![(0, 16383)]),
+            slots_default: AtomicBool::new(true),
             pfail_reports: RwLock::new(HashMap::new()),
             bus_running: AtomicBool::new(false),
             cancel_bus: RwLock::new(None),
@@ -607,9 +615,15 @@ impl ClusterHub {
         }
         let mut content = self.render_nodes(false);
         content.push_str(&format!(
-            "vars currentEpoch {} lastVoteEpoch {}\n",
+            "vars currentEpoch {} lastVoteEpoch {}{}\n",
             self.current_epoch.load(Ordering::Relaxed),
-            self.last_vote_epoch.load(Ordering::Relaxed)
+            self.last_vote_epoch.load(Ordering::Relaxed),
+            // Redis ignores vars it doesn't know.
+            if self.has_default_slots() {
+                " rudisDefaultSlots 1"
+            } else {
+                ""
+            }
         ));
         let tmp_path = path.with_extension(format!("tmp.{}", self.port));
         std::fs::write(&tmp_path, content.as_bytes())
@@ -629,6 +643,9 @@ impl ClusterHub {
         let mut parsed_my_slots = Vec::new();
         let mut parsed_slot_states = HashMap::new();
         let mut saw_myself = false;
+        // Files without the var (older versions, or Redis) hold only
+        // assigned slots.
+        let mut default_slots = false;
 
         for raw_line in content.lines() {
             let line = raw_line.trim();
@@ -653,6 +670,10 @@ impl ClusterHub {
                             if let Ok(v) = parts[i + 1].parse::<u64>() {
                                 self.last_vote_epoch.store(v, Ordering::SeqCst);
                             }
+                            i += 2;
+                        }
+                        "rudisDefaultSlots" => {
+                            default_slots = parts[i + 1] == "1";
                             i += 2;
                         }
                         _ => i += 1,
@@ -753,6 +774,8 @@ impl ClusterHub {
         if saw_myself {
             *self.my_slots.write() = parsed_my_slots;
             *self.slot_states.write() = parsed_slot_states;
+            self.slots_default
+                .store(default_slots && parsed_peers.is_empty(), Ordering::Release);
         }
         if !parsed_peers.is_empty() {
             *self.nodes.write() = parsed_peers;
@@ -782,32 +805,63 @@ impl ClusterHub {
         next
     }
 
-    /// Sets the node configuration epoch if it is currently 0 and no slots are assigned.
+    /// Whether `my_slots` holds only the default slots (see
+    /// [`ClusterHub::slots_default`]).
+    pub fn has_default_slots(&self) -> bool {
+        self.slots_default.load(Ordering::Acquire)
+    }
+
+    /// The slots this node announces to peers: none while it holds only
+    /// its default slots, which nobody assigned.
+    fn announced_slots(&self) -> Vec<(u16, u16)> {
+        let my_slots = self.my_slots.read();
+        if self.has_default_slots() {
+            Vec::new()
+        } else {
+            my_slots.clone()
+        }
+    }
+
+    /// An explicit slot assignment: drops the default slots, if still
+    /// held, so the node's slots are then exactly the assigned ones.
+    fn end_default_slots(&self, my_slots: &mut Vec<(u16, u16)>) {
+        if self.slots_default.swap(false, Ordering::AcqRel) {
+            my_slots.clear();
+        }
+    }
+
+    /// The node heard from another node (a MEET either way, a PING): it
+    /// gives up its default slots and serves only what it is assigned, as
+    /// a fresh Redis node does. Before this, a new node that joined a
+    /// cluster went on serving every slot itself (reads of keys it didn't
+    /// own came back empty, writes to them landed on it). Takes neither
+    /// lock if the slots were assigned already; callers hold no cluster
+    /// lock.
+    fn leave_default_slots(&self) {
+        if !self.has_default_slots() {
+            return;
+        }
+        {
+            let mut my_slots = self.my_slots.write();
+            self.end_default_slots(&mut my_slots);
+        }
+        crate::log_notice!("Cluster: met another node; serving only the slots assigned to me");
+        let _ = self.save_config();
+    }
+
+    /// Sets the node configuration epoch if it is currently 0 and the node
+    /// knows no other node.
     pub fn set_config_epoch(&self, epoch: u64) -> Result<(), String> {
         if epoch == 0 {
             return Err("ERR Invalid config epoch specified".to_string());
         }
-        let current_cfg = self.config_epoch.load(Ordering::SeqCst);
-        if current_cfg != 0 {
-            return Err(format!(
-                "ERR Node config epoch is already set to {}",
-                current_cfg
-            ));
+        // As in Redis: only before the node joins a cluster, whatever its
+        // slots (`redis-cli --cluster create` assigns the slots first).
+        if !self.nodes.read().is_empty() {
+            return Err("ERR The user can assign a config epoch only when the node does not know any other node.".to_string());
         }
-        let slots = self.my_slots.read();
-        let has_explicit_slots = !slots.is_empty() && !(slots.len() == 1 && slots[0] == (0, 16383));
-        if has_explicit_slots {
-            return Err(
-                "ERR Node has slots assigned to it. Setting config epoch is not allowed."
-                    .to_string(),
-            );
-        }
-        drop(slots);
-        {
-            let mut my_slots = self.my_slots.write();
-            if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
-                my_slots.clear();
-            }
+        if self.config_epoch.load(Ordering::SeqCst) != 0 {
+            return Err("ERR Node config epoch is already non-zero".to_string());
         }
         self.config_epoch.store(epoch, Ordering::SeqCst);
         self.current_epoch.fetch_max(epoch, Ordering::SeqCst);
@@ -853,7 +907,7 @@ impl ClusterHub {
             self.my_id(),
             self.config_epoch.load(Ordering::Relaxed),
             self.role.read(),
-            slots_repr(&self.my_slots.read()),
+            slots_repr(&self.announced_slots()),
             self.announce_tokens(),
             gossip
         )
@@ -943,11 +997,12 @@ impl ClusterHub {
         self.render_nodes(true)
     }
 
-    /// CLUSTER NODES. With `single_node_view`, a cluster-mode node that
-    /// knows no peers shows each of its shards as a node of its own (each
-    /// listens on its own port), as clients see it. That view is never
-    /// saved to nodes.conf: read back, the pseudo nodes became peers that
-    /// never answer, and their slot claims outlived any real owner's.
+    /// CLUSTER NODES. With `single_node_view`, as clients see it: without
+    /// the default slots (see [`ClusterHub::slots_default`]), which are
+    /// saved to nodes.conf. (Neither shows a lone node's shards as nodes of
+    /// their own any more: read back from nodes.conf, such pseudo nodes
+    /// became peers that never answer, and their slot claims outlived any
+    /// real owner's.)
     fn render_nodes(&self, single_node_view: bool) -> String {
         let mut out = String::new();
 
@@ -956,18 +1011,14 @@ impl ClusterHub {
         let role = self.role.read().clone();
         let master_id = self.master_id.read().clone();
         let cfg_epoch = self.config_epoch.load(Ordering::Relaxed);
-        let is_cluster = self.cluster_enabled.load(Ordering::Relaxed);
-        let num_shards = self.num_shards.load(Ordering::Relaxed).max(1);
         let my_slots_snapshot = self.my_slots.read().clone();
-        let has_default_all_slots =
-            my_slots_snapshot.len() == 1 && my_slots_snapshot[0] == (0, 16383);
-        let my_slots_str = if single_node_view
-            && is_cluster
-            && self.nodes.read().is_empty()
-            && has_default_all_slots
-        {
-            let end_slot = 16384 / num_shards - 1;
-            format!(" 0-{}", end_slot)
+        // Clients see only assigned slots, as with a fresh Redis node:
+        // `redis-cli --cluster create` reads them back as the node's own
+        // and would hand them out again. (CLUSTER SLOTS and SHARDS still
+        // show a lone node's default slots, for cluster clients pointed at
+        // it.)
+        let my_slots_str = if single_node_view && self.has_default_slots() {
+            String::new()
         } else {
             let mut s_str = String::new();
             for (s, e) in &my_slots_snapshot {
@@ -1014,30 +1065,6 @@ impl ClusterHub {
 
         // 2. Peer entries
         let nodes = self.nodes.read();
-        if single_node_view && is_cluster && nodes.is_empty() {
-            for s in 1..num_shards {
-                let peer_port = my_port + s as u16;
-                let peer_cport = peer_port + 10000;
-                let peer_start = s * 16384 / num_shards;
-                let peer_end = if s == num_shards - 1 {
-                    16383
-                } else {
-                    (s + 1) * 16384 / num_shards - 1
-                };
-                let peer_id = format!("{:040x}", s + 1);
-                out.push_str(&format!(
-                    "{} {}:{}@{} master - 0 0 {} connected {}-{}\n",
-                    peer_id,
-                    my_ip,
-                    peer_port,
-                    peer_cport,
-                    s + 1,
-                    peer_start,
-                    peer_end
-                ));
-            }
-            return out;
-        }
         // Health is judged by the bus tick (`cluster_bus_tick`); this only
         // reports it.
         let mut keys: Vec<String> = nodes.keys().cloned().collect();
@@ -1153,6 +1180,7 @@ impl ClusterHub {
         };
         let temp_id = generate_node_id(port);
 
+        self.leave_default_slots();
         if self.add_meet_placeholder(&temp_id, ip, port, cport, now) {
             self.has_nodes.store(true, Ordering::Release);
             HAS_ACTIVE_CLUSTER.store(true, Ordering::Release);
@@ -1173,7 +1201,7 @@ impl ClusterHub {
             let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
 
             let my_epoch = self.config_epoch.load(Ordering::Relaxed);
-            let my_slots = self.my_slots.read().clone();
+            let my_slots = self.announced_slots();
             let mut slots_repr = String::new();
             for (s, e) in my_slots {
                 slots_repr.push_str(&format!("{}-{},", s, e));
@@ -1272,14 +1300,21 @@ impl ClusterHub {
             }
             (master.ip.clone(), master.port)
         };
-        if *self.role.read() == "master" && !self.my_slots.read().is_empty() {
+        if *self.role.read() == "master"
+            && !self.my_slots.read().is_empty()
+            && !self.has_default_slots()
+        {
             return Err(
                 "To set a master the node must be empty and without assigned slots.".to_string(),
             );
         }
         *self.role.write() = "slave".to_string();
         *self.master_id.write() = master_id.to_string();
-        self.my_slots.write().clear();
+        {
+            let mut my_slots = self.my_slots.write();
+            self.end_default_slots(&mut my_slots);
+            my_slots.clear();
+        }
         let _ = self.save_config();
         Ok(addr)
     }
@@ -1354,8 +1389,9 @@ impl ClusterHub {
 
     pub fn cluster_slots(&self, out: &mut Vec<u8>, num_shards: usize) {
         let nodes = self.nodes.read();
-        if nodes.is_empty() {
-            // Standalone node fallback: report slots divided across local num_shards
+        if nodes.is_empty() && self.has_default_slots() {
+            // A lone node with its default slots: report them divided
+            // across the local shards
             let my_ip = self.my_ip();
             out.extend_from_slice(format!("*{}\r\n", num_shards).as_bytes());
             for s in 0..num_shards {
@@ -1734,9 +1770,7 @@ impl ClusterHub {
         }
         {
             let mut my_slots = self.my_slots.write();
-            if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
-                my_slots.clear();
-            }
+            self.end_default_slots(&mut my_slots);
             for &s in slots {
                 my_slots.push((s, s));
             }
@@ -1749,6 +1783,8 @@ impl ClusterHub {
     pub fn cluster_delslots(&self, slots: &[u16]) -> Result<(), String> {
         {
             let mut my_slots = self.my_slots.write();
+            // The rest of the default slots are now assigned to us.
+            self.slots_default.store(false, Ordering::Release);
             remove_slots(&mut my_slots, slots);
         }
         let _ = self.save_config();
@@ -1763,9 +1799,7 @@ impl ClusterHub {
         }
         {
             let mut my_slots = self.my_slots.write();
-            if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
-                my_slots.clear();
-            }
+            self.end_default_slots(&mut my_slots);
             for &(start, end) in ranges {
                 my_slots.push((start, end));
             }
@@ -1778,6 +1812,8 @@ impl ClusterHub {
     pub fn cluster_delslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
         {
             let mut my_slots = self.my_slots.write();
+            // The rest of the default slots are now assigned to us.
+            self.slots_default.store(false, Ordering::Release);
             let mut to_remove = Vec::new();
             for &(start, end) in ranges {
                 for s in start..=end {
@@ -2598,7 +2634,7 @@ fn now_ms() -> u64 {
 fn pong_reply(hub: &ClusterHub) -> String {
     let my_epoch = hub.config_epoch.load(Ordering::Relaxed);
     let role = hub.role.read().clone();
-    let my_slots = hub.my_slots.read().clone();
+    let my_slots = hub.announced_slots();
     let mut slots_repr = String::new();
     for (s, e) in my_slots {
         slots_repr.push_str(&format!("{}-{},", s, e));
@@ -2949,6 +2985,7 @@ fn handle_cluster_bus_line_from(
             };
             let now = now_ms();
             let peer_slots = parts.get(5).map_or_else(Vec::new, |r| parse_slot_ranges(r));
+            hub.leave_default_slots();
 
             {
                 let mut nodes = hub.nodes.write();
@@ -2990,6 +3027,9 @@ fn handle_cluster_bus_line_from(
             }
             let peer_id = parts[1].to_string();
             let now = now_ms();
+            if peer_id != hub.my_id() {
+                hub.leave_default_slots();
+            }
 
             {
                 let mut nodes = hub.nodes.write();
@@ -3402,13 +3442,15 @@ mod tests {
 
     #[test]
     fn test_nodes_conf_holds_no_pseudo_shard_nodes() {
-        // A cluster-mode node with 2 shards and no peers shows each shard
-        // as a node, but saves only itself.
+        // A fresh cluster-mode node with 2 shards shows itself, without
+        // its default slots, and saves only itself, with them.
         let hub = ClusterHub::new(7400);
         hub.cluster_enabled.store(true, Ordering::Relaxed);
         hub.num_shards.store(2, Ordering::Relaxed);
         let pseudo = format!("{:040x}", 2);
-        assert!(hub.cluster_nodes().contains(&pseudo));
+        let nodes = hub.cluster_nodes();
+        assert_eq!(nodes.lines().count(), 1, "{nodes}");
+        assert!(nodes.ends_with(" connected\n"), "{nodes}");
         let path = std::env::temp_dir().join(format!("nodes-pseudo-{}.conf", std::process::id()));
         hub.set_config_file(path.clone());
         hub.save_config().unwrap();
@@ -3745,6 +3787,7 @@ mod tests {
     #[test]
     fn test_mfstart_pauses_a_masters_writers_until_it_steps_down() {
         let hub = ClusterHub::new(7960);
+        hub.cluster_addslotsrange(&[(0, 16383)]).unwrap();
         let reply = handle_cluster_bus_line(&format!("MFSTART {}", "r".repeat(40)), &hub).unwrap();
         assert!(reply.starts_with("+MFOFFSET "), "{reply}");
         assert!(crate::connection::is_client_paused().is_some());
@@ -3930,8 +3973,6 @@ mod tests {
             nodes.contains(" 10.1.1.1:27000@37000 myself,master"),
             "{nodes}"
         );
-        // The single-node view's shard 1, at the announced port + 1.
-        assert!(nodes.contains(" 10.1.1.1:27001@37001 master"), "{nodes}");
         let mut slots = Vec::new();
         hub.cluster_slots(&mut slots, 2);
         let slots = String::from_utf8(slots).unwrap();
@@ -4038,6 +4079,68 @@ mod tests {
     }
 
     #[test]
+    fn test_default_slots_are_never_announced_and_dropped_on_meeting_a_node() {
+        // A fresh node serves every slot while alone, but announces none.
+        let hub = ClusterHub::new(7980);
+        assert!(hub.has_default_slots());
+        assert!(hub.owns_slot(0) && hub.owns_slot(16383));
+        assert!(
+            !pong_reply(&hub).contains("0-16383"),
+            "{}",
+            pong_reply(&hub)
+        );
+        assert!(!hub.ping_frame("").contains("0-16383"));
+        // Met by a node of a cluster: it serves only assigned slots.
+        let peer = "p".repeat(40);
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7981 {peer} 1 0-8191"), &hub);
+        assert!(!hub.has_default_slots());
+        assert!(hub.my_slots.read().is_empty());
+        assert!(!hub.owns_slot(0) && !hub.owns_slot(16383));
+        assert!(hub.nodes.read()[&peer].slots == vec![(0, 8191)]);
+
+        // A PING from a node it doesn't know does the same.
+        let hub = ClusterHub::new(7982);
+        handle_cluster_bus_line(&format!("PING {peer} 1 master 0-8191 GOSSIP "), &hub);
+        assert!(hub.my_slots.read().is_empty());
+
+        // Slots assigned to it, all of them included, stay when it meets nodes.
+        let hub = ClusterHub::new(7984);
+        hub.cluster_addslotsrange(&[(0, 16383)]).unwrap();
+        assert!(!hub.has_default_slots());
+        assert!(pong_reply(&hub).contains(" 0-16383 "));
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7985 {peer} 0"), &hub);
+        assert_eq!(*hub.my_slots.read(), vec![(0, 16383)]);
+
+        // ADDSLOTS replaces the default slots; DELSLOTS keeps the rest.
+        let hub = ClusterHub::new(7986);
+        hub.cluster_addslots(&[5]).unwrap();
+        assert_eq!(*hub.my_slots.read(), vec![(5, 5)]);
+        let hub = ClusterHub::new(7987);
+        hub.cluster_delslotsrange(&[(0, 99)]).unwrap();
+        assert_eq!(*hub.my_slots.read(), vec![(100, 16383)]);
+        assert!(!hub.has_default_slots());
+    }
+
+    #[test]
+    fn test_default_slots_survive_a_restart_but_assigned_ones_stay_assigned() {
+        let path = std::env::temp_dir().join(format!("nodes-default-{}.conf", std::process::id()));
+        let hub = ClusterHub::new(7990);
+        hub.set_config_file(path.clone());
+        hub.save_config().unwrap();
+        let restarted = ClusterHub::new(7990);
+        assert!(restarted.load_config(&path).unwrap());
+        assert!(restarted.has_default_slots());
+        assert_eq!(*restarted.my_slots.read(), vec![(0, 16383)]);
+
+        hub.cluster_addslotsrange(&[(0, 16383)]).unwrap();
+        let restarted = ClusterHub::new(7990);
+        assert!(restarted.load_config(&path).unwrap());
+        assert!(!restarted.has_default_slots());
+        assert_eq!(*restarted.my_slots.read(), vec![(0, 16383)]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_cluster_replicate_returns_the_master_to_sync_from() {
         let peer = |id: &str, port: u16, flags: &str| ClusterNodeInfo {
             id: id.to_string(),
@@ -4064,8 +4167,10 @@ mod tests {
             .write()
             .insert(replica.clone(), peer(&replica, 7102, "slave"));
 
+        // A fresh node gives up the default slots it starts with.
+        assert!(hub.has_default_slots());
         // A master serving slots would lose its keys to the sync.
-        assert!(!hub.my_slots.read().is_empty());
+        hub.cluster_addslotsrange(&[(0, 100)]).unwrap();
         assert!(
             hub.cluster_replicate(&master)
                 .unwrap_err()

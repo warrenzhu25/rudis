@@ -193,21 +193,30 @@ base port plus that shard number. This shows up in three places:
    redirect.
 2. **Local redirect.** A command for a slot this node serves, arriving on the wrong shard port, gets
    `-MOVED <slot> <announced ip>:<announced port + owning shard>` (§10, §6.5).
-3. **Single-node view.** Before any peer is known, the introspection commands present each shard as
-   if it were a separate master:
-   * `CLUSTER NODES` shows this view only when cluster mode is on, the peer table is empty and the
-     slot list is still the default 0–16383. The `myself` line shows the first shard's range,
-     then there is one line per extra shard with its pseudo id, its address
-     (`<announced ip>:<announced port+shard>@<that port+10000>`) and its range (`shard × 16384 / N` up to
-     `(shard + 1) × 16384 / N − 1`, the last ending at 16383).
-   * `CLUSTER SLOTS` shows one entry per shard with the same ranges and pseudo ids whenever the
-     peer table is empty; the port is the announced port plus the shard in cluster mode, else the
-     announced port.
+3. **Default slots and the single-node view.** A node starts with the *default slots*, all 16384
+   (`ClusterHub::slots_default`), so a lone cluster-mode node serves every key without setup. Nobody
+   assigned them, so they behave unlike assigned slots:
+   * PINGs, PONGs and MEETs never announce them: peers never record the node as their owner.
+   * The node gives them up the first time it hears from another node (it sends or receives a MEET,
+     or receives a PING) and then serves only the slots assigned to it, as a fresh Redis node does.
+     Before, a node that joined a cluster kept serving every slot itself: reads of keys it didn't
+     own came back empty and writes to them stayed on it.
+   * Any explicit assignment ends them: `ADDSLOTS`/`ADDSLOTSRANGE` replace them with the assigned
+     slots, `DELSLOTS`/`DELSLOTSRANGE` leave the rest assigned, `REPLICATE` accepts a node that
+     still holds only them.
+   * `CLUSTER NODES` doesn't show them (the `myself` line has no slots), as with a fresh Redis node:
+     `redis-cli --cluster create` reads a node's slots from it and would hand them all out again.
+   * `CLUSTER SLOTS` shows one entry per shard (range `shard × 16384 / N` up to
+     `(shard + 1) × 16384 / N − 1`, the last ending at 16383, with pseudo ids) while the node holds
+     only them and knows no peer; the port is the announced port plus the shard in cluster mode,
+     else the announced port. Cluster clients pointed at a lone node use this.
    * `CLUSTER SHARDS` shows one shard entry per local shard (shard 0 uses the real id).
    * `CLUSTER CHECK` counts the pseudo peers' ranges (see the gotcha in §16).
 
-   This view is never written to `nodes.conf`, and loading skips any pseudo-shard entry written by
-   older versions (a port within 1024 above ours whose id is the matching pseudo id).
+   `nodes.conf` keeps the default slots with a `rudisDefaultSlots 1` var (a file without it holds
+   only assigned slots). No view writes the pseudo shards to it, and loading skips any pseudo-shard
+   entry written by older versions (a port within 1024 above ours whose id is the matching pseudo
+   id).
 
 **Worked example.** With base port 7000, 4 shards and no peers, `CLUSTER SLOTS` returns
 `0-4095` on 7000, `4096-8191` on 7001, `8192-12287` on 7002 and `12288-16383` on 7003. `GET foo`
@@ -457,8 +466,9 @@ which wins epoch 5 and broadcasts `FAILOVER_ANNOUNCE B' 5 8192-16383`.
   epoch is raised to match; the node file is saved. This runs after this node's slot set changes
   through migration (`SETSLOT ... NODE`, rebalance) and for `CLUSTER BUMPEPOCH` (reply `+BUMPED
   <epoch>`).
-* **Set:** `CLUSTER SET-CONFIG-EPOCH` works only if the value is non-zero, the current config epoch
-  is 0, and the node has no explicit slots (the default 0–16383 counts as none and is cleared).
+* **Set:** `CLUSTER SET-CONFIG-EPOCH` works, as in Redis, only if the value is non-zero, the current
+  config epoch is 0 and the node knows no other node, whatever its slots (`redis-cli --cluster
+  create` assigns slots first, then epochs, then sends the MEETs).
 * **Assign:** local bookkeeping that adds a slot to an owner (us or a peer) and removes it from
   everyone else, then saves.
 
@@ -788,6 +798,8 @@ The save writes the node table (without the single-node view) plus a trailer lin
 vars currentEpoch 5 lastVoteEpoch 4
 ```
 
+A node that still holds its default slots (§5) adds ` rudisDefaultSlots 1` to the `vars` line.
+
 It writes to a temporary file beside the target (the extension is replaced with `tmp.<port>`) and
 renames it, so a crash never leaves a half-written file. It does nothing if no path is configured.
 Saves happen after `MEET`, `FORGET`, `REPLICATE`, a manual failover, slot add, delete and flush,
@@ -810,10 +822,11 @@ line was found.
    separately. A failing master keeps its role, and its slots stay visible until someone claims them.
 4. **A slot has at most one owner in any node's view.** The conflict rule gives ties to the current
    holder and removes accepted slots from older claimants.
-5. **The default slot list claims everything at epoch 0.** Two fresh nodes that MEET each keep all
-   slots (the tie goes to the holder), so neither redirects. Assign slots with `ADDSLOTS` or
-   `ADDSLOTSRANGE` (which clear the default) before relying on routing. `CLUSTER NODES` and
-   `SET-CONFIG-EPOCH` treat the default as "no explicit slots".
+5. **The default slots never leave the node.** They are not announced, and they go when the node
+   first hears from another node (§5). A node that should keep serving every slot once it has
+   peers needs them assigned (`ADDSLOTSRANGE 0 16383`) before it meets them. (Until 2026-11, the
+   default claimed everything at epoch 0 and was kept after a MEET: a new node joining a cluster
+   served every slot itself.)
 6. **`CLUSTER CHECK` on a fresh multi-shard node** counts the default 0–16383 for `myself` *and* the
    pseudo shards' ranges, so every slot above shard 0's range is reported as a duplicate until slots
    are assigned explicitly.
