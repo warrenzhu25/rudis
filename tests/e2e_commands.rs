@@ -15266,3 +15266,60 @@ fn test_bcast_tracking_invalidates_remote_writes_once_e2e() {
     }
     shutdown_and_wait(port, &mut srv.0);
 }
+
+#[test]
+fn test_slowlog_max_len_zero_uses_no_entry_ids_e2e() {
+    // Redis' unit/slowlog checks the entry ID after commands run with
+    // slowlog-max-len 0: that disables the log, so they must not use up IDs.
+    let port = 20600u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let first_id = |reply: &str| -> u64 {
+        // *1\r\n*N\r\n:<id>\r\n...
+        let i = reply.find(':').expect(reply);
+        reply[i + 1..]
+            .split("\r\n")
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    for (k, v) in [("slowlog-max-len", "10"), ("slowlog-log-slower-than", "0")] {
+        assert_eq!(resp_cmd(&mut c, &["CONFIG", "SET", k, v]), "+OK\r\n");
+    }
+    assert_eq!(resp_cmd(&mut c, &["SLOWLOG", "RESET"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    let ping_id = first_id(&resp_cmd(&mut c, &["SLOWLOG", "GET", "1"]));
+    // ping_id + 1 is the SLOWLOG GET above. With the log disabled, neither
+    // the CONFIG SET that disables it nor the PINGs get an entry.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "slowlog-max-len", "0"]),
+        "+OK\r\n"
+    );
+    for _ in 0..50 {
+        assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    }
+    assert_eq!(resp_cmd(&mut c, &["SLOWLOG", "LEN"]), ":0\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "slowlog-max-len", "10"]),
+        "+OK\r\n"
+    );
+    let reply = resp_cmd(&mut c, &["SLOWLOG", "GET", "1"]);
+    assert!(reply.contains("slowlog-max-len"), "{reply}");
+    assert_eq!(first_id(&reply), ping_id + 2, "{reply}");
+    let _ = srv.kill();
+    let _ = srv.wait();
+}

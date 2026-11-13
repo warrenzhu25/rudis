@@ -145,6 +145,13 @@ pub fn log_command_if_slow(cmd: &Command, duration_us: u64, client_addr: &str, c
     if duration_us < threshold as u64 {
         return;
     }
+    // slowlog-max-len 0 disables the log, as in Redis: no entry, so no entry
+    // ID is used up either.
+    let max_len = SLOWLOG_MAX_LEN.load(Ordering::Relaxed);
+    if max_len == 0 {
+        SLOWLOG_BUFFER.lock().clear();
+        return;
+    }
 
     let id = NEXT_ENTRY_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -207,12 +214,7 @@ pub fn log_command_if_slow(cmd: &Command, duration_us: u64, client_addr: &str, c
         original_argc,
     };
 
-    let max_len = SLOWLOG_MAX_LEN.load(Ordering::Relaxed);
     let mut buf = SLOWLOG_BUFFER.lock();
-    if max_len == 0 {
-        buf.clear();
-        return;
-    }
     buf.push_back(entry);
     while buf.len() > max_len {
         buf.pop_front();
