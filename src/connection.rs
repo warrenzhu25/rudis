@@ -14022,7 +14022,6 @@ async fn execute_command_inner(
                 }
                 false
             } else {
-                notify_key_invalidation(router.port, key.as_ref(), client_id);
                 if condition == crate::resp::SetCondition::None
                     && !get
                     && !keepttl
@@ -14033,6 +14032,10 @@ async fn execute_command_inner(
                         .load(std::sync::atomic::Ordering::Relaxed)
                         == 0
                 {
+                    // The fast path's shard doesn't invalidate; the full
+                    // path's does (its `record_change!`), so invalidating
+                    // here too sent BCAST trackers every remote SET twice.
+                    notify_key_invalidation(router.port, key.as_ref(), client_id);
                     router.set(key.clone(), value, expire_in).await;
                     out.extend_from_slice(b"+OK\r\n");
                 } else {

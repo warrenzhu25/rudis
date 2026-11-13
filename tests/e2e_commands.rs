@@ -15206,3 +15206,63 @@ fn test_himport_fieldsets_are_per_script_run_e2e() {
     assert!(resp_cmd(&mut c, &["HIMPORT", "SET", "k", "fs", "1"]).contains("no such fieldset"));
     shutdown_and_wait(port, &mut srv.0);
 }
+
+/// A BCAST tracker gets one invalidation per write, also for keys on
+/// another shard than the writer's connection when the write takes the
+/// full path (here: keyspace notifications on). Before, the connection
+/// invalidated the key and the owning shard did again, so the tracker got
+/// each such write twice (Redis' "Tracking NOLOOP mode in BCAST mode
+/// works" read the duplicate and every later tracking test went off by one).
+#[test]
+fn test_bcast_tracking_invalidates_remote_writes_once_e2e() {
+    let port = 20331u16;
+    let ps = port.to_string();
+    let mut srv = KillRudisOnDrop(spawn_rudis_listening(
+        &["--port", &ps, "--threads", "4", "--no-pin"],
+        port,
+    ));
+    let conn = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        c
+    };
+    let mut redir = conn();
+    let id = resp_cmd(&mut redir, &["CLIENT", "ID"]);
+    let id = id.trim().trim_start_matches(':').to_string();
+    resp_cmd(&mut redir, &["SUBSCRIBE", "__redis__:invalidate"]);
+    let mut r = conn();
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "SET", "notify-keyspace-events", "KEA"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut r,
+            &[
+                "CLIENT", "TRACKING", "on", "BCAST", "REDIRECT", &id, "NOLOOP"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    let mut w = conn();
+    let keys: Vec<String> = (0..16).map(|i| format!("key{i}")).collect();
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut w, &["SET", k, "1"]), "+OK\r\n");
+    }
+    thread::sleep(Duration::from_millis(300));
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while let Ok(n) = redir.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&got);
+    for k in &keys {
+        let needle = format!("*1\r\n${}\r\n{k}\r\n", k.len());
+        assert_eq!(text.matches(&needle).count(), 1, "{k}: {text}");
+    }
+    shutdown_and_wait(port, &mut srv.0);
+}
