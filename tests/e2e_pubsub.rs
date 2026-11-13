@@ -1400,3 +1400,120 @@ fn test_subkey_notification_on_replica_e2e() {
     shutdown_and_wait(rport, &mut replica.0);
     shutdown_and_wait(mport, &mut master.0);
 }
+
+#[test]
+fn test_client_list_omem_counts_a_stalled_subscribers_queue_e2e() {
+    // CLIENT LIST's omem for a subscriber that doesn't read was a snapshot
+    // the writer took before its write to the full socket, so it stayed at a
+    // few hundred bytes while megabytes queued (Redis' unit/obuf-limits
+    // watches omem grow up to the limit).
+    let port = 20603u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &[
+                "CONFIG",
+                "SET",
+                "client-output-buffer-limit",
+                "pubsub 256mb 0 0"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    let mut sub = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sub.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert!(resp_cmd(&mut sub, &["CLIENT", "SETNAME", "stalled"]).starts_with("+OK"));
+    assert!(resp_cmd(&mut sub, &["SUBSCRIBE", "foo"]).contains("subscribe"));
+    // `sub` reads nothing from here on.
+    let msg = "x".repeat(1000);
+    let omem = |c: &mut TcpStream| -> usize {
+        let list = resp_cmd(c, &["CLIENT", "LIST"]);
+        let line = list
+            .lines()
+            .find(|l| l.contains("name=stalled"))
+            .expect(&list);
+        let v = line
+            .split(' ')
+            .find_map(|f| f.strip_prefix("omem="))
+            .unwrap();
+        v.parse().unwrap()
+    };
+    let mut seen = 0;
+    for _ in 0..200 {
+        // 100 KB per round, up to 20 MB: past what the socket buffers hold.
+        for _ in 0..100 {
+            assert_eq!(resp_cmd(&mut c, &["PUBLISH", "foo", &msg]), ":1\r\n");
+        }
+        seen = omem(&mut c);
+        if seen > 1_000_000 {
+            break;
+        }
+    }
+    assert!(seen > 1_000_000, "omem {seen}");
+    drop(sub);
+    let _ = srv.kill();
+    let _ = srv.wait();
+}
+
+#[test]
+fn test_pubsub_soft_limit_disconnects_without_more_traffic_e2e() {
+    // A subscriber over the pubsub soft limit was only checked when the next
+    // message came: with publishing stopped it stayed connected, its queue
+    // full, forever. Redis disconnects it once soft_seconds pass.
+    let port = 20604u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &[
+                "CONFIG",
+                "SET",
+                "client-output-buffer-limit",
+                "pubsub 0 100000 2"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    let mut sub = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sub.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert!(resp_cmd(&mut sub, &["CLIENT", "SETNAME", "softsub"]).starts_with("+OK"));
+    assert!(resp_cmd(&mut sub, &["SUBSCRIBE", "foo"]).contains("subscribe"));
+    let msg = "x".repeat(1000);
+    let omem = |c: &mut TcpStream| -> Option<usize> {
+        let list = resp_cmd(c, &["CLIENT", "LIST"]);
+        let line = list.lines().find(|l| l.contains("name=softsub"))?;
+        line.split(' ')
+            .find_map(|f| f.strip_prefix("omem="))
+            .map(|v| v.parse().unwrap())
+    };
+    // Publish until the queue is over the soft limit, then stop.
+    let mut over = false;
+    for _ in 0..200 {
+        for _ in 0..100 {
+            resp_cmd(&mut c, &["PUBLISH", "foo", &msg]);
+        }
+        if omem(&mut c).is_some_and(|m| m > 100_000) {
+            over = true;
+            break;
+        }
+    }
+    assert!(over, "queue never went over the soft limit");
+    let stopped = std::time::Instant::now();
+    while omem(&mut c).is_some() {
+        assert!(
+            stopped.elapsed() < Duration::from_secs(6),
+            "still connected after the soft limit's 2 s"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    drop(sub);
+    let _ = srv.kill();
+    let _ = srv.wait();
+}

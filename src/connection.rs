@@ -97,9 +97,17 @@ pub struct ClientInfo {
     /// HIMPORT PREPARE's fieldsets: field lists by name, this connection's
     /// own until DISCARD, RESET or disconnect.
     pub himport_fieldsets: hashbrown::HashMap<Bytes, Vec<Bytes>>,
+    /// Once the connection's writes go through a queue (subscribers,
+    /// MONITOR), its byte count.
+    pub out_queue: Option<crate::pubsub::QueueGauge>,
 }
 
 impl ClientInfo {
+    /// Output bytes waiting (CLIENT LIST `omem`).
+    pub fn omem_now(&self) -> usize {
+        self.out_queue.as_ref().map_or(self.omem, |q| q.queued())
+    }
+
     pub fn effective_qbuf(&self, idle_secs: u64) -> (usize, usize) {
         if self.qbuf_cap == 0 && self.qbuf_len == 0 {
             (0, 0)
@@ -6695,6 +6703,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
             stats: stats.clone(),
             push,
             himport_fieldsets: hashbrown::HashMap::new(),
+            out_queue: None,
         },
     );
 
@@ -7642,6 +7651,9 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
     // buffer limit.
     let (raw_tx, write_rx) = flume::unbounded::<Bytes>();
     let write_tx = crate::pubsub::SubscriberTx::new(raw_tx, router.port, client_id);
+    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+        c.out_queue = Some(write_tx.gauge());
+    }
     let (mut reader, mut writer) = transport.into_split(write_tx.raw());
     // Declared after the split so it drops (and unregisters the client from
     // GLOBAL_CLIENTS) before `reader` closes the socket: other threads use the
@@ -15416,7 +15428,7 @@ async fn execute_command_inner(
                             c.db,
                             qbuf,
                             qbuf_free,
-                            c.omem,
+                            c.omem_now(),
                             c.last_cmd.to_lowercase(),
                             if c.is_resp3 { 3 } else { 2 },
                             c.lib_name.as_deref().unwrap_or(""),

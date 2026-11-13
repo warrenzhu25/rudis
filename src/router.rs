@@ -3545,7 +3545,7 @@ impl Router {
                 client.db,
                 qbuf,
                 qbuf_free,
-                client.omem,
+                client.omem_now(),
                 client.last_cmd.to_lowercase(),
                 client.lib_name.as_deref().unwrap_or(""),
                 client.lib_ver.as_deref().unwrap_or(""),

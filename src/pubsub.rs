@@ -325,6 +325,73 @@ pub struct SubscriberTx {
     state: std::sync::Arc<SubscriberState>,
 }
 
+/// Subscribers over the pubsub soft limit, swept by a thread that
+/// disconnects those still over it after `soft_seconds`: published messages
+/// check it too, but a subscriber that got no more of them stayed connected
+/// with its queue full (Redis' clientsCron checks it every turn).
+static SOFT_OVER: parking_lot::Mutex<Vec<std::sync::Arc<SubscriberState>>> =
+    parking_lot::Mutex::new(Vec::new());
+static SOFT_SWEEPER: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
+
+fn watch_soft_limit(state: &std::sync::Arc<SubscriberState>) {
+    SOFT_OVER.lock().push(state.clone());
+    let sweeper = SOFT_SWEEPER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("pubsub-soft-limit".into())
+            .spawn(sweep_soft_limits)
+            .expect("spawn the pubsub soft-limit sweeper")
+            .thread()
+            .clone()
+    });
+    sweeper.unpark();
+}
+
+fn sweep_soft_limits() {
+    use std::sync::atomic::Ordering::Relaxed;
+    loop {
+        if SOFT_OVER.lock().is_empty() {
+            std::thread::park();
+            continue;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let limit = pubsub_limit();
+        let now = now_ms();
+        let mut over = Vec::new();
+        SOFT_OVER.lock().retain(|st| {
+            let since = st.soft_since_ms.load(Relaxed);
+            if since == 0 || st.closing.load(Relaxed) {
+                return false;
+            }
+            let queued = st.queued.load(Relaxed);
+            if limit.soft_limit == 0 || (queued as u64) < limit.soft_limit {
+                st.soft_since_ms.store(0, Relaxed);
+                return false;
+            }
+            if now.saturating_sub(since) >= limit.soft_seconds * 1000 {
+                over.push((st.clone(), queued));
+                return false;
+            }
+            true
+        });
+        for (st, queued) in over {
+            if !st.closing.swap(true, Relaxed) {
+                crate::connection::close_client_over_output_limit(st.port, st.client_id, queued);
+            }
+        }
+    }
+}
+
+/// A subscriber queue's byte count, for CLIENT LIST's `omem`: live, unlike
+/// the writer's snapshots, which stop while a write to a full socket waits.
+#[derive(Clone, Debug)]
+pub struct QueueGauge(std::sync::Arc<SubscriberState>);
+
+impl QueueGauge {
+    pub fn queued(&self) -> usize {
+        self.0.queued.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[derive(Debug)]
 struct SubscriberState {
     queued: std::sync::atomic::AtomicUsize,
@@ -371,7 +438,10 @@ impl SubscriberTx {
         if !over && limit.soft_limit > 0 && queued as u64 >= limit.soft_limit {
             let now = now_ms();
             match st.soft_since_ms.load(Relaxed) {
-                0 => st.soft_since_ms.store(now, Relaxed),
+                0 => {
+                    st.soft_since_ms.store(now, Relaxed);
+                    watch_soft_limit(&self.state);
+                }
                 since => over = now.saturating_sub(since) >= limit.soft_seconds * 1000,
             }
         } else if st.soft_since_ms.load(Relaxed) != 0 {
@@ -403,6 +473,11 @@ impl SubscriberTx {
     /// Bytes queued and not yet written.
     pub fn queued(&self) -> usize {
         self.state.queued.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reads [`Self::queued`] without holding the channel open.
+    pub fn gauge(&self) -> QueueGauge {
+        QueueGauge(self.state.clone())
     }
 
     /// A subscriber not registered with any server (tests).
