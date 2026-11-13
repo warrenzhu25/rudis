@@ -1559,7 +1559,7 @@ pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
         LatencySubcommand::History(ev) => {
             if ev.is_empty() {
                 out.extend_from_slice(
-                    b"-ERR wrong number of arguments for 'latency history' command\r\n",
+                    b"-ERR wrong number of arguments for 'latency|history' command\r\n",
                 );
             } else {
                 let map = LATENCY_EVENTS.read();
@@ -1598,7 +1598,7 @@ pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
         LatencySubcommand::Graph(ev) => {
             if ev.is_empty() {
                 out.extend_from_slice(
-                    b"-ERR wrong number of arguments for 'latency graph' command\r\n",
+                    b"-ERR wrong number of arguments for 'latency|graph' command\r\n",
                 );
             } else {
                 let map = LATENCY_EVENTS.read();

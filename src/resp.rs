@@ -3889,7 +3889,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "ENCODING" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'object encoding' command".to_string()
+                            "wrong number of arguments for 'object|encoding' command".to_string()
                         );
                     }
                     Ok(Some(Command::Object(ObjectSubcommand::Encoding(
@@ -3899,7 +3899,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "FREQ" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'object freq' command".to_string()
+                            "wrong number of arguments for 'object|freq' command".to_string()
                         );
                     }
                     Ok(Some(Command::Object(ObjectSubcommand::Freq(
@@ -3909,7 +3909,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "IDLETIME" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'object idletime' command".to_string()
+                            "wrong number of arguments for 'object|idletime' command".to_string()
                         );
                     }
                     Ok(Some(Command::Object(ObjectSubcommand::Idletime(
@@ -3919,7 +3919,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "REFCOUNT" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'object refcount' command".to_string()
+                            "wrong number of arguments for 'object|refcount' command".to_string()
                         );
                     }
                     Ok(Some(Command::Object(ObjectSubcommand::Refcount(
@@ -4098,7 +4098,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "KEYSLOT" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'cluster keyslot' command".to_string()
+                            "wrong number of arguments for 'cluster|keyslot' command".to_string()
                         );
                     }
                     Ok(Some(Command::Cluster(ClusterSubcommand::KeySlot(
@@ -4108,7 +4108,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "COUNTKEYSINSLOT" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'cluster countkeysinslot' command"
+                            "wrong number of arguments for 'cluster|countkeysinslot' command"
                                 .to_string(),
                         );
                     }
@@ -4123,7 +4123,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "GETKEYSINSLOT" => {
                     if args.len() < 4 {
                         return Err(
-                            "wrong number of arguments for 'cluster getkeysinslot' command"
+                            "wrong number of arguments for 'cluster|getkeysinslot' command"
                                 .to_string(),
                         );
                     }
@@ -4142,7 +4142,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "SETSLOT" => {
                     if args.len() < 4 {
                         return Err(
-                            "wrong number of arguments for 'cluster setslot' command".to_string()
+                            "wrong number of arguments for 'cluster|setslot' command".to_string()
                         );
                     }
                     let slot: u16 = std::str::from_utf8(&args[2])
@@ -4200,7 +4200,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "ADDSLOTS" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'cluster addslots' command".to_string()
+                            "wrong number of arguments for 'cluster|addslots' command".to_string()
                         );
                     }
                     let mut slots = Vec::with_capacity(args.len() - 2);
@@ -4216,7 +4216,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "DELSLOTS" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'cluster delslots' command".to_string()
+                            "wrong number of arguments for 'cluster|delslots' command".to_string()
                         );
                     }
                     let mut slots = Vec::with_capacity(args.len() - 2);
@@ -4232,7 +4232,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "ADDSLOTSRANGE" | "ADDSLOTS-RANGE" => {
                     if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
                         return Err(
-                            "wrong number of arguments for 'cluster addslotsrange' command"
+                            "wrong number of arguments for 'cluster|addslotsrange' command"
                                 .to_string(),
                         );
                     }
@@ -4255,7 +4255,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "DELSLOTSRANGE" | "DELSLOTS-RANGE" => {
                     if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
                         return Err(
-                            "wrong number of arguments for 'cluster delslotsrange' command"
+                            "wrong number of arguments for 'cluster|delslotsrange' command"
                                 .to_string(),
                         );
                     }
@@ -4281,7 +4281,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "MEET" => {
                     if args.len() < 4 {
                         return Err(
-                            "wrong number of arguments for 'cluster meet' command".to_string()
+                            "wrong number of arguments for 'cluster|meet' command".to_string()
                         );
                     }
                     let ip = String::from_utf8_lossy(&args[2]).to_string();
@@ -4294,7 +4294,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "MIGRATE-SLOT" | "MIGRATESLOT" => {
                     if args.len() < 5 {
                         return Err(
-                            "wrong number of arguments for 'cluster migrate-slot' command"
+                            "wrong number of arguments for 'cluster|migrate-slot' command"
                                 .to_string(),
                         );
                     }
@@ -4377,7 +4377,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "RESHARD" => {
                     if args.len() < 5 {
                         return Err(
-                            "wrong number of arguments for 'cluster reshard' command".to_string()
+                            "wrong number of arguments for 'cluster|reshard' command".to_string()
                         );
                     }
                     let target_node_id = String::from_utf8_lossy(&args[2]).to_string();
@@ -4409,7 +4409,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "FORGET" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'cluster forget' command".to_string()
+                            "wrong number of arguments for 'cluster|forget' command".to_string()
                         );
                     }
                     let node_id = String::from_utf8_lossy(&args[2]).to_string();
@@ -4418,7 +4418,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "REPLICATE" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'cluster replicate' command".to_string()
+                            "wrong number of arguments for 'cluster|replicate' command".to_string()
                         );
                     }
                     let node_id = String::from_utf8_lossy(&args[2]).to_string();
@@ -4432,7 +4432,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "SET-CONFIG-EPOCH" | "SETCONFIGEPOCH" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'cluster set-config-epoch' command"
+                            "wrong number of arguments for 'cluster|set-config-epoch' command"
                                 .to_string(),
                         );
                     }
@@ -4698,7 +4698,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "UNBLOCK" => {
                     if args.len() < 3 || args.len() > 4 {
                         return Err(
-                            "wrong number of arguments for 'client unblock' command".to_string()
+                            "wrong number of arguments for 'client|unblock' command".to_string()
                         );
                     }
                     let client_id: u64 = std::str::from_utf8(&args[2])
@@ -4782,7 +4782,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "REPLY" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'client reply' command".to_string()
+                            "wrong number of arguments for 'client|reply' command".to_string()
                         );
                     }
                     let mode_str = String::from_utf8_lossy(&args[2]).to_uppercase();
@@ -6967,20 +6967,20 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "SPILL" => {
                     if args.len() != 3 {
                         return Err(
-                            "wrong number of arguments for 'tier spill' command".to_string()
+                            "wrong number of arguments for 'tier|spill' command".to_string()
                         );
                     }
                     Ok(Some(Command::Tier(TierSubcommand::Spill(args[2].clone()))))
                 }
                 "LOAD" | "PROMOTE" => {
                     if args.len() != 3 {
-                        return Err("wrong number of arguments for 'tier load' command".to_string());
+                        return Err("wrong number of arguments for 'tier|load' command".to_string());
                     }
                     Ok(Some(Command::Tier(TierSubcommand::Load(args[2].clone()))))
                 }
                 "COOL" => {
                     if args.len() != 3 {
-                        return Err("wrong number of arguments for 'tier cool' command".to_string());
+                        return Err("wrong number of arguments for 'tier|cool' command".to_string());
                     }
                     Ok(Some(Command::Tier(TierSubcommand::Cool(args[2].clone()))))
                 }
@@ -6992,7 +6992,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             args[2].clone(),
                         )))))
                     } else {
-                        Err("wrong number of arguments for 'tier decommit' command".to_string())
+                        Err("wrong number of arguments for 'tier|decommit' command".to_string())
                     }
                 }
                 "INFO" => Ok(Some(Command::Tier(TierSubcommand::Info))),
@@ -7014,7 +7014,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "CONFIG" => {
                     if args.len() != 3 {
                         return Err(
-                            "ERR wrong number of arguments for 'dflycluster config' command"
+                            "ERR wrong number of arguments for 'dflycluster|config' command"
                                 .to_string(),
                         );
                     }
@@ -7075,7 +7075,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
             if sub == "FLOW" {
                 if args.len() < 5 {
-                    return Err("ERR wrong number of arguments for 'dfly flow' command".to_string());
+                    return Err("ERR wrong number of arguments for 'dfly|flow' command".to_string());
                 }
                 let master_replid = String::from_utf8_lossy(&args[2]).to_string();
                 let sync_id = String::from_utf8_lossy(&args[3]).to_string();
@@ -7106,7 +7106,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "INIT" => {
                     if args.len() < 5 {
                         return Err(
-                            "ERR wrong number of arguments for 'dflymigrate init' command"
+                            "ERR wrong number of arguments for 'dflymigrate|init' command"
                                 .to_string(),
                         );
                     }
@@ -7138,7 +7138,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "FLOW" => {
                     if args.len() != 4 {
                         return Err(
-                            "ERR wrong number of arguments for 'dflymigrate flow' command"
+                            "ERR wrong number of arguments for 'dflymigrate|flow' command"
                                 .to_string(),
                         );
                     }
@@ -7155,7 +7155,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "ACK" => {
                     if args.len() != 3 {
                         return Err(
-                            "ERR wrong number of arguments for 'dflymigrate ack' command"
+                            "ERR wrong number of arguments for 'dflymigrate|ack' command"
                                 .to_string(),
                         );
                     }
@@ -8670,7 +8670,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "CREATE" => {
                     if args.len() < 5 {
                         return Err(
-                            "wrong number of arguments for 'xgroup create' command".to_string()
+                            "wrong number of arguments for 'xgroup|create' command".to_string()
                         );
                     }
                     let key = args[2].clone();
@@ -8719,7 +8719,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "DESTROY" => {
                     if args.len() < 4 {
                         return Err(
-                            "wrong number of arguments for 'xgroup destroy' command".to_string()
+                            "wrong number of arguments for 'xgroup|destroy' command".to_string()
                         );
                     }
                     let key = args[2].clone();
@@ -8729,7 +8729,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "CREATECONSUMER" => {
                     if args.len() < 5 {
                         return Err(
-                            "wrong number of arguments for 'xgroup createconsumer' command"
+                            "wrong number of arguments for 'xgroup|createconsumer' command"
                                 .to_string(),
                         );
                     }
@@ -8744,7 +8744,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "DELCONSUMER" => {
                     if args.len() < 5 {
-                        return Err("wrong number of arguments for 'xgroup delconsumer' command"
+                        return Err("wrong number of arguments for 'xgroup|delconsumer' command"
                             .to_string());
                     }
                     let key = args[2].clone();
@@ -8759,7 +8759,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "SETID" => {
                     if args.len() < 5 {
                         return Err(
-                            "wrong number of arguments for 'xgroup setid' command".to_string()
+                            "wrong number of arguments for 'xgroup|setid' command".to_string()
                         );
                     }
                     let key = args[2].clone();
@@ -9724,7 +9724,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "STREAM" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'xinfo stream' command".to_string()
+                            "wrong number of arguments for 'xinfo|stream' command".to_string()
                         );
                     }
                     let key = args[2].clone();
@@ -9756,7 +9756,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "GROUPS" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'xinfo groups' command".to_string()
+                            "wrong number of arguments for 'xinfo|groups' command".to_string()
                         );
                     }
                     let key = args[2].clone();
@@ -9765,7 +9765,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "CONSUMERS" => {
                     if args.len() < 4 {
                         return Err(
-                            "wrong number of arguments for 'xinfo consumers' command".to_string()
+                            "wrong number of arguments for 'xinfo|consumers' command".to_string()
                         );
                     }
                     let key = args[2].clone();
@@ -11503,7 +11503,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "LOAD" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'function load' command".to_string()
+                            "wrong number of arguments for 'function|load' command".to_string()
                         );
                     }
                     let (replace, code) = if args.len() == 3 {
@@ -11529,7 +11529,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "DUMP" => {
                     if args.len() != 2 {
                         return Err(
-                            "wrong number of arguments for 'function dump' command".to_string()
+                            "wrong number of arguments for 'function|dump' command".to_string()
                         );
                     }
                     Ok(Some(Command::FunctionDump))
@@ -11601,7 +11601,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "DELETE" => {
                     if args.len() != 3 {
                         return Err(
-                            "wrong number of arguments for 'function delete' command".to_string()
+                            "wrong number of arguments for 'function|delete' command".to_string()
                         );
                     }
                     let lib = String::from_utf8_lossy(&args[2]).to_string();
