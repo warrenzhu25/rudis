@@ -13104,6 +13104,24 @@ fn test_version_and_info_report_the_build_commit_e2e() {
     );
 }
 
+/// INFO has a Cluster section, as in Redis: redis-cli --cluster refuses a
+/// node whose INFO lacks cluster_enabled:1.
+#[test]
+fn test_info_cluster_section_e2e() {
+    let port = 29765;
+    start_test_server(port, 2);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let info = resp_cmd_full(&mut c, &["INFO", "cluster"]);
+    assert!(
+        info.contains("# Cluster\r\ncluster_enabled:0\r\n"),
+        "{info}"
+    );
+    for section in [&["INFO"][..], &["INFO", "all"]] {
+        let info = resp_cmd_full(&mut c, section);
+        assert!(info.contains("cluster_enabled:0\r\n"), "{info}");
+    }
+}
+
 /// A cross-shard MGET never sees a cross-shard MSET or MULTI/EXEC half
 /// applied, as in Redis: with 8 keys spread over 4 shards and a writer
 /// setting all of them to one value at a time, every read (alone or in a

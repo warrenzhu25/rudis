@@ -13286,6 +13286,7 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
                         "cpu",
                         "storage",
                         "errorstats",
+                        "cluster",
                         "keyspace",
                     ] {
                         push_unique(s);
@@ -13304,6 +13305,7 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
                         "commandstats",
                         "latencystats",
                         "errorstats",
+                        "cluster",
                         "keyspace",
                     ] {
                         push_unique(s);
@@ -13320,6 +13322,7 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
                 "commandstats" => push_unique("commandstats"),
                 "latencystats" => push_unique("latencystats"),
                 "errorstats" => push_unique("errorstats"),
+                "cluster" => push_unique("cluster"),
                 "keyspace" => push_unique("keyspace"),
                 _ => {}
             }
@@ -13338,6 +13341,13 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
                 "commandstats" => acc.push_str(&cmdstat_str),
                 "latencystats" => acc.push_str(&latencystat_str),
                 "errorstats" => acc.push_str(&errorstat_str),
+                // As in Redis: redis-cli --cluster (and client libraries)
+                // check cluster_enabled before treating a node as a cluster
+                // node.
+                "cluster" => acc.push_str(&format!(
+                    "# Cluster\r\ncluster_enabled:{}\r\n",
+                    u8::from(router.cluster_enabled)
+                )),
                 "keyspace" => {
                     // Only fan out when the section is requested.
                     let stats_by_db = router.keyspace_stats_by_db().await;

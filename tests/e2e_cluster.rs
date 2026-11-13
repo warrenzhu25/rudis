@@ -899,6 +899,8 @@ fn test_cluster_mode_moved_redirection_and_per_shard_ports_e2e() {
 
     // 1. Connect to Shard 0 (base_port)
     let mut client0 = TcpStream::connect(format!("127.0.0.1:{}", base_port)).unwrap();
+    let info = send_and_read(&mut client0, b"INFO cluster\r\n");
+    assert!(info.contains("cluster_enabled:1\r\n"), "{info}");
 
     // 2. Query CLUSTER SLOTS and verify per-shard ports
     let slots_resp = send_and_read(&mut client0, b"CLUSTER SLOTS\r\n");
