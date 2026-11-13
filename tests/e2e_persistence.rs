@@ -1967,6 +1967,107 @@ fn test_bgsave_schedule_waits_for_an_aof_rewrite_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// BGREWRITEAOF during a background save is scheduled, as in Redis: it
+/// starts once the save ends (INFO aof_rewrite_scheduled:1 meanwhile). It
+/// used to fail ("Background save or rewrite already in progress"), and the
+/// rewrite never happened. A rewrite already running is an error.
+#[test]
+fn test_bgrewriteaof_is_scheduled_during_a_bgsave_e2e() {
+    let port = 16934;
+    let dir = std::env::temp_dir().join(format!("rudis-bgrw-sched-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--appendonly",
+        "yes",
+        "--save",
+        "",
+    ];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for i in 0..100 {
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", &format!("br:{i}"), "v"]),
+            "+OK\r\n"
+        );
+    }
+    let wait_for = |c: &mut TcpStream, what: &str, ok: &dyn Fn(&mut TcpStream) -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ok(c) {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let delay = |c: &mut TcpStream, us: &str| {
+        assert_eq!(
+            resp_cmd(c, &["CONFIG", "SET", "rdb-key-save-delay", us]),
+            "+OK\r\n"
+        );
+    };
+    let rewrites_before: u64 = info_field(&mut c, "aof_rewrites").parse().unwrap();
+
+    // A slowed save; the rewrite waits for it.
+    delay(&mut c, "300000");
+    assert_eq!(
+        resp_cmd(&mut c, &["BGSAVE"]),
+        "+Background saving started\r\n"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            resp_cmd(&mut c, &["BGREWRITEAOF"]),
+            "+Background append only file rewriting scheduled\r\n"
+        );
+    }
+    assert_eq!(info_field(&mut c, "aof_rewrite_scheduled"), "1");
+    assert_eq!(info_field(&mut c, "aof_rewrite_in_progress"), "0");
+
+    // The save ends, then the scheduled rewrite runs (once).
+    delay(&mut c, "0");
+    wait_for(&mut c, "scheduled rewrite never ran", &|c| {
+        info_field(c, "aof_rewrite_scheduled") == "0"
+            && info_field(c, "aof_rewrite_in_progress") == "0"
+            && info_field(c, "rdb_bgsave_in_progress") == "0"
+    });
+    assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "ok");
+    assert_eq!(info_field(&mut c, "aof_last_bgrewrite_status"), "ok");
+    let rewrites: u64 = info_field(&mut c, "aof_rewrites").parse().unwrap();
+    assert_eq!(rewrites, rewrites_before + 1);
+
+    // A rewrite already running is not scheduled again.
+    delay(&mut c, "300000");
+    assert_eq!(
+        resp_cmd(&mut c, &["BGREWRITEAOF"]),
+        "+Background append only file rewriting started\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["BGREWRITEAOF"]),
+        "-ERR Background append only file rewriting already in progress\r\n"
+    );
+    delay(&mut c, "0");
+    wait_for(&mut c, "rewrite never finished", &|c| {
+        info_field(c, "aof_rewrite_in_progress") == "0"
+    });
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_getex_ttl_change_reaches_aof_e2e() {
     let port = 16966;
@@ -2800,10 +2901,11 @@ fn test_bgsave_and_bgrewriteaof_exclusive_across_shards_e2e() {
         err_save, "-ERR Background save already in progress\r\n",
         "{err_save}"
     );
-    let err_rw = resp_cmd(&mut c2, &["BGREWRITEAOF"]);
+    // A rewrite waits for the save (as in Redis).
+    let rw = resp_cmd(&mut c2, &["BGREWRITEAOF"]);
     assert_eq!(
-        err_rw, "-ERR Background save or rewrite already in progress\r\n",
-        "{err_rw}"
+        rw, "+Background append only file rewriting scheduled\r\n",
+        "{rw}"
     );
 
     // Clear the artificial delay and wait for the save to finish
@@ -2812,8 +2914,18 @@ fn test_bgsave_and_bgrewriteaof_exclusive_across_shards_e2e() {
         "+OK\r\n"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while resp_cmd(&mut c1, &["INFO", "persistence"]).contains("rdb_bgsave_in_progress:1") {
-        assert!(std::time::Instant::now() < deadline, "save did not finish");
+    loop {
+        let info = resp_cmd(&mut c1, &["INFO", "persistence"]);
+        if info.contains("rdb_bgsave_in_progress:0")
+            && info.contains("aof_rewrite_scheduled:0")
+            && info.contains("aof_rewrite_in_progress:0")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "save and scheduled rewrite did not finish"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 

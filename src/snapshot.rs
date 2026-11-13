@@ -261,6 +261,18 @@ pub fn bgsave_scheduled(port: u16) -> Arc<AtomicBool> {
         .clone()
 }
 
+static AOF_REWRITE_SCHEDULED: Mutex<Option<HashMap<u16, Arc<AtomicBool>>>> = Mutex::new(None);
+
+/// Whether a `BGREWRITEAOF` waits for a running background save to end
+/// (Redis `aof_rewrite_scheduled`), per server (keyed by base port).
+pub fn aof_rewrite_scheduled(port: u16) -> Arc<AtomicBool> {
+    let mut map = AOF_REWRITE_SCHEDULED.lock();
+    map.get_or_insert_with(HashMap::new)
+        .entry(port)
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
 static IS_SAVING: Mutex<Option<HashMap<u16, Arc<AtomicBool>>>> = Mutex::new(None);
 
 /// Mutual exclusivity flag for SAVE / BGSAVE / BGREWRITEAOF, shared by all

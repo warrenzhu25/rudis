@@ -5170,14 +5170,46 @@ impl Router {
         });
     }
 
-    pub async fn bgrewriteaof(&self) -> Result<(), String> {
+    /// `BGREWRITEAOF`, with Redis's replies: a rewrite already running is
+    /// an error; during a background save the rewrite is scheduled, to
+    /// start once the save ends (INFO aof_rewrite_scheduled:1 meanwhile).
+    /// Returns the status line to reply.
+    pub async fn bgrewriteaof(&self) -> Result<&'static str, String> {
         if self
             .is_saving
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+            .is_ok()
         {
-            return Err("Background save or rewrite already in progress".to_string());
+            self.start_rewrite_aof_locked();
+            return Ok("Background append only file rewriting started");
         }
+        if crate::snapshot::aof_rewrite_state(self.base_port).in_progress() {
+            return Err("Background append only file rewriting already in progress".to_string());
+        }
+        let scheduled = crate::snapshot::aof_rewrite_scheduled(self.base_port);
+        if !scheduled.swap(true, Ordering::SeqCst) {
+            let router = self.clone();
+            monoio::spawn(async move {
+                while router
+                    .is_saving
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    if crate::shutdown::is_shutting_down() {
+                        scheduled.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    monoio::time::sleep(Duration::from_millis(10)).await;
+                }
+                scheduled.store(false, Ordering::SeqCst);
+                router.start_rewrite_aof_locked();
+            });
+        }
+        Ok("Background append only file rewriting scheduled")
+    }
+
+    /// Starts a background AOF rewrite; the caller holds `is_saving`.
+    fn start_rewrite_aof_locked(&self) {
         // Begin before replying so INFO right after +OK shows the rewrite
         // instead of the previous one's status.
         crate::snapshot::aof_rewrite_state(self.base_port).begin();
@@ -5188,7 +5220,6 @@ impl Router {
             let _ = router_clone.perform_rewrite_aof().await;
             guard.disarm();
         });
-        Ok(())
     }
 
     /// Sends `SetAppendonly` to every shard (this one directly).

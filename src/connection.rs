@@ -13118,9 +13118,13 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
         crate::server::rdb_last_load_keys_loaded(router.base_port),
         u8::from(router.aof().is_some()),
         u8::from(aof_rw.in_progress()),
-        // The initial rewrite of AOF turned on at runtime, waiting
-        // for a save to end.
-        u8::from(crate::aof::aof_enabling(router.base_port) && !aof_rw.in_progress()),
+        // The initial rewrite of AOF turned on at runtime, or a
+        // BGREWRITEAOF, waiting for a save to end.
+        u8::from(
+            (crate::aof::aof_enabling(router.base_port) && !aof_rw.in_progress())
+                || crate::snapshot::aof_rewrite_scheduled(router.base_port)
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        ),
         if aof_rw.last_ok() { "ok" } else { "err" },
         if crate::aof::aof_write_misconf(router.port).is_some() {
             "err"
@@ -19930,8 +19934,8 @@ async fn execute_command_inner(
         }
         Command::Bgrewriteaof => {
             match router.bgrewriteaof().await {
-                Ok(_) => {
-                    out.extend_from_slice(b"+Background append only file rewriting started\r\n");
+                Ok(status) => {
+                    out.extend_from_slice(format!("+{status}\r\n").as_bytes());
                 }
                 Err(e) => {
                     let err = format!("-ERR {}\r\n", e);

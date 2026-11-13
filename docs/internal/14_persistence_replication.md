@@ -353,7 +353,10 @@ rewrites do not use it.
 ### 4.6 AOF rewrite
 
 **Trigger.** `BGREWRITEAOF` takes the server-wide save lock (the same one as `SAVE` and `BGSAVE`, taken
-with a compare-and-swap), marks the rewrite as begun before replying, and spawns the rewrite. The cron on
+with a compare-and-swap), marks the rewrite as begun before replying, and spawns the rewrite. As in Redis,
+during a background save it is scheduled instead (`+Background append only file rewriting scheduled`,
+`INFO aof_rewrite_scheduled:1`): a task takes the lock once the save releases it; a rewrite already running
+is an error (`Background append only file rewriting already in progress`). The cron on
 shard 0 (every 100 ms) starts one automatically, at most once a second, when the total AOF size is above
 `auto-aof-rewrite-min-size` (default 64 MB) and has grown by at least `auto-aof-rewrite-percentage`
 (default 100%) over the size after the last rewrite. After 3 consecutive failures, automatic rewrites back
