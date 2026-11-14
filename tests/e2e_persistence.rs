@@ -4668,7 +4668,11 @@ fn test_bgrewriteaof_does_not_block_on_other_dbs_e2e() {
 /// A restart doesn't push a dataset that fit under maxmemory over it: the
 /// buffers each shard's AOF replay freed used to stay in its allocator
 /// cache (~1.5 MB a thread), counted in used_memory, so a restart near the
-/// limit evicted keys.
+/// limit evicted keys. Commands arriving as the load ends must not evict
+/// either: the memory the loader threads allocated (the dataset) was
+/// still counted as no shard's until shard 0's cron recalibrated it, on
+/// top of the shards' fresh counts, and the first commands evicted up to
+/// 16% of the keys (about 4 restarts in 10 with a client already sending).
 #[test]
 fn test_restart_near_maxmemory_keeps_keys_e2e() {
     let port = 18054u16;
@@ -4715,9 +4719,57 @@ fn test_restart_near_maxmemory_keeps_keys_e2e() {
     let limit = (live_used + (5 << 19)).to_string();
     let mut args = base.to_vec();
     args.extend(["--maxmemory", &limit, "--maxmemory-policy", "allkeys-lru"]);
-    let srv = ServerGuard(spawn_rudis_listening(&args, port));
-    let mut c = connect();
-    thread::sleep(Duration::from_millis(1500));
+    // A client sends commands from the moment the server accepts
+    // connections (-LOADING while it loads), across the end of the load.
+    let child = rudis_bin()
+        .args(&args)
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rudis");
+    let srv = ServerGuard(child);
+    // A PING, reconnecting on a refused or reset connection: right after
+    // the first instance was killed, the kernel may still hold its
+    // io_uring listener for a moment, which accepts and then resets.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut conn: Option<TcpStream> = None;
+    let ping = |conn: &mut Option<TcpStream>| -> Option<String> {
+        if conn.is_none() {
+            let c = TcpStream::connect(("127.0.0.1", port)).ok()?;
+            c.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+            *conn = Some(c);
+        }
+        let c = conn.as_mut().unwrap();
+        let mut buf = [0u8; 256];
+        let n = c
+            .write_all(b"PING\r\n")
+            .and_then(|()| c.read(&mut buf))
+            .ok()
+            .filter(|&n| n > 0);
+        match n {
+            Some(n) => Some(String::from_utf8_lossy(&buf[..n]).into_owned()),
+            None => {
+                *conn = None;
+                None
+            }
+        }
+    };
+    let mut answered: Option<std::time::Instant> = None;
+    while answered.is_none_or(|t| t.elapsed() < Duration::from_millis(1500)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server never answered"
+        );
+        match ping(&mut conn) {
+            Some(r) => {
+                assert!(r == "+PONG\r\n" || r.starts_with("-LOADING"), "{r}");
+                answered.get_or_insert_with(std::time::Instant::now);
+            }
+            None => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    let mut c = conn.expect("connected");
     let loaded_used = info_field_u64(&mut c, "memory", "used_memory");
     eprintln!("used_memory live {live_used}, after restart {loaded_used}, limit {limit}");
     assert_eq!(info_field_u64(&mut c, "stats", "evicted_keys"), 0);

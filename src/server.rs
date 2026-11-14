@@ -452,6 +452,13 @@ async fn finish_startup_load(
     }
     router.publish_memory_state();
     if note_shard_loaded(base_port, num_shards) {
+        // Every shard has adopted its loader's bytes and published them:
+        // recount the memory no shard is charged for before commands come
+        // in. Calibrated by the cron during the load, it still held the
+        // dataset the loader threads allocated, now counted by the shards
+        // too, and the first commands evicted keys of a dataset that fit
+        // (up to 16% of it) until the cron recalibrated.
+        router.calibrate_real_memory();
         // Every shard has its data: serve commands, and from now on a
         // shutdown signal takes the graceful path (writes may come in).
         crate::replication::end_startup_loading(base_port);
