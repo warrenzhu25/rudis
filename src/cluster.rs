@@ -478,11 +478,6 @@ impl ClusterHub {
     /// slots this way (it was failed over while down or cut off) becomes a
     /// replica of the claimant, so two nodes never serve the same slots.
     pub fn claim_slots(&self, id: &str, epoch: Option<u64>, slots: Vec<(u16, u16)>) {
-        // Like Redis's currentEpoch: the highest epoch seen anywhere, so an
-        // epoch we pick next (failover, election) outranks every claim.
-        if let Some(e) = epoch {
-            self.current_epoch.fetch_max(e, Ordering::SeqCst);
-        }
         // Our own state first: never take `my_slots` under `nodes`.
         let my_epoch = self.config_epoch.load(Ordering::SeqCst);
         let my_slots = self.my_slots.read().clone();
@@ -494,6 +489,14 @@ impl ClusterHub {
             let Some(node) = nodes.get(id) else {
                 return;
             };
+            // Like Redis's currentEpoch: the highest epoch seen anywhere, so
+            // an epoch we pick next (failover, election) outranks every
+            // claim. As in Redis, only from a node we know: a node that was
+            // just reset (CLUSTER RESET, back to epoch 1) or forgot a peer
+            // moved it on that peer's next PING.
+            if let Some(e) = epoch {
+                self.current_epoch.fetch_max(e, Ordering::SeqCst);
+            }
             let epoch = match epoch {
                 Some(e) if e < node.config_epoch => return,
                 Some(e) => e,
@@ -3709,6 +3712,20 @@ mod tests {
         hub.cluster_failover(false).unwrap();
         assert!(hub.config_epoch.load(Ordering::SeqCst) > 5);
         assert_eq!(*hub.my_slots.read(), vec![(0, 5460)]);
+    }
+
+    /// As in Redis, only a known node moves currentEpoch: a node just reset
+    /// (back to epoch 1) kept getting it raised by its old peers' PINGs.
+    #[test]
+    fn test_only_known_nodes_move_the_current_epoch() {
+        let hub = ClusterHub::new(7610);
+        let stranger = "s".repeat(40);
+        handle_cluster_bus_line(&format!("PING {stranger} 9 master 0-5460"), &hub);
+        assert_eq!(hub.current_epoch.load(Ordering::SeqCst), 1);
+        let peer = "p".repeat(40);
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7611 {peer} 0"), &hub);
+        handle_cluster_bus_line(&format!("PING {peer} 9 master 0-5460"), &hub);
+        assert_eq!(hub.current_epoch.load(Ordering::SeqCst), 9);
     }
 
     /// A master that can reach fewer than a majority of the masters
