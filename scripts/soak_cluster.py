@@ -111,6 +111,7 @@ class ClusterClient:
         port = self.slots.get(key_slot(key)) or random.choice(self.seeds)
         asking = False
         last = None
+        hops = []
         for _ in range(tries):
             try:
                 c = self.conn(port)
@@ -126,15 +127,18 @@ class ClusterClient:
                 port = self.slots.get(key_slot(key)) or random.choice(self.seeds)
                 continue
             if isinstance(r, str) and r.startswith("-MOVED "):
+                hops.append(f"{port}>M{r.split()[2].rsplit(':', 1)[1]}")
                 port = int(r.split()[2].rsplit(":", 1)[1])
                 self.slots[key_slot(key)] = port
                 continue
             if isinstance(r, str) and r.startswith("-ASK "):
+                hops.append(f"{port}>A{r.split()[2].rsplit(':', 1)[1]}")
                 port = int(r.split()[2].rsplit(":", 1)[1])
                 asking = True
                 continue
             return r
-        return last
+        # Out of tries: the error, or the redirects that went in circles.
+        return last or f"-REDIRECTLOOP slot {key_slot(key)}: {' '.join(hops)}"
 
 
 def node_info(port, timeout=5):
@@ -305,6 +309,8 @@ def main():
             else:
                 kind = (r or "-NONE").split()[0]
                 counter_errors[kind] = counter_errors.get(kind, 0) + 1
+                if kind == "-REDIRECTLOOP" and counter_errors[kind] <= 5:
+                    note(f"counter writer: {r}")
                 time.sleep(0.01)
 
     writer = threading.Thread(target=counters, daemon=True)
@@ -485,6 +491,25 @@ def main():
                              "lost": len(lost), "examples": lost[:10]}
         if lost:
             anomalies.append(f"{len(lost)} counters below their highest acknowledged INCR: {lost[:5]}")
+            # Who each node thinks serves those slots (and any open
+            # migration markers), to tell lost data from a routing split.
+            for k, _, _ in lost[:3]:
+                slot = key_slot(k)
+                views = {}
+                for p in ports:
+                    try:
+                        for n in cluster_nodes(p):
+                            for part in n[4].split():
+                                if part.startswith("["):
+                                    if int(part[1:].split("-", 1)[0]) == slot:
+                                        views.setdefault(p, []).append(f"{n[1]}{part}")
+                                    continue
+                                lo, _, hi = part.partition("-")
+                                if int(lo) <= slot <= int(hi or lo):
+                                    views.setdefault(p, []).append(f"{n[1]}({n[2]})")
+                    except Exception as e:  # noqa: BLE001
+                        views[p] = [repr(e)]
+                anomalies.append(f"slot {slot} ({k}) as each node sees it: {views}")
         pairs = []
         ns = cluster_nodes(ports[0])
         for m in [n for n in ns if n[2] == "master"]:
