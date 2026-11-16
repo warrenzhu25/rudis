@@ -482,6 +482,33 @@ impl ClusterHub {
         self.follow.lock().take()
     }
 
+    /// Two masters with the same config epoch (Redis's
+    /// `clusterHandleConfigEpochCollision`): the one with the smaller node
+    /// id takes a new epoch, so every master's is unique again. Without
+    /// it, a tie is never broken: each side keeps the slots it holds on a
+    /// tie, so two masters that both claimed the same slots (a failover
+    /// that picked an epoch the old master had reached meanwhile) both
+    /// went on serving them.
+    fn resolve_config_epoch_collision(&self, id: &str, epoch: Option<u64>) {
+        let Some(epoch) = epoch.filter(|&e| e > 0) else {
+            return;
+        };
+        if epoch != self.config_epoch.load(Ordering::SeqCst)
+            || *self.role.read() != "master"
+            || self.my_id().as_str() >= id
+            || !self.nodes.read().get(id).is_some_and(|n| n.is_master())
+        {
+            return;
+        }
+        let new_epoch = self.bump_config_epoch();
+        crate::log_warning!(
+            "Cluster: config epoch {} collides with {}'s: taking {}",
+            epoch,
+            id,
+            new_epoch
+        );
+    }
+
     /// Records that `id` serves `slots` at config `epoch`, as its PING or
     /// PONG says. Each slot belongs to the claimant with the highest config
     /// epoch (Redis's `clusterUpdateSlotsConfigWith`): older claims by
@@ -490,6 +517,7 @@ impl ClusterHub {
     /// slots this way (it was failed over while down or cut off) becomes a
     /// replica of the claimant, so two nodes never serve the same slots.
     pub fn claim_slots(&self, id: &str, epoch: Option<u64>, slots: Vec<(u16, u16)>) {
+        self.resolve_config_epoch_collision(id, epoch);
         // Our own state first: never take `my_slots` under `nodes`.
         let my_epoch = self.config_epoch.load(Ordering::SeqCst);
         let my_slots = self.my_slots.read().clone();
@@ -3604,6 +3632,52 @@ mod tests {
         assert!(restarted.nodes.read().is_empty());
         assert_eq!(*restarted.my_slots.read(), vec![(0, 16383)]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_masters_with_the_same_config_epoch_break_the_tie() {
+        let peer = |id: &str, epoch: u64| ClusterNodeInfo {
+            id: id.to_string(),
+            ip: "127.0.0.1".to_string(),
+            port: 7311,
+            cport: 17311,
+            flags: "master".to_string(),
+            fail: FailState::Ok,
+            shards: 0,
+            master_id: "-".to_string(),
+            ping_sent: 0,
+            pong_recv: 0,
+            config_epoch: epoch,
+            link_state: "connected".to_string(),
+            slots: Vec::new(),
+        };
+        let (low, high) = ("a".repeat(40), "z".repeat(40));
+        // Two masters both claim 0-100 at epoch 5 (a failover that picked
+        // an epoch the old master had already reached).
+        let hub_for = |me: &str, other: &str, port: u16| {
+            let hub = ClusterHub::new(port);
+            *hub.my_id.write() = me.to_string();
+            *hub.my_slots.write() = vec![(0, 100)];
+            hub.slots_default.store(false, Ordering::SeqCst);
+            hub.config_epoch.store(5, Ordering::SeqCst);
+            hub.current_epoch.store(5, Ordering::SeqCst);
+            hub.nodes.write().insert(other.to_string(), peer(other, 5));
+            hub
+        };
+        // The smaller id takes a new epoch, and with it keeps the slots.
+        let hub = hub_for(&low, &high, 7310);
+        hub.claim_slots(&high, Some(5), vec![(0, 100)]);
+        assert_eq!(hub.config_epoch.load(Ordering::SeqCst), 6);
+        assert_eq!(*hub.my_slots.read(), vec![(0, 100)]);
+        // The larger id keeps its epoch, and gives the slots up once it
+        // hears the new one.
+        let hub = hub_for(&high, &low, 7312);
+        hub.claim_slots(&low, Some(5), vec![(0, 100)]);
+        assert_eq!(hub.config_epoch.load(Ordering::SeqCst), 5);
+        assert_eq!(*hub.my_slots.read(), vec![(0, 100)]);
+        hub.claim_slots(&low, Some(6), vec![(0, 100)]);
+        assert!(hub.my_slots.read().is_empty());
+        assert_eq!(*hub.role.read(), "slave");
     }
 
     #[test]
