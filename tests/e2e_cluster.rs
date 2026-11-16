@@ -1853,6 +1853,153 @@ fn test_cluster_migrate_of_several_keys_to_an_importing_node_e2e() {
     let _ = std::fs::remove_dir_all(&db);
 }
 
+/// Keys written while MIGRATE moves them end up on the target only, with
+/// every acknowledged write: the source used to delete a key only if it
+/// was unchanged since its DUMP, so a client's write in between kept it on
+/// both nodes (the target with the old value) and the next MIGRATE of the
+/// slot failed "BUSYKEY", as `redis-cli --cluster reshard` did in the
+/// cluster soak, leaving the slot open.
+#[test]
+fn test_cluster_migrate_under_concurrent_writes_keeps_every_write_e2e() {
+    let (a, b) = (18361u16, 18367u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_migrace_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "1",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (da, db) = (mk_dir(a), mk_dir(b));
+    let _na = spawn(a, &da);
+    let _nb = spawn(b, &db);
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let (a_id, b_id) = (
+        bulk(cmd(a, &["CLUSTER", "MYID"])),
+        bulk(cmd(b, &["CLUSTER", "MYID"])),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(b, &["CLUSTER", "NODES"]).contains(&a_id) {
+        assert!(std::time::Instant::now() < deadline, "b never learned a");
+        thread::sleep(Duration::from_millis(50));
+    }
+    const KEYS: usize = 40;
+    const WRITERS: usize = 8;
+    let keys: Vec<String> = (0..KEYS).map(|i| format!("{{mr}}:{i}")).collect();
+    let slot = rudis::router::key_slot(keys[0].as_bytes()).to_string();
+    for k in &keys {
+        assert_eq!(cmd(a, &["SET", k, "0"]), "+OK\r\n");
+    }
+    assert_eq!(
+        cmd(b, &["CLUSTER", "SETSLOT", &slot, "IMPORTING", &a_id]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "SETSLOT", &slot, "MIGRATING", &b_id]),
+        "+OK\r\n"
+    );
+
+    // Writer w INCRs keys w, w + WRITERS, ...; a key already gone from the
+    // source is written on the target after ASKING, as a cluster client does.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let keys = keys.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let (mut ca, mut cb) = (connect_ready(a), connect_ready(b));
+                let mut acked = vec![0u64; KEYS];
+                let mut i = w;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut r = resp_cmd(&mut ca, &["INCR", &keys[i]]);
+                    if r.starts_with("-ASK ") {
+                        assert_eq!(resp_cmd(&mut cb, &["ASKING"]), "+OK\r\n");
+                        r = resp_cmd(&mut cb, &["INCR", &keys[i]]);
+                    }
+                    assert!(r.starts_with(':'), "INCR {}: {r:?}", keys[i]);
+                    acked[i] += 1;
+                    i += WRITERS;
+                    if i >= KEYS {
+                        i = w;
+                    }
+                }
+                acked
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(100));
+
+    // Move the slot 2 keys at a time, as redis-cli --cluster reshard does
+    // (it sends GETKEYSINSLOT batches to MIGRATE ... KEYS).
+    let b_s = b.to_string();
+    let mut src = connect_ready(a);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot never emptied"
+        );
+        let listed = resp_cmd_full(&mut src, &["CLUSTER", "GETKEYSINSLOT", &slot, "2"]);
+        let batch: Vec<&str> = listed
+            .split("\r\n")
+            .skip(1)
+            .filter(|l| !l.is_empty() && !l.starts_with(['$', '+']))
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        let mut args = vec!["MIGRATE", "127.0.0.1", &b_s, "", "0", "5000", "KEYS"];
+        args.extend(&batch);
+        assert_eq!(resp_cmd(&mut src, &args), "+OK\r\n", "MIGRATE {batch:?}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(100));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut acked = vec![0u64; KEYS];
+    for h in writers {
+        for (t, n) in acked.iter_mut().zip(h.join().unwrap()) {
+            *t += n;
+        }
+    }
+    assert!(acked.iter().all(|&n| n > 0), "a key was never written");
+    assert_eq!(
+        resp_cmd(&mut src, &["CLUSTER", "COUNTKEYSINSLOT", &slot]),
+        ":0\r\n",
+        "keys left on the source"
+    );
+    let mut tgt = connect_ready(b);
+    for (k, n) in keys.iter().zip(&acked) {
+        assert_eq!(resp_cmd(&mut tgt, &["ASKING"]), "+OK\r\n");
+        let v = resp_cmd(&mut tgt, &["GET", k]);
+        assert_eq!(v, format!("${}\r\n{n}\r\n", n.to_string().len()), "{k}");
+    }
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}
+
 /// A hostile cluster-bus peer gets error replies or a hang-up, never a crash:
 /// MEET with a port above 55535 used to overflow `port + 10000` while holding
 /// the node-table lock, poisoning it for every later CLUSTER command.

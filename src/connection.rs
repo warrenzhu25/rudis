@@ -10266,15 +10266,16 @@ fn write_resp_command(out: &mut Vec<u8>, args: &[&[u8]]) {
     }
 }
 
-/// Splits complete simple-string / error replies off the front of `buf`
-/// into `replies`: Ok for `+...`, Err(message) for `-...` and for any other
-/// reply type. Returns how many bytes were consumed.
+/// Splits complete simple-string / integer / error replies off the front
+/// of `buf` into `replies`: Ok for `+...` and `:...`, Err(message) for
+/// `-...` and for any other reply type. Returns how many bytes were
+/// consumed.
 fn take_simple_replies(buf: &[u8], replies: &mut Vec<Result<(), String>>) -> usize {
     let mut pos = 0;
     while let Some(nl) = buf[pos..].windows(2).position(|w| w == b"\r\n") {
         let line = &buf[pos..pos + nl];
         replies.push(match line.first() {
-            Some(b'+') => Ok(()),
+            Some(b'+' | b':') => Ok(()),
             Some(b'-') => Err(String::from_utf8_lossy(&line[1..]).into_owned()),
             _ => Err(format!(
                 "unexpected reply {:?}",
@@ -10532,6 +10533,122 @@ pub fn migrate_cached_sockets() -> usize {
 /// `conn` carries the connection to the target across calls (a slot moves
 /// in many batches): it is opened when `None`, and dropped after an error
 /// so the next call starts on a fresh one.
+/// Sends `tx_buf` to the target and reads `expected` simple replies, in
+/// order. On a write, read or timeout error, the replies read so far and
+/// the error.
+async fn exchange_with_target(
+    stream: &mut TcpStream,
+    tx_buf: Vec<u8>,
+    expected: usize,
+    timeout: std::time::Duration,
+) -> (Vec<Result<(), String>>, Option<String>) {
+    let mut replies = Vec::with_capacity(expected);
+    if let Err(e) = stream.write_all(tx_buf).await.0 {
+        return (
+            replies,
+            Some(format!("IOERR error sending to destination: {}", e)),
+        );
+    }
+    let mut failure = None;
+    let mut pending = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    while replies.len() < expected {
+        let (res, b) = match monoio::time::timeout(timeout, stream.read(buf)).await {
+            Ok(r) => r,
+            Err(_) => {
+                failure = Some("IOERR timeout reading from destination".to_string());
+                break;
+            }
+        };
+        buf = b;
+        match res {
+            Ok(0) => {
+                failure = Some("IOERR destination closed the connection".to_string());
+                break;
+            }
+            Ok(n) => {
+                pending.extend_from_slice(&buf[..n]);
+                let used = take_simple_replies(&pending, &mut replies);
+                pending.drain(..used);
+            }
+            Err(e) => {
+                failure = Some(format!("IOERR error reading from destination: {}", e));
+                break;
+            }
+        }
+    }
+    (replies, failure)
+}
+
+/// How many times a migrated key that clients keep changing is re-sent
+/// before MIGRATE gives up on it.
+const MIGRATE_SETTLE_ATTEMPTS: usize = 64;
+
+/// Deletes a key just restored on the target from here, so it ends up on
+/// the target only and with its latest value. Redis's MIGRATE blocks the
+/// server from DUMP to DEL; here clients keep running, and one that
+/// changed the key in between left the target an old copy: deleting the
+/// source lost the write, keeping it left the key on both nodes (the
+/// next `redis-cli --cluster reshard` of the slot failed "Target key
+/// exists" and left it open). So a changed key is sent again with
+/// REPLACE, and a key deleted meanwhile is deleted on the target too,
+/// until the delete here finds the value the target has.
+async fn settle_migrated_key(
+    router: &Router,
+    stream: &mut TcpStream,
+    key: Bytes,
+    mut payload: Bytes,
+    opts: &MigrateOpts,
+) -> Result<(), String> {
+    let shard = router.target_shard(&key);
+    for _ in 0..MIGRATE_SETTLE_ATTEMPTS {
+        if router.del_if_unchanged(key.clone(), payload.clone()).await {
+            return Ok(());
+        }
+        let dump = exec_on_shard(router, shard, Command::Dump(key.clone())).await;
+        let mut tx_buf = Vec::new();
+        let new_payload = resp_bulk_payload(&dump);
+        match &new_payload {
+            Some(p) => {
+                let expire_at = resp_integer(
+                    &exec_on_shard(router, shard, Command::Expiretime(key.clone(), true)).await,
+                )
+                .unwrap_or(-1);
+                let ttl = expire_at.max(0).to_string();
+                let mut args: Vec<&[u8]> =
+                    vec![b"RESTORE-ASKING", &key, ttl.as_bytes(), p, b"REPLACE"];
+                if expire_at > 0 {
+                    args.push(b"ABSTTL");
+                }
+                write_resp_command(&mut tx_buf, &args);
+            }
+            None => {
+                if let Some(err) = dump.strip_prefix(b"-") {
+                    return Err(String::from_utf8_lossy(err).trim_end().to_string());
+                }
+                write_resp_command(&mut tx_buf, &[b"ASKING"]);
+                write_resp_command(&mut tx_buf, &[b"DEL", &key]);
+            }
+        }
+        let expected = if new_payload.is_some() { 1 } else { 2 };
+        let (replies, failure) = exchange_with_target(stream, tx_buf, expected, opts.timeout).await;
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        if let Some(Err(e)) = replies.iter().find(|r| r.is_err()) {
+            return Err(format!("ERR Target instance replied with error: {}", e));
+        }
+        match new_payload {
+            Some(p) => payload = p,
+            None => return Ok(()),
+        }
+    }
+    Err(format!(
+        "ERR key {} kept changing while it was migrated",
+        String::from_utf8_lossy(&key)
+    ))
+}
+
 async fn migrate_keys_to_node(
     router: &Router,
     keys: &[Bytes],
@@ -10610,41 +10727,9 @@ async fn migrate_keys_to_node(
             }
         }
     };
-    if let Err(e) = stream.write_all(tx_buf).await.0 {
-        return Err(format!("IOERR error sending to destination: {}", e));
-    }
-
     // One reply per prefix command, then one per RESTORE, in order.
-    let expected = dumps.len() + prefix;
-    let mut replies = Vec::with_capacity(expected);
-    let mut failure = None;
-    let mut pending = Vec::new();
-    let mut buf = vec![0u8; 4096];
-    while replies.len() < expected {
-        let (res, b) = match monoio::time::timeout(opts.timeout, stream.read(buf)).await {
-            Ok(r) => r,
-            Err(_) => {
-                failure = Some("IOERR timeout reading from destination".to_string());
-                break;
-            }
-        };
-        buf = b;
-        match res {
-            Ok(0) => {
-                failure = Some("IOERR destination closed the connection".to_string());
-                break;
-            }
-            Ok(n) => {
-                pending.extend_from_slice(&buf[..n]);
-                let used = take_simple_replies(&pending, &mut replies);
-                pending.drain(..used);
-            }
-            Err(e) => {
-                failure = Some(format!("IOERR error reading from destination: {}", e));
-                break;
-            }
-        }
-    }
+    let (replies, mut failure) =
+        exchange_with_target(&mut stream, tx_buf, dumps.len() + prefix, opts.timeout).await;
 
     // A refused AUTH or SELECT fails the whole MIGRATE (the RESTOREs then
     // failed too, or went to the wrong database).
@@ -10656,11 +10741,23 @@ async fn migrate_keys_to_node(
         return Err(failure.unwrap_or_default());
     }
     let mut stored = 0;
+    let mut stream_ok = failure.is_none();
     for (i, (k, payload, _)) in dumps.into_iter().enumerate() {
         match replies.get(i + prefix) {
             Some(Ok(())) => {
                 stored += 1;
-                if !opts.copy {
+                if opts.copy {
+                    // MIGRATE COPY keeps the source key.
+                } else if stream_ok {
+                    if let Err(e) =
+                        settle_migrated_key(router, &mut stream, k, payload, &opts).await
+                    {
+                        // The stream may be mid-reply: only plain deletes
+                        // for the rest.
+                        stream_ok = false;
+                        failure.get_or_insert(e);
+                    }
+                } else {
                     router.del_if_unchanged(k, payload).await;
                 }
             }
@@ -32869,7 +32966,10 @@ mod tests {
             replies[1],
             Err("BUSYKEY Target key name already exists.".to_string())
         );
-        assert!(replies[2].is_err(), "a non-simple reply is not an OK");
+        assert_eq!(replies[2], Ok(()), "an integer reply (DEL's) is an OK");
+        let mut bulk = Vec::new();
+        assert_eq!(take_simple_replies(b"$2\r\n", &mut bulk), 4);
+        assert!(bulk[0].is_err(), "a bulk reply is not an OK");
         assert_eq!(take_simple_replies(b"+OK\r\n", &mut replies), 5);
         assert_eq!(replies[3], Ok(()));
     }
