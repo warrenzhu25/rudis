@@ -946,13 +946,24 @@ impl ClusterHub {
         // thread hung holding nothing, then every thread needing `nodes`
         // behind the PONG handler that held it, shards included (the node
         // stopped answering during a manual failover).
+        //
+        // The epoch is read before the slots. A node giving a slot away
+        // removes it and then bumps its epoch (CLUSTER SETSLOT NODE): read
+        // the other way round, a PING could carry the slot (read before the
+        // removal) with the new epoch (read after the bump). That claim
+        // outranked the target's, which had just taken the slot at a lower
+        // epoch: the target dropped it, the source had dropped it too, and
+        // the slot was left without an owner (seen in the cluster soak).
+        // Epoch first, a racing PING at worst pairs the old epoch with the
+        // new slot set, which peers reject or apply harmlessly.
+        let epoch = self.config_epoch.load(Ordering::SeqCst);
         let role = self.role.read().clone();
         let slots = slots_repr(&self.announced_slots());
         let tokens = self.announce_tokens();
         format!(
             "PING {} {} {} {} {} GOSSIP {}\r\n",
             self.my_id(),
-            self.config_epoch.load(Ordering::Relaxed),
+            epoch,
             role,
             slots,
             tokens,
@@ -2740,7 +2751,8 @@ fn now_ms() -> u64 {
 }
 
 fn pong_reply(hub: &ClusterHub) -> String {
-    let my_epoch = hub.config_epoch.load(Ordering::Relaxed);
+    // Before the slots, as in `ClusterHub::ping_frame`.
+    let my_epoch = hub.config_epoch.load(Ordering::SeqCst);
     let role = hub.role.read().clone();
     let my_slots = hub.announced_slots();
     let mut slots_repr = String::new();
@@ -4198,6 +4210,63 @@ mod tests {
         assert_eq!(hub.my_ip(), "192.0.2.1");
         *hub.announce_ip.write() = None;
         assert_eq!(hub.my_ip(), "10.0.0.8");
+    }
+
+    #[test]
+    fn test_announcements_never_pair_a_given_away_slot_with_a_newer_epoch() {
+        // A node gives slots away one by one as CLUSTER SETSLOT NODE does
+        // (drop the slot, then bump the epoch) while its PINGs and PONGs
+        // are built: none may carry a slot together with an epoch from
+        // after the slot was dropped. Slot i is dropped before the bump to
+        // epoch i + 2, so a frame at epoch e must hold no slot below e - 1.
+        let hub = std::sync::Arc::new(ClusterHub::new(7990));
+        const N: u16 = 3000;
+        *hub.my_slots.write() = vec![(0, N - 1)];
+        hub.slots_default.store(false, Ordering::SeqCst);
+        hub.config_epoch.store(1, Ordering::SeqCst);
+        hub.current_epoch.store(1, Ordering::SeqCst);
+        let giver_done = std::sync::Arc::new(AtomicBool::new(false));
+        let giver = {
+            let hub = hub.clone();
+            std::thread::spawn(move || {
+                for slot in 0..N {
+                    remove_slots(&mut hub.my_slots.write(), &[slot]);
+                    hub.bump_config_epoch();
+                }
+            })
+        };
+        fn check(frame: &str, epoch_field: usize, slots_field: usize) {
+            let f: Vec<&str> = frame.trim_end().split(' ').collect();
+            let epoch: u64 = f[epoch_field].parse().unwrap();
+            let lowest = f[slots_field]
+                .split(',')
+                .filter_map(|r| r.split('-').next()?.parse::<u64>().ok())
+                .min();
+            if let Some(lowest) = lowest {
+                assert!(
+                    lowest + 2 > epoch,
+                    "slot {lowest}, given away before epoch {}, announced at epoch {epoch}",
+                    lowest + 2
+                );
+            }
+        }
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let hub = hub.clone();
+                let giver_done = giver_done.clone();
+                std::thread::spawn(move || {
+                    while !giver_done.load(Ordering::SeqCst) {
+                        check(&hub.ping_frame(""), 2, 4);
+                        check(&pong_reply(&hub), 2, 4);
+                    }
+                })
+            })
+            .collect();
+        giver.join().unwrap();
+        giver_done.store(true, Ordering::SeqCst);
+        for r in readers {
+            r.join().unwrap();
+        }
     }
 
     #[test]
