@@ -2000,6 +2000,106 @@ fn test_cluster_migrate_under_concurrent_writes_keeps_every_write_e2e() {
     let _ = std::fs::remove_dir_all(&db);
 }
 
+/// A node giving a slot away (CLUSTER SETSLOT NODE <other>) keeps its
+/// config epoch; only the node taking it bumps. The giver used to bump
+/// too, to the cluster's highest epoch + 1, which could pass the taker's
+/// next epoch: in a reshard the giver's claim to the next slot (still its
+/// own) then beat the taker's when the taker took it, the taker gave it
+/// back, the giver dropped it on its own SETSLOT NODE, and the slot was
+/// left without an owner (seen in the cluster soak).
+#[test]
+fn test_cluster_giving_a_slot_away_keeps_the_givers_epoch_e2e() {
+    let (a, b) = (18371u16, 18377u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_giveep_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "1",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (da, db) = (mk_dir(a), mk_dir(b));
+    let _na = spawn(a, &da);
+    let _nb = spawn(b, &db);
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    let my_epoch = |p: u16| -> u64 {
+        let info = resp_cmd_full(&mut connect_ready(p), &["CLUSTER", "INFO"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix("cluster_my_epoch:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let (a_id, b_id) = (
+        bulk(cmd(a, &["CLUSTER", "MYID"])),
+        bulk(cmd(b, &["CLUSTER", "MYID"])),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(b, &["CLUSTER", "NODES"]).contains(&a_id) {
+        assert!(std::time::Instant::now() < deadline, "b never learned a");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Hand slots 0..20 over one by one, the taker first, as redis-cli does.
+    let a_epoch = my_epoch(a);
+    for slot in 0..20 {
+        let slot = slot.to_string();
+        assert_eq!(
+            cmd(b, &["CLUSTER", "SETSLOT", &slot, "NODE", &b_id]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(a, &["CLUSTER", "SETSLOT", &slot, "NODE", &b_id]),
+            "+OK\r\n"
+        );
+    }
+    assert_eq!(my_epoch(a), a_epoch, "the giver bumped its epoch");
+    assert!(my_epoch(b) > a_epoch, "the taker did not outrank the giver");
+    // After a few bus rounds both still agree: every slot has an owner,
+    // 0-19 on b, the rest on a.
+    thread::sleep(Duration::from_millis(1500));
+    for p in [a, b] {
+        let info = resp_cmd_full(&mut connect_ready(p), &["CLUSTER", "INFO"]);
+        assert!(info.contains("cluster_slots_assigned:16384"), "{p}: {info}");
+        let nodes = resp_cmd_full(&mut connect_ready(p), &["CLUSTER", "NODES"]);
+        let line = |id: &str| {
+            nodes
+                .lines()
+                .find(|l| l.starts_with(id))
+                .unwrap_or_default()
+                .trim_end()
+                .to_string()
+        };
+        assert!(line(&b_id).ends_with(" 0-19"), "{p}: {nodes}");
+        assert!(line(&a_id).ends_with(" 20-16383"), "{p}: {nodes}");
+    }
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}
+
 /// A hostile cluster-bus peer gets error replies or a hang-up, never a crash:
 /// MEET with a port above 55535 used to overflow `port + 10000` while holding
 /// the node-table lock, poisoning it for every later CLUSTER command.

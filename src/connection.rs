@@ -10928,10 +10928,10 @@ async fn execute_rebalance_plans(
             })?;
             hub.assign_slot(p.slot, &p.target_node_id);
             hub.slot_states.write().remove(&p.slot);
-            hub.bump_config_epoch();
-            // The target bumped its epoch when it took the slot; learning that
-            // epoch now makes any older announcement from it (still without
-            // the slot) stale, and gives it our new epoch the same way.
+            // No epoch bump for giving the slot away: see CLUSTER SETSLOT
+            // NODE. The target bumped its epoch when it took the slot;
+            // learning that epoch now makes any older announcement from it
+            // (still without the slot) stale.
             hub.refresh_peer(&p.target_node_id).await;
             moved += 1;
         } else if p.target_node_id == hub.my_id() {
@@ -15282,19 +15282,22 @@ async fn execute_command_inner(
                                     node
                                 }
                             };
-                            let owned = hub
-                                .my_slots
-                                .read()
-                                .iter()
-                                .any(|&(s, e)| slot >= s && slot <= e);
+                            // Giving a slot away does not bump our epoch
+                            // (as in Redis): the new owner bumped its own,
+                            // and peers take our smaller slot list at the
+                            // same epoch. A bump here could take our epoch
+                            // past the new owner's next one (ours rose to
+                            // the cluster's highest, theirs only to the
+                            // highest they had seen): our claim to the next
+                            // slot of the reshard, still ours, then beat
+                            // theirs when they took it, they gave it back,
+                            // we dropped it on our SETSLOT NODE, and the
+                            // slot was left without an owner.
                             match owner_id {
                                 Some(id) => hub.assign_slot(slot, &id),
                                 None => {
                                     crate::cluster::remove_slots(&mut hub.my_slots.write(), &[slot])
                                 }
-                            }
-                            if owned {
-                                hub.bump_config_epoch();
                             }
                             router
                                 .set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
