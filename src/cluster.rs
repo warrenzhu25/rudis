@@ -1447,26 +1447,20 @@ impl ClusterHub {
             *self.my_slots.write() = inherited_slots.clone();
         }
 
-        // Broadcast FAILOVER to all peers
-        {
-            let nodes = self.nodes.read();
-            for peer in nodes.values() {
-                let addr = format!("{}:{}", peer.ip, peer.cport);
-                if let Ok(parsed) = addr.parse::<SocketAddr>()
-                    && let Ok(mut stream) = bus_dial(self.port, parsed, Duration::from_millis(200))
-                {
-                    let mut slots_repr = String::new();
-                    for (s, e) in &inherited_slots {
-                        slots_repr.push_str(&format!("{}-{},", s, e));
-                    }
-                    if slots_repr.ends_with(',') {
-                        slots_repr.pop();
-                    }
-                    let msg = format!("FAILOVER {} {} {}\r\n", my_id, new_epoch, slots_repr);
-                    let _ = stream.write_all(msg.as_bytes());
-                }
-            }
-        }
+        // Broadcast FAILOVER to all peers. broadcast_to_peers dials (up to
+        // 200 ms each) with the node table unlocked: holding it, a writer
+        // queued behind (gossip, CLUSTER MEET) stalled every reader of the
+        // table, i.e. every CLUSTER command and redirect, for the whole
+        // broadcast.
+        let slots_repr = inherited_slots
+            .iter()
+            .map(|(s, e)| format!("{}-{}", s, e))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.broadcast_to_peers(&format!(
+            "FAILOVER {} {} {}\r\n",
+            my_id, new_epoch, slots_repr
+        ));
 
         let _ = self.save_config();
         Ok(())
