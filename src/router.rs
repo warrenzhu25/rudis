@@ -676,11 +676,30 @@ impl Router {
 
     #[inline(always)]
     pub fn get_slot_state(&self, slot: u16) -> crate::shard::SlotState {
-        self.slot_states
+        let state = self
+            .slot_states
             .borrow()
             .get(&slot)
             .cloned()
-            .unwrap_or(crate::shard::SlotState::Stable)
+            .unwrap_or(crate::shard::SlotState::Stable);
+        match state {
+            // In a cluster the node table decides where a slot is served;
+            // a MOVED recorded when we gave the slot away is only a
+            // fallback for an owner the table doesn't know. Once the table
+            // knows the slot's owner, the record is stale if it disagrees:
+            // the slot moved on, or came back to us, by a way that doesn't
+            // touch these tables (a failover inheriting a master's slots,
+            // gossip). Followed, it sent clients to a node that sent them
+            // back, forever: the cluster soak saw MOVED loops while every
+            // node's CLUSTER NODES agreed on the owner.
+            crate::shard::SlotState::Moved(_)
+                if (self.cluster_enabled || crate::cluster::has_active_cluster(self.base_port))
+                    && crate::cluster::get_cluster_hub(self.base_port).slot_owner_known(slot) =>
+            {
+                crate::shard::SlotState::Stable
+            }
+            state => state,
+        }
     }
 
     pub fn target_shard_for_slot(&self, slot: u16) -> usize {

@@ -2100,6 +2100,145 @@ fn test_cluster_giving_a_slot_away_keeps_the_givers_epoch_e2e() {
     let _ = std::fs::remove_dir_all(&db);
 }
 
+/// A node that gave a slot away and later gets it back by a failover
+/// (inheriting its master's slots) serves it, instead of redirecting by
+/// the MOVED it recorded when it gave the slot away. It used to answer
+/// MOVED to the node it had given the slot to, which answered MOVED back:
+/// clients went in circles (seen in the cluster soak).
+#[test]
+fn test_cluster_slot_regained_by_failover_is_served_not_redirected_e2e() {
+    let (a, b, r) = (18381u16, 18385u16, 18387u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_stalemv_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "1",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let dirs = [mk_dir(a), mk_dir(b), mk_dir(r)];
+    let _na = spawn(a, &dirs[0]);
+    let _nb = spawn(b, &dirs[1]);
+    let _nr = spawn(r, &dirs[2]);
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    let wait = |what: &str, f: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !f() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let role = |p: u16| {
+        let info = resp_cmd_full(&mut connect_ready(p), &["INFO", "replication"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix("role:"))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    let ids: Vec<String> = [a, b, r]
+        .iter()
+        .map(|&p| bulk(cmd(p, &["CLUSTER", "MYID"])))
+        .collect();
+    let (a_id, b_id, r_id) = (&ids[0], &ids[1], &ids[2]);
+    for p in [b, r] {
+        assert_eq!(
+            cmd(p, &["CLUSTER", "MEET", "127.0.0.1", &a.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    wait("everyone knows everyone", &|| {
+        [a, b, r].iter().all(|&p| {
+            let nodes = resp_cmd_full(&mut connect_ready(p), &["CLUSTER", "NODES"]);
+            ids.iter().all(|id| nodes.contains(id.as_str()))
+        })
+    });
+    assert_eq!(cmd(r, &["CLUSTER", "REPLICATE", a_id]), "+OK\r\n");
+    wait("r replicates a", &|| role(r) == "slave");
+
+    let key = "stale_mv";
+    let slot = rudis::router::key_slot(key.as_bytes()).to_string();
+    let hand_over = |from: u16, to: u16, to_id: &str| {
+        assert_eq!(
+            cmd(to, &["CLUSTER", "SETSLOT", &slot, "NODE", to_id]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(from, &["CLUSTER", "SETSLOT", &slot, "NODE", to_id]),
+            "+OK\r\n"
+        );
+    };
+    // a gives the slot to b: a records a MOVED to b for it.
+    hand_over(a, b, b_id);
+    // r takes over from a, which becomes r's replica.
+    assert_eq!(cmd(r, &["CLUSTER", "FAILOVER"]), "+OK\r\n");
+    wait("a follows r", &|| role(a) == "slave" && role(r) == "master");
+    // b gives the slot to r; then a takes over from r, inheriting it.
+    hand_over(b, r, r_id);
+    // (Once a has heard r's new epoch: a failover picking an epoch r
+    // already has would tie with it.)
+    let info_u = |p: u16, field: &str| -> u64 {
+        resp_cmd_full(&mut connect_ready(p), &["CLUSTER", "INFO"])
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    };
+    wait("a hears r's epoch", &|| {
+        info_u(a, "cluster_current_epoch:") >= info_u(r, "cluster_my_epoch:")
+    });
+    assert_eq!(cmd(a, &["CLUSTER", "FAILOVER"]), "+OK\r\n");
+    wait("a is master again", &|| role(a) == "master");
+    // a serves the slot (it may redirect to r until it has taken over).
+    let last = std::cell::RefCell::new(String::new());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = cmd(a, &["SET", key, "v"]);
+        if reply == "+OK\r\n" {
+            break;
+        }
+        *last.borrow_mut() = reply;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a never served slot {slot}: {}\n{}",
+            last.borrow(),
+            [a, b, r]
+                .iter()
+                .map(|&p| format!(
+                    "{p}:\n{}",
+                    resp_cmd_full(&mut connect_ready(p), &["CLUSTER", "NODES"])
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// A hostile cluster-bus peer gets error replies or a hang-up, never a crash:
 /// MEET with a port above 55535 used to overflow `port + 10000` while holding
 /// the node-table lock, poisoning it for every later CLUSTER command.

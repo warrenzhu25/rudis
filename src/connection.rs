@@ -10888,6 +10888,12 @@ async fn migrate_slot_to(
     drop(conn);
 
     send_setslot(host, port, slot, &["NODE", "myself"]).await?;
+    // The slot leaves our slot set before the MOVED goes in: a MOVED for
+    // a slot we still own is ignored as stale (see
+    // `Router::get_slot_state`).
+    if let Some(id) = target_id {
+        crate::cluster::get_cluster_hub(router.base_port).assign_slot(slot, id);
+    }
     router.set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
     router.sync_slot_tables().await;
     Ok(())
@@ -10947,6 +10953,9 @@ async fn execute_rebalance_plans(
             hub.assign_slot(p.slot, &p.target_node_id);
             hub.slot_states.write().remove(&p.slot);
             hub.bump_config_epoch();
+            // Ours now: the importing redirect goes.
+            router.set_slot_state(p.slot, crate::shard::SlotState::Stable);
+            router.sync_slot_tables().await;
             moved += 1;
         }
     }

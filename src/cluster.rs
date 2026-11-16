@@ -425,6 +425,18 @@ impl ClusterHub {
     }
 
     /// Whether this node serves `slot`.
+    /// Whether this node or a known master serves `slot` (so the node
+    /// table, not a recorded MOVED, says where it is served).
+    pub fn slot_owner_known(&self, slot: u16) -> bool {
+        // `my_slots` and `nodes` one at a time: never both held.
+        self.owns_slot(slot)
+            || self
+                .nodes
+                .read()
+                .values()
+                .any(|n| n.is_master() && n.slots.iter().any(|&(s, e)| slot >= s && slot <= e))
+    }
+
     pub fn owns_slot(&self, slot: u16) -> bool {
         self.my_slots
             .read()
