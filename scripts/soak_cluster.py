@@ -40,7 +40,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from soak import MEMTIER, Conn, cpus  # noqa: E402
+from soak import MEMTIER, Conn, cpus, resp  # noqa: E402
 
 CLI = os.path.expanduser(os.environ.get("VALKEY_CLI", "~/valkey-stable/src/valkey-cli"))
 SLOTS = 16384
@@ -162,6 +162,39 @@ def cluster_nodes(port):
         p = int(f[1].split("@")[0].rsplit(":", 1)[1])
         role = "master" if "master" in f[2] else "slave"
         out.append((f[0], p, role, f[3], " ".join(f[8:])))
+    return out
+
+
+def foreign_keys(port):
+    """{slot: keys} for slots holding keys on `port` that it doesn't serve
+    (its master's, for a replica): stale data a node should not have."""
+    ns = cluster_nodes(port)
+    myid = Conn(port, timeout=5).cmd("CLUSTER", "MYID")
+    mine = next(n for n in ns if n[0] == myid)
+    owner_id = myid if mine[2] == "master" else mine[3]
+    owned = set()
+    owner_port = next(n[1] for n in ns if n[0] == owner_id)
+    for n in ns:
+        if n[0] == owner_id:
+            for part in n[4].split():
+                if part.startswith("["):
+                    continue
+                lo, _, hi = part.partition("-")
+                owned.update(range(int(lo), int(hi or lo) + 1))
+    # A slot open for migration ([slot-<-id] importing, [slot->-id]
+    # migrating, shown by the owner only) legitimately has keys on both.
+    for n in cluster_nodes(owner_port):
+        for part in n[4].split():
+            if part.startswith("["):
+                owned.add(int(part[1:].split("-", 1)[0]))
+    c = Conn(port, timeout=30)
+    others = [s for s in range(SLOTS) if s not in owned]
+    c.sock.sendall(b"".join(resp("CLUSTER", "COUNTKEYSINSLOT", s) for s in others))
+    out = {}
+    for s in others:
+        r = c.reply()
+        if isinstance(r, str) and r.startswith(":") and r != ":0":
+            out[s] = int(r[1:])
     return out
 
 
@@ -410,6 +443,19 @@ def main():
                             f()
                         except Exception as e:  # noqa: BLE001
                             bad(f"{f.__name__} raised {e!r}")
+                        # After each action: no node may hold keys of slots
+                        # it doesn't serve (give replication a moment).
+                        time.sleep(2)
+                        for p in ports:
+                            try:
+                                fk = foreign_keys(p)
+                            except Exception as e:  # noqa: BLE001
+                                bad(f"foreign-key check on {p} failed: {e!r}")
+                                continue
+                            if fk:
+                                items = sorted(fk.items())[:5]
+                                bad(f"node {p} holds keys of slots it doesn't serve, after {f.__name__}: "
+                                    f"{len(fk)} slots, {sum(fk.values())} keys, e.g. {items}")
     except KeyboardInterrupt:
         pass
     finally:
