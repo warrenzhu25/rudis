@@ -10573,12 +10573,16 @@ async fn migrate_keys_to_node(
         write_resp_command(&mut tx_buf, &[b"SELECT", db.as_bytes()]);
         prefix += 1;
     }
-    // ASKING lets a cluster target accept keys of a slot it is importing.
-    write_resp_command(&mut tx_buf, &[b"ASKING"]);
-    prefix += 1;
+    // RESTORE-ASKING, which a target importing the slot accepts like a
+    // command after ASKING (Redis has it with cluster mode off too). A
+    // single ASKING up front covered only the first RESTORE (ASKING lasts
+    // one command): with several keys (redis-cli --cluster reshard
+    // migrates them 10 at a time) the target answered the rest -MOVED, the
+    // reshard failed and left the slot open on both nodes.
+    let restore: &[u8] = b"RESTORE-ASKING";
     for (k, payload, expire_at) in &dumps {
         let ttl = (*expire_at).max(0).to_string();
-        let mut args: Vec<&[u8]> = vec![b"RESTORE", k, ttl.as_bytes(), payload];
+        let mut args: Vec<&[u8]> = vec![restore, k, ttl.as_bytes(), payload];
         if opts.replace {
             args.push(b"REPLACE");
         }

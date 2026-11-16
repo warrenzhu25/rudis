@@ -1767,6 +1767,92 @@ fn test_migrate_never_drops_keys_the_target_did_not_store_e2e() {
     shutdown_and_wait(dst_port, &mut dst);
 }
 
+/// MIGRATE of several keys of a slot the target is importing moves them
+/// all, as redis-cli --cluster reshard does 10 keys at a time: the source
+/// sent one ASKING then a RESTORE per key, ASKING covered only the first,
+/// and the target answered the others -MOVED (the reshard failed and left
+/// the slot open on both nodes). RESTORE-ASKING per key, as in Redis.
+#[test]
+fn test_cluster_migrate_of_several_keys_to_an_importing_node_e2e() {
+    let (a, b) = (18353u16, 18359u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_migkeys_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "1",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (da, db) = (mk_dir(a), mk_dir(b));
+    let _na = spawn(a, &da);
+    let _nb = spawn(b, &db);
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let (a_id, b_id) = (
+        bulk(cmd(a, &["CLUSTER", "MYID"])),
+        bulk(cmd(b, &["CLUSTER", "MYID"])),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(b, &["CLUSTER", "NODES"]).contains(&a_id) {
+        assert!(std::time::Instant::now() < deadline, "b never learned a");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let keys: Vec<String> = (0..5).map(|i| format!("{{mk}}:{i}")).collect();
+    let slot = rudis::router::key_slot(keys[0].as_bytes()).to_string();
+    for k in &keys {
+        assert_eq!(cmd(a, &["SET", k, "v"]), "+OK\r\n");
+    }
+    assert_eq!(
+        cmd(b, &["CLUSTER", "SETSLOT", &slot, "IMPORTING", &a_id]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "SETSLOT", &slot, "MIGRATING", &b_id]),
+        "+OK\r\n"
+    );
+    let b_s = b.to_string();
+    let mut args = vec![
+        "MIGRATE",
+        "127.0.0.1",
+        b_s.as_str(),
+        "",
+        "0",
+        "5000",
+        "KEYS",
+    ];
+    args.extend(keys.iter().map(String::as_str));
+    assert_eq!(cmd(a, &args), "+OK\r\n");
+    assert_eq!(
+        cmd(b, &["CLUSTER", "COUNTKEYSINSLOT", &slot]),
+        format!(":{}\r\n", keys.len())
+    );
+    assert_eq!(cmd(a, &["CLUSTER", "COUNTKEYSINSLOT", &slot]), ":0\r\n");
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}
+
 /// A hostile cluster-bus peer gets error replies or a hang-up, never a crash:
 /// MEET with a port above 55535 used to overflow `port + 10000` while holding
 /// the node-table lock, poisoning it for every later CLUSTER command.
@@ -4215,7 +4301,14 @@ fn test_rebalance_never_hands_over_a_slot_whose_keys_did_not_move_e2e() {
     assert_eq!(
         resp_cmd(
             &mut c2,
-            &["ACL", "SETUSER", "default", "+cluster", "-restore"]
+            &[
+                "ACL",
+                "SETUSER",
+                "default",
+                "+cluster",
+                "-restore",
+                "-restore-asking"
+            ]
         ),
         "+OK\r\n"
     );
@@ -4234,7 +4327,10 @@ fn test_rebalance_never_hands_over_a_slot_whose_keys_did_not_move_e2e() {
 
     // 3. Once the target accepts the keys, running it again finishes it.
     assert_eq!(
-        resp_cmd(&mut c2, &["ACL", "SETUSER", "default", "+restore"]),
+        resp_cmd(
+            &mut c2,
+            &["ACL", "SETUSER", "default", "+restore", "+restore-asking"]
+        ),
         "+OK\r\n"
     );
     assert_eq!(rebalance(&mut c1), ":1\r\n");
