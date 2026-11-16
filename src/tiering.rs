@@ -1403,10 +1403,20 @@ mod tests {
             assert_eq!(first.read_ptr_sync(ptr).unwrap().1, b"live");
 
             drop(first);
-            // io_uring closes the dropped fd as an async op; let the ring run
-            // so the flock is released before reopening.
-            monoio::time::sleep(std::time::Duration::from_millis(5)).await;
-            let again = ShardTierManager::open(0, 55559, &dir).await.unwrap();
+            // io_uring closes the dropped fd as an async op: let the ring run
+            // until the flock is released. A fixed 5 ms wasn't always enough
+            // with the whole suite running (the reopen found the file still
+            // "in use").
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let again = loop {
+                monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+                match ShardTierManager::open(0, 55559, &dir).await {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline => {}
+                    r => break r.unwrap(),
+                }
+            };
             assert_eq!(again.current_offset.get(), 0);
         });
         let _ = std::fs::remove_dir_all(&dir);
