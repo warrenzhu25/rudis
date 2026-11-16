@@ -458,7 +458,7 @@ impl ClusterHub {
         let frame = format!("MFSTART {}\r\n", self.my_id());
         match bus_exchange_async(self.port, addr, frame, Duration::from_secs(2)).await {
             Some(reply) => {
-                // +MFOFFSET <offset> [<master's current epoch>]
+                // +MFOFFSET <offset> [<master's current epoch> [<its slots>]]
                 let mut fields = reply
                     .strip_prefix("+MFOFFSET ")
                     .unwrap_or_default()
@@ -468,6 +468,16 @@ impl ClusterHub {
                 })?;
                 if let Some(e) = fields.next().and_then(|e| e.parse().ok()) {
                     self.current_epoch.fetch_max(e, Ordering::SeqCst);
+                }
+                // The slots we take over are the ones our master has now
+                // (its writers are paused, so they stay put), not the ones
+                // we last heard of: a slot it took just before (a reshard)
+                // was left out, and stayed with it, two masters splitting
+                // what was one master's.
+                if let Some(slots) = fields.next()
+                    && let Some(m) = self.nodes.write().get_mut(&master_id)
+                {
+                    m.slots = parse_slot_ranges(slots);
                 }
                 Ok(offset)
             }
@@ -3344,7 +3354,14 @@ fn handle_cluster_bus_line_from(
             // Our current epoch too: the replica's failover epoch must be
             // above every epoch we know, ours included.
             let epoch = hub.current_epoch.load(Ordering::SeqCst);
-            Some(format!("+MFOFFSET {offset} {epoch}\r\n"))
+            // And our slots, the ones the replica takes over.
+            let slots = slots_repr(&hub.announced_slots());
+            Some(
+                format!("+MFOFFSET {offset} {epoch} {slots}")
+                    .trim_end()
+                    .to_string()
+                    + "\r\n",
+            )
         }
         "FAILOVER_AUTH_REQUEST" => {
             // FAILOVER_AUTH_REQUEST <replica_id> <epoch> <master_id>
@@ -4027,6 +4044,8 @@ mod tests {
         // With our current epoch, which the replica's failover epoch must
         // pass.
         assert_eq!(reply.split_whitespace().nth(2), Some("9"), "{reply}");
+        // And our slots, which the replica takes over.
+        assert_eq!(reply.split_whitespace().nth(3), Some("0-16383"), "{reply}");
         assert!(crate::connection::is_client_paused().is_some());
         // Stepping down (a newer claim takes all its slots) lifts the pause.
         let new = "n".repeat(40);
