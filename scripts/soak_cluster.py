@@ -205,7 +205,10 @@ def main():
     ap.add_argument("--interval", type=int, default=60, help="seconds between samples")
     ap.add_argument("--dir", required=True, help="working directory (wiped)")
     ap.add_argument("--cores", default="16-31")
-    ap.add_argument("--port", type=int, default=23000, help="first node's port; nodes are 10 apart")
+    # Bus ports are port + 10000: keep them below the ephemeral range
+    # (32768+ on Linux), where an outgoing connection can hold one and a
+    # node fails to start or restart with "Address already in use".
+    ap.add_argument("--port", type=int, default=21000, help="first node's port; nodes are 10 apart")
     ap.add_argument("--threads", type=int, default=2, help="shards per node")
     ap.add_argument("--rate", type=int, default=1000, help="memtier requests/s per connection")
     ap.add_argument("--keys", type=int, default=300000, help="memtier key space")
