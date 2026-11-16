@@ -457,10 +457,20 @@ impl ClusterHub {
         let addr: SocketAddr = addr.parse().map_err(|e| format!("{e}"))?;
         let frame = format!("MFSTART {}\r\n", self.my_id());
         match bus_exchange_async(self.port, addr, frame, Duration::from_secs(2)).await {
-            Some(reply) => reply
-                .strip_prefix("+MFOFFSET ")
-                .and_then(|o| o.trim().parse().ok())
-                .ok_or_else(|| format!("master refused the manual failover: {}", reply.trim())),
+            Some(reply) => {
+                // +MFOFFSET <offset> [<master's current epoch>]
+                let mut fields = reply
+                    .strip_prefix("+MFOFFSET ")
+                    .unwrap_or_default()
+                    .split_whitespace();
+                let offset = fields.next().and_then(|o| o.parse().ok()).ok_or_else(|| {
+                    format!("master refused the manual failover: {}", reply.trim())
+                })?;
+                if let Some(e) = fields.next().and_then(|e| e.parse().ok()) {
+                    self.current_epoch.fetch_max(e, Ordering::SeqCst);
+                }
+                Ok(offset)
+            }
             _ => Err("master did not answer the manual failover (use FORCE)".to_string()),
         }
     }
@@ -3331,7 +3341,10 @@ fn handle_cluster_bus_line_from(
             let offset = crate::replication::get_replication_hub(hub.port)
                 .master_repl_offset
                 .load(Ordering::SeqCst);
-            Some(format!("+MFOFFSET {offset}\r\n"))
+            // Our current epoch too: the replica's failover epoch must be
+            // above every epoch we know, ours included.
+            let epoch = hub.current_epoch.load(Ordering::SeqCst);
+            Some(format!("+MFOFFSET {offset} {epoch}\r\n"))
         }
         "FAILOVER_AUTH_REQUEST" => {
             // FAILOVER_AUTH_REQUEST <replica_id> <epoch> <master_id>
@@ -4008,8 +4021,12 @@ mod tests {
     fn test_mfstart_pauses_a_masters_writers_until_it_steps_down() {
         let hub = ClusterHub::new(7960);
         hub.cluster_addslotsrange(&[(0, 16383)]).unwrap();
+        hub.current_epoch.store(9, Ordering::SeqCst);
         let reply = handle_cluster_bus_line(&format!("MFSTART {}", "r".repeat(40)), &hub).unwrap();
         assert!(reply.starts_with("+MFOFFSET "), "{reply}");
+        // With our current epoch, which the replica's failover epoch must
+        // pass.
+        assert_eq!(reply.split_whitespace().nth(2), Some("9"), "{reply}");
         assert!(crate::connection::is_client_paused().is_some());
         // Stepping down (a newer claim takes all its slots) lifts the pause.
         let new = "n".repeat(40);

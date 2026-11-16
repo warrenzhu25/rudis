@@ -2194,20 +2194,6 @@ fn test_cluster_slot_regained_by_failover_is_served_not_redirected_e2e() {
     wait("a follows r", &|| role(a) == "slave" && role(r) == "master");
     // b gives the slot to r; then a takes over from r, inheriting it.
     hand_over(b, r, r_id);
-    // (Once a has heard r's new epoch: a failover picking an epoch r
-    // already has would tie with it.)
-    let info_u = |p: u16, field: &str| -> u64 {
-        resp_cmd_full(&mut connect_ready(p), &["CLUSTER", "INFO"])
-            .lines()
-            .find_map(|l| l.strip_prefix(field))
-            .unwrap_or("0")
-            .trim()
-            .parse()
-            .unwrap_or(0)
-    };
-    wait("a hears r's epoch", &|| {
-        info_u(a, "cluster_current_epoch:") >= info_u(r, "cluster_my_epoch:")
-    });
     assert_eq!(cmd(a, &["CLUSTER", "FAILOVER"]), "+OK\r\n");
     wait("a is master again", &|| role(a) == "master");
     // a serves the slot (it may redirect to r until it has taken over).
