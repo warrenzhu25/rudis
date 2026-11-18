@@ -224,6 +224,12 @@ pub struct ClusterHub {
     pub minority_since: AtomicU64,
     /// `cluster-allow-reads-when-down`: serve reads while down.
     pub allow_reads_when_down: AtomicBool,
+    /// `cluster-require-full-coverage` (default yes, as in Redis): the
+    /// cluster is down while some slot is served by no reachable master.
+    pub require_full_coverage: AtomicBool,
+    /// Down for coverage: some slot has no owner, or only a failed one
+    /// (see `update_cluster_state`; with `require_full_coverage`).
+    pub coverage_down: AtomicBool,
     /// This master paused its writers for a replica's manual failover
     /// (until it steps down, or the pause times out).
     pub mf_paused: AtomicBool,
@@ -341,6 +347,8 @@ impl ClusterHub {
             cluster_down: AtomicBool::new(false),
             minority_since: AtomicU64::new(0),
             allow_reads_when_down: AtomicBool::new(false),
+            require_full_coverage: AtomicBool::new(true),
+            coverage_down: AtomicBool::new(false),
             mf_paused: AtomicBool::new(false),
             announce_ip: RwLock::new(None),
             announce_port: std::sync::atomic::AtomicU16::new(0),
@@ -425,6 +433,38 @@ impl ClusterHub {
     }
 
     /// Whether this node serves `slot`.
+    /// Whether the cluster is down here: this master is cut off from the
+    /// majority, or (with `cluster-require-full-coverage`) some slot is
+    /// served by no reachable master. Keyed commands get -CLUSTERDOWN.
+    pub fn is_down(&self) -> bool {
+        self.cluster_down.load(Ordering::Relaxed) || self.coverage_down.load(Ordering::Relaxed)
+    }
+
+    /// Whether every slot is served, by this master or by a master not
+    /// marked failed. A lone node still on its default slots serves all.
+    pub fn all_slots_served(&self) -> bool {
+        if self.has_default_slots() {
+            return true;
+        }
+        let mut served = vec![false; 16384];
+        let mut mark = |ranges: &[(u16, u16)]| {
+            for &(s, e) in ranges {
+                served[s as usize..=e as usize].fill(true);
+            }
+        };
+        // `my_slots` and `nodes` one at a time: never both held.
+        if *self.role.read() == "master" {
+            let mine = self.my_slots.read().clone();
+            mark(&mine);
+        }
+        for n in self.nodes.read().values() {
+            if n.is_master() && n.fail != FailState::Fail {
+                mark(&n.slots);
+            }
+        }
+        served.iter().all(|&s| s)
+    }
+
     /// Whether this node or a known master serves `slot` (so the node
     /// table, not a recorded MOVED, says where it is served).
     pub fn slot_owner_known(&self, slot: u16) -> bool {
@@ -1274,11 +1314,12 @@ impl ClusterHub {
         let count = |st: u8| slot_state.iter().filter(|&&v| v == st).count();
         let (slots_ok, slots_pfail, slots_fail) = (count(1), count(2), count(3));
         let slots_assigned = slots_ok + slots_pfail + slots_fail;
-        // Down while a failed master still serves slots (no replica took
-        // them over yet).
-        let uncovered = nodes
-            .values()
-            .any(|n| n.fail == FailState::Fail && n.is_master() && !n.slots.is_empty());
+        // With cluster-require-full-coverage, down while some slot has no
+        // owner or only a failed one (no replica took it over yet), as in
+        // Redis; and down while this master is cut off from the majority.
+        let uncovered = self.require_full_coverage.load(Ordering::Relaxed)
+            && !self.has_default_slots()
+            && (slots_ok + slots_pfail < 16384);
         let down = uncovered || self.cluster_down.load(Ordering::Relaxed);
         let state = if down { "fail" } else { "ok" };
         let cur_epoch = self.current_epoch.load(Ordering::Relaxed);
@@ -3496,6 +3537,7 @@ fn note_unreachable(hub: &ClusterHub, id: &str, now: u64, quorum: usize) {
 /// for a rejoin delay (the node timeout, within 0.5-5 s), giving it time
 /// to learn whether it was failed over meanwhile.
 fn update_cluster_state(hub: &ClusterHub, now: u64) {
+    update_coverage_state(hub);
     let me_serves = *hub.role.read() == "master" && !hub.my_slots.read().is_empty();
     let minority = me_serves && {
         let nodes = hub.nodes.read();
@@ -3522,6 +3564,20 @@ fn update_cluster_state(hub: &ClusterHub, now: u64) {
             || now.saturating_sub(hub.minority_since.load(Ordering::Relaxed)) >= rejoin_delay
         {
             hub.cluster_down.store(false, Ordering::Relaxed);
+            crate::log_notice!("Cluster state changed: ok");
+        }
+    }
+}
+
+/// `cluster-require-full-coverage`: down while some slot is served by no
+/// reachable master (unassigned, or its master failed and no replica took
+/// over), up again as soon as every slot is.
+fn update_coverage_state(hub: &ClusterHub) {
+    let uncovered = hub.require_full_coverage.load(Ordering::Relaxed) && !hub.all_slots_served();
+    if hub.coverage_down.swap(uncovered, Ordering::Relaxed) != uncovered {
+        if uncovered {
+            crate::log_warning!("Cluster state changed: fail (not all slots are served)");
+        } else if !hub.cluster_down.load(Ordering::Relaxed) {
             crate::log_notice!("Cluster state changed: ok");
         }
     }
@@ -3935,6 +3991,62 @@ mod tests {
     /// A master that can reach fewer than a majority of the masters
     /// serving slots marks the cluster down, and serves again only a
     /// rejoin delay after the majority is reachable again.
+    #[test]
+    fn test_require_full_coverage_downs_the_cluster_while_a_slot_is_unserved() {
+        let peer = |id: &str, slots: Vec<(u16, u16)>| ClusterNodeInfo {
+            id: id.to_string(),
+            ip: "127.0.0.1".to_string(),
+            port: 7731,
+            cport: 17731,
+            flags: "master".to_string(),
+            fail: FailState::Ok,
+            shards: 0,
+            master_id: "-".to_string(),
+            ping_sent: 0,
+            pong_recv: 0,
+            config_epoch: 1,
+            link_state: "connected".to_string(),
+            slots,
+        };
+        let state = |hub: &ClusterHub| {
+            let info = hub.cluster_info();
+            info.lines()
+                .find_map(|l| l.strip_prefix("cluster_state:"))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let hub = ClusterHub::new(7730);
+        // A lone node on its default slots serves them all.
+        update_coverage_state(&hub);
+        assert!(!hub.is_down());
+        // Joined: we serve 0-8191, a peer 8192-16382; 16383 has no owner.
+        hub.slots_default.store(false, Ordering::SeqCst);
+        *hub.my_slots.write() = vec![(0, 8191)];
+        let other = "o".repeat(40);
+        hub.nodes
+            .write()
+            .insert(other.clone(), peer(&other, vec![(8192, 16382)]));
+        update_coverage_state(&hub);
+        assert!(hub.is_down(), "a slot without an owner");
+        assert_eq!(state(&hub), "fail");
+        // Every slot served: up again.
+        hub.nodes.write().get_mut(&other).unwrap().slots = vec![(8192, 16383)];
+        update_coverage_state(&hub);
+        assert!(!hub.is_down());
+        assert_eq!(state(&hub), "ok");
+        // The peer's master failed (no replica took over): down.
+        hub.nodes.write().get_mut(&other).unwrap().fail = FailState::Fail;
+        update_coverage_state(&hub);
+        assert!(hub.is_down(), "slots of a failed master");
+        assert_eq!(state(&hub), "fail");
+        // cluster-require-full-coverage no: only the unserved slots are.
+        hub.require_full_coverage.store(false, Ordering::SeqCst);
+        update_coverage_state(&hub);
+        assert!(!hub.is_down());
+        assert_eq!(state(&hub), "ok");
+    }
+
     #[test]
     fn test_a_master_in_a_minority_marks_the_cluster_down() {
         let hub = ClusterHub::new(7710);

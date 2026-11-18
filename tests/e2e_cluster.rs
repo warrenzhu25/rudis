@@ -478,8 +478,15 @@ fn test_cluster_bus_gossip_failover_e2e() {
         "Node 2 should be promoted to myself,master after failover"
     );
 
+    // No slot was ever assigned here: with cluster-require-full-coverage
+    // (the default, as in Redis) that cluster is down. This test is about
+    // the failover itself, so coverage isn't required.
+    assert_eq!(
+        send_and_read(&mut c2, b"CONFIG SET cluster-require-full-coverage no\r\n"),
+        "+OK\r\n"
+    );
     let info2 = send_and_read(&mut c2, b"CLUSTER INFO\r\n");
-    assert!(info2.contains("cluster_state:ok"));
+    assert!(info2.contains("cluster_state:ok"), "{info2}");
     assert!(
         info2.contains("cluster_current_epoch:2") || info2.contains("cluster_my_epoch:2"),
         "Epoch should increment after failover. Info: {}",

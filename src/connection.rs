@@ -4207,6 +4207,11 @@ pub fn apply_config_value(
                 .allow_reads_when_down
                 .store(parse_config_bool(name, val_str)?, Ordering::Relaxed);
         }
+        "cluster-require-full-coverage" => {
+            crate::cluster::get_cluster_hub(base_port)
+                .require_full_coverage
+                .store(parse_config_bool(name, val_str)?, Ordering::Relaxed);
+        }
         "cluster-node-timeout" => {
             let ms: u64 = parse_config_num(name, val_str)?;
             if ms == 0 {
@@ -4489,7 +4494,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 109] = [
+    let all_configs: [(&str, String); 110] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -4499,6 +4504,18 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
             "cluster-allow-reads-when-down",
             if cluster_hub
                 .allow_reads_when_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
+        (
+            "cluster-require-full-coverage",
+            if cluster_hub
+                .require_full_coverage
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 "yes"
@@ -13835,7 +13852,7 @@ async fn execute_command_inner(
                     // A master cut off from the majority of masters serves
                     // no keys (Redis's minority rule; see
                     // `cluster::update_cluster_state`).
-                    if hub.cluster_down.load(std::sync::atomic::Ordering::Relaxed)
+                    if hub.is_down()
                         && (cmd.is_write_command()
                             || !hub
                                 .allow_reads_when_down
