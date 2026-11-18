@@ -3167,11 +3167,17 @@ fn test_cluster_master_failure_promotes_its_replica_e2e() {
     );
     let k = &keys[1];
     let shard = rudis::router::slot_to_shard(rudis::router::key_slot(k.as_bytes()), 2);
-    let moved = cmd(ports[2] + shard as u16, &["SET", k, "split"]);
-    assert!(
-        moved.starts_with("-MOVED"),
-        "old master still serves: {moved}"
-    );
+    // It never takes the write. Until its view has every slot served
+    // again (cluster-require-full-coverage) it answers -CLUSTERDOWN, then
+    // -MOVED to the new master.
+    wait_until("old master redirects to the new one", &mut || {
+        let r = cmd(ports[2] + shard as u16, &["SET", k, "split"]);
+        assert!(
+            r.starts_with("-MOVED") || r.starts_with("-CLUSTERDOWN"),
+            "old master still serves: {r}"
+        );
+        (!r.starts_with("-MOVED")).then_some(r)
+    });
     wait_until("old master replicates the new master", &mut || {
         let info = cmd(ports[2], &["INFO", "replication"]);
         let want = format!("master_port:{replica}");
