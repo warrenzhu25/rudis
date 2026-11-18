@@ -178,31 +178,7 @@ pub fn log_command_if_slow(cmd: &Command, duration_us: u64, client_addr: &str, c
         .unwrap_or_default()
         .as_secs();
 
-    let (mut argv, original_argc) = command_to_slowlog_argv(cmd);
-
-    // 1. Truncate strings longer than slowlog-entry-max-string-len. Shorter
-    // ones are copied: arguments can be slices of a connection's shared read
-    // buffer (zero-copy parsed commands), and an entry kept in the log would
-    // otherwise pin that whole buffer.
-    let max_str_len = SLOWLOG_ENTRY_MAX_STRING_LEN.load(Ordering::Relaxed);
-    for arg in &mut argv {
-        if arg.len() > max_str_len {
-            let excess = arg.len() - max_str_len;
-            let mut truncated = arg.slice(..max_str_len).to_vec();
-            truncated.extend_from_slice(format!("... ({} more bytes)", excess).as_bytes());
-            *arg = Bytes::from(truncated);
-        } else if !arg.is_empty() {
-            *arg = Bytes::copy_from_slice(arg);
-        }
-    }
-
-    // 2. Truncate argv longer than slowlog-entry-max-argc
-    let max_argc = SLOWLOG_ENTRY_MAX_ARGC.load(Ordering::Relaxed);
-    if argv.len() > max_argc && max_argc >= 2 {
-        let excess = original_argc - (max_argc - 1);
-        argv.truncate(max_argc - 1);
-        argv.push(Bytes::from(format!("... ({} more arguments)", excess)));
-    }
+    let (argv, original_argc) = logged_argv(cmd);
 
     let entry = SlowlogEntry {
         id,
@@ -910,6 +886,38 @@ pub fn write_slowlog_entries_resp(entries: &[SlowlogEntry], out: &mut Vec<u8>) {
     }
 }
 
+/// `cmd`'s arguments as a log entry keeps them (SLOWLOG, COMMANDLOG):
+/// sensitive ones redacted, strings past slowlog-entry-max-string-len cut
+/// short and argv past slowlog-entry-max-argc too. Every argument is a
+/// copy: arguments can be slices of a connection's read buffer
+/// (zero-copy parsed commands), and an entry kept in the log would
+/// otherwise pin that whole buffer. COMMANDLOG's large-request entries
+/// kept their short arguments (`SET`, the key) as such slices: each pinned
+/// the ~8 MB buffer of the request it logged, up to 64 of them, so a few
+/// big writes held hundreds of MB, counted in used_memory, and a server
+/// under maxmemory then refused every write.
+fn logged_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
+    let (mut argv, original_argc) = command_to_slowlog_argv(cmd);
+    let max_str_len = SLOWLOG_ENTRY_MAX_STRING_LEN.load(Ordering::Relaxed);
+    for arg in &mut argv {
+        if arg.len() > max_str_len {
+            let excess = arg.len() - max_str_len;
+            let mut truncated = arg.slice(..max_str_len).to_vec();
+            truncated.extend_from_slice(format!("... ({} more bytes)", excess).as_bytes());
+            *arg = Bytes::from(truncated);
+        } else if !arg.is_empty() {
+            *arg = Bytes::copy_from_slice(arg);
+        }
+    }
+    let max_argc = SLOWLOG_ENTRY_MAX_ARGC.load(Ordering::Relaxed);
+    if argv.len() > max_argc && max_argc >= 2 {
+        let excess = original_argc - (max_argc - 1);
+        argv.truncate(max_argc - 1);
+        argv.push(Bytes::from(format!("... ({} more arguments)", excess)));
+    }
+    (argv, original_argc)
+}
+
 fn build_truncated_entry(
     cmd: &Command,
     metric_val: u64,
@@ -922,22 +930,7 @@ fn build_truncated_entry(
         .unwrap_or_default()
         .as_secs();
 
-    let (mut argv, original_argc) = command_to_slowlog_argv(cmd);
-    let max_str_len = SLOWLOG_ENTRY_MAX_STRING_LEN.load(Ordering::Relaxed);
-    for arg in &mut argv {
-        if arg.len() > max_str_len {
-            let excess = arg.len() - max_str_len;
-            let mut truncated = arg.slice(..max_str_len).to_vec();
-            truncated.extend_from_slice(format!("... ({} more bytes)", excess).as_bytes());
-            *arg = Bytes::from(truncated);
-        }
-    }
-    let max_argc = SLOWLOG_ENTRY_MAX_ARGC.load(Ordering::Relaxed);
-    if argv.len() > max_argc && max_argc >= 2 {
-        let excess = original_argc - (max_argc - 1);
-        argv.truncate(max_argc - 1);
-        argv.push(Bytes::from(format!("... ({} more arguments)", excess)));
-    }
+    let (argv, original_argc) = logged_argv(cmd);
     SlowlogEntry {
         id,
         timestamp: now_ts,
@@ -1300,6 +1293,45 @@ pub(crate) mod tests {
             "slowlog entry still points into the request buffer"
         );
         slowlog_reset();
+    }
+
+    #[test]
+    fn test_commandlog_entries_do_not_pin_the_request_buffer() {
+        // Same for COMMANDLOG: a large SET whose key (and command) are
+        // slices of the read buffer holding its value. Its entries kept the
+        // short arguments as slices, pinning the whole buffer (MBs per big
+        // write, up to 64 entries per log).
+        let _guard = TEST_LOCK.lock();
+        commandlog_reset(CommandlogType::LargeRequest);
+        commandlog_reset(CommandlogType::LargeReply);
+        COMMANDLOG_REQUEST_LARGER_THAN.store(1024, Ordering::Relaxed);
+        COMMANDLOG_REPLY_LARGER_THAN.store(1024, Ordering::Relaxed);
+        SLOWLOG_ENTRY_MAX_STRING_LEN.store(128, Ordering::Relaxed);
+        let buf = Bytes::from(vec![b'v'; 64 * 1024]);
+        let range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
+        let cmd = Command::Append {
+            key: buf.slice(10..20),
+            value: buf.slice(100..),
+        };
+        log_command_if_large_request(&cmd, 64 * 1024, "127.0.0.1:5002", "pin-test");
+        log_command_if_large_reply(&cmd, 64 * 1024, "127.0.0.1:5002", "pin-test");
+        for log in [&LARGE_REQUEST_BUFFER, &LARGE_REPLY_BUFFER] {
+            let entries = log.lock();
+            let e = entries
+                .iter()
+                .find(|e| e.client_name == "pin-test")
+                .expect("entry logged");
+            for arg in &e.argv {
+                assert!(
+                    !range.contains(&(arg.as_ptr() as usize)),
+                    "commandlog entry still points into the request buffer: {arg:?}"
+                );
+            }
+        }
+        commandlog_reset(CommandlogType::LargeRequest);
+        commandlog_reset(CommandlogType::LargeReply);
+        COMMANDLOG_REQUEST_LARGER_THAN.store(DEFAULT_COMMANDLOG_LARGER_THAN, Ordering::Relaxed);
+        COMMANDLOG_REPLY_LARGER_THAN.store(DEFAULT_COMMANDLOG_LARGER_THAN, Ordering::Relaxed);
     }
 
     #[test]
