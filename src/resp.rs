@@ -25,6 +25,10 @@ pub enum SetSlotSubcommand {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum ClusterSubcommand {
+    /// CLUSTER REPLICAS / SLAVES <node-id>
+    Replicas(String),
+    /// CLUSTER COUNT-FAILURE-REPORTS <node-id>
+    CountFailureReports(String),
     KeySlot(Bytes),
     CountKeysInSlot(u16),
     GetKeysInSlot(u16, usize),
@@ -4254,6 +4258,20 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "NODES" => Ok(Some(Command::Cluster(ClusterSubcommand::Nodes))),
                 "INFO" => Ok(Some(Command::Cluster(ClusterSubcommand::Info))),
                 "MYID" => Ok(Some(Command::Cluster(ClusterSubcommand::MyId))),
+                "REPLICAS" | "SLAVES" | "COUNT-FAILURE-REPORTS" => {
+                    if args.len() != 3 {
+                        return Err(format!(
+                            "wrong number of arguments for 'cluster|{}' command",
+                            sub.to_ascii_lowercase()
+                        ));
+                    }
+                    let id = String::from_utf8_lossy(&args[2]).to_string();
+                    Ok(Some(Command::Cluster(if sub == "COUNT-FAILURE-REPORTS" {
+                        ClusterSubcommand::CountFailureReports(id)
+                    } else {
+                        ClusterSubcommand::Replicas(id)
+                    })))
+                }
                 "MEET" => {
                     if args.len() < 4 {
                         return Err(

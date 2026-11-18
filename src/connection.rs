@@ -15265,6 +15265,24 @@ async fn execute_command_inner(
                     out.extend_from_slice(info.as_bytes());
                     out.extend_from_slice(b"\r\n");
                 }
+                ClusterSubcommand::Replicas(id) => {
+                    match crate::cluster::get_cluster_hub(router.base_port).cluster_replicas(&id) {
+                        Ok(lines) => {
+                            out.extend_from_slice(format!("*{}\r\n", lines.len()).as_bytes());
+                            for l in lines {
+                                write_resp_bulk(out, l.as_bytes());
+                            }
+                        }
+                        Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+                    }
+                }
+                ClusterSubcommand::CountFailureReports(id) => {
+                    match crate::cluster::get_cluster_hub(router.base_port).count_failure_reports(&id)
+                    {
+                        Ok(n) => out.extend_from_slice(format!(":{n}\r\n").as_bytes()),
+                        Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+                    }
+                }
                 ClusterSubcommand::MyId => {
                     let id = router.my_id();
                     out.extend_from_slice(format!("${}\r\n", id.len()).as_bytes());

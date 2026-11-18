@@ -1346,6 +1346,41 @@ impl ClusterHub {
         }
     }
 
+    /// CLUSTER REPLICAS <node-id>: the CLUSTER NODES lines of the master
+    /// `id`'s replicas.
+    pub fn cluster_replicas(&self, id: &str) -> Result<Vec<String>, String> {
+        let my_id = self.my_id();
+        let is_master = if id == my_id {
+            *self.role.read() == "master"
+        } else {
+            match self.nodes.read().get(id) {
+                Some(n) => n.is_master(),
+                None => return Err(format!("Unknown node {id}")),
+            }
+        };
+        if !is_master {
+            return Err("The specified node is not a master".to_string());
+        }
+        Ok(self
+            .render_nodes(false)
+            .lines()
+            .filter(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() > 3 && f[2].split(',').any(|x| x == "slave") && f[3] == id
+            })
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// CLUSTER COUNT-FAILURE-REPORTS <node-id>: how many masters reported
+    /// `id` unreachable (PFAIL), as this node has heard.
+    pub fn count_failure_reports(&self, id: &str) -> Result<usize, String> {
+        if id != self.my_id() && !self.nodes.read().contains_key(id) {
+            return Err(format!("Unknown node {id}"));
+        }
+        Ok(self.pfail_reports.read().get(id).map_or(0, |r| r.len()))
+    }
+
     pub fn cluster_nodes(&self) -> String {
         self.render_nodes(true)
     }
@@ -4332,6 +4367,42 @@ mod tests {
         // Already following it: nothing more.
         handle_cluster_bus_line(&format!("PING {m} 1 slave port=7751 of={sib}"), &hub);
         assert_eq!(hub.take_follow(), None);
+    }
+
+    #[test]
+    fn test_cluster_replicas_and_count_failure_reports() {
+        let hub = ClusterHub::new(7760);
+        hub.my_slots.write().clear();
+        hub.slots_default.store(false, Ordering::SeqCst);
+        let (m, r1, r2) = ("m".repeat(40), "a".repeat(40), "b".repeat(40));
+        for (id, port) in [(&m, 7761), (&r1, 7762), (&r2, 7763)] {
+            handle_cluster_bus_line(&format!("MEET 127.0.0.1 {port} {id} 0"), &hub);
+        }
+        handle_cluster_bus_line(&format!("PING {m} 1 master 0-16383 port=7761"), &hub);
+        handle_cluster_bus_line(&format!("PING {r1} 0 slave port=7762 of={m}"), &hub);
+        handle_cluster_bus_line(&format!("PING {r2} 0 slave port=7763 of={m}"), &hub);
+        let replicas = hub.cluster_replicas(&m).unwrap();
+        assert_eq!(replicas.len(), 2, "{replicas:?}");
+        assert!(replicas.iter().all(|l| l.contains(&format!(" slave {m} "))));
+        // We replicate m too: listed with the others.
+        hub.cluster_replicate(&m).unwrap();
+        assert_eq!(hub.cluster_replicas(&m).unwrap().len(), 3);
+        assert_eq!(
+            hub.cluster_replicas(&r1),
+            Err("The specified node is not a master".to_string())
+        );
+        assert_eq!(
+            hub.cluster_replicas(&"z".repeat(40)),
+            Err(format!("Unknown node {}", "z".repeat(40)))
+        );
+        assert_eq!(hub.count_failure_reports(&m), Ok(0));
+        hub.pfail_reports
+            .write()
+            .entry(m.clone())
+            .or_default()
+            .insert(r1.clone());
+        assert_eq!(hub.count_failure_reports(&m), Ok(1));
+        assert!(hub.count_failure_reports(&"z".repeat(40)).is_err());
     }
 
     #[test]
