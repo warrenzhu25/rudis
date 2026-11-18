@@ -2414,6 +2414,105 @@ fn test_cluster_announce_hostname_and_preferred_endpoint_e2e() {
     let _ = std::fs::remove_dir_all(&db);
 }
 
+/// A master that loses a slot to a newer claim (another node took it with
+/// a higher config epoch) deletes its keys there, and its replica drops
+/// them too, as in Redis: they were kept, stale copies that came back if
+/// the slot ever returned.
+#[test]
+fn test_cluster_lost_slot_keys_are_deleted_on_master_and_replica_e2e() {
+    let (a, b, ra) = (18481u16, 18485u16, 18487u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_lostslot_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "1",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let dirs = [mk_dir(a), mk_dir(b), mk_dir(ra)];
+    let _na = spawn(a, &dirs[0]);
+    let _nb = spawn(b, &dirs[1]);
+    let _nr = spawn(ra, &dirs[2]);
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    let wait = |what: &str, f: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !f() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "8191"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["CLUSTER", "ADDSLOTSRANGE", "8192", "16383"]),
+        "+OK\r\n"
+    );
+    for p in [b, ra] {
+        assert_eq!(
+            cmd(p, &["CLUSTER", "MEET", "127.0.0.1", &a.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    let a_id = bulk(cmd(a, &["CLUSTER", "MYID"]));
+    let b_id = bulk(cmd(b, &["CLUSTER", "MYID"]));
+    wait("ra knows a", &|| {
+        cmd(ra, &["CLUSTER", "NODES"]).contains(&a_id)
+    });
+    assert_eq!(cmd(ra, &["CLUSTER", "REPLICATE", &a_id]), "+OK\r\n");
+    let key = (0..)
+        .map(|i| format!("lost{i}"))
+        .find(|k| rudis::router::key_slot(k.as_bytes()) < 8192)
+        .unwrap();
+    let slot = rudis::router::key_slot(key.as_bytes()).to_string();
+    wait("everyone agrees", &|| {
+        [a, b, ra]
+            .iter()
+            .all(|&p| cmd(p, &["CLUSTER", "INFO"]).contains("cluster_state:ok"))
+    });
+    assert_eq!(cmd(a, &["SET", &key, "v"]), "+OK\r\n");
+    let count = |p: u16| cmd(p, &["CLUSTER", "COUNTKEYSINSLOT", &slot]);
+    wait("ra has the key", &|| count(ra) == ":1\r\n");
+    // b takes the slot with a newer epoch, without a's agreement.
+    assert!(cmd(b, &["CLUSTER", "BUMPEPOCH"]).starts_with("+"));
+    assert_eq!(
+        cmd(b, &["CLUSTER", "SETSLOT", &slot, "NODE", &b_id]),
+        "+OK\r\n"
+    );
+    wait("a drops the key", &|| count(a) == ":0\r\n");
+    wait("ra drops the key", &|| count(ra) == ":0\r\n");
+    // Other keys of a's slots stay.
+    let other = (0..)
+        .map(|i| format!("keep{i}"))
+        .find(|k| {
+            let s = rudis::router::key_slot(k.as_bytes());
+            s < 8192 && s.to_string() != slot
+        })
+        .unwrap();
+    assert_eq!(cmd(a, &["SET", &other, "v"]), "+OK\r\n");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(cmd(a, &["EXISTS", &other]), ":1\r\n");
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// A hostile cluster-bus peer gets error replies or a hang-up, never a crash:
 /// MEET with a port above 55535 used to overflow `port + 10000` while holding
 /// the node-table lock, poisoning it for every later CLUSTER command.

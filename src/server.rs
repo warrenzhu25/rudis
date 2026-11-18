@@ -682,10 +682,13 @@ pub fn run_shard_worker(
                 // or EXPIRE from the master and lose the key).
                 let is_replica = crate::replication::get_replication_hub(base_port).is_slave();
                 if !is_replica {
-                    let mut db = active_db.borrow_mut();
-                    db.active_expire_cycle();
-                    // A promoted replica expires everything normally now.
-                    db.replica_local_keys.clear();
+                    {
+                        let mut db = active_db.borrow_mut();
+                        db.active_expire_cycle();
+                        // A promoted replica expires everything normally now.
+                        db.replica_local_keys.clear();
+                    }
+                    purge_lost_slots(&mem_router, &active_db, base_port, shard_id);
                 } else {
                     // Except keys clients wrote here, which no master expires.
                     active_db.borrow_mut().expire_replica_local_keys();
@@ -3008,6 +3011,44 @@ pub(crate) fn spawn_aof_flusher(
             }
         }
     });
+}
+
+/// Deletes this shard's keys in slots the cluster says this master lost
+/// to a newer claim (see `ClusterHub::take_slot_purges`), propagated to
+/// replicas and the AOF like any delete. A slot this node owns again by
+/// now is left alone.
+fn purge_lost_slots(
+    router: &crate::router::Router,
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
+    base_port: u16,
+    shard_id: usize,
+) {
+    if !crate::cluster::has_active_cluster(base_port) {
+        return;
+    }
+    let hub = crate::cluster::get_cluster_hub(base_port);
+    for slot in hub.take_slot_purges(shard_id) {
+        if hub.owns_slot(slot) {
+            continue;
+        }
+        let mut deleted = 0usize;
+        loop {
+            let keys = db.borrow_mut().get_keys_in_slot(slot, 1000);
+            if keys.is_empty() {
+                break;
+            }
+            for k in keys {
+                deleted += usize::from(router.del_local(k));
+            }
+        }
+        if deleted > 0 {
+            crate::log_notice!(
+                "Cluster: deleted {} keys of slot {}, now served by another node",
+                deleted,
+                slot
+            );
+        }
+    }
 }
 
 /// The `appendfsync everysec` fsync: makes what is written so far durable

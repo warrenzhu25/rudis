@@ -290,6 +290,10 @@ pub struct ClusterHub {
     /// Down for coverage: some slot has no owner, or only a failed one
     /// (see `update_cluster_state`; with `require_full_coverage`).
     pub coverage_down: AtomicBool,
+    /// Slots this master lost to a newer claim while it may still hold keys
+    /// in them, per shard: each shard deletes its keys there (propagated
+    /// to replicas and the AOF), as Redis does with its "dirty slots".
+    slot_purges: parking_lot::Mutex<Vec<Vec<u16>>>,
     /// This master paused its writers for a replica's manual failover
     /// (until it steps down, or the pause times out).
     pub mf_paused: AtomicBool,
@@ -416,6 +420,7 @@ impl ClusterHub {
             allow_reads_when_down: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
             coverage_down: AtomicBool::new(false),
+            slot_purges: parking_lot::Mutex::new(Vec::new()),
             mf_paused: AtomicBool::new(false),
             announce_ip: RwLock::new(None),
             announce_hostname: RwLock::new(String::new()),
@@ -787,8 +792,35 @@ impl ClusterHub {
             if self.mf_paused.swap(false, Ordering::SeqCst) {
                 crate::connection::unpause_clients();
             }
+        } else if *self.role.read() == "master" {
+            // Still a master: keys left in the lost slots are stale (their
+            // new owner serves the slot now), so they go, here and on our
+            // replicas. A master that lost all its slots becomes a replica
+            // instead and resyncs from its new master.
+            self.queue_slot_purge(&lost);
         }
         let _ = self.save_config();
+    }
+
+    /// Has each shard delete its keys in `slots` (see `take_slot_purges`).
+    fn queue_slot_purge(&self, slots: &[u16]) {
+        let shards = self.num_shards.load(Ordering::Acquire).max(1);
+        let mut q = self.slot_purges.lock();
+        if q.len() < shards {
+            q.resize_with(shards, Vec::new);
+        }
+        for per_shard in q.iter_mut() {
+            per_shard.extend_from_slice(slots);
+        }
+    }
+
+    /// The lost slots shard `shard` has yet to delete its keys in.
+    pub fn take_slot_purges(&self, shard: usize) -> Vec<u16> {
+        self.slot_purges
+            .lock()
+            .get_mut(shard)
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     pub fn set_config_file(&self, path: std::path::PathBuf) {
