@@ -1104,6 +1104,13 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
             "cluster-preferred-endpoint-type".to_string(),
             cluster_hub.preferred_endpoint().name().to_string(),
         );
+        let migrate = cluster_hub
+            .allow_replica_migration
+            .load(std::sync::atomic::Ordering::Relaxed);
+        directives.insert(
+            "cluster-allow-replica-migration".to_string(),
+            if migrate { "yes" } else { "no" }.to_string(),
+        );
         let full = cluster_hub
             .require_full_coverage
             .load(std::sync::atomic::Ordering::Relaxed);

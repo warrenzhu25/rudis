@@ -4241,6 +4241,11 @@ pub fn apply_config_value(
                 .preferred_endpoint
                 .store(e as u8, Ordering::Relaxed);
         }
+        "cluster-allow-replica-migration" => {
+            crate::cluster::get_cluster_hub(base_port)
+                .allow_replica_migration
+                .store(parse_config_bool(name, val_str)?, Ordering::Relaxed);
+        }
         "cluster-require-full-coverage" => {
             crate::cluster::get_cluster_hub(base_port)
                 .require_full_coverage
@@ -4528,7 +4533,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 113] = [
+    let all_configs: [(&str, String); 114] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -4554,6 +4559,18 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         (
             "cluster-preferred-endpoint-type",
             cluster_hub.preferred_endpoint().name().to_string(),
+        ),
+        (
+            "cluster-allow-replica-migration",
+            if cluster_hub
+                .allow_replica_migration
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
         ),
         (
             "cluster-require-full-coverage",
@@ -15452,7 +15469,13 @@ async fn execute_command_inner(
                             // we dropped it on our SETSLOT NODE, and the
                             // slot was left without an owner.
                             match owner_id {
-                                Some(id) => hub.assign_slot(slot, &id),
+                                Some(id) => {
+                                    let was_mine = hub.owns_slot(slot);
+                                    hub.assign_slot(slot, &id);
+                                    if was_mine {
+                                        hub.follow_after_last_slot(&id);
+                                    }
+                                }
                                 None => {
                                     crate::cluster::remove_slots(&mut hub.my_slots.write(), &[slot])
                                 }

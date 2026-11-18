@@ -5651,3 +5651,102 @@ fn test_cluster_multi_redirects_when_queued_e2e() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// A master that gives its last slot away with CLUSTER SETSLOT NODE (as
+/// redis-cli does on the old owner of a reshard) becomes a replica of the
+/// new owner, as in Redis; not with cluster-allow-replica-migration no.
+#[test]
+fn test_cluster_master_giving_last_slot_away_becomes_replica_e2e() {
+    for migrate in ["yes", "no"] {
+        let (a, b) = (18571u16, 18577u16);
+        let mk_dir = |p: u16| {
+            let d =
+                std::env::temp_dir().join(format!("rudis_lastslot_{}_{}", p, std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d.to_str().unwrap().to_string()
+        };
+        let spawn = |p: u16, dir: &str| {
+            ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    dir,
+                    "--cluster-enabled",
+                    "yes",
+                    "--threads",
+                    "1",
+                    "--no-pin",
+                ],
+                p,
+            ))
+        };
+        let (da, db) = (mk_dir(a), mk_dir(b));
+        let na = spawn(a, &da);
+        let nb = spawn(b, &db);
+        let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+        let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+        assert_eq!(
+            cmd(
+                b,
+                &["CONFIG", "SET", "cluster-allow-replica-migration", migrate]
+            ),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "16382"]),
+            "+OK\r\n"
+        );
+        assert_eq!(cmd(b, &["CLUSTER", "ADDSLOTS", "16383"]), "+OK\r\n");
+        assert_eq!(
+            cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+            "+OK\r\n"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while ![a, b]
+            .iter()
+            .all(|&p| cmd(p, &["CLUSTER", "INFO"]).contains("cluster_state:ok"))
+        {
+            assert!(std::time::Instant::now() < deadline, "never ok");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let a_id = bulk(cmd(a, &["CLUSTER", "MYID"]));
+        // The old owner first, so its own SETSLOT empties it (not a's claim).
+        assert_eq!(
+            cmd(b, &["CLUSTER", "SETSLOT", "16383", "NODE", &a_id]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(a, &["CLUSTER", "SETSLOT", "16383", "NODE", &a_id]),
+            "+OK\r\n"
+        );
+        let follows = |p: u16| {
+            let nodes = cmd(p, &["CLUSTER", "NODES"]);
+            nodes
+                .lines()
+                .any(|l| l.contains("myself,slave") && l.contains(&a_id))
+        };
+        if migrate == "yes" {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !(follows(b)
+                && cmd(b, &["INFO", "replication"]).contains("master_link_status:up"))
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "b did not become a's replica: {}",
+                    cmd(b, &["CLUSTER", "NODES"])
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        } else {
+            thread::sleep(Duration::from_secs(1));
+            assert!(!follows(b), "{}", cmd(b, &["CLUSTER", "NODES"]));
+            assert!(cmd(b, &["CLUSTER", "NODES"]).contains("myself,master"));
+        }
+        drop((na, nb));
+        for d in [&da, &db] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}

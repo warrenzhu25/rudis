@@ -300,6 +300,9 @@ pub struct ClusterHub {
     /// `cluster-require-full-coverage` (default yes, as in Redis): the
     /// cluster is down while some slot is served by no reachable master.
     pub require_full_coverage: AtomicBool,
+    /// `cluster-allow-replica-migration`: a master that gives away its last
+    /// slot (CLUSTER SETSLOT NODE) becomes a replica of the new owner.
+    pub allow_replica_migration: AtomicBool,
     /// Down for coverage: some slot has no owner, or only a failed one
     /// (see `update_cluster_state`; with `require_full_coverage`).
     pub coverage_down: AtomicBool,
@@ -445,6 +448,7 @@ impl ClusterHub {
             minority_since: AtomicU64::new(0),
             allow_reads_when_down: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
+            allow_replica_migration: AtomicBool::new(true),
             coverage_down: AtomicBool::new(false),
             slot_purges: parking_lot::Mutex::new(Vec::new()),
             mf_paused: AtomicBool::new(false),
@@ -699,6 +703,44 @@ impl ClusterHub {
     /// current owner is ignored for that slot. A master that loses all its
     /// slots this way (it was failed over while down or cut off) becomes a
     /// replica of the claimant, so two nodes never serve the same slots.
+    /// Turns this master into a replica of `id` (at client address
+    /// `addr`), which the replication loop then syncs from.
+    fn become_replica_of(&self, id: &str, addr: (String, u16)) {
+        *self.role.write() = "slave".to_string();
+        *self.master_id.write() = id.to_string();
+        *self.follow.lock() = Some(addr);
+        // A manual failover paused our writers: they resume now, and get
+        // MOVED to the new master.
+        if self.mf_paused.swap(false, Ordering::SeqCst) {
+            crate::connection::unpause_clients();
+        }
+    }
+
+    /// CLUSTER SETSLOT <slot> NODE `new_owner` gave away a slot of ours: if
+    /// it was our last, we become the new owner's replica, as Redis does
+    /// with `cluster-allow-replica-migration` (the default). Otherwise a
+    /// reshard that empties a node (redis-cli does SETSLOT NODE on the old
+    /// owner too, before the new owner's claim reaches it) left an empty
+    /// master behind.
+    pub fn follow_after_last_slot(&self, new_owner: &str) {
+        if !self.allow_replica_migration.load(Ordering::Relaxed)
+            || *self.role.read() != "master"
+            || !self.my_slots.read().is_empty()
+        {
+            return;
+        }
+        let addr = match self.nodes.read().get(new_owner) {
+            Some(n) if n.is_master() => (n.ip.clone(), n.port),
+            _ => return,
+        };
+        crate::log_warning!(
+            "Cluster: gave my last slot to {}: becoming its replica",
+            new_owner
+        );
+        self.become_replica_of(new_owner, addr);
+        let _ = self.save_config();
+    }
+
     pub fn claim_slots(&self, id: &str, epoch: Option<u64>, slots: Vec<(u16, u16)>) {
         self.resolve_config_epoch_collision(id, epoch);
         // Our own state first: never take `my_slots` under `nodes`. The
@@ -811,14 +853,7 @@ impl ClusterHub {
         );
         if emptied && *self.role.read() == "master" {
             crate::log_warning!("Cluster: lost all my slots to {}: becoming its replica", id);
-            *self.role.write() = "slave".to_string();
-            *self.master_id.write() = id.to_string();
-            *self.follow.lock() = Some(master_addr);
-            // A manual failover paused our writers: they resume now, and
-            // get MOVED to the new master.
-            if self.mf_paused.swap(false, Ordering::SeqCst) {
-                crate::connection::unpause_clients();
-            }
+            self.become_replica_of(id, master_addr);
         } else if *self.role.read() == "master" {
             // Still a master: keys left in the lost slots are stale (their
             // new owner serves the slot now), so they go, here and on our
