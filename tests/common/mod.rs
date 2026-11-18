@@ -21,7 +21,7 @@ pub fn sweep_dead_test_server_dirs() {
         };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            let pid = ["rudis-srv-", "rudis-cluster-", "rudis-tls-"]
+            let pid = ["rudis-srv-", "rudis-cluster-", "rudis-tls-", "rudis-e2e-"]
                 .iter()
                 .find_map(|prefix| name.strip_prefix(prefix))
                 .and_then(|rest| rest.split('-').next())
@@ -29,7 +29,10 @@ pub fn sweep_dead_test_server_dirs() {
             if let Some(pid) = pid
                 && !std::path::Path::new(&format!("/proc/{pid}")).exists()
             {
-                let _ = std::fs::remove_dir_all(e.path());
+                // Server output files (`rudis-e2e-*`) are files.
+                if std::fs::remove_dir_all(e.path()).is_err() {
+                    let _ = std::fs::remove_file(e.path());
+                }
             }
         }
     });
@@ -479,7 +482,51 @@ impl Drop for ServerGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        report_server_log(self.0.id());
     }
+}
+
+fn server_logs() -> &'static std::sync::Mutex<std::collections::HashMap<u32, std::path::PathBuf>> {
+    static LOGS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    LOGS.get_or_init(Default::default)
+}
+
+fn server_log_path(port: u16) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("rudis-e2e-{}-{port}-{n}.log", std::process::id()))
+}
+
+/// Called once a spawned server is gone: if the test is failing, prints
+/// the end of the server's output (shown with the failure), then removes
+/// the file.
+pub fn report_server_log(pid: u32) {
+    report_server_log_inner(pid, std::thread::panicking());
+}
+
+/// [`report_server_log`], printing whether or not the test is failing yet.
+pub fn report_server_log_now(pid: u32) {
+    report_server_log_inner(pid, true);
+}
+
+fn report_server_log_inner(pid: u32, print: bool) {
+    let Some(path) = server_logs().lock().unwrap().remove(&pid) else {
+        return;
+    };
+    if print && let Ok(text) = std::fs::read_to_string(&path) {
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = &lines[lines.len().saturating_sub(60)..];
+        eprintln!(
+            "---- rudis pid {pid} output (last {} lines) ----",
+            tail.len()
+        );
+        for l in tail {
+            eprintln!("{l}");
+        }
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 pub fn spawn_rudis_listening(args: &[&str], port: u16) -> std::process::Child {
@@ -500,14 +547,26 @@ pub fn spawn_rudis_listening_at(
     port: u16,
     legacy: &str,
 ) -> std::process::Child {
+    // The server's output goes to a file, shown if the test fails (see
+    // `report_server_log`), so a failure that only shows up in a full run
+    // leaves the server's side of it (a crash report, a dropped client).
+    let log = server_log_path(port);
+    let (out, err) = match std::fs::File::create(&log) {
+        Ok(f) => match f.try_clone() {
+            Ok(g) => (std::process::Stdio::from(f), std::process::Stdio::from(g)),
+            Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+        },
+        Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+    };
     let mut child = rudis_bin()
         .args(args)
         .args(DEBUG_ON)
         .env("MONOIO_FORCE_LEGACY_DRIVER", legacy)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .spawn()
         .expect("spawn rudis");
+    server_logs().lock().unwrap().insert(child.id(), log);
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     // A bare connect is not enough: right after a previous instance on the
     // same port was SIGKILLed, the kernel may still hold its io_uring
@@ -544,10 +603,14 @@ pub fn shutdown_and_wait(port: u16, child: &mut std::process::Child) {
     while child.try_wait().unwrap().is_none() {
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
+            // Shown: the server's output says where it hung.
+            report_server_log_now(child.id());
             panic!("rudis did not shut down");
         }
         thread::sleep(Duration::from_millis(50));
     }
+    report_server_log(child.id());
 }
 
 pub fn wait_exit(
@@ -1342,6 +1405,7 @@ impl Drop for KillRudisOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        report_server_log(self.0.id());
     }
 }
 
