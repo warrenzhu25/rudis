@@ -4209,10 +4209,12 @@ pub fn apply_config_value(
         }
         "cluster-announce-hostname" => {
             if !crate::cluster::valid_hostname(val_str) {
-                return Err(
-                    "Hostnames must be less than 256 characters and only contain letters, digits, '-' and '.'"
-                        .to_string(),
-                );
+                return Err(if val_str.len() >= 256 {
+                    "Hostnames must be less than 256 characters".to_string()
+                } else {
+                    "Hostnames may only contain alphanumeric characters, hyphens or dots"
+                        .to_string()
+                });
             }
             *crate::cluster::get_cluster_hub(base_port)
                 .announce_hostname
