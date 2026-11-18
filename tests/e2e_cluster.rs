@@ -5411,3 +5411,82 @@ fn test_migrate_slot_keys_readable_on_non_cluster_target_e2e() {
     shutdown_and_wait(p2, &mut srv2);
     shutdown_and_wait(p1, &mut srv1);
 }
+
+/// CLUSTER FORGET reaches every node, as in Redis: the forgotten node goes
+/// from the whole cluster, and gossip doesn't bring it back. Before, only
+/// the node that ran FORGET dropped it, and the others re-taught it.
+#[test]
+fn test_cluster_forget_propagates_to_all_nodes_e2e() {
+    let ports = [18531u16, 18537, 18543];
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_forget_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let dirs: Vec<String> = ports.iter().map(|&p| mk_dir(p)).collect();
+    let _srvs: Vec<ServerGuard> = ports
+        .iter()
+        .zip(&dirs)
+        .map(|(&p, dir)| {
+            ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    dir,
+                    "--cluster-enabled",
+                    "yes",
+                    "--threads",
+                    "1",
+                    "--no-pin",
+                ],
+                p,
+            ))
+        })
+        .collect();
+    let [a, b, c] = ports;
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    for p in [b, c] {
+        assert_eq!(
+            cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &p.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    let (a_id, c_id) = (
+        bulk(cmd(a, &["CLUSTER", "MYID"])),
+        bulk(cmd(c, &["CLUSTER", "MYID"])),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(b, &["CLUSTER", "NODES"]).contains(&c_id) {
+        assert!(std::time::Instant::now() < deadline, "b never learned c");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(cmd(a, &["CLUSTER", "FORGET", &a_id]).starts_with("-ERR I tried hard"));
+    assert!(cmd(a, &["CLUSTER", "FORGET", &"f".repeat(40)]).starts_with("-ERR Unknown node"));
+
+    // c leaves under a new id; a forgets the old one.
+    assert_eq!(cmd(c, &["CLUSTER", "RESET", "HARD"]), "+OK\r\n");
+    assert_eq!(cmd(a, &["CLUSTER", "FORGET", &c_id]), "+OK\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while [a, b]
+        .iter()
+        .any(|&p| cmd(p, &["CLUSTER", "NODES"]).contains(&c_id))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "FORGET did not reach b: {}",
+            cmd(b, &["CLUSTER", "NODES"])
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // And stays forgotten across a few gossip rounds.
+    thread::sleep(Duration::from_secs(3));
+    for p in [a, b] {
+        assert!(!cmd(p, &["CLUSTER", "NODES"]).contains(&c_id));
+    }
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

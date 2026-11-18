@@ -259,6 +259,10 @@ pub struct ClusterHub {
     /// slots. Any explicit slot assignment ends this state.
     pub slots_default: AtomicBool,
     pub pfail_reports: RwLock<HashMap<String, HashSet<String>>>,
+    /// Nodes removed by CLUSTER FORGET (here or on a peer) and when the
+    /// ban ends: gossip does not re-add them until then, as Redis's
+    /// 60-second forget blacklist.
+    forgotten: RwLock<HashMap<String, u64>>,
     pub bus_running: AtomicBool,
     pub cancel_bus: RwLock<Option<flume::Sender<()>>>,
     pub active_migration: RwLock<Option<ActiveMigration>>,
@@ -406,6 +410,7 @@ impl ClusterHub {
             my_slots: RwLock::new(vec![(0, 16383)]),
             slots_default: AtomicBool::new(true),
             pfail_reports: RwLock::new(HashMap::new()),
+            forgotten: RwLock::new(HashMap::new()),
             bus_running: AtomicBool::new(false),
             cancel_bus: RwLock::new(None),
             active_migration: RwLock::new(None),
@@ -1697,7 +1702,52 @@ impl ClusterHub {
         Ok(())
     }
 
+    /// CLUSTER FORGET: drops `node_id`, bans it from gossip for
+    /// [`FORGET_TTL_MS`], and tells every peer to do the same, so the node
+    /// leaves the whole cluster instead of being gossiped straight back.
     pub fn cluster_forget(&self, node_id: &str) -> Result<(), String> {
+        if node_id == self.my_id() {
+            return Err("I tried hard but I can't forget myself...".to_string());
+        }
+        if !self.nodes.read().contains_key(node_id) {
+            return Err(format!("Unknown node {node_id}"));
+        }
+        if *self.role.read() == "slave" && *self.master_id.read() == node_id {
+            return Err("Can't forget my master!".to_string());
+        }
+        self.forget_node(node_id);
+        // Off the caller's thread: dialing every peer blocks.
+        let peers = self.peer_bus_addrs();
+        let msg = format!("FORGET {node_id}\r\n");
+        let port = self.port;
+        std::thread::spawn(move || {
+            for addr in peers {
+                if let Ok(mut stream) = bus_dial(port, addr, Duration::from_millis(200)) {
+                    let _ = stream.write_all(msg.as_bytes());
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Whether gossip must not (re-)add `node_id`: it was forgotten less
+    /// than [`FORGET_TTL_MS`] ago.
+    fn is_forgotten(&self, node_id: &str) -> bool {
+        self.forgotten
+            .read()
+            .get(node_id)
+            .is_some_and(|&until| until > now_ms())
+    }
+
+    /// Removes `node_id` and bans it from gossip (CLUSTER FORGET here, or a
+    /// peer's FORGET).
+    fn forget_node(&self, node_id: &str) {
+        {
+            let now = now_ms();
+            let mut f = self.forgotten.write();
+            f.retain(|_, until| *until > now);
+            f.insert(node_id.to_string(), now + FORGET_TTL_MS);
+        }
         {
             let mut nodes = self.nodes.write();
             nodes.remove(node_id);
@@ -1710,7 +1760,6 @@ impl ClusterHub {
             }
         }
         let _ = self.save_config();
-        Ok(())
     }
 
     /// Makes this node a replica of `master_id` and returns the master's
@@ -2361,16 +2410,18 @@ impl ClusterHub {
         self.cluster_delslots(&Self::expand_ranges(ranges)?)
     }
 
+    /// Bus addresses of every known peer.
+    fn peer_bus_addrs(&self) -> Vec<SocketAddr> {
+        let nodes = self.nodes.read();
+        nodes
+            .values()
+            .filter_map(|n| format!("{}:{}", n.ip, n.cport).parse().ok())
+            .collect()
+    }
+
     pub fn broadcast_to_peers(&self, msg: &str) {
-        let peers: Vec<(String, u16)> = {
-            let nodes = self.nodes.read();
-            nodes.values().map(|n| (n.ip.clone(), n.cport)).collect()
-        };
-        for (ip, cport) in peers {
-            let addr = format!("{}:{}", ip, cport);
-            if let Ok(parsed) = addr.parse::<SocketAddr>()
-                && let Ok(mut stream) = bus_dial(self.port, parsed, Duration::from_millis(200))
-            {
+        for addr in self.peer_bus_addrs() {
+            if let Ok(mut stream) = bus_dial(self.port, addr, Duration::from_millis(200)) {
                 let _ = stream.write_all(msg.as_bytes());
             }
         }
@@ -3135,6 +3186,9 @@ const MAX_BUS_LINE: usize = 1 << 20;
 /// table, or the per-tick PING fan-out over it, without bound.
 pub const MAX_CLUSTER_NODES: usize = 1000;
 
+/// How long a forgotten node stays out of gossip (Redis: 60 seconds).
+const FORGET_TTL_MS: u64 = 60_000;
+
 /// Concurrent inbound cluster-bus connections; each one holds a thread.
 const MAX_BUS_CONNS: usize = 256;
 
@@ -3632,7 +3686,10 @@ fn handle_cluster_bus_line_from(
                                 if gfail == FailState::Fail {
                                     n.fail = FailState::Fail;
                                 }
-                            } else if gport > 0 && nodes.len() < MAX_CLUSTER_NODES {
+                            } else if gport > 0
+                                && nodes.len() < MAX_CLUSTER_NODES
+                                && !hub.is_forgotten(&gid)
+                            {
                                 nodes.insert(
                                     gid.clone(),
                                     ClusterNodeInfo {
@@ -3661,6 +3718,16 @@ fn handle_cluster_bus_line_from(
             }
 
             Some(pong_reply(hub))
+        }
+        "FORGET" => {
+            // FORGET <node_id>: a peer ran CLUSTER FORGET.
+            let id = parts.get(1)?;
+            // Like Redis, never ourselves, nor the master we replicate.
+            let my_master = *hub.role.read() == "slave" && *hub.master_id.read() == *id;
+            if *id != hub.my_id() && !my_master {
+                hub.forget_node(id);
+            }
+            Some("+OK\r\n".to_string())
         }
         "FAIL" => {
             // FAIL <failed_node_id>
@@ -5386,6 +5453,53 @@ mod tests {
         assert!(!hub.pfail_reports.read().get(&node2_id).unwrap().is_empty());
         hub.cluster_forget(&node2_id).unwrap();
         assert!(!hub.pfail_reports.read().contains_key(&node2_id));
+    }
+
+    /// CLUSTER FORGET refuses unknown nodes and ourselves, keeps the node
+    /// out of gossip for the ban, and a peer's FORGET does the same here.
+    #[test]
+    fn test_cluster_forget_bans_node_from_gossip() {
+        let hub = Arc::new(ClusterHub::new(7150));
+        let peer = "a".repeat(40);
+        let x = "b".repeat(40);
+        let y = "c".repeat(40);
+        let gossip = |id: &str| {
+            handle_cluster_bus_line(
+                &format!("PING {peer} 1 master 0-100 GOSSIP {id},127.0.0.1,7002,17002,master,1"),
+                &hub,
+            );
+        };
+        gossip(&x);
+        gossip(&y);
+        assert!(hub.nodes.read().contains_key(&x));
+        assert!(hub.nodes.read().contains_key(&y));
+
+        assert!(
+            hub.cluster_forget(&hub.my_id())
+                .unwrap_err()
+                .contains("myself")
+        );
+        assert!(
+            hub.cluster_forget(&"d".repeat(40))
+                .unwrap_err()
+                .starts_with("Unknown node")
+        );
+        hub.cluster_forget(&x).unwrap();
+        assert!(!hub.nodes.read().contains_key(&x));
+        // Still gossiped by others: not added back during the ban.
+        gossip(&x);
+        assert!(!hub.nodes.read().contains_key(&x));
+
+        // A peer forgot y.
+        handle_cluster_bus_line(&format!("FORGET {y}"), &hub);
+        assert!(!hub.nodes.read().contains_key(&y));
+        gossip(&y);
+        assert!(!hub.nodes.read().contains_key(&y));
+
+        // Once the ban ends, gossip may add it again.
+        hub.forgotten.write().insert(x.clone(), 0);
+        gossip(&x);
+        assert!(hub.nodes.read().contains_key(&x));
     }
 
     #[test]
