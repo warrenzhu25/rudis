@@ -25,14 +25,17 @@ anomaly seen. Processes are pinned with taskset to --cores (a range, e.g.
 """
 
 import argparse
+import hashlib
 import json
 import os
+import random
 import shutil
 import signal
 import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 
 MEMTIER = os.path.expanduser("~/memtier_benchmark/memtier_benchmark")
@@ -62,12 +65,19 @@ class Conn:
         return line
 
     def _exact(self, n):
-        while len(self.buf) < n + 2:
-            chunk = self.sock.recv(1 << 16)
-            if not chunk:
-                raise ConnectionError("closed")
-            self.buf += chunk
-        data, self.buf = self.buf[:n], self.buf[n + 2 :]
+        need = n + 2
+        if len(self.buf) < need:
+            # Collected then joined: appending to bytes copied a multi-MB
+            # reply over and over.
+            parts, have = [self.buf], len(self.buf)
+            while have < need:
+                chunk = self.sock.recv(max(1 << 16, min(need - have, 1 << 22)))
+                if not chunk:
+                    raise ConnectionError("closed")
+                parts.append(chunk)
+                have += len(chunk)
+            self.buf = b"".join(parts)
+        data, self.buf = self.buf[:n], self.buf[need:]
         return data
 
     def reply(self):
@@ -112,6 +122,94 @@ def latency_probe(port, n=200):
     }
 
 
+class BigValueWriter(threading.Thread):
+    """Writes big values (512 KB to 8 MB) to a few keys, reads each back and
+    checks its content, now and then deletes one: what a load of small
+    values never exercises (big query buffers, COMMANDLOG large-request
+    entries, big AOF and replication writes). `cmd(key, *args)` runs a
+    command for `key` (and reconnects on errors as it needs).
+
+    A value read back different from the last one acknowledged for its key
+    (or present after an acknowledged DEL) is a mismatch: an anomaly. A
+    missing one counts apart (evicted, under maxmemory)."""
+
+    def __init__(self, cmd, period, keys=16, min_size=512 << 10, max_size=8 << 20, prefix="bigval:"):
+        super().__init__(daemon=True)
+        self.cmd, self.period = cmd, period
+        self.keys = [f"{prefix}{i}" for i in range(keys)]
+        self.min_size, self.max_size = min_size, max_size
+        self.expect = {}  # key -> sha256 of the value acknowledged last, None after DEL
+        self.stats = {"writes": 0, "bytes_written": 0, "verified": 0, "missing": 0, "deletes": 0,
+                      "mismatches": 0, "errors": {}}
+        self.examples = []
+        self.stop_event = threading.Event()
+
+    def _err(self, r):
+        kind = (r or "-NONE").split()[0] if isinstance(r, str) else type(r).__name__
+        self.stats["errors"][kind] = self.stats["errors"].get(kind, 0) + 1
+
+    def _check(self, key, value):
+        want = self.expect.get(key, "unknown")
+        if want == "unknown":
+            return
+        if value is None:
+            if want is not None:
+                self.stats["missing"] += 1
+            else:
+                self.stats["verified"] += 1
+            return
+        got = hashlib.sha256(value.encode()).hexdigest()
+        if got == want:
+            self.stats["verified"] += 1
+        else:
+            self.stats["mismatches"] += 1
+            if len(self.examples) < 5:
+                self.examples.append(f"{key}: {len(value)} bytes, not the value last written")
+
+    def run(self):
+        ver = 0
+        while not self.stop_event.wait(self.period):
+            key = random.choice(self.keys)
+            try:
+                op = random.random()
+                if op < 0.1:
+                    r = self.cmd(key, "DEL", key)
+                    if isinstance(r, str) and r.startswith(":"):
+                        self.expect[key] = None
+                        self.stats["deletes"] += 1
+                    else:
+                        self._err(r)
+                        self.expect[key] = "unknown"
+                    continue
+                if op < 0.8:
+                    ver += 1
+                    size = random.randint(self.min_size, self.max_size)
+                    base = hashlib.sha256(f"{key}:{ver}".encode()).hexdigest()
+                    value = (base * (size // len(base) + 1))[:size]
+                    r = self.cmd(key, "SET", key, value)
+                    if r == "+OK":
+                        self.expect[key] = hashlib.sha256(value.encode()).hexdigest()
+                        self.stats["writes"] += 1
+                        self.stats["bytes_written"] += size
+                    else:
+                        # Refused (OOM, a redirect loop): what the key holds
+                        # is unknown until the next acknowledged write.
+                        self._err(r)
+                        self.expect[key] = "unknown"
+                        continue
+                r = self.cmd(key, "GET", key)
+                if r is None or (isinstance(r, str) and not r.startswith("-")):
+                    self._check(key, r)
+                else:
+                    self._err(r)
+            except Exception as e:  # noqa: BLE001
+                self._err(f"-EXC {type(e).__name__}")
+                self.expect[key] = "unknown"
+
+    def summary(self):
+        return dict(self.stats, examples=self.examples)
+
+
 def wait_port(port, proc, secs=30):
     end = time.time() + secs
     while time.time() < end:
@@ -141,6 +239,8 @@ def main():
     ap.add_argument("--port", type=int, default=21000, help="master port; replica is +1")
     ap.add_argument("--maxmemory", default="2gb")
     ap.add_argument("--rate", type=int, default=2000, help="memtier requests/s per connection")
+    ap.add_argument("--big-every", type=float, default=2.0,
+                    help="seconds between big-value operations (512 KB-8 MB values); 0 turns them off")
     a = ap.parse_args()
 
     shutil.rmtree(a.dir, ignore_errors=True)
@@ -188,6 +288,22 @@ def main():
         "--key-prefix", "ttl-", "--key-maximum", "2000000", "--expiry-range", "5-600",
         "--rate-limiting", str(a.rate // 2), "--test-time", str(duration), "--hide-histogram",
     ], stdout=open(os.path.join(a.dir, "memtier_ttl.out"), "w"), stderr=subprocess.STDOUT)
+
+    big = None
+    if a.big_every > 0:
+        conn = {}
+
+        def big_cmd(_key, *args):
+            try:
+                c = conn.get("c") or Conn(mp, timeout=30)
+                conn["c"] = c
+                return c.cmd(*args)
+            except OSError:
+                conn.pop("c", None)
+                raise
+
+        big = BigValueWriter(big_cmd, a.big_every)
+        big.start()
 
     samples_path = os.path.join(a.dir, "samples.jsonl")
     anomalies = []
@@ -254,6 +370,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if big:
+            big.stop_event.set()
+            big.join(60)
         for p in (mixed, ttl):
             if p.poll() is None:
                 p.terminate()
@@ -295,6 +414,10 @@ def main():
                 p.wait(60)
             except subprocess.TimeoutExpired:
                 p.kill()
+    if big:
+        digest["big_values"] = big.summary()
+        if big.stats["mismatches"]:
+            anomalies.append(f"big values read back wrong: {big.examples}")
     write_report(a, samples_path, anomalies, digest)
 
 

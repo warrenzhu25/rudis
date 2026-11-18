@@ -40,7 +40,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from soak import MEMTIER, Conn, cpus, resp  # noqa: E402
+from soak import MEMTIER, BigValueWriter, Conn, cpus, resp  # noqa: E402
 
 CLI = os.path.expanduser(os.environ.get("VALKEY_CLI", "~/valkey-stable/src/valkey-cli"))
 SLOTS = 16384
@@ -222,6 +222,8 @@ def main():
     ap.add_argument("--threads", type=int, default=2, help="shards per node")
     ap.add_argument("--rate", type=int, default=1000, help="memtier requests/s per connection")
     ap.add_argument("--keys", type=int, default=300000, help="memtier key space")
+    ap.add_argument("--big-every", type=float, default=2.0,
+                    help="seconds between big-value operations (512 KB-8 MB values); 0 turns them off")
     ap.add_argument("--failover-every", type=int, default=600, help="seconds")
     ap.add_argument("--reshard-every", type=int, default=1200, help="seconds")
     ap.add_argument("--restart-every", type=int, default=1800, help="seconds")
@@ -321,6 +323,11 @@ def main():
 
     writer = threading.Thread(target=counters, daemon=True)
     writer.start()
+    big = None
+    if a.big_every > 0:
+        big_cc = ClusterClient(ports)
+        big = BigValueWriter(lambda key, *args: big_cc.cmd(key, *args), a.big_every)
+        big.start()
 
     def masters():
         ns = cluster_nodes(random.choice([p for p in ports if procs[p].poll() is None]))
@@ -484,6 +491,9 @@ def main():
         pass
     finally:
         stop_counters.set()
+        if big:
+            big.stop_event.set()
+            big.join(60)
         if memtier.poll() is None:
             memtier.terminate()
         try:
@@ -502,6 +512,10 @@ def main():
             got = int(r) if isinstance(r, str) and r.lstrip("-").isdigit() else None
             if got is None or got < v:
                 lost.append((k, v, r))
+        if big:
+            final["big_values"] = big.summary()
+            if big.stats["mismatches"]:
+                anomalies.append(f"big values read back wrong: {big.examples}")
         final["counters"] = {"keys": len(acked), "acked_incrs": sum(acked.values()),
                              "lost": len(lost), "examples": lost[:10]}
         if lost:
