@@ -25,6 +25,64 @@ pub const MANUAL_FAILOVER_TIMEOUT_MS: u64 = 5000;
 /// Default `cluster-node-timeout`: a peer silent this long is PFAIL.
 pub const NODE_TIMEOUT_MS: u64 = 5000;
 
+/// `cluster-preferred-endpoint-type`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Endpoint {
+    /// The node's IP (the default).
+    Ip = 0,
+    /// Its announced hostname, `?` if it has none.
+    Hostname = 1,
+    /// None: clients reach the node at the address they used.
+    Unknown = 2,
+}
+
+impl Endpoint {
+    pub fn parse(v: &str) -> Option<Self> {
+        match v.to_ascii_lowercase().as_str() {
+            "ip" => Some(Self::Ip),
+            "hostname" => Some(Self::Hostname),
+            "unknown-endpoint" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ip => "ip",
+            Self::Hostname => "hostname",
+            Self::Unknown => "unknown-endpoint",
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Hostname,
+            2 => Self::Unknown,
+            _ => Self::Ip,
+        }
+    }
+}
+
+/// `,<hostname>` after a node's address in CLUSTER NODES (and nodes.conf),
+/// as in Redis; nothing without one.
+fn hostname_suffix(h: &str) -> String {
+    if h.is_empty() {
+        String::new()
+    } else {
+        format!(",{h}")
+    }
+}
+
+/// Whether `h` may be announced as a hostname: as in Redis, letters,
+/// digits, `-` and `.` only (it is gossiped and shown space-separated),
+/// under 256 characters. Empty clears it.
+pub fn valid_hostname(h: &str) -> bool {
+    h.len() < 256
+        && h.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
 #[derive(Clone, Debug)]
 pub struct ClusterNodeInfo {
     pub id: String,
@@ -45,6 +103,8 @@ pub struct ClusterNodeInfo {
     pub config_epoch: u64,
     pub link_state: String, // "connected", "disconnected"
     pub slots: Vec<(u16, u16)>,
+    /// `cluster-announce-hostname` as the node announces it; empty if none.
+    pub hostname: String,
 }
 
 impl ClusterNodeInfo {
@@ -236,6 +296,13 @@ pub struct ClusterHub {
     /// `cluster-announce-ip`: the address peers and clients are told to
     /// reach this node at (MEET, CLUSTER NODES/SLOTS/SHARDS, MOVED).
     pub announce_ip: RwLock<Option<String>>,
+    /// `cluster-announce-hostname`: shown with this node's address in
+    /// CLUSTER NODES/SHARDS/SLOTS (and given to clients instead of it with
+    /// `cluster-preferred-endpoint-type hostname`); empty if none.
+    pub announce_hostname: RwLock<String>,
+    /// `cluster-preferred-endpoint-type`: what CLUSTER SLOTS and MOVED/ASK
+    /// give clients as a node's endpoint (see [`Endpoint`]).
+    pub preferred_endpoint: std::sync::atomic::AtomicU8,
     /// `cluster-announce-port` (0: the port we listen on). Shard N is at
     /// this port + N, as with the real one.
     pub announce_port: std::sync::atomic::AtomicU16,
@@ -351,6 +418,8 @@ impl ClusterHub {
             coverage_down: AtomicBool::new(false),
             mf_paused: AtomicBool::new(false),
             announce_ip: RwLock::new(None),
+            announce_hostname: RwLock::new(String::new()),
+            preferred_endpoint: std::sync::atomic::AtomicU8::new(Endpoint::Ip as u8),
             announce_port: std::sync::atomic::AtomicU16::new(0),
             announce_bus_port: std::sync::atomic::AtomicU16::new(0),
             learned_ip: RwLock::new(None),
@@ -433,6 +502,28 @@ impl ClusterHub {
     }
 
     /// Whether this node serves `slot`.
+    /// The endpoint clients are given for a node at `ip` announcing
+    /// `hostname` (CLUSTER SLOTS, MOVED/ASK), per
+    /// `cluster-preferred-endpoint-type`: its IP, its hostname (`?` if it
+    /// has none), or nothing (clients reach it at the address they used).
+    pub fn endpoint<'a>(&self, ip: &'a str, hostname: &'a str) -> &'a str {
+        match Endpoint::from_u8(self.preferred_endpoint.load(Ordering::Relaxed)) {
+            Endpoint::Ip => ip,
+            Endpoint::Hostname if hostname.is_empty() => "?",
+            Endpoint::Hostname => hostname,
+            Endpoint::Unknown => "",
+        }
+    }
+
+    pub fn preferred_endpoint(&self) -> Endpoint {
+        Endpoint::from_u8(self.preferred_endpoint.load(Ordering::Relaxed))
+    }
+
+    /// This node's announced hostname (empty if none).
+    pub fn my_hostname(&self) -> String {
+        self.announce_hostname.read().clone()
+    }
+
     /// Whether the cluster is down here: this master is cut off from the
     /// majority, or (with `cluster-require-full-coverage`) some slot is
     /// served by no reachable master. Keyed commands get -CLUSTERDOWN.
@@ -795,7 +886,12 @@ impl ClusterHub {
                 continue;
             }
             let id = parts[0].to_string();
-            let addr_part = parts[1];
+            // ip:port@cport[,hostname]
+            let (addr_part, hostname) = match parts[1].split_once(',') {
+                Some((a, h)) if valid_hostname(h) => (a, h.to_string()),
+                Some((a, _)) => (a, String::new()),
+                None => (parts[1], String::new()),
+            };
             let (ip_port, cport_opt) = match addr_part.split_once('@') {
                 Some((ip_p, cp)) => (ip_p, cp.parse::<u16>().ok()),
                 None => (addr_part, None),
@@ -850,6 +946,9 @@ impl ClusterHub {
                 self.config_epoch.store(config_epoch, Ordering::SeqCst);
                 self.current_epoch.fetch_max(config_epoch, Ordering::SeqCst);
                 parsed_my_slots = node_slots;
+                // Our own hostname comes from cluster-announce-hostname, as
+                // in Redis, not from the file.
+                let _ = hostname;
             } else if is_own_shard_pseudo_node(self.port, &id, port) {
                 // Written by older versions (see `render_nodes`): one of our
                 // own shards, not a peer.
@@ -876,6 +975,7 @@ impl ClusterHub {
                         config_epoch,
                         link_state,
                         slots: node_slots,
+                        hostname,
                     },
                 );
             }
@@ -1105,6 +1205,8 @@ impl ClusterHub {
             self.my_port(),
             self.my_cport()
         ));
+        // Always, so peers also learn when it is cleared.
+        t.push_str(&format!(" hostname={}", self.announce_hostname.read()));
         if *self.role.read() == "slave" {
             t.push_str(&format!(" of={}", self.master_id.read()));
         }
@@ -1223,11 +1325,12 @@ impl ClusterHub {
         let my_flags = format!("myself,{}", role);
         let (my_ip, my_port, my_cport) = (self.my_ip(), self.my_port(), self.my_cport());
         out.push_str(&format!(
-            "{} {}:{}@{} {} {} 0 0 {} connected{}{}\n",
+            "{} {}:{}@{}{} {} {} 0 0 {} connected{}{}\n",
             my_id,
             my_ip,
             my_port,
             my_cport,
+            hostname_suffix(&self.announce_hostname.read()),
             my_flags,
             master_id,
             cfg_epoch,
@@ -1257,11 +1360,12 @@ impl ClusterHub {
                 }
 
                 out.push_str(&format!(
-                    "{} {}:{}@{} {} {} {} {} {} {}{}\n",
+                    "{} {}:{}@{}{} {} {} {} {} {} {}{}\n",
                     node.id,
                     node.ip,
                     node.port,
                     node.cport,
+                    hostname_suffix(&node.hostname),
                     node.flags_repr(),
                     node.master_id,
                     node.ping_sent,
@@ -1371,6 +1475,7 @@ impl ClusterHub {
                 config_epoch: 0,
                 link_state: "connected".to_string(),
                 slots: Vec::new(),
+                hostname: String::new(),
             },
         );
         true
@@ -1465,6 +1570,7 @@ impl ClusterHub {
                                     config_epoch: remote_epoch,
                                     link_state: "connected".to_string(),
                                     slots: remote_slots,
+                                    hostname: String::new(),
                                 },
                             );
                         }
@@ -1592,6 +1698,45 @@ impl ClusterHub {
         Ok(())
     }
 
+    /// One node of a CLUSTER SLOTS entry: [endpoint, port, id], plus, as
+    /// in Redis, a map of the networking details the endpoint doesn't give
+    /// (`ip` when the endpoint isn't the IP, `hostname` when it isn't the
+    /// hostname) if there are any.
+    fn write_slots_node(&self, out: &mut Vec<u8>, ip: &str, hostname: &str, port: u16, id: &str) {
+        let pref = self.preferred_endpoint();
+        let endpoint = match self.endpoint(ip, hostname) {
+            "" => "?",
+            e => e,
+        };
+        let mut meta: Vec<(&str, &str)> = Vec::new();
+        if pref != Endpoint::Ip {
+            meta.push(("ip", ip));
+        }
+        if pref != Endpoint::Hostname && !hostname.is_empty() {
+            meta.push(("hostname", hostname));
+        }
+        out.extend_from_slice(
+            format!(
+                "*{}\r\n${}\r\n{}\r\n:{}\r\n${}\r\n{}\r\n",
+                if meta.is_empty() { 3 } else { 4 },
+                endpoint.len(),
+                endpoint,
+                port,
+                id.len(),
+                id
+            )
+            .as_bytes(),
+        );
+        if !meta.is_empty() {
+            out.extend_from_slice(format!("*{}\r\n", meta.len() * 2).as_bytes());
+            for (k, v) in meta {
+                out.extend_from_slice(
+                    format!("${}\r\n{}\r\n${}\r\n{}\r\n", k.len(), k, v.len(), v).as_bytes(),
+                );
+            }
+        }
+    }
+
     pub fn cluster_slots(&self, out: &mut Vec<u8>, num_shards: usize) {
         let nodes = self.nodes.read();
         if nodes.is_empty() && self.has_default_slots() {
@@ -1614,17 +1759,7 @@ impl ClusterHub {
                 };
                 out.extend_from_slice(b"*3\r\n");
                 out.extend_from_slice(format!(":{}\r\n:{}\r\n", start_slot, end_slot).as_bytes());
-                out.extend_from_slice(
-                    format!(
-                        "*3\r\n${}\r\n{}\r\n:{}\r\n${}\r\n{}\r\n",
-                        my_ip.len(),
-                        my_ip,
-                        shard_port,
-                        node_id.len(),
-                        node_id
-                    )
-                    .as_bytes(),
-                );
+                self.write_slots_node(out, &my_ip, &self.my_hostname(), shard_port, &node_id);
             }
             return;
         }
@@ -1641,18 +1776,27 @@ impl ClusterHub {
             master_port: u16,
             master_shards: u16,
             master_id: String,
-            /// (ip, port, id, shards)
-            replicas: Vec<(String, u16, String, u16)>,
+            master_hostname: String,
+            /// (ip, port, id, shards, hostname)
+            replicas: Vec<(String, u16, String, u16, String)>,
         }
 
         let mut entries = Vec::new();
 
         // 1. Myself if master
         if my_role == "master" {
-            let my_replicas: Vec<(String, u16, String, u16)> = nodes
+            let my_replicas: Vec<(String, u16, String, u16, String)> = nodes
                 .values()
                 .filter(|n| n.master_id == my_id)
-                .map(|n| (n.ip.clone(), n.port, n.id.clone(), n.shards))
+                .map(|n| {
+                    (
+                        n.ip.clone(),
+                        n.port,
+                        n.id.clone(),
+                        n.shards,
+                        n.hostname.clone(),
+                    )
+                })
                 .collect();
             let my_shards = if self.cluster_enabled.load(Ordering::Relaxed) {
                 self.num_shards.load(Ordering::Relaxed).max(1) as u16
@@ -1667,6 +1811,7 @@ impl ClusterHub {
                     master_port: self.my_port(),
                     master_shards: my_shards,
                     master_id: my_id.clone(),
+                    master_hostname: self.my_hostname(),
                     replicas: my_replicas.clone(),
                 });
             }
@@ -1675,10 +1820,18 @@ impl ClusterHub {
         // 2. Peer masters
         for peer in nodes.values() {
             if peer.is_master() {
-                let peer_replicas: Vec<(String, u16, String, u16)> = nodes
+                let peer_replicas: Vec<(String, u16, String, u16, String)> = nodes
                     .values()
                     .filter(|n| n.master_id == peer.id)
-                    .map(|n| (n.ip.clone(), n.port, n.id.clone(), n.shards))
+                    .map(|n| {
+                        (
+                            n.ip.clone(),
+                            n.port,
+                            n.id.clone(),
+                            n.shards,
+                            n.hostname.clone(),
+                        )
+                    })
                     .collect();
                 for &(s, e) in &peer.slots {
                     entries.push(MasterSlotEntry {
@@ -1688,6 +1841,7 @@ impl ClusterHub {
                         master_port: peer.port,
                         master_shards: peer.shards,
                         master_id: peer.id.clone(),
+                        master_hostname: peer.hostname.clone(),
                         replicas: peer_replicas.clone(),
                     });
                 }
@@ -1725,11 +1879,18 @@ impl ClusterHub {
                     master_port: shard_port(e.master_port, e.master_shards, start),
                     master_shards: 1,
                     master_id: e.master_id.clone(),
+                    master_hostname: e.master_hostname.clone(),
                     replicas: e
                         .replicas
                         .iter()
-                        .map(|(ip, p, id, sh)| {
-                            (ip.clone(), shard_port(*p, *sh, start), id.clone(), 1)
+                        .map(|(ip, p, id, sh, h)| {
+                            (
+                                ip.clone(),
+                                shard_port(*p, *sh, start),
+                                id.clone(),
+                                1,
+                                h.clone(),
+                            )
                         })
                         .collect(),
                 });
@@ -1747,31 +1908,17 @@ impl ClusterHub {
             let total_nodes = 1 + entry.replicas.len();
             out.extend_from_slice(format!("*{}\r\n", 2 + total_nodes).as_bytes());
             out.extend_from_slice(format!(":{}\r\n:{}\r\n", entry.start, entry.end).as_bytes());
-            // Master node tuple: [ip, port, id]
-            out.extend_from_slice(
-                format!(
-                    "*3\r\n${}\r\n{}\r\n:{}\r\n${}\r\n{}\r\n",
-                    entry.master_ip.len(),
-                    entry.master_ip,
-                    entry.master_port,
-                    entry.master_id.len(),
-                    entry.master_id
-                )
-                .as_bytes(),
+            // Master node tuple: [endpoint, port, id(, metadata)]
+            self.write_slots_node(
+                out,
+                &entry.master_ip,
+                &entry.master_hostname,
+                entry.master_port,
+                &entry.master_id,
             );
             // Replicas tuples
-            for (rip, rport, rid, _) in entry.replicas {
-                out.extend_from_slice(
-                    format!(
-                        "*3\r\n${}\r\n{}\r\n:{}\r\n${}\r\n{}\r\n",
-                        rip.len(),
-                        rip,
-                        rport,
-                        rid.len(),
-                        rid
-                    )
-                    .as_bytes(),
-                );
+            for (rip, rport, rid, _, rhost) in entry.replicas {
+                self.write_slots_node(out, &rip, &rhost, rport, &rid);
             }
         }
     }
@@ -1784,7 +1931,7 @@ impl ClusterHub {
 
         struct ShardItem {
             slots: Vec<(u16, u16)>,
-            nodes: Vec<(String, u16, String, String, String)>, // id, port, ip, role, health
+            nodes: Vec<(String, u16, String, String, String, String)>, // id, port, ip, role, health, hostname
         }
 
         let mut shards = Vec::new();
@@ -1798,6 +1945,7 @@ impl ClusterHub {
                 self.my_ip(),
                 "master".to_string(),
                 "online".to_string(),
+                self.my_hostname(),
             ));
             for n in nodes.values() {
                 if n.master_id == my_id {
@@ -1812,6 +1960,7 @@ impl ClusterHub {
                         n.ip.clone(),
                         "replica".to_string(),
                         health.to_string(),
+                        n.hostname.clone(),
                     ));
                 }
             }
@@ -1836,6 +1985,7 @@ impl ClusterHub {
                     peer.ip.clone(),
                     "master".to_string(),
                     master_health.to_string(),
+                    peer.hostname.clone(),
                 ));
                 for n in nodes.values() {
                     if n.master_id == peer.id {
@@ -1850,6 +2000,7 @@ impl ClusterHub {
                             n.ip.clone(),
                             "replica".to_string(),
                             health.to_string(),
+                            n.hostname.clone(),
                         ));
                     }
                 }
@@ -1861,6 +2012,7 @@ impl ClusterHub {
                         self.my_ip(),
                         "replica".to_string(),
                         "online".to_string(),
+                        self.my_hostname(),
                     ));
                 }
                 shards.push(ShardItem {
@@ -1893,6 +2045,7 @@ impl ClusterHub {
                         self.my_ip(),
                         "master".to_string(),
                         "online".to_string(),
+                        self.my_hostname(),
                     )];
                     shards.push(ShardItem {
                         slots: vec![(start_slot as u16, end_slot as u16)],
@@ -1907,6 +2060,7 @@ impl ClusterHub {
                     self.my_ip(),
                     my_role,
                     "online".to_string(),
+                    self.my_hostname(),
                 )];
                 shards.push(ShardItem {
                     slots: my_slots,
@@ -1927,8 +2081,15 @@ impl ClusterHub {
             // Field 2: nodes
             out.extend_from_slice(b"$5\r\nnodes\r\n");
             out.extend_from_slice(format!("*{}\r\n", shard.nodes.len()).as_bytes());
-            for (id, port, ip, role, health) in shard.nodes {
-                out.extend_from_slice(b"*14\r\n");
+            for (id, port, ip, role, health, hostname) in shard.nodes {
+                // As in Redis: `endpoint` is the preferred endpoint, and
+                // `hostname` is listed when the node announces one.
+                let endpoint = match self.endpoint(&ip, &hostname) {
+                    "" => "?",
+                    e => e,
+                };
+                let fields = if hostname.is_empty() { 14 } else { 16 };
+                out.extend_from_slice(format!("*{fields}\r\n").as_bytes());
                 out.extend_from_slice(b"$2\r\nid\r\n");
                 out.extend_from_slice(format!("${}\r\n{}\r\n", id.len(), id).as_bytes());
                 out.extend_from_slice(b"$4\r\nport\r\n");
@@ -1936,7 +2097,15 @@ impl ClusterHub {
                 out.extend_from_slice(b"$2\r\nip\r\n");
                 out.extend_from_slice(format!("${}\r\n{}\r\n", ip.len(), ip).as_bytes());
                 out.extend_from_slice(b"$8\r\nendpoint\r\n");
-                out.extend_from_slice(format!("${}\r\n{}\r\n", ip.len(), ip).as_bytes());
+                out.extend_from_slice(
+                    format!("${}\r\n{}\r\n", endpoint.len(), endpoint).as_bytes(),
+                );
+                if !hostname.is_empty() {
+                    out.extend_from_slice(b"$8\r\nhostname\r\n");
+                    out.extend_from_slice(
+                        format!("${}\r\n{}\r\n", hostname.len(), hostname).as_bytes(),
+                    );
+                }
                 out.extend_from_slice(b"$4\r\nrole\r\n");
                 out.extend_from_slice(format!("${}\r\n{}\r\n", role.len(), role).as_bytes());
                 out.extend_from_slice(b"$18\r\nreplication-offset\r\n:0\r\n");
@@ -3123,6 +3292,8 @@ fn apply_announce(node: &mut ClusterNodeInfo, parts: &[&str]) {
             && cport != 0
         {
             node.cport = cport;
+        } else if let Some(h) = p.strip_prefix("hostname=").filter(|h| valid_hostname(h)) {
+            node.hostname = h.to_string();
         }
     }
     if node.is_master() {
@@ -3247,6 +3418,7 @@ fn handle_cluster_bus_line_from(
                         config_epoch: known_epoch,
                         link_state: "connected".to_string(),
                         slots: known_slots,
+                        hostname: String::new(),
                     },
                 );
             }
@@ -3346,6 +3518,7 @@ fn handle_cluster_bus_line_from(
                                         config_epoch: gepoch,
                                         link_state: "connected".to_string(),
                                         slots: Vec::new(),
+                                        hostname: String::new(),
                                     },
                                 );
                             }
@@ -3756,6 +3929,7 @@ mod tests {
             config_epoch: 1000,
             link_state: "connected".to_string(),
             slots: vec![(0, 99)],
+            hostname: String::new(),
         };
         let old_owner = "p".repeat(40);
         let hub = std::sync::Arc::new(ClusterHub::new(7320));
@@ -3818,6 +3992,7 @@ mod tests {
             config_epoch: epoch,
             link_state: "connected".to_string(),
             slots: Vec::new(),
+            hostname: String::new(),
         };
         let (low, high) = ("a".repeat(40), "z".repeat(40));
         // Two masters both claim 0-100 at epoch 5 (a failover that picked
@@ -3864,6 +4039,7 @@ mod tests {
             config_epoch: epoch,
             link_state: "connected".to_string(),
             slots: Vec::new(),
+            hostname: String::new(),
         };
         // We are the old master of 10923-16383 at epoch 0, back after a
         // failover promoted `new` at epoch 2.
@@ -3924,6 +4100,7 @@ mod tests {
                     config_epoch: 0,
                     link_state: "connected".to_string(),
                     slots: Vec::new(),
+                    hostname: String::new(),
                 },
             );
         };
@@ -3992,6 +4169,47 @@ mod tests {
     /// serving slots marks the cluster down, and serves again only a
     /// rejoin delay after the majority is reachable again.
     #[test]
+    fn test_hostnames_are_gossiped_and_kept_in_nodes_conf() {
+        let dir =
+            std::env::temp_dir().join(format!("rudis_cluster_hostname_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes-7740.conf");
+        let hub = ClusterHub::new(7740);
+        hub.set_config_file(path.clone());
+        *hub.announce_hostname.write() = "me.example".to_string();
+        let peer = "p".repeat(40);
+        // A peer's PING announces its hostname.
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7741 {peer} 0"), &hub);
+        handle_cluster_bus_line(
+            &format!(
+                "PING {peer} 1 master 0-100 shards=1 port=7741 cport=17741 hostname=peer.example"
+            ),
+            &hub,
+        );
+        assert_eq!(hub.nodes.read()[&peer].hostname, "peer.example");
+        // And our PINGs announce ours.
+        assert!(hub.ping_frame("").contains(" hostname=me.example"));
+        // An invalid one is ignored.
+        handle_cluster_bus_line(
+            &format!("PING {peer} 1 master 0-100 hostname=bad,name"),
+            &hub,
+        );
+        assert_eq!(hub.nodes.read()[&peer].hostname, "peer.example");
+        hub.save_config().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("@17741,peer.example "), "{text}");
+        assert!(text.contains(",me.example "), "{text}");
+        // Reloaded: the peer's hostname is back; ours comes from the
+        // configuration only (none here), not from the file.
+        let restarted = ClusterHub::new(7740);
+        assert!(restarted.load_config(&path).unwrap());
+        assert_eq!(restarted.nodes.read()[&peer].hostname, "peer.example");
+        assert_eq!(restarted.my_hostname(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_require_full_coverage_downs_the_cluster_while_a_slot_is_unserved() {
         let peer = |id: &str, slots: Vec<(u16, u16)>| ClusterNodeInfo {
             id: id.to_string(),
@@ -4007,6 +4225,7 @@ mod tests {
             config_epoch: 1,
             link_state: "connected".to_string(),
             slots,
+            hostname: String::new(),
         };
         let state = |hub: &ClusterHub| {
             let info = hub.cluster_info();
@@ -4067,6 +4286,7 @@ mod tests {
             config_epoch: 0,
             link_state: "connected".to_string(),
             slots,
+            hostname: String::new(),
         };
         let (a, b) = ("a".repeat(40), "b".repeat(40));
         hub.nodes
@@ -4139,6 +4359,7 @@ mod tests {
                 config_epoch: 0,
                 link_state: "connected".to_string(),
                 slots,
+                hostname: String::new(),
             };
         let (a_port, b_port) = (voter(None), voter(Some(b_grants.clone())));
         hub.nodes
@@ -4380,6 +4601,7 @@ mod tests {
                     config_epoch: 1,
                     link_state: "connected".to_string(),
                     slots: Vec::new(),
+                    hostname: String::new(),
                 },
             );
         }
@@ -4669,6 +4891,7 @@ mod tests {
             config_epoch: 1,
             link_state: "connected".to_string(),
             slots,
+            hostname: String::new(),
         };
         {
             let mut nodes = hub.nodes.write();
@@ -4715,6 +4938,7 @@ mod tests {
                 config_epoch: 1,
                 link_state: "connected".to_string(),
                 slots: vec![(200, 299)],
+                hostname: String::new(),
             },
         );
         // A slot some node holds can't be added: it would have two owners.
@@ -4762,6 +4986,7 @@ mod tests {
             config_epoch: 1,
             link_state: "connected".to_string(),
             slots: Vec::new(),
+            hostname: String::new(),
         };
         let hub = ClusterHub::new(7100);
         let master = "m".repeat(40);
@@ -4860,6 +5085,7 @@ mod tests {
                     config_epoch: 1,
                     link_state: "connected".to_string(),
                     slots: vec![(0, 5460)],
+                    hostname: String::new(),
                 },
             );
             nodes.insert(
@@ -4878,6 +5104,7 @@ mod tests {
                     config_epoch: 1,
                     link_state: "connected".to_string(),
                     slots: vec![(5461, 10922)],
+                    hostname: String::new(),
                 },
             );
         }
@@ -5033,6 +5260,7 @@ mod tests {
                 config_epoch: 2,
                 link_state: "connected".to_string(),
                 slots: Vec::new(),
+                hostname: String::new(),
             },
         );
 
@@ -5300,6 +5528,7 @@ mod tests {
                 config_epoch: 9,
                 link_state: "connected".to_string(),
                 slots: vec![(5461, 9999), (10001, 16383)],
+                hostname: String::new(),
             },
         );
         hub.has_nodes.store(true, Ordering::Release);

@@ -4207,6 +4207,25 @@ pub fn apply_config_value(
                 .allow_reads_when_down
                 .store(parse_config_bool(name, val_str)?, Ordering::Relaxed);
         }
+        "cluster-announce-hostname" => {
+            if !crate::cluster::valid_hostname(val_str) {
+                return Err(
+                    "Hostnames must be less than 256 characters and only contain letters, digits, '-' and '.'"
+                        .to_string(),
+                );
+            }
+            *crate::cluster::get_cluster_hub(base_port)
+                .announce_hostname
+                .write() = val_str.to_string();
+        }
+        "cluster-preferred-endpoint-type" => {
+            let e = crate::cluster::Endpoint::parse(val_str).ok_or_else(|| {
+                "argument must be one of: ip, hostname, unknown-endpoint".to_string()
+            })?;
+            crate::cluster::get_cluster_hub(base_port)
+                .preferred_endpoint
+                .store(e as u8, Ordering::Relaxed);
+        }
         "cluster-require-full-coverage" => {
             crate::cluster::get_cluster_hub(base_port)
                 .require_full_coverage
@@ -4494,7 +4513,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 110] = [
+    let all_configs: [(&str, String); 112] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -4511,6 +4530,11 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 "no"
             }
             .to_string(),
+        ),
+        ("cluster-announce-hostname", cluster_hub.my_hostname()),
+        (
+            "cluster-preferred-endpoint-type",
+            cluster_hub.preferred_endpoint().name().to_string(),
         ),
         (
             "cluster-require-full-coverage",
@@ -12762,7 +12786,7 @@ pub(crate) fn blocked_moved_reply(router: &Router, slot: u16, out: &mut Vec<u8>)
             format!(
                 "-MOVED {} {}:{}\r\n",
                 slot,
-                peer.ip,
+                hub.endpoint(&peer.ip, &peer.hostname),
                 peer.port_for_slot(slot)
             )
             .as_bytes(),
@@ -13878,7 +13902,12 @@ async fn execute_command_inner(
                             if target_shard != router.shard_id {
                                 let target_port = hub.my_port() + target_shard as u16;
                                 out.extend_from_slice(
-                                    format!("-MOVED {} {}:{}\r\n", slot, hub.my_ip(), target_port)
+                                    format!(
+                                        "-MOVED {} {}:{}\r\n",
+                                        slot,
+                                        hub.endpoint(&hub.my_ip(), &hub.my_hostname()),
+                                        target_port
+                                    )
                                         .as_bytes(),
                                 );
                                 return false;
@@ -13894,7 +13923,12 @@ async fn execute_command_inner(
                             })
                         {
                             out.extend_from_slice(
-                                format!("-MOVED {} {}:{}\r\n", slot, peer.ip, peer.port_for_slot(slot))
+                                format!(
+                                    "-MOVED {} {}:{}\r\n",
+                                    slot,
+                                    hub.endpoint(&peer.ip, &peer.hostname),
+                                    peer.port_for_slot(slot)
+                                )
                                     .as_bytes(),
                             );
                             return false;

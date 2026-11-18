@@ -2232,6 +2232,188 @@ fn test_cluster_slot_regained_by_failover_is_served_not_redirected_e2e() {
     }
 }
 
+/// cluster-announce-hostname reaches peers by gossip and shows in their
+/// CLUSTER NODES and SHARDS, and cluster-preferred-endpoint-type picks
+/// what CLUSTER SLOTS and MOVED give clients: the IP (default), the
+/// hostname (`?` for a node without one) or nothing. Both settings were
+/// accepted and ignored.
+#[test]
+fn test_cluster_announce_hostname_and_preferred_endpoint_e2e() {
+    let (a, b) = (18471u16, 18477u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_hostname_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "1",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (da, db) = (mk_dir(a), mk_dir(b));
+    let _na = spawn(a, &da);
+    let _nb = spawn(b, &db);
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let full = |p: u16, args: &[&str]| resp_cmd_full(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+
+    // Invalid hostnames are refused; a valid one is taken.
+    assert!(
+        cmd(
+            b,
+            &["CONFIG", "SET", "cluster-announce-hostname", "bad name"]
+        )
+        .starts_with("-ERR")
+    );
+    assert_eq!(
+        cmd(
+            b,
+            &[
+                "CONFIG",
+                "SET",
+                "cluster-announce-hostname",
+                "node-b.example"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        full(b, &["CONFIG", "GET", "cluster-announce-hostname"]),
+        "*2\r\n$25\r\ncluster-announce-hostname\r\n$14\r\nnode-b.example\r\n"
+    );
+    assert!(
+        cmd(
+            a,
+            &["CONFIG", "SET", "cluster-preferred-endpoint-type", "dns"]
+        )
+        .starts_with("-ERR")
+    );
+
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "8191"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["CLUSTER", "ADDSLOTSRANGE", "8192", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let b_id = bulk(cmd(b, &["CLUSTER", "MYID"]));
+    // A learns B's hostname by gossip.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let b_line = loop {
+        let nodes = full(a, &["CLUSTER", "NODES"]);
+        if let Some(l) = nodes.lines().find(|l| l.starts_with(&b_id))
+            && l.contains(",node-b.example ")
+            && l.contains(" 8192-16383")
+        {
+            break l.to_string();
+        }
+        assert!(std::time::Instant::now() < deadline, "A's view:\n{nodes}");
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        b_line.contains(&format!("127.0.0.1:{b}@{},node-b.example ", b + 10000)),
+        "{b_line}"
+    );
+    let shards = full(a, &["CLUSTER", "SHARDS"]);
+    assert!(
+        shards.contains("$8\r\nhostname\r\n$14\r\nnode-b.example\r\n"),
+        "{shards}"
+    );
+
+    let key = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| rudis::router::key_slot(k.as_bytes()) >= 8192)
+        .unwrap();
+    let slot = rudis::router::key_slot(key.as_bytes());
+    // Default: the IP, and the hostname only as metadata in SLOTS.
+    assert_eq!(
+        cmd(a, &["GET", &key]),
+        format!("-MOVED {slot} 127.0.0.1:{b}\r\n")
+    );
+    let slots = full(a, &["CLUSTER", "SLOTS"]);
+    assert!(
+        slots.contains(&format!(
+            "*4\r\n$9\r\n127.0.0.1\r\n:{b}\r\n${}\r\n{b_id}\r\n*2\r\n$8\r\nhostname\r\n$14\r\nnode-b.example\r\n",
+            b_id.len()
+        )),
+        "{slots}"
+    );
+    // hostname: B by its name, A (which has none) as `?`.
+    assert_eq!(
+        cmd(
+            a,
+            &[
+                "CONFIG",
+                "SET",
+                "cluster-preferred-endpoint-type",
+                "hostname"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["GET", &key]),
+        format!("-MOVED {slot} node-b.example:{b}\r\n")
+    );
+    let slots = full(a, &["CLUSTER", "SLOTS"]);
+    assert!(
+        slots.contains(&format!("$14\r\nnode-b.example\r\n:{b}\r\n")),
+        "{slots}"
+    );
+    assert!(slots.contains(&format!("$1\r\n?\r\n:{a}\r\n")), "{slots}");
+    // unknown-endpoint: no host at all in MOVED.
+    assert_eq!(
+        cmd(
+            a,
+            &[
+                "CONFIG",
+                "SET",
+                "cluster-preferred-endpoint-type",
+                "unknown-endpoint"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(cmd(a, &["GET", &key]), format!("-MOVED {slot} :{b}\r\n"));
+    // Cleared on B: A's view drops it too.
+    assert_eq!(
+        cmd(b, &["CONFIG", "SET", "cluster-announce-hostname", ""]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let nodes = full(a, &["CLUSTER", "NODES"]);
+        if nodes
+            .lines()
+            .find(|l| l.starts_with(&b_id))
+            .is_some_and(|l| !l.contains(",node-b.example"))
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "A's view:\n{nodes}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}
+
 /// A hostile cluster-bus peer gets error replies or a hang-up, never a crash:
 /// MEET with a port above 55535 used to overflow `port + 10000` while holding
 /// the node-table lock, poisoning it for every later CLUSTER command.
