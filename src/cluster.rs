@@ -374,6 +374,15 @@ pub fn has_active_cluster(port: u16) -> bool {
 static CLUSTER_HUBS: LazyLock<RwLock<HashMap<u16, Arc<ClusterHub>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Whether the node on `port` runs in cluster mode, without creating its
+/// hub (as [`get_cluster_hub`] would) when it has none.
+pub fn cluster_mode(port: u16) -> bool {
+    CLUSTER_HUBS
+        .read()
+        .get(&port)
+        .is_some_and(|h| h.cluster_enabled.load(Ordering::Relaxed))
+}
+
 pub fn get_cluster_hub(port: u16) -> Arc<ClusterHub> {
     {
         let hubs = CLUSTER_HUBS.read();

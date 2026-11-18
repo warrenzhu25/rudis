@@ -5490,3 +5490,78 @@ fn test_cluster_forget_propagates_to_all_nodes_e2e() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// In cluster mode a script with a shebang, or a function, may only touch
+/// keys of one slot unless it has the `allow-cross-slot-keys` flag; old
+/// style scripts may touch any. `no-cluster` scripts are refused. As Redis.
+#[test]
+fn test_cluster_script_cross_slot_rules_e2e() {
+    let port = 18551u16;
+    let dir = std::env::temp_dir().join(format!("rudis_scriptslot_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _srv = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &port.to_string(),
+            "--dir",
+            dir.to_str().unwrap(),
+            "--cluster-enabled",
+            "yes",
+            "--threads",
+            "1",
+            "--no-pin",
+        ],
+        port,
+    ));
+    let cmd = |args: &[&str]| resp_cmd(&mut connect_ready(port), args);
+    assert_eq!(cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]), "+OK\r\n");
+    const CROSS: &str = "-ERR Script attempted to access keys that do not hash to the same slot";
+    let two_sets = "redis.call('set','foo','bar'); redis.call('set','bar','foo'); return 'OK'";
+
+    // Old style: allowed.
+    assert_eq!(cmd(&["EVAL", two_sets, "0"]), "$2\r\nOK\r\n");
+    // Shebang: refused, unless flagged.
+    let shebang = format!("#!lua\n{two_sets}");
+    assert!(cmd(&["EVAL", &shebang, "0"]).starts_with(CROSS));
+    let flagged = format!("#!lua flags=allow-cross-slot-keys\n{two_sets}");
+    assert_eq!(cmd(&["EVAL", &flagged, "0"]), "$2\r\nOK\r\n");
+    // pcall gets the error as a value.
+    let pcall = "#!lua\nredis.call('set','foo','1'); \
+                 return redis.pcall('set','bar','2')['err']";
+    assert!(
+        cmd(&["EVAL", pcall, "0"]).contains("do not hash to the same slot"),
+        "{}",
+        cmd(&["EVAL", pcall, "0"])
+    );
+    // Same slot (hash tags) is fine; a key off the declared one's slot isn't.
+    let tagged = "#!lua\nredis.call('set','{t}a','1'); redis.call('set','{t}b','2'); return 'OK'";
+    assert_eq!(cmd(&["EVAL", tagged, "0"]), "$2\r\nOK\r\n");
+    let one = "#!lua\nredis.call('set','foo','bar'); return 'OK'";
+    assert!(cmd(&["EVAL", one, "1", "bar"]).starts_with(CROSS));
+    assert_eq!(cmd(&["EVAL", one, "1", "foo"]), "$2\r\nOK\r\n");
+
+    // Functions: refused by default, allowed with the flag.
+    let lib = "#!lua name=crossslot\n\
+               local function f(keys, args) \
+               redis.call('set','foo','bar'); redis.call('set','bar','foo'); return 'OK' end\n\
+               redis.register_function('strict', f)\n\
+               redis.register_function{function_name='loose', callback=f, \
+               flags={'allow-cross-slot-keys'}}\n\
+               redis.register_function{function_name='nc', callback=f, flags={'no-cluster'}}";
+    assert_eq!(
+        cmd(&["FUNCTION", "LOAD", "REPLACE", lib]),
+        "$9\r\ncrossslot\r\n"
+    );
+    assert!(cmd(&["FCALL", "strict", "0"]).starts_with(CROSS));
+    assert_eq!(cmd(&["FCALL", "loose", "0"]), "$2\r\nOK\r\n");
+    assert!(
+        cmd(&["FCALL", "nc", "0"])
+            .contains("Can not run script on cluster, 'no-cluster' flag is set")
+    );
+    assert!(
+        cmd(&["EVAL", "#!lua flags=no-cluster\nreturn 1", "0"])
+            .contains("Can not run script on cluster, 'no-cluster' flag is set")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

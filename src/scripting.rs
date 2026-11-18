@@ -85,6 +85,11 @@ pub struct RunningScript {
     wrote: std::sync::atomic::AtomicBool,
     /// It has run past `busy-reply-threshold`.
     busy: std::sync::atomic::AtomicBool,
+    /// In cluster mode, a script with a shebang or a function without
+    /// `allow-cross-slot-keys` may only touch keys of one slot, as in Redis:
+    /// that slot once known, [`SLOT_UNSET`] before, [`SLOT_ANY`] when it may
+    /// touch any.
+    slot: std::sync::atomic::AtomicI32,
 }
 
 impl RunningScript {
@@ -150,6 +155,56 @@ thread_local! {
 }
 
 /// Registers a script for its whole run; dropping it unregisters.
+/// [`RunningScript::slot`]: no key touched yet.
+const SLOT_UNSET: i32 = -1;
+/// [`RunningScript::slot`]: keys of any slot allowed.
+const SLOT_ANY: i32 = -2;
+
+const SCRIPT_CROSS_SLOT_ERR: &str =
+    "ERR Script attempted to access keys that do not hash to the same slot";
+const SCRIPT_NO_CLUSTER_ERR: &str = "ERR Can not run script on cluster, 'no-cluster' flag is set.";
+
+fn cluster_enabled(port: u16) -> bool {
+    crate::cluster::cluster_mode(crate::connection::node_port(port))
+}
+
+impl ScriptRunGuard {
+    /// Holds this run to one slot (see [`RunningScript::slot`]): the
+    /// declared keys' if any, else the first key it touches.
+    fn pin_slot(&self, keys: &[Bytes]) {
+        let slot = keys
+            .first()
+            .map_or(SLOT_UNSET, |k| i32::from(crate::router::key_slot(k)));
+        self.0
+            .slot
+            .store(slot, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether the running script's `cmd` touches a key outside the one slot it
+/// is held to (see [`RunningScript::slot`]); the first key sets the slot.
+fn script_crosses_slot(cmd: &Command) -> bool {
+    use std::sync::atomic::Ordering;
+    CURRENT_SCRIPT.with(|c| {
+        let Some(run) = c.borrow().clone() else {
+            return false;
+        };
+        if run.slot.load(Ordering::Relaxed) == SLOT_ANY {
+            return false;
+        }
+        let mut crosses = false;
+        crate::connection::for_each_cmd_key(cmd, |k| {
+            let slot = i32::from(crate::router::key_slot(k));
+            match run.slot.load(Ordering::Relaxed) {
+                SLOT_UNSET => run.slot.store(slot, Ordering::Relaxed),
+                s if s != slot => crosses = true,
+                _ => {}
+            }
+        });
+        crosses
+    })
+}
+
 struct ScriptRunGuard(std::sync::Arc<RunningScript>);
 
 impl ScriptRunGuard {
@@ -162,6 +217,7 @@ impl ScriptRunGuard {
             killed: std::sync::atomic::AtomicBool::new(false),
             wrote: std::sync::atomic::AtomicBool::new(false),
             busy: std::sync::atomic::AtomicBool::new(false),
+            slot: std::sync::atomic::AtomicI32::new(SLOT_ANY),
         });
         RUNNING_SCRIPTS.lock().push(run.clone());
         CURRENT_SCRIPT.with(|c| *c.borrow_mut() = Some(run.clone()));
@@ -1659,6 +1715,10 @@ fn prepare_function(
     }
 
     let effective_read_only = read_only || func_def.flags.iter().any(|f| f == "no-writes");
+    let in_cluster = cluster_enabled(db.borrow().port);
+    if in_cluster && func_def.flags.iter().any(|f| f == "no-cluster") {
+        return Err(SCRIPT_NO_CLUSTER_ERR.to_string());
+    }
 
     let allow_oom = func_def.flags.iter().any(|f| f == "allow-oom");
     let vm = ScriptVm::acquire(db, aof, effective_read_only, allow_oom)?;
@@ -1672,6 +1732,9 @@ fn prepare_function(
     argv.extend(keys.iter().cloned());
     argv.extend(args.iter().cloned());
     let run = ScriptRunGuard::start(db.borrow().port, false, Some((func_def.name.clone(), argv)));
+    if in_cluster && !func_def.flags.iter().any(|f| f == "allow-cross-slot-keys") {
+        run.pin_slot(keys);
+    }
     let ctl = YieldControl::new(can_yield);
     install_script_hook(&lua, &run.0, &ctl)?;
     let (keys_tbl, argv_tbl) = keys_and_argv(&lua, keys, args)?;
@@ -1953,6 +2016,10 @@ fn prepare_eval(
     let mut effective_read_only = read_only;
     let mut allow_oom = false;
     let mut processed_script: Option<String> = None;
+    // A script without a shebang may touch keys of any slot (Redis keeps
+    // that for old scripts); one with a shebang must opt in.
+    let mut cross_slot = true;
+    let mut no_cluster = false;
 
     let first_line = script_content.lines().next().unwrap_or("");
     if first_line.trim_start().starts_with("#!") {
@@ -1963,6 +2030,7 @@ fn prepare_eval(
         if !engine.eq_ignore_ascii_case("lua") {
             return Err("ERR Unexpected engine in script shebang".to_string());
         }
+        cross_slot = false;
         for opt in parts {
             if let Some(pos) = opt.find('=') {
                 let key = &opt[..pos];
@@ -1976,7 +2044,11 @@ fn prepare_eval(
                         effective_read_only = true;
                     } else if f_trim == "allow-oom" {
                         allow_oom = true;
-                    } else if f_trim == "allow-stale" || f_trim == "no-cluster" {
+                    } else if f_trim == "allow-cross-slot-keys" {
+                        cross_slot = true;
+                    } else if f_trim == "no-cluster" {
+                        no_cluster = true;
+                    } else if f_trim == "allow-stale" {
                         // valid flags
                     } else {
                         return Err(format!(
@@ -2005,9 +2077,16 @@ fn prepare_eval(
         );
     }
 
+    let in_cluster = cluster_enabled(db.borrow().port);
+    if no_cluster && in_cluster {
+        return Err(SCRIPT_NO_CLUSTER_ERR.to_string());
+    }
     let vm = ScriptVm::acquire(db, aof, effective_read_only, allow_oom)?;
     let lua = vm.lua.clone();
     let run = ScriptRunGuard::start(db.borrow().port, true, None);
+    if in_cluster && !cross_slot {
+        run.pin_slot(keys);
+    }
     let ctl = YieldControl::new(can_yield);
     install_script_hook(&lua, &run.0, &ctl)?;
     let (keys_tbl, argv_tbl) = keys_and_argv(&lua, keys, args)?;
@@ -3200,6 +3279,12 @@ fn register_redis_module(
                 crate::connection::SCRIPT_NON_LOCAL_KEY_ERR.to_string(),
             ));
         }
+        if script_crosses_slot(&cmd) {
+            crate::connection::record_rejected_stat(crate::connection::stat_cmd_name(&cmd));
+            crate::connection::record_error_stat("ERR", None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            return Err(mlua::Error::RuntimeError(SCRIPT_CROSS_SLOT_ERR.to_string()));
+        }
         if crate::connection::script_touches_non_local_key(&cmd) {
             crate::connection::record_rejected_stat(crate::connection::stat_cmd_name(&cmd));
             crate::connection::record_error_stat("ERR", None);
@@ -3383,6 +3468,14 @@ fn register_redis_module(
         if script_redirects(&cmd) {
             let tbl = lua.create_table()?;
             tbl.set("err", crate::connection::SCRIPT_NON_LOCAL_KEY_ERR)?;
+            return Ok(Value::Table(tbl));
+        }
+        if script_crosses_slot(&cmd) {
+            crate::connection::record_rejected_stat(crate::connection::stat_cmd_name(&cmd));
+            crate::connection::record_error_stat("ERR", None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            let tbl = lua.create_table()?;
+            tbl.set("err", SCRIPT_CROSS_SLOT_ERR)?;
             return Ok(Value::Table(tbl));
         }
         if crate::connection::script_touches_non_local_key(&cmd) {
