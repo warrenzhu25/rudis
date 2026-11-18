@@ -10950,9 +10950,8 @@ async fn execute_rebalance_plans(
             );
             router.sync_slot_tables().await;
 
-            hub.assign_slot(p.slot, &p.target_node_id);
+            hub.take_slot(p.slot);
             hub.slot_states.write().remove(&p.slot);
-            hub.bump_config_epoch();
             // Ours now: the importing redirect goes.
             router.set_slot_state(p.slot, crate::shard::SlotState::Stable);
             router.sync_slot_tables().await;
@@ -15267,8 +15266,7 @@ async fn execute_command_inner(
                             router.set_slot_state(slot, crate::shard::SlotState::Stable);
                             // Also drops the slot from the previous owner in
                             // our view, so the cluster never shows it twice.
-                            hub.assign_slot(slot, &my_id);
-                            hub.bump_config_epoch();
+                            hub.take_slot(slot);
                         } else {
                             let owner_id = {
                                 let nodes = hub.nodes.read();

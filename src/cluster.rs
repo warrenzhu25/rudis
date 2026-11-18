@@ -538,9 +538,15 @@ impl ClusterHub {
     /// replica of the claimant, so two nodes never serve the same slots.
     pub fn claim_slots(&self, id: &str, epoch: Option<u64>, slots: Vec<(u16, u16)>) {
         self.resolve_config_epoch_collision(id, epoch);
-        // Our own state first: never take `my_slots` under `nodes`.
-        let my_epoch = self.config_epoch.load(Ordering::SeqCst);
+        // Our own state first: never take `my_slots` under `nodes`. The
+        // slots before the epoch: a node taking a slot bumps its epoch
+        // first (see `take_slot`), so a slot read here as ours comes with
+        // the epoch it was taken at. Read the other way round, a slot taken
+        // in between came with the epoch from before, and a claim older
+        // than the new one took it from us (the cluster soak lost a slot
+        // that way mid-reshard: neither node had it after).
         let my_slots = self.my_slots.read().clone();
+        let my_epoch = self.config_epoch.load(Ordering::SeqCst);
         let owns =
             |ranges: &[(u16, u16)], slot: u16| ranges.iter().any(|&(s, e)| slot >= s && slot <= e);
         let mut lost: Vec<u16> = Vec::new();
@@ -935,6 +941,14 @@ impl ClusterHub {
 
     /// Records in the local view that `owner_id` (this node or a known peer)
     /// now serves `slot`, and that no other node does.
+    /// Takes `slot` for this node (CLUSTER SETSLOT <slot> NODE myself, a
+    /// rebalance step): a new config epoch, then the slot, in that order
+    /// (see `claim_slots`).
+    pub fn take_slot(&self, slot: u16) {
+        self.bump_config_epoch();
+        self.assign_slot(slot, &self.my_id());
+    }
+
     pub fn assign_slot(&self, slot: u16, owner_id: &str) {
         let me = owner_id == self.my_id();
         let lost = {
@@ -3662,6 +3676,74 @@ mod tests {
         assert!(restarted.nodes.read().is_empty());
         assert_eq!(*restarted.my_slots.read(), vec![(0, 16383)]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_a_slot_taken_while_its_old_owner_still_claims_it_stays_taken() {
+        // Mid-reshard: we take a slot (CLUSTER SETSLOT NODE myself) while
+        // its old owner, which hasn't heard yet, keeps announcing it at its
+        // epoch. Taking it bumps our epoch above that, so the slot stays
+        // ours however the two interleave. The claim used to read our epoch
+        // before our slots: landing between "add the slot" and "bump the
+        // epoch", it saw the slot as ours at the old epoch and took it.
+        let peer = |id: &str| ClusterNodeInfo {
+            id: id.to_string(),
+            ip: "127.0.0.1".to_string(),
+            port: 7321,
+            cport: 17321,
+            flags: "master".to_string(),
+            fail: FailState::Ok,
+            shards: 0,
+            master_id: "-".to_string(),
+            ping_sent: 0,
+            pong_recv: 0,
+            config_epoch: 1000,
+            link_state: "connected".to_string(),
+            slots: vec![(0, 99)],
+        };
+        let old_owner = "p".repeat(40);
+        let hub = std::sync::Arc::new(ClusterHub::new(7320));
+        *hub.my_id.write() = "a".repeat(40);
+        hub.my_slots.write().clear();
+        hub.slots_default.store(false, Ordering::SeqCst);
+        hub.config_epoch.store(1, Ordering::SeqCst);
+        hub.nodes
+            .write()
+            .insert(old_owner.clone(), peer(&old_owner));
+        // The epoch the old owner announces: above ours until we take.
+        let claim_epoch = std::sync::Arc::new(AtomicU64::new(1000));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let claimer = {
+            let (hub, stop, id, claim_epoch) = (
+                hub.clone(),
+                stop.clone(),
+                old_owner.clone(),
+                claim_epoch.clone(),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let e = claim_epoch.load(Ordering::SeqCst);
+                    hub.claim_slots(&id, Some(e), vec![(0, 99)]);
+                }
+            })
+        };
+        // Each round (epochs only grow, as in a cluster): the old owner
+        // has the slot at an epoch above ours, which we know of; we take
+        // the slot and must still have it.
+        let mut lost = 0;
+        for _ in 0..5_000 {
+            hub.assign_slot(7, &old_owner);
+            let e = hub.config_epoch.load(Ordering::SeqCst) + 1000;
+            hub.current_epoch.fetch_max(e, Ordering::SeqCst);
+            claim_epoch.store(e, Ordering::SeqCst);
+            hub.take_slot(7);
+            if !hub.owns_slot(7) {
+                lost += 1;
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        claimer.join().unwrap();
+        assert_eq!(lost, 0, "taken slots went back to their old owner");
     }
 
     #[test]
