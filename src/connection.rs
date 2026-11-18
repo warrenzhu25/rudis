@@ -6791,6 +6791,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
     // complete frames still in `buf`: run them before reading more.
     let mut carry_over = false;
     loop {
+        release_big_query_buf(&mut buf);
         if buf.capacity() - buf.len() < MIN_READ_SPARE {
             buf.reserve(READ_BUFFER_SIZE);
         }
@@ -8440,6 +8441,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
     }
 
     loop {
+        release_big_query_buf(&mut buf);
         match reader.read_append(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
@@ -8502,6 +8504,21 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
             }
             Err(_) => break,
         }
+    }
+}
+
+/// A query buffer at least this large is dropped once drained.
+const QUERY_BUF_KEEP_BYTES: usize = 1 << 20;
+
+/// Swaps a drained query buffer that grew past [`QUERY_BUF_KEEP_BYTES`]
+/// (one big command: a 5 MB argument grew it to ~8 MB) for a fresh one.
+/// Kept, it stayed allocated for the client's lifetime and counted in
+/// used_memory, so later commands of every client hit -OOM under a
+/// maxmemory the big one was already refused for (Redis hands a big
+/// argument's buffer to the command and starts a new one).
+fn release_big_query_buf(buf: &mut BytesMut) {
+    if buf.is_empty() && buf.capacity() >= QUERY_BUF_KEEP_BYTES {
+        *buf = BytesMut::with_capacity(READ_BUFFER_SIZE);
     }
 }
 

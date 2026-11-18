@@ -752,6 +752,60 @@ fn test_subscribe_refused_over_maxmemory_e2e() {
     shutdown_and_wait(port, &mut srv);
 }
 
+/// A client whose big command was refused for maxmemory doesn't keep
+/// its memory: its 5 MB argument grew the query buffer to ~8 MB, kept for
+/// the life of the connection and counted in used_memory, so every other
+/// client's next subscribe or write was refused -OOM too (the Redis
+/// unit/pubsub suite failed this way when the next test started before the
+/// server saw the big client close).
+#[test]
+fn test_refused_big_command_does_not_keep_its_memory_e2e() {
+    let port = 18461u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let mut admin = connect();
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["CONFIG", "SET", "maxmemory-policy", "noeviction"]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut admin, &["CONFIG", "SET", "maxmemory", "5242880"]),
+        "+OK\r\n"
+    );
+    let small = "a".repeat(10240);
+    let big = "b".repeat(5 << 20);
+    // In subscribe mode (its commands go through the pubsub loop), then
+    // one subscribe too big for the limit: refused.
+    let mut hog = connect();
+    assert!(resp_cmd_all(&mut hog, &["PSUBSCRIBE", &small]).contains("psubscribe"));
+    let r = resp_cmd_all(&mut hog, &["PSUBSCRIBE", &big]);
+    assert!(r.starts_with("-OOM command not allowed"), "{r}");
+    // The same from a plain client.
+    let mut hog2 = connect();
+    let r = resp_cmd_all(&mut hog2, &["SET", "k", &big]);
+    assert!(r.starts_with("-OOM command not allowed"), "{r}");
+    // Both still connected: the others' small commands run.
+    let used = info_u64(&mut admin, "memory", "used_memory");
+    assert!(
+        used < 5 << 20,
+        "used_memory {used} after the refused commands"
+    );
+    let mut other = connect();
+    let r = resp_cmd_all(&mut other, &["PSUBSCRIBE", &"c".repeat(10240)]);
+    assert!(r.contains("psubscribe"), "{}", &r[..r.len().min(80)]);
+    assert_eq!(resp_cmd(&mut admin, &["SET", "small", "v"]), "+OK\r\n");
+    drop((hog, hog2, other));
+    shutdown_and_wait(port, &mut srv);
+}
+
 /// Hash field TTL commands publish their keyspace events, as in Redis 7.4+:
 /// HEXPIRE & co `hexpire` (or `hdel` when a past time deletes fields, then
 /// `del` if the hash went), HPERSIST `hpersist`, HGETEX the event of what it
