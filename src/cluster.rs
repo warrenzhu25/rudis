@@ -1818,9 +1818,15 @@ impl ClusterHub {
         }
 
         // 2. Peer masters
+        let my_master = self.master_id.read().clone();
+        let my_shards = if self.cluster_enabled.load(Ordering::Relaxed) {
+            self.num_shards.load(Ordering::Relaxed).max(1) as u16
+        } else {
+            1
+        };
         for peer in nodes.values() {
             if peer.is_master() {
-                let peer_replicas: Vec<(String, u16, String, u16, String)> = nodes
+                let mut peer_replicas: Vec<(String, u16, String, u16, String)> = nodes
                     .values()
                     .filter(|n| n.master_id == peer.id)
                     .map(|n| {
@@ -1833,6 +1839,18 @@ impl ClusterHub {
                         )
                     })
                     .collect();
+                // This node too, if it replicates `peer`: a replica left
+                // itself out of its master's entry, so its CLUSTER SLOTS
+                // differed from every other node's.
+                if my_role == "slave" && my_master == peer.id {
+                    peer_replicas.push((
+                        self.my_ip(),
+                        self.my_port(),
+                        my_id.clone(),
+                        my_shards,
+                        self.my_hostname(),
+                    ));
+                }
                 for &(s, e) in &peer.slots {
                     entries.push(MasterSlotEntry {
                         start: s,

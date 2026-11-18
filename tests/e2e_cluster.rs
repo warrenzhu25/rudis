@@ -4084,6 +4084,28 @@ fn test_cluster_replica_serves_readonly_reads_e2e() {
     assert!(resp_cmd(&mut c, &["SET", k, "w"]).starts_with("-MOVED"));
     assert_eq!(resp_cmd(&mut c, &["READWRITE"]), "+OK\r\n");
     assert!(resp_cmd(&mut c, &["GET", k]).starts_with("-MOVED"));
+    // The replica's CLUSTER SLOTS lists it under its master, as the
+    // master's does (it used to leave itself out, so the two differed).
+    let replica_id = cmd(rport, &["CLUSTER", "MYID"])
+        .lines()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    // (The master learns it has a new replica by gossip: wait for that.)
+    for p in [rport, mport] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let slots = resp_cmd_full(&mut connect_ready(p), &["CLUSTER", "SLOTS"]);
+            if slots.contains(&replica_id) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "CLUSTER SLOTS on {p} never listed the replica: {slots}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
     let _ = std::fs::remove_dir_all(&md);
     let _ = std::fs::remove_dir_all(&rd);
 }
