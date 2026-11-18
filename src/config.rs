@@ -1093,6 +1093,10 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
             quoted(cluster_hub.my_hostname()),
         );
         directives.insert(
+            "cluster-announce-human-nodename".to_string(),
+            quoted(cluster_hub.human_nodename.read().clone()),
+        );
+        directives.insert(
             "cluster-announce-ip".to_string(),
             quoted(cluster_hub.announce_ip.read().clone().unwrap_or_default()),
         );
@@ -1682,6 +1686,7 @@ mod tests {
         assert!(content.contains("cluster-announce-ip \"\""), "{content}");
         assert!(!content.contains("10.0.0.9"));
         assert!(content.contains("cluster-require-full-coverage no"));
+        assert!(content.contains("cluster-announce-human-nodename \"\""));
         assert!(content.contains("cluster-preferred-endpoint-type ip"));
         assert_eq!(unquote("\"\""), "");
 

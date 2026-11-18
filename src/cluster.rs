@@ -77,6 +77,15 @@ fn hostname_suffix(h: &str) -> String {
 /// Whether `h` may be announced as a hostname: as in Redis, letters,
 /// digits, `-` and `.` only (it is gossiped and shown space-separated),
 /// under 256 characters. Empty clears it.
+/// Whether `n` may be a `cluster-announce-human-nodename`: printable ASCII
+/// without the characters that would break a nodes.conf or log line
+/// (space, `,`, `=`, quotes, backslash), as Redis checks.
+pub fn valid_human_nodename(n: &str) -> bool {
+    n.len() < 256
+        && n.bytes()
+            .all(|b| b.is_ascii_graphic() && !b",=\"'\\".contains(&b))
+}
+
 pub fn valid_hostname(h: &str) -> bool {
     h.len() < 256
         && h.bytes()
@@ -308,6 +317,9 @@ pub struct ClusterHub {
     /// CLUSTER NODES/SHARDS/SLOTS (and given to clients instead of it with
     /// `cluster-preferred-endpoint-type hostname`); empty if none.
     pub announce_hostname: RwLock<String>,
+    /// `cluster-announce-human-nodename`: a name for this node in logs;
+    /// empty if none.
+    pub human_nodename: RwLock<String>,
     /// `cluster-preferred-endpoint-type`: what CLUSTER SLOTS and MOVED/ASK
     /// give clients as a node's endpoint (see [`Endpoint`]).
     pub preferred_endpoint: std::sync::atomic::AtomicU8,
@@ -429,6 +441,7 @@ impl ClusterHub {
             mf_paused: AtomicBool::new(false),
             announce_ip: RwLock::new(None),
             announce_hostname: RwLock::new(String::new()),
+            human_nodename: RwLock::new(String::new()),
             preferred_endpoint: std::sync::atomic::AtomicU8::new(Endpoint::Ip as u8),
             announce_port: std::sync::atomic::AtomicU16::new(0),
             announce_bus_port: std::sync::atomic::AtomicU16::new(0),
@@ -4961,6 +4974,11 @@ mod tests {
         assert_eq!(addr(&hub), ("10.3.3.3".to_string(), 27200, 27600));
         assert!(!valid_announced_ip("0.0.0.0"));
         assert!(valid_announced_ip("::1"));
+        assert!(valid_human_nodename("my-redis-node-1"));
+        assert!(valid_human_nodename(""));
+        for bad in ["a\nb", "a\tb", "a b", "a,b", "a=b", "a\"b", "a'b", "a\\b"] {
+            assert!(!valid_human_nodename(bad), "{bad:?}");
+        }
     }
 
     #[test]

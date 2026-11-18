@@ -4207,6 +4207,14 @@ pub fn apply_config_value(
                 .allow_reads_when_down
                 .store(parse_config_bool(name, val_str)?, Ordering::Relaxed);
         }
+        "cluster-announce-human-nodename" => {
+            if !crate::cluster::valid_human_nodename(val_str) {
+                return Err("Human nodename contains an invalid character".to_string());
+            }
+            *crate::cluster::get_cluster_hub(base_port)
+                .human_nodename
+                .write() = val_str.to_string();
+        }
         "cluster-announce-hostname" => {
             if !crate::cluster::valid_hostname(val_str) {
                 return Err(if val_str.len() >= 256 {
@@ -4515,7 +4523,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 112] = [
+    let all_configs: [(&str, String); 113] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -4534,6 +4542,10 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
             .to_string(),
         ),
         ("cluster-announce-hostname", cluster_hub.my_hostname()),
+        (
+            "cluster-announce-human-nodename",
+            cluster_hub.human_nodename.read().clone(),
+        ),
         (
             "cluster-preferred-endpoint-type",
             cluster_hub.preferred_endpoint().name().to_string(),
