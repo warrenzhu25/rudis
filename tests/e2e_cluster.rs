@@ -5565,3 +5565,89 @@ fn test_cluster_script_cross_slot_rules_e2e() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// MULTI in cluster mode, as Redis: a queued command whose key another node
+/// serves gets -MOVED right away and the EXEC aborts (before, it was queued
+/// and the EXEC ran the rest), and an SPUBLISH channel counts for the
+/// transaction's single-slot rule.
+#[test]
+fn test_cluster_multi_redirects_when_queued_e2e() {
+    let (a, b) = (18561u16, 18567u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_multimoved_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let spawn = |p: u16, dir: &str| {
+        ServerGuard(spawn_rudis_listening(
+            &[
+                "--port",
+                &p.to_string(),
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "1",
+                "--no-pin",
+            ],
+            p,
+        ))
+    };
+    let (da, db) = (mk_dir(a), mk_dir(b));
+    let _na = spawn(a, &da);
+    let _nb = spawn(b, &db);
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "8191"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["CLUSTER", "ADDSLOTSRANGE", "8192", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(a, &["CLUSTER", "INFO"]).contains("cluster_state:ok") {
+        assert!(std::time::Instant::now() < deadline, "never ok");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // "bar" (slot 5061) is served by a, "foo" (12182) by b.
+    let mut c = connect_ready(a);
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "bar", "1"]), "+QUEUED\r\n");
+    assert!(
+        resp_cmd(&mut c, &["GET", "foo"]).starts_with("-MOVED 12182 "),
+        "not redirected when queued"
+    );
+    assert!(resp_cmd(&mut c, &["EXEC"]).starts_with("-EXECABORT"));
+    assert_eq!(cmd(a, &["EXISTS", "bar"]), ":0\r\n");
+
+    // A shard channel in another of a's slots than the key's: CROSSSLOT.
+    let channel = (0..)
+        .map(|i| format!("ch{i}"))
+        .find(|ch| {
+            let s = rudis::router::key_slot(ch.as_bytes());
+            s < 8192 && s != 5061
+        })
+        .unwrap();
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["SPUBLISH", &channel, "hi"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["GET", "bar"]), "+QUEUED\r\n");
+    assert!(resp_cmd(&mut c, &["EXEC"]).starts_with("-CROSSSLOT"));
+    // Channel and key in one slot: fine.
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SPUBLISH", "bar", "hi"]), "+QUEUED\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "bar"]), "+QUEUED\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXEC"]), "*2\r\n:0\r\n$-1\r\n");
+    for d in [&da, &db] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

@@ -784,7 +784,12 @@ pub(crate) fn stream_claim_propagation(
 pub fn tx_has_cross_slot(tx_queue: &[Command]) -> bool {
     let mut expected_slot: Option<u16> = None;
     for cmd in tx_queue {
-        for k in cmd_keys(cmd) {
+        // A shard channel has a slot too, as in Redis.
+        let channel = match cmd {
+            Command::Spublish { channel, .. } => Some(channel.as_ref()),
+            _ => None,
+        };
+        for k in cmd_keys(cmd).into_iter().chain(channel) {
             let slot = crate::router::key_slot(k);
             if let Some(s) = expected_slot {
                 if s != slot {
@@ -6148,6 +6153,112 @@ pub fn get_isolated_panics() -> u64 {
     ISOLATED_PANICS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The cluster redirect (or -CLUSTERDOWN / -ASK) `cmd`'s key gets on this
+/// node, written to `out`: whether there was one. Run for every command,
+/// and when a command is queued in MULTI (Redis answers -MOVED then, and
+/// the EXEC aborts).
+async fn cluster_redirects(
+    cmd: &Command,
+    router: &Router,
+    is_asking: bool,
+    client_id: u64,
+    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+    out: &mut Vec<u8>,
+) -> bool {
+    if let Some(key) = cmd_primary_key(cmd) {
+        let slot = key_slot(key);
+        let state = router.get_slot_state(slot);
+        match state {
+            crate::shard::SlotState::Moved(target) => {
+                out.extend_from_slice(format!("-MOVED {} {}\r\n", slot, target).as_bytes());
+                return true;
+            }
+            crate::shard::SlotState::Importing(source) => {
+                if !is_asking {
+                    out.extend_from_slice(format!("-MOVED {} {}\r\n", slot, source).as_bytes());
+                    return true;
+                }
+            }
+            crate::shard::SlotState::Migrating(target) => {
+                let key_exists = router.exists(key.clone()).await;
+                if !key_exists {
+                    out.extend_from_slice(format!("-ASK {} {}\r\n", slot, target).as_bytes());
+                    return true;
+                }
+            }
+            crate::shard::SlotState::Stable => {
+                if router.cluster_enabled || crate::cluster::has_active_cluster(router.base_port) {
+                    let hub = crate::cluster::get_cluster_hub(router.base_port);
+                    // A master cut off from the majority of masters serves
+                    // no keys (Redis's minority rule; see
+                    // `cluster::update_cluster_state`).
+                    if hub.is_down()
+                        && (cmd.is_write_command()
+                            || !hub
+                                .allow_reads_when_down
+                                .load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        out.extend_from_slice(b"-CLUSTERDOWN The cluster is down\r\n");
+                        return true;
+                    }
+                    // Never hold `my_slots` while taking `nodes` below: the
+                    // cluster bus takes them the other way round.
+                    // Like Redis, a READONLY client of a cluster replica gets
+                    // reads for its master's slots served here.
+                    let owns_slot = hub.owns_slot(slot)
+                        || (!cmd.is_write_command()
+                            && client_registry
+                                .borrow()
+                                .get(&client_id)
+                                .is_some_and(|c| c.readonly)
+                            && hub.replicates_slot(slot));
+                    if owns_slot {
+                        if router.cluster_enabled {
+                            let target_shard = router.target_shard_for_slot(slot);
+                            if target_shard != router.shard_id {
+                                let target_port = hub.my_port() + target_shard as u16;
+                                out.extend_from_slice(
+                                    format!(
+                                        "-MOVED {} {}:{}\r\n",
+                                        slot,
+                                        hub.endpoint(&hub.my_ip(), &hub.my_hostname()),
+                                        target_port
+                                    )
+                                    .as_bytes(),
+                                );
+                                return true;
+                            }
+                        }
+                    } else {
+                        let nodes = hub.nodes.read();
+                        if !nodes.is_empty()
+                            && let Some(peer) = nodes.values().find(|n| {
+                                n.is_master()
+                                    && n.fail != crate::cluster::FailState::Fail
+                                    && n.slots.iter().any(|&(s, e)| slot >= s && slot <= e)
+                            })
+                        {
+                            out.extend_from_slice(
+                                format!(
+                                    "-MOVED {} {}:{}\r\n",
+                                    slot,
+                                    hub.endpoint(&peer.ip, &peer.hostname),
+                                    peer.port_for_slot(slot)
+                                )
+                                .as_bytes(),
+                            );
+                            return true;
+                        }
+                        out.extend_from_slice(b"-CLUSTERDOWN Hash slot not served\r\n");
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_tx_step(
     cmd: Command,
@@ -6491,6 +6602,15 @@ async fn execute_tx_step(
                 ) {
                     *tx_has_error = true;
                     out_buf.extend_from_slice(&err);
+                    return false;
+                }
+                // And the cluster: a key served elsewhere gets its -MOVED
+                // now, as in Redis, and the EXEC aborts.
+                if router.cluster_enabled
+                    && cluster_redirects(c, router, false, client_id, client_registry, out_buf)
+                        .await
+                {
+                    *tx_has_error = true;
                     return false;
                 }
                 // And a script running past its time limit: the command
@@ -13869,96 +13989,8 @@ async fn execute_command_inner(
         return false;
     }
 
-    if let Some(key) = cmd_primary_key(&cmd) {
-        let slot = key_slot(key);
-        let state = router.get_slot_state(slot);
-        match state {
-            crate::shard::SlotState::Moved(target) => {
-                out.extend_from_slice(format!("-MOVED {} {}\r\n", slot, target).as_bytes());
-                return false;
-            }
-            crate::shard::SlotState::Importing(source) => {
-                if !is_asking {
-                    out.extend_from_slice(format!("-MOVED {} {}\r\n", slot, source).as_bytes());
-                    return false;
-                }
-            }
-            crate::shard::SlotState::Migrating(target) => {
-                let key_exists = router.exists(key.clone()).await;
-                if !key_exists {
-                    out.extend_from_slice(format!("-ASK {} {}\r\n", slot, target).as_bytes());
-                    return false;
-                }
-            }
-            crate::shard::SlotState::Stable => {
-                if router.cluster_enabled || crate::cluster::has_active_cluster(router.base_port) {
-                    let hub = crate::cluster::get_cluster_hub(router.base_port);
-                    // A master cut off from the majority of masters serves
-                    // no keys (Redis's minority rule; see
-                    // `cluster::update_cluster_state`).
-                    if hub.is_down()
-                        && (cmd.is_write_command()
-                            || !hub
-                                .allow_reads_when_down
-                                .load(std::sync::atomic::Ordering::Relaxed))
-                    {
-                        out.extend_from_slice(b"-CLUSTERDOWN The cluster is down\r\n");
-                        return false;
-                    }
-                    // Never hold `my_slots` while taking `nodes` below: the
-                    // cluster bus takes them the other way round.
-                    // Like Redis, a READONLY client of a cluster replica gets
-                    // reads for its master's slots served here.
-                    let owns_slot = hub.owns_slot(slot)
-                        || (!cmd.is_write_command()
-                            && client_registry
-                                .borrow()
-                                .get(&client_id)
-                                .is_some_and(|c| c.readonly)
-                            && hub.replicates_slot(slot));
-                    if owns_slot {
-                        if router.cluster_enabled {
-                            let target_shard = router.target_shard_for_slot(slot);
-                            if target_shard != router.shard_id {
-                                let target_port = hub.my_port() + target_shard as u16;
-                                out.extend_from_slice(
-                                    format!(
-                                        "-MOVED {} {}:{}\r\n",
-                                        slot,
-                                        hub.endpoint(&hub.my_ip(), &hub.my_hostname()),
-                                        target_port
-                                    )
-                                        .as_bytes(),
-                                );
-                                return false;
-                            }
-                        }
-                    } else {
-                        let nodes = hub.nodes.read();
-                        if !nodes.is_empty()
-                            && let Some(peer) = nodes.values().find(|n| {
-                                n.is_master()
-                                    && n.fail != crate::cluster::FailState::Fail
-                                    && n.slots.iter().any(|&(s, e)| slot >= s && slot <= e)
-                            })
-                        {
-                            out.extend_from_slice(
-                                format!(
-                                    "-MOVED {} {}:{}\r\n",
-                                    slot,
-                                    hub.endpoint(&peer.ip, &peer.hostname),
-                                    peer.port_for_slot(slot)
-                                )
-                                    .as_bytes(),
-                            );
-                            return false;
-                        }
-                        out.extend_from_slice(b"-CLUSTERDOWN Hash slot not served\r\n");
-                        return false;
-                    }
-                }
-            }
-        }
+    if cluster_redirects(&cmd, router, is_asking, client_id, client_registry, out).await {
+        return false;
     }
 
     if crate::replication::is_loading(router.base_port)
