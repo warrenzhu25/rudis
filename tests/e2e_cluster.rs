@@ -4155,7 +4155,7 @@ fn test_cluster_watch_sees_flushall_from_another_port_e2e() {
 /// shard's port (it used to report the kill and leave it connected).
 #[test]
 fn test_cluster_client_kill_reaches_every_shard_port_e2e() {
-    let port = 18291u16;
+    let port = 18441u16;
     let dir = std::env::temp_dir().join(format!("rudis_cl_kill_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -4719,7 +4719,7 @@ fn test_rebalance_never_hands_over_a_slot_whose_keys_did_not_move_e2e() {
 /// its peer, at that address, and redirects name it.
 #[test]
 fn test_cluster_nodes_learn_their_addresses_without_announce_ip_e2e() {
-    let port = 28403u16;
+    let port = 28411u16;
     let spawn = |ip: &str| {
         let dir =
             std::env::temp_dir().join(format!("rudis_cluster_learn_{}_{}", ip, std::process::id()));
