@@ -1081,6 +1081,33 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
     if cluster_cfg_name != "nodes.conf" {
         directives.insert("cluster-config-file".to_string(), cluster_cfg_name);
     }
+    if cluster_hub
+        .cluster_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        // Set at runtime, kept across a restart, as Redis does; written
+        // even when empty or default so an older line doesn't come back.
+        let quoted = |v: String| if v.is_empty() { "\"\"".to_string() } else { v };
+        directives.insert(
+            "cluster-announce-hostname".to_string(),
+            quoted(cluster_hub.my_hostname()),
+        );
+        directives.insert(
+            "cluster-announce-ip".to_string(),
+            quoted(cluster_hub.announce_ip.read().clone().unwrap_or_default()),
+        );
+        directives.insert(
+            "cluster-preferred-endpoint-type".to_string(),
+            cluster_hub.preferred_endpoint().name().to_string(),
+        );
+        let full = cluster_hub
+            .require_full_coverage
+            .load(std::sync::atomic::Ordering::Relaxed);
+        directives.insert(
+            "cluster-require-full-coverage".to_string(),
+            if full { "yes" } else { "no" }.to_string(),
+        );
+    }
     {
         let tls_rt = crate::tls::get_tls_runtime(port);
         let rt = tls_rt.read();
@@ -1626,6 +1653,38 @@ mod tests {
         assert!(content.contains("client-output-buffer-limit"));
 
         let _ = fs::remove_file(&cfg_path);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Cluster announce settings changed at runtime survive CONFIG REWRITE,
+    /// and an emptied one replaces its old line.
+    #[test]
+    fn test_rewrite_config_file_keeps_cluster_announce_settings() {
+        let _guard = ACTIVE_CONFIG_LOCK.lock();
+        let port = 9871;
+        let temp_dir =
+            std::env::temp_dir().join(format!("rudis-cfg-cluster-{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cfg_path = temp_dir.join("cluster.conf");
+        fs::write(&cfg_path, "cluster-announce-ip 10.0.0.9\n").unwrap();
+        *ACTIVE_CONFIG_FILE.write() = Some(cfg_path.clone());
+        let hub = crate::cluster::get_cluster_hub(port);
+        hub.cluster_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *hub.announce_hostname.write() = "node-1.example.com".to_string();
+        *hub.announce_ip.write() = None;
+        hub.require_full_coverage
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        rewrite_config_file(port).unwrap();
+        let content = fs::read_to_string(&cfg_path).unwrap();
+        assert!(content.contains("cluster-announce-hostname node-1.example.com"));
+        assert!(content.contains("cluster-announce-ip \"\""), "{content}");
+        assert!(!content.contains("10.0.0.9"));
+        assert!(content.contains("cluster-require-full-coverage no"));
+        assert!(content.contains("cluster-preferred-endpoint-type ip"));
+        assert_eq!(unquote("\"\""), "");
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
