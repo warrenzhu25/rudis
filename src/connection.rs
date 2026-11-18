@@ -6910,6 +6910,19 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                             };
                             if drain_n > 0 {
                                 batch_in_bytes += drain_n;
+                                // The buffer grew to hold the rest of the
+                                // command (CLIENT LIST qbuf). Recorded only
+                                // after a read before: a big command whose
+                                // first read was small and whose rest was
+                                // drained here finished as qbuf=0 (the Redis
+                                // unit/querybuf suite failed on it, depending
+                                // on how the first segment arrived).
+                                if buf.len() > 16384
+                                    && let Some(c) =
+                                        client_registry.borrow_mut().get_mut(&client_id)
+                                {
+                                    c.qbuf_cap = c.qbuf_cap.max(buf.len());
+                                }
                                 stats.tot_net_in.fetch_add(
                                     drain_n as u64,
                                     std::sync::atomic::Ordering::Relaxed,
