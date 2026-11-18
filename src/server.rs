@@ -2003,6 +2003,7 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                                 &dir,
                                 shard_id,
                                 aof.as_ref(),
+                                crate::aof::appendfsync_is_always(base_port),
                             )
                             .await
                             .map_err(|e| e.to_string());
@@ -3019,7 +3020,13 @@ async fn everysec_fsync(aof: &Rc<RefCell<crate::aof::AofWriter>>) {
     if let Some(file) = file
         && file.sync_data().await.is_ok()
     {
-        aof.borrow().mark_fsynced(upto);
+        let w = aof.borrow();
+        // Not if a rewrite swapped in another file meanwhile: this fsync
+        // covered the old one, and the new one's last bytes may not be
+        // synced yet (the next fsync covers them).
+        if w.is_current_file(&file) {
+            w.mark_fsynced(upto);
+        }
     }
 }
 

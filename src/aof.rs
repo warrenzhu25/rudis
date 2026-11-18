@@ -472,17 +472,34 @@ impl AofWriter {
             monoio::time::sleep(std::time::Duration::from_micros(20)).await;
         }
         let file = aof.borrow().get_file();
-        if let Some(file) = file {
+        if let Some(file) = &file {
             file.sync_data().await?;
         }
-        let mut w = aof.borrow_mut();
-        // A rewrite may have swapped in a new (already synced) file meanwhile.
-        if w.offset >= target {
-            w.durable = w.durable.max(target);
+        let swapped = {
+            let w = aof.borrow();
+            match (&file, &w.file) {
+                (Some(a), Some(b)) => !std::rc::Rc::ptr_eq(a, b),
+                _ => false,
+            }
+        };
+        if swapped {
+            // A rewrite swapped in a new file meanwhile, which may not be
+            // synced to the end yet (the rewrite leaves its last bytes to
+            // the next fsync): sync that one.
+            return Box::pin(Self::sync_durable(aof)).await;
         }
-        // A swapped-in file was synced too, so either way all is durable.
+        let mut w = aof.borrow_mut();
+        w.durable = w.durable.max(target);
         w.mark_fsynced(logical);
         Ok(())
+    }
+
+    /// Whether `file` is still the file this writer writes to (no rewrite
+    /// swapped another in).
+    pub fn is_current_file(&self, file: &std::rc::Rc<monoio::fs::File>) -> bool {
+        self.file
+            .as_ref()
+            .is_some_and(|f| std::rc::Rc::ptr_eq(f, file))
     }
 
     /// Hands everything appended so far to the kernel (no fsync): writes the
@@ -588,17 +605,27 @@ impl AofWriter {
     /// renamed into place, `new_size` bytes long, holding everything
     /// appended so far (its tail ends in the DB this writer last selected,
     /// so that is kept). Synchronous, with nothing pending or in flight.
-    fn swap_after_live_rewrite(&mut self, new_size: u64) -> std::io::Result<()> {
+    ///
+    /// `std_file` is the new file, opened for writing beforehand. Its first
+    /// `durable` bytes are synced; if that is all of it, everything
+    /// appended so far is durable, otherwise the next fsync makes it so.
+    fn swap_after_live_rewrite(
+        &mut self,
+        std_file: std::fs::File,
+        new_size: u64,
+        durable: u64,
+    ) -> std::io::Result<()> {
         debug_assert!(self.buffer.is_empty() && self.inflight == 0);
-        let std_file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
         let new = std::rc::Rc::new(monoio::fs::File::from_std(std_file)?);
         let old = self.file.replace(new);
         self.offset = new_size;
-        self.durable = new_size;
+        self.durable = durable;
         self.progress
             .written
             .store(self.appended_total, std::sync::atomic::Ordering::Release);
-        self.mark_fsynced(self.appended_total);
+        if durable >= new_size {
+            self.mark_fsynced(self.appended_total);
+        }
         self.drop_incremental_file();
         retire_replaced_file(old);
         Ok(())
@@ -740,14 +767,18 @@ const TAIL_SYNC_BYTES: u64 = 1 << 20;
 /// the last bit (and the switch to the new file) in one synchronous step.
 /// A shard used to stop for the whole rewrite (~0.75 s per GB). Falls back
 /// to that blocking pass if the image cannot stay point-in-time.
+///
+/// `fsync_always`: the server runs `appendfsync always`, so the switch to
+/// the new file syncs everything (and the rename) before any write after it.
 pub async fn rewrite_shard_aof_live(
     db: &std::rc::Rc<std::cell::RefCell<ShardDb>>,
     dir: &Path,
     shard_id: usize,
     aof: Option<&std::rc::Rc<std::cell::RefCell<AofWriter>>>,
+    fsync_always: bool,
 ) -> std::io::Result<usize> {
     let (tmp_path, target_path) = rewrite_paths(dir, shard_id);
-    let res = rewrite_live_inner(db, &tmp_path, &target_path, aof).await;
+    let res = rewrite_live_inner(db, &tmp_path, &target_path, aof, fsync_always).await;
     if res.is_err() {
         crate::shard::take_aof_image();
         let _ = std::fs::remove_file(&tmp_path);
@@ -786,6 +817,7 @@ async fn rewrite_live_inner(
     tmp_path: &Path,
     target_path: &Path,
     aof: Option<&std::rc::Rc<std::cell::RefCell<AofWriter>>>,
+    fsync_always: bool,
 ) -> Result<usize, LiveRewriteError> {
     // Start: the image and the AOF mark in one synchronous step, so the
     // image is the state right before the first byte of the tail.
@@ -821,7 +853,7 @@ async fn rewrite_live_inner(
     let file = done_rx.recv_async().await.map_err(|_| gone())??;
     match (aof, mark) {
         (Some(aof), Some(mark)) => {
-            catch_up_and_swap(aof, file, mark, tmp_path, target_path).await?;
+            catch_up_and_swap(aof, file, mark, tmp_path, target_path, fsync_always).await?;
         }
         _ => {
             drop(file);
@@ -893,6 +925,38 @@ fn open_for_reading(
     std::fs::File::open(path)
 }
 
+/// `file.sync_data()` on another thread, awaited: an fsync of a large
+/// file without blocking the shard.
+async fn sync_data_off_thread(file: &std::fs::File) -> std::io::Result<()> {
+    let dup = file.try_clone()?;
+    let (tx, rx) = flume::bounded(1);
+    std::thread::Builder::new()
+        .name("aof-sync".into())
+        .spawn(move || {
+            let _ = tx.send(dup.sync_data());
+        })?;
+    rx.recv_async()
+        .await
+        .map_err(|_| std::io::Error::other("AOF sync thread failed"))?
+}
+
+/// Syncs `path`'s directory (making a rename durable) on another thread,
+/// not waited for.
+fn sync_parent_dir_off_thread(path: &Path) {
+    let owned = path.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("aof-dirsync".into())
+        .spawn(move || {
+            if let Err(e) = sync_parent_dir(&owned) {
+                crate::log_warning!("AOF rewrite: syncing the directory of {:?}: {}", owned, e);
+            }
+        });
+    if spawned.is_err() {
+        // No thread: sync here rather than not at all.
+        let _ = sync_parent_dir(path);
+    }
+}
+
 /// A rewrite's final switch this long is logged (see [`SwitchTimer`]).
 const SLOW_SWITCH: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -957,6 +1021,7 @@ async fn catch_up_and_swap(
     mark: RewriteMark,
     tmp_path: &Path,
     target_path: &Path,
+    fsync_always: bool,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     let old = open_for_reading(aof, target_path)?;
@@ -967,6 +1032,13 @@ async fn catch_up_and_swap(
         file.write_all_at(select.as_bytes(), out_pos)?;
         out_pos += select.len() as u64;
     }
+    // Where the copied tail starts in the new file: old-file position
+    // `mark.file_pos + n` (appended byte `mark.logical + n`) lands at
+    // `out_base + n`.
+    let out_base = out_pos;
+    // How much of the new file an fsync made durable before the switch.
+    let mut presynced: Option<u64> = None;
+    let mut presync_rounds = 0;
     let mut copied = mark.file_pos;
     let mut chunk = vec![0u8; TAIL_COPY_BYTES as usize];
     let mut copy =
@@ -996,6 +1068,34 @@ async fn catch_up_and_swap(
             )
         };
         if appended_end.saturating_sub(copied) <= TAIL_SYNC_BYTES {
+            // Sync what the new file has so far off this thread, so the
+            // switch below (no command runs meanwhile) need not: its fsync
+            // blocked the shard for 5-12 ms in the cluster soak. Again if
+            // an fsync of the old file meanwhile reported bytes durable
+            // that this one didn't cover (the switch would have to sync
+            // them); a few rounds at most. Then catch up again with what
+            // came in meanwhile.
+            let reported = aof
+                .borrow()
+                .progress
+                .fsynced
+                .load(std::sync::atomic::Ordering::Acquire);
+            let uncovered = match presynced {
+                None => true,
+                Some(p) => reported > mark.logical + (p - out_base),
+            };
+            if uncovered && presync_rounds < 3 {
+                presync_rounds += 1;
+                // What the writer has written so far first, or the sync
+                // covers none of the tail.
+                if written_end > copied {
+                    copy(copied, written_end, &mut copied, &mut out_pos)?;
+                }
+                let upto = out_pos;
+                sync_data_off_thread(&file).await?;
+                presynced = Some(upto);
+                continue;
+            }
             break;
         }
         if written_end > copied {
@@ -1006,6 +1106,10 @@ async fn catch_up_and_swap(
             monoio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
+    // The writer's handle on the new file, opened now rather than in the
+    // switch (the open follows the file through the rename).
+    let writer_file = std::fs::OpenOptions::new().write(true).open(tmp_path)?;
+    let presynced = presynced.unwrap_or(out_base);
     // The last bit and the switch, with no command in between.
     loop {
         {
@@ -1017,13 +1121,35 @@ async fn catch_up_and_swap(
                 let end = w.offset;
                 copy(copied, end, &mut copied, &mut out_pos)?;
                 t.lap("copy tail");
-                file.sync_data()?;
+                // The bytes not synced yet came in during the presync.
+                // Under `appendfsync always` they must be durable before
+                // the switch, and so must any an fsync of the old file
+                // already reported durable (WAITAOF): then sync them here.
+                // Otherwise the next fsync of the new file does, as for
+                // any write under everysec.
+                let covered = mark.logical + (presynced - out_base);
+                let reported = w
+                    .progress
+                    .fsynced
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let durable = if fsync_always || reported > covered {
+                    file.sync_data()?;
+                    out_pos
+                } else {
+                    presynced
+                };
                 t.lap("fsync new file");
                 std::fs::rename(tmp_path, target_path)?;
                 t.lap("rename");
-                let _ = sync_parent_dir(target_path);
+                // Likewise the rename: synced here under `always`, else on
+                // another thread right away.
+                if fsync_always {
+                    let _ = sync_parent_dir(target_path);
+                } else {
+                    sync_parent_dir_off_thread(target_path);
+                }
                 t.lap("fsync dir");
-                let res = w.swap_after_live_rewrite(out_pos);
+                let res = w.swap_after_live_rewrite(writer_file, out_pos, durable);
                 t.lap("switch writer");
                 drop(old);
                 t.lap("close old file");
@@ -6392,7 +6518,7 @@ mod tests {
         let task = {
             let (db, aof, dir, done) = (db.clone(), aof.clone(), dir.clone(), done.clone());
             monoio::spawn(async move {
-                let res = rewrite_shard_aof_live(&db, &dir, 0, Some(&aof)).await;
+                let res = rewrite_shard_aof_live(&db, &dir, 0, Some(&aof), false).await;
                 done.set(true);
                 res
             })
@@ -6485,6 +6611,74 @@ mod tests {
         assert!(!fields(&live).is_empty());
         drop(live);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the switch to a live-rewritten AOF records as durable: under
+    /// `appendfsync always` everything at once; otherwise what the
+    /// off-thread presync covered, the next fsync the rest. An fsync of the
+    /// old file finishing after the switch must not count for the new one.
+    #[monoio::test(timer_enabled = true)]
+    async fn test_live_rewrite_switch_records_what_is_durable() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        for always in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "rudis-aof-switch-durable-{}-{always}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = Rc::new(RefCell::new(ShardDb::new(6384)));
+            let aof = Rc::new(RefCell::new(
+                AofWriter::open(dir.join("appendonly-0.aof")).await.unwrap(),
+            ));
+            let mut out = Vec::new();
+            let mut run = |line: String| {
+                crate::connection::CURRENT_DB.set(0);
+                out.clear();
+                crate::connection::execute_local_command(
+                    &parse_line(&line),
+                    &mut db.borrow_mut(),
+                    &mut out,
+                    Some(&aof),
+                );
+            };
+            for i in 0..5000 {
+                run(format!("SET k{i} v{i}"));
+            }
+            AofWriter::write_through(&aof).await.unwrap();
+            let old_file = aof.borrow().get_file().unwrap();
+            rewrite_shard_aof_live(&db, &dir, 0, Some(&aof), always)
+                .await
+                .unwrap();
+            {
+                let w = aof.borrow();
+                assert!(!w.is_current_file(&old_file), "the writer switched files");
+                assert!(w.durable <= w.offset);
+                if always {
+                    assert_eq!(w.durable, w.offset, "always: all synced at the switch");
+                    assert_eq!(
+                        w.progress
+                            .fsynced
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        w.appended_total
+                    );
+                }
+            }
+            // Writes after the switch, then an fsync: all durable.
+            run("SET after x".to_string());
+            AofWriter::sync_durable(&aof).await.unwrap();
+            let w = aof.borrow();
+            assert_eq!(w.durable, w.offset);
+            assert_eq!(
+                w.progress
+                    .fsynced
+                    .load(std::sync::atomic::Ordering::Acquire),
+                w.appended_total
+            );
+            drop(w);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Startup removes the temp files of rewrites a crash cut short, and

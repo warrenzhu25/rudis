@@ -5373,6 +5373,7 @@ impl Router {
             &self.db_dir,
             self.shard_id,
             self.aof().as_ref(),
+            crate::aof::appendfsync_is_always(self.base_port),
         )
         .await
         .map_err(|e| format!("shard {}: {}", self.shard_id, e))?;
