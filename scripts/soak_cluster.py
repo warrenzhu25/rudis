@@ -74,6 +74,10 @@ class ClusterClient:
         self.seeds = list(seeds)
         self.slots = {}
         self.conns = {}
+        # Connections that failed (and were redone, after a 50 ms pause)
+        # during the last cmd: its latency is then the client's, not the
+        # server's.
+        self.reconnects = 0
         self.refresh()
 
     def refresh(self):
@@ -112,6 +116,7 @@ class ClusterClient:
         asking = False
         last = None
         hops = []
+        self.reconnects = 0
         for _ in range(tries):
             try:
                 c = self.conn(port)
@@ -121,6 +126,7 @@ class ClusterClient:
                 r = c.cmd(*args)
             except Exception as e:  # noqa: BLE001
                 self.drop(port)
+                self.reconnects += 1
                 last = f"-CONN {e}"
                 time.sleep(0.05)
                 self.refresh()
@@ -428,17 +434,26 @@ def main():
                     if n.get("role") == "slave" and n.get("master_link_status") != "up":
                         bad(f"replica {p} link {n.get('master_link_status')}")
                 times = []
+                reconnect_times = []
                 for _ in range(200):
                     k = f"memtier-{random.randrange(a.keys)}"
                     s = time.perf_counter()
                     r = probe.cmd(k, "GET", k)
-                    times.append((time.perf_counter() - s) * 1000)
+                    ms = (time.perf_counter() - s) * 1000
+                    # A GET that had to reconnect (its node was killed or
+                    # restarted since) measures the client's 50 ms
+                    # back-off: counted apart, not as server latency.
+                    (reconnect_times if probe.reconnects else times).append(ms)
                     if isinstance(r, str) and r.startswith("-") and not r.startswith("-LOADING"):
                         row.setdefault("probe_errors", {}).setdefault(r.split()[0], 0)
                         row["probe_errors"][r.split()[0]] += 1
                 times.sort()
-                row["probe"] = {"p50_ms": round(times[100], 3), "p99_ms": round(times[197], 3),
+                n = len(times)
+                row["probe"] = {"p50_ms": round(times[n // 2], 3), "p99_ms": round(times[n * 99 // 100 - 1], 3),
                                 "max_ms": round(times[-1], 3)}
+                if reconnect_times:
+                    row["probe"]["reconnects"] = len(reconnect_times)
+                    row["probe"]["reconnect_max_ms"] = round(max(reconnect_times), 3)
                 row["counters"] = {"acked_total": sum(acked.values()), "errors": dict(counter_errors)}
                 if memtier.poll() not in (None, 0):
                     bad(f"memtier exited ({memtier.returncode})")
@@ -565,7 +580,9 @@ def write_report(a, samples_path, events, anomalies, final):
         ):
             lines.append(f"| {label} | {avg(first, f):.2f} | {avg(last, f):.2f} |")
         worst = max(r["probe"]["max_ms"] for r in rows)
+        recon = sum(r["probe"].get("reconnects", 0) for r in rows)
         lines += ["", f"* worst probe latency: {worst:.1f} ms",
+                  f"* probe GETs that reconnected first (not counted above): {recon}",
                   f"* counter writer at the end: {rows[-1].get('counters')}"]
         perr = {}
         for r in rows:
