@@ -1278,7 +1278,42 @@ impl ClusterHub {
             }
         }
         self.claim_slots(key, epoch, slots);
+        self.follow_demoted_master(key);
         true
+    }
+
+    /// Our master `peer` now announces itself a replica of another master
+    /// (a manual failover promoted a sibling of ours): follow that master,
+    /// as Redis does. We otherwise only switched on seeing the new master
+    /// claim our master's slots; heard from the old master first, that
+    /// claim no longer took slots from anyone we followed, and we stayed a
+    /// replica of a replica.
+    pub fn follow_demoted_master(&self, peer: &str) {
+        if *self.role.read() != "slave" || *self.master_id.read() != peer {
+            return;
+        }
+        let my_id = self.my_id();
+        let target = {
+            let nodes = self.nodes.read();
+            let Some(old) = nodes.get(peer) else {
+                return;
+            };
+            if old.is_master() || old.master_id == "-" || old.master_id == my_id {
+                return;
+            }
+            match nodes.get(&old.master_id) {
+                Some(new) if new.is_master() => (new.id.clone(), new.ip.clone(), new.port),
+                _ => return,
+            }
+        };
+        crate::log_warning!(
+            "Cluster: my master {} is now a replica of {}: following it",
+            peer,
+            target.0
+        );
+        *self.master_id.write() = target.0;
+        *self.follow.lock() = Some((target.1, target.2));
+        let _ = self.save_config();
     }
 
     /// Exchanges a fresh PING/PONG with `node_id`, so both sides see each
@@ -3513,6 +3548,7 @@ fn handle_cluster_bus_line_from(
                     .map_or_else(Vec::new, |r| parse_slot_ranges(r));
                 hub.claim_slots(&peer_id, parts[2].parse::<u64>().ok(), slots);
             }
+            hub.follow_demoted_master(&peer_id);
 
             // Parse gossip section if present
             if let Some(gossip_pos) = parts.iter().position(|&p| p == "GOSSIP")
@@ -4257,6 +4293,31 @@ mod tests {
         assert_eq!(restarted.nodes.read()[&peer].hostname, "peer.example");
         assert_eq!(restarted.my_hostname(), "");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_a_replica_follows_its_master_demoted_by_a_manual_failover() {
+        // We replicate m; our sibling s gets promoted. We first hear m
+        // announce itself a replica of s (before s's own slot claim
+        // reaches us): we follow s.
+        let hub = ClusterHub::new(7750);
+        hub.my_slots.write().clear();
+        hub.slots_default.store(false, Ordering::SeqCst);
+        let (m, sib) = ("m".repeat(40), "s".repeat(40));
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7751 {m} 0"), &hub);
+        handle_cluster_bus_line(&format!("MEET 127.0.0.1 7752 {sib} 0"), &hub);
+        handle_cluster_bus_line(&format!("PING {m} 1 master 0-16383 port=7751"), &hub);
+        handle_cluster_bus_line(&format!("PING {sib} 0 master port=7752"), &hub);
+        hub.cluster_replicate(&m).unwrap();
+        let _ = hub.take_follow();
+        // s becomes a master in our view first (its PING without slots),
+        // then m demotes itself to its replica.
+        handle_cluster_bus_line(&format!("PING {m} 1 slave port=7751 of={sib}"), &hub);
+        assert_eq!(*hub.master_id.read(), sib);
+        assert_eq!(hub.take_follow(), Some(("127.0.0.1".to_string(), 7752)));
+        // Already following it: nothing more.
+        handle_cluster_bus_line(&format!("PING {m} 1 slave port=7751 of={sib}"), &hub);
+        assert_eq!(hub.take_follow(), None);
     }
 
     #[test]
