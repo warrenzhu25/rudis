@@ -1160,6 +1160,18 @@ impl ClusterHub {
     /// serves, get -MOVED instead of waiting for pushes that now go to
     /// another node (see [`crate::block::unblock_lost_slots`]). Callers
     /// hold no cluster lock.
+    /// The cluster just went down here: clients blocked on keys get
+    /// -CLUSTERDOWN now (Redis's clusterRedirectBlockedClientIfNeeded)
+    /// instead of waiting for pushes no client can make while it is down.
+    /// With cluster-allow-reads-when-down they keep waiting.
+    fn unblock_all_for_cluster_down(&self) {
+        if self.allow_reads_when_down.load(Ordering::Relaxed) {
+            return;
+        }
+        let all: Vec<u16> = (0..16384).collect();
+        self.unblock_lost_slots(&all);
+    }
+
     fn unblock_lost_slots(&self, lost: &[u16]) {
         if lost.is_empty() || !crate::block::has_blocked_waiters(self.port) {
             return;
@@ -3814,6 +3826,7 @@ fn update_cluster_state(hub: &ClusterHub, now: u64) {
             crate::log_warning!(
                 "Cluster state changed: fail (this master can't reach a majority of masters)"
             );
+            hub.unblock_all_for_cluster_down();
         }
         return;
     }
@@ -3836,6 +3849,7 @@ fn update_coverage_state(hub: &ClusterHub) {
     if hub.coverage_down.swap(uncovered, Ordering::Relaxed) != uncovered {
         if uncovered {
             crate::log_warning!("Cluster state changed: fail (not all slots are served)");
+            hub.unblock_all_for_cluster_down();
         } else if !hub.cluster_down.load(Ordering::Relaxed) {
             crate::log_notice!("Cluster state changed: ok");
         }

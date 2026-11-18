@@ -2513,6 +2513,70 @@ fn test_cluster_lost_slot_keys_are_deleted_on_master_and_replica_e2e() {
     }
 }
 
+/// A client blocked on a key (BLPOP) gets -CLUSTERDOWN when the cluster
+/// goes down, as in Redis, instead of waiting for a push no client can
+/// make while it is down (the Redis unit/cluster/cli suite hung on it).
+#[test]
+fn test_cluster_down_unblocks_blocked_clients_e2e() {
+    let port = 18491u16;
+    let dir = std::env::temp_dir().join(format!("rudis_downunblock_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _srv = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &port.to_string(),
+            "--dir",
+            dir.to_str().unwrap(),
+            "--cluster-enabled",
+            "yes",
+            "--threads",
+            "1",
+            "--no-pin",
+        ],
+        port,
+    ));
+    let cmd = |args: &[&str]| resp_cmd(&mut connect_ready(port), args);
+    assert_eq!(cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]), "+OK\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !cmd(&["CLUSTER", "INFO"]).contains("cluster_state:ok") {
+        assert!(std::time::Instant::now() < deadline, "never ok");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut blocked = connect_ready(port);
+    blocked
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    blocked
+        .write_all(b"*3\r\n$5\r\nBLPOP\r\n$4\r\nlist\r\n$1\r\n0\r\n")
+        .unwrap();
+    // Blocked: then one slot loses its owner, and the cluster is down
+    // (cluster-require-full-coverage).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while info_u64(&mut connect_ready(port), "clients", "blocked_clients") != 1 {
+        assert!(std::time::Instant::now() < deadline, "never blocked");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let other = (0..16384u16)
+        .find(|&s| s != rudis::router::key_slot(b"list"))
+        .unwrap()
+        .to_string();
+    assert_eq!(cmd(&["CLUSTER", "DELSLOTS", &other]), "+OK\r\n");
+    let mut buf = [0u8; 128];
+    let n = blocked
+        .read(&mut buf)
+        .expect("the blocked client got no reply");
+    assert_eq!(
+        String::from_utf8_lossy(&buf[..n]),
+        "-CLUSTERDOWN The cluster is down\r\n"
+    );
+    assert_eq!(
+        info_u64(&mut connect_ready(port), "clients", "blocked_clients"),
+        0
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A hostile cluster-bus peer gets error replies or a hang-up, never a crash:
 /// MEET with a port above 55535 used to overflow `port + 10000` while holding
 /// the node-table lock, poisoning it for every later CLUSTER command.

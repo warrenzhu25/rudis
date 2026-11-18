@@ -12778,6 +12778,12 @@ pub const BLOCKED_NOPERM_REPLY: &[u8] = b"-NOPERM No permissions to access a key
 /// command, or -CLUSTERDOWN if no node serves it.
 pub(crate) fn blocked_moved_reply(router: &Router, slot: u16, out: &mut Vec<u8>) {
     let hub = crate::cluster::get_cluster_hub(router.base_port);
+    // Unblocked because the cluster went down (see
+    // `ClusterHub::unblock_all_for_cluster_down`), as Redis answers then.
+    if hub.is_down() {
+        out.extend_from_slice(b"-CLUSTERDOWN The cluster is down\r\n");
+        return;
+    }
     let nodes = hub.nodes.read();
     match nodes.values().find(|n| {
         n.is_master()
