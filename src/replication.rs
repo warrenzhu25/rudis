@@ -1573,6 +1573,11 @@ impl ReplicationHub {
     /// startup). Redis's replica data age, which `cluster-replica-validity-
     /// factor` bounds for a replica to run for election.
     pub fn master_data_age_secs(&self) -> Option<u64> {
+        // Data that isn't this master's (see `synced_current_master`) is no
+        // copy of it at all.
+        if !self.has_current_master_data() {
+            return None;
+        }
         match self.last_master_io_secs.load(Ordering::Relaxed) {
             0 => None,
             t => Some(unix_secs().saturating_sub(t)),

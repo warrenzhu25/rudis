@@ -2913,17 +2913,9 @@ impl ClusterHub {
             return;
         }
 
-        // A replica that never got its master's data must not take over:
-        // it would serve the slots empty (or with another shard's keys).
         let repl = crate::replication::get_replication_hub(self.port);
-        if !repl.holds_master_data() {
-            self.log_cant_failover(&format!(
-                "master {master_id} failed but I hold none of its data: not taking over"
-            ));
-            self.election_in_progress.store(false, Ordering::SeqCst);
-            return;
-        }
-        // Nor one whose data is too old, as Redis bounds it.
+        // As Redis, not a replica whose data is too old (never heard from
+        // this master counts as forever).
         let factor = self.replica_validity_factor.load(Ordering::Relaxed);
         if factor > 0 {
             let timeout = self.node_timeout_ms.load(Ordering::Relaxed);
@@ -2944,6 +2936,15 @@ impl ClusterHub {
                 self.election_in_progress.store(false, Ordering::SeqCst);
                 return;
             }
+        }
+        // A replica that never got its master's data must not take over:
+        // it would serve the slots empty (or with another shard's keys).
+        if !repl.holds_master_data() {
+            self.log_cant_failover(&format!(
+                "master {master_id} failed but I hold none of its data: not taking over"
+            ));
+            self.election_in_progress.store(false, Ordering::SeqCst);
+            return;
         }
         // Like Redis, wait a little (500 ms plus up to 500 ms of jitter), so
         // the FAIL verdict spreads and replicas of the same master don't
