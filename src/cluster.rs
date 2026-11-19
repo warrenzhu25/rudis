@@ -2046,9 +2046,12 @@ impl ClusterHub {
 
         // 1. Myself if master
         if my_role == "master" {
+            // Like Redis, without failed replicas: no client should be sent
+            // there, and nodes that do or don't know of a dead replica yet
+            // answer the same.
             let my_replicas: Vec<(String, u16, String, u16, String)> = nodes
                 .values()
-                .filter(|n| n.master_id == my_id)
+                .filter(|n| n.master_id == my_id && n.fail != FailState::Fail)
                 .map(|n| {
                     (
                         n.ip.clone(),
@@ -2089,7 +2092,7 @@ impl ClusterHub {
             if peer.is_master() {
                 let mut peer_replicas: Vec<(String, u16, String, u16, String)> = nodes
                     .values()
-                    .filter(|n| n.master_id == peer.id)
+                    .filter(|n| n.master_id == peer.id && n.fail != FailState::Fail)
                     .map(|n| {
                         (
                             n.ip.clone(),
@@ -5660,6 +5663,33 @@ mod tests {
         assert!(!hub.pfail_reports.read().get(&node2_id).unwrap().is_empty());
         hub.cluster_forget(&node2_id).unwrap();
         assert!(!hub.pfail_reports.read().contains_key(&node2_id));
+    }
+
+    /// CLUSTER SLOTS leaves failed replicas out, as Redis.
+    #[test]
+    fn test_cluster_slots_omits_failed_replicas() {
+        let hub = Arc::new(ClusterHub::new(7170));
+        let m = "a".repeat(40);
+        let (ok, dead) = ("b".repeat(40), "c".repeat(40));
+        // A peer gossips them all in; then each announces itself.
+        handle_cluster_bus_line(
+            &format!(
+                "PING {} 1 master GOSSIP {m},127.0.0.1,7001,17001,master,1;\
+                 {ok},127.0.0.1,7002,17002,slave,1;{dead},127.0.0.1,7003,17003,slave,1",
+                "z".repeat(40)
+            ),
+            &hub,
+        );
+        handle_cluster_bus_line(&format!("PING {m} 1 master 0-16383"), &hub);
+        for id in [&ok, &dead] {
+            handle_cluster_bus_line(&format!("PING {id} 1 slave of={m}"), &hub);
+        }
+        hub.nodes.write().get_mut(&dead).unwrap().fail = FailState::Fail;
+        let mut out = Vec::new();
+        hub.cluster_slots(&mut out, 1);
+        let out = String::from_utf8_lossy(&out);
+        assert!(out.contains(&ok), "{out}");
+        assert!(!out.contains(&dead), "{out}");
     }
 
     /// Replicas announce their replication offset; a candidate ranks below
