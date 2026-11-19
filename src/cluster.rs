@@ -816,11 +816,19 @@ impl ClusterHub {
             }
             // Our master's slots all went to `id` (it was failed over, maybe
             // to another of its replicas): like Redis, follow the new owner.
+            // Its slots migrated away while it lives on: only with
+            // cluster-allow-replica-migration; otherwise we stay with it,
+            // and follow its new master once it turns replica (a
+            // sub-replica, see `follow_demoted_master`).
+            let master_failed = nodes
+                .get(&my_master)
+                .is_some_and(|m| m.fail == FailState::Fail);
             if *self.role.read() == "slave"
                 && my_master != id
                 && master_had_slots
                 && nodes.get(&my_master).is_some_and(|m| m.slots.is_empty())
                 && !accepted.is_empty()
+                && (master_failed || self.allow_replica_migration.load(Ordering::Relaxed))
             {
                 let new_master = nodes.get(id).map(|n| (n.ip.clone(), n.port));
                 if let Some(addr) = new_master {
@@ -4595,6 +4603,40 @@ mod tests {
         // Already following it: nothing more.
         handle_cluster_bus_line(&format!("PING {m} 1 slave port=7751 of={sib}"), &hub);
         assert_eq!(hub.take_follow(), None);
+    }
+
+    /// Our live master's last slot migrates to another master: we follow
+    /// the slot's new owner with cluster-allow-replica-migration, else we
+    /// stay until our master turns replica, then follow its master (as a
+    /// sub-replica), as Redis.
+    #[test]
+    fn test_replica_follows_migrated_slots_only_when_allowed() {
+        for allowed in [true, false] {
+            let hub = ClusterHub::new(7755);
+            hub.my_slots.write().clear();
+            hub.slots_default.store(false, Ordering::SeqCst);
+            hub.allow_replica_migration.store(allowed, Ordering::SeqCst);
+            let (m, other) = ("m".repeat(40), "o".repeat(40));
+            handle_cluster_bus_line(&format!("MEET 127.0.0.1 7756 {m} 0"), &hub);
+            handle_cluster_bus_line(&format!("MEET 127.0.0.1 7757 {other} 0"), &hub);
+            handle_cluster_bus_line(&format!("PING {m} 1 master 0-0 port=7756"), &hub);
+            handle_cluster_bus_line(&format!("PING {other} 2 master 1-16383 port=7757"), &hub);
+            hub.cluster_replicate(&m).unwrap();
+            let _ = hub.take_follow();
+            // `other` takes m's only slot at a newer epoch; m lives on.
+            handle_cluster_bus_line(&format!("PING {other} 3 master 0-16383 port=7757"), &hub);
+            if allowed {
+                assert_eq!(*hub.master_id.read(), other);
+                assert_eq!(hub.take_follow(), Some(("127.0.0.1".to_string(), 7757)));
+                continue;
+            }
+            assert_eq!(*hub.master_id.read(), m);
+            assert_eq!(hub.take_follow(), None);
+            // m becomes other's replica: we flatten onto other.
+            handle_cluster_bus_line(&format!("PING {m} 1 slave port=7756 of={other}"), &hub);
+            assert_eq!(*hub.master_id.read(), other);
+            assert_eq!(hub.take_follow(), Some(("127.0.0.1".to_string(), 7757)));
+        }
     }
 
     #[test]
