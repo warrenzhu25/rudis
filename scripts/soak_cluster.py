@@ -294,12 +294,34 @@ def main():
 
     duration = int(a.hours * 3600)
     load_cpu = ",".join(map(str, load_cores))
-    memtier = subprocess.Popen([
-        "taskset", "-c", load_cpu, MEMTIER, "--server", "127.0.0.1", "--port", str(ports[0]),
-        "--cluster-mode", "--threads", "2", "--clients", "8", "--ratio", "1:3",
-        "--data-size-range", "32-1024", "--key-maximum", str(a.keys), "--key-pattern", "R:R",
-        "--rate-limiting", str(a.rate), "--test-time", str(duration), "--hide-histogram",
-    ], stdout=open(os.path.join(a.dir, "memtier.out"), "w"), stderr=subprocess.STDOUT)
+    memtier_out = os.path.join(a.dir, "memtier.out")
+    memtier_end = time.time() + duration
+
+    def start_memtier():
+        # Appends: a restarted memtier keeps the earlier runs' output.
+        secs = max(1, int(memtier_end - time.time()))
+        return subprocess.Popen([
+            "taskset", "-c", load_cpu, MEMTIER, "--server", "127.0.0.1", "--port", str(ports[0]),
+            "--cluster-mode", "--threads", "2", "--clients", "8", "--ratio", "1:3",
+            "--data-size-range", "32-1024", "--key-maximum", str(a.keys), "--key-pattern", "R:R",
+            "--rate-limiting", str(a.rate), "--test-time", str(secs), "--hide-histogram",
+        ], stdout=open(memtier_out, "a"), stderr=subprocess.STDOUT)
+
+    def memtier_stalled():
+        # memtier drops a client thread on a connection error (a node it
+        # was connected to was killed) and never replaces it; with none
+        # left it keeps running, generating no load.
+        try:
+            with open(memtier_out, "rb") as f:
+                f.seek(max(0, os.path.getsize(memtier_out) - 400))
+                tail = f.read().decode(errors="replace").replace("\r", "\n").strip().splitlines()
+        except OSError:
+            return False
+        return bool(tail) and " 0 threads" in tail[-1]
+
+    open(memtier_out, "w").close()
+    memtier = start_memtier()
+    memtier_restarts = 0
 
     # Counter writer: the highest value each counter's INCR acknowledged.
     acked = {}
@@ -462,8 +484,23 @@ def main():
                     row["probe"]["reconnects"] = len(reconnect_times)
                     row["probe"]["reconnect_max_ms"] = round(max(reconnect_times), 3)
                 row["counters"] = {"acked_total": sum(acked.values()), "errors": dict(counter_errors)}
-                if memtier.poll() not in (None, 0):
-                    bad(f"memtier exited ({memtier.returncode})")
+                # The load generator stopping isn't a server anomaly, but
+                # the soak must keep its load: restart it, and say so.
+                if time.time() < memtier_end - 60 and (
+                    memtier.poll() is not None or memtier_stalled()
+                ):
+                    why = (f"exited ({memtier.returncode})" if memtier.poll() is not None
+                           else "no client threads left")
+                    if memtier.poll() is None:
+                        memtier.terminate()
+                        try:
+                            memtier.wait(10)
+                        except subprocess.TimeoutExpired:
+                            memtier.kill()
+                    memtier_restarts += 1
+                    note(f"memtier {why}: restarted")
+                    memtier = start_memtier()
+                row["memtier_restarts"] = memtier_restarts
                 out_f.write(json.dumps(row) + "\n")
                 out_f.flush()
                 now = time.time()
@@ -597,7 +634,9 @@ def write_report(a, samples_path, events, anomalies, final):
         recon = sum(r["probe"].get("reconnects", 0) for r in rows)
         lines += ["", f"* worst probe latency: {worst:.1f} ms",
                   f"* probe GETs that reconnected first (not counted above): {recon}",
-                  f"* counter writer at the end: {rows[-1].get('counters')}"]
+                  f"* counter writer at the end: {rows[-1].get('counters')}",
+                  f"* memtier restarts (lost its client threads or exited): "
+                  f"{rows[-1].get('memtier_restarts', 0)}"]
         perr = {}
         for r in rows:
             for k, v in r.get("probe_errors", {}).items():
