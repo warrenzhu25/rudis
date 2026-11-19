@@ -4241,6 +4241,11 @@ pub fn apply_config_value(
                 .preferred_endpoint
                 .store(e as u8, Ordering::Relaxed);
         }
+        "cluster-replica-validity-factor" | "cluster-slave-validity-factor" => {
+            crate::cluster::get_cluster_hub(base_port)
+                .replica_validity_factor
+                .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
+        }
         "cluster-allow-replica-migration" => {
             crate::cluster::get_cluster_hub(base_port)
                 .allow_replica_migration
@@ -4533,7 +4538,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 114] = [
+    let all_configs: [(&str, String); 115] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -4559,6 +4564,13 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         (
             "cluster-preferred-endpoint-type",
             cluster_hub.preferred_endpoint().name().to_string(),
+        ),
+        (
+            "cluster-replica-validity-factor",
+            cluster_hub
+                .replica_validity_factor
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
         ),
         (
             "cluster-allow-replica-migration",

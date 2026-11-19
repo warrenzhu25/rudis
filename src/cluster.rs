@@ -306,6 +306,13 @@ pub struct ClusterHub {
     /// `cluster-allow-replica-migration`: a master that gives away its last
     /// slot (CLUSTER SETSLOT NODE) becomes a replica of the new owner.
     pub allow_replica_migration: AtomicBool,
+    /// `cluster-replica-validity-factor`: a replica whose data is older
+    /// than node timeout x this (plus the replication ping period) doesn't
+    /// run for election, as in Redis; 0 lets any replica run.
+    pub replica_validity_factor: AtomicU64,
+    /// When we last logged why we can't fail over (ms), so a reason that
+    /// holds every cluster tick is logged every 10 s, as Redis does.
+    cant_failover_logged_ms: AtomicU64,
     /// Down for coverage: some slot has no owner, or only a failed one
     /// (see `update_cluster_state`; with `require_full_coverage`).
     pub coverage_down: AtomicBool,
@@ -452,6 +459,8 @@ impl ClusterHub {
             allow_reads_when_down: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
             allow_replica_migration: AtomicBool::new(true),
+            replica_validity_factor: AtomicU64::new(10),
+            cant_failover_logged_ms: AtomicU64::new(0),
             coverage_down: AtomicBool::new(false),
             slot_purges: parking_lot::Mutex::new(Vec::new()),
             mf_paused: AtomicBool::new(false),
@@ -2879,6 +2888,21 @@ impl ClusterHub {
         Ok(plans)
     }
 
+    /// Logs why this replica can't fail over its failed master, at most
+    /// every 10 s (the cluster tick retries all the time).
+    fn log_cant_failover(&self, why: &str) {
+        let now = now_ms();
+        let last = self.cant_failover_logged_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 10_000
+            && self
+                .cant_failover_logged_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            crate::log_warning!("Cluster: {}", why);
+        }
+    }
+
     pub fn start_election(&self) {
         let master_id = self.master_id.read().clone();
         if master_id == "-" || master_id.is_empty() {
@@ -2887,14 +2911,36 @@ impl ClusterHub {
         }
 
         // A replica that never got its master's data must not take over:
-        // it would serve the slots empty.
-        if !crate::replication::get_replication_hub(self.port).holds_master_data() {
-            crate::log_warning!(
-                "Cluster: master {} failed but I hold none of its data: not taking over",
-                master_id
-            );
+        // it would serve the slots empty (or with another shard's keys).
+        let repl = crate::replication::get_replication_hub(self.port);
+        if !repl.holds_master_data() {
+            self.log_cant_failover(&format!(
+                "master {master_id} failed but I hold none of its data: not taking over"
+            ));
             self.election_in_progress.store(false, Ordering::SeqCst);
             return;
+        }
+        // Nor one whose data is too old, as Redis bounds it.
+        let factor = self.replica_validity_factor.load(Ordering::Relaxed);
+        if factor > 0 {
+            let timeout = self.node_timeout_ms.load(Ordering::Relaxed);
+            let mut age_ms = repl
+                .master_data_age_secs()
+                .map_or(u64::MAX, |s| s.saturating_mul(1000));
+            if age_ms > timeout {
+                age_ms -= timeout;
+            }
+            let ping_ms = crate::replication::REPL_PING_PERIOD
+                .load(Ordering::Relaxed)
+                .saturating_mul(1000);
+            if age_ms > ping_ms.saturating_add(timeout.saturating_mul(factor)) {
+                self.log_cant_failover(
+                    "Currently unable to failover: Disconnected from master for longer than allowed. \
+                     Please check the 'cluster-replica-validity-factor' configuration option.",
+                );
+                self.election_in_progress.store(false, Ordering::SeqCst);
+                return;
+            }
         }
         // Like Redis, wait a little (500 ms plus up to 500 ms of jitter), so
         // the FAIL verdict spreads and replicas of the same master don't
@@ -4690,6 +4736,13 @@ mod tests {
         assert!(!hub.cluster_down.load(Ordering::Relaxed));
     }
 
+    fn unix_now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
     #[test]
     fn test_election_needs_data_and_a_majority_of_masters() {
         // We replicate M (0-5460), which failed; A and B serve the other
@@ -4765,8 +4818,39 @@ mod tests {
         hub.start_election();
         assert!(!won(&hub), "promoted on one vote of three");
 
-        // 3. Two of three: promoted with M's slots.
+        // 3. Two of three would vote, but our data is too old for
+        // cluster-replica-validity-factor (node timeout 15 s x 10 + 10 s
+        // ping period): no election. Factor 0 lifts the bound.
         b_grants.store(true, Ordering::SeqCst);
+        let repl = crate::replication::get_replication_hub(7700);
+        let ago = |secs: u64| {
+            repl.last_master_io_secs
+                .store(unix_now_secs() - secs, Ordering::Relaxed)
+        };
+        ago(15 + 150 + 10 + 5);
+        hub.start_election();
+        assert!(!won(&hub), "a replica with stale data took over");
+        hub.replica_validity_factor.store(0, Ordering::Relaxed);
+        hub.start_election();
+        assert!(won(&hub), "factor 0 still bounded the data age");
+        assert_eq!(*hub.my_slots.read(), vec![(0, 5460)]);
+
+        // 4. Within the bound, with the default factor: promoted too.
+        let hub = ClusterHub::new(7701);
+        hub.my_slots.write().clear();
+        for (id, info) in [
+            (&m, node(&m, 17701, vec![(0, 5460)], FailState::Fail)),
+            (&a, node(&a, a_port, vec![(5461, 10922)], FailState::Ok)),
+            (&b, node(&b, b_port, vec![(10923, 16383)], FailState::Ok)),
+        ] {
+            hub.nodes.write().insert(id.clone(), info);
+        }
+        *hub.role.write() = "slave".to_string();
+        *hub.master_id.write() = m.clone();
+        let repl = crate::replication::get_replication_hub(7701);
+        repl.pretend_synced();
+        repl.last_master_io_secs
+            .store(unix_now_secs() - 20, Ordering::Relaxed);
         hub.start_election();
         assert!(won(&hub));
         assert_eq!(*hub.my_slots.read(), vec![(0, 5460)]);

@@ -1568,6 +1568,17 @@ impl ReplicationHub {
         self.is_slave() && self.has_current_master_data()
     }
 
+    /// How old our copy of the master's data is: seconds since we last
+    /// heard from it, None if never (since it became our master, or since
+    /// startup). Redis's replica data age, which `cluster-replica-validity-
+    /// factor` bounds for a replica to run for election.
+    pub fn master_data_age_secs(&self) -> Option<u64> {
+        match self.last_master_io_secs.load(Ordering::Relaxed) {
+            0 => None,
+            t => Some(unix_secs().saturating_sub(t)),
+        }
+    }
+
     /// The offset of our master's data we hold, 0 if none (see
     /// `synced_current_master`): what a replica announces to rank its
     /// election.
@@ -1598,6 +1609,8 @@ impl ReplicationHub {
         self.is_slave_atomic.store(true, Ordering::Release);
         self.cached_master.store(true, Ordering::Relaxed);
         self.synced_current_master.store(true, Ordering::Relaxed);
+        self.last_master_io_secs
+            .store(unix_secs(), Ordering::Relaxed);
     }
 
     /// `stop_sync_and_wait` for threads outside the shards' runtimes (the
@@ -3827,6 +3840,8 @@ pub fn start_replica_sync(
         };
         if !same_master {
             hub.synced_current_master.store(false, Ordering::Relaxed);
+            // Never heard from this one yet (see `master_data_age_secs`).
+            hub.last_master_io_secs.store(0, Ordering::Relaxed);
         }
         if matches!(*role, ReplicationRole::Master)
             && (hub.master_repl_offset.load(Ordering::SeqCst) > 0
