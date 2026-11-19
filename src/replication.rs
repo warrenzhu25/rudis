@@ -662,6 +662,13 @@ pub struct ReplicationHub {
     /// partial resync of our history (`ids.replid`, `master_repl_offset`);
     /// otherwise it asks for a full resync.
     cached_master: AtomicBool,
+    /// A sync with the current master completed (full, or a partial one
+    /// continuing our history) since it became our master, or our data was
+    /// loaded at startup as its replica. Until then our dataset may be
+    /// another master's (a demoted master, or a replica moved to another
+    /// shard): it is not this master's data, so we report no offset and
+    /// must not win an election for its slots.
+    synced_current_master: AtomicBool,
     /// One token, held by a replica's worker while it applies and feeds a
     /// batch of its master's stream, and by a full sync or save on a
     /// replica while it snapshots: the snapshot then matches one offset of
@@ -1123,6 +1130,7 @@ impl ReplicationHub {
             rdb_claims: Mutex::new(HashMap::new()),
             no_replicas_since: AtomicU64::new(0),
             cached_master: AtomicBool::new(false),
+            synced_current_master: AtomicBool::new(false),
             apply_token: std::sync::Arc::new(crate::mailbox::AsyncToken::new()),
             replica_batches_in_flight: std::sync::atomic::AtomicUsize::new(0),
             tx_stream_token: std::sync::Arc::new(crate::mailbox::AsyncToken::new()),
@@ -1360,6 +1368,7 @@ impl ReplicationHub {
             backlog.clear(offset);
             self.psync_holes.lock().clear();
             self.cached_master.store(true, Ordering::Relaxed);
+            self.synced_current_master.store(true, Ordering::Relaxed);
         }
         self.activate_backlog();
     }
@@ -1372,6 +1381,7 @@ impl ReplicationHub {
         let dropped = {
             let _backlog = self.backlog.write();
             self.cached_master.store(true, Ordering::Relaxed);
+            self.synced_current_master.store(true, Ordering::Relaxed);
             let mut ids = self.ids.write();
             if ids.replid == new_id {
                 Vec::new()
@@ -1421,6 +1431,7 @@ impl ReplicationHub {
                 ids.replid2 = NULL_REPLID.to_string();
                 ids.second_offset = -1;
                 self.cached_master.store(true, Ordering::Relaxed);
+                self.synced_current_master.store(true, Ordering::Relaxed);
                 self.replica_selected_db.store(stream_db, Ordering::Relaxed);
             } else {
                 ids.replid2 = replid.to_string();
@@ -1554,7 +1565,14 @@ impl ReplicationHub {
     /// Whether this replica holds a dataset from its master: a sync with
     /// it completed (full or partial) and wasn't discarded since.
     pub fn holds_master_data(&self) -> bool {
-        self.is_slave() && self.cached_master.load(Ordering::Relaxed)
+        self.is_slave() && self.has_current_master_data()
+    }
+
+    /// Whether our dataset is the current master's (see
+    /// `synced_current_master`), so its offset means something to it.
+    fn has_current_master_data(&self) -> bool {
+        self.cached_master.load(Ordering::Relaxed)
+            && self.synced_current_master.load(Ordering::Relaxed)
     }
 
     /// Tests: act as a replica that completed a sync with its master.
@@ -1568,6 +1586,7 @@ impl ReplicationHub {
         };
         self.is_slave_atomic.store(true, Ordering::Release);
         self.cached_master.store(true, Ordering::Relaxed);
+        self.synced_current_master.store(true, Ordering::Relaxed);
     }
 
     /// `stop_sync_and_wait` for threads outside the shards' runtimes (the
@@ -2356,7 +2375,7 @@ impl ReplicationHub {
                 out.extend_from_slice(state_str.as_bytes());
                 // Redis shows the offset of what was processed from the
                 // master, -1 while there is none.
-                let shown: i64 = if self.cached_master.load(Ordering::Relaxed) {
+                let shown: i64 = if self.has_current_master_data() {
                     offset as i64
                 } else {
                     -1
@@ -2455,12 +2474,12 @@ impl ReplicationHub {
                 link_status,
                 sync_in_progress,
             } => {
-                let processed = if self.cached_master.load(Ordering::Relaxed) {
+                let processed = if self.has_current_master_data() {
                     self.master_repl_offset.load(Ordering::SeqCst)
                 } else {
                     0
                 };
-                let read_ahead = if self.cached_master.load(Ordering::Relaxed) {
+                let read_ahead = if self.has_current_master_data() {
                     self.master_read_ahead.load(Ordering::Relaxed)
                 } else {
                     0
@@ -3783,6 +3802,21 @@ pub fn start_replica_sync(
         // after we turned into a replica (see `append_stream`).
         let _backlog = hub.backlog.write();
         let mut role = hub.role.write();
+        // Another master than the one our data came from: none of its data
+        // until a sync with it completes. A master's own data (demoted)
+        // isn't either, except the history restored at startup as this
+        // master's replica (`restore_saved_history`).
+        let same_master = match &*role {
+            ReplicationRole::Slave {
+                master_host: h,
+                master_port: p,
+                ..
+            } => *h == master_host && *p == master_port,
+            ReplicationRole::Master => hub.cached_master.load(Ordering::Relaxed),
+        };
+        if !same_master {
+            hub.synced_current_master.store(false, Ordering::Relaxed);
+        }
         if matches!(*role, ReplicationRole::Master)
             && (hub.master_repl_offset.load(Ordering::SeqCst) > 0
                 || hub.ids.read().replid2 != NULL_REPLID)

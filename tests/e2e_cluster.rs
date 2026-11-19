@@ -5750,3 +5750,138 @@ fn test_cluster_master_giving_last_slot_away_becomes_replica_e2e() {
         }
     }
 }
+
+/// A master that becomes another master's replica (here by giving away its
+/// last slot) holds its own old data until its sync with the new master
+/// completes. It must not win an election for the new master's slots
+/// meanwhile: it would serve its old shard's keys there. Redis reports no
+/// offset for it (ROLE -1) and it never ranks as the most up to date.
+#[test]
+fn test_cluster_demoted_master_cannot_take_over_before_syncing_e2e() {
+    let ports = [18581u16, 18583, 18585, 18587, 18589];
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_demoted_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let dirs: Vec<String> = ports.iter().map(|&p| mk_dir(p)).collect();
+    let srvs: Vec<Option<ServerGuard>> = ports
+        .iter()
+        .zip(&dirs)
+        .map(|(&p, dir)| {
+            Some(ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    dir,
+                    "--cluster-enabled",
+                    "yes",
+                    "--cluster-node-timeout",
+                    "1000",
+                    "--threads",
+                    "1",
+                    "--no-pin",
+                ],
+                p,
+            )))
+        })
+        .collect();
+    let [a, b, c, d, e] = ports;
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "5000"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["CLUSTER", "ADDSLOTSRANGE", "5001", "10000"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(c, &["CLUSTER", "ADDSLOTSRANGE", "10001", "16382"]),
+        "+OK\r\n"
+    );
+    assert_eq!(cmd(d, &["CLUSTER", "ADDSLOTS", "16383"]), "+OK\r\n");
+    for p in [b, c, d, e] {
+        assert_eq!(
+            cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &p.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    let wait = |what: &str, f: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !f() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let d_id = bulk(cmd(d, &["CLUSTER", "MYID"]));
+    wait("e never learned d", &|| {
+        cmd(e, &["CLUSTER", "NODES"]).contains(&d_id)
+    });
+    // d has a replica, so its writes build a replication offset.
+    assert_eq!(cmd(e, &["CLUSTER", "REPLICATE", &d_id]), "+OK\r\n");
+    wait("e never synced with d", &|| {
+        cmd(e, &["INFO", "replication"]).contains("master_link_status:up")
+    });
+    wait("cluster never ok", &|| {
+        ports
+            .iter()
+            .all(|&p| cmd(p, &["CLUSTER", "INFO"]).contains("cluster_state:ok"))
+    });
+    let a_id = bulk(cmd(a, &["CLUSTER", "MYID"]));
+    let key_in = |lo: u16, hi: u16| {
+        (0..)
+            .map(|i| format!("k{i}"))
+            .find(|k| (lo..=hi).contains(&rudis::router::key_slot(k.as_bytes())))
+            .unwrap()
+    };
+    // d has data (an offset) of its own.
+    assert_eq!(cmd(a, &["SET", &key_in(0, 5000), "a"]), "+OK\r\n");
+    assert_eq!(cmd(d, &["SET", &key_in(16383, 16383), "d"]), "+OK\r\n");
+    // a hangs (so d never syncs with it), then d gives its last slot to a
+    // and becomes a's replica.
+    let a_pid = srvs[0].as_ref().unwrap().id().to_string();
+    let signal = |sig: &str| {
+        let ok = std::process::Command::new("kill")
+            .args([sig, &a_pid])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "kill {sig}");
+    };
+    signal("-STOP");
+    assert_eq!(
+        cmd(d, &["CLUSTER", "SETSLOT", "16383", "NODE", &a_id]),
+        "+OK\r\n"
+    );
+    wait("d never followed a", &|| {
+        cmd(d, &["ROLE"]).contains(&format!(":{a}\r\n"))
+    });
+    let role = cmd(d, &["ROLE"]);
+    assert!(
+        role.ends_with(":-1\r\n"),
+        "demoted master reports an offset: {role}"
+    );
+
+    // a is failed: d must not take its slots with its old data.
+    wait("a never marked failed", &|| {
+        cmd(b, &["CLUSTER", "NODES"])
+            .lines()
+            .any(|l| l.starts_with(&a_id) && l.contains("fail") && !l.contains("fail?"))
+    });
+    thread::sleep(Duration::from_secs(4));
+    for p in [d, e] {
+        let nodes = cmd(p, &["CLUSTER", "NODES"]);
+        assert!(
+            nodes.lines().any(|l| l.contains("myself,slave")),
+            "a node with d's data took over a's slots: {nodes}"
+        );
+    }
+    signal("-CONT");
+    drop(srvs);
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
