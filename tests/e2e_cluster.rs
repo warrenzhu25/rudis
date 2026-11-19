@@ -6010,3 +6010,99 @@ fn test_cluster_failover_of_a_frozen_master_converges_e2e() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// CLUSTER SETSLOT NODE tells every node right away (as Redis broadcasts a
+/// PONG), not on the next half-second tick: a third node learns each moved
+/// slot's owner within a few hundred milliseconds.
+#[test]
+fn test_cluster_setslot_node_spreads_at_once_e2e() {
+    let ports = [18621u16, 18623, 18625];
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_spread_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let dirs: Vec<String> = ports.iter().map(|&p| mk_dir(p)).collect();
+    let _srvs: Vec<ServerGuard> = ports
+        .iter()
+        .zip(&dirs)
+        .map(|(&p, dir)| {
+            ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    dir,
+                    "--cluster-enabled",
+                    "yes",
+                    "--threads",
+                    "1",
+                    "--no-pin",
+                ],
+                p,
+            ))
+        })
+        .collect();
+    let [a, b, c] = ports;
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "8191"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["CLUSTER", "ADDSLOTSRANGE", "8192", "16383"]),
+        "+OK\r\n"
+    );
+    for p in [b, c] {
+        assert_eq!(
+            cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &p.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while ![a, b, c]
+        .iter()
+        .all(|&p| cmd(p, &["CLUSTER", "INFO"]).contains("cluster_state:ok"))
+    {
+        assert!(std::time::Instant::now() < deadline, "never ok");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let b_id = bulk(cmd(b, &["CLUSTER", "MYID"]));
+    // c's view of slot `s`'s owner, from CLUSTER NODES.
+    let owner_on_c = |s: u16| -> String {
+        cmd(c, &["CLUSTER", "NODES"])
+            .lines()
+            .find(|l| {
+                l.split_whitespace().skip(8).any(|r| {
+                    let (lo, hi) = r.split_once('-').unwrap_or((r, r));
+                    matches!((lo.parse::<u16>(), hi.parse::<u16>()), (Ok(lo), Ok(hi)) if lo <= s && s <= hi)
+                })
+            })
+            .map(|l| l.split_whitespace().next().unwrap_or_default().to_string())
+            .unwrap_or_default()
+    };
+    for s in 0..5u16 {
+        let slot = s.to_string();
+        assert_eq!(
+            cmd(b, &["CLUSTER", "SETSLOT", &slot, "NODE", &b_id]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(a, &["CLUSTER", "SETSLOT", &slot, "NODE", &b_id]),
+            "+OK\r\n"
+        );
+        let start = std::time::Instant::now();
+        while owner_on_c(s) != b_id {
+            assert!(
+                start.elapsed() < Duration::from_millis(300),
+                "slot {s}: c still had the old owner after 300 ms"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

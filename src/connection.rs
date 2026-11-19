@@ -15496,6 +15496,8 @@ async fn execute_command_inner(
                                 .set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
                         }
                         router.sync_slot_tables().await;
+                        // Peers learn the new owner (and its epoch) now.
+                        hub.broadcast_config();
                         out.extend_from_slice(b"+OK\r\n");
                     }
                 },

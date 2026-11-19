@@ -313,6 +313,8 @@ pub struct ClusterHub {
     /// When we last logged why we can't fail over (ms), so a reason that
     /// holds every cluster tick is logged every 10 s, as Redis does.
     cant_failover_logged_ms: AtomicU64,
+    /// See `broadcast_config`.
+    broadcast_state: std::sync::atomic::AtomicU8,
     /// Down for coverage: some slot has no owner, or only a failed one
     /// (see `update_cluster_state`; with `require_full_coverage`).
     pub coverage_down: AtomicBool,
@@ -461,6 +463,7 @@ impl ClusterHub {
             allow_replica_migration: AtomicBool::new(true),
             replica_validity_factor: AtomicU64::new(10),
             cant_failover_logged_ms: AtomicU64::new(0),
+            broadcast_state: std::sync::atomic::AtomicU8::new(0),
             coverage_down: AtomicBool::new(false),
             slot_purges: parking_lot::Mutex::new(Vec::new()),
             mf_paused: AtomicBool::new(false),
@@ -751,6 +754,7 @@ impl ClusterHub {
         );
         self.become_replica_of(new_owner, addr);
         let _ = self.save_config();
+        self.broadcast_config();
     }
 
     pub fn claim_slots(&self, id: &str, epoch: Option<u64>, slots: Vec<(u16, u16)>) {
@@ -1454,6 +1458,70 @@ impl ClusterHub {
         *self.master_id.write() = target.0;
         *self.follow.lock() = Some((target.1, target.2));
         let _ = self.save_config();
+    }
+
+    /// Tells every peer our configuration now (a PING each, applying their
+    /// PONGs), off the caller's thread, as Redis's clusterBroadcastPong
+    /// after a change of slots or role: waiting for the next tick left
+    /// peers on the old view for up to half a second, so a replica frozen
+    /// or failing over in that window acted on stale slots (it took over
+    /// its master's slots minus the one just moved to it).
+    ///
+    /// Coalesced: a reshard calls this per slot, so while one round runs,
+    /// further calls only ask for one more round after it (which sends the
+    /// configuration as of then).
+    pub fn broadcast_config(&self) {
+        // 0 idle, 1 a round running, 2 running and another one asked for.
+        if self.broadcast_state.fetch_add(1, Ordering::AcqRel) > 0 {
+            self.broadcast_state.store(2, Ordering::Release);
+            return;
+        }
+        let hub = get_cluster_hub(self.port);
+        std::thread::spawn(move || {
+            loop {
+                hub.broadcast_config_round();
+                // Asked again meanwhile: one more round; else idle.
+                if hub
+                    .broadcast_state
+                    .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+                hub.broadcast_state.store(1, Ordering::Release);
+            }
+        });
+    }
+
+    fn broadcast_config_round(self: &Arc<Self>) {
+        let hub = self;
+        let peers: Vec<(String, SocketAddr)> = self
+            .nodes
+            .read()
+            .values()
+            .filter_map(|n| Some((n.id.clone(), format!("{}:{}", n.ip, n.cport).parse().ok()?)))
+            .collect();
+        {
+            std::thread::scope(|scope| {
+                for (id, addr) in &peers {
+                    let hub = &hub;
+                    scope.spawn(move || {
+                        let Ok(mut stream) = bus_dial(hub.port, *addr, Duration::from_millis(300))
+                        else {
+                            return;
+                        };
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                        let mut buf = [0u8; 4096];
+                        if stream.write_all(hub.ping_frame("").as_bytes()).is_ok()
+                            && let Ok(n) = stream.read(&mut buf)
+                        {
+                            hub.apply_pong(id, &String::from_utf8_lossy(&buf[..n]));
+                        }
+                    });
+                }
+            });
+        }
     }
 
     /// Exchanges a fresh PING/PONG with `node_id`, so both sides see each
