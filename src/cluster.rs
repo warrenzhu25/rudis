@@ -1420,9 +1420,9 @@ impl ClusterHub {
             }
         };
         crate::log_warning!(
-            "Cluster: my master {} is now a replica of {}: following it",
-            peer,
-            target.0
+            "I'm a sub-replica! Reconfiguring myself as a replica of {} from {}",
+            target.0,
+            peer
         );
         *self.master_id.write() = target.0;
         *self.follow.lock() = Some((target.1, target.2));
