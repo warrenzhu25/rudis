@@ -9,6 +9,11 @@
 #       test targets build, and the perf A/B against its parent when it
 #       changes src/; then full CI on <tip>
 #
+# CI_ALLOW_NOISY=1 passes --allow-noisy to the perf A/B: on a host too
+# noisy for a perf verdict, the series still checks every commit's build,
+# lint and tests. The perf verdict is then still owed: rerun the A/B for
+# the tip on a quiet host before pushing.
+#
 # It never pushes: push only after it exits 0. The e2e and TCL suites are
 # timing-sensitive, so keep the host otherwise quiet while it runs (builds
 # or benchmarks alongside it have failed tests that pass alone).
@@ -109,7 +114,7 @@ commit_checks() { # sha
     fi
     local perf="$LOGS/perf_$short.log"
     if ! (cd "$WT" && cargo build --release && python3 scripts/check_perf_regression.py \
-        --memtier --baseline-rev "$sha^") > "$perf" 2>&1; then
+        --memtier --baseline-rev "$sha^" ${CI_ALLOW_NOISY:+--allow-noisy}) > "$perf" 2>&1; then
         tail -20 "$perf"
         echo "PERF FAILED ($short): an INCONCLUSIVE verdict means the host was noisy; rerun when quiet" >&2
         exit 1
