@@ -1334,11 +1334,29 @@ impl ClusterHub {
         ));
         // Always, so peers also learn when it is cleared.
         t.push_str(&format!(" hostname={}", self.announce_hostname.read()));
+        // Our current epoch, as every Redis message carries it: an epoch
+        // bump spreads through every node that heard of it, not only from
+        // the node that bumped (which may freeze right after).
+        t.push_str(&format!(
+            " cepoch={}",
+            self.current_epoch.load(Ordering::SeqCst)
+        ));
         if *self.role.read() == "slave" {
             t.push_str(&format!(" of={}", self.master_id.read()));
             t.push_str(&format!(" offset={}", self.my_repl_offset()));
         }
         t
+    }
+
+    /// Raises our current epoch to the `cepoch=` a known peer announced
+    /// (see `announce_tokens`), as Redis does with every message's header.
+    fn learn_current_epoch(&self, parts: &[&str]) {
+        if let Some(e) = parts
+            .iter()
+            .find_map(|p| p.strip_prefix("cepoch=")?.parse::<u64>().ok())
+        {
+            self.current_epoch.fetch_max(e, Ordering::SeqCst);
+        }
     }
 
     /// The replication offset of our master's data we hold (0 if none),
@@ -1398,6 +1416,7 @@ impl ClusterHub {
                 apply_announce(node, &parts);
             }
         }
+        self.learn_current_epoch(&parts);
         self.claim_slots(key, epoch, slots);
         self.follow_demoted_master(key);
         true
@@ -3667,6 +3686,10 @@ fn apply_announce(node: &mut ClusterNodeInfo, parts: &[&str]) {
     }
 }
 
+fn nodes_know(hub: &ClusterHub, id: &str) -> bool {
+    hub.nodes.read().contains_key(id)
+}
+
 fn handle_cluster_bus_conn(stream: TcpStream, hub: &Arc<ClusterHub>) {
     let ends = stream.peer_addr().ok().zip(stream.local_addr().ok());
     let stream = match bus_accept(hub.port, stream) {
@@ -3821,6 +3844,13 @@ fn handle_cluster_bus_line_from(
                         .map_or(&parts[..], |g| &parts[..g]);
                     apply_announce(node, own);
                 }
+            }
+            if nodes_know(hub, &peer_id) {
+                let own = parts
+                    .iter()
+                    .position(|p| *p == "GOSSIP")
+                    .map_or(&parts[..], |g| &parts[..g]);
+                hub.learn_current_epoch(own);
             }
             if parts.len() >= 4 {
                 // No slot list (the next field is GOSSIP or nothing): none.
@@ -5738,6 +5768,30 @@ mod tests {
         assert!(!hub.pfail_reports.read().get(&node2_id).unwrap().is_empty());
         hub.cluster_forget(&node2_id).unwrap();
         assert!(!hub.pfail_reports.read().contains_key(&node2_id));
+    }
+
+    /// Nodes announce their current epoch; ours rises to a known peer's
+    /// (not an unknown node's), and our PINGs carry ours.
+    #[test]
+    fn test_current_epoch_spreads_through_pings() {
+        let hub = Arc::new(ClusterHub::new(7190));
+        let known = "a".repeat(40);
+        handle_cluster_bus_line(
+            &format!(
+                "PING {} 1 master GOSSIP {known},127.0.0.1,7001,17001,master,1",
+                "z".repeat(40)
+            ),
+            &hub,
+        );
+        let before = hub.current_epoch.load(Ordering::SeqCst);
+        handle_cluster_bus_line(&format!("PING {} 1 master cepoch=50", "u".repeat(40)), &hub);
+        assert_eq!(hub.current_epoch.load(Ordering::SeqCst), before);
+        handle_cluster_bus_line(&format!("PING {known} 1 master cepoch=9"), &hub);
+        assert_eq!(hub.current_epoch.load(Ordering::SeqCst), before.max(9));
+        assert!(
+            hub.ping_frame("")
+                .contains(&format!(" cepoch={}", before.max(9)))
+        );
     }
 
     /// A master votes only for an epoch that beats both its current epoch
