@@ -2981,7 +2981,17 @@ impl ClusterHub {
             return;
         }
 
-        let req_epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        // Above every epoch we know of, the failed master's config epoch
+        // included: a claim at that epoch ties the master's, and on a tie
+        // the master keeps its slots everywhere (the cluster stayed down
+        // until it came back, then took them back from us).
+        let master_epoch = self
+            .nodes
+            .read()
+            .get(&master_id)
+            .map_or(0, |m| m.config_epoch);
+        let req_epoch = self.current_epoch.load(Ordering::SeqCst).max(master_epoch) + 1;
+        self.current_epoch.fetch_max(req_epoch, Ordering::SeqCst);
 
         // The masters serving slots vote, the failed one included in the
         // count: winning takes a majority of them. A replica gets no vote
@@ -3022,6 +3032,13 @@ impl ClusterHub {
                         let resp = String::from_utf8_lossy(&buf[..n]);
                         if resp.starts_with("+FAILOVER_AUTH_ACK") {
                             votes += 1;
+                        } else if let Some(e) = resp
+                            .split_whitespace()
+                            .find_map(|t| t.strip_prefix("epoch=")?.parse::<u64>().ok())
+                        {
+                            // Refused for a stale epoch: the next try asks
+                            // for one above what the voter knows.
+                            self.current_epoch.fetch_max(e, Ordering::SeqCst);
                         }
                     }
                 }
@@ -3967,22 +3984,35 @@ fn handle_cluster_bus_line_from(
             let last_vote = hub.last_vote_epoch.load(Ordering::Relaxed);
             // Down, and not failed over yet: once another node took its
             // slots, a later election (another replica) must not take them.
-            let master_is_down = {
+            let (master_is_down, master_epoch) = {
                 let nodes = hub.nodes.read();
-                nodes
-                    .get(claimed_master)
-                    .is_some_and(|n| n.fail == FailState::Fail && !n.slots.is_empty())
+                nodes.get(claimed_master).map_or((false, 0), |n| {
+                    (
+                        n.fail == FailState::Fail && !n.slots.is_empty(),
+                        n.config_epoch,
+                    )
+                })
             };
+            // As Redis: not for an epoch older than ours, nor one that
+            // doesn't beat the failed master's config epoch (its claim would
+            // tie the master's, which keeps the slots on a tie).
+            let current = hub.current_epoch.load(Ordering::SeqCst);
+            let epoch_ok = req_epoch >= current && req_epoch > master_epoch;
 
-            if is_master && req_epoch > last_vote && master_is_down {
+            if is_master && req_epoch > last_vote && master_is_down && epoch_ok {
                 hub.last_vote_epoch.store(req_epoch, Ordering::SeqCst);
+                hub.current_epoch.fetch_max(req_epoch, Ordering::SeqCst);
                 Some(format!(
                     "+FAILOVER_AUTH_ACK {} {}\r\n",
                     hub.my_id(),
                     req_epoch
                 ))
             } else {
-                Some("-ERR vote rejected\r\n".to_string())
+                // The epoch to beat, so the candidate retries above it.
+                Some(format!(
+                    "-ERR vote rejected epoch={}\r\n",
+                    current.max(master_epoch)
+                ))
             }
         }
         "FAILOVER_ANNOUNCE" => {
@@ -5708,6 +5738,42 @@ mod tests {
         assert!(!hub.pfail_reports.read().get(&node2_id).unwrap().is_empty());
         hub.cluster_forget(&node2_id).unwrap();
         assert!(!hub.pfail_reports.read().contains_key(&node2_id));
+    }
+
+    /// A master votes only for an epoch that beats both its current epoch
+    /// and the failed master's config epoch (a claim at the master's epoch
+    /// ties it, and the master keeps the slots on a tie); a refusal names
+    /// the epoch to beat.
+    #[test]
+    fn test_vote_needs_an_epoch_above_the_failed_masters() {
+        let hub = Arc::new(ClusterHub::new(7180));
+        let m = "a".repeat(40);
+        let r = "b".repeat(40);
+        handle_cluster_bus_line(
+            &format!(
+                "PING {} 1 master GOSSIP {m},127.0.0.1,7001,17001,master,1",
+                "z".repeat(40)
+            ),
+            &hub,
+        );
+        handle_cluster_bus_line(&format!("PING {m} 5 master 0-100"), &hub);
+        hub.nodes.write().get_mut(&m).unwrap().fail = FailState::Fail;
+        assert_eq!(hub.nodes.read()[&m].config_epoch, 5);
+        // We serve slots, so we vote.
+        *hub.my_slots.write() = vec![(101, 16383)];
+        let ask = |epoch: u64| {
+            handle_cluster_bus_line(&format!("FAILOVER_AUTH_REQUEST {r} {epoch} {m}"), &hub)
+                .unwrap_or_default()
+        };
+        // The master's own epoch: refused, told to beat 5.
+        let no = ask(5);
+        assert!(
+            no.starts_with("-ERR vote rejected") && no.contains("epoch=5"),
+            "{no}"
+        );
+        assert!(ask(6).starts_with("+FAILOVER_AUTH_ACK"));
+        // And not twice for one epoch.
+        assert!(ask(6).starts_with("-ERR"));
     }
 
     /// CLUSTER SLOTS leaves failed replicas out, as Redis.

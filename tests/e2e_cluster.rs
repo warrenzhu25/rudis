@@ -5885,3 +5885,128 @@ fn test_cluster_demoted_master_cannot_take_over_before_syncing_e2e() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// A master that freezes (SIGSTOP: its kernel still accepts connections,
+/// but it never answers) is failed over like a dead one, and the whole
+/// cluster converges on the new master: before, the winner's cluster bus
+/// could hang on the frozen peer, so nobody learned of the new owner until
+/// the old master woke up.
+#[test]
+fn test_cluster_failover_of_a_frozen_master_converges_e2e() {
+    let ports = [18601u16, 18603, 18605, 18607];
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_frozen_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let dirs: Vec<String> = ports.iter().map(|&p| mk_dir(p)).collect();
+    let srvs: Vec<ServerGuard> = ports
+        .iter()
+        .zip(&dirs)
+        .map(|(&p, dir)| {
+            ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    dir,
+                    "--cluster-enabled",
+                    "yes",
+                    "--cluster-node-timeout",
+                    "1000",
+                    "--threads",
+                    "1",
+                    "--no-pin",
+                ],
+                p,
+            ))
+        })
+        .collect();
+    let [a, b, c, r] = ports;
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "5460"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["CLUSTER", "ADDSLOTSRANGE", "5461", "10922"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(c, &["CLUSTER", "ADDSLOTSRANGE", "10923", "16383"]),
+        "+OK\r\n"
+    );
+    for p in [b, c, r] {
+        assert_eq!(
+            cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &p.to_string()]),
+            "+OK\r\n"
+        );
+    }
+    let wait = |secs: u64, what: &str, f: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while !f() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let (a_id, r_id) = (
+        bulk(cmd(a, &["CLUSTER", "MYID"])),
+        bulk(cmd(r, &["CLUSTER", "MYID"])),
+    );
+    wait(20, "r never learned a", &|| {
+        cmd(r, &["CLUSTER", "NODES"]).contains(&a_id)
+    });
+    let key = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| rudis::router::key_slot(k.as_bytes()) <= 5460)
+        .unwrap();
+    assert_eq!(cmd(a, &["SET", &key, "v"]), "+OK\r\n");
+    assert_eq!(cmd(r, &["CLUSTER", "REPLICATE", &a_id]), "+OK\r\n");
+    wait(20, "r never synced", &|| {
+        cmd(r, &["INFO", "replication"]).contains("master_link_status:up")
+    });
+    wait(20, "cluster never ok", &|| {
+        [a, b, c, r]
+            .iter()
+            .all(|&p| cmd(p, &["CLUSTER", "INFO"]).contains("cluster_state:ok"))
+    });
+
+    let a_pid = srvs[0].id().to_string();
+    let signal = |sig: &str| {
+        let ok = std::process::Command::new("kill")
+            .args([sig, &a_pid])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "kill {sig}");
+    };
+    signal("-STOP");
+    // r takes over, and every live node sees it own a's slots, ok.
+    let converged = || {
+        [b, c, r].iter().all(|&p| {
+            let slots = cmd(p, &["CLUSTER", "SLOTS"]);
+            cmd(p, &["CLUSTER", "INFO"]).contains("cluster_state:ok")
+                && slots.contains(&r_id)
+                && !slots.contains(&a_id)
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !converged() {
+        if std::time::Instant::now() > deadline {
+            let views: Vec<String> = [b, c, r]
+                .iter()
+                .map(|&p| format!("{p}: {}", cmd(p, &["CLUSTER", "NODES"])))
+                .collect();
+            signal("-CONT");
+            panic!("no convergence after freezing a:\n{}", views.join("\n"));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(cmd(r, &["GET", &key]), "$1\r\nv\r\n");
+    signal("-CONT");
+    drop(srvs);
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
