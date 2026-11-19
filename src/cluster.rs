@@ -1636,10 +1636,12 @@ impl ClusterHub {
         // With cluster-require-full-coverage, down while some slot has no
         // owner or only a failed one (no replica took it over yet), as in
         // Redis; and down while this master is cut off from the majority.
-        let uncovered = self.require_full_coverage.load(Ordering::Relaxed)
-            && !self.has_default_slots()
-            && (slots_ok + slots_pfail < 16384);
-        let down = uncovered || self.cluster_down.load(Ordering::Relaxed);
+        // The same state commands answer -CLUSTERDOWN by (refreshed here,
+        // as the bus tick may not have yet): computed apart, INFO said ok
+        // while reads still got CLUSTERDOWN.
+        drop(nodes);
+        update_coverage_state(self);
+        let down = self.is_down();
         let state = if down { "fail" } else { "ok" };
         let cur_epoch = self.current_epoch.load(Ordering::Relaxed);
         let cfg_epoch = self.config_epoch.load(Ordering::Relaxed);
