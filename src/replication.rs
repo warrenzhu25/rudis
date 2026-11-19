@@ -1568,6 +1568,17 @@ impl ReplicationHub {
         self.is_slave() && self.has_current_master_data()
     }
 
+    /// The offset of our master's data we hold, 0 if none (see
+    /// `synced_current_master`): what a replica announces to rank its
+    /// election.
+    pub fn reported_offset(&self) -> u64 {
+        if self.has_current_master_data() {
+            self.master_repl_offset.load(Ordering::SeqCst)
+        } else {
+            0
+        }
+    }
+
     /// Whether our dataset is the current master's (see
     /// `synced_current_master`), so its offset means something to it.
     fn has_current_master_data(&self) -> bool {

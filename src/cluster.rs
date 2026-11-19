@@ -114,6 +114,9 @@ pub struct ClusterNodeInfo {
     pub slots: Vec<(u16, u16)>,
     /// `cluster-announce-hostname` as the node announces it; empty if none.
     pub hostname: String,
+    /// For a replica, the replication offset it last announced (0 while it
+    /// holds none of its master's data): ranks its election, as in Redis.
+    pub repl_offset: u64,
 }
 
 impl ClusterNodeInfo {
@@ -1070,6 +1073,7 @@ impl ClusterHub {
                         link_state,
                         slots: node_slots,
                         hostname,
+                        repl_offset: 0,
                     },
                 );
             }
@@ -1315,8 +1319,34 @@ impl ClusterHub {
         t.push_str(&format!(" hostname={}", self.announce_hostname.read()));
         if *self.role.read() == "slave" {
             t.push_str(&format!(" of={}", self.master_id.read()));
+            t.push_str(&format!(" offset={}", self.my_repl_offset()));
         }
         t
+    }
+
+    /// The replication offset of our master's data we hold (0 if none),
+    /// which ranks our election among its replicas.
+    fn my_repl_offset(&self) -> u64 {
+        crate::replication::get_replication_hub(self.port).reported_offset()
+    }
+
+    /// Our rank among the replicas of `master_id` for its election: how
+    /// many of the ones still reachable hold more of its data than us.
+    /// Redis delays each candidate by a second per rank, so the most up to
+    /// date replica normally runs first and wins.
+    fn election_rank(&self, master_id: &str, my_offset: u64) -> usize {
+        let my_id = self.my_id();
+        self.nodes
+            .read()
+            .values()
+            .filter(|n| {
+                n.id != my_id
+                    && !n.is_master()
+                    && n.master_id == master_id
+                    && n.fail != FailState::Fail
+                    && n.repl_offset > my_offset
+            })
+            .count()
     }
 
     /// Applies a `+PONG <id> <epoch> <role> <slots>` reply from `node_id`.
@@ -1652,6 +1682,7 @@ impl ClusterHub {
                 link_state: "connected".to_string(),
                 slots: Vec::new(),
                 hostname: String::new(),
+                repl_offset: 0,
             },
         );
         true
@@ -1747,6 +1778,7 @@ impl ClusterHub {
                                     link_state: "connected".to_string(),
                                     slots: remote_slots,
                                     hostname: String::new(),
+                                    repl_offset: 0,
                                 },
                             );
                         }
@@ -2866,8 +2898,19 @@ impl ClusterHub {
         }
         // Like Redis, wait a little (500 ms plus up to 500 ms of jitter), so
         // the FAIL verdict spreads and replicas of the same master don't
-        // split the votes of one epoch.
-        std::thread::sleep(Duration::from_millis(500 + random_below(500)));
+        // split the votes of one epoch, plus a second per replica of it
+        // holding more of its data than us, so the most up to date one
+        // normally runs first and wins.
+        let offset = self.my_repl_offset();
+        let rank = self.election_rank(&master_id, offset);
+        let delay = 500 + random_below(500) + rank as u64 * 1000;
+        crate::log_notice!(
+            "Start of election delayed for {} milliseconds (rank #{}, offset {}).",
+            delay,
+            rank,
+            offset
+        );
+        std::thread::sleep(Duration::from_millis(delay));
         let still_failed = self
             .nodes
             .read()
@@ -3537,10 +3580,13 @@ fn apply_announce(node: &mut ClusterNodeInfo, parts: &[&str]) {
             node.cport = cport;
         } else if let Some(h) = p.strip_prefix("hostname=").filter(|h| valid_hostname(h)) {
             node.hostname = h.to_string();
+        } else if let Some(o) = p.strip_prefix("offset=").and_then(|o| o.parse().ok()) {
+            node.repl_offset = o;
         }
     }
     if node.is_master() {
         node.master_id = "-".to_string();
+        node.repl_offset = 0;
     }
 }
 
@@ -3662,6 +3708,7 @@ fn handle_cluster_bus_line_from(
                         link_state: "connected".to_string(),
                         slots: known_slots,
                         hostname: String::new(),
+                        repl_offset: 0,
                     },
                 );
             }
@@ -3766,6 +3813,7 @@ fn handle_cluster_bus_line_from(
                                         link_state: "connected".to_string(),
                                         slots: Vec::new(),
                                         hostname: String::new(),
+                                        repl_offset: 0,
                                     },
                                 );
                             }
@@ -4189,6 +4237,7 @@ mod tests {
             link_state: "connected".to_string(),
             slots: vec![(0, 99)],
             hostname: String::new(),
+            repl_offset: 0,
         };
         let old_owner = "p".repeat(40);
         let hub = std::sync::Arc::new(ClusterHub::new(7320));
@@ -4252,6 +4301,7 @@ mod tests {
             link_state: "connected".to_string(),
             slots: Vec::new(),
             hostname: String::new(),
+            repl_offset: 0,
         };
         let (low, high) = ("a".repeat(40), "z".repeat(40));
         // Two masters both claim 0-100 at epoch 5 (a failover that picked
@@ -4299,6 +4349,7 @@ mod tests {
             link_state: "connected".to_string(),
             slots: Vec::new(),
             hostname: String::new(),
+            repl_offset: 0,
         };
         // We are the old master of 10923-16383 at epoch 0, back after a
         // failover promoted `new` at epoch 2.
@@ -4360,6 +4411,7 @@ mod tests {
                     link_state: "connected".to_string(),
                     slots: Vec::new(),
                     hostname: String::new(),
+                    repl_offset: 0,
                 },
             );
         };
@@ -4546,6 +4598,7 @@ mod tests {
             link_state: "connected".to_string(),
             slots,
             hostname: String::new(),
+            repl_offset: 0,
         };
         let state = |hub: &ClusterHub| {
             let info = hub.cluster_info();
@@ -4607,6 +4660,7 @@ mod tests {
             link_state: "connected".to_string(),
             slots,
             hostname: String::new(),
+            repl_offset: 0,
         };
         let (a, b) = ("a".repeat(40), "b".repeat(40));
         hub.nodes
@@ -4680,6 +4734,7 @@ mod tests {
                 link_state: "connected".to_string(),
                 slots,
                 hostname: String::new(),
+                repl_offset: 0,
             };
         let (a_port, b_port) = (voter(None), voter(Some(b_grants.clone())));
         hub.nodes
@@ -4922,6 +4977,7 @@ mod tests {
                     link_state: "connected".to_string(),
                     slots: Vec::new(),
                     hostname: String::new(),
+                    repl_offset: 0,
                 },
             );
         }
@@ -5217,6 +5273,7 @@ mod tests {
             link_state: "connected".to_string(),
             slots,
             hostname: String::new(),
+            repl_offset: 0,
         };
         {
             let mut nodes = hub.nodes.write();
@@ -5264,6 +5321,7 @@ mod tests {
                 link_state: "connected".to_string(),
                 slots: vec![(200, 299)],
                 hostname: String::new(),
+                repl_offset: 0,
             },
         );
         // A slot some node holds can't be added: it would have two owners.
@@ -5312,6 +5370,7 @@ mod tests {
             link_state: "connected".to_string(),
             slots: Vec::new(),
             hostname: String::new(),
+            repl_offset: 0,
         };
         let hub = ClusterHub::new(7100);
         let master = "m".repeat(40);
@@ -5411,6 +5470,7 @@ mod tests {
                     link_state: "connected".to_string(),
                     slots: vec![(0, 5460)],
                     hostname: String::new(),
+                    repl_offset: 0,
                 },
             );
             nodes.insert(
@@ -5430,6 +5490,7 @@ mod tests {
                     link_state: "connected".to_string(),
                     slots: vec![(5461, 10922)],
                     hostname: String::new(),
+                    repl_offset: 0,
                 },
             );
         }
@@ -5515,6 +5576,46 @@ mod tests {
         assert!(!hub.pfail_reports.read().get(&node2_id).unwrap().is_empty());
         hub.cluster_forget(&node2_id).unwrap();
         assert!(!hub.pfail_reports.read().contains_key(&node2_id));
+    }
+
+    /// Replicas announce their replication offset; a candidate ranks below
+    /// each live sibling replica of the same master holding more data.
+    #[test]
+    fn test_election_rank_follows_announced_offsets() {
+        let hub = Arc::new(ClusterHub::new(7160));
+        let m = "a".repeat(40);
+        let (r1, r2, r3, other) = (
+            "b".repeat(40),
+            "c".repeat(40),
+            "d".repeat(40),
+            "e".repeat(40),
+        );
+        handle_cluster_bus_line(&format!("PING {m} 1 master 0-100"), &hub);
+        // Each sibling gossips itself in, then PINGs its own announcement.
+        for (id, of, offset) in [
+            (&r1, &m, 900),
+            (&r2, &m, 100),
+            (&r3, &m, 500),
+            (&other, &r1, 5000),
+        ] {
+            handle_cluster_bus_line(
+                &format!("PING {m} 1 master 0-100 GOSSIP {id},127.0.0.1,7002,17002,slave,1"),
+                &hub,
+            );
+            handle_cluster_bus_line(&format!("PING {id} 1 slave of={of} offset={offset}"), &hub);
+        }
+        assert_eq!(hub.nodes.read()[&r1].repl_offset, 900);
+        // At 500: r1 (900) is ahead; r2 is behind; `other` replicates
+        // someone else.
+        assert_eq!(hub.election_rank(&m, 500), 1);
+        assert_eq!(hub.election_rank(&m, 1000), 0);
+        assert_eq!(hub.election_rank(&m, 0), 3);
+        // A failed sibling doesn't count.
+        hub.nodes.write().get_mut(&r1).unwrap().fail = FailState::Fail;
+        assert_eq!(hub.election_rank(&m, 500), 0);
+        // A master announces no offset.
+        handle_cluster_bus_line(&format!("PING {r3} 2 master offset=7"), &hub);
+        assert_eq!(hub.nodes.read()[&r3].repl_offset, 0);
     }
 
     /// CLUSTER FORGET refuses unknown nodes and ourselves, keeps the node
@@ -5633,6 +5734,7 @@ mod tests {
                 link_state: "connected".to_string(),
                 slots: Vec::new(),
                 hostname: String::new(),
+                repl_offset: 0,
             },
         );
 
@@ -5901,6 +6003,7 @@ mod tests {
                 link_state: "connected".to_string(),
                 slots: vec![(5461, 9999), (10001, 16383)],
                 hostname: String::new(),
+                repl_offset: 0,
             },
         );
         hub.has_nodes.store(true, Ordering::Release);
