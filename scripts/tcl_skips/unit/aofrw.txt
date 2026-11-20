@@ -1,0 +1,11 @@
+# unit/aofrw tests that don't apply to rudis.
+#
+# FUNCTION FLUSH after the rewrite is in the AOF tail (it is a write, as in
+# Redis), so DEBUG LOADAOF replays it and the function is gone. Functions do
+# survive an AOF rewrite plus restart (checked by hand); this test relies on
+# how this Redis version replays the flush on DEBUG LOADAOF.
+AOF rewrite functions
+# Arrays (ARSET & co.) are an unreleased Redis type rudis doesn't implement.
+AOF rewrite of array with mixed value types
+AOF rewrite of array with insert_idx (circular buffer)
+AOF rewrite of array spanning multiple slices
