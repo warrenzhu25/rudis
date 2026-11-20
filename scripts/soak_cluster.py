@@ -29,6 +29,7 @@ compares DEBUG DIGEST of each master and its replica, and writes report.md.
 
 import argparse
 import json
+import re
 import os
 import random
 import shutil
@@ -307,17 +308,29 @@ def main():
             "--rate-limiting", str(a.rate), "--test-time", str(secs), "--hide-histogram",
         ], stdout=open(memtier_out, "a"), stderr=subprocess.STDOUT)
 
+    memtier_zero = [0]
+
     def memtier_stalled():
         # memtier drops a client thread on a connection error (a node it
         # was connected to was killed) and never replaces it; with none
-        # left it keeps running, generating no load.
+        # left it keeps running, generating no load. It can also keep its
+        # threads and stop sending (seen for hours after a replica kill).
+        # Stalled: 0 threads, or 0 ops/s on two samples in a row.
         try:
             with open(memtier_out, "rb") as f:
                 f.seek(max(0, os.path.getsize(memtier_out) - 400))
                 tail = f.read().decode(errors="replace").replace("\r", "\n").strip().splitlines()
         except OSError:
             return False
-        return bool(tail) and " 0 threads" in tail[-1]
+        last = next((l for l in reversed(tail) if l.startswith("[RUN")), "")
+        if " 0 threads" in last:
+            return True
+        m = re.search(r"ops,\s+(\d+) \(avg", last)
+        if m and int(m.group(1)) == 0:
+            memtier_zero[0] += 1
+        else:
+            memtier_zero[0] = 0
+        return memtier_zero[0] >= 2
 
     open(memtier_out, "w").close()
     memtier = start_memtier()
@@ -490,7 +503,7 @@ def main():
                     memtier.poll() is not None or memtier_stalled()
                 ):
                     why = (f"exited ({memtier.returncode})" if memtier.poll() is not None
-                           else "no client threads left")
+                           else "stalled (no client threads, or 0 ops/s)")
                     if memtier.poll() is None:
                         memtier.terminate()
                         try:
@@ -498,6 +511,7 @@ def main():
                         except subprocess.TimeoutExpired:
                             memtier.kill()
                     memtier_restarts += 1
+                    memtier_zero[0] = 0
                     note(f"memtier {why}: restarted")
                     memtier = start_memtier()
                 row["memtier_restarts"] = memtier_restarts
