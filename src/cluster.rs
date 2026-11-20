@@ -117,6 +117,9 @@ pub struct ClusterNodeInfo {
     /// For a replica, the replication offset it last announced (0 while it
     /// holds none of its master's data): ranks its election, as in Redis.
     pub repl_offset: u64,
+    /// `cluster-announce-human-nodename` as the node announces it: shown
+    /// next to its id in log messages; empty if none.
+    pub human_nodename: String,
 }
 
 impl ClusterNodeInfo {
@@ -1095,6 +1098,7 @@ impl ClusterHub {
                         slots: node_slots,
                         hostname,
                         repl_offset: 0,
+                        human_nodename: String::new(),
                     },
                 );
             }
@@ -1338,6 +1342,7 @@ impl ClusterHub {
         ));
         // Always, so peers also learn when it is cleared.
         t.push_str(&format!(" hostname={}", self.announce_hostname.read()));
+        t.push_str(&format!(" nodename={}", self.human_nodename.read()));
         // Our current epoch, as every Redis message carries it: an epoch
         // bump spreads through every node that heard of it, not only from
         // the node that bumped (which may freeze right after).
@@ -1789,6 +1794,7 @@ impl ClusterHub {
                 slots: Vec::new(),
                 hostname: String::new(),
                 repl_offset: 0,
+                human_nodename: String::new(),
             },
         );
         true
@@ -1885,6 +1891,7 @@ impl ClusterHub {
                                     slots: remote_slots,
                                     hostname: String::new(),
                                     repl_offset: 0,
+                                    human_nodename: String::new(),
                                 },
                             );
                         }
@@ -3746,6 +3753,11 @@ fn apply_announce(node: &mut ClusterNodeInfo, parts: &[&str]) {
             node.hostname = h.to_string();
         } else if let Some(o) = p.strip_prefix("offset=").and_then(|o| o.parse().ok()) {
             node.repl_offset = o;
+        } else if let Some(n) = p
+            .strip_prefix("nodename=")
+            .filter(|n| valid_human_nodename(n))
+        {
+            node.human_nodename = n.to_string();
         }
     }
     if node.is_master() {
@@ -3877,6 +3889,7 @@ fn handle_cluster_bus_line_from(
                         slots: known_slots,
                         hostname: String::new(),
                         repl_offset: 0,
+                        human_nodename: String::new(),
                     },
                 );
             }
@@ -3949,11 +3962,24 @@ fn handle_cluster_bus_line_from(
                             // Failure reports only count for nodes we know.
                             if nodes.contains_key(&gid) {
                                 if gfail != FailState::Ok {
-                                    hub.pfail_reports
+                                    let new = hub
+                                        .pfail_reports
                                         .write()
                                         .entry(gid.clone())
                                         .or_default()
                                         .insert(peer_id.clone());
+                                    if new {
+                                        let name = |id: &str| {
+                                            nodes.get(id).map_or("", |n| n.human_nodename.as_str())
+                                        };
+                                        crate::log_verbose!(
+                                            "Node {} ({}) reported node {} ({}) as not reachable.",
+                                            peer_id,
+                                            name(&peer_id),
+                                            gid,
+                                            name(&gid)
+                                        );
+                                    }
                                 } else if let Some(reports) =
                                     hub.pfail_reports.write().get_mut(&gid)
                                 {
@@ -3989,6 +4015,7 @@ fn handle_cluster_bus_line_from(
                                         slots: Vec::new(),
                                         hostname: String::new(),
                                         repl_offset: 0,
+                                        human_nodename: String::new(),
                                     },
                                 );
                             }
@@ -4426,6 +4453,7 @@ mod tests {
             slots: vec![(0, 99)],
             hostname: String::new(),
             repl_offset: 0,
+            human_nodename: String::new(),
         };
         let old_owner = "p".repeat(40);
         let hub = std::sync::Arc::new(ClusterHub::new(7320));
@@ -4490,6 +4518,7 @@ mod tests {
             slots: Vec::new(),
             hostname: String::new(),
             repl_offset: 0,
+            human_nodename: String::new(),
         };
         let (low, high) = ("a".repeat(40), "z".repeat(40));
         // Two masters both claim 0-100 at epoch 5 (a failover that picked
@@ -4538,6 +4567,7 @@ mod tests {
             slots: Vec::new(),
             hostname: String::new(),
             repl_offset: 0,
+            human_nodename: String::new(),
         };
         // We are the old master of 10923-16383 at epoch 0, back after a
         // failover promoted `new` at epoch 2.
@@ -4600,6 +4630,7 @@ mod tests {
                     slots: Vec::new(),
                     hostname: String::new(),
                     repl_offset: 0,
+                    human_nodename: String::new(),
                 },
             );
         };
@@ -4821,6 +4852,7 @@ mod tests {
             slots,
             hostname: String::new(),
             repl_offset: 0,
+            human_nodename: String::new(),
         };
         let state = |hub: &ClusterHub| {
             let info = hub.cluster_info();
@@ -4883,6 +4915,7 @@ mod tests {
             slots,
             hostname: String::new(),
             repl_offset: 0,
+            human_nodename: String::new(),
         };
         let (a, b) = ("a".repeat(40), "b".repeat(40));
         hub.nodes
@@ -4964,6 +4997,7 @@ mod tests {
                 slots,
                 hostname: String::new(),
                 repl_offset: 0,
+                human_nodename: String::new(),
             };
         let (a_port, b_port) = (voter(None), voter(Some(b_grants.clone())));
         hub.nodes
@@ -5238,6 +5272,7 @@ mod tests {
                     slots: Vec::new(),
                     hostname: String::new(),
                     repl_offset: 0,
+                    human_nodename: String::new(),
                 },
             );
         }
@@ -5534,6 +5569,7 @@ mod tests {
             slots,
             hostname: String::new(),
             repl_offset: 0,
+            human_nodename: String::new(),
         };
         {
             let mut nodes = hub.nodes.write();
@@ -5582,6 +5618,7 @@ mod tests {
                 slots: vec![(200, 299)],
                 hostname: String::new(),
                 repl_offset: 0,
+                human_nodename: String::new(),
             },
         );
         // A slot some node holds can't be added: it would have two owners.
@@ -5631,6 +5668,7 @@ mod tests {
             slots: Vec::new(),
             hostname: String::new(),
             repl_offset: 0,
+            human_nodename: String::new(),
         };
         let hub = ClusterHub::new(7100);
         let master = "m".repeat(40);
@@ -5731,6 +5769,7 @@ mod tests {
                     slots: vec![(0, 5460)],
                     hostname: String::new(),
                     repl_offset: 0,
+                    human_nodename: String::new(),
                 },
             );
             nodes.insert(
@@ -5751,6 +5790,7 @@ mod tests {
                     slots: vec![(5461, 10922)],
                     hostname: String::new(),
                     repl_offset: 0,
+                    human_nodename: String::new(),
                 },
             );
         }
@@ -5836,6 +5876,27 @@ mod tests {
         assert!(!hub.pfail_reports.read().get(&node2_id).unwrap().is_empty());
         hub.cluster_forget(&node2_id).unwrap();
         assert!(!hub.pfail_reports.read().contains_key(&node2_id));
+    }
+
+    /// Nodes announce their human nodename; an invalid one is ignored, and
+    /// our PINGs carry ours.
+    #[test]
+    fn test_human_nodename_is_gossiped() {
+        let hub = Arc::new(ClusterHub::new(7195));
+        let peer = "a".repeat(40);
+        handle_cluster_bus_line(
+            &format!(
+                "PING {} 1 master GOSSIP {peer},127.0.0.1,7001,17001,master,1",
+                "z".repeat(40)
+            ),
+            &hub,
+        );
+        handle_cluster_bus_line(&format!("PING {peer} 1 master nodename=prod-1"), &hub);
+        assert_eq!(hub.nodes.read()[&peer].human_nodename, "prod-1");
+        handle_cluster_bus_line(&format!("PING {peer} 1 master nodename=bad\\x"), &hub);
+        assert_eq!(hub.nodes.read()[&peer].human_nodename, "prod-1");
+        *hub.human_nodename.write() = "me-1".to_string();
+        assert!(hub.ping_frame("").contains(" nodename=me-1"));
     }
 
     /// Nodes announce their current epoch; ours rises to a known peer's
@@ -6082,6 +6143,7 @@ mod tests {
                 slots: Vec::new(),
                 hostname: String::new(),
                 repl_offset: 0,
+                human_nodename: String::new(),
             },
         );
 
@@ -6351,6 +6413,7 @@ mod tests {
                 slots: vec![(5461, 9999), (10001, 16383)],
                 hostname: String::new(),
                 repl_offset: 0,
+                human_nodename: String::new(),
             },
         );
         hub.has_nodes.store(true, Ordering::Release);
