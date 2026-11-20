@@ -831,20 +831,37 @@ async fn rewrite_live_inner(
     };
     let (tx, done_rx) = spawn_image_writer(tmp_path.to_path_buf())?;
     let gone = || std::io::Error::other("AOF rewrite writer thread failed");
-    loop {
-        let step = crate::shard::with_aof_image(|img| {
-            img.step(&db.borrow(), crate::shard::RDB_SAVE_STEP, IMAGE_FLUSH_BYTES)
-        })
-        .expect("the AOF image stays installed during its rewrite");
-        let (piece, done) = step.map_err(LiveRewriteError::Fallback)?;
-        if let Some(piece) = piece {
-            tx.send_async(piece).await.map_err(|_| gone())?;
+    let state = crate::snapshot::aof_rewrite_state(crate::connection::node_port(db.borrow().port));
+    let canceled = || state.canceled();
+    let streamed: Result<(), LiveRewriteError> = async {
+        loop {
+            if canceled() {
+                return Err(LiveRewriteError::Io(std::io::Error::other(
+                    "stopped: AOF was turned off",
+                )));
+            }
+            let step = crate::shard::with_aof_image(|img| {
+                img.step(&db.borrow(), crate::shard::RDB_SAVE_STEP, IMAGE_FLUSH_BYTES)
+            })
+            .expect("the AOF image stays installed during its rewrite");
+            let (piece, done) = step.map_err(LiveRewriteError::Fallback)?;
+            if let Some(piece) = piece {
+                tx.send_async(piece).await.map_err(|_| gone())?;
+            }
+            rewrite_key_save_delay_unless(canceled).await;
+            if done {
+                return Ok(());
+            }
+            crate::mailbox::yield_now().await;
         }
-        rewrite_key_save_delay().await;
-        if done {
-            break;
-        }
-        crate::mailbox::yield_now().await;
+    }
+    .await;
+    if let Err(e) = streamed {
+        // Let the writer thread finish with the temp file before the
+        // caller removes it: removed first, the thread recreated it.
+        drop(tx);
+        let _ = done_rx.recv_async().await;
+        return Err(e);
     }
     let image = crate::shard::take_aof_image().expect("installed above");
     let rest = image.finish().map_err(LiveRewriteError::Fallback)?;
@@ -871,12 +888,17 @@ async fn rewrite_live_inner(
 /// ending early once the knob is lowered, so a test can let a slowed save
 /// finish.
 pub(crate) async fn rewrite_key_save_delay() {
+    rewrite_key_save_delay_unless(|| false).await;
+}
+
+/// [`rewrite_key_save_delay`], ending at once when `stop()` turns true.
+pub(crate) async fn rewrite_key_save_delay_unless(stop: impl Fn() -> bool) {
     let delay = || crate::connection::RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed);
     let start = std::time::Instant::now();
     loop {
         let want = std::time::Duration::from_micros(delay());
         let elapsed = start.elapsed();
-        if elapsed >= want {
+        if elapsed >= want || stop() {
             return;
         }
         monoio::time::sleep((want - elapsed).min(std::time::Duration::from_millis(10))).await;

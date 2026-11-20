@@ -207,6 +207,9 @@ pub struct AofRewriteState {
     /// `aof_rewrite_base_size`), the base `auto-aof-rewrite-percentage`
     /// growth is measured from.
     base_size: AtomicU64,
+    /// Set by `CONFIG SET appendonly no` while a rewrite runs: it stops at
+    /// its next step and is dropped (Redis kills the rewrite child).
+    cancel: AtomicBool,
 }
 
 /// Automatic rewrites back off after this many consecutive failures
@@ -244,6 +247,7 @@ pub fn aof_rewrite_state(port: u16) -> Arc<AofRewriteState> {
                 consecutive_failures: AtomicU64::new(0),
                 last_failure_unix: AtomicU64::new(0),
                 base_size: AtomicU64::new(0),
+                cancel: AtomicBool::new(false),
             })
         })
         .clone()
@@ -290,11 +294,32 @@ pub fn is_saving(port: u16) -> Arc<AtomicBool> {
 /// `in_progress` reads false (INFO may run on another shard thread).
 impl AofRewriteState {
     pub fn begin(&self) {
+        self.cancel.store(false, Ordering::SeqCst);
         self.rewrites.fetch_add(1, Ordering::Relaxed);
         self.in_progress.store(true, Ordering::SeqCst);
     }
 
+    /// Asks a running rewrite to stop (`CONFIG SET appendonly no`).
+    /// Returns whether one was running.
+    pub fn cancel(&self) -> bool {
+        let running = self.in_progress.load(Ordering::SeqCst);
+        if running {
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+        running
+    }
+
+    pub fn canceled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
     pub fn finish(&self, ok: bool) {
+        // A rewrite stopped on purpose is no failure: it must not delay the
+        // next automatic one.
+        if !ok && self.cancel.swap(false, Ordering::SeqCst) {
+            self.in_progress.store(false, Ordering::SeqCst);
+            return;
+        }
         if ok {
             self.consecutive_failures.store(0, Ordering::Relaxed);
         } else {

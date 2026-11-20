@@ -5341,6 +5341,13 @@ impl Router {
         }
         crate::aof::set_aof_enabling(self.base_port, false);
         crate::aof::set_aof_on(self.base_port, false);
+        // As Redis kills its rewrite child: the rewrite would only produce
+        // a file nobody uses, and kept BGREWRITEAOF refused meanwhile.
+        if crate::snapshot::aof_rewrite_state(self.base_port).cancel() {
+            crate::log_notice!(
+                "Killing running AOF rewrite child: stopping the background AOF rewrite"
+            );
+        }
         self.set_appendonly_everywhere(false).await
     }
 

@@ -6087,3 +6087,84 @@ fn test_flushall_with_save_points_survives_crash_e2e() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `CONFIG SET appendonly no` stops a running AOF rewrite, as Redis kills
+/// its rewrite child: it kept going (a slowed one for as long as it took)
+/// and every BGREWRITEAOF meanwhile was refused as "already in progress".
+/// The stopped rewrite leaves no temp file and counts as no failure.
+#[test]
+fn test_appendonly_no_stops_a_running_rewrite_e2e() {
+    let port = 18671u16;
+    let dir = std::env::temp_dir().join(format!("rudis_aofoff_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--appendonly",
+        "yes",
+        "--save",
+        "",
+    ];
+    let _srv = ServerGuard(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for i in 0..20 {
+        assert_eq!(resp_cmd(&mut c, &["SET", &format!("k{i}"), "v"]), "+OK\r\n");
+    }
+    let wait_rewrite_done = |c: &mut TcpStream, secs: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while info_field(c, "aof_rewrite_in_progress") != "0" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rewrite still running"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_rewrite_done(&mut c, 10);
+    // Each step of the rewrite now waits 10 s: it would take minutes.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "rdb-key-save-delay", "10000000"]),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+    assert_eq!(info_field(&mut c, "aof_rewrite_in_progress"), "1");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "appendonly", "no"]),
+        "+OK\r\n"
+    );
+    wait_rewrite_done(&mut c, 3);
+    assert!(
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().contains(".tmp")),
+        "the stopped rewrite left its temp file: {:?}",
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+    // Not a failure; and a new rewrite is accepted.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "rdb-key-save-delay", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "appendonly", "yes"]),
+        "+OK\r\n"
+    );
+    wait_rewrite_done(&mut c, 10);
+    assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+    wait_rewrite_done(&mut c, 10);
+    assert_eq!(info_field(&mut c, "aof_last_bgrewrite_status"), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
