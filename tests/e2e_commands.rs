@@ -9151,12 +9151,19 @@ fn test_client_no_touch_is_per_client_e2e() {
             );
         }
     }
-    // RESET turns NO-TOUCH off.
+    // RESET turns NO-TOUCH off. Idle time counts whole seconds: a second
+    // may tick between the GET and OBJECT IDLETIME (the key was idle >= 2
+    // before), as allowed for the normal reads above.
     assert_eq!(resp_cmd(&mut a, &["RESET"]), "+RESET\r\n");
     assert_eq!(resp_cmd(&mut a, &["GET", &keys[0]]), "$1\r\nv\r\n");
-    assert_eq!(
-        resp_cmd(&mut b, &["OBJECT", "IDLETIME", &keys[0]]),
-        ":0\r\n"
+    let idle: u64 = resp_cmd(&mut b, &["OBJECT", "IDLETIME", &keys[0]])
+        .trim()
+        .trim_start_matches(':')
+        .parse()
+        .unwrap();
+    assert!(
+        idle <= 1,
+        "read after RESET did not touch the key (idle {idle})"
     );
     drop(a);
     drop(b);
