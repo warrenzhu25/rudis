@@ -1476,7 +1476,7 @@ impl RudisValue {
             RudisValue::Int(_) => "int",
             RudisValue::SmallHash(_) => "listpack",
             RudisValue::Hash(_) => "hashtable",
-            RudisValue::List(_) => "quicklist",
+            RudisValue::List(l) => list_encoding(l),
             RudisValue::Set(_) => "hashtable",
             RudisValue::ZSet(_) => "skiplist",
             RudisValue::HyperLogLog(_) => "raw",
@@ -1494,6 +1494,35 @@ impl RudisValue {
             RudisValue::Cooled(cv) => cv.val.encoding_str(),
         }
     }
+}
+
+/// `OBJECT ENCODING` of a list, as Redis 7 switches it: `listpack` while
+/// it fits `list-max-listpack-size` (positive: that many entries; -1..-5:
+/// 4 KB..64 KB of listpack bytes, each entry taking its length plus about
+/// two bytes of framing), `quicklist` beyond.
+pub fn list_encoding(l: &crate::packedlist::PackedList) -> &'static str {
+    let fill = crate::connection::LIST_MAX_LISTPACK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+    let fits = if fill >= 0 {
+        // Redis also caps a positive fill at its 8 KB safety limit.
+        l.len() <= fill as usize && listpack_bytes(l, 8192) <= 8192
+    } else {
+        let limit = 4096usize << ((-fill - 1).min(4) as u32);
+        listpack_bytes(l, limit) <= limit
+    };
+    if fits { "listpack" } else { "quicklist" }
+}
+
+/// Approximate listpack size of `l`'s entries, counted up to just past
+/// `cap` (no need to walk a long list).
+fn listpack_bytes(l: &crate::packedlist::PackedList, cap: usize) -> usize {
+    let mut bytes = 7; // header + end byte
+    for e in l.iter() {
+        bytes += e.len() + if e.len() < 64 { 2 } else { 3 };
+        if bytes > cap {
+            break;
+        }
+    }
+    bytes
 }
 
 /// Smallest value (by `approx_bytes`) worth spilling to the tier.
@@ -8234,7 +8263,7 @@ impl RudisTable {
                     RudisValue::Int(_) => Some("int"),
                     RudisValue::SmallHash(_) => Some("listpack"),
                     RudisValue::Hash(_) => Some("hashtable"),
-                    RudisValue::List(_) => Some("quicklist"),
+                    RudisValue::List(l) => Some(list_encoding(l)),
                     RudisValue::Set(s) => match &**s {
                         RudisSet::Small(_) => Some("intset"),
                         RudisSet::Full(_) => Some("hashtable"),
@@ -17608,6 +17637,33 @@ fn load_legacy_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list reports `listpack` while it fits list-max-listpack-size, as
+    /// Redis 7 switches it, `quicklist` beyond.
+    #[test]
+    fn test_list_encoding_follows_list_max_listpack_size() {
+        use crate::connection::LIST_MAX_LISTPACK_SIZE;
+        let list = |n: usize, len: usize| {
+            let mut l = crate::packedlist::PackedList::new();
+            for _ in 0..n {
+                l.push_back_slice(&vec![b'x'; len]);
+            }
+            l
+        };
+        let saved = LIST_MAX_LISTPACK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+        // Default -2: 8 KB.
+        LIST_MAX_LISTPACK_SIZE.store(-2, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(list_encoding(&list(10, 6)), "listpack");
+        assert_eq!(list_encoding(&list(100, 100)), "quicklist");
+        // -1: 4 KB.
+        LIST_MAX_LISTPACK_SIZE.store(-1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(list_encoding(&list(50, 100)), "quicklist");
+        // Positive: entries.
+        LIST_MAX_LISTPACK_SIZE.store(4, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(list_encoding(&list(4, 6)), "listpack");
+        assert_eq!(list_encoding(&list(5, 6)), "quicklist");
+        LIST_MAX_LISTPACK_SIZE.store(saved, std::sync::atomic::Ordering::Relaxed);
+    }
     use std::thread;
 
     /// Expired hash fields deleted by an HEXPIRE already past, lazily and by

@@ -3616,6 +3616,12 @@ pub fn write_resp_err(out: &mut Vec<u8>, err: impl AsRef<str>) {
     }
 }
 
+/// `list-max-listpack-size`: positive, the most entries a list reports
+/// `listpack` encoding with; -1 to -5, the most bytes (4 KB to 64 KB), as
+/// Redis's list encoding switch.
+pub static LIST_MAX_LISTPACK_SIZE: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-2);
+
 pub static HASH_MAX_ENTRIES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(512);
 pub static HASH_MAX_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
@@ -3924,6 +3930,9 @@ pub fn apply_config_value(
         }
         "hash-max-listpack-entries" | "hash-max-ziplist-entries" => {
             HASH_MAX_ENTRIES.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "list-max-listpack-size" | "list-max-ziplist-size" => {
+            LIST_MAX_LISTPACK_SIZE.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
         }
         "hash-max-listpack-value" | "hash-max-ziplist-value" => {
             HASH_MAX_VALUE.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
@@ -4538,7 +4547,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 115] = [
+    let all_configs: [(&str, String); 117] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -4741,6 +4750,18 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         ("lua-time-limit", lua_time_limit),
         ("tiered-offload-threshold", offload),
         ("tiered-upload-threshold", upload),
+        (
+            "list-max-listpack-size",
+            LIST_MAX_LISTPACK_SIZE
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "list-max-ziplist-size",
+            LIST_MAX_LISTPACK_SIZE
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
         ("hash-max-listpack-entries", hash_entries.clone()),
         ("hash-max-ziplist-entries", hash_entries),
         ("hash-max-listpack-value", hash_value.clone()),
@@ -4931,6 +4952,7 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
             "min-slaves-to-write" | "min-replicas-to-write" => "min-replicas-to-write",
             "min-slaves-max-lag" | "min-replicas-max-lag" => "min-replicas-max-lag",
             "hash-max-ziplist-entries" | "hash-max-listpack-entries" => "hash-max-listpack-entries",
+            "list-max-ziplist-size" | "list-max-listpack-size" => "list-max-listpack-size",
             "hash-max-ziplist-value" | "hash-max-listpack-value" => "hash-max-listpack-value",
             other => other,
         };
@@ -5230,6 +5252,11 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
                 out.extend_from_slice(
                     b"-ERR Invalid argument for CONFIG SET tiered-upload-threshold\r\n",
                 );
+                return;
+            }
+        } else if p_str == "list-max-listpack-size" || p_str == "list-max-ziplist-size" {
+            if val_str.parse::<i64>().is_err() {
+                out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
                 return;
             }
         } else if p_str == "hash-max-listpack-entries"
