@@ -229,7 +229,19 @@ def main():
     ap.add_argument("--reshard-every", type=int, default=1200, help="seconds")
     ap.add_argument("--restart-every", type=int, default=1800, help="seconds")
     ap.add_argument("--save-every", type=int, default=1800, help="seconds")
+    ap.add_argument("--chaos", choices=["normal", "fast"], default="normal",
+                    help="fast: failover every 60 s, reshard 120 s, replica restart 180 s, "
+                         "save 300 s (about a day of normal-pace chaos events in 2-3 h); "
+                         "explicit --*-every flags still win")
     a = ap.parse_args()
+    if a.chaos == "fast":
+        given = set(sys.argv)
+        for flag, attr, secs in (("--failover-every", "failover_every", 60),
+                                 ("--reshard-every", "reshard_every", 120),
+                                 ("--restart-every", "restart_every", 180),
+                                 ("--save-every", "save_every", 300)):
+            if flag not in given:
+                setattr(a, attr, secs)
 
     shutil.rmtree(a.dir, ignore_errors=True)
     os.makedirs(a.dir)
