@@ -55,6 +55,9 @@ pub struct ClientStats {
     pub multi_mem: std::sync::atomic::AtomicUsize,
     /// CLIENT NO-EVICT ON: never evicted for `maxmemory-clients`.
     pub no_evict: std::sync::atomic::AtomicBool,
+    /// Its `tot-mem` as its shard last measured it (every 100 ms while
+    /// `maxmemory-clients` is set), for the evictor on another thread.
+    pub tot_mem: std::sync::atomic::AtomicUsize,
 }
 
 impl ClientStats {
@@ -74,6 +77,7 @@ impl ClientStats {
             multi_count: std::sync::atomic::AtomicI64::new(-1),
             multi_mem: std::sync::atomic::AtomicUsize::new(0),
             no_evict: std::sync::atomic::AtomicBool::new(false),
+            tot_mem: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -153,7 +157,11 @@ pub fn estimate_incomplete_qbuf_cap(buf: &[u8]) -> usize {
             i += 1;
         }
     }
-    (buf.len() + max_bulk).max(16384)
+    // The buffer grows to hold the biggest argument (as Redis sizes its
+    // query buffer for a big bulk), not that much on top of what came: a
+    // bulk nearly all in counted twice, and maxmemory-clients evicted a
+    // client at half the limit.
+    buf.len().max(max_bulk + 64).max(16384)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3950,13 +3958,166 @@ static CONFIG_BACKUPDIRNAME: std::sync::LazyLock<parking_lot::RwLock<String>> =
 
 /// Whether a `maxmemory-clients` value asks for client eviction (anything
 /// but 0 / 0%), which rudis does not implement.
-fn maxmemory_clients_enabled(val: &str) -> bool {
+/// `maxmemory-clients` in bytes (0: off, or given as a percentage).
+static MAXMEMORY_CLIENTS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `maxmemory-clients` as a percentage of `maxmemory` (0: given in bytes).
+static MAXMEMORY_CLIENTS_PCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Parses `maxmemory-clients`: bytes (`1gb`) or a percentage of
+/// maxmemory (`10%`, at most 100); 0 turns client eviction off.
+fn parse_maxmemory_clients(val: &str) -> Result<(u64, u64), String> {
     let val = val.trim();
-    let n = match val.strip_suffix('%') {
-        Some(pct) => pct.trim().parse::<u64>().ok(),
-        None => crate::tiering::parse_memory_bytes(val),
+    match val.strip_suffix('%') {
+        Some(pct) => match pct.trim().parse::<u64>() {
+            Ok(p) if p <= 100 => Ok((0, p)),
+            _ => Err("percentage argument must be less or equal to 100".to_string()),
+        },
+        None => crate::tiering::parse_memory_bytes(val)
+            .map(|b| (b, 0))
+            .ok_or_else(|| "invalid maxmemory-clients".to_string()),
+    }
+}
+
+/// The client memory limit `maxmemory-clients` sets on the server at
+/// `port`, in bytes; 0 when off (also a percentage while maxmemory is 0).
+pub fn maxmemory_clients_limit(port: u16) -> u64 {
+    match MAXMEMORY_CLIENTS_PCT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => MAXMEMORY_CLIENTS_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        pct => crate::tiering::get_max_memory(port).saturating_mul(pct) / 100,
+    }
+}
+
+/// Measures every client of this shard (`registry`) for the evictor
+/// (`ClientStats::tot_mem`): its shard holds what tot-mem counts.
+pub fn measure_client_memory(
+    registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+    port: u16,
+    pubsub: &crate::pubsub::PubSubHub,
+) {
+    let now = Instant::now();
+    for c in registry.borrow().values() {
+        let idle = now.duration_since(c.last_active).as_secs();
+        c.stats.tot_mem.store(
+            client_tot_mem(c, idle, port, pubsub),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// `maxmemory-clients`: while the clients subject to eviction (not
+/// replicas, not CLIENT NO-EVICT) hold more than the limit, closes the
+/// biggest, as Redis evicts clients largest first. Runs on one shard for
+/// the whole node (`port`: its base port), from the shards' measurements.
+pub fn evict_clients(port: u16, limit: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut candidates: Vec<(usize, u64)> = Vec::new();
+    let mut total: u64 = 0;
+    {
+        let map = GLOBAL_CLIENTS.read();
+        for (&(p, id), e) in map.iter() {
+            if node_port(p) != port
+                || e.stats.killed.load(Relaxed)
+                || e.stats.is_replica.load(Relaxed)
+                || e.stats.no_evict.load(Relaxed)
+            {
+                continue;
+            }
+            let mem = e.stats.tot_mem.load(Relaxed);
+            total += mem as u64;
+            candidates.push((mem, id));
+        }
+    }
+    if total <= limit {
+        return;
+    }
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    for (mem, id) in candidates {
+        if total <= limit {
+            break;
+        }
+        if evict_client(port, id, mem) {
+            total = total.saturating_sub(mem as u64);
+        }
+    }
+}
+
+/// `maxmemory-clients`, checked as client `id` (holding `my_mem` now)
+/// grows, as Redis evicts on reading input and queueing MULTI commands:
+/// if the evictable clients' memory is over the limit and this client is
+/// the biggest, it is evicted at once (true: close it without running
+/// what it sent). The 100 ms check handles the rest.
+pub(crate) fn client_evicted_for_memory(port: u16, id: u64, my_mem: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let limit = maxmemory_clients_limit(port);
+    if limit == 0 {
+        return false;
+    }
+    let mut total = my_mem as u64;
+    let mut biggest_other = 0;
+    {
+        let map = GLOBAL_CLIENTS.read();
+        for (&(p, cid), e) in map.iter() {
+            if node_port(p) != port {
+                continue;
+            }
+            let exempt = e.stats.killed.load(Relaxed)
+                || e.stats.is_replica.load(Relaxed)
+                || e.stats.no_evict.load(Relaxed);
+            if cid == id {
+                if exempt {
+                    return false;
+                }
+                e.stats.tot_mem.fetch_max(my_mem, Relaxed);
+                continue;
+            }
+            if !exempt {
+                let mem = e.stats.tot_mem.load(Relaxed);
+                total += mem as u64;
+                biggest_other = biggest_other.max(mem);
+            }
+        }
+    }
+    total > limit && my_mem >= biggest_other && evict_client(port, id, my_mem)
+}
+
+/// Closes client `id` for `maxmemory-clients` (as CLIENT KILL does), logs
+/// and counts it. Returns whether it was still open.
+fn evict_client(port: u16, id: u64, mem: usize) -> bool {
+    let map = GLOBAL_CLIENTS.read();
+    let Some((_, entry)) = map
+        .iter()
+        .find(|((p, cid), _)| *cid == id && node_port(*p) == port)
+    else {
+        return false;
     };
-    n != Some(0)
+    if entry
+        .stats
+        .killed
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    crate::server_stats::add(crate::server_stats::Stat::EvictedClients, 1);
+    crate::log_verbose!(
+        "Evicting client: id={} addr={} tot-mem={} (maxmemory-clients)",
+        id,
+        entry.stats.addr,
+        mem
+    );
+    // SAFETY: shutdown(2) takes no pointers; the entry is read under the
+    // GLOBAL_CLIENTS read lock and a connection removes its entry before
+    // closing its socket (see close_client_over_output_limit).
+    unsafe {
+        libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
+    }
+    true
 }
 
 /// The process's `oom_score_adj` before rudis changed it: what `relative`
@@ -4325,12 +4486,15 @@ pub fn apply_config_value(
             crate::config::set_save_points(base_port, crate::config::parse_save_points(val_str)?)
         }
         "maxmemory-clients" => {
-            // No client eviction: a limit would be ignored, so the config
-            // file's is reported as an unsupported directive instead.
-            if maxmemory_clients_enabled(val_str) {
-                return Ok(false);
+            let (bytes, pct) = parse_maxmemory_clients(val_str)?;
+            MAXMEMORY_CLIENTS_BYTES.store(bytes, Ordering::Relaxed);
+            MAXMEMORY_CLIENTS_PCT.store(pct, Ordering::Relaxed);
+            // As CONFIG GET shows it: a percentage, or bytes.
+            *CONFIG_MAXMEMORY_CLIENTS.write() = if pct > 0 {
+                format!("{pct}%")
+            } else {
+                bytes.to_string()
             }
-            *CONFIG_MAXMEMORY_CLIENTS.write() = val_str.to_string()
         }
         "backupdirname" => *CONFIG_BACKUPDIRNAME.write() = val_str.to_string(),
         "slaveof" | "replicaof" => *CONFIG_SLAVEOF.write() = val_str.to_string(),
@@ -5319,12 +5483,6 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
             } else if crate::tiering::parse_memory_bytes(&val_str).is_none() {
                 out.extend_from_slice(
                     b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory-clients') - invalid maxmemory-clients\r\n",
-                );
-                return;
-            }
-            if maxmemory_clients_enabled(&val_str) {
-                out.extend_from_slice(
-                    b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory-clients') - client eviction is not supported, only 0 (off) is accepted\r\n",
                 );
                 return;
             }
@@ -6477,6 +6635,7 @@ async fn cluster_redirects(
 /// `multi-mem`) and `maxmemory-clients` after a step that may have
 /// changed it (`queued_before`: the queue length before the step).
 fn publish_tx_state(
+    port: u16,
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
     client_id: u64,
     in_multi: bool,
@@ -6505,6 +6664,19 @@ fn publish_tx_state(
         c.stats.multi_mem.fetch_add(added, Relaxed);
     }
     c.stats.multi_count.store(tx_queue.len() as i64, Relaxed);
+    // maxmemory-clients: a growing MULTI queue is checked as it grows, as
+    // Redis evicts on queueing.
+    if tx_queue.len() > queued_before && maxmemory_clients_limit(port) > 0 {
+        let now = Instant::now();
+        let idle = now.duration_since(c.last_active).as_secs();
+        // Each part once (the last measurement already includes the
+        // queue, so it isn't the base here).
+        let (qbuf, qbuf_free) = c.effective_qbuf(idle);
+        let my_mem =
+            CLIENT_BASE_MEM + qbuf + qbuf_free + c.omem_now() + c.stats.multi_mem.load(Relaxed);
+        drop(reg);
+        client_evicted_for_memory(port, client_id, my_mem);
+    }
 }
 
 /// The bytes a command queued in MULTI holds: its arguments.
@@ -6545,6 +6717,7 @@ async fn execute_tx_step(
     .await;
     if was_in_multi || *in_multi {
         publish_tx_state(
+            router.base_port,
             client_registry,
             client_id,
             *in_multi,
@@ -7482,6 +7655,23 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                     }
                 }
 
+                // maxmemory-clients: a big batch (a large argv, or a long
+                // pipeline) is checked before it runs, as Redis evicts on
+                // reading input.
+                if !qbuf_overflow
+                    && batch_in_bytes.max(batch_bytes) > 32768
+                    && maxmemory_clients_limit(router.base_port) > 0
+                {
+                    let my_mem = client_registry.borrow().get(&client_id).map_or(0, |c| {
+                        CLIENT_BASE_MEM
+                            + batch_in_bytes.max(batch_bytes).max(c.qbuf_cap)
+                            + c.omem_now()
+                            + c.stats.multi_mem.load(std::sync::atomic::Ordering::Relaxed)
+                    });
+                    if client_evicted_for_memory(router.base_port, client_id, my_mem) {
+                        qbuf_overflow = true;
+                    }
+                }
                 if qbuf_overflow {
                     // Like Redis: close without running or answering what is
                     // buffered; the loop exit recycles the scratch buffers.
@@ -13676,7 +13866,7 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
     let pubsub_patterns = router.pubsub_numpat().await;
     let pubsubshard_channels = router.pubsub_shardchannels(None).await.len();
     let stats_str = format!(
-        "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_subkeys:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:{migrate_cached_sockets}\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_query_buffer_limit_disconnections:{}\r\nclient_output_buffer_limit_disconnections:{}\r\nacl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\nacl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\n",
+        "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_subkeys:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nevicted_clients:{evicted_clients}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:{migrate_cached_sockets}\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_query_buffer_limit_disconnections:{}\r\nclient_output_buffer_limit_disconnections:{}\r\nacl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\nacl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\n",
         total(Stat::ConnectionsReceived),
         total(Stat::Commands),
         ops_per_sec,
@@ -13711,6 +13901,7 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
         total(Stat::AclAccessDeniedKey),
         total(Stat::AclAccessDeniedChannel),
         migrate_cached_sockets = migrate_cached_sockets(),
+        evicted_clients = total(Stat::EvictedClients),
     );
     let (blocked_clients_count, total_blocking_keys, total_blocking_keys_on_nokey) = {
         let hub_arc = crate::block::get_block_hub_for_port(router.port);
@@ -16420,7 +16611,12 @@ async fn execute_command_inner(
                     CLIENT_NO_TOUCH.set(enabled);
                     out.extend_from_slice(b"+OK\r\n");
                 }
-                ClientSubcommand::NoEvict(_) => {
+                ClientSubcommand::NoEvict(on) => {
+                    if let Some(c) = client_registry.borrow().get(&client_id) {
+                        c.stats
+                            .no_evict
+                            .store(on, std::sync::atomic::Ordering::Relaxed);
+                    }
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 ClientSubcommand::Reply(mode) => {
@@ -33203,21 +33399,13 @@ mod tests {
     }
 
     #[test]
-    fn test_maxmemory_clients_only_accepts_off() {
-        for off in ["0", "0%", " 0 ", "0mb"] {
-            assert!(!maxmemory_clients_enabled(off), "{off}");
-        }
-        for on in ["1", "10%", "1gb", "junk"] {
-            assert!(maxmemory_clients_enabled(on), "{on}");
-        }
-        assert_eq!(
-            apply_config_value(65142, 65142, "maxmemory-clients", "1gb"),
-            Ok(false)
-        );
-        assert_eq!(
-            apply_config_value(65142, 65142, "maxmemory-clients", "0"),
-            Ok(true)
-        );
+    fn test_parse_maxmemory_clients() {
+        assert_eq!(parse_maxmemory_clients("0"), Ok((0, 0)));
+        assert_eq!(parse_maxmemory_clients(" 1gb "), Ok((1 << 30, 0)));
+        assert_eq!(parse_maxmemory_clients("10%"), Ok((0, 10)));
+        assert_eq!(parse_maxmemory_clients("100%"), Ok((0, 100)));
+        assert!(parse_maxmemory_clients("101%").is_err());
+        assert!(parse_maxmemory_clients("junk").is_err());
     }
 
     #[test]

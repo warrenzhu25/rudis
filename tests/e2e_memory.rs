@@ -2190,28 +2190,89 @@ fn test_oom_score_adj_sets_the_process_score_e2e() {
     let _ = child.wait();
 }
 
-/// Client eviction isn't implemented, so `maxmemory-clients` only accepts
-/// 0 (off): a limit that would be silently ignored is refused.
+/// `maxmemory-clients`: once the clients subject to eviction hold more
+/// than the limit (bytes, or a percentage of maxmemory), the biggest are
+/// closed, as in Redis; CLIENT NO-EVICT clients and small ones stay, and
+/// INFO counts `evicted_clients`. It used to accept only 0.
 #[test]
-fn test_maxmemory_clients_refuses_a_limit_e2e() {
+fn test_maxmemory_clients_evicts_the_biggest_client_e2e() {
     let port = 29771;
     start_test_server(port, 2);
-    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    for limit in ["1gb", "10%"] {
-        let r = resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-clients", limit]);
-        assert!(
-            r.contains("client eviction is not supported"),
-            "{limit}: {r}"
-        );
-    }
+    let connect = |name: &str| {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(resp_cmd(&mut c, &["CLIENT", "SETNAME", name]), "+OK\r\n");
+        c
+    };
+    let mut admin = connect("admin");
     assert_eq!(
-        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory-clients", "0"]),
+        resp_cmd(&mut admin, &["CLIENT", "NO-EVICT", "ON"]),
         "+OK\r\n"
     );
     assert_eq!(
-        resp_cmd(&mut c, &["CONFIG", "GET", "maxmemory-clients"]),
-        "*2\r\n$17\r\nmaxmemory-clients\r\n$1\r\n0\r\n"
+        resp_cmd(&mut admin, &["CONFIG", "SET", "maxmemory-clients", "3mb"]),
+        "+OK\r\n"
     );
+    assert_eq!(
+        resp_cmd(&mut admin, &["CONFIG", "GET", "maxmemory-clients"]),
+        "*2\r\n$17\r\nmaxmemory-clients\r\n$7\r\n3145728\r\n"
+    );
+    // A big incomplete command fills the client's query buffer.
+    // (The server may evict the client mid-write: then the write fails.)
+    let fill = |c: &mut TcpStream, bytes: usize| {
+        let _ = c.write_all(format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${}\r\n", 16 << 20).as_bytes());
+        let _ = c.write_all(&vec![b'x'; bytes]);
+    };
+    // Closed by the server (EOF or reset), not merely quiet: a read
+    // timeout means it is still open.
+    let closed = |c: &mut TcpStream| {
+        let mut b = [0u8; 16];
+        match c.read(&mut b) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+        }
+    };
+    let mut small = connect("small");
+    let mut keep = connect("keep");
+    assert_eq!(
+        resp_cmd(&mut keep, &["CLIENT", "NO-EVICT", "ON"]),
+        "+OK\r\n"
+    );
+    fill(&mut keep, 4 << 20);
+    let mut big = connect("big");
+    fill(&mut big, 4 << 20);
+    assert!(
+        closed(&mut big),
+        "the biggest evictable client was not evicted"
+    );
+    let info = resp_cmd(&mut admin, &["INFO", "stats"]);
+    assert!(info.contains("evicted_clients:1\r\n"), "{info}");
+    assert_eq!(resp_cmd(&mut small, &["PING"]), "+PONG\r\n");
+    assert!(
+        resp_cmd(&mut admin, &["CLIENT", "LIST"]).contains(" name=keep "),
+        "the NO-EVICT client was evicted"
+    );
+
+    // A percentage of maxmemory: 5% of 100 MB.
+    assert_eq!(
+        resp_cmd(&mut admin, &["CONFIG", "SET", "maxmemory", "100mb"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut admin, &["CONFIG", "SET", "maxmemory-clients", "5%"]),
+        "+OK\r\n"
+    );
+    let mut big2 = connect("big2");
+    fill(&mut big2, 8 << 20);
+    assert!(closed(&mut big2), "not evicted under a percentage limit");
+    for (k, v) in [("maxmemory-clients", "0"), ("maxmemory", "0")] {
+        assert_eq!(resp_cmd(&mut admin, &["CONFIG", "SET", k, v]), "+OK\r\n");
+    }
+    drop((small, keep));
 }
 
 /// `/metrics` breaks keys and memory down by shard and reports the

@@ -666,6 +666,28 @@ pub fn run_shard_worker(
         }
         router.publish_memory_state();
 
+        // maxmemory-clients: every 100 ms, measure this shard's clients
+        // (their memory lives here); shard 0 then evicts for the node.
+        let mem_clients = client_registry.clone();
+        let mem_clients_router = router.clone();
+        monoio::spawn(async move {
+            loop {
+                monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let limit = crate::connection::maxmemory_clients_limit(base_port);
+                if limit == 0 {
+                    continue;
+                }
+                crate::connection::measure_client_memory(
+                    &mem_clients,
+                    mem_clients_router.port,
+                    &mem_clients_router.pubsub.borrow(),
+                );
+                if shard_id == 0 {
+                    crate::connection::evict_clients(base_port, limit);
+                }
+            }
+        });
+
         // Active expiration cycle: run every 100ms
         let active_db = local_db.clone();
         let mem_router = router.clone();
