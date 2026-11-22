@@ -132,6 +132,34 @@ impl ClientInfo {
     }
 }
 
+/// Where the data of the big argument (32 KB or more, Redis's
+/// PROTO_MBULK_BIG_ARG) that the incomplete command in `buf` is still
+/// reading starts. Redis moves such an argument to the start of the query
+/// buffer, the arguments before it into argv, so CLIENT LIST's qbuf counts
+/// only its bytes read so far.
+fn pending_big_arg_start(buf: &[u8]) -> Option<usize> {
+    fn line(buf: &[u8], from: usize, prefix: u8) -> Option<(usize, usize)> {
+        if buf.get(from) != Some(&prefix) {
+            return None;
+        }
+        let end = from + 1 + buf[from + 1..].windows(2).position(|w| w == b"\r\n")?;
+        let n = std::str::from_utf8(&buf[from + 1..end])
+            .ok()?
+            .parse()
+            .ok()?;
+        Some((n, end + 2))
+    }
+    let (argc, mut i) = line(buf, 0, b'*')?;
+    for _ in 0..argc {
+        let (len, data) = line(buf, i, b'$')?;
+        if data + len + 2 > buf.len() {
+            return (len >= 32 * 1024).then_some(data);
+        }
+        i = data + len + 2;
+    }
+    None
+}
+
 pub fn estimate_incomplete_qbuf_cap(buf: &[u8]) -> usize {
     let mut max_bulk = 0usize;
     let mut i = 0;
@@ -7595,7 +7623,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                             }
                             if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                                 c.last_active = Instant::now();
-                                c.qbuf_len = buf.len();
+                                c.qbuf_len = buf.len() - pending_big_arg_start(&buf).unwrap_or(0);
                                 c.qbuf_cap = c.qbuf_cap.max(estimate_incomplete_qbuf_cap(&buf));
                             }
                             break;
@@ -33412,6 +33440,19 @@ mod tests {
         for bad in ["0 200", "0 200 800 1", "0 x 800", "0 2001 800", ""] {
             assert!(parse_oom_score_adj_values(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn test_pending_big_arg_start() {
+        let big = 64 * 1024;
+        let mut buf = format!("*3\r\n$3\r\nset\r\n$1\r\na\r\n${big}\r\n").into_bytes();
+        let start = buf.len();
+        assert_eq!(pending_big_arg_start(&buf), Some(start));
+        buf.extend(std::iter::repeat_n(b'v', 1000));
+        assert_eq!(pending_big_arg_start(&buf), Some(start));
+        // A small pending argument, or an incomplete header: the whole buffer.
+        assert_eq!(pending_big_arg_start(b"*2\r\n$3\r\nget\r\n$5\r\nab"), None);
+        assert_eq!(pending_big_arg_start(b"*2\r\n$3\r\nget\r\n$700"), None);
     }
 
     #[test]
