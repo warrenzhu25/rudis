@@ -42,23 +42,28 @@ pub enum PushTarget {
 }
 
 impl PushTarget {
-    /// Delivers `msg` if there is room, dropping it otherwise (never blocks).
-    pub fn push(&self, msg: &[u8]) {
+    /// Delivers `msg` if there is room, dropping it otherwise (never
+    /// blocks). Returns whether it went out whole. A partial write would
+    /// leave half a frame in the stream, garbling every later reply, so the
+    /// connection is shut down then.
+    pub fn push(&self, msg: &[u8]) -> bool {
         match self {
             // SAFETY: `msg` is a live slice and the length matches; send only reads it,
             // so even a stale fd cannot corrupt memory. The fd comes from a client
             // registry entry, and the connection removes its registry entry (ClientCleanup / PubsubCleanup) before its socket is closed, so the fd is not a reused number.
             PushTarget::Fd(fd) => unsafe {
-                libc::send(
+                let n = libc::send(
                     *fd,
                     msg.as_ptr() as *const libc::c_void,
                     msg.len(),
                     libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
                 );
+                if n > 0 && (n as usize) < msg.len() {
+                    libc::shutdown(*fd, libc::SHUT_RDWR);
+                }
+                n >= 0 && n as usize == msg.len()
             },
-            PushTarget::Queue(tx) => {
-                let _ = tx.try_send(Bytes::copy_from_slice(msg));
-            }
+            PushTarget::Queue(tx) => tx.try_send(Bytes::copy_from_slice(msg)).is_ok(),
         }
     }
 }

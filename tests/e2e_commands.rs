@@ -15454,3 +15454,52 @@ fn test_client_list_tot_mem_follows_client_state_e2e() {
     assert!(num(&mut admin, "watch", "tot-mem") >= base + 20_000);
     drop((idle.flush(), big, m, s, w));
 }
+
+/// A tracking invalidation that can't be delivered to its redirect client
+/// (it doesn't read; its socket is full) closes that client, as Redis
+/// disconnects a client whose output it can't hold. It used to be dropped:
+/// the client kept serving the changed key from its cache.
+#[test]
+fn test_undeliverable_tracking_invalidation_closes_the_client_e2e() {
+    let port = 18683u16;
+    let port_s = port.to_string();
+    let _srv = ServerGuard(spawn_rudis_listening(
+        &["--port", &port_s, "--threads", "1", "--no-pin"],
+        port,
+    ));
+    // The redirect target: subscribed to invalidations, never reads.
+    let mut target = connect_ready(port);
+    let id = resp_cmd(&mut target, &["CLIENT", "ID"])
+        .trim()
+        .trim_start_matches(':')
+        .to_string();
+    target
+        .write_all(b"*2\r\n$9\r\nSUBSCRIBE\r\n$20\r\n__redis__:invalidate\r\n")
+        .unwrap();
+    let mut c = connect_ready(port);
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["CLIENT", "TRACKING", "ON", "REDIRECT", &id, "BCAST"]
+        ),
+        "+OK\r\n"
+    );
+    // Long key names fill the target's socket fast.
+    let key = "k".repeat(200 * 1024);
+    let mut admin = connect_ready(port);
+    let target_listed =
+        |admin: &mut TcpStream| resp_cmd(admin, &["CLIENT", "LIST"]).contains(&format!("id={id} "));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while target_listed(&mut admin) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the target kept its connection while missing invalidations"
+        );
+        resp_cmd(&mut c, &["INCR", &key]);
+    }
+    let info = resp_cmd(&mut admin, &["INFO", "stats"]);
+    assert!(
+        !info.contains("client_output_buffer_limit_disconnections:0\r\n"),
+        "{info}"
+    );
+}

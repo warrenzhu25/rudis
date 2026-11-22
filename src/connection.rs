@@ -3148,8 +3148,41 @@ fn send_raw_to_client_entry(target_id: u64, entry: &GlobalClientEntry, msg: Vec<
     };
     if target_id == exec_cid {
         let _ = entry.track_tx.send(msg);
-    } else {
-        entry.push.push(&msg);
+    } else if !entry.push.push(&msg) {
+        // Never dropped: a client that missed an invalidation would keep
+        // serving the key from its cache. As Redis disconnects a client
+        // whose output it can't hold, close it; a client drops its cache
+        // when it loses its connection.
+        tracking_client_overflowed(target_id, entry);
+    }
+}
+
+/// Closes tracking client `id`: an invalidation for it couldn't be
+/// delivered (its socket full, or a partial write).
+fn tracking_client_overflowed(id: u64, entry: &GlobalClientEntry) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if entry
+        .stats
+        .killed
+        .compare_exchange(false, true, Relaxed, Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    ACTIVE_CLIENTS.fetch_sub(1, Relaxed);
+    crate::server_stats::add(
+        crate::server_stats::Stat::ClientOutputBufferLimitDisconnections,
+        1,
+    );
+    crate::log_warning!(
+        "Client id={} addr={} closed: a tracking invalidation for it could not be delivered (its output is full)",
+        id,
+        entry.stats.addr
+    );
+    // SAFETY: shutdown(2) takes no pointers; the entry is read under the
+    // GLOBAL_CLIENTS lock (see close_client_over_output_limit).
+    unsafe {
+        libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
     }
 }
 
