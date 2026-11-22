@@ -527,6 +527,21 @@ impl PubSubHub {
         ids
     }
 
+    /// Client `client_id`'s channel, pattern and shard channel
+    /// subscriptions here, and their bytes (CLIENT LIST `sub`, `psub`,
+    /// `ssub`; part of `tot-mem`).
+    pub fn client_sub_stats(&self, client_id: u64) -> (usize, usize, usize, usize) {
+        let count = |m: &hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>| {
+            m.get(&client_id).map_or((0, 0), |s| {
+                (s.len(), s.iter().map(|c| c.len()).sum::<usize>())
+            })
+        };
+        let (sub, sb) = count(&self.client_channels);
+        let (psub, pb) = count(&self.client_patterns);
+        let (ssub, ssb) = count(&self.client_shard_channels);
+        (sub, psub, ssub, sb + pb + ssb)
+    }
+
     pub fn total_subscriptions(&self, client_id: u64) -> usize {
         let ch_count = self
             .client_channels

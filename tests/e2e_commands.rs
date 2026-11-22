@@ -15348,3 +15348,109 @@ fn test_slowlog_max_len_zero_uses_no_entry_ids_e2e() {
     let _ = srv.kill();
     let _ = srv.wait();
 }
+
+/// CLIENT LIST's memory fields follow what each client holds (Redis's
+/// `tot-mem`, which `maxmemory-clients` evicts by): its query buffer,
+/// MULTI queue (`multi`, `multi-mem`), subscriptions (`sub`, `psub`) and
+/// watched keys. They were constants (tot-mem=22306, multi=-1, sub=0).
+#[test]
+fn test_client_list_tot_mem_follows_client_state_e2e() {
+    let port = 18681u16;
+    let port_s = port.to_string();
+    let _srv = ServerGuard(spawn_rudis_listening(
+        &["--port", &port_s, "--threads", "2", "--no-pin"],
+        port,
+    ));
+    let mut admin = connect_ready(port);
+    // `field` of the client named `name` in CLIENT LIST.
+    let field = |admin: &mut TcpStream, name: &str, field: &str| -> String {
+        let list = resp_cmd(admin, &["CLIENT", "LIST"]);
+        let line = list
+            .lines()
+            .find(|l| l.contains(&format!(" name={name} ")))
+            .unwrap_or_else(|| panic!("{name} not in {list}"))
+            .to_string();
+        line.split(' ')
+            .find_map(|kv| kv.strip_prefix(&format!("{field}=")))
+            .unwrap_or_else(|| panic!("{field} not in {line}"))
+            .to_string()
+    };
+    let num = |admin: &mut TcpStream, name: &str, f: &str| -> i64 {
+        field(admin, name, f).parse().unwrap()
+    };
+    let named = |name: &str| {
+        let mut c = connect_ready(port);
+        assert_eq!(resp_cmd(&mut c, &["CLIENT", "SETNAME", name]), "+OK\r\n");
+        c
+    };
+    let mut idle = named("idle");
+    let base = num(&mut admin, "idle", "tot-mem");
+    assert!(base > 0 && base < 64 * 1024, "idle tot-mem {base}");
+    assert_eq!(num(&mut admin, "idle", "multi"), -1);
+
+    // A big incomplete command sits in the query buffer.
+    let mut big = named("bigq");
+    big.write_all(format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${}\r\n", 4 << 20).as_bytes())
+        .unwrap();
+    big.write_all(&vec![b'x'; 1 << 20]).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while num(&mut admin, "bigq", "tot-mem") < base + (1 << 20) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "query buffer not counted"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // MULTI: queued commands and their bytes.
+    let mut m = named("multi");
+    assert_eq!(resp_cmd(&mut m, &["MULTI"]), "+OK\r\n");
+    assert_eq!(num(&mut admin, "multi", "multi"), 0);
+    let value = "v".repeat(100_000);
+    for i in 0..3 {
+        assert_eq!(
+            resp_cmd(&mut m, &["SET", &format!("m{i}"), &value]),
+            "+QUEUED\r\n"
+        );
+    }
+    assert_eq!(num(&mut admin, "multi", "multi"), 3);
+    assert!(num(&mut admin, "multi", "multi-mem") >= 300_000);
+    assert!(num(&mut admin, "multi", "tot-mem") >= base + 300_000);
+    assert!(field(&mut admin, "multi", "flags").contains('x'));
+    resp_cmd(&mut m, &["EXEC"]);
+    assert_eq!(num(&mut admin, "multi", "multi"), -1);
+    assert_eq!(num(&mut admin, "multi", "multi-mem"), 0);
+
+    // Subscriptions, counted and charged.
+    let mut s = named("subs");
+    let chans: Vec<String> = (0..50)
+        .map(|i| format!("{}{i}", "c".repeat(1000)))
+        .collect();
+    let mut args = vec!["SUBSCRIBE"];
+    args.extend(chans.iter().map(|c| c.as_str()));
+    s.write_all(&{
+        let mut b = format!("*{}\r\n", args.len()).into_bytes();
+        for a in &args {
+            b.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+        }
+        b
+    })
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while num(&mut admin, "subs", "sub") != 50 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "subscriptions not counted"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(num(&mut admin, "subs", "tot-mem") >= base + 50_000);
+
+    // Watched keys.
+    let mut w = named("watch");
+    let key = "w".repeat(20_000);
+    assert_eq!(resp_cmd(&mut w, &["WATCH", &key]), "+OK\r\n");
+    assert_eq!(num(&mut admin, "watch", "watch"), 1);
+    assert!(num(&mut admin, "watch", "tot-mem") >= base + 20_000);
+    drop((idle.flush(), big, m, s, w));
+}

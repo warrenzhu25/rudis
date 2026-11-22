@@ -49,6 +49,12 @@ pub struct ClientStats {
     /// The connection became a replica's replication link (PSYNC, SYNC or
     /// a DFLY FLOW): CLIENT LIST flag `S`, CLIENT KILL TYPE replica.
     pub is_replica: std::sync::atomic::AtomicBool,
+    /// Commands queued in its MULTI (CLIENT LIST `multi`), -1 outside one.
+    pub multi_count: std::sync::atomic::AtomicI64,
+    /// Bytes of those commands (CLIENT LIST `multi-mem`).
+    pub multi_mem: std::sync::atomic::AtomicUsize,
+    /// CLIENT NO-EVICT ON: never evicted for `maxmemory-clients`.
+    pub no_evict: std::sync::atomic::AtomicBool,
 }
 
 impl ClientStats {
@@ -65,6 +71,9 @@ impl ClientStats {
             pipeline_len_cnt: std::sync::atomic::AtomicU64::new(0),
             killed: std::sync::atomic::AtomicBool::new(false),
             is_replica: std::sync::atomic::AtomicBool::new(false),
+            multi_count: std::sync::atomic::AtomicI64::new(-1),
+            multi_mem: std::sync::atomic::AtomicUsize::new(0),
+            no_evict: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -1148,6 +1157,122 @@ fn watch_counts(port: u16) -> (usize, usize) {
     let watchers: hashbrown::HashSet<u64> = port_map.values().flatten().copied().collect();
     let keys = port_map.values().filter(|c| !c.is_empty()).count();
     (watchers.len(), keys)
+}
+
+/// What every connection costs before it buffers anything: its client
+/// state and reply buffer (Redis's idle `tot-mem` is about this).
+pub const CLIENT_BASE_MEM: usize = 2048;
+/// Per subscription, watched key or queued MULTI command, besides its bytes.
+const CLIENT_ENTRY_OVERHEAD: usize = 64;
+
+/// A client's memory, as Redis's `tot-mem` counts it: its query buffer,
+/// output buffer, MULTI queue, subscriptions and watched keys, plus
+/// [`CLIENT_BASE_MEM`]. `maxmemory-clients` evicts by it.
+pub(crate) fn client_tot_mem(
+    c: &ClientInfo,
+    idle_secs: u64,
+    port: u16,
+    pubsub: &crate::pubsub::PubSubHub,
+) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (qbuf, qbuf_free) = c.effective_qbuf(idle_secs);
+    let (sub, psub, ssub, sub_bytes) = pubsub.client_sub_stats(c.id);
+    let (watched, watch_bytes) = client_watch_mem(port, c.id);
+    let queued = c.stats.multi_count.load(Relaxed).max(0) as usize;
+    CLIENT_BASE_MEM
+        + qbuf
+        + qbuf_free
+        + c.omem_now()
+        + c.stats.multi_mem.load(Relaxed)
+        + sub_bytes
+        + watch_bytes
+        + (sub + psub + ssub + watched + queued) * CLIENT_ENTRY_OVERHEAD
+}
+
+/// One CLIENT LIST / CLIENT INFO line (with its newline).
+pub(crate) fn format_client_line(
+    c: &ClientInfo,
+    port: u16,
+    pubsub: &crate::pubsub::PubSubHub,
+    now: Instant,
+) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let age = now.duration_since(c.connected_at).as_secs();
+    let idle = now.duration_since(c.last_active).as_secs();
+    let is_blocked = crate::block::get_block_hub_for_port(port)
+        .lock()
+        .is_blocked(c.id);
+    let mut flags = String::new();
+    if c.is_monitor {
+        flags.push('O');
+    } else if c.stats.is_replica.load(Relaxed) {
+        flags.push('S');
+    }
+    if is_blocked {
+        flags.push('b');
+    }
+    let multi = c.stats.multi_count.load(Relaxed);
+    if multi >= 0 {
+        flags.push('x');
+    }
+    if c.stats.no_evict.load(Relaxed) {
+        flags.push('e');
+    }
+    if flags.is_empty() {
+        flags.push('N');
+    }
+    let (qbuf, qbuf_free) = c.effective_qbuf(idle);
+    let (sub, psub, ssub, _) = pubsub.client_sub_stats(c.id);
+    let s = &c.stats;
+    format!(
+        "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} \
+         sub={} psub={} ssub={} multi={} watch={} qbuf={} qbuf-free={} argv-mem=0 \
+         multi-mem={} rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 \
+         tot-mem={} events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={} \
+         io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} \
+         avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
+        c.id,
+        c.addr,
+        port,
+        c.name.as_deref().unwrap_or(""),
+        age,
+        idle,
+        flags,
+        c.db,
+        sub,
+        psub,
+        ssub,
+        multi,
+        client_watch_count(port, c.id),
+        qbuf,
+        qbuf_free,
+        s.multi_mem.load(Relaxed),
+        c.omem_now(),
+        client_tot_mem(c, idle, port, pubsub),
+        c.last_cmd.to_lowercase(),
+        if c.is_resp3 { 3 } else { 2 },
+        c.lib_name.as_deref().unwrap_or(""),
+        c.lib_ver.as_deref().unwrap_or(""),
+        s.tot_net_in.load(Relaxed),
+        s.tot_net_out.load(Relaxed),
+        s.tot_cmds.load(Relaxed),
+        s.read_events.load(Relaxed),
+        s.pipeline_len_sum.load(Relaxed),
+        s.pipeline_len_cnt.load(Relaxed),
+    )
+}
+
+/// The keys client `id` watches: how many, and their bytes.
+pub(crate) fn client_watch_mem(port: u16, id: u64) -> (usize, usize) {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return (0, 0);
+    }
+    let map = WATCHED_KEYS.read();
+    map.get(&node_port(port)).map_or((0, 0), |m| {
+        m.iter()
+            .filter(|(_, c)| c.contains(&id))
+            .fold((0, 0), |(n, b), ((_, key), _)| (n + 1, b + key.len()))
+    })
 }
 
 /// CLIENT LIST/INFO `watch=`: how many keys client `id` is watching.
@@ -6315,8 +6440,90 @@ async fn cluster_redirects(
     false
 }
 
+/// Publishes a client's MULTI state for CLIENT LIST (`multi`,
+/// `multi-mem`) and `maxmemory-clients` after a step that may have
+/// changed it (`queued_before`: the queue length before the step).
+fn publish_tx_state(
+    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+    client_id: u64,
+    in_multi: bool,
+    tx_queue: &[Command],
+    queued_before: usize,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reg = client_registry.borrow();
+    let Some(c) = reg.get(&client_id) else {
+        return;
+    };
+    if !in_multi {
+        c.stats.multi_count.store(-1, Relaxed);
+        c.stats.multi_mem.store(0, Relaxed);
+        return;
+    }
+    if tx_queue.len() < queued_before || c.stats.multi_count.load(Relaxed) < 0 {
+        // A new MULTI (or the queue shrank): recount it whole.
+        let mem = tx_queue.iter().map(queued_command_mem).sum();
+        c.stats.multi_mem.store(mem, Relaxed);
+    } else {
+        let added: usize = tx_queue[queued_before..]
+            .iter()
+            .map(queued_command_mem)
+            .sum();
+        c.stats.multi_mem.fetch_add(added, Relaxed);
+    }
+    c.stats.multi_count.store(tx_queue.len() as i64, Relaxed);
+}
+
+/// The bytes a command queued in MULTI holds: its arguments.
+fn queued_command_mem(cmd: &Command) -> usize {
+    let (argv, _) = crate::slowlog::command_to_slowlog_argv(cmd);
+    argv.iter().map(|a| a.len()).sum::<usize>() + 16 * argv.len()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_tx_step(
+    cmd: Command,
+    router: &Rc<Router>,
+    client_id: u64,
+    client_registry: &Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+    out_buf: &mut Vec<u8>,
+    asking: &mut bool,
+    authenticated: &mut bool,
+    auth_user: &mut String,
+    in_multi: &mut bool,
+    tx_queue: &mut Vec<Command>,
+    tx_has_error: &mut bool,
+) -> bool {
+    let was_in_multi = *in_multi;
+    let queued_before = tx_queue.len();
+    let quit = execute_tx_step_inner(
+        cmd,
+        router,
+        client_id,
+        client_registry,
+        out_buf,
+        asking,
+        authenticated,
+        auth_user,
+        in_multi,
+        tx_queue,
+        tx_has_error,
+    )
+    .await;
+    if was_in_multi || *in_multi {
+        publish_tx_state(
+            client_registry,
+            client_id,
+            *in_multi,
+            tx_queue,
+            queued_before,
+        );
+    }
+    quit
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_tx_step_inner(
     cmd: Command,
     router: &Rc<Router>,
     client_id: u64,
@@ -15751,65 +15958,11 @@ async fn execute_command_inner(
                 ClientSubcommand::Info => {
                     let reg = client_registry.borrow();
                     if let Some(c) = reg.get(&client_id) {
-                        let now = std::time::Instant::now();
-                        let age = now.duration_since(c.connected_at).as_secs();
-                        let idle = now.duration_since(c.last_active).as_secs();
-                        let is_blocked = crate::block::get_block_hub_for_port(router.port)
-                            .lock()
-                            .is_blocked(c.id);
-                        let flags = if c.is_monitor {
-                            "O"
-                        } else if is_blocked {
-                            "b"
-                        } else {
-                            "N"
-                        };
-                        let (qbuf, qbuf_free) = c.effective_qbuf(idle);
-                        let tot_net_in = c
-                            .stats
-                            .tot_net_in
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let tot_net_out = c
-                            .stats
-                            .tot_net_out
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let tot_cmds = c.stats.tot_cmds.load(std::sync::atomic::Ordering::Relaxed);
-                        let read_events = c
-                            .stats
-                            .read_events
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let pipe_sum = c
-                            .stats
-                            .pipeline_len_sum
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let pipe_cnt = c
-                            .stats
-                            .pipeline_len_cnt
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let info = format!(
-                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 multi=-1 watch={watch} qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
-                            c.id,
-                            c.addr,
+                        let info = format_client_line(
+                            c,
                             router.port,
-                            c.name.as_deref().unwrap_or(""),
-                            age,
-                            idle,
-                            flags,
-                            c.db,
-                            qbuf,
-                            qbuf_free,
-                            c.omem_now(),
-                            c.last_cmd.to_lowercase(),
-                            if c.is_resp3 { 3 } else { 2 },
-                            c.lib_name.as_deref().unwrap_or(""),
-                            c.lib_ver.as_deref().unwrap_or(""),
-                            tot_net_in,
-                            tot_net_out,
-                            tot_cmds,
-                            read_events,
-                            pipe_sum,
-                            pipe_cnt,
-                            watch = crate::connection::client_watch_count(router.port, c.id),
+                            &router.pubsub.borrow(),
+                            std::time::Instant::now(),
                         );
                         out.extend_from_slice(format!("${}\r\n", info.len()).as_bytes());
                         out.extend_from_slice(info.as_bytes());
