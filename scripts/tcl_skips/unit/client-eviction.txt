@@ -1,0 +1,16 @@
+# unit/client-eviction tests that don't apply to rudis.
+#
+# rudis stops reading a client's commands while its replies can't be written
+# (backpressure), so a client that never reads its replies can't grow an
+# output buffer to evict: its own writes block once the socket buffers are
+# full, and this test, waiting for eviction, never ends. Redis keeps reading
+# and buffers the replies.
+client evicted due to output buf
+# The same: these grow a client's output buffer past 10 MB by sending
+# commands without reading the replies.
+client total memory grows during client no-evict
+client total memory grows during maxmemory-clients disabled
+# rudis doesn't read a blocked client's input until it unblocks (what it
+# pipelines behind BLPOP waits in the socket), so its memory can't grow
+# past 1 MB to be evicted while blocked, as this test needs.
+Evicting the next client while serving blocked clients is safe

@@ -77,7 +77,7 @@ full_ci() { # rev
     step "release build" cargo build --release
     step "TCL core suites" netns "SKIP_BUILD=1 bash scripts/run_redis_test_suite.sh 16379 all"
     step "TCL replication integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown,integration/replication-3,integration/replication-4,integration/psync2-reg"
-    step "TCL persistence integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh unit/aofrw,integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load,integration/rdb,integration/corrupt-dump,integration/corrupt-dump-fuzzer,unit/wait,unit/violations,integration/logging"
+    step "TCL persistence integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh unit/aofrw,unit/client-eviction,integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load,integration/rdb,integration/corrupt-dump,integration/corrupt-dump-fuzzer,unit/wait,unit/violations,integration/logging"
     step "TCL cluster integration suites" netns "RUDIS_THREADS=1 SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh unit/cluster/failure-marking,unit/cluster/internal-secret,unit/cluster/multi-slot-operations,unit/cluster/misc,unit/cluster/scripting,unit/cluster/sharded-pubsub,unit/cluster/slot-ownership,unit/cluster/replica-migration,unit/cluster/human-announced-nodename,integration/dismiss-mem"
     # Job supply_chain.
     step "cargo deny check" cargo deny check
