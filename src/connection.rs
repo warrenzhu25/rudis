@@ -1186,6 +1186,7 @@ pub(crate) fn client_tot_mem(
     let (qbuf, qbuf_free) = c.effective_qbuf(idle_secs);
     let (sub, psub, ssub, sub_bytes) = pubsub.client_sub_stats(c.id);
     let (watched, watch_bytes) = client_watch_mem(port, c.id);
+    let (prefixes, prefix_bytes) = client_tracking_mem(c.id);
     let queued = c.stats.multi_count.load(Relaxed).max(0) as usize;
     CLIENT_BASE_MEM
         + qbuf
@@ -1194,7 +1195,8 @@ pub(crate) fn client_tot_mem(
         + c.stats.multi_mem.load(Relaxed)
         + sub_bytes
         + watch_bytes
-        + (sub + psub + ssub + watched + queued) * CLIENT_ENTRY_OVERHEAD
+        + prefix_bytes
+        + (sub + psub + ssub + watched + queued + prefixes) * CLIENT_ENTRY_OVERHEAD
 }
 
 /// One CLIENT LIST / CLIENT INFO line (with its newline).
@@ -1268,6 +1270,20 @@ pub(crate) fn format_client_line(
         s.pipeline_len_sum.load(Relaxed),
         s.pipeline_len_cnt.load(Relaxed),
     )
+}
+
+/// Client `id`'s CLIENT TRACKING prefixes: how many, and their bytes
+/// (part of `tot-mem`, as in Redis).
+pub(crate) fn client_tracking_mem(id: u64) -> (usize, usize) {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return (0, 0);
+    }
+    let map = TRACKING_CLIENTS.read();
+    map.iter()
+        .find(|((_, cid), _)| *cid == id)
+        .map_or((0, 0), |(_, t)| {
+            (t.prefixes.len(), t.prefixes.iter().map(|p| p.len()).sum())
+        })
 }
 
 /// The keys client `id` watches: how many, and their bytes.
