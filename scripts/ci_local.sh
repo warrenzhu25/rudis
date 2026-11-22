@@ -143,6 +143,27 @@ commit_checks() { # sha
     fi
 }
 
+# A continuous soak (scripts/soak_continuous.sh) needs the same cores as the
+# perf A/B and makes the host noisy: pause it for the run, ending its
+# current segment (which still writes its report).
+SOAK_ROOT="${SOAK_ROOT:-$HOME/soak-runs/continuous}"
+pause_soak() {
+    local pidf="$SOAK_ROOT/segment.pid" pid
+    [ -d "$SOAK_ROOT" ] || return 0
+    touch "$SOAK_ROOT/PAUSE"
+    trap 'rm -f "$SOAK_ROOT/PAUSE"' EXIT
+    pid=$(cat "$pidf" 2>/dev/null) || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    echo "== pausing the continuous soak (segment pid $pid)"
+    kill -TERM "$pid" 2>/dev/null
+    for _ in $(seq 1 120); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 5
+    done
+    echo "   the soak segment did not stop within 10 min; continuing anyway" >&2
+}
+pause_soak
+
 case "${1:-}" in
     --series)
         [ $# -eq 3 ] || usage
