@@ -5810,6 +5810,23 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
         }
         applied.push((p_str, old));
     }
+    // A lower client memory limit evicts before CONFIG SET replies, as in
+    // Redis, from fresh readings of this shard's clients (the others'
+    // come from their shards' periodic measurement).
+    if applied
+        .iter()
+        .any(|(n, _)| n == "maxmemory-clients" || n == "maxmemory")
+    {
+        let limit = maxmemory_clients_limit(router.base_port);
+        if limit > 0 {
+            SHARD_CLIENTS.with(|c| {
+                if let Some(reg) = c.borrow().as_ref() {
+                    measure_client_memory(reg, router.port, &router.pubsub.borrow());
+                }
+            });
+            evict_clients(router.base_port, limit);
+        }
+    }
     out.extend_from_slice(b"+OK\r\n");
 }
 
@@ -7625,6 +7642,12 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 c.last_active = Instant::now();
                                 c.qbuf_len = buf.len() - pending_big_arg_start(&buf).unwrap_or(0);
                                 c.qbuf_cap = c.qbuf_cap.max(estimate_incomplete_qbuf_cap(&buf));
+                                // Fresh for maxmemory-clients (CONFIG SET
+                                // evicts from these readings at once).
+                                c.stats.tot_mem.store(
+                                    client_tot_mem(c, 0, router.port, &router.pubsub.borrow()),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                             }
                             break;
                         }

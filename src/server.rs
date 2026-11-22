@@ -668,13 +668,17 @@ pub fn run_shard_worker(
 
         // maxmemory-clients: every 100 ms, measure this shard's clients
         // (their memory lives here); shard 0 then evicts for the node.
+        // Without a limit, measure each second, so a limit set later
+        // (evicting at once on CONFIG SET) starts from recent readings.
         let mem_clients = client_registry.clone();
         let mem_clients_router = router.clone();
         monoio::spawn(async move {
+            let mut tick: u32 = 0;
             loop {
                 monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tick = tick.wrapping_add(1);
                 let limit = crate::connection::maxmemory_clients_limit(base_port);
-                if limit == 0 {
+                if limit == 0 && !tick.is_multiple_of(10) {
                     continue;
                 }
                 crate::connection::measure_client_memory(
@@ -682,7 +686,7 @@ pub fn run_shard_worker(
                     mem_clients_router.port,
                     &mem_clients_router.pubsub.borrow(),
                 );
-                if shard_id == 0 {
+                if shard_id == 0 && limit > 0 {
                     crate::connection::evict_clients(base_port, limit);
                 }
             }
