@@ -37,7 +37,9 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - name: Restore corpus
         uses: actions/cache/restore@v4
@@ -47,7 +49,12 @@ jobs:
           restore-keys: fuzz-corpus-
 
       - name: Build targets
-        run: cargo +nightly fuzz build
+        run: |
+          set -o pipefail
+          cargo +nightly fuzz build 2>&1 | tee build.log || {
+            grep -E '^error' -A 3 build.log | head -n 10 | while IFS= read -r l; do echo "::error title=fuzz build::$l"; done
+            exit 1
+          }
 
       # -rss_limit_mb and -malloc_limit_mb make an input that allocates
       # without bound (as LCS on two 400 KB strings once did) a failure
