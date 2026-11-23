@@ -5,7 +5,7 @@ All notable changes to Rudis are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Before 1.0, a minor version may change behavior
 or the persistence format; such changes are called out under **Breaking**.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-11-23
 
 The first tagged release.
 
