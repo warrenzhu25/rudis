@@ -773,8 +773,17 @@ fn test_aof_bgrewriteaof_compaction_e2e() {
         "+Background append only file rewriting started\r\n"
     );
 
-    // Wait for async background rewrite to complete and flush to disk
-    thread::sleep(Duration::from_millis(300));
+    // Wait for the background rewrite to finish (a fixed 300 ms sleep was
+    // too short on a loaded host: server 1's rewrite was still running when
+    // server 2, below, loaded the same directory).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while info_field(&mut client1, "aof_rewrite_in_progress") != "0" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rewrite never finished"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 
     let compacted_size0 = aof_file0.metadata().map(|m| m.len()).unwrap_or(0);
     let compacted_size1 = aof_file1.metadata().map(|m| m.len()).unwrap_or(0);
