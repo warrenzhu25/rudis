@@ -1,0 +1,71 @@
+name: Release
+
+# Pushing a tag v* builds the Linux x86_64 binary with the `dist` profile
+# (fat LTO), and publishes it with its SHA-256 sum as a GitHub release whose
+# notes are that version's section of CHANGELOG.md.
+
+on:
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish
+    # The oldest supported runner image: the binary links against its glibc,
+    # so it runs on that glibc and anything newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Keep in sync with rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $ver"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --profile dist --bin rudis
+
+      - name: Package
+        run: |
+          name="rudis-${GITHUB_REF_NAME}-x86_64-linux-gnu"
+          mkdir "$name"
+          cp target/dist/rudis README.md LICENSE rudis.conf "$name"/
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $ver"
+            exit 1
+          fi
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
