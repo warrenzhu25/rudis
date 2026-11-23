@@ -74,11 +74,13 @@ same = all(p.get("same") for p in pairs) if pairs else "?"
 mt = re.search(r"memtier restarts[^:]*: (\d+)", text)
 p99 = re.search(r"\| probe p99 \(ms\) \| [\d.]+ \| ([\d.]+) \|", text)
 mem = re.search(r"\| used_memory, all nodes \(MB\) \| ([\d.]+) \| ([\d.]+) \|", text)
+trend = re.search(r"used_memory trend after warmup: ([+-][\d.]+ MB/h)", text)
 print(("OK" if ok and lost == 0 and mism in (0, "-") and same is True else "PROBLEM")
       + f" lost={lost} big_mismatches={mism} replicas_same={same}"
       + f" memtier_restarts={mt.group(1) if mt else '?'}"
       + f" p99_last_h={p99.group(1) if p99 else '?'}ms"
       + (f" mem={mem.group(1)}->{mem.group(2)}MB" if mem else "")
+      + (f" mem_trend={trend.group(1).replace(' ', '')}" if trend else "")
       + ("" if ok else f" anomalies: {anom[:200]!r}"))
 PY
 )

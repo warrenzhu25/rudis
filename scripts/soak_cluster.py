@@ -635,8 +635,11 @@ def write_report(a, samples_path, events, anomalies, final):
     rows = [json.loads(l) for l in open(samples_path)] if os.path.exists(samples_path) else []
     lines = [f"# Cluster soak report ({len(rows)} samples, {a.hours} h planned)", ""]
     if rows:
+        # The cluster fills its keyspace in the first ~15 min: compare
+        # memory and latency from after a 30 min warmup, not the fill.
         hour = max(1, 3600 // a.interval)
-        first, last = rows[:hour], rows[-hour:]
+        warm = [r for r in rows if r["t"] >= 1800] or rows
+        first, last = warm[:hour], rows[-hour:]
 
         def avg(rs, f):
             vals = [v for v in (f(r) for r in rs) if v is not None]
@@ -646,7 +649,7 @@ def write_report(a, samples_path, events, anomalies, final):
             vals = [float(n[k]) for n in r["nodes"].values() if n.get(k) not in (None, "")]
             return sum(vals) if vals else None
 
-        lines += ["| | first hour | last hour |", "| :--- | ---: | ---: |"]
+        lines += ["| | first hour after warmup | last hour |", "| :--- | ---: | ---: |"]
         for label, f in (
             ("used_memory, all nodes (MB)", lambda r: (total(r, "used_memory") or 0) / 2**20),
             ("used_memory_rss, all nodes (MB)", lambda r: (total(r, "used_memory_rss") or 0) / 2**20),
@@ -656,9 +659,19 @@ def write_report(a, samples_path, events, anomalies, final):
             ("probe max (ms)", lambda r: r["probe"]["max_ms"]),
         ):
             lines.append(f"| {label} | {avg(first, f):.2f} | {avg(last, f):.2f} |")
+        # Memory trend after warmup, a least-squares slope: big values
+        # come and go, so two hourly averages swing by +-10% on their own.
+        pts = [(r["t"] / 3600, (total(r, "used_memory") or 0) / 2**20) for r in warm]
+        trend = ""
+        if len(pts) >= 10 and pts[-1][0] - pts[0][0] >= 1:
+            mx = statistics.mean(x for x, _ in pts)
+            my = statistics.mean(y for _, y in pts)
+            slope = sum((x - mx) * (y - my) for x, y in pts) / sum((x - mx) ** 2 for x, _ in pts)
+            trend = f"{slope:+.1f} MB/h ({100 * slope / my:+.2f}%/h of {my:.0f} MB)"
         worst = max(r["probe"]["max_ms"] for r in rows)
         recon = sum(r["probe"].get("reconnects", 0) for r in rows)
-        lines += ["", f"* worst probe latency: {worst:.1f} ms",
+        lines += ["", f"* used_memory trend after warmup: {trend or 'n/a (too short)'}",
+                  f"* worst probe latency: {worst:.1f} ms",
                   f"* probe GETs that reconnected first (not counted above): {recon}",
                   f"* counter writer at the end: {rows[-1].get('counters')}",
                   f"* memtier restarts (lost its client threads or exited): "
