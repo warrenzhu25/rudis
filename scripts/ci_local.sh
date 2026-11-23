@@ -15,6 +15,10 @@
 # io_uring; the debug e2e on the legacy driver, instrumented for coverage;
 # and three lanes of Redis TCL suites. Each step's time is logged.
 #
+# A series runs only what its changes need (agent.md, Rule 4): nothing for
+# docs only, a YAML check for workflows only, everything otherwise (the
+# perf A/B only for commits that change src/). CI_FULL=1 forces everything.
+#
 # CI_ALLOW_NOISY=1 passes --allow-noisy to the perf A/B: on a host too
 # noisy for a perf verdict, the series still checks every commit's build,
 # lint and tests. The perf verdict is then still owed: rerun the A/B for
@@ -305,6 +309,44 @@ pause_soak() {
     done
     echo "   the soak segment did not stop within 10 min; continuing anyway" >&2
 }
+# What a series needs, from what it changes (see agent.md, Rule 4):
+# "docs" (only *.md, docs/, LICENSE: nothing can break), "workflows" (only
+# those and .github/: the YAML must parse), or "full". CI_FULL=1 forces
+# "full".
+change_tier() { # base, tip
+    local files
+    files="$(git -C "$REPO" diff --name-only "$1" "$2")"
+    if [ -n "${CI_FULL:-}" ]; then
+        echo full
+    elif ! grep -qvE '(\.md$|^docs/|^LICENSE$)' <<< "$files"; then
+        echo docs
+    elif ! grep -qvE '(\.md$|^docs/|^LICENSE$|^\.github/)' <<< "$files"; then
+        echo workflows
+    else
+        echo full
+    fi
+}
+
+if [ "${1:-}" = --series ] && [ $# -eq 3 ]; then
+    tip_short="$(git -C "$REPO" rev-parse --short "$3")"
+    case "$(change_tier "$2" "$3")" in
+        docs)
+            echo "== $2..$3 changes only docs: nothing to run"
+            echo "CI PASSED ($tip_short, docs only)"
+            exit 0
+            ;;
+        workflows)
+            echo "== $2..$3 changes only docs and workflows: checking the workflow YAML"
+            for f in $(git -C "$REPO" diff --name-only "$2" "$3" -- .github); do
+                git -C "$REPO" show "$3:$f" 2> /dev/null | python3 -c 'import sys, yaml; yaml.safe_load(sys.stdin)' \
+                    || { echo "CI FAILED: $f does not parse" >&2; exit 1; }
+            done
+            echo "CI PASSED ($tip_short, workflows only)"
+            exit 0
+            ;;
+    esac
+fi
+
 pause_soak
 
 case "${1:-}" in
