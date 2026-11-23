@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Skips tests too big for a hosted runner (16 GB, 4 vCPUs), such as the
+  # 2 GiB full sync; scripts/ci_local.sh runs them.
+  RUDIS_SKIP_HEAVY_TESTS: "1"
 
 jobs:
   build_and_test:

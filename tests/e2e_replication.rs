@@ -5678,6 +5678,13 @@ fn test_replica_hides_expired_hash_fields_e2e() {
 /// dropped the connection without a word and the replica retried forever.
 #[test]
 fn test_full_sync_over_2gib_e2e() {
+    // Peaks at ~8.5 GB of RSS: more than a GitHub runner (16 GB, 4 vCPUs)
+    // can hold beside the build, where it timed out or was killed. GitHub
+    // CI sets RUDIS_SKIP_HEAVY_TESTS; scripts/ci_local.sh runs it.
+    if std::env::var_os("RUDIS_SKIP_HEAVY_TESTS").is_some() {
+        eprintln!("skipped: RUDIS_SKIP_HEAVY_TESTS is set");
+        return;
+    }
     let mp = 18058u16;
     let mps = mp.to_string();
     // On io_uring, as in production: the legacy driver's send() takes a
