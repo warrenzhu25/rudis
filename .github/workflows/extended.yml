@@ -1,0 +1,170 @@
+name: Extended CI
+
+# The timing-heavy checks that flake on a shared hosted runner (4 vCPUs) but
+# pass on a dedicated host: the debug e2e suite on the legacy driver with
+# coverage, and the Redis TCL suites that start their own servers
+# (replication, persistence, cluster). Nightly and on demand; they don't
+# gate a push here, but scripts/ci_local.sh runs all of them before every
+# merge. Failures here are fixed like any other bug.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUDIS_SKIP_HEAVY_TESTS: "1"
+
+jobs:
+  debug_e2e_coverage:
+    name: Debug e2e (legacy driver) with coverage
+    runs-on: ubuntu-latest
+    env:
+      MONOIO_FORCE_LEGACY_DRIVER: 1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Keep in sync with rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run End-to-End Integration Tests (serial)
+        run: |
+          set -o pipefail
+          cargo test --test 'e2e_*' -- --test-threads=1 2>&1 | tee e2e.log || {
+            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+              echo "### E2E Test Failures" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              sed -n '/failures:/,$p' e2e.log | head -n 300 >> "$GITHUB_STEP_SUMMARY" || cat e2e.log >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+            grep -n -A 2 "panicked at" e2e.log | head -n 10 | while read -r line; do
+              echo "::error title=Panic::$line"
+            done
+            exit 1
+          }
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate Code Coverage & Step Summary
+        run: |
+          set -o pipefail
+          ./scripts/generate_coverage.sh 2>&1 | tee coverage.log || {
+            # The instrumented test runs: annotate which test failed.
+            grep -E -A3 "panicked at|^test .* FAILED$" coverage.log | grep -v '^--$' | head -n 10 \
+              | while IFS= read -r line; do echo "::error title=coverage test::$line"; done
+            exit 1
+          }
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            echo "### Code Coverage Report" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cargo llvm-cov report >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+
+  tcl_integration:
+    name: Redis TCL integration suites (io_uring)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Keep in sync with rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Install tclsh and the Redis CLI tools
+        run: sudo apt-get update && sudo apt-get install -y tcl redis-tools
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # Replication suites that start their own servers (a master, replicas,
+      # restarts), through the integration wrapper.
+      - name: Run the replication integration suites
+        run: |
+          set -o pipefail
+          SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
+            integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown,integration/replication-3,integration/replication-4,integration/psync2-reg \
+            2>&1 | tee -a /tmp/rudis_tcl_suites.log
+
+      # Persistence suites: AOF writes racing redis-benchmark load,
+      # Redis-written RDBs loading, corrupt RESTORE payloads and RDBs
+      # (including a fuzzer: the server must never crash), and WAIT/WAITAOF.
+      # Tests that don't apply, and known gaps, are listed with the reason
+      # in scripts/tcl_skips/; scripts/tcl_patches/ adapts some suites.
+      - name: Run the persistence integration suites
+        run: |
+          set -o pipefail
+          SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
+            integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load,integration/rdb,integration/corrupt-dump,integration/corrupt-dump-fuzzer,unit/wait,unit/violations,integration/logging \
+            2>&1 | tee -a /tmp/rudis_tcl_suites.log
+
+      # Cluster suites (and dismiss-mem, which ends with a one-node
+      # cluster), one shard per node: in cluster mode shard N listens on
+      # port + N, and the harness puts nodes on consecutive ports.
+      - name: Run the cluster integration suites
+        run: |
+          set -o pipefail
+          RUDIS_THREADS=1 SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
+            unit/cluster/failure-marking,unit/cluster/internal-secret,unit/cluster/multi-slot-operations,integration/dismiss-mem \
+            2>&1 | tee -a /tmp/rudis_tcl_suites.log
+
+      # Annotations are visible on the run page without downloading logs.
+      - name: Report failing TCL tests
+        if: failure()
+        run: |
+          # Only failures: GitHub shows 10 annotations per step, and each
+          # passing suite's "Failed: 0 ()" line used to fill them first.
+          # -A1: the line after an [err] says what was expected.
+          grep -E -A1 '^\[(err|exception)\]' /tmp/rudis_tcl_suites.log | grep -v '^--$' \
+            | head -6 | while IFS= read -r line; do echo "::error title=TCL::${line}"; done
+          # The suite and the last test started before a [TIMEOUT].
+          awk '/^Testing |^\[(ok|err|skip)\]/ {last = last_suite ? last_suite " / " $0 : $0}
+               /^Testing / {last_suite = $0}
+               /^\[TIMEOUT\]/ {print "hung in: " last; exit}' /tmp/rudis_tcl_suites.log \
+            | while IFS= read -r line; do echo "::error title=TCL timeout::${line}"; done
+          # After a [TIMEOUT], the clients state report names the test that hung.
+          grep -E -A4 '^\[TIMEOUT\]' /tmp/rudis_tcl_suites.log | grep -v '^--$' | head -n 5 \
+            | while IFS= read -r line; do echo "::error title=TCL timeout::${line}"; done
+          # Which suite and test were running (a [TIMEOUT] names neither).
+          last=$(grep -E '^Testing |^\[(ok|err|skip)\]' /tmp/rudis_tcl_suites.log | tail -n 3 | tr '\n' ' ')
+          echo "::error title=TCL last tests::${last}"
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rudis-tcl-server-log
+          path: |
+            /tmp/rudis_tcl_test_16379.log
+            /tmp/rudis_tcl_suites.log

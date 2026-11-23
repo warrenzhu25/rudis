@@ -1,5 +1,11 @@
 name: CI
 
+# The checks every push and pull request must pass, chosen to be
+# deterministic on a hosted runner (4 vCPUs, shared). The timing-heavy rest
+# (debug e2e with coverage; the replication, persistence and cluster TCL
+# suites) runs nightly in extended.yml, and all of it gates every merge in
+# scripts/ci_local.sh on a dedicated host.
+
 on:
   push:
     branches: [ "main" ]
@@ -20,7 +26,8 @@ jobs:
       # Many in-process servers per test binary; the legacy (epoll) driver
       # avoids io_uring memlock exhaustion on older runner kernels. The
       # production io_uring driver is covered by `io_uring_tests` and the
-      # TCL job below.
+      # TCL job below. The e2e suite on this driver, with coverage, runs in
+      # extended.yml.
       MONOIO_FORCE_LEGACY_DRIVER: 1
 
     steps:
@@ -70,41 +77,6 @@ jobs:
           cargo test --test test_tls_e2e --test test_fuzz_parsers
           --test test_resilience_chaos --test test_redis_rdb_compat
           -- --test-threads=1
-
-      - name: Run End-to-End Integration Tests (serial)
-        run: |
-          set -o pipefail
-          cargo test --test 'e2e_*' -- --test-threads=1 2>&1 | tee e2e.log || {
-            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
-              echo "### E2E Test Failures" >> "$GITHUB_STEP_SUMMARY"
-              echo '```' >> "$GITHUB_STEP_SUMMARY"
-              sed -n '/failures:/,$p' e2e.log | head -n 300 >> "$GITHUB_STEP_SUMMARY" || cat e2e.log >> "$GITHUB_STEP_SUMMARY"
-              echo '```' >> "$GITHUB_STEP_SUMMARY"
-            fi
-            grep -n -A 2 "panicked at" e2e.log | head -n 10 | while read -r line; do
-              echo "::error title=Panic::$line"
-            done
-            exit 1
-          }
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Generate Code Coverage & Step Summary
-        run: |
-          set -o pipefail
-          ./scripts/generate_coverage.sh 2>&1 | tee coverage.log || {
-            # The instrumented test runs: annotate which test failed.
-            grep -E -A3 "panicked at|^test .* FAILED$" coverage.log | grep -v '^--$' | head -n 10 \
-              | while IFS= read -r line; do echo "::error title=coverage test::$line"; done
-            exit 1
-          }
-          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
-            echo "### Code Coverage Report" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cargo llvm-cov report >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-          fi
 
       - name: Build Optimized Release Binary
         run: cargo build --release
@@ -175,7 +147,7 @@ jobs:
           }
 
   redis_tcl_suites:
-    name: Redis TCL compatibility suites (io_uring)
+    name: Redis TCL core suites (io_uring)
     runs-on: ubuntu-latest
 
     steps:
@@ -210,37 +182,6 @@ jobs:
         run: |
           set -o pipefail
           SKIP_BUILD=1 bash scripts/run_redis_test_suite.sh 16379 all 2>&1 | tee /tmp/rudis_tcl_suites.log
-
-      # Replication suites that start their own servers (a master, replicas,
-      # restarts), through the integration wrapper.
-      - name: Run the replication integration suites
-        run: |
-          set -o pipefail
-          SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
-            integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown,integration/replication-3,integration/replication-4,integration/psync2-reg \
-            2>&1 | tee -a /tmp/rudis_tcl_suites.log
-
-      # Persistence suites: AOF writes racing redis-benchmark load,
-      # Redis-written RDBs loading, corrupt RESTORE payloads and RDBs
-      # (including a fuzzer: the server must never crash), and WAIT/WAITAOF.
-      # Tests that don't apply, and known gaps, are listed with the reason
-      # in scripts/tcl_skips/; scripts/tcl_patches/ adapts some suites.
-      - name: Run the persistence integration suites
-        run: |
-          set -o pipefail
-          SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
-            integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load,integration/rdb,integration/corrupt-dump,integration/corrupt-dump-fuzzer,unit/wait,unit/violations,integration/logging \
-            2>&1 | tee -a /tmp/rudis_tcl_suites.log
-
-      # Cluster suites (and dismiss-mem, which ends with a one-node
-      # cluster), one shard per node: in cluster mode shard N listens on
-      # port + N, and the harness puts nodes on consecutive ports.
-      - name: Run the cluster integration suites
-        run: |
-          set -o pipefail
-          RUDIS_THREADS=1 SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh \
-            unit/cluster/failure-marking,unit/cluster/internal-secret,unit/cluster/multi-slot-operations,integration/dismiss-mem \
-            2>&1 | tee -a /tmp/rudis_tcl_suites.log
 
       # Annotations are visible on the run page without downloading logs.
       - name: Report failing TCL tests
