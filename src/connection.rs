@@ -7471,6 +7471,10 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
         mut squashed_responses,
         mut commands,
     } = take_conn_scratch(router.num_shards);
+    // The arguments each command in `commands` was sent with, in step with
+    // it (MONITOR and SLOWLOG show them).
+    let mut argvs: std::collections::VecDeque<Option<crate::resp::RawArgv>> =
+        std::collections::VecDeque::new();
 
     let mut asking = false;
     let mut in_multi = false;
@@ -7561,6 +7565,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
 
                 // 1. Parse all complete commands currently in the buffer
                 commands.clear();
+                argvs.clear();
                 let mut should_quit = false;
                 let mut has_special = in_multi;
                 let mut batch_in_bytes = n;
@@ -7572,8 +7577,8 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                 let mut qbuf_overflow = false;
                 while !buf.is_empty() {
                     let len_before = buf.len();
-                    match parse_command(&mut buf) {
-                        Ok(Some(cmd)) => {
+                    match crate::resp::parse_command_with_argv(&mut buf) {
+                        Ok(Some((cmd, argv))) => {
                             if parsed_query_over_limit(len_before, buf.len(), qbuf_limit) {
                                 client_query_limit_reached(client_id, len_before - buf.len());
                                 qbuf_overflow = true;
@@ -7584,6 +7589,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 has_special = true;
                             }
                             commands.push(cmd);
+                            argvs.push_back(argv);
                             if is_quit {
                                 buf.clear();
                                 break;
@@ -7668,6 +7674,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                             }
                             if in_multi {
                                 for cmd in commands.drain(..) {
+                                    argvs.pop_front();
                                     if execute_tx_step(
                                         cmd,
                                         &router,
@@ -7690,12 +7697,14 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 tx_has_error = true;
                             } else {
                                 for cmd in commands.drain(..) {
+                                    let argv = argvs.pop_front().flatten();
                                     if let Some(c) =
                                         client_registry.borrow_mut().get_mut(&client_id)
                                     {
                                         c.last_active = Instant::now();
                                         c.last_cmd = get_cmd_name(&cmd);
                                     }
+                                    set_exec_argv(argv);
                                     let quit = execute_command(
                                         cmd,
                                         &router,
@@ -7743,6 +7752,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                     // Like Redis: close without running or answering what is
                     // buffered; the loop exit recycles the scratch buffers.
                     commands.clear();
+                    argvs.clear();
                     buf.clear();
                     break;
                 }
@@ -7756,6 +7766,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                 }
                 if batch_guard.is_none() {
                     commands.clear();
+                    argvs.clear();
                     break;
                 }
                 let batch_writes = aof_on
@@ -7783,6 +7794,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                 // ACL must be enforced here before switching modes.
                 while has_special && let Some(idx) = commands.iter().position(is_mode_switch_cmd) {
                     for c in commands.drain(..idx) {
+                        set_exec_argv(argvs.pop_front().flatten());
                         let _ = execute_command(
                             c,
                             &router,
@@ -7799,6 +7811,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         mode_switch_denied(&commands[0], router.port, authenticated, &auth_user)
                     {
                         commands.remove(0);
+                        argvs.pop_front();
                         out_buf.extend_from_slice(&err);
                         continue;
                     }
@@ -7821,6 +7834,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         let _ = transport.write_all(write_chunk).await.0;
                     }
                     let switch_cmd = commands.remove(0);
+                    argvs.pop_front();
                     if matches!(
                         switch_cmd,
                         Command::Psync { .. } | Command::Sync | Command::DflyFlow { .. }
@@ -7919,6 +7933,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                     }
                     if has_tx {
                         for cmd in commands.drain(..) {
+                            argvs.pop_front();
                             if execute_tx_step(
                                 cmd,
                                 &router,
@@ -7983,6 +7998,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         // Each command counts itself at the pause gate.
                         drop(batch_running.take());
                         for cmd in commands.drain(..) {
+                            let argv = argvs.pop_front().flatten();
                             if (is_client_paused().is_some()
                                 || matches!(
                                     cmd,
@@ -8033,6 +8049,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 c.last_active = Instant::now();
                                 c.last_cmd = get_cmd_name(&cmd);
                             }
+                            set_exec_argv(argv);
                             let quit = execute_command(
                                 cmd,
                                 &router,
@@ -8056,6 +8073,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         }
                     } else if commands.len() == 1 {
                         let single_cmd = commands.pop().unwrap();
+                        set_exec_argv(argvs.pop_back().flatten());
                         if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                             c.last_active = Instant::now();
                             c.last_cmd = get_cmd_name(&single_cmd);
@@ -13708,6 +13726,45 @@ impl<'a, F: std::future::Future> std::future::Future for WithCurrentDb<'a, F> {
     }
 }
 
+thread_local! {
+    /// The raw arguments of the command the read loop is about to run,
+    /// handed to [`execute_command`] (which takes them before its first
+    /// await, so no other task on the thread can see them).
+    static EXEC_ARGV: RefCell<Option<crate::resp::RawArgv>> = const { RefCell::new(None) };
+}
+
+/// Hands `argv` to the next [`execute_command`] on this thread.
+#[inline]
+fn set_exec_argv(argv: Option<crate::resp::RawArgv>) {
+    if argv.is_some() {
+        EXEC_ARGV.with(|a| *a.borrow_mut() = argv);
+    }
+}
+
+/// `argv` if it is `cmd`'s and may be shown as is: commands with arguments
+/// to redact (AUTH, HELLO, MIGRATE, ACL, CONFIG, SENTINEL, DEBUG) keep the
+/// reconstruction that redacts them.
+fn shown_argv(argv: Option<&crate::resp::RawArgv>, cmd: &Command) -> Option<Vec<Bytes>> {
+    let argv = argv?;
+    if matches!(
+        cmd,
+        Command::Auth { .. }
+            | Command::Hello { .. }
+            | Command::Migrate { .. }
+            | Command::Acl(_)
+            | Command::ConfigSet(_)
+            | Command::ConfigGet(_)
+            | Command::Sentinel(_)
+            | Command::Debug(_)
+    ) || !argv
+        .name()
+        .eq_ignore_ascii_case(get_cmd_name(cmd).as_bytes())
+    {
+        return None;
+    }
+    Some(argv.to_vec())
+}
+
 async fn execute_command(
     cmd: Command,
     router: &Router,
@@ -13718,6 +13775,8 @@ async fn execute_command(
     authenticated: &mut bool,
     auth_user: &mut String,
 ) -> bool {
+    // First, before any await: the arguments the read loop handed over.
+    let raw_argv = EXEC_ARGV.with(|a| a.borrow_mut().take());
     let initial_db = client_registry
         .borrow()
         .get(&client_id)
@@ -13734,6 +13793,7 @@ async fn execute_command(
     let reply_start = out.len();
     let fut = execute_command_inner(
         cmd,
+        raw_argv,
         router,
         client_id,
         client_registry,
@@ -14279,8 +14339,10 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
     out.extend_from_slice(b"\r\n");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_command_inner(
     cmd: Command,
+    raw_argv: Option<crate::resp::RawArgv>,
     router: &Router,
     client_id: u64,
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
@@ -14362,7 +14424,8 @@ async fn execute_command_inner(
             .get(&client_id)
             .map(|c| c.addr.to_string())
             .unwrap_or_default();
-        let monitor_argv = crate::slowlog::command_to_monitor_argv(&cmd);
+        let monitor_argv = shown_argv(raw_argv.as_ref(), &cmd)
+            .unwrap_or_else(|| crate::slowlog::command_to_monitor_argv(&cmd));
         broadcast_monitor(router.port, &addr_s, &monitor_argv);
     }
     // Also feeds LATENCY HISTOGRAM, all in thread-local state.
@@ -14391,6 +14454,8 @@ async fn execute_command_inner(
         };
     struct SlowlogTracker<'a> {
         cmd: Option<Command>,
+        /// The command's arguments as sent, for its log entries.
+        raw_argv: Option<crate::resp::RawArgv>,
         start: Option<std::time::Instant>,
         threshold: i64,
         skip_slowlog: bool,
@@ -14408,6 +14473,7 @@ async fn execute_command_inner(
                     record_latency_event("command", duration_ms);
                 }
                 if !self.skip_slowlog {
+                    let raw = shown_argv(self.raw_argv.as_ref(), &cmd);
                     let req_thresh = crate::slowlog::COMMANDLOG_REQUEST_LARGER_THAN
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let rep_thresh = crate::slowlog::COMMANDLOG_REPLY_LARGER_THAN
@@ -14415,12 +14481,16 @@ async fn execute_command_inner(
                     let is_slow = self.threshold >= 0 && duration_us >= self.threshold as u64;
                     let is_large_rep = rep_thresh >= 0 && (self.reply_bytes as i64) >= rep_thresh;
                     let req_bytes = if req_thresh >= 0 {
-                        let b = crate::slowlog::estimate_command_request_bytes(&cmd);
+                        let b = raw.as_ref().map_or_else(
+                            || crate::slowlog::estimate_command_request_bytes(&cmd),
+                            |r| r.iter().map(|a| a.len()).sum(),
+                        );
                         ((b as i64) >= req_thresh).then_some(b)
                     } else {
                         None
                     };
                     if is_slow || is_large_rep || req_bytes.is_some() {
+                        let _raw = crate::slowlog::RawArgvScope::set(raw);
                         let (addr_str, name_str) =
                             if let Some(c) = self.client_registry.borrow().get(&self.client_id) {
                                 (c.addr.to_string(), c.name.clone().unwrap_or_default())
@@ -14454,6 +14524,11 @@ async fn execute_command_inner(
         }
     }
     let mut _slowlog_guard = SlowlogTracker {
+        raw_argv: if cmd_for_slowlog.is_some() {
+            raw_argv
+        } else {
+            None
+        },
         cmd: cmd_for_slowlog,
         start: exec_start,
         threshold: slow_threshold,

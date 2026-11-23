@@ -10769,7 +10769,8 @@ fn test_slowlog_args_survive_read_buffer_reuse_e2e() {
     }
     let log = String::from_utf8_lossy(&log);
     assert!(
-        log.contains("$3\r\nget\r\n$18\r\nslowlog_marker_key\r\n"),
+        // As sent (GET), like Redis; this used to be a rebuilt "get".
+        log.contains("$3\r\nGET\r\n$18\r\nslowlog_marker_key\r\n"),
         "marker GET missing or corrupted in SLOWLOG ({} bytes): {}",
         log.len(),
         &log[..log.len().min(600)]
@@ -15502,4 +15503,110 @@ fn test_undeliverable_tracking_invalidation_closes_the_client_e2e() {
         !info.contains("client_output_buffer_limit_disconnections:0\r\n"),
         "{info}"
     );
+}
+
+/// MONITOR and SLOWLOG show a command's arguments as the client sent them.
+/// Both rebuilt them from the parsed command, which lost or garbled them for
+/// most commands: `XADD s * a 1` showed as `xadd`, `LRANGE l 0 -1` as
+/// `lrange l -1`, `ZADD z 1 a 2 b` as `zadd z a b`. A password is still not
+/// shown.
+#[test]
+fn test_monitor_and_slowlog_show_the_arguments_as_sent_e2e() {
+    let port = 18685u16;
+    let port_s = port.to_string();
+    let mut srv = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--aof",
+            "false",
+        ],
+        port,
+    );
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let mut c = connect();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "slowlog-log-slower-than", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "slowlog-max-len", "128"]),
+        "+OK\r\n"
+    );
+    let mut mon = connect();
+    assert_eq!(resp_cmd(&mut mon, &["MONITOR"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SLOWLOG", "RESET"]), "+OK\r\n");
+
+    let many: Vec<String> = (0..20).map(|i| format!("v{i}")).collect();
+    let mut rpush = vec!["RPUSH", "big"];
+    rpush.extend(many.iter().map(String::as_str));
+    let sent: Vec<Vec<&str>> = vec![
+        vec!["XADD", "s", "*", "a", "1"],
+        vec!["LRANGE", "l", "0", "-1"],
+        vec!["ZADD", "z", "1", "a", "2", "b"],
+        vec!["EXPIRE", "s", "100"],
+        vec!["HSET", "h", "f1", "v1", "f2", "v2"],
+        rpush,
+    ];
+    for argv in &sent {
+        let _ = resp_cmd(&mut c, argv);
+    }
+    // An inline command, and a password that must not show.
+    c.write_all(b"SET inline_key inline_val\r\n").unwrap();
+    let mut buf = [0u8; 64];
+    let _ = c.read(&mut buf).unwrap();
+    let _ = resp_cmd(&mut c, &["AUTH", "s3cret-password"]);
+    let _ = resp_cmd(&mut c, &["ECHO", "monitor-done"]);
+
+    // MONITOR: each command's line quotes its arguments as sent.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut seen = String::new();
+    while !seen.contains("monitor-done") {
+        assert!(std::time::Instant::now() < deadline, "monitor saw: {seen}");
+        let mut b = [0u8; 4096];
+        if let Ok(n) = mon.read(&mut b) {
+            seen.push_str(&String::from_utf8_lossy(&b[..n]));
+        }
+    }
+    for argv in &sent {
+        let quoted: Vec<String> = argv.iter().map(|a| format!("\"{a}\"")).collect();
+        let want = format!("{}\r\n", quoted.join(" "));
+        assert!(
+            seen.contains(&want),
+            "monitor should show {want:?}, saw: {seen}"
+        );
+    }
+    assert!(
+        seen.contains("\"SET\" \"inline_key\" \"inline_val\""),
+        "{seen}"
+    );
+    assert!(
+        !seen.contains("s3cret-password"),
+        "monitor leaked a password: {seen}"
+    );
+
+    // SLOWLOG: the same arguments, oldest command last.
+    let log = resp_cmd_full(&mut c, &["SLOWLOG", "GET", "128"]);
+    for argv in &sent {
+        let entry: String = argv
+            .iter()
+            .map(|a| format!("${}\r\n{a}\r\n", a.len()))
+            .collect();
+        let want = format!("*{}\r\n{entry}", argv.len());
+        assert!(log.contains(&want), "slowlog should have {argv:?}: {log}");
+    }
+    assert!(
+        !log.contains("s3cret-password"),
+        "slowlog leaked a password: {log}"
+    );
+    drop(mon);
+    drop(c);
+    shutdown_and_wait(port, &mut srv);
 }

@@ -886,6 +886,28 @@ pub fn write_slowlog_entries_resp(entries: &[SlowlogEntry], out: &mut Vec<u8>) {
     }
 }
 
+thread_local! {
+    static RAW_ARGV: std::cell::RefCell<Option<Vec<Bytes>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, log entries record `raw` (a command's arguments as the
+/// client sent them, see [`crate::resp::RawArgv`]); without it they record
+/// a reconstruction from the parsed command. Synchronous use only.
+pub struct RawArgvScope(Option<Vec<Bytes>>);
+
+impl RawArgvScope {
+    pub fn set(raw: Option<Vec<Bytes>>) -> Self {
+        RawArgvScope(RAW_ARGV.with(|r| r.replace(raw)))
+    }
+}
+
+impl Drop for RawArgvScope {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        RAW_ARGV.with(|r| *r.borrow_mut() = prev);
+    }
+}
+
 /// `cmd`'s arguments as a log entry keeps them (SLOWLOG, COMMANDLOG):
 /// sensitive ones redacted, strings past slowlog-entry-max-string-len cut
 /// short and argv past slowlog-entry-max-argc too. Every argument is a
@@ -897,7 +919,13 @@ pub fn write_slowlog_entries_resp(entries: &[SlowlogEntry], out: &mut Vec<u8>) {
 /// big writes held hundreds of MB, counted in used_memory, and a server
 /// under maxmemory then refused every write.
 fn logged_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
-    let (mut argv, original_argc) = command_to_slowlog_argv(cmd);
+    let (mut argv, original_argc) = match RAW_ARGV.with(|r| r.borrow().clone()) {
+        Some(raw) => {
+            let n = raw.len();
+            (raw, n)
+        }
+        None => command_to_slowlog_argv(cmd),
+    };
     let max_str_len = SLOWLOG_ENTRY_MAX_STRING_LEN.load(Ordering::Relaxed);
     for arg in &mut argv {
         if arg.len() > max_str_len {

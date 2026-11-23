@@ -2311,7 +2311,85 @@ fn parse_min_idle_time(s: &str) -> Result<u64, String> {
 /// Parse a single Redis command from the buffer.
 /// Supports both RESP arrays (e.g., `*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n`)
 /// and inline commands (e.g., `GET foo\r\n`).
+/// The arguments a client sent for one command, as received. MONITOR and
+/// SLOWLOG show these: rebuilding them from the parsed command lost
+/// arguments for most commands (`XADD s * a 1` showed as `xadd`) and
+/// garbled others (`LRANGE l 0 -1` as `lrange l -1`). A command of up to 16
+/// arguments keeps just its RESP frame (one reference count), its arguments
+/// found again only when MONITOR or SLOWLOG asks for them.
+#[derive(Debug, Clone)]
+pub enum RawArgv {
+    Frame(Bytes),
+    Args(Vec<Bytes>),
+}
+
+impl RawArgv {
+    /// The arguments' (start, len) in a validated RESP array frame.
+    fn frame_offsets(f: &[u8]) -> SmallVec<[(usize, usize); 16]> {
+        let mut out = SmallVec::new();
+        let line_end = |from: usize| {
+            f[from..]
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .map(|p| from + p)
+        };
+        let Some(e) = line_end(0) else { return out };
+        let n = parse_decimal_bytes(&f[1..e]).unwrap_or(0);
+        let mut i = e + 2;
+        for _ in 0..n {
+            let Some(e) = line_end(i) else { break };
+            let Some(len) = parse_decimal_bytes(&f[i + 1..e]) else {
+                break;
+            };
+            let start = e + 2;
+            if start + len > f.len() {
+                break;
+            }
+            out.push((start, len));
+            i = start + len + 2;
+        }
+        out
+    }
+
+    /// The command name, as sent.
+    pub fn name(&self) -> &[u8] {
+        match self {
+            RawArgv::Frame(f) => Self::frame_offsets(f)
+                .first()
+                .map_or(&[][..], |&(s, l)| &f[s..s + l]),
+            RawArgv::Args(a) => a.first().map_or(&[][..], |b| &b[..]),
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<Bytes> {
+        match self {
+            RawArgv::Frame(f) => Self::frame_offsets(f)
+                .iter()
+                .map(|&(s, l)| f.slice(s..s + l))
+                .collect(),
+            RawArgv::Args(a) => a.clone(),
+        }
+    }
+}
+
+/// [`parse_command`], also returning the arguments as the client sent them
+/// (`None` for a Memcached command).
+pub fn parse_command_with_argv(
+    buf: &mut BytesMut,
+) -> Result<Option<(Command, Option<RawArgv>)>, String> {
+    let mut argv = None;
+    let res = parse_command_inner(buf, &mut Some(&mut argv));
+    res.map(|c| c.map(|c| (c, argv)))
+}
+
 pub fn parse_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
+    parse_command_inner(buf, &mut None)
+}
+
+fn parse_command_inner(
+    buf: &mut BytesMut,
+    argv_out: &mut Option<&mut Option<RawArgv>>,
+) -> Result<Option<Command>, String> {
     // Frames that carry no command (blank inline lines, `*0`, `*-1`) are
     // consumed here in a loop rather than by recursing: a peer can send
     // millions of them for a byte or two each, which would overflow the stack.
@@ -2321,12 +2399,12 @@ pub fn parse_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
         }
         let mut skipped = false;
         let parsed = if buf[0] == b'*' {
-            parse_resp_array(buf, &mut skipped)
+            parse_resp_array(buf, &mut skipped, argv_out)
         } else {
             match parse_memcached_storage_command(buf)? {
                 Some(Some(cmd)) => Ok(Some(cmd)),
                 Some(None) => Ok(None),
-                None => parse_inline_command(buf, &mut skipped),
+                None => parse_inline_command(buf, &mut skipped, argv_out),
             }
         };
         if !skipped {
@@ -2488,7 +2566,11 @@ pub fn set_proto_max_bulk_len(val: usize) {
 }
 
 /// Sets `skipped` instead of returning when the frame is an empty array.
-fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Command>, String> {
+fn parse_resp_array(
+    buf: &mut BytesMut,
+    skipped: &mut bool,
+    argv_out: &mut Option<&mut Option<RawArgv>>,
+) -> Result<Option<Command>, String> {
     let (newline_pos, advance_len) = match find_newline(buf) {
         Some(res) => res,
         None => {
@@ -2596,6 +2678,9 @@ fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Com
         } else {
             buf.split_to(scan_cursor).freeze()
         };
+        if let Some(out) = argv_out {
+            **out = Some(RawArgv::Frame(frame.clone()));
+        }
         if num_args > 0 {
             let (cmd_start, cmd_len) = offsets[0];
             let cmd_bytes = &frame[cmd_start..cmd_start + cmd_len];
@@ -2916,6 +3001,9 @@ fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Com
             args.push(data);
         }
 
+        if let Some(out) = argv_out {
+            **out = Some(RawArgv::Args(args.clone()));
+        }
         build_command(args)
     }
 }
@@ -2998,7 +3086,11 @@ fn split_inline_args(line: &[u8]) -> Result<Vec<Bytes>, String> {
 }
 
 /// Sets `skipped` instead of returning when the line is blank.
-fn parse_inline_command(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Command>, String> {
+fn parse_inline_command(
+    buf: &mut BytesMut,
+    skipped: &mut bool,
+    argv_out: &mut Option<&mut Option<RawArgv>>,
+) -> Result<Option<Command>, String> {
     let (line_end, advance_len) = match find_newline(buf) {
         Some(res) => res,
         None => {
@@ -3018,6 +3110,9 @@ fn parse_inline_command(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option
         return Ok(None);
     }
 
+    if let Some(out) = argv_out {
+        **out = Some(RawArgv::Args(parts.clone()));
+    }
     build_command(parts)
 }
 
