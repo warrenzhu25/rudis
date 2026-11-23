@@ -5171,8 +5171,12 @@ fn test_full_sync_does_not_make_master_evict_e2e() {
     ));
     let mut m = TcpStream::connect(("127.0.0.1", mp)).unwrap();
     m.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    // ~28 MB of data under the 40 MB limit: room for the master's own
+    // overhead on a slow host (at 34 MB it sat 2 MB under the limit and a
+    // GitHub runner evicted), while a snapshot counted against the limit
+    // (about the dataset's size again) still overshoots it.
     let val = "v".repeat(1000);
-    for b in 0..34 {
+    for b in 0..28 {
         let mut req = String::new();
         for i in 0..1000 {
             let k = format!("k{b}:{i}");
