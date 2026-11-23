@@ -52,6 +52,11 @@ redis-cli -p 6379 GET hello
 A cluster, a replica, persistence and the other options are under [Configuration](#configuration)
 and [Production Deployment](#production-deployment).
 
+Where `io_uring` is unavailable (an older kernel, or a seccomp profile that blocks it, such as
+Docker's default), Rudis runs on epoll instead and says so at startup. To get `io_uring` in a
+container, allow its system calls (`io_uring_setup`, `io_uring_enter`, `io_uring_register`) in the
+container's seccomp profile.
+
 ## How it's tested
 
 - **Redis's own test suite.** CI runs 81 of the Redis/Valkey TCL test suites (data types,
