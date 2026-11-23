@@ -2399,7 +2399,7 @@ pub fn load_file(
         strict,
         load_functions: shard_id == 0,
         now_ms: unix_ms_now(),
-        anchor: (Instant::now(), crate::table::unix_now()),
+        anchor: crate::clock::now_pair(),
         count: 0,
         keep_expired: false,
     };
@@ -2430,7 +2430,7 @@ pub fn load_chunk(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResult<usiz
         strict: false,
         load_functions: false,
         now_ms: unix_ms_now(),
-        anchor: (Instant::now(), crate::table::unix_now()),
+        anchor: crate::clock::now_pair(),
         count: 0,
         keep_expired: false,
     };
@@ -2465,7 +2465,7 @@ pub fn load_rdb_preamble(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResu
         strict,
         load_functions: true,
         now_ms: unix_ms_now(),
-        anchor: (Instant::now(), crate::table::unix_now()),
+        anchor: crate::clock::now_pair(),
         count: 0,
         keep_expired: true,
     };

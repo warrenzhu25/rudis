@@ -4812,8 +4812,7 @@ struct RdbClock {
 
 impl RdbClock {
     fn now(port: u16) -> Self {
-        let now = crate::clock::now();
-        let unix = crate::table::unix_now();
+        let (now, unix) = crate::clock::now_pair();
         RdbClock {
             keep_expired: crate::replication::snapshots_keep_expired(port),
             now,

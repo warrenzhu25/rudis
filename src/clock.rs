@@ -22,6 +22,36 @@ pub fn system_now() -> SystemTime {
     FROZEN.get().map_or_else(SystemTime::now, |f| f.1)
 }
 
+/// `now()` and the Unix time (`system_now()` since the epoch) of the same
+/// moment, to convert deadlines between the two clocks. Read one after the
+/// other, the two can be apart by however long the thread was preempted in
+/// between, and an absolute deadline converted in with one pair and out
+/// with another came back a millisecond off (HPEXPIREAT, then
+/// HPEXPIRETIME). This reads the monotonic clock on both sides of the
+/// system clock, retrying until they are close, and takes their midpoint.
+pub fn now_pair() -> (Instant, std::time::Duration) {
+    use std::time::{Duration, UNIX_EPOCH};
+    let since_epoch = |s: SystemTime| s.duration_since(UNIX_EPOCH).unwrap_or_default();
+    if let Some((i, s)) = FROZEN.get() {
+        return (i, since_epoch(s));
+    }
+    let mut best: Option<(Duration, Instant, SystemTime)> = None;
+    for _ in 0..4 {
+        let a = Instant::now();
+        let s = SystemTime::now();
+        let b = Instant::now();
+        let gap = b - a;
+        if best.is_none_or(|(g, _, _)| gap < g) {
+            best = Some((gap, a + gap / 2, s));
+        }
+        if gap < Duration::from_micros(20) {
+            break;
+        }
+    }
+    let (_, i, s) = best.expect("sampled at least once");
+    (i, since_epoch(s))
+}
+
 /// The current time, to freeze a script at.
 pub fn snapshot() -> (Instant, SystemTime) {
     (Instant::now(), SystemTime::now())

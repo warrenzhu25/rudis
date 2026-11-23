@@ -6900,8 +6900,7 @@ impl RudisTable {
             _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
         }
 
-        let now = crate::clock::now();
-        let now_unix = unix_now();
+        let (now, now_unix) = crate::clock::now_pair();
         // An absolute time converts from nanoseconds: truncating the clock
         // to milliseconds first stored it up to 1 ms early, and
         // HPEXPIRETIME read it back off by one.
@@ -7019,8 +7018,7 @@ impl RudisTable {
             _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
         }
 
-        let now = crate::clock::now();
-        let now_unix = unix_now();
+        let (now, now_unix) = crate::clock::now_pair();
         let mut results = Vec::with_capacity(fields.len());
 
         for f in fields {
@@ -15666,8 +15664,7 @@ impl RudisTable {
     }
 
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
-        let now = crate::clock::now();
-        let now_unix = unix_now();
+        let (now, now_unix) = crate::clock::now_pair();
 
         // Cursor positions cover every segment; see `keys`.
         for cur in 0..self.table.cursor_bound() {
@@ -15714,7 +15711,7 @@ impl RudisTable {
     }
 
     pub fn restore_rdb_chunk(&mut self, mut data: &[u8]) -> Result<(), &'static str> {
-        let (now, unix_ns) = (crate::clock::now(), unix_now());
+        let (now, unix_ns) = crate::clock::now_pair();
         let unix_now = unix_ns.as_millis() as u64;
 
         while !data.is_empty() {
@@ -17168,7 +17165,7 @@ fn load_legacy_records(
     shard_id: usize,
     num_shards: usize,
 ) -> (usize, bool, usize) {
-    let (now, unix_ns) = (crate::clock::now(), unix_now());
+    let (now, unix_ns) = crate::clock::now_pair();
     let unix_now = unix_ns.as_millis() as u64;
 
     let mut cursor = start;
@@ -17730,7 +17727,7 @@ mod tests {
             // One clock sample for both ways: two samples of the monotonic
             // and the wall clock drift apart by up to a millisecond between
             // them (this failed once in CI by 1 ms).
-            let (now, unix) = (crate::clock::now(), unix_now());
+            let (now, unix) = crate::clock::now_pair();
             let at = unix_ms_to_instant(ms, now, unix);
             assert_eq!(instant_to_unix_ms(at, now, unix), ms);
         }

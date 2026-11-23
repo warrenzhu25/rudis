@@ -4959,8 +4959,7 @@ fn write_canonical_aof(
 ) -> std::io::Result<usize> {
     use std::io::Write;
     let mut count = 0;
-    let now = std::time::Instant::now();
-    let unix_now = crate::table::unix_now();
+    let (now, unix_now) = crate::clock::now_pair();
 
     let orig_db = db.current_db;
     let max_db = db.max_db_len();
