@@ -103,10 +103,15 @@ pub fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudi
             .expect("Failed to spawn test shard");
     }
 
-    // Wait until server is listening and accepting connections
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Wait until the server accepts connections and has loaded its AOF: a
+    // command sent while it loads gets -LOADING, which a busy host made
+    // long enough for tests to hit.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
-        if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+        if let Ok(mut c) = TcpStream::connect(format!("127.0.0.1:{}", port))
+            && c.set_read_timeout(Some(Duration::from_secs(5))).is_ok()
+            && resp_cmd(&mut c, &["INFO", "persistence"]).contains("loading:0")
+        {
             break;
         }
         thread::sleep(Duration::from_millis(20));
