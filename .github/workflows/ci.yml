@@ -234,7 +234,8 @@ jobs:
         run: |
           # Only failures: GitHub shows 10 annotations per step, and each
           # passing suite's "Failed: 0 ()" line used to fill them first.
-          grep -E '\[(err|exception|TIMEOUT)\]|Failed: [1-9]|Killing still running' /tmp/rudis_tcl_suites.log \
+          # -A1: the line after an [err] says what was expected.
+          grep -E -A1 '^\[(err|exception|TIMEOUT)\]' /tmp/rudis_tcl_suites.log | grep -v '^--$' \
             | head -10 | while IFS= read -r line; do echo "::error title=TCL::${line}"; done
 
       - name: Upload server log on failure
