@@ -52,7 +52,11 @@ jobs:
         run: |
           set -o pipefail
           cargo +nightly fuzz build 2>&1 | tee build.log || {
-            grep -E '^error' -A 3 build.log | head -n 10 | while IFS= read -r l; do echo "::error title=fuzz build::$l"; done
+            # Without the color codes (CARGO_TERM_COLOR is always), which
+            # hid every error line from this grep; an OOM-killed rustc shows
+            # as a signal.
+            sed 's/\x1b\[[0-9;]*m//g' build.log | grep -E -A 3 '^error|Killed|signal: 9' \
+              | head -n 10 | while IFS= read -r l; do echo "::error title=fuzz build::$l"; done
             exit 1
           }
 
