@@ -63,6 +63,14 @@ jobs:
       - name: Run Cross-Thread Integration Tests
         run: cargo test --test test_cross_thread
 
+      # TLS clients, adversarial parser input, cross-shard overload, and
+      # RDB/DUMP compatibility with Valkey (skipped where it is not installed).
+      - name: Run the other integration tests
+        run: >-
+          cargo test --test test_tls_e2e --test test_fuzz_parsers
+          --test test_resilience_chaos --test test_redis_rdb_compat
+          -- --test-threads=1
+
       - name: Run End-to-End Integration Tests (serial)
         run: |
           set -o pipefail

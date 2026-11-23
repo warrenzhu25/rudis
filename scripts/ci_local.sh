@@ -167,14 +167,14 @@ build_coverage() (
 lane_release() {
     export MONOIO_FORCE_LEGACY_DRIVER=0
     step "release unit, cross-thread and e2e tests (io_uring)" \
-        run_tests "$LOGS/ci_$SHA.release-tests" '/(rudis|test_cross_thread|e2e_[a-z_]+)-[0-9a-f]+$' 3
+        run_tests "$LOGS/ci_$SHA.release-tests" '/(rudis|test_[a-z_]+|e2e_[a-z_]+)-[0-9a-f]+$' 3
 }
 
 # Lane: the debug build, instrumented, on the legacy driver; then the report.
 lane_coverage() {
     cov_env
     step "debug unit, cross-thread and e2e tests (legacy driver, coverage)" \
-        run_tests "$LOGS/ci_$SHA.cov-tests" '/(rudis|test_cross_thread|e2e_[a-z_]+)-[0-9a-f]+$' 3
+        run_tests "$LOGS/ci_$SHA.cov-tests" '/(rudis|test_[a-z_]+|e2e_[a-z_]+)-[0-9a-f]+$' 3
     step "coverage report" bash -c 'cargo llvm-cov report --lcov --output-path coverage.lcov &&
         { cargo llvm-cov report; echo; cargo llvm-cov report --text; } > coverage.txt &&
         cargo llvm-cov report && python3 scripts/command_coverage.py --details'
