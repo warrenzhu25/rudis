@@ -92,7 +92,13 @@ jobs:
 
       - name: Generate Code Coverage & Step Summary
         run: |
-          ./scripts/generate_coverage.sh
+          set -o pipefail
+          ./scripts/generate_coverage.sh 2>&1 | tee coverage.log || {
+            # The instrumented test runs: annotate which test failed.
+            grep -E -A3 "panicked at|^test .* FAILED$" coverage.log | grep -v '^--$' | head -n 10 \
+              | while IFS= read -r line; do echo "::error title=coverage test::$line"; done
+            exit 1
+          }
           if [ -n "$GITHUB_STEP_SUMMARY" ]; then
             echo "### Code Coverage Report" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -243,8 +249,11 @@ jobs:
           # Only failures: GitHub shows 10 annotations per step, and each
           # passing suite's "Failed: 0 ()" line used to fill them first.
           # -A1: the line after an [err] says what was expected.
-          grep -E -A1 '^\[(err|exception|TIMEOUT)\]' /tmp/rudis_tcl_suites.log | grep -v '^--$' \
-            | head -8 | while IFS= read -r line; do echo "::error title=TCL::${line}"; done
+          grep -E -A1 '^\[(err|exception)\]' /tmp/rudis_tcl_suites.log | grep -v '^--$' \
+            | head -6 | while IFS= read -r line; do echo "::error title=TCL::${line}"; done
+          # After a [TIMEOUT], the clients state report names the test that hung.
+          grep -E -A4 '^\[TIMEOUT\]' /tmp/rudis_tcl_suites.log | grep -v '^--$' | head -n 5 \
+            | while IFS= read -r line; do echo "::error title=TCL timeout::${line}"; done
           # Which suite and test were running (a [TIMEOUT] names neither).
           last=$(grep -E '^Testing |^\[(ok|err|skip)\]' /tmp/rudis_tcl_suites.log | tail -n 3 | tr '\n' ' ')
           echo "::error title=TCL last tests::${last}"
