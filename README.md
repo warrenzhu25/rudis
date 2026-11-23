@@ -59,9 +59,12 @@ container's seccomp profile.
 
 ## How it's tested
 
-- **Redis's own test suite.** CI runs 81 of the Redis/Valkey TCL test suites (data types,
-  scripting, ACLs, replication, persistence, cluster, client eviction, ...). The few tests that
-  don't apply to Rudis are skipped, each [with its reason](scripts/tcl_skips/).
+- **Redis's own test suite.** 81 of the Redis/Valkey TCL test suites (data types, scripting,
+  ACLs, replication, persistence, cluster, client eviction, ...) gate every merge, run by
+  [`scripts/ci_local.sh`](scripts/ci_local.sh) on a dedicated host. GitHub Actions runs the core
+  suites on every push and the timing-heavy rest nightly, since a shared 4-vCPU runner makes
+  timing assertions flaky. The few tests that don't apply to Rudis are skipped, each
+  [with its reason](scripts/tcl_skips/).
 - **Chaos soak on every change to `main`.** A 6-node cluster takes steady load for 6 h segments
   while failovers, live resharding, `kill -9` restarts and snapshots happen under it. Each
   segment checks that no acknowledged write was lost and that every replica matches its master
