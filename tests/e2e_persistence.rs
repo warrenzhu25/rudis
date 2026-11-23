@@ -4645,9 +4645,13 @@ fn test_bgrewriteaof_does_not_block_on_other_dbs_e2e() {
     }
     eprintln!("live rewrite (DB 1): {i} write rounds, worst command {worst:?}");
     assert!(i > 40, "writes during the rewrite: {i}");
+    // 100 ms in a release build. An unoptimized build on a small host (a
+    // 4-vCPU GitHub runner) took 148 ms, still far from the whole-DB stall
+    // (seconds for these 1M keys) this test guards against.
+    let limit = Duration::from_millis(if cfg!(debug_assertions) { 500 } else { 100 });
     assert!(
-        worst < Duration::from_millis(100),
-        "a command took {worst:?} during the rewrite"
+        worst < limit,
+        "a command took {worst:?} during the rewrite (limit {limit:?})"
     );
     let digest = send_and_read_reply(&mut c, b"DEBUG DIGEST\r\n");
     let probe = b"CMS.QUERY cms7 x\r\n";
