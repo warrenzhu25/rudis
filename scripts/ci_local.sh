@@ -9,6 +9,12 @@
 #       test targets build, and the perf A/B against its parent when it
 #       changes src/; then full CI on <tip>
 #
+# Full CI lints and builds everything first, one step at a time, then runs
+# the test groups at the same time in lanes, each on its own physical cores
+# and in its own network namespace (see lane() below): release e2e on
+# io_uring; the debug e2e on the legacy driver, instrumented for coverage;
+# and three lanes of Redis TCL suites. Each step's time is logged.
+#
 # CI_ALLOW_NOISY=1 passes --allow-noisy to the perf A/B: on a host too
 # noisy for a perf verdict, the series still checks every commit's build,
 # lint and tests. The perf verdict is then still owed: rerun the A/B for
@@ -40,20 +46,158 @@ checkout() { # rev
     fi
 }
 
-# Runs a step, logging to $LOG; on failure shows the tail and exits 1.
+# Runs a step, logging to $LOG, and prints how long it took; on failure
+# shows the tail and exits 1 (inside a lane, only that lane's subshell).
 step() { # name, command...
-    local name="$1"; shift
-    printf '== %s\n' "$name" | tee -a "$LOG"
+    local name="$1" t=$SECONDS; shift
+    printf '== %s%s\n' "${LANE:+[$LANE] }" "$name" | tee -a "$LOG"
     if ! "$@" >> "$LOG" 2>&1; then
         tail -60 "$LOG"
-        echo "CI FAILED at: $name ($SHA)" >&2
+        echo "CI FAILED at: ${LANE:+[$LANE] }$name ($SHA, $((SECONDS - t))s)" >&2
+        exit 1
+    fi
+    printf '   %s%s: %ds\n' "${LANE:+[$LANE] }" "$name" "$((SECONDS - t))" | tee -a "$LOG"
+}
+
+# Runs a shell snippet in a private network namespace (loopback only), so
+# fixed test ports never clash with anything else on the host, nor with the
+# other lanes.
+netns() { unshare -rn bash -c "ip link set lo up && $*"; }
+
+# The test executables `cargo test --no-run $@` builds, one path per line,
+# longest-running first (so a worker pool finishes them soonest).
+test_executables() { # cargo test args...
+    cargo test --no-run --message-format=json "$@" 2>/dev/null | python3 -c '
+import json, os, sys
+order = ["e2e_replication", "e2e_persistence", "e2e_memory", "e2e_commands", "e2e_cluster"]
+exes = []
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    if m.get("reason") == "compiler-artifact" and m.get("profile", {}).get("test") and m.get("executable"):
+        exes.append(m["executable"])
+def rank(e):
+    n = os.path.basename(e).rsplit("-", 1)[0]
+    return order.index(n) if n in order else len(order)
+print("\n".join(sorted(set(exes), key=rank)))
+'
+}
+
+# Runs test executables (paths in $1 matching $2) with $3 at a time, each in
+# its own network namespace, logging each to its own file. Fails if any
+# fails, with that log's tail.
+run_tests() { # list-file, regex, workers
+    local list="$1" re="$2" workers="$3" exe name rc=0
+    local -A pid_name=()
+    while read -r exe; do
+        [ -n "$exe" ] || continue
+        while [ "$(jobs -rp | wc -l)" -ge "$workers" ]; do wait -n || true; done
+        name="$(basename "$exe")"
+        # Serial inside an e2e binary (fixed ports); unit tests in parallel.
+        local args=""
+        case "$name" in e2e_*) args="--test-threads=1" ;; esac
+        (cd "$WT" && netns "'$exe' $args") > "$LOGS/ci_$SHA.${LANE:-}.$name.log" 2>&1 &
+        pid_name[$!]="$name"
+    done < <(grep -E "$re" "$list")
+    for pid in "${!pid_name[@]}"; do
+        name="${pid_name[$pid]}"
+        if wait "$pid"; then
+            grep -h "^test result" "$LOGS/ci_$SHA.${LANE:-}.$name.log" | sed "s/^/   $name: /"
+        else
+            echo "   FAILED: $name"
+            tail -40 "$LOGS/ci_$SHA.${LANE:-}.$name.log"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+# Lanes: test groups that run at the same time, each pinned to its own
+# physical cores (with their SMT siblings: vCPU i and i+32 share a core on
+# this 32-core / 64-vCPU host), in its own network namespace and with its
+# own copy of the TCL tree. Everything is built before they start, so no
+# compile competes with their timing-sensitive tests.
+LANE_PIDS=()
+LANE_NAMES=()
+lane() { # name, cpus, function
+    local name="$1" cpus="$2" fn="$3"
+    (
+        taskset -pc "$cpus" "$BASHPID" > /dev/null
+        LANE="$name"
+        LOG="$LOGS/ci_$SHA.$name.log"
+        : > "$LOG"
+        "$fn"
+    ) &
+    LANE_PIDS+=("$!")
+    LANE_NAMES+=("$name")
+}
+wait_lanes() {
+    local i failed=""
+    for i in "${!LANE_PIDS[@]}"; do
+        wait "${LANE_PIDS[$i]}" || failed="$failed ${LANE_NAMES[$i]}"
+    done
+    LANE_PIDS=()
+    LANE_NAMES=()
+    if [ -n "$failed" ]; then
+        echo "CI FAILED in lanes:$failed ($SHA; logs: $LOGS/ci_$SHA.<lane>.log)" >&2
         exit 1
     fi
 }
 
-# Runs a shell snippet in a private network namespace (loopback only), so
-# fixed test ports never clash with anything else on the host.
-netns() { unshare -rn bash -c "ip link set lo up && $*"; }
+# Coverage instruments the debug build in target/ (cargo-llvm-cov's
+# show-env): the coverage lane's run is also the debug, legacy-driver pass.
+cov_env() {
+    eval "$(cargo llvm-cov show-env --sh 2> /dev/null)"
+    export MONOIO_FORCE_LEGACY_DRIVER=1
+}
+
+build_release_tests() {
+    test_executables --release --lib --tests > "$LOGS/ci_$SHA.release-tests"
+}
+build_coverage() (
+    cargo llvm-cov clean --workspace
+    cov_env
+    cargo build
+    test_executables --lib --tests > "$LOGS/ci_$SHA.cov-tests"
+)
+
+# Lane: release build on the io_uring driver, as production runs.
+lane_release() {
+    export MONOIO_FORCE_LEGACY_DRIVER=0
+    step "release unit, cross-thread and e2e tests (io_uring)" \
+        run_tests "$LOGS/ci_$SHA.release-tests" '/(rudis|test_cross_thread|e2e_[a-z_]+)-[0-9a-f]+$' 3
+}
+
+# Lane: the debug build, instrumented, on the legacy driver; then the report.
+lane_coverage() {
+    cov_env
+    step "debug unit, cross-thread and e2e tests (legacy driver, coverage)" \
+        run_tests "$LOGS/ci_$SHA.cov-tests" '/(rudis|test_cross_thread|e2e_[a-z_]+)-[0-9a-f]+$' 3
+    step "coverage report" bash -c 'cargo llvm-cov report --lcov --output-path coverage.lcov &&
+        { cargo llvm-cov report; echo; cargo llvm-cov report --text; } > coverage.txt &&
+        cargo llvm-cov report && python3 scripts/command_coverage.py --details'
+}
+
+TCL_REPL="integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown,integration/replication-3,integration/replication-4,integration/psync2-reg"
+TCL_PERSIST="unit/aofrw,unit/client-eviction,integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load,integration/rdb,integration/corrupt-dump,integration/corrupt-dump-fuzzer,unit/wait,unit/violations,integration/logging"
+TCL_CLUSTER="unit/cluster/failure-marking,unit/cluster/internal-secret,unit/cluster/multi-slot-operations,unit/cluster/misc,unit/cluster/scripting,unit/cluster/sharded-pubsub,unit/cluster/slot-ownership,unit/cluster/replica-migration,unit/cluster/human-announced-nodename,integration/dismiss-mem"
+
+lane_tcl_core() {
+    export RUDIS_TCL_DIR="$WT/target/tcl-core"
+    step "TCL core suites" netns "SKIP_BUILD=1 bash scripts/run_redis_test_suite.sh 16379 all"
+}
+lane_tcl_repl() {
+    export RUDIS_TCL_DIR="$WT/target/tcl-repl"
+    step "TCL replication integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh $TCL_REPL"
+}
+lane_tcl_persist_cluster() {
+    export RUDIS_TCL_DIR="$WT/target/tcl-persist"
+    step "TCL persistence integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh $TCL_PERSIST"
+    export RUDIS_TCL_DIR="$WT/target/tcl-cluster"
+    step "TCL cluster integration suites" netns "RUDIS_THREADS=1 SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh $TCL_CLUSTER"
+}
 
 full_ci() { # rev
     SHA="$(git -C "$REPO" rev-parse --short "$1")"
@@ -62,28 +206,27 @@ full_ci() { # rev
     checkout "$SHA"
     cd "$WT"
     echo "CI for $SHA (log: $LOG)"
-    # Job build_and_test, and gate.sh's both-driver e2e passes (debug).
-    step "gate.sh (no perf)" env GATE_SKIP_PERF=1 scripts/gate.sh
+    local t0=$SECONDS
+    # Lint, the quick checks that build differently, and every build the
+    # lanes need, one at a time.
+    step "cargo fmt --check" cargo fmt --check
+    step "clippy" cargo clippy --all-targets -- -D warnings
+    step "clippy (no default features)" cargo clippy --all-targets --no-default-features -- -D warnings
     step "unit tests, no default features" \
         env MONOIO_FORCE_LEGACY_DRIVER=1 cargo test --lib --no-default-features
-    # Job io_uring_tests: release builds on the io_uring driver.
-    step "release unit tests (io_uring)" \
-        env MONOIO_FORCE_LEGACY_DRIVER=0 cargo test --release --lib
-    step "release cross-thread (io_uring)" \
-        env MONOIO_FORCE_LEGACY_DRIVER=0 cargo test --release --test test_cross_thread
-    step "release e2e (io_uring)" env MONOIO_FORCE_LEGACY_DRIVER=0 \
-        unshare -rn bash -c "ip link set lo up && cargo test --release --test 'e2e_*' -- --test-threads=1"
-    # Job redis_tcl_suites.
-    step "release build" cargo build --release
-    step "TCL core suites" netns "SKIP_BUILD=1 bash scripts/run_redis_test_suite.sh 16379 all"
-    step "TCL replication integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown,integration/replication-3,integration/replication-4,integration/psync2-reg"
-    step "TCL persistence integration suites" netns "SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh unit/aofrw,unit/client-eviction,integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load,integration/rdb,integration/corrupt-dump,integration/corrupt-dump-fuzzer,unit/wait,unit/violations,integration/logging"
-    step "TCL cluster integration suites" netns "RUDIS_THREADS=1 SKIP_BUILD=1 bash scripts/run_redis_integration_suite.sh unit/cluster/failure-marking,unit/cluster/internal-secret,unit/cluster/multi-slot-operations,unit/cluster/misc,unit/cluster/scripting,unit/cluster/sharded-pubsub,unit/cluster/slot-ownership,unit/cluster/replica-migration,unit/cluster/human-announced-nodename,integration/dismiss-mem"
-    # Job supply_chain.
+    step "redis rdb compat tests" cargo test --test test_redis_rdb_compat
     step "cargo deny check" cargo deny check
-    # The coverage step of build_and_test re-runs the tests instrumented.
-    step "coverage" netns "./scripts/generate_coverage.sh"
-    echo "CI PASSED ($SHA)" | tee -a "$LOG"
+    step "release build" cargo build --release
+    step "release test build" build_release_tests
+    step "coverage build" build_coverage
+    # The test groups, at the same time.
+    lane release 0-5,32-37 lane_release
+    lane coverage 6-11,38-43 lane_coverage
+    lane tcl-core 12-17,44-49 lane_tcl_core
+    lane tcl-repl 18-23,50-55 lane_tcl_repl
+    lane tcl-persist-cluster 24-31,56-63 lane_tcl_persist_cluster
+    wait_lanes
+    echo "CI PASSED ($SHA, $((SECONDS - t0))s)" | tee -a "$LOG"
 }
 
 commit_checks() { # sha
