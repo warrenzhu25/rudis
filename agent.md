@@ -84,43 +84,20 @@ Every commit to `main` must strictly adhere to the following four rules:
     * `docs(scope):` documentation and benchmark records
 
 ### Rule 4: Every Commit Must Pass CI Before Push
-* **Every commit must pass the full CI quality gate before pushing to `origin main`**:
-  Under no circumstances should an unverified commit or failing test ever be pushed. The entire CI check suite matching `.github/workflows/ci.yml` must be executed and pass with zero failures and zero warnings:
-  ```bash
-  # 1. Check code formatting
-  cargo fmt --check
+* **Before pushing, run `scripts/ci_local.sh --series origin/main HEAD`** and push only after it exits 0. It picks the checks by what the series changes (`origin/main..HEAD`), from the cheapest tier that covers it:
 
-  # 2. Run Clippy linter with zero warnings tolerated
-  cargo clippy --all-targets -- -D warnings
+  | The series changes | What runs | Time |
+  | :--- | :--- | ---: |
+  | only docs (`*.md`, `docs/`, `LICENSE`) | nothing: they can't break a build or a test | 0 |
+  | only `.github/` workflows | the workflow files parse as YAML | seconds |
+  | anything else (tests, scripts, configs, `Cargo.*`) | per commit: fmt, clippy (both feature sets), unit tests, test targets build; then full CI on the tip | ~16 min |
+  | `src/` | as above, plus the perf A/B against the parent for each commit that changes `src/` | ~17–20 min |
 
-  # 3. Run all unit tests
-  cargo test --lib
-
-  # 4. Run cross-thread integration tests
-  cargo test --test test_cross_thread
-
-  # 5. Run end-to-end integration tests (serial), then again on the io_uring
-  #    driver production uses (the first pass runs servers on monoio's legacy
-  #    epoll driver)
-  cargo test --test 'e2e_*' -- --test-threads=1
-  MONOIO_FORCE_LEGACY_DRIVER=0 cargo test --test 'e2e_*' -- --test-threads=1
-
-  # 6. Live throughput regression check on this host: this build vs HEAD (the
-  #    baseline commit is built once and cached), measured back to back in
-  #    alternating launches after waiting for a quiet host. Fails below -5%.
-  #    Without --memtier the script only re-reads stored numbers and tests nothing.
-  cargo build --release && python3 scripts/check_perf_regression.py --memtier --baseline-rev HEAD
-  ```
-  **Run it as `scripts/gate.sh`**, which executes exactly these steps (plus `cargo test --test test_redis_rdb_compat`) under `set -euo pipefail`, so no step's failure can be masked by piping its output (a `clippy ... | tail` once hid a clippy error), and also runs `scripts/miri_smallhash.sh` / `scripts/miri_compact.sh` when `src/smallhash.rs` / `src/compact.rs` changed (their `unsafe` code is checked under Miri).
-  If the perf A/B reports **INCONCLUSIVE**, the host was too noisy (CV > 8% after the extra rounds) or too slow (baseline build under 75% of `docs/benchmarks/results/benchmark_live_baseline.json`) to tell a regression from noise: rerun later; do not push on `--allow-noisy` unless the change cannot affect performance.
-  Without `--baseline-rev`, `--memtier` compares against the fixed numbers in `docs/benchmarks/results/benchmark_live_baseline.json`, which drift with the host; prefer the A/B. Update that file only deliberately (`--memtier --update-baseline`, in its own commit), never to make a failing gate pass.
-* **Before pushing a series, run `scripts/ci_local.sh --series origin/main HEAD`.** `gate.sh` covers the commit being made; GitHub's CI (`.github/workflows/ci.yml`) also runs release builds on io_uring, the Redis TCL suites, `cargo deny` and coverage, on the pushed head only. `ci_local.sh` checks every commit of the series (fmt, clippy, unit tests, perf A/B) and runs all of CI's jobs on the tip, on a clean worktree under `target/`. It never pushes: push only after it exits 0, and keep the host quiet while it runs (builds or benchmarks alongside it have failed timing-sensitive tests).
-* **Immediate Push Upon Green CI**:
-  Once the CI suite passes cleanly, the commit must be pushed immediately to `origin main`:
-  ```bash
-  git push origin main
-  ```
-* Never leave completed commits unpushed, and never push without verifying the full CI suite. Local `main` and `origin/main` must remain synchronized and green at all times.
+  Full CI lints and builds everything, then runs the test groups in parallel lanes on separate cores: the release unit/integration/e2e tests on io_uring, the debug pass on the legacy driver with coverage, and the Redis TCL suites (core, replication, persistence, cluster). `CI_FULL=1` forces the full tier whatever changed.
+* **Perf**: the A/B (`scripts/check_perf_regression.py --memtier --baseline-rev <rev>`) fails below -5%. If it reports **INCONCLUSIVE** (host too noisy or too slow to tell a regression from noise), rerun later; `CI_ALLOW_NOISY=1` lets a series continue past noise only when a strict A/B of the tip against `origin/main` passes before the push. Update `docs/benchmarks/results/benchmark_live_baseline.json` only deliberately, in its own commit.
+* `scripts/gate.sh` remains the quick pre-commit check for the commit at hand (fmt, clippy, unit and e2e tests, Miri for `src/smallhash.rs` / `src/compact.rs` when they change, perf A/B vs `HEAD`).
+* GitHub Actions runs the hosted-runner-safe subset on every push (`ci.yml`) and the timing-heavy rest nightly (`extended.yml`); a red run there is a bug to fix like any other.
+* **Push right after CI is green** (`git push origin <sha>:main`). Never leave completed commits unpushed. Keep the host quiet while CI runs, and never edit `scripts/ci_local.sh` while it runs (bash reads the script as it goes).
 
 
 ---
