@@ -6807,8 +6807,10 @@ fn test_restarted_master_releases_an_unused_backlog_e2e() {
         "--no-pin",
         "--dir",
         &md,
+        // The restart grace (at most this TTL) runs from startup: 3 s was
+        // used up before the first INFO by a coverage-instrumented build.
         "--repl-backlog-ttl",
-        "3",
+        "10",
     ];
     let rs = rport.to_string();
     let mut master = spawn_rudis_listening(&margs, mport);
@@ -6873,7 +6875,7 @@ fn test_restarted_master_releases_an_unused_backlog_e2e() {
     wait_value(&mut connect(rport), "$1\r\n2\r\n");
     // Back after the grace: the backlog was released; full sync.
     let mut m = restart(&mut master, &|m| {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while stat(m, "repl_backlog_active") != "0" {
             assert!(
                 std::time::Instant::now() < deadline,
