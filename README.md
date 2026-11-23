@@ -1,44 +1,70 @@
 # Rudis
 
 <p align="center">
-  <b>A shared-nothing, thread-per-core, Redis- and Memcached-compatible in-memory datastore in Rust</b><br>
-  Built on Linux <code>io_uring</code> via the <a href="https://github.com/bytedance/monoio">Monoio</a> runtime
+  <b>A thread-per-core, Redis-compatible in-memory database in Rust, built on Linux <code>io_uring</code>.</b>
 </p>
 
 <p align="center">
-  <a href="https://github.com/warrenzhu25/rudis/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status"></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.99-blue.svg" alt="Rust Version"></a>
-  <a href="https://kernel.dk/io_uring.pdf"><img src="https://img.shields.io/badge/Linux-io__uring-orange.svg" alt="Linux io_uring"></a>
+  <a href="https://github.com/warrenzhu25/rudis/actions/workflows/ci.yml"><img src="https://github.com/warrenzhu25/rudis/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/rust-1.99-orange.svg" alt="Rust 1.99"></a>
 </p>
 
-[Architecture Overview](#architecture-overview) • [Benchmarks](#benchmarks) • [Quick Start](#quick-start) • [Configuration](#configuration) • [Production Deployment](#production-deployment) • [Design Decisions](#design-decisions) • [Feature Matrix](#subsystem--feature-matrix) • [Documentation](docs/)
+Rudis speaks the Redis protocol (RESP2 and RESP3) and Redis Cluster, so existing Redis clients,
+`redis-cli` and cluster tooling work unchanged. Each core owns a shard of the keyspace and runs
+its own `io_uring` event loop: no global lock and no shared hash table on the request path.
 
----
+> [!NOTE]
+> Rudis is young (0.x) and maintained by one person. The core Redis feature set below is tested
+> hard (see [How it's tested](#how-its-tested)), but it is not yet a drop-in production
+> replacement for Redis. [What's implemented, partial or experimental](#subsystem--feature-matrix)
+> is listed explicitly.
 
-## What Rudis Is
+## Highlights
 
-**Rudis** (crate name `rudis`, currently at version `0.1.0`) is an experimental, from-scratch
-Rust implementation of a Redis/Memcached-compatible in-memory datastore, built around a
-**shared-nothing, thread-per-core** execution model on Linux `io_uring` (via the `monoio`
-async runtime), in the tradition of engines such as ScyllaDB (Seastar) and Dragonfly.
+- **Thread-per-core, shared-nothing.** Keys are partitioned across cores; a request for a key on
+  another core crosses a lock-free per-core-pair ring. Connections are spread by the kernel
+  (`SO_REUSEPORT`).
+- **Redis where it matters.** Strings, hashes, lists, sets, sorted sets, streams and consumer
+  groups, bitmaps, HyperLogLog, geo; `MULTI`/`EXEC`, Lua scripting and functions, pub/sub
+  (including sharded), ACLs, client-side caching, keyspace notifications, `maxmemory` eviction
+  and client eviction.
+- **Persistence and HA.** RDB snapshots without `fork()`, AOF, `PSYNC` replication, and Redis
+  Cluster with gossip, automatic failover and live resharding.
+- **Memcached text protocol** on the same port, sharing the keyspace.
+- **Optional extras**, off by default: JSON, search and vector search, probabilistic types and
+  NVMe tiering.
 
-It speaks the **Redis wire protocol (RESP2, plus RESP3 reply encoding negotiated via
-`HELLO 3`)** and a **Memcached text-protocol gateway** on the same TCP port, so most existing
-Redis and Memcached client libraries can connect without modification. The `Command` enum in
-[`src/resp.rs`](src/resp.rs) currently defines over 330 top-level command variants — strings,
-hashes, lists, sets, sorted sets, streams, transactions, pub/sub, scripting, JSON, search,
-vector search, AI-native agent memory/checkpoints/quotas, Model Context Protocol (MCP), semantic
-caching, probabilistic structures, geospatial commands, cluster/replication/ACL
-administration, and a Memcached command subset — plus nested subcommand enums (`ACL`,
-`CLUSTER`, `CLIENT`, `MEMORY`, and others) that expand the effective surface further. See
-[Subsystem & Feature Matrix](#subsystem--feature-matrix) below for what is implemented, and
-what is still partial or experimental.
+## Quick start
 
-This is a young, single-maintainer project, not a drop-in production replacement for Redis or
-Dragonfly. Several subsystems described in this README and in `docs/` are real and load-bearing;
-a few others (kernel-bypass networking, automatic multi-region CRDT sync)
-exist as working building blocks that are **not yet wired onto the live request path** — those
-are called out explicitly rather than left implicit, both here and in the linked subsystem docs.
+Linux only (`io_uring`). The Rust toolchain version is pinned in
+`rust-toolchain.toml`, and `rustup` installs it on first use.
+
+```bash
+git clone https://github.com/warrenzhu25/rudis.git && cd rudis
+cargo build --release
+./target/release/rudis --port 6379          # one shard per core, up to 8 by default
+
+redis-cli -p 6379 SET hello world           # any Redis client works
+redis-cli -p 6379 GET hello
+```
+
+A cluster, a replica, persistence and the other options are under [Configuration](#configuration)
+and [Production Deployment](#production-deployment).
+
+## How it's tested
+
+- **Redis's own test suite.** CI runs 81 of the Redis/Valkey TCL test suites (data types,
+  scripting, ACLs, replication, persistence, cluster, client eviction, ...). The few tests that
+  don't apply to Rudis are skipped, each [with its reason](scripts/tcl_skips/).
+- **Chaos soak on every change to `main`.** A 6-node cluster takes steady load for 6 h segments
+  while failovers, live resharding, `kill -9` restarts and snapshots happen under it. Each
+  segment checks that no acknowledged write was lost and that every replica matches its master
+  ([`scripts/soak_cluster.py`](scripts/soak_cluster.py)).
+- **A performance gate on every commit.** An A/B run of `memtier_benchmark` against the
+  previous `main` blocks a regression.
+- **Fuzzing** of every untrusted input: the RESP parser, `RESTORE` payloads, RDB and AOF files,
+  and the cluster bus.
 
 ---
 
@@ -46,19 +72,9 @@ are called out explicitly rather than left implicit, both here and in the linked
 
 - [Architecture Overview](#architecture-overview)
 - [Benchmarks](#benchmarks)
-- [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Production Deployment](#production-deployment)
 - [Design Decisions](#design-decisions)
-  - [1. Shared-Nothing Thread-Per-Core on Linux io_uring](#1-shared-nothing-thread-per-core-on-linux-io_uring)
-  - [2. Fork-less RDB Snapshots](#2-fork-less-rdb-snapshots)
-  - [3. Redis 7 Sharded Pub/Sub & Striped Presence Bitmask](#3-redis-7-sharded-pubsub--striped-presence-bitmask)
-  - [4. RediSearch: RangeTree Indexing, Hybrid Vector Search & FT.AGGREGATE](#4-redisearch-rangetree-indexing-hybrid-vector-search--ftaggregate)
-  - [5. Replication: PSYNC and Dragonfly-Compatible DFLY FLOW](#5-replication-psync-and-dragonfly-compatible-dfly-flow)
-  - [6. NVMe Tiered Storage (SmallBins & Direct I/O)](#6-nvme-tiered-storage-smallbins--direct-io)
-  - [7. Kernel-Bypass Networking & TLS: Status](#7-kernel-bypass-networking--tls-status)
-  - [8. Dual-Protocol Engine: Redis + Memcached](#8-dual-protocol-engine-redis--memcached)
-  - [9. Agent Memory, LLM Quota, Checkpoints & MCP Server](#9-agent-memory-llm-quota-checkpoints--mcp-server)
 - [Subsystem & Feature Matrix](#subsystem--feature-matrix)
 - [Redis/Valkey TCL Compatibility Suite](#redisvalkey-tcl-compatibility-suite)
 - [Documentation & Contributor Guides](#documentation--contributor-guides)
@@ -185,74 +201,6 @@ client threads, and [`docs/benchmarks/multi_command_comparison.md`](docs/benchma
 `LPOP`, `LRANGE`, `SADD`, `SISMEMBER`, `ZADD`, `ZRANGE`, `DEL`, `EXISTS`) at 8 and 16 physical
 cores, where Rudis leads Dragonfly v1.39 on all 16 commands by **+43.9% to +210.8% (1.44x–3.11x)**
 at 16 physical cores.
-
----
-
-## Quick Start
-
-### 1. Build from Source
-
-Rudis targets Linux (for `io_uring`) and builds with the Rust toolchain pinned in
-`rust-toolchain.toml` (**Rust 1.99**; `rustup` installs it on the first `cargo` run):
-
-```bash
-git clone https://github.com/warrenzhu25/rudis.git
-cd rudis
-cargo build --release
-```
-
-For production, `cargo build --release --no-default-features` leaves out the experimental
-`MCP.*` (JSON-RPC tool calls) and `XDP.*` (AF_XDP packet path, polled on every shard)
-subsystems; their commands are then refused even with `enable-experimental-commands yes`.
-
-### 2. Run Rudis
-
-The binary is `rudis`. Its real command-line flags (from `src/main.rs`, via `clap`) are:
-
-```bash
-# Listen on the default port 6379, worker count = min(available_cores, 8)
-./target/release/rudis
-
-# Explicit port and thread (shard) count
-./target/release/rudis --port 6379 --threads 8
-
-# Load a config file, then apply CLI overrides on top of it
-./target/release/rudis -c rudis.conf --port 6380
-```
-
-> Only the flags listed in [Configuration](#configuration) below actually exist. There is
-> **no** `--dbfilename`, `--requirepass`, `--maxmemory`-as-a-plain-flag beyond what
-> is listed, `--cache_mode`, `--tiered_prefix`, or `--memcached_port` flag — those either do
-> not exist in the source at all, or are config-file-only directives (see below).
-
-### 3. Connect with `redis-cli` (RESP2 / RESP3)
-
-```bash
-redis-cli -p 6379
-127.0.0.1:6379> PING
-PONG
-127.0.0.1:6379> SET user:1 alice
-OK
-127.0.0.1:6379> GET user:1
-"alice"
-```
-
-### 4. Connect with Memcached Clients (Dual-Protocol Gateway)
-
-Rudis detects Memcached text-protocol framing on the same port and shares database 0 with the
-Redis-protocol view of the keyspace:
-
-```bash
-$ nc 127.0.0.1 6379
-set session:1 0 3600 5
-admin
-STORED
-get session:1
-VALUE session:1 0 5
-admin
-END
-quit
-```
 
 ---
 
