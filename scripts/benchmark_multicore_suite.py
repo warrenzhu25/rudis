@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Core Benchmark Suite: Rudis vs. Dragonfly v1.39 vs. Valkey 8.1 (1 to 16 Physical Cores).
+Multi-Core Benchmark Suite: Rudis vs. Dragonfly vs. Valkey (1 to 16 Physical Cores).
 
 Hardware topology on this 64-vCPU AMD EPYC 7B13 host (`lscpu -e`):
   - 32 physical cores (CORE 0..31), 2 SMT threads per core:
@@ -12,7 +12,7 @@ Hardware topology on this 64-vCPU AMD EPYC 7B13 host (`lscpu -e`):
     pinned to physical cores 16..31 (vCPUs 16-31,48-63 on CCX 2-3).
 
 Measures (3 interleaved rounds per workload, reporting medians):
-  1. Head-to-Head Comparison at 8 and 16 Physical Cores (Rudis vs. Dragonfly v1.39 vs. Valkey 8.1):
+  1. Head-to-Head Comparison at 8 and 16 Physical Cores (Rudis vs. Dragonfly vs. Valkey):
      - SET 100% (Pipeline 16, 1KB)
      - GET 100% (Pipeline 16, 1KB)
      - SET 100% Unpipelined (Pipeline 1, 1KB)
@@ -27,6 +27,7 @@ import os
 import socket
 import statistics
 import subprocess
+import re
 import time
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +35,24 @@ RUDIS_BIN = os.environ.get("RUDIS_BIN", os.path.join(REPO_DIR, "target", "releas
 DRAGONFLY_BIN = os.environ.get("DRAGONFLY_BIN", "/usr/local/google/home/warrenzhu/dragonfly")
 VALKEY_BIN = os.environ.get("VALKEY_BIN", "/usr/local/google/home/warrenzhu/valkey-stable/src/valkey-server")
 MEMTIER_BIN = os.environ.get("MEMTIER_BIN", "/usr/local/google/home/warrenzhu/memtier_benchmark/memtier_benchmark")
+
+
+
+def _bin_version(path, pattern):
+    """The version a server binary reports, for the report's labels."""
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+        out = r.stdout + r.stderr
+        m = re.search(pattern, out)
+        return m.group(1) if m else "?"
+    except (OSError, subprocess.SubprocessError):
+        return "?"
+
+
+DF_VER = _bin_version(DRAGONFLY_BIN, r"dragonfly (?:\x1b\[[\d;]*m)?(v[\w.]+)")
+VK_VER = _bin_version(VALKEY_BIN, r"v=([\d.]+)")
+DF = f"Dragonfly {DF_VER}"
+VK = f"Valkey {VK_VER}"
 
 # Disjoint physical cores (CCX 2 & 3) so server cores 0..15 (CCX 0 & 1, SMT siblings 32..47 idle)
 # experience zero SMT or L1/L2/L3 cache interference from memtier_benchmark.
@@ -380,7 +399,7 @@ def run_engine_scaling(engine="Rudis"):
 
 def generate_markdown(results, out_path):
     lines = [
-        "# Multi-Core Benchmark Report: Rudis vs. Dragonfly v1.39 vs. Valkey 8.1 (1–16 Physical Cores)",
+        f"# Multi-Core Benchmark Report: Rudis vs. {DF} vs. {VK} (1–16 Physical Cores)",
         "",
         "**Hardware Platform:** AMD EPYC 7B13 (64 logical vCPUs / 32 physical cores across 4 L3 CCXs, 128 MiB L3 cache)",
         "**Host Partitioning:** Dedicated Server Physical Cores `0-15` (CCX 0–1, SMT siblings `32-47` idle) | Dedicated Client Physical Cores `16-31` (`16-31,48-63` on CCX 2–3 — zero physical-core or L3 overlap)",
@@ -412,7 +431,7 @@ def generate_markdown(results, out_path):
             "",
             f"## {sec_idx}. Head-to-Head Comparison: {core_title}",
             "",
-            "| Workload | Rudis | Dragonfly v1.39 | Valkey 8.1 | Rudis vs. Dragonfly | Rudis p99 | Dragonfly p99 |",
+            f"| Workload | Rudis | {DF} | {VK} | Rudis vs. Dragonfly | Rudis p99 | Dragonfly p99 |",
             "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
         ])
         for wid, label in workload_order:
@@ -434,7 +453,7 @@ def generate_markdown(results, out_path):
 
     lines.extend([
         "",
-        "## 4. Physical Core Scaling Profile (1 to 16 Cores: Rudis vs. Dragonfly v1.39)",
+        f"## 4. Physical Core Scaling Profile (1 to 16 Cores: Rudis vs. {DF})",
         "",
         "### Rudis (1 to 16 Physical Cores)",
         "",
@@ -461,7 +480,7 @@ def generate_markdown(results, out_path):
     if df_scaling:
         lines.extend([
             "",
-            "### Dragonfly v1.39 (1 to 16 Physical Cores)",
+            f"### {DF} (1 to 16 Physical Cores)",
             "",
             "| Physical Cores | SET (P16, 1KB) | SET Speedup | SET p99 | GET (P16, 1KB) | GET Speedup | GET p99 |",
             "| :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
