@@ -604,7 +604,18 @@ fn main() {
     log_notice!("============================================================");
     log_notice!("  rudis v0.1.0 (Redis in Rust)");
     log_notice!("  Architecture: Multi-threaded Shared-Nothing (Thread-per-Core)");
-    log_notice!("  I/O Backend:  Linux io_uring (Monoio)");
+    // The driver monoio actually picked: it falls back to epoll where
+    // io_uring is unavailable (an old kernel, or a seccomp profile such as
+    // Docker's default blocking it), and the banner said io_uring anyway.
+    if rudis::connection::io_driver_name() == "io_uring" {
+        log_notice!("  I/O Backend:  Linux io_uring (Monoio)");
+    } else {
+        log_notice!("  I/O Backend:  epoll (Monoio legacy driver)");
+        log_warning!(
+            "io_uring is unavailable (kernel too old, disabled, or blocked by a seccomp profile \
+             such as Docker's default) or MONOIO_FORCE_LEGACY_DRIVER is set: running on epoll"
+        );
+    }
     log_notice!("  Listening:    port {} (bind {})", port, bind_display);
     if let Some(ref tls_cfg) = tls_config {
         log_notice!(
