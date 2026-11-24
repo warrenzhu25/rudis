@@ -3139,7 +3139,23 @@ impl ClusterHub {
         }
 
         let majority = (total_masters / 2) + 1;
-        if votes >= majority {
+        // While the votes came in, another replica of the same master may
+        // have won (its FAILOVER_ANNOUNCE took the master's slots, and we
+        // now follow it). Promoting ourselves then would leave a master
+        // with no slots that still replicates the winner.
+        let superseded = *self.master_id.read() != master_id
+            || self
+                .nodes
+                .read()
+                .get(&master_id)
+                .is_none_or(|m| m.slots.is_empty());
+        if votes >= majority && superseded {
+            crate::log_notice!(
+                "Cluster: won the election for epoch {} but {} was failed over meanwhile: staying a replica",
+                req_epoch,
+                master_id
+            );
+        } else if votes >= majority {
             // Won the election! End the link to the dead master and become
             // a replication master first, so whoever sees us serving the
             // slots (CLUSTER NODES/SLOTS) also finds us a master.
