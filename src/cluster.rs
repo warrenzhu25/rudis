@@ -1533,10 +1533,10 @@ impl ClusterHub {
     /// other's current slots and epoch right away instead of on the next tick.
     pub async fn refresh_peer(&self, node_id: &str) {
         let addr = match self.nodes.read().get(node_id) {
-            Some(n) => format!("{}:{}", n.ip, n.cport),
+            Some(n) => peer_addr(&n.ip, n.cport),
             None => return,
         };
-        let Ok(addr) = addr.parse::<SocketAddr>() else {
+        let Some(addr) = addr else {
             return;
         };
         let frame = self.ping_frame("");
@@ -3108,8 +3108,7 @@ impl ClusterHub {
         let mut votes = 0;
 
         for (ip, cport) in &masters {
-            let addr = format!("{}:{}", ip, cport);
-            if let Ok(parsed) = addr.parse::<SocketAddr>()
+            if let Some(parsed) = peer_addr(ip, *cport)
                 && let Ok(mut stream) = bus_dial(self.port, parsed, Duration::from_millis(500))
             {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
@@ -3728,8 +3727,42 @@ async fn bus_exchange_async(
 /// Whether `ip` may be announced or taken from a peer's announcement: an IP
 /// address (as `cluster-announce-ip` requires in Redis).
 pub fn valid_announced_ip(ip: &str) -> bool {
-    ip.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| !ip.is_unspecified())
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_unspecified(),
+        // As in Redis 8, a hostname too (peers resolve it, see `peer_addr`).
+        Err(_) => valid_hostname(ip),
+    }
+}
+
+/// The cluster-bus address of a peer announced as `host` (an IP or, with
+/// `cluster-announce-ip` set to one, a hostname) on `cport`. IPv6 needs
+/// brackets in "host:port", which formatting the two together lacked, so
+/// such a peer was never reached. A hostname resolves through the system
+/// resolver, cached for a few seconds: the heartbeat dials every peer
+/// each tick.
+pub fn peer_addr(host: &str, cport: u16) -> Option<SocketAddr> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, cport));
+    }
+    if !valid_hostname(host) || host.is_empty() {
+        return None;
+    }
+    type Cache =
+        parking_lot::Mutex<HashMap<(String, u16), (Option<SocketAddr>, std::time::Instant)>>;
+    static CACHE: std::sync::LazyLock<Cache> = std::sync::LazyLock::new(Default::default);
+    let key = (host.to_string(), cport);
+    if let Some(&(addr, at)) = CACHE.lock().get(&key)
+        && at.elapsed() < Duration::from_secs(5)
+    {
+        return addr;
+    }
+    use std::net::ToSocketAddrs;
+    let addr = (host, cport)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next());
+    CACHE.lock().insert(key, (addr, std::time::Instant::now()));
+    addr
 }
 
 /// Records what a peer's PING or PONG announced (see `announce_tokens`).
@@ -4318,7 +4351,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
     // Every peer at once (a bounded batch at a time): one slow or dead
     // peer must not delay the others' heartbeats.
     let exchange = |id: &str, ip: &str, cport: u16| -> bool {
-        let Ok(addr) = format!("{}:{}", ip, cport).parse::<SocketAddr>() else {
+        let Some(addr) = peer_addr(ip, cport) else {
             return false;
         };
         let Ok(mut stream) = bus_dial(hub.port, addr, Duration::from_millis(500)) else {
@@ -5294,6 +5327,26 @@ mod tests {
     }
 
     #[test]
+    fn test_peer_addr_takes_ipv4_ipv6_and_hostnames() {
+        assert_eq!(
+            peer_addr("10.0.0.1", 17000),
+            Some("10.0.0.1:17000".parse().unwrap())
+        );
+        // "2001:db8::1:17000" does not parse as a socket address.
+        assert_eq!(
+            peer_addr("2001:db8::1", 17000),
+            Some("[2001:db8::1]:17000".parse().unwrap())
+        );
+        let local = peer_addr("localhost", 17000).expect("localhost resolves");
+        assert!(local.ip().is_loopback() && local.port() == 17000, "{local}");
+        assert_eq!(peer_addr("bad host\n", 17000), None);
+        assert!(valid_announced_ip("redis-node-1.example.com"));
+        assert!(valid_announced_ip("2001:db8::1"));
+        assert!(!valid_announced_ip("redis-node\nnext"));
+        assert!(!valid_announced_ip("0.0.0.0"));
+    }
+
+    #[test]
     fn test_announced_address_is_what_peers_and_clients_see() {
         let hub = ClusterHub::new(7140);
         hub.cluster_enabled.store(true, Ordering::Relaxed);
@@ -5361,12 +5414,20 @@ mod tests {
             &hub,
         );
         assert_eq!(addr(&hub), ("10.3.3.3".to_string(), 27200, 27600));
-        // Not an IP address, or zero ports: ignored.
+        // Neither an IP address nor a hostname, or zero ports: ignored.
         handle_cluster_bus_line(
-            &format!("PING {peer} 1 master shards=1 ip=not-an-ip port=0 cport=0 GOSSIP "),
+            &format!("PING {peer} 1 master shards=1 ip=not_a_host port=0 cport=0 GOSSIP "),
             &hub,
         );
         assert_eq!(addr(&hub), ("10.3.3.3".to_string(), 27200, 27600));
+        // A hostname is an address too (cluster-announce-ip may be one).
+        handle_cluster_bus_line(
+            &format!(
+                "PING {peer} 1 master shards=1 ip=node-7.example.com port=27200 cport=27600 GOSSIP "
+            ),
+            &hub,
+        );
+        assert_eq!(addr(&hub), ("node-7.example.com".to_string(), 27200, 27600));
         assert!(!valid_announced_ip("0.0.0.0"));
         assert!(valid_announced_ip("::1"));
         assert!(valid_human_nodename("my-redis-node-1"));

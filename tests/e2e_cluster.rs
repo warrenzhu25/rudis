@@ -4910,7 +4910,8 @@ fn test_cluster_announce_ip_reaches_peers_and_redirects_e2e() {
         cmd(a, port, &["CONFIG", "GET", "cluster-announce-ip"]),
         format!("*2\r\n$19\r\ncluster-announce-ip\r\n$9\r\n{a}\r\n")
     );
-    assert!(cmd(a, port, &["CONFIG", "SET", "cluster-announce-ip", "nope"]).starts_with("-ERR"));
+    // Neither an IP address nor a hostname (which, as in Redis 8, it may be).
+    assert!(cmd(a, port, &["CONFIG", "SET", "cluster-announce-ip", "no_pe"]).starts_with("-ERR"));
 
     for (ip, (s, e)) in [(a, ("0", "8191")), (b, ("8192", "16383"))] {
         assert_eq!(

@@ -4268,6 +4268,11 @@ fn parse_config_bool(name: &str, val: &str) -> Result<bool, String> {
     }
 }
 
+/// Why a `cluster-announce-ip` was refused: it must be an IP address or,
+/// as in Redis 8, a hostname.
+const ANNOUNCE_IP_ERR: &str =
+    "must be an IP address or a hostname of alphanumeric characters, hyphens or dots";
+
 /// Applies one runtime-settable config parameter. Shared by `CONFIG SET`
 /// (after its own validation pass) and by config-file loading at startup.
 ///
@@ -4642,7 +4647,7 @@ pub fn apply_config_value(
         }
         "cluster-announce-ip" => {
             if !val_str.is_empty() && !crate::cluster::valid_announced_ip(val_str) {
-                return Err(format!("Invalid cluster-announce-ip '{val_str}'"));
+                return Err(ANNOUNCE_IP_ERR.to_string());
             }
             *crate::cluster::get_cluster_hub(base_port)
                 .announce_ip
@@ -5429,7 +5434,10 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
         } else if p_str == "cluster-announce-ip" {
             if !val_str.is_empty() && !crate::cluster::valid_announced_ip(&val_str) {
                 out.extend_from_slice(
-                    b"-ERR CONFIG SET failed (possibly related to argument 'cluster-announce-ip') - argument must be an IP address\r\n",
+                    format!(
+                        "-ERR CONFIG SET failed (possibly related to argument 'cluster-announce-ip') - {ANNOUNCE_IP_ERR}\r\n"
+                    )
+                    .as_bytes(),
                 );
                 return;
             }
