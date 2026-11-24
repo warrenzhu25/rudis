@@ -1804,7 +1804,8 @@ mod tests {
         let readme = fs::read_to_string("README.md").unwrap();
         assert!(readme.contains("Type=notify"));
         assert!(readme.contains("MIT License"));
-        assert!(readme.contains("EXT_TYPE_LLM_QUOTA"));
+        let experimental = fs::read_to_string("docs/experimental.md").unwrap();
+        assert!(experimental.contains("EXT_TYPE_LLM_QUOTA"));
         assert!(!readme.contains("save is not currently acted on"));
         assert!(!readme.contains("does not currently include a `LICENSE` file"));
 
