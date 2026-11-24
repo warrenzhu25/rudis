@@ -342,15 +342,22 @@ fn test_lua_publish_from_two_shards_does_not_deadlock_e2e() {
         .collect();
 
     // With nobody else publishing, a script gets the full receiver count.
+    // A SUBSCRIBE replies before the other shard learns of the subscriber,
+    // so allow the count a moment to settle.
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    assert_eq!(
-        resp_cmd(
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = resp_cmd(
             &mut c,
-            &["EVAL", "return redis.call('publish','pc','x')", "0"]
-        ),
-        ":6\r\n"
-    );
+            &["EVAL", "return redis.call('publish','pc','x')", "0"],
+        );
+        if got == ":6\r\n" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "receivers: {got:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     // Scripts on both shards publishing at once used to block each shard
     // thread on the other's reply forever, hanging the whole server.
