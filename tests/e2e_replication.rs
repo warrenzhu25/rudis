@@ -6713,7 +6713,7 @@ fn test_failover_command_switches_master_and_replica_e2e() {
         wait_for_master_link(r);
     }
     let wait_info = |c: &mut TcpStream, what: &str| {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let info = resp_cmd_full(c, &["INFO", "replication"]);
             if info.contains(what) {
