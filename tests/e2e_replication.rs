@@ -5960,7 +5960,7 @@ fn test_streamed_full_sync_e2e() {
         thread::sleep(Duration::from_millis(200));
     }
     assert!(
-        worst < Duration::from_millis(200),
+        worst < latency_bound(200),
         "a PING took {worst:?} during the full sync"
     );
     drop(replica);

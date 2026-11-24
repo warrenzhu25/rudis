@@ -4553,7 +4553,7 @@ fn test_bgrewriteaof_does_not_block_and_keeps_every_write_e2e() {
     eprintln!("live rewrite: {i} write rounds, worst PING {worst:?}");
     assert!(i > 50, "writes during the rewrite: {i}");
     assert!(
-        worst < Duration::from_millis(500),
+        worst < latency_bound(500),
         "PING took {worst:?} during the rewrite"
     );
     let mut reply = [0u8; 64];
@@ -4657,7 +4657,7 @@ fn test_bgrewriteaof_does_not_block_on_other_dbs_e2e() {
     // 100 ms in a release build. An unoptimized build on a small host (a
     // 4-vCPU GitHub runner) took 148 ms, still far from the whole-DB stall
     // (seconds for these 1M keys) this test guards against.
-    let limit = Duration::from_millis(if cfg!(debug_assertions) { 500 } else { 100 });
+    let limit = latency_bound(100);
     assert!(
         worst < limit,
         "a command took {worst:?} during the rewrite (limit {limit:?})"

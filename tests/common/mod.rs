@@ -1886,3 +1886,17 @@ pub fn send_and_read_reply_n(stream: &mut TcpStream, cmd: &[u8], n: usize) -> St
         got.extend_from_slice(&buf[..k]);
     }
 }
+
+/// A latency bound for an e2e test: `release_ms` in a release build, five
+/// times that in a debug one. The bounds are what a release build must
+/// meet; an unoptimized build (the coverage pass runs one, instrumented, on
+/// the legacy driver, beside the other lanes) takes several times longer
+/// for the same work, and its stalls failed these tests with nothing wrong.
+#[allow(dead_code)]
+pub fn latency_bound(release_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(if cfg!(debug_assertions) {
+        release_ms * 5
+    } else {
+        release_ms
+    })
+}

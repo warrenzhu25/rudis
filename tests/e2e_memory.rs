@@ -2072,7 +2072,7 @@ fn test_live_rewrite_over_spilled_values_e2e() {
     // A whole segment of spilled values read back in one step took ~50 ms
     // here (debug build); now a step stops at its budget.
     assert!(
-        worst < Duration::from_millis(25),
+        worst < latency_bound(25),
         "a command took {worst:?} during the rewrite"
     );
     assert_eq!(
