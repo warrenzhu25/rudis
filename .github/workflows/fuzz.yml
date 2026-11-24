@@ -28,6 +28,10 @@ jobs:
     name: Fuzz all targets
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # The prebuilt cargo-fuzz is a musl binary and defaults to its own
+      # triple, which has neither a std for nightly here nor ASan support.
+      FUZZ_TARGET: x86_64-unknown-linux-gnu
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -51,7 +55,7 @@ jobs:
       - name: Build targets
         run: |
           set -o pipefail
-          cargo +nightly fuzz build 2>&1 | tee build.log || {
+          cargo +nightly fuzz build --target "$FUZZ_TARGET" 2>&1 | tee build.log || {
             # Without the color codes (CARGO_TERM_COLOR is always), which
             # hid every error line from this grep; an OOM-killed rustc shows
             # as a signal.
@@ -70,7 +74,7 @@ jobs:
           for t in $TARGETS; do
             mkdir -p "fuzz/corpus/$t"
             echo "::group::$t"
-            if ! cargo +nightly fuzz run "$t" -- \
+            if ! cargo +nightly fuzz run --target "$FUZZ_TARGET" "$t" -- \
                 -max_total_time=${{ inputs.seconds || '600' }} \
                 -rss_limit_mb=4096 -malloc_limit_mb=2048 -timeout=30; then
               failed="$failed $t"
@@ -84,7 +88,7 @@ jobs:
 
       - name: Minimize corpus
         if: success()
-        run: for t in $TARGETS; do cargo +nightly fuzz cmin "$t"; done
+        run: for t in $TARGETS; do cargo +nightly fuzz cmin --target "$FUZZ_TARGET" "$t"; done
 
       - name: Save corpus
         if: always()
