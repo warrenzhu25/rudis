@@ -6555,8 +6555,12 @@ fn log_oom_rejection(max_mem: u64, policy: &str) {
 /// used memory is over `maxmemory` after the policy had its chance to free
 /// some, so the subscription is refused. Subscriptions take memory (the
 /// channel names, the registry), and a client could otherwise grow it past
-/// the limit without bound.
-async fn subscribe_over_maxmemory(router: &Router, client_id: u64) -> bool {
+/// the limit without bound. `incoming` is the size of the names about to be
+/// subscribed: Redis counts them in the client's query buffer, but rudis
+/// may hold them in a pooled read buffer that was already allocated, so
+/// used memory alone did not always show them (a 2 MB channel name under a
+/// 2 MB limit was sometimes accepted).
+async fn subscribe_over_maxmemory(router: &Router, client_id: u64, incoming: usize) -> bool {
     let max_mem = router
         .tier_stats
         .max_memory
@@ -6565,7 +6569,7 @@ async fn subscribe_over_maxmemory(router: &Router, client_id: u64) -> bool {
         return false;
     }
     let policy = get_max_memory_policy();
-    let over = if policy != "noeviction" {
+    let mut over = if policy != "noeviction" {
         let mut scratch = Vec::new();
         !router
             .evict_until_under_maxmemory(max_mem as usize, &policy, client_id, &mut scratch)
@@ -6576,6 +6580,11 @@ async fn subscribe_over_maxmemory(router: &Router, client_id: u64) -> bool {
             router.over_maxmemory()
         }
     };
+    if !over && incoming > 0 {
+        router.over_maxmemory();
+        router.refresh_published_usage().await;
+        over = router.tier_stats.real_used_total(None) + incoming as i64 > max_mem as i64;
+    }
     if over {
         log_oom_rejection(max_mem, &policy);
     }
@@ -8588,7 +8597,17 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                 cmd,
                 Command::Subscribe(_) | Command::Psubscribe(_) | Command::Ssubscribe(_)
             )
-            && subscribe_over_maxmemory(router, client_id).await
+            && subscribe_over_maxmemory(
+                router,
+                client_id,
+                match &cmd {
+                    Command::Subscribe(names)
+                    | Command::Psubscribe(names)
+                    | Command::Ssubscribe(names) => names.iter().map(|n| n.len()).sum(),
+                    _ => 0,
+                },
+            )
+            .await
         {
             let c_name = stat_cmd_name(&cmd);
             record_rejected_stat(c_name);
