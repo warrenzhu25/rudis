@@ -339,20 +339,22 @@ impl AofManifest {
 /// shard in `dir` (`appenddirname`), named `<name>.<seq>.incr.aof` and
 /// tagged `shard <i>` in the manifest. Manifest updates (a shard's rewrite
 /// replacing its file, from any shard's thread) are serialized per
-/// directory and written crash-safely.
+/// directory and written crash-safely. The manifest is cached in memory
+/// (per directory), so looking a shard's file up costs no I/O.
 #[derive(Clone, Debug)]
 pub struct ShardAofFiles {
     pub dir: PathBuf,
     pub name: String,
 }
 
-/// Serializes manifest read-modify-writes per AOF directory.
-fn dir_lock(dir: &Path) -> std::sync::Arc<parking_lot::Mutex<()>> {
-    type Locks = parking_lot::Mutex<
-        std::collections::HashMap<PathBuf, std::sync::Arc<parking_lot::Mutex<()>>>,
-    >;
-    static LOCKS: std::sync::LazyLock<Locks> = std::sync::LazyLock::new(Default::default);
-    LOCKS.lock().entry(dir.to_path_buf()).or_default().clone()
+type ManifestCell = std::sync::Arc<parking_lot::Mutex<Option<AofManifest>>>;
+
+/// The cached manifest of an AOF directory, also the lock that serializes
+/// its read-modify-writes.
+fn dir_state(dir: &Path) -> ManifestCell {
+    type States = parking_lot::Mutex<std::collections::HashMap<PathBuf, ManifestCell>>;
+    static STATES: std::sync::LazyLock<States> = std::sync::LazyLock::new(Default::default);
+    STATES.lock().entry(dir.to_path_buf()).or_default().clone()
 }
 
 impl ShardAofFiles {
@@ -363,9 +365,37 @@ impl ShardAofFiles {
         }
     }
 
+    /// Runs `f` on the manifest (an empty one if there is none yet) with
+    /// the directory locked.
+    fn with_manifest<R>(
+        &self,
+        f: impl FnOnce(&mut AofManifest) -> std::io::Result<R>,
+    ) -> std::io::Result<R> {
+        let cell = dir_state(&self.dir);
+        let mut cached = cell.lock();
+        if cached.is_none() {
+            *cached = Some(AofManifest::load(&self.dir, &self.name)?.unwrap_or_default());
+        }
+        f(cached.as_mut().expect("loaded above"))
+    }
+
+    /// Persists `next` and makes it the cached manifest.
+    fn commit(&self, cur: &mut AofManifest, next: AofManifest) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        next.persist(&self.dir, &self.name)?;
+        *cur = next;
+        Ok(())
+    }
+
+    /// Forgets the cached manifest, so the next use reads the file (after
+    /// something other than these methods changed it, e.g. at startup).
+    pub fn invalidate(&self) {
+        *dir_state(&self.dir).lock() = None;
+    }
+
     /// The manifest, or an empty one if there is none yet.
     pub fn manifest(&self) -> std::io::Result<AofManifest> {
-        Ok(AofManifest::load(&self.dir, &self.name)?.unwrap_or_default())
+        self.with_manifest(|m| Ok(m.clone()))
     }
 
     /// Whether the manifest exists and every incr file in it belongs to a
@@ -377,52 +407,68 @@ impl ShardAofFiles {
 
     /// The shard count the manifest records (its highest shard tag + 1).
     pub fn shard_count(&self) -> std::io::Result<Option<usize>> {
-        Ok(self
-            .manifest()?
-            .incr
-            .iter()
-            .filter_map(|f| f.shard)
-            .max()
-            .map(|m| m + 1))
+        self.with_manifest(|m| Ok(m.incr.iter().filter_map(|f| f.shard).max().map(|m| m + 1)))
+    }
+
+    /// Shard `shard`'s current file, if it has one.
+    pub fn shard_path(&self, shard: usize) -> std::io::Result<Option<PathBuf>> {
+        self.with_manifest(|m| {
+            Ok(m.incr
+                .iter()
+                .find(|f| f.shard == Some(shard))
+                .map(|f| self.dir.join(&f.name)))
+        })
+    }
+
+    /// Every file the manifest lists.
+    pub fn all_paths(&self) -> std::io::Result<Vec<PathBuf>> {
+        self.with_manifest(|m| {
+            Ok(m.base
+                .iter()
+                .chain(&m.history)
+                .chain(&m.incr)
+                .map(|f| self.dir.join(&f.name))
+                .collect())
+        })
     }
 
     /// Each of shards `0..n`'s incr file, adding entries (and empty files)
     /// for shards that have none.
     pub fn ensure_shards(&self, n: usize) -> std::io::Result<Vec<PathBuf>> {
-        let lock = dir_lock(&self.dir);
-        let _g = lock.lock();
-        std::fs::create_dir_all(&self.dir)?;
-        let mut m = self.manifest()?;
-        let mut changed = false;
-        let mut paths = Vec::with_capacity(n);
-        for shard in 0..n {
-            let path = match m.incr.iter().find(|f| f.shard == Some(shard)) {
-                Some(f) => self.dir.join(&f.name),
-                None => {
-                    let seq = m.max_seq() + 1;
-                    let name = incr_name(&self.name, seq);
-                    let path = self.dir.join(&name);
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)?
-                        .sync_all()?;
-                    m.incr.push(AofFileInfo {
-                        name,
-                        seq,
-                        kind: AofFileType::Incr,
-                        shard: Some(shard),
-                    });
-                    changed = true;
-                    path
-                }
-            };
-            paths.push(path);
-        }
-        if changed {
-            m.persist(&self.dir, &self.name)?;
-        }
-        Ok(paths)
+        self.with_manifest(|cur| {
+            let mut m = cur.clone();
+            let mut changed = false;
+            let mut paths = Vec::with_capacity(n);
+            for shard in 0..n {
+                let path = match m.incr.iter().find(|f| f.shard == Some(shard)) {
+                    Some(f) => self.dir.join(&f.name),
+                    None => {
+                        std::fs::create_dir_all(&self.dir)?;
+                        let seq = m.max_seq() + 1;
+                        let name = incr_name(&self.name, seq);
+                        let path = self.dir.join(&name);
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)?
+                            .sync_all()?;
+                        m.incr.push(AofFileInfo {
+                            name,
+                            seq,
+                            kind: AofFileType::Incr,
+                            shard: Some(shard),
+                        });
+                        changed = true;
+                        path
+                    }
+                };
+                paths.push(path);
+            }
+            if changed {
+                self.commit(cur, m)?;
+            }
+            Ok(paths)
+        })
     }
 
     /// Replaces `shard`'s incr file with `new_file` (a complete rewrite in
@@ -431,61 +477,129 @@ impl ShardAofFiles {
     /// before the manifest is persisted leaves the old file in force (the
     /// renamed one is unreferenced); after, the new one.
     pub fn replace_shard_file(&self, shard: usize, new_file: &Path) -> std::io::Result<PathBuf> {
-        let lock = dir_lock(&self.dir);
-        let _g = lock.lock();
-        let mut m = self.manifest()?;
-        let seq = m.max_seq() + 1;
-        let name = incr_name(&self.name, seq);
-        let path = self.dir.join(&name);
-        std::fs::rename(new_file, &path)?;
-        let old = m
-            .incr
-            .iter()
-            .position(|f| f.shard == Some(shard))
-            .map(|i| m.incr.remove(i));
-        m.incr.push(AofFileInfo {
-            name,
-            seq,
-            kind: AofFileType::Incr,
-            shard: Some(shard),
-        });
-        m.persist(&self.dir, &self.name)?;
-        if let Some(old) = old {
-            let _ = std::fs::remove_file(self.dir.join(old.name));
-        }
-        Ok(path)
-    }
-
-    /// Replaces every shard's file at once with `files[i]` for shard `i`
-    /// (a reshard, or an import): one manifest swap, then the old files
-    /// (and any history) deleted.
-    pub fn replace_all(&self, files: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
-        let lock = dir_lock(&self.dir);
-        let _g = lock.lock();
-        std::fs::create_dir_all(&self.dir)?;
-        let old = self.manifest()?;
-        let mut seq = old.max_seq();
-        let mut m = AofManifest::default();
-        let mut paths = Vec::with_capacity(files.len());
-        for (shard, f) in files.iter().enumerate() {
-            seq += 1;
+        self.with_manifest(|cur| {
+            let mut m = cur.clone();
+            let seq = m.max_seq() + 1;
             let name = incr_name(&self.name, seq);
             let path = self.dir.join(&name);
-            std::fs::rename(f, &path)?;
+            std::fs::rename(new_file, &path)?;
+            let old = m
+                .incr
+                .iter()
+                .position(|f| f.shard == Some(shard))
+                .map(|i| m.incr.remove(i));
             m.incr.push(AofFileInfo {
                 name,
                 seq,
                 kind: AofFileType::Incr,
                 shard: Some(shard),
             });
-            paths.push(path);
-        }
-        m.persist(&self.dir, &self.name)?;
-        for f in old.base.iter().chain(&old.history).chain(&old.incr) {
-            let _ = std::fs::remove_file(self.dir.join(&f.name));
-        }
-        Ok(paths)
+            self.commit(cur, m)?;
+            if let Some(old) = old {
+                let _ = std::fs::remove_file(self.dir.join(old.name));
+            }
+            Ok(path)
+        })
     }
+
+    /// Takes `shard`'s file out of the manifest and deletes it (its data is
+    /// stale: AOF turned on at runtime, until the first rewrite).
+    pub fn drop_shard(&self, shard: usize) -> std::io::Result<()> {
+        self.with_manifest(|cur| {
+            let Some(i) = cur.incr.iter().position(|f| f.shard == Some(shard)) else {
+                return Ok(());
+            };
+            let mut m = cur.clone();
+            let old = m.incr.remove(i);
+            self.commit(cur, m)?;
+            let _ = std::fs::remove_file(self.dir.join(old.name));
+            Ok(())
+        })
+    }
+
+    /// Replaces every shard's file at once with `files[i]` for shard `i`
+    /// (a reshard, or an import): one manifest swap, then the old files
+    /// (and any history) deleted.
+    pub fn replace_all(&self, files: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
+        self.with_manifest(|cur| {
+            std::fs::create_dir_all(&self.dir)?;
+            let old = cur.clone();
+            let mut seq = old.max_seq();
+            let mut m = AofManifest::default();
+            let mut paths = Vec::with_capacity(files.len());
+            for (shard, f) in files.iter().enumerate() {
+                seq += 1;
+                let name = incr_name(&self.name, seq);
+                let path = self.dir.join(&name);
+                std::fs::rename(f, &path)?;
+                m.incr.push(AofFileInfo {
+                    name,
+                    seq,
+                    kind: AofFileType::Incr,
+                    shard: Some(shard),
+                });
+                paths.push(path);
+            }
+            self.commit(cur, m)?;
+            for f in old.base.iter().chain(&old.history).chain(&old.incr) {
+                let _ = std::fs::remove_file(self.dir.join(&f.name));
+            }
+            Ok(paths)
+        })
+    }
+
+    /// Deletes AOF files in `dir` the manifest doesn't list: left by a
+    /// crash between a file's rename and the manifest update. Startup only.
+    pub fn remove_unreferenced(&self) -> std::io::Result<Vec<String>> {
+        let listed: std::collections::HashSet<std::ffi::OsString> = self
+            .all_paths()?
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_owned()))
+            .collect();
+        let prefix = format!("{}.", self.name);
+        let mut removed = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Ok(removed);
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let ours = name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(seq, kind)| {
+                    seq.parse::<u64>().is_ok()
+                        && matches!(kind, "incr.aof" | "base.aof" | "base.rdb")
+                });
+            if ours
+                && !listed.contains(entry.file_name().as_os_str())
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed.push(name);
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Multi-part AOF layouts in use, by the server's `dir`: a shard's AOF
+/// lives in the layout registered for its server's dir, or (none
+/// registered) at the flat `dir/appendonly-<i>.aof`.
+pub(crate) static LAYOUTS: std::sync::LazyLock<
+    parking_lot::RwLock<std::collections::HashMap<PathBuf, ShardAofFiles>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Makes `files` the AOF layout of the server whose `dir` is `dir`.
+pub fn register_layout(dir: &Path, files: ShardAofFiles) {
+    LAYOUTS.write().insert(dir.to_path_buf(), files);
+}
+
+/// The multi-part AOF layout of the server whose `dir` is `dir`, if any.
+pub fn layout_for(dir: &Path) -> Option<ShardAofFiles> {
+    let layouts = LAYOUTS.read();
+    if layouts.is_empty() {
+        return None;
+    }
+    layouts.get(dir).cloned()
 }
 
 #[cfg(test)]

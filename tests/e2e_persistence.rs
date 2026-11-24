@@ -6184,3 +6184,144 @@ fn test_appendonly_no_stops_a_running_rewrite_e2e() {
     assert_eq!(info_field(&mut c, "aof_last_bgrewrite_status"), "ok");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `aof-multipart yes`: flat shard AOF files move into Redis 7's layout
+/// (`appendonlydir/`, a manifest naming one incr file per shard), and data
+/// survives kill -9 after writes, after BGREWRITEAOF (each shard's file
+/// replaced by the next seq), across a thread-count change, and after AOF
+/// is turned off and on at runtime. Turning the option off again imports
+/// the layout back into flat files.
+#[test]
+fn test_multipart_aof_survives_kill9_rewrite_reshard_and_toggle_e2e() {
+    let port = 18190u16;
+    let ps = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-e2e-multipart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds = dir.to_str().unwrap().to_string();
+    let args = |threads: &'static str, multipart: &'static str| {
+        vec![
+            "--port".to_string(),
+            ps.clone(),
+            "--threads".into(),
+            threads.into(),
+            "--no-pin".into(),
+            "--dir".into(),
+            ds.clone(),
+            "--appendonly".into(),
+            "yes".into(),
+            "--aof-multipart".into(),
+            multipart.into(),
+        ]
+    };
+    let spawn = |a: Vec<String>| {
+        let a: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+        let srv = ServerGuard(spawn_rudis_listening(&a, port));
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        (srv, c)
+    };
+    let set_range = |c: &mut TcpStream, from: usize, to: usize| {
+        for i in from..to {
+            let cmd = format!("SET k{i} v{i}\r\n");
+            assert_eq!(send_and_read_reply(c, cmd.as_bytes()), "+OK\r\n");
+        }
+    };
+    let dbsize = |c: &mut TcpStream| send_and_read_reply(c, b"DBSIZE\r\n");
+    let wait_rewrite = |c: &mut TcpStream| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let info = send_and_read_reply(c, b"INFO persistence\r\n");
+            if info.contains("aof_rewrite_in_progress:0")
+                && !info.contains("aof_rewrite_scheduled:1")
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "rewrite never ended");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let manifest = dir.join("appendonlydir/appendonly.aof.manifest");
+    let incr_files = || {
+        let mut v: Vec<String> = std::fs::read_dir(dir.join("appendonlydir"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".incr.aof"))
+            .collect();
+        v.sort();
+        v
+    };
+
+    // Flat files first.
+    let (srv, mut c) = spawn(args("4", "no"));
+    set_range(&mut c, 0, 100);
+    drop(srv);
+    assert!(dir.join("appendonly-0.aof").exists());
+
+    // Into the layout.
+    let (srv, mut c) = spawn(args("4", "yes"));
+    assert_eq!(dbsize(&mut c), ":100\r\n");
+    assert!(!dir.join("appendonly-0.aof").exists());
+    assert_eq!(incr_files().len(), 4);
+    assert_eq!(
+        send_and_read_reply(&mut c, b"CONFIG GET aof-multipart\r\n"),
+        "*2\r\n$13\r\naof-multipart\r\n$3\r\nyes\r\n"
+    );
+    set_range(&mut c, 100, 150);
+    drop(srv);
+
+    // BGREWRITEAOF: new seqs, old files gone; then more writes.
+    let (srv, mut c) = spawn(args("4", "yes"));
+    assert_eq!(dbsize(&mut c), ":150\r\n");
+    let before = incr_files();
+    send_and_read_reply(&mut c, b"BGREWRITEAOF\r\n");
+    wait_rewrite(&mut c);
+    let after = incr_files();
+    assert_eq!(after.len(), 4);
+    assert!(
+        after.iter().all(|f| !before.contains(f)),
+        "{before:?} -> {after:?}"
+    );
+    set_range(&mut c, 150, 200);
+    drop(srv);
+
+    // Another thread count.
+    let (srv, mut c) = spawn(args("2", "yes"));
+    assert_eq!(dbsize(&mut c), ":200\r\n");
+    assert_eq!(incr_files().len(), 2);
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    assert!(
+        text.contains("shard 1") && !text.contains("shard 2"),
+        "{text}"
+    );
+
+    // AOF off and on at runtime: the initial rewrite replaces the files.
+    assert_eq!(
+        send_and_read_reply(&mut c, b"CONFIG SET appendonly no\r\n"),
+        "+OK\r\n"
+    );
+    set_range(&mut c, 200, 210);
+    assert_eq!(
+        send_and_read_reply(&mut c, b"CONFIG SET appendonly yes\r\n"),
+        "+OK\r\n"
+    );
+    wait_rewrite(&mut c);
+    set_range(&mut c, 210, 220);
+    drop(srv);
+    let (srv, mut c) = spawn(args("2", "yes"));
+    assert_eq!(dbsize(&mut c), ":220\r\n");
+    assert_eq!(incr_files().len(), 2);
+    drop(srv);
+
+    // Option off: imported back into flat files, the layout moved aside.
+    let (srv, mut c) = spawn(args("2", "no"));
+    assert_eq!(dbsize(&mut c), ":220\r\n");
+    assert_eq!(
+        send_and_read_reply(&mut c, b"GET k219\r\n"),
+        "$4\r\nv219\r\n"
+    );
+    assert!(!manifest.exists());
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

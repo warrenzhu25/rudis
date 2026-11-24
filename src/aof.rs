@@ -719,9 +719,13 @@ pub fn rewrite_and_swap_shard_aof(
     shard_id: usize,
     aof: Option<&std::rc::Rc<std::cell::RefCell<AofWriter>>>,
 ) -> std::io::Result<usize> {
-    let count = rewrite_shard_aof(db, dir, shard_id)?;
+    let (count, path) = rewrite_shard_aof(db, dir, shard_id)?;
     if let Some(aof) = aof {
-        aof.borrow_mut().swap_after_rewrite()?;
+        let mut w = aof.borrow_mut();
+        if !w.path.as_os_str().is_empty() {
+            w.path = path;
+        }
+        w.swap_after_rewrite()?;
     }
     Ok(count)
 }
@@ -777,8 +781,8 @@ pub async fn rewrite_shard_aof_live(
     aof: Option<&std::rc::Rc<std::cell::RefCell<AofWriter>>>,
     fsync_always: bool,
 ) -> std::io::Result<usize> {
-    let (tmp_path, target_path) = rewrite_paths(dir, shard_id);
-    let res = rewrite_live_inner(db, &tmp_path, &target_path, aof, fsync_always).await;
+    let tmp_path = rewrite_tmp_path(dir, shard_id);
+    let res = rewrite_live_inner(db, &tmp_path, dir, shard_id, aof, fsync_always).await;
     if res.is_err() {
         crate::shard::take_aof_image();
         let _ = std::fs::remove_file(&tmp_path);
@@ -798,24 +802,84 @@ pub async fn rewrite_shard_aof_live(
     }
 }
 
-fn rewrite_paths(dir: &Path, shard_id: usize) -> (std::path::PathBuf, std::path::PathBuf) {
+fn rewrite_tmp_path(dir: &Path, shard_id: usize) -> PathBuf {
     static TMP_LIVE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let tmp_id = TMP_LIVE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    (
-        dir.join(format!(
-            "appendonly-{}.aof.tmp.{}_live{}",
-            shard_id,
-            std::process::id(),
-            tmp_id
-        )),
-        dir.join(format!("appendonly-{}.aof", shard_id)),
-    )
+    shard_aof_tmp_dir(dir).join(format!(
+        "appendonly-{}.aof.tmp.{}_live{}",
+        shard_id,
+        std::process::id(),
+        tmp_id
+    ))
+}
+
+/// Shard `shard_id`'s AOF in the server's `dir`: the file the multi-part
+/// manifest lists for it (see [`crate::aof_manifest::layout_for`]), or the
+/// flat `dir/appendonly-<i>.aof`. A shard a layout lists no file for gets
+/// a path that doesn't exist (it has no data).
+pub fn shard_aof_path(dir: &Path, shard_id: usize) -> PathBuf {
+    match crate::aof_manifest::layout_for(dir) {
+        Some(layout) => layout
+            .shard_path(shard_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| layout.dir.join(format!("appendonly-{shard_id}.aof.none"))),
+        None => dir.join(format!("appendonly-{}.aof", shard_id)),
+    }
+}
+
+/// The file AOF turned on at runtime appends to until its initial rewrite
+/// (see [`AofWriter::open_incremental`]).
+pub fn shard_aof_incr_path(dir: &Path, shard_id: usize) -> PathBuf {
+    shard_aof_tmp_dir(dir).join(format!("appendonly-{}.aof.incr", shard_id))
+}
+
+/// Removes shard `shard_id`'s AOF (stale: AOF is being turned on at
+/// runtime), so it isn't loaded if the server stops before the initial
+/// rewrite puts a complete one in its place.
+pub fn drop_shard_aof(dir: &Path, shard_id: usize) -> std::io::Result<()> {
+    // A flat file goes either way: with a layout, it is a stale one that
+    // would block the next startup's move into the layout.
+    match std::fs::remove_file(dir.join(format!("appendonly-{}.aof", shard_id))) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    match crate::aof_manifest::layout_for(dir) {
+        Some(layout) => layout.drop_shard(shard_id),
+        None => Ok(()),
+    }
+}
+
+/// Where shard AOF rewrites write their temp files: next to the files
+/// they replace (renames don't cross directories).
+fn shard_aof_tmp_dir(dir: &Path) -> PathBuf {
+    match crate::aof_manifest::layout_for(dir) {
+        Some(layout) => layout.dir,
+        None => dir.to_path_buf(),
+    }
+}
+
+/// Puts `tmp`, a complete rewrite of shard `shard_id`'s AOF, in place and
+/// returns its path: renamed over the flat `dir/appendonly-<i>.aof`, or in
+/// a multi-part layout given the next seq's name and listed in the
+/// manifest (persisted before the old file is deleted). The caller syncs
+/// the directory.
+fn install_shard_aof(dir: &Path, shard_id: usize, tmp: &Path) -> std::io::Result<PathBuf> {
+    match crate::aof_manifest::layout_for(dir) {
+        Some(layout) => layout.replace_shard_file(shard_id, tmp),
+        None => {
+            let target = dir.join(format!("appendonly-{}.aof", shard_id));
+            std::fs::rename(tmp, &target)?;
+            Ok(target)
+        }
+    }
 }
 
 async fn rewrite_live_inner(
     db: &std::rc::Rc<std::cell::RefCell<ShardDb>>,
     tmp_path: &Path,
-    target_path: &Path,
+    dir: &Path,
+    shard_id: usize,
     aof: Option<&std::rc::Rc<std::cell::RefCell<AofWriter>>>,
     fsync_always: bool,
 ) -> Result<usize, LiveRewriteError> {
@@ -870,12 +934,12 @@ async fn rewrite_live_inner(
     let file = done_rx.recv_async().await.map_err(|_| gone())??;
     match (aof, mark) {
         (Some(aof), Some(mark)) => {
-            catch_up_and_swap(aof, file, mark, tmp_path, target_path, fsync_always).await?;
+            catch_up_and_swap(aof, file, mark, tmp_path, dir, shard_id, fsync_always).await?;
         }
         _ => {
             drop(file);
-            std::fs::rename(tmp_path, target_path)?;
-            let _ = sync_parent_dir(target_path);
+            let path = install_shard_aof(dir, shard_id, tmp_path)?;
+            let _ = sync_parent_dir(&path);
         }
     }
     Ok(keys)
@@ -1042,11 +1106,13 @@ async fn catch_up_and_swap(
     file: std::fs::File,
     mark: RewriteMark,
     tmp_path: &Path,
-    target_path: &Path,
+    dir: &Path,
+    shard_id: usize,
     fsync_always: bool,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
-    let old = open_for_reading(aof, target_path)?;
+    let current = aof.borrow().path.clone();
+    let old = open_for_reading(aof, &current)?;
     let mut out_pos = file.metadata()?.len();
     if mark.db != 0 {
         let db = mark.db.to_string();
@@ -1161,15 +1227,16 @@ async fn catch_up_and_swap(
                     presynced
                 };
                 t.lap("fsync new file");
-                std::fs::rename(tmp_path, target_path)?;
+                let target_path = install_shard_aof(dir, shard_id, tmp_path)?;
                 t.lap("rename");
                 // Likewise the rename: synced here under `always`, else on
                 // another thread right away.
                 if fsync_always {
-                    let _ = sync_parent_dir(target_path);
+                    let _ = sync_parent_dir(&target_path);
                 } else {
-                    sync_parent_dir_off_thread(target_path);
+                    sync_parent_dir_off_thread(&target_path);
                 }
+                w.path = target_path;
                 t.lap("fsync dir");
                 let res = w.swap_after_live_rewrite(writer_file, out_pos, durable);
                 t.lap("switch writer");
@@ -1213,7 +1280,7 @@ pub fn unpropagated_changes() -> u64 {
 /// writes). Drives `auto-aof-rewrite-*` and INFO `aof_current_size`.
 pub fn aof_files_size(dir: &Path, num_shards: usize) -> u64 {
     (0..num_shards)
-        .filter_map(|i| std::fs::metadata(dir.join(format!("appendonly-{}.aof", i))).ok())
+        .filter_map(|i| std::fs::metadata(shard_aof_path(dir, i)).ok())
         .map(|m| m.len())
         .sum()
 }
@@ -4409,6 +4476,155 @@ fn raw_resp_arg(raw: &[u8], idx: usize) -> Option<&[u8]> {
     None
 }
 
+/// Prepares `dir` for multi-part AOF (`aof-multipart yes`): the shard
+/// files in the Redis 7 layout `dir/<dirname>` (see
+/// [`crate::aof_manifest::ShardAofFiles`]), registered so every AOF path
+/// lookup for `dir` finds them. The shard count and routing stay in
+/// [`AOF_SHARDS_MANIFEST`] in `dir`.
+///
+/// - A layout for another shard count (or routing) goes back to flat
+///   `appendonly-<i>.aof` files first (hard links; the manifest's removal
+///   is the switch), for [`reshard_aof_dir`].
+/// - [`reshard_aof_dir`] then reshards (or imports Redis files) as it does
+///   without the layout.
+/// - Flat files move into the layout: hard-linked in, one manifest swap
+///   (the switch), then the flat names removed.
+///
+/// A crash at any step leaves either the layout or the flat files in
+/// force, never a mix: flat files that are still hard links to the
+/// layout's are leftovers, removed; any others alongside a layout are an
+/// error (they could be newer).
+///
+/// Returns the old shard count if a reshard happened.
+pub fn prepare_multipart_aof_dir(
+    dir: &Path,
+    num_shards: usize,
+    port: u16,
+    dirname: &str,
+    filename: &str,
+) -> std::io::Result<Option<usize>> {
+    use std::os::unix::fs::MetadataExt;
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    let files = crate::aof_manifest::ShardAofFiles::new(dir.join(dirname), filename);
+    files.invalidate();
+    let flat = |i: usize| dir.join(format!("appendonly-{}.aof", i));
+    let flat_indexes = || -> Vec<usize> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str().and_then(aof_shard_file_index))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if files.is_rudis_layout()? {
+        remove_stale_rewrite_temps(&files.dir);
+        for name in files.remove_unreferenced()? {
+            crate::log_notice!("Removed {} left by an interrupted AOF rewrite", name);
+        }
+        let recorded = read_aof_shards_manifest(dir)?;
+        let layout_shards = files.shard_count()?.unwrap_or(0);
+        let current = AofLayout::current(num_shards);
+        let matches = match recorded {
+            Some(l) => l == current,
+            None => layout_shards == num_shards,
+        };
+        // Flat files next to the layout: leftovers of an interrupted move
+        // (hard links to the layout's files) or something else.
+        for i in flat_indexes() {
+            let leftover = match (std::fs::metadata(flat(i)), files.shard_path(i)?) {
+                (Ok(f), Some(p)) => std::fs::metadata(&p).is_ok_and(|m| m.ino() == f.ino()),
+                (Ok(f), None) => f.len() == 0,
+                (Err(_), _) => true,
+            };
+            if !leftover {
+                return Err(invalid(format!(
+                    "{:?} holds both the multi-part AOF {:?} and a flat {:?} that isn't part of it. \
+                     Refusing to guess which to load: move one away and restart",
+                    dir,
+                    files.dir,
+                    flat(i)
+                )));
+            }
+            std::fs::remove_file(flat(i))?;
+        }
+        if matches {
+            if recorded.is_none() {
+                write_aof_shards_manifest_with_ext(dir, current, None)?;
+            }
+            files.ensure_shards(num_shards)?;
+            crate::aof_manifest::register_layout(dir, files);
+            return Ok(None);
+        }
+        // Back to flat files for the reshard.
+        for i in 0..layout_shards {
+            if let Some(p) = files.shard_path(i)? {
+                std::fs::hard_link(&p, flat(i))?;
+            }
+        }
+        if recorded.is_none() {
+            write_aof_shards_manifest_with_ext(
+                dir,
+                AofLayout {
+                    shards: layout_shards,
+                    ..current
+                },
+                None,
+            )?;
+        }
+        sync_parent_dir(&flat(0))?;
+        let manifest = files.dir.join(crate::aof_manifest::manifest_name(filename));
+        std::fs::remove_file(&manifest)?;
+        sync_parent_dir(&manifest)?;
+        let _ = std::fs::remove_dir_all(&files.dir);
+        files.invalidate();
+    }
+    let resharded = reshard_aof_dir(dir, num_shards, port)?;
+    // Whatever else is in the layout's dir (Redis's own AOF, imported above
+    // if it was at Redis's default path) is kept, out of the way.
+    let only_temps = std::fs::read_dir(&files.dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .all(|e| e.file_name().to_string_lossy().contains(".aof.tmp."))
+    });
+    if only_temps {
+        // Left by a move into the layout cut short before its switch.
+        let _ = std::fs::remove_dir_all(&files.dir);
+    } else if files.dir.exists() {
+        let backup = dir.join(format!("{}-backup-{}", dirname, unix_ms_now()));
+        std::fs::rename(&files.dir, &backup)?;
+        crate::log_warning!(
+            "Moved {:?} (not a rudis multi-part AOF) to {:?} to make room for one",
+            files.dir,
+            backup
+        );
+        files.invalidate();
+    }
+    // Into the layout.
+    std::fs::create_dir_all(&files.dir)?;
+    let mut staged = Vec::with_capacity(num_shards);
+    for i in 0..num_shards {
+        let tmp = files.dir.join(format!("appendonly-{}.aof.tmp.migrate", i));
+        let _ = std::fs::remove_file(&tmp);
+        match std::fs::hard_link(flat(i), &tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::File::create(&tmp)?.sync_all()?;
+            }
+            Err(e) => return Err(e),
+        }
+        staged.push(tmp);
+    }
+    files.replace_all(&staged)?;
+    for i in flat_indexes() {
+        std::fs::remove_file(flat(i))?;
+    }
+    sync_parent_dir(&flat(0))?;
+    crate::aof_manifest::register_layout(dir, files);
+    Ok(resharded)
+}
+
 /// Makes the per-shard AOF files in `dir` match `num_shards`.
 ///
 /// Each shard replays only `appendonly-{shard}.aof`, and keys are owned by
@@ -4504,6 +4720,23 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
                 ext_files,
                 num_shards
             );
+            // A multi-part AOF rudis wrote (`aof-multipart yes`, now off)
+            // goes out of the way: left in place, it would win over the
+            // flat files (and every write since) were the option turned
+            // back on.
+            if let Some(manifest) = &manifest_opt
+                && let (Some(sub), Some(name)) = (manifest.parent(), manifest.file_name())
+                && sub != dir
+                && crate::aof_manifest::ShardAofFiles::new(
+                    sub.to_path_buf(),
+                    name.to_string_lossy().trim_end_matches(".manifest"),
+                )
+                .is_rudis_layout()?
+            {
+                let backup = dir.join(format!("appendonlydir-backup-{}", unix_ms_now()));
+                std::fs::rename(sub, &backup)?;
+                crate::log_notice!("Moved the imported multi-part AOF to {:?}", backup);
+            }
             return Ok(None);
         }
     }
@@ -4654,18 +4887,28 @@ fn swap_in_staged_aof(
     Ok(())
 }
 
-pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::io::Result<usize> {
+/// Rewrites shard `shard_id`'s AOF from `db` in one blocking pass and puts
+/// it in place (see [`install_shard_aof`]); returns the number of keys and
+/// the new file's path.
+pub fn rewrite_shard_aof(
+    db: &mut ShardDb,
+    dir: &Path,
+    shard_id: usize,
+) -> std::io::Result<(usize, PathBuf)> {
     static TMP_REWRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let tmp_id = TMP_REWRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = dir.join(format!(
+    let tmp_path = shard_aof_tmp_dir(dir).join(format!(
         "appendonly-{}.aof.tmp.{}_{}",
         shard_id,
         std::process::id(),
         tmp_id
     ));
-    let target_path = dir.join(format!("appendonly-{}.aof", shard_id));
     let orig_db = db.current_db;
-    let res = write_rewritten_aof(db, &tmp_path, &target_path);
+    let res = write_rewritten_aof(db, &tmp_path).and_then(|keys| {
+        let path = install_shard_aof(dir, shard_id, &tmp_path)?;
+        let _ = sync_parent_dir(&path);
+        Ok((keys, path))
+    });
     if res.is_err() {
         // Don't leave a partial rewrite behind; the live AOF is untouched.
         let _ = std::fs::remove_file(&tmp_path);
@@ -4702,16 +4945,11 @@ pub fn rewrite_shard_aof_canonical(
     res
 }
 
-/// Writes `db` as an AOF to `tmp_path`, fsyncs it and renames it to
-/// `target_path`. The AOF is an RDB image of the shard (an RDB preamble,
+/// Writes `db` as an AOF to `tmp_path` and fsyncs it. The AOF is an RDB image of the shard (an RDB preamble,
 /// like Redis's default `aof-use-rdb-preamble yes`): it holds everything
 /// a snapshot does, function libraries included. Returns the number of
 /// keys written.
-fn write_rewritten_aof(
-    db: &mut ShardDb,
-    tmp_path: &Path,
-    target_path: &Path,
-) -> std::io::Result<usize> {
+fn write_rewritten_aof(db: &mut ShardDb, tmp_path: &Path) -> std::io::Result<usize> {
     let keys = db
         .keyspace_stats_by_db()
         .iter()
@@ -4733,8 +4971,6 @@ fn write_rewritten_aof(
     }
     writer.write(&image.finish().map_err(std::io::Error::other)?)?;
     drop(writer.finish()?);
-    std::fs::rename(tmp_path, target_path)?;
-    let _ = sync_parent_dir(target_path);
     Ok(keys)
 }
 
@@ -5995,7 +6231,7 @@ mod tests {
         replay_aof(&log, &mut replayed).unwrap();
         assert_eq!(replayed.probabilistic_store, db.probabilistic_store);
 
-        let n = rewrite_shard_aof(&mut db, &dir, 0).unwrap();
+        let n = rewrite_shard_aof(&mut db, &dir, 0).unwrap().0;
         assert_eq!(n, 8, "one *.RESTORE per structure");
         let mut rewritten = ShardDb::new(6379);
         let applied = replay_aof(&dir.join("appendonly-0.aof"), &mut rewritten).unwrap();
@@ -6167,7 +6403,7 @@ mod tests {
         db.set(Bytes::from("k"), Bytes::from("v"), None);
         db.rpush(Bytes::from("l"), vec![Bytes::from("a"), Bytes::from("b")])
             .unwrap();
-        assert_eq!(rewrite_shard_aof(&mut db, &dir, 0).unwrap(), 2);
+        assert_eq!(rewrite_shard_aof(&mut db, &dir, 0).unwrap().0, 2);
         let file = std::fs::read(dir.join("appendonly-0.aof")).unwrap();
         assert!(file.starts_with(b"REDIS"), "an RDB preamble");
         assert!(crate::scripting::delete_function(lib));
@@ -7202,6 +7438,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Replays each shard's file in `dir`'s multi-part layout, checking
+    /// every key sits in its owner's file. Returns the total key count.
+    fn assert_layout_keys_owned(dir: &Path, num_shards: usize) -> usize {
+        let mut total = 0;
+        for i in 0..num_shards {
+            let mut db = ShardDb::new(0);
+            replay_aof(&shard_aof_path(dir, i), &mut db).unwrap();
+            for e in db.table.entries() {
+                assert_eq!(crate::router::target_shard(&e.key, num_shards), i);
+                total += 1;
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn test_multipart_aof_dir_migrates_reshards_and_rewrites() {
+        use crate::aof_manifest::ShardAofFiles;
+        let dir = std::env::temp_dir().join(format!("rudis-aof-multipart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout = || ShardAofFiles::new(dir.join("appendonlydir"), "appendonly.aof");
+        // Flat files written by 2 shards.
+        let mut dbs: Vec<ShardDb> = (0..2).map(|_| ShardDb::new(0)).collect();
+        for k in 0..50 {
+            let key = Bytes::from(format!("k{}", k));
+            dbs[crate::router::target_shard(&key, 2)].set(key, Bytes::from("v"), None);
+        }
+        for (i, db) in dbs.iter_mut().enumerate() {
+            rewrite_shard_aof(db, &dir, i).unwrap();
+        }
+
+        // Into the layout: flat files gone, data intact.
+        let prep = |n| prepare_multipart_aof_dir(&dir, n, 0, "appendonlydir", "appendonly.aof");
+        assert_eq!(prep(2).unwrap(), None);
+        assert!(!dir.join("appendonly-0.aof").exists() && !dir.join("appendonly-1.aof").exists());
+        assert!(layout().is_rudis_layout().unwrap());
+        assert_eq!(layout().shard_count().unwrap(), Some(2));
+        assert_eq!(
+            shard_aof_path(&dir, 0),
+            dir.join("appendonlydir/appendonly.aof.1.incr.aof")
+        );
+        assert_eq!(assert_layout_keys_owned(&dir, 2), 50);
+        // Again: nothing to do.
+        assert_eq!(prep(2).unwrap(), None);
+        assert_eq!(layout().manifest().unwrap().max_seq(), 2);
+
+        // A flat file that is a hard link to the layout's (a move cut short)
+        // is a leftover; any other is refused.
+        std::fs::hard_link(shard_aof_path(&dir, 1), dir.join("appendonly-1.aof")).unwrap();
+        assert_eq!(prep(2).unwrap(), None);
+        assert!(!dir.join("appendonly-1.aof").exists());
+        std::fs::write(dir.join("appendonly-1.aof"), SET_A).unwrap();
+        assert!(prep(2).is_err());
+        std::fs::remove_file(dir.join("appendonly-1.aof")).unwrap();
+
+        // A rewrite: the next seq, listed in the manifest, the old file gone.
+        let old = shard_aof_path(&dir, 0);
+        let (keys, new) = rewrite_shard_aof(&mut dbs[0], &dir, 0).unwrap();
+        assert!(keys > 0);
+        assert_eq!(new, dir.join("appendonlydir/appendonly.aof.3.incr.aof"));
+        assert_eq!(shard_aof_path(&dir, 0), new);
+        assert!(!old.exists());
+        assert_eq!(assert_layout_keys_owned(&dir, 2), 50);
+        // A crash between a rewrite's rename and the manifest update leaves
+        // an unlisted file: removed at startup.
+        std::fs::write(dir.join("appendonlydir/appendonly.aof.9.incr.aof"), SET_A).unwrap();
+        assert_eq!(prep(2).unwrap(), None);
+        assert!(!dir.join("appendonlydir/appendonly.aof.9.incr.aof").exists());
+
+        // Another shard count: back to flat files, resharded, into the
+        // layout again.
+        assert_eq!(prep(3).unwrap(), Some(2));
+        assert_eq!(layout().shard_count().unwrap(), Some(3));
+        assert_eq!(assert_layout_keys_owned(&dir, 3), 50);
+        assert!(!dir.join("appendonly-0.aof").exists());
+        assert_eq!(
+            read_aof_shards_manifest(&dir).unwrap(),
+            Some(AofLayout::current(3))
+        );
+
+        // AOF turned on at runtime: the shard's file leaves the manifest.
+        drop_shard_aof(&dir, 2).unwrap();
+        assert_eq!(layout().shard_path(2).unwrap(), None);
+        assert!(!shard_aof_path(&dir, 2).exists());
+        assert_eq!(aof_files_size(&dir, 3), {
+            let a = std::fs::metadata(shard_aof_path(&dir, 0)).unwrap().len();
+            a + std::fs::metadata(shard_aof_path(&dir, 1)).unwrap().len()
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_flat_aof_dir_imports_and_moves_aside_a_multipart_one() {
+        use crate::aof_manifest::ShardAofFiles;
+        let dir = std::env::temp_dir().join(format!("rudis-aof-mp-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut dbs: Vec<ShardDb> = (0..2).map(|_| ShardDb::new(0)).collect();
+        for k in 0..20 {
+            let key = Bytes::from(format!("k{}", k));
+            dbs[crate::router::target_shard(&key, 2)].set(key, Bytes::from("v"), None);
+        }
+        for (i, db) in dbs.iter_mut().enumerate() {
+            rewrite_shard_aof(db, &dir, i).unwrap();
+        }
+        assert_eq!(
+            prepare_multipart_aof_dir(&dir, 2, 0, "appendonlydir", "appendonly.aof").unwrap(),
+            None
+        );
+        // `aof-multipart no` again: the layout is imported into flat files
+        // and moved aside, so turning the option back on can't revive it.
+        crate::aof_manifest::LAYOUTS.write().remove(&dir);
+        reshard_aof_dir(&dir, 2, 0).unwrap();
+        assert!(!dir.join("appendonlydir").exists());
+        assert_eq!(assert_aof_keys_owned(&dir, 2), 20);
+        assert!(
+            !ShardAofFiles::new(dir.join("appendonlydir"), "appendonly.aof")
+                .is_rudis_layout()
+                .unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_reshard_aof_dir_refuses_after_interrupted_swap_or_bad_manifest() {
         let dir =
@@ -7392,8 +7752,9 @@ mod tests {
             .unwrap();
 
         // 2. Perform AOF rewrite
-        let rewritten_count =
-            rewrite_shard_aof(&mut db, &temp_dir, 0).expect("rewrite should succeed");
+        let rewritten_count = rewrite_shard_aof(&mut db, &temp_dir, 0)
+            .expect("rewrite should succeed")
+            .0;
         assert_eq!(rewritten_count, 7);
 
         let aof_file = temp_dir.join("appendonly-0.aof");
@@ -7450,7 +7811,7 @@ mod tests {
             // Populate db with k1 and rewrite
             let mut db = ShardDb::new(6379);
             db.set(Bytes::from("k1"), Bytes::from("v1"), None);
-            let count = rewrite_shard_aof(&mut db, &temp_dir, 0).unwrap();
+            let count = rewrite_shard_aof(&mut db, &temp_dir, 0).unwrap().0;
             assert_eq!(count, 1);
 
             // Switch the writer to the rewritten file and log k2

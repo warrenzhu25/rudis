@@ -35,6 +35,14 @@ pub struct RudisConfig {
     /// `replication::dual_channel_replication`).
     pub dual_channel_replication: bool,
     pub aof_load_truncated: bool,
+    /// `aof-multipart`: keep the shard AOF files in Redis 7's multi-part
+    /// layout (`appenddirname`, a manifest naming one incr file per shard)
+    /// rather than as flat `appendonly-<i>.aof` files. Startup only.
+    pub aof_multipart: bool,
+    /// `appenddirname` (default `appendonlydir`), with `aof-multipart`.
+    pub appenddirname: String,
+    /// `appendfilename` (default `appendonly.aof`), with `aof-multipart`.
+    pub appendfilename: String,
     pub dir: PathBuf,
     pub requirepass: Option<String>,
     pub tls_port: Option<u16>,
@@ -90,6 +98,9 @@ impl Default for RudisConfig {
             cross_shard_strict: false,
             dual_channel_replication: false,
             aof_load_truncated: true,
+            aof_multipart: false,
+            appenddirname: "appendonlydir".to_string(),
+            appendfilename: "appendonly.aof".to_string(),
             dir: PathBuf::from("."),
             requirepass: None,
             tls_port: None,
@@ -674,6 +685,36 @@ impl RudisConfig {
                             ));
                         }
                     };
+                }
+                "aof-multipart" => {
+                    config.aof_multipart = match rest[0].to_lowercase().as_str() {
+                        "yes" => true,
+                        "no" => false,
+                        other => {
+                            return Err(format!(
+                                "Invalid aof-multipart at line {}: '{}' (expected yes|no)",
+                                line_num + 1,
+                                other
+                            ));
+                        }
+                    };
+                }
+                "appenddirname" | "appendfilename" => {
+                    let v = unquote(rest[0]).to_string();
+                    // As Redis: a bare name, in `dir`.
+                    if v.is_empty() || v.contains('/') || v == "." || v == ".." {
+                        return Err(format!(
+                            "Invalid {} at line {}: '{}' (must be a plain file name)",
+                            directive,
+                            line_num + 1,
+                            v
+                        ));
+                    }
+                    if directive == "appenddirname" {
+                        config.appenddirname = v;
+                    } else {
+                        config.appendfilename = v;
+                    }
                 }
                 "dir" => {
                     // Strip quotes if present

@@ -256,7 +256,7 @@ fn startup_has_dataset(
 ) -> bool {
     if aof_config.enabled {
         (0..num_shards).any(|i| {
-            std::fs::metadata(aof_config.dir.join(format!("appendonly-{}.aof", i)))
+            std::fs::metadata(crate::aof::shard_aof_path(&aof_config.dir, i))
                 .is_ok_and(|m| m.len() > 0)
         })
     } else {
@@ -303,7 +303,7 @@ fn spawn_startup_load(
     let (tx, rx) = flume::bounded(1);
     let aof_enabled = aof_config.enabled;
     let rdb_path = aof_config.dir.join(crate::config::dbfilename(base_port));
-    let aof_path = aof_config.dir.join(format!("appendonly-{}.aof", shard_id));
+    let aof_path = crate::aof::shard_aof_path(&aof_config.dir, shard_id);
     std::thread::Builder::new()
         .name(format!("rudis-load-{}", shard_id))
         .stack_size(SHARD_THREAD_STACK_SIZE)
@@ -386,7 +386,7 @@ async fn open_aof_writer(
     if !aof_config.enabled {
         return None;
     }
-    let aof_path = aof_config.dir.join(format!("appendonly-{}.aof", shard_id));
+    let aof_path = crate::aof::shard_aof_path(&aof_config.dir, shard_id);
     match crate::aof::AofWriter::open(aof_path).await {
         Ok(mut w) => {
             w.set_progress(crate::aof::aof_progress(base_port, shard_id));
@@ -2939,9 +2939,10 @@ pub(crate) async fn set_shard_appendonly(
         return Ok(());
     }
     if on {
-        let target = dir.join(format!("appendonly-{}.aof", shard_id));
-        let incr = dir.join(format!("appendonly-{}.aof.incr", shard_id));
-        let _ = std::fs::remove_file(&target);
+        crate::aof::drop_shard_aof(dir, shard_id)
+            .map_err(|e| format!("shard {shard_id}: removing the stale AOF: {e}"))?;
+        let target = crate::aof::shard_aof_path(dir, shard_id);
+        let incr = crate::aof::shard_aof_incr_path(dir, shard_id);
         let mut w = crate::aof::AofWriter::open_incremental(target, incr)
             .await
             .map_err(|e| format!("shard {shard_id}: opening the AOF: {e}"))?;

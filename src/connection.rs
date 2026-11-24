@@ -4822,6 +4822,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .unwrap_or_default(),
         )
     };
+    let layout = crate::aof_manifest::layout_for(&router.db_dir);
     let app = if router.aof().is_some() {
         "yes".to_string()
     } else {
@@ -4918,7 +4919,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 117] = [
+    let all_configs: [(&str, String); 120] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -5154,6 +5155,25 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         ("client-output-buffer-limit", obuf),
         ("requirepass", pass),
         ("appendonly", app),
+        (
+            "aof-multipart",
+            if layout.is_some() { "yes" } else { "no" }.to_string(),
+        ),
+        (
+            "appenddirname",
+            layout
+                .as_ref()
+                .and_then(|l| l.dir.file_name())
+                .map_or("appendonlydir".to_string(), |n| {
+                    n.to_string_lossy().into_owned()
+                }),
+        ),
+        (
+            "appendfilename",
+            layout
+                .as_ref()
+                .map_or("appendonly.aof".to_string(), |l| l.name.clone()),
+        ),
         (
             "appendfsync",
             crate::aof::appendfsync_name(router.base_port).to_string(),

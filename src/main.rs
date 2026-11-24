@@ -532,8 +532,29 @@ fn main() {
         dir: server_config.dir.clone(),
         fsync_every_sec: server_config.appendfsync_every_sec,
     };
+    if server_config.aof_multipart && !aof_config.enabled {
+        // For AOF turned on at runtime; its files replace whatever is there.
+        rudis::aof_manifest::register_layout(
+            &aof_config.dir,
+            rudis::aof_manifest::ShardAofFiles::new(
+                aof_config.dir.join(&server_config.appenddirname),
+                &server_config.appendfilename,
+            ),
+        );
+    }
     if aof_config.enabled {
-        match rudis::aof::reshard_aof_dir(&aof_config.dir, num_shards, port) {
+        let prepared = if server_config.aof_multipart {
+            rudis::aof::prepare_multipart_aof_dir(
+                &aof_config.dir,
+                num_shards,
+                port,
+                &server_config.appenddirname,
+                &server_config.appendfilename,
+            )
+        } else {
+            rudis::aof::reshard_aof_dir(&aof_config.dir, num_shards, port)
+        };
+        match prepared {
             Ok(Some(old)) => log_notice!(
                 "AOF files in {:?} were written with a different shard layout ({} shards); \
                  resharded them for {} shards (originals kept in an aof-reshard-backup-* dir)",

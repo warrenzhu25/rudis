@@ -5,6 +5,17 @@ All notable changes to Rudis are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Before 1.0, a minor version may change behavior
 or the persistence format; such changes are called out under **Breaking**.
 
+## [Unreleased]
+
+### Added
+
+- `aof-multipart yes` (startup option, off by default): the per-shard AOF files are kept in
+  Redis 7's multi-part layout, `appendonlydir/` with an `appendonly.aof.manifest` naming one
+  incr file per shard (`appenddirname` and `appendfilename` are honoured). Redis and Valkey
+  can load the directory directly. Existing flat `appendonly-<i>.aof` files move into the
+  layout at startup; a thread-count change reshards as before; turning the option off imports
+  the layout back into flat files.
+
 ## [0.1.0] - 2026-11-23
 
 The first tagged release.
