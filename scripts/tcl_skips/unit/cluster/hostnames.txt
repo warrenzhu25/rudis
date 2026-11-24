@@ -1,0 +1,9 @@
+# unit/cluster/hostnames tests that don't apply to rudis.
+#
+# rudis's cluster bus is a text protocol, not Redis's binary one: there is
+# no binary PING extension to send without its null terminator.
+PING with hostname extension missing null terminator is rejected
+# Holds two nodes in the handshake phase with DEBUG DROP-CLUSTER-PACKET-FILTER,
+# which drops Redis's binary bus packets by type; rudis accepts the command
+# but has no packet types to filter, so the handshake completes.
+Verify the nodes configured with prefer hostname only show hostname for new nodes

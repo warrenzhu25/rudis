@@ -59,7 +59,7 @@ container's seccomp profile.
 
 ## How it's tested
 
-- **Redis's own test suite.** 81 of the Redis/Valkey TCL test suites (data types, scripting,
+- **Redis's own test suite.** 83 of the Redis/Valkey TCL test suites (data types, scripting,
   ACLs, replication, persistence, cluster, client eviction, ...) gate every merge, run by
   [`scripts/ci_local.sh`](scripts/ci_local.sh) on a dedicated host. GitHub Actions runs the core
   suites on every push and the timing-heavy rest nightly, since a shared 4-vCPU runner makes

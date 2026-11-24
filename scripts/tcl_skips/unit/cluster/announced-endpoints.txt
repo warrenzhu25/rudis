@@ -1,0 +1,5 @@
+# unit/cluster/announced-endpoints tests rudis doesn't pass yet.
+#
+# Known gap: rudis can't change its listening port at runtime (CONFIG SET
+# port); it is set at startup.
+CONFIG SET port updates cluster-announced port
