@@ -19,6 +19,9 @@ TEST_DIR="${RUDIS_TCL_DIR:-$REPO_ROOT/target/redis-tests-integ}"
 SUITES="${1:?usage: $0 suite[,suite...]}"
 CLIENTS="${CLIENTS:-1}"
 THREADS="${RUDIS_THREADS:-4}"
+# Extra rudis arguments for every server the suites start, e.g.
+# RUDIS_SERVER_ARGS="--aof-multipart yes".
+SERVER_ARGS="${RUDIS_SERVER_ARGS:-}"
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     (cd "$REPO_ROOT" && cargo build --release) || exit 1
@@ -82,7 +85,7 @@ cat > "$TEST_DIR/src/redis-server" <<EOF
 # redis-server. Extra redis-server style "--name value" overrides are passed
 # through as config lines appended to a copy of the config file.
 if [ \$# -eq 0 ] || [ "\${1#-}" != "\$1" ]; then
-    exec "$REPO_ROOT/target/release/rudis" --threads $THREADS --no-pin "\$@"
+    exec "$REPO_ROOT/target/release/rudis" --threads $THREADS --no-pin $SERVER_ARGS "\$@"
 fi
 conf="\$1"; shift
 if [ \$# -gt 0 ]; then
@@ -98,7 +101,7 @@ if [ \$# -gt 0 ]; then
 fi
 echo " PID: \$\$ (rudis wrapper)"
 echo "Server initialized"
-exec "$REPO_ROOT/target/release/rudis" --config "\$conf" --threads $THREADS --no-pin
+exec "$REPO_ROOT/target/release/rudis" --config "\$conf" --threads $THREADS --no-pin $SERVER_ARGS
 EOF
 chmod +x "$TEST_DIR/src/redis-server"
 
