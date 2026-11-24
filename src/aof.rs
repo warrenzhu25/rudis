@@ -4148,199 +4148,22 @@ fn replay_script(script: &str, keys: &[bytes::Bytes], args: &[bytes::Bytes], db:
 /// tokens, where a token may be `"double quoted"` (with `\"`, `\\`, `\n`,
 /// `\r`, `\t`, `\xHH` escapes) or `'single quoted'` (with `\'`). Returns
 /// `None` for unbalanced quotes or a closing quote not followed by a space.
-fn split_manifest_args(line: &str) -> Option<Vec<String>> {
-    let b = line.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    loop {
-        while i < b.len() && b[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i == b.len() {
-            return Some(out);
-        }
-        let mut tok: Vec<u8> = Vec::new();
-        match b[i] {
-            b'"' => {
-                i += 1;
-                loop {
-                    match *b.get(i)? {
-                        b'"' => break,
-                        b'\\' => {
-                            let c = *b.get(i + 1)?;
-                            if c == b'x'
-                                && let Some(hex) = b.get(i + 2..i + 4)
-                                && let Ok(v) =
-                                    u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16)
-                            {
-                                tok.push(v);
-                                i += 4;
-                                continue;
-                            }
-                            tok.push(match c {
-                                b'n' => b'\n',
-                                b'r' => b'\r',
-                                b't' => b'\t',
-                                b'b' => 8,
-                                b'a' => 7,
-                                other => other,
-                            });
-                            i += 2;
-                        }
-                        c => {
-                            tok.push(c);
-                            i += 1;
-                        }
-                    }
-                }
-                i += 1;
-                if b.get(i).is_some_and(|c| !c.is_ascii_whitespace()) {
-                    return None;
-                }
-            }
-            b'\'' => {
-                i += 1;
-                loop {
-                    match *b.get(i)? {
-                        b'\'' => break,
-                        b'\\' if b.get(i + 1) == Some(&b'\'') => {
-                            tok.push(b'\'');
-                            i += 2;
-                        }
-                        c => {
-                            tok.push(c);
-                            i += 1;
-                        }
-                    }
-                }
-                i += 1;
-                if b.get(i).is_some_and(|c| !c.is_ascii_whitespace()) {
-                    return None;
-                }
-            }
-            _ => {
-                while i < b.len() && !b[i].is_ascii_whitespace() {
-                    tok.push(b[i]);
-                    i += 1;
-                }
-            }
-        }
-        out.push(String::from_utf8(tok).ok()?);
-    }
-}
-
 /// Parses a Redis 7+ `appendonly.aof.manifest` file and returns the ordered
 /// list of AOF files to load (base file first, then incremental files ordered
 /// by `seq`).
 fn parse_redis_aof_manifest(manifest_path: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
     let parent = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let content = std::fs::read_to_string(manifest_path)?;
-    if content.is_empty() {
-        return Err(invalid(format!(
-            "Found an empty AOF manifest in {:?}",
-            manifest_path
-        )));
-    }
-    let mut base_files: Vec<(u64, PathBuf)> = Vec::new();
-    let mut incr_files: Vec<(u64, PathBuf)> = Vec::new();
-    let mut saw_any_entry = false;
-    for raw_line in content.lines() {
-        if raw_line.len() > 1024 {
-            return Err(invalid(format!(
-                "The AOF manifest file contains too long line in {:?}",
-                manifest_path
-            )));
-        }
-        let line = raw_line.trim();
-        if line.is_empty() {
-            return Err(invalid(format!(
-                "Invalid AOF manifest file format in {:?}: blank line",
-                manifest_path
-            )));
-        }
-        if line.starts_with('#') {
-            continue;
-        }
-        let bad_line = || {
-            invalid(format!(
-                "Invalid AOF manifest file format in {:?}: {:?}",
-                manifest_path, line
-            ))
-        };
-        let parts = split_manifest_args(line).ok_or_else(bad_line)?;
-        if !parts.len().is_multiple_of(2) {
-            return Err(bad_line());
-        }
-        // `key value` pairs in any order; unknown keys are ignored, as in Redis.
-        let (mut file_name, mut seq, mut kind) = (None, None, None);
-        for pair in parts.chunks(2) {
-            match pair[0].as_str() {
-                "file" => file_name = Some(pair[1].as_str()),
-                "seq" => seq = Some(pair[1].as_str()),
-                "type" => kind = Some(pair[1].as_str()),
-                _ => {}
-            }
-        }
-        let (Some(file_name), Some(seq), Some(kind)) = (file_name, seq, kind) else {
-            return Err(bad_line());
-        };
-        let seq: u64 = match seq.parse::<u64>() {
-            Ok(s) if s > 0 => s,
-            _ => return Err(bad_line()),
-        };
-        // Like Redis: entries are file names inside the AOF dir, never paths.
-        if file_name.is_empty()
-            || file_name == "."
-            || file_name == ".."
-            || file_name.contains('/')
-            || file_name.contains('\\')
-        {
-            return Err(invalid(format!(
-                "File can't be a path, just a filename, in {:?}: {:?}",
-                manifest_path, file_name
-            )));
-        }
-        let file_path = parent.join(file_name);
-        saw_any_entry = true;
-        match kind {
-            "b" => {
-                if !base_files.is_empty() {
-                    return Err(invalid(format!(
-                        "Found duplicate base file information in {:?}",
-                        manifest_path
-                    )));
-                }
-                base_files.push((seq, file_path));
-            }
-            "i" => {
-                if let Some(&(prev_seq, _)) = incr_files.last()
-                    && seq <= prev_seq
-                {
-                    return Err(invalid(format!(
-                        "Found a non-monotonic sequence number in {:?}: {:?}",
-                        manifest_path, line
-                    )));
-                }
-                incr_files.push((seq, file_path));
-            }
-            "h" => {} // history file: ignored by Redis on load
-            other => {
-                return Err(invalid(format!(
-                    "Unknown AOF file type '{}' in {:?}: {:?}",
-                    other, manifest_path, line
-                )));
-            }
-        }
-    }
-    if !saw_any_entry {
-        return Err(invalid(format!(
-            "Found an empty AOF manifest in {:?}",
-            manifest_path
-        )));
-    }
-    let mut out: Vec<PathBuf> = base_files.into_iter().map(|(_, p)| p).collect();
-    out.extend(incr_files.into_iter().map(|(_, p)| p));
+    let manifest = crate::aof_manifest::AofManifest::parse(&content).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{e} in {manifest_path:?}"),
+        )
+    })?;
+    let out: Vec<PathBuf> = manifest
+        .load_order()
+        .map(|f| parent.join(&f.name))
+        .collect();
     for p in &out {
         if !p.exists() {
             return Err(std::io::Error::new(
@@ -8444,15 +8267,15 @@ mod tests {
     #[test]
     fn test_redis_aof_manifest_parsing() {
         assert_eq!(
-            split_manifest_args(r#"file "a b.aof" seq 1 type 'i'"#).unwrap(),
+            crate::aof_manifest::split_args(r#"file "a b.aof" seq 1 type 'i'"#).unwrap(),
             ["file", "a b.aof", "seq", "1", "type", "i"]
         );
         assert_eq!(
-            split_manifest_args(r#"file "q\"\x41" seq 2"#).unwrap(),
+            crate::aof_manifest::split_args(r#"file "q\"\x41" seq 2"#).unwrap(),
             ["file", "q\"A", "seq", "2"]
         );
-        assert!(split_manifest_args(r#"file "unterminated"#).is_none());
-        assert!(split_manifest_args(r#"file "a"b seq 1"#).is_none());
+        assert!(crate::aof_manifest::split_args(r#"file "unterminated"#).is_none());
+        assert!(crate::aof_manifest::split_args(r#"file "a"b seq 1"#).is_none());
 
         let dir = std::env::temp_dir().join(format!("rudis-aof-manifest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

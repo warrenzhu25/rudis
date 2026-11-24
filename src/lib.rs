@@ -8,6 +8,7 @@ pub mod acl_categories;
 pub mod agent;
 pub mod allocator;
 pub mod aof;
+pub mod aof_manifest;
 
 pub mod block;
 pub mod cluster;
