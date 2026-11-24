@@ -235,6 +235,8 @@ def main():
                     help="fast: failover every 60 s, reshard 120 s, replica restart 180 s, "
                          "save 300 s (about a day of normal-pace chaos events in 2-3 h); "
                          "explicit --*-every flags still win")
+    ap.add_argument("--server-args", default="",
+                    help='extra rudis arguments for every node, e.g. "--aof-multipart yes"')
     a = ap.parse_args()
     if a.chaos == "fast":
         given = set(sys.argv)
@@ -277,7 +279,7 @@ def main():
             "--port", str(port), "--threads", str(a.threads), "--no-pin", "--dir", d,
             "--cluster-enabled", "yes", "--appendonly", "yes", "--save", "",
             "--enable-debug-command", "yes", "--logfile", os.path.join(a.dir, f"node-{port}.log"),
-        ]
+        ] + a.server_args.split()
         procs[port] = subprocess.Popen(
             args, stdout=subprocess.DEVNULL, stderr=open(os.path.join(a.dir, f"node-{port}.err"), "a"))
         end = time.time() + 60
@@ -636,6 +638,8 @@ def main():
 def write_report(a, samples_path, events, anomalies, final):
     rows = [json.loads(l) for l in open(samples_path)] if os.path.exists(samples_path) else []
     lines = [f"# Cluster soak report ({len(rows)} samples, {a.hours} h planned)", ""]
+    if a.server_args:
+        lines += [f"Node arguments added: `{a.server_args}`", ""]
     if rows:
         # The cluster fills its keyspace in the first ~15 min: compare
         # memory and latency from after a 30 min warmup, not the fill.
