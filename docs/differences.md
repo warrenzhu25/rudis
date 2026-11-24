@@ -6,14 +6,14 @@ This document summarizes the architectural, operational, and semantic difference
 
 ## 1. High-Level Comparison
 
-| Feature / Property | Redis 7.2 | Dragonfly v1.39 | Rudis |
+| Feature / Property | Redis 7.2 | Dragonfly | Rudis |
 | :--- | :--- | :--- | :--- |
 | **Language** | C99 | C++20 | **Rust (edition 2024, toolchain pinned to 1.99 in `rust-toolchain.toml`)** |
-| **Concurrency Model** | Single-threaded event loop (I/O threads in 6.0+) | Shared-nothing with Boost.Fibers and epoll | **Shared-nothing Thread-Per-Core on Linux `io_uring` (Monoio)** |
+| **Concurrency Model** | Single-threaded event loop (I/O threads in 6.0+) | Shared-nothing with fibers on `io_uring` (epoll fallback, `--force_epoll`) | **Shared-nothing Thread-Per-Core on Linux `io_uring` (Monoio)** |
 | **Ingress Load Balancing** | Single listener socket | Single listener socket + thread dispatch | **Kernel `SO_REUSEPORT` 4-tuple balancing** |
 | **Kernel Bypass & Hardware** | None (standard libc sockets) | None (standard libc sockets) | **AF_XDP and `SO_ZEROCOPY` code paths exist but are not wired onto the live network path; kernel TLS offload is not implemented (TLS is userspace `rustls` only) — see [architecture.md](architecture.md) and [design/10_kernel_bypass_xdp.md](design/10_kernel_bypass_xdp.md)** |
 | **Memory Allocation** | jemalloc (global heap) | Custom DashTable + Mimalloc | **Thread-local `RudisTable` + `tikv-jemallocator` (jemalloc) as the process global allocator** |
-| **Snapshots (`BGSAVE`)** | Process `fork()` with Linux CoW | Fiber-level snapshot iteration | **No `fork()`, but blocking sequential per-shard `std::fs` I/O — not `io_uring`-accelerated. Tiered values are read back into the RDB — see [rdbsave.md](rdbsave.md)** |
+| **Snapshots (`BGSAVE`)** | Process `fork()` with Linux CoW | Fiber-level snapshot iteration | **No `fork()`: every shard saves from a copy-on-write image started at the same moment, in steps of ~1 ms between its other clients; CRC, writes and fsync run on a writer thread (plain `std::fs`, not `io_uring`). Tiered values are read back into the RDB — see [rdbsave.md](rdbsave.md)** |
 | **Multi-Core Replication** | Single TCP connection (`PSYNC`) | Per-shard parallel flows (`DFLY FLOW`) | **Rudis-to-Rudis replication uses single-connection `PSYNC`, same as Redis. `DFLY FLOW` exists master-side only, to interoperate with a Dragonfly-protocol client — Rudis replicas never use it. See [replication.md](replication.md)** |
 | **NVMe Tiered Storage** | None (pure in-memory) | SmallBins tiering | **3-State Lifecycle + SmallBins 4KB + Direct I/O (`O_DIRECT`)** |
 | **Dual-Protocol Support** | RESP2 / RESP3 only | Redis + Memcached gateway | **Redis RESP2 (full) / RESP3 (output-side typed replies via `HELLO 3`) + Memcached Text Protocol on the same port** |
@@ -139,7 +139,11 @@ tests for them are skipped (`scripts/tcl_skips/unit/info.txt`).
   child still has them), and a `SWAPDB` during a save leaves the file as of its start.
 
 ### Turning AOF On at Runtime
-* `CONFIG SET appendonly yes` works as in Redis (writes logged at once, initial AOF written by a background rewrite, `SHUTDOWN` refused until it is done). Until then the writes go to `appendonly-<shard>.aof.incr` and no `appendonly-<shard>.aof` exists, so a crash in between never leaves an AOF without the dataset. Redis 7 tracks this in its multi-part AOF manifest, which rudis doesn't have.
+* `CONFIG SET appendonly yes` works as in Redis (writes logged at once, initial AOF written by a background rewrite, `SHUTDOWN` refused until it is done). Until then the writes go to `appendonly-<shard>.aof.incr` and no `appendonly-<shard>.aof` exists, so a crash in between never leaves an AOF without the dataset. Redis 7 tracks this in its multi-part AOF manifest; with `aof-multipart yes` (opt-in, below) rudis takes the shard's file out of its manifest instead.
+
+### AOF Files
+* **Redis 7**: one multi-part AOF in `appenddirname`: a base file and incr files listed in a manifest.
+* **Rudis**: one AOF per shard, `appendonly-<shard>.aof` in `dir`, plus `appendonly.shards` recording the shard count. A Redis AOF directory or single file found at startup is imported. With `aof-multipart yes` (startup option, off by default) the shard files live in Redis 7's layout instead: `appenddirname` with a manifest naming one incr file per shard (tagged `shard <i>`, which Redis and Valkey ignore), so Redis or Valkey can load the directory as is. There is no separate base file yet: each shard's rewrite replaces its own incr file.
 
 ### Turning AOF Off During a Rewrite
 * `CONFIG SET appendonly no` during an AOF rewrite stops logging at once, as in Redis, but the rewrite runs to its end (its result is not used); Redis kills the rewriting child. A `BGREWRITEAOF` meanwhile gets "Background append only file rewriting already in progress" until it ends.

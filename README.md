@@ -69,8 +69,9 @@ container's seccomp profile.
   while failovers, live resharding, `kill -9` restarts and snapshots happen under it. Each
   segment checks that no acknowledged write was lost and that every replica matches its master
   ([`scripts/soak_cluster.py`](scripts/soak_cluster.py)).
-- **A performance gate on every commit.** An A/B run of `memtier_benchmark` against the
-  previous `main` blocks a regression.
+- **A performance gate before every merge.** An A/B run of `memtier_benchmark` against the
+  current `main` ([`scripts/check_perf_regression.py`](scripts/check_perf_regression.py)) has to
+  pass before a change to the server lands; GitHub also runs a benchmark nightly.
 - **Fuzzing** of every untrusted input: the RESP parser, `RESTORE` payloads, RDB and AOF files,
   and the cluster bus.
 
@@ -136,8 +137,8 @@ container's seccomp profile.
                         ▼                                     ▼
          ┌──────────────────────────────┐      ┌──────────────────────────────┐
          │ Replication (PSYNC / DFLY)   │      │ RDB Snapshot / AOF           │
-         │ • Single-stream PSYNC (rudis)│      │ • Sequential per-shard save  │
-         │ • DFLY FLOW for DF clients   │      │ • No fork(); blocking file IO│
+         │ • Single-stream PSYNC (rudis)│      │ • No fork(): CoW shard images│
+         │ • DFLY FLOW for DF clients   │      │ • ~1 ms steps, writer thread │
          └──────────────────────────────┘      └──────────────────────────────┘
 ```
 
@@ -728,10 +729,13 @@ links go to the corresponding source-verified subsystem specification.
 
 ## Redis/Valkey TCL Compatibility Suite
 
-Rudis is continuously validated against **49 official Redis/Valkey TCL test suites** in `tests/redis-tests` via [`scripts/run_redis_test_suite.sh`](scripts/run_redis_test_suite.sh):
+Rudis is validated against **83 official Redis/Valkey TCL test suites**: the 49 core suites
+below, which run against one server via
+[`scripts/run_redis_test_suite.sh`](scripts/run_redis_test_suite.sh), plus 34 replication,
+persistence and cluster suites that start their own servers:
 
 ```bash
-# Run all 49 core TCL suites
+# Run the 49 core TCL suites
 ./scripts/run_redis_test_suite.sh 16379 all
 
 # Run a specific suite or comma-separated list of suites
@@ -746,10 +750,17 @@ Rudis is continuously validated against **49 official Redis/Valkey TCL test suit
 | **Auth, ACLs & Protocol** | `unit/auth`, `unit/acl`, `unit/acl-v2`, `unit/protocol`, `unit/quit`, `unit/limits`, `unit/obuf-limits`, `unit/replybufsize`, `unit/querybuf` |
 | **Introspection & Telemetry** | `unit/info`, `unit/info-command`, `unit/introspection`, `unit/introspection-2`, `unit/slowlog`, `unit/latency-monitor`, `unit/pause`, `unit/other`, `unit/printver` |
 
-Suites that start their own servers (replication, persistence, corrupt payloads) run through
-[`scripts/run_redis_integration_suite.sh`](scripts/run_redis_integration_suite.sh); CI runs
-`integration/{replication-2,replication-3,replication-4,replication-psync,block-repl,psync2,psync2-pingoff,psync2-master-restart,psync2-reg,failover,shutdown,aof-race,convert-ziplist-hash-on-load,convert-ziplist-zset-on-load,rdb,corrupt-dump,corrupt-dump-fuzzer}`
-and `unit/{wait,violations}`. Tests that don't apply to rudis (no `fork()`, no Unix socket, ...)
+Suites that start their own servers run through
+[`scripts/run_redis_integration_suite.sh`](scripts/run_redis_integration_suite.sh):
+
+| Category | Suites (34) |
+| :--- | :--- |
+| **Replication** (11) | `integration/{replication-2,replication-3,replication-4,replication-psync,block-repl,psync2,psync2-pingoff,psync2-master-restart,psync2-reg,failover,shutdown}` |
+| **Persistence** (11) | `unit/{aofrw,client-eviction,wait,violations}`, `integration/{aof-race,convert-ziplist-hash-on-load,convert-ziplist-zset-on-load,rdb,corrupt-dump,corrupt-dump-fuzzer,logging}` |
+| **Cluster** (12) | `unit/cluster/{failure-marking,internal-secret,multi-slot-operations,misc,scripting,sharded-pubsub,slot-ownership,replica-migration,human-announced-nodename,hostnames,announced-endpoints}`, `integration/dismiss-mem` |
+
+All 83 gate every merge through [`scripts/ci_local.sh`](scripts/ci_local.sh). GitHub Actions
+runs the core suites on every push and the other 34 nightly. Tests that don't apply to rudis (no `fork()`, no Unix socket, ...)
 and known gaps are listed, each with its reason, in [`scripts/tcl_skips/`](scripts/tcl_skips/);
 [`scripts/tcl_patches/`](scripts/tcl_patches/) adapts a suite where rudis's behavior differs on
 purpose (it refuses corrupt `RESTORE` payloads up front instead of crashing on them later).
