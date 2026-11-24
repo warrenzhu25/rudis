@@ -225,8 +225,12 @@ def wait_port(port, proc, secs=30):
 
 
 def cpus(spec):
-    lo, hi = (int(x) for x in spec.split("-"))
-    return list(range(lo, hi + 1))
+    """CPUs of a taskset-style list: "24-31", or "24-31,56-63"."""
+    out = []
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        out.extend(range(int(lo), int(hi or lo) + 1))
+    return out
 
 
 def main():

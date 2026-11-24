@@ -224,11 +224,13 @@ full_ci() { # rev
     step "release test build" build_release_tests
     step "coverage build" build_coverage
     # The test groups, at the same time.
-    lane release 0-5,32-37 lane_release
-    lane coverage 6-11,38-43 lane_coverage
-    lane tcl-core 12-17,44-49 lane_tcl_core
-    lane tcl-repl 18-23,50-55 lane_tcl_repl
-    lane tcl-persist-cluster 24-31,56-63 lane_tcl_persist_cluster
+    # Physical cores 0-23 and their siblings; 24-31 (CCX 3) are the
+    # continuous soak's.
+    lane release 0-3,32-35 lane_release
+    lane coverage 4-9,36-41 lane_coverage
+    lane tcl-core 10-14,42-46 lane_tcl_core
+    lane tcl-repl 15-19,47-51 lane_tcl_repl
+    lane tcl-persist-cluster 20-23,52-55 lane_tcl_persist_cluster
     wait_lanes
     echo "CI PASSED ($SHA, $((SECONDS - t0))s)" | tee -a "$LOG"
 }
@@ -290,25 +292,6 @@ commit_checks() { # sha
     fi
 }
 
-# A continuous soak (scripts/soak_continuous.sh) needs the same cores as the
-# perf A/B and makes the host noisy: pause it for the run, ending its
-# current segment (which still writes its report).
-SOAK_ROOT="${SOAK_ROOT:-$HOME/soak-runs/continuous}"
-pause_soak() {
-    local pidf="$SOAK_ROOT/segment.pid" pid
-    [ -d "$SOAK_ROOT" ] || return 0
-    touch "$SOAK_ROOT/PAUSE"
-    trap 'rm -f "$SOAK_ROOT/PAUSE"' EXIT
-    pid=$(cat "$pidf" 2>/dev/null) || return 0
-    kill -0 "$pid" 2>/dev/null || return 0
-    echo "== pausing the continuous soak (segment pid $pid)"
-    kill -TERM "$pid" 2>/dev/null
-    for _ in $(seq 1 120); do
-        kill -0 "$pid" 2>/dev/null || return 0
-        sleep 5
-    done
-    echo "   the soak segment did not stop within 10 min; continuing anyway" >&2
-}
 # What a series needs, from what it changes (see agent.md, Rule 4):
 # "docs" (only *.md, docs/, LICENSE: nothing can break), "workflows" (only
 # those and .github/: the YAML must parse), or "full". CI_FULL=1 forces
@@ -347,7 +330,6 @@ if [ "${1:-}" = --series ] && [ $# -eq 3 ]; then
     esac
 fi
 
-pause_soak
 
 case "${1:-}" in
     --series)

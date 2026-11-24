@@ -215,7 +215,9 @@ def main():
     ap.add_argument("--hours", type=float, default=24)
     ap.add_argument("--interval", type=int, default=60, help="seconds between samples")
     ap.add_argument("--dir", required=True, help="working directory (wiped)")
-    ap.add_argument("--cores", default="16-31")
+    # Physical cores 24-31 and their SMT siblings: CCX 3, which local CI's
+    # lanes and the perf A/B (CPUs 0-23 and their siblings) leave free.
+    ap.add_argument("--cores", default="24-31,56-63")
     # Bus ports are port + 10000: keep them below the ephemeral range
     # (32768+ on Linux), where an outgoing connection can hold one and a
     # node fails to start or restart with "Address already in use".

@@ -11,9 +11,10 @@
 # $ROOT/summary.log; each segment's full report stays in its directory.
 # Touch $ROOT/STOP to end after the current segment.
 #
-# scripts/ci_local.sh pauses it: it creates $ROOT/PAUSE and interrupts the
-# running segment (which still writes its report), since CI's perf A/B
-# needs the cores and a quiet host; segments resume once PAUSE is gone.
+# Segments run on physical cores 24-31 and their SMT siblings (CCX 3; the
+# soak_cluster.py default), which local CI and the perf A/B leave alone, so
+# CI no longer interrupts them. Creating $ROOT/PAUSE still holds the next
+# segment back (e.g. for a full benchmark run), until it is removed.
 set -uo pipefail
 
 SEG_HOURS="${1:-6}"

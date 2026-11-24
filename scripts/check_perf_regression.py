@@ -445,19 +445,31 @@ AB_DEGRADED_FRAC = 0.75
 BASELINE_CACHE = "/tmp/rudis_baseline_bins"
 
 
-def busy_cpus(window=2.0):
-    """CPUs' worth of non-idle time across the host over `window` seconds,
-    from /proc/stat. (The load average would still count our own previous
+# The CPUs the A/B uses: client 0-15, server from 16. Only these must be
+# quiet; the continuous soak runs on 24-31 and 56-63, outside them.
+GATE_CPUS = range(0, 24)
+
+
+def busy_cpus(window=2.0, cpus=GATE_CPUS):
+    """CPUs' worth of non-idle time on `cpus` over `window` seconds, from
+    /proc/stat. (The load average would still count our own previous
     benchmark run for minutes.)"""
+    want = {f"cpu{c}" for c in cpus}
+
     def snap():
+        busy = total = 0
         with open("/proc/stat") as f:
-            v = [int(x) for x in f.readline().split()[1:]]
-        idle = v[3] + v[4]
-        return sum(v) - idle, sum(v)
+            for line in f:
+                parts = line.split()
+                if parts and parts[0] in want:
+                    v = [int(x) for x in parts[1:]]
+                    busy += sum(v) - (v[3] + v[4])
+                    total += sum(v)
+        return busy, total
     b0, t0 = snap()
     time.sleep(window)
     b1, t1 = snap()
-    return (b1 - b0) / max(1, t1 - t0) * (os.cpu_count() or 1)
+    return (b1 - b0) / max(1, t1 - t0) * len(want)
 
 
 def wait_quiet(max_busy, timeout=180.0):
