@@ -335,6 +335,159 @@ impl AofManifest {
     }
 }
 
+/// rudis's per-shard AOF files in Redis 7's layout: one incr file per
+/// shard in `dir` (`appenddirname`), named `<name>.<seq>.incr.aof` and
+/// tagged `shard <i>` in the manifest. Manifest updates (a shard's rewrite
+/// replacing its file, from any shard's thread) are serialized per
+/// directory and written crash-safely.
+#[derive(Clone, Debug)]
+pub struct ShardAofFiles {
+    pub dir: PathBuf,
+    pub name: String,
+}
+
+/// Serializes manifest read-modify-writes per AOF directory.
+fn dir_lock(dir: &Path) -> std::sync::Arc<parking_lot::Mutex<()>> {
+    type Locks = parking_lot::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Arc<parking_lot::Mutex<()>>>,
+    >;
+    static LOCKS: std::sync::LazyLock<Locks> = std::sync::LazyLock::new(Default::default);
+    LOCKS.lock().entry(dir.to_path_buf()).or_default().clone()
+}
+
+impl ShardAofFiles {
+    pub fn new(dir: PathBuf, name: &str) -> Self {
+        Self {
+            dir,
+            name: name.to_string(),
+        }
+    }
+
+    /// The manifest, or an empty one if there is none yet.
+    pub fn manifest(&self) -> std::io::Result<AofManifest> {
+        Ok(AofManifest::load(&self.dir, &self.name)?.unwrap_or_default())
+    }
+
+    /// Whether the manifest exists and every incr file in it belongs to a
+    /// shard: a directory rudis wrote, rather than one Redis wrote.
+    pub fn is_rudis_layout(&self) -> std::io::Result<bool> {
+        Ok(AofManifest::load(&self.dir, &self.name)?
+            .is_some_and(|m| !m.incr.is_empty() && m.incr.iter().all(|f| f.shard.is_some())))
+    }
+
+    /// The shard count the manifest records (its highest shard tag + 1).
+    pub fn shard_count(&self) -> std::io::Result<Option<usize>> {
+        Ok(self
+            .manifest()?
+            .incr
+            .iter()
+            .filter_map(|f| f.shard)
+            .max()
+            .map(|m| m + 1))
+    }
+
+    /// Each of shards `0..n`'s incr file, adding entries (and empty files)
+    /// for shards that have none.
+    pub fn ensure_shards(&self, n: usize) -> std::io::Result<Vec<PathBuf>> {
+        let lock = dir_lock(&self.dir);
+        let _g = lock.lock();
+        std::fs::create_dir_all(&self.dir)?;
+        let mut m = self.manifest()?;
+        let mut changed = false;
+        let mut paths = Vec::with_capacity(n);
+        for shard in 0..n {
+            let path = match m.incr.iter().find(|f| f.shard == Some(shard)) {
+                Some(f) => self.dir.join(&f.name),
+                None => {
+                    let seq = m.max_seq() + 1;
+                    let name = incr_name(&self.name, seq);
+                    let path = self.dir.join(&name);
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)?
+                        .sync_all()?;
+                    m.incr.push(AofFileInfo {
+                        name,
+                        seq,
+                        kind: AofFileType::Incr,
+                        shard: Some(shard),
+                    });
+                    changed = true;
+                    path
+                }
+            };
+            paths.push(path);
+        }
+        if changed {
+            m.persist(&self.dir, &self.name)?;
+        }
+        Ok(paths)
+    }
+
+    /// Replaces `shard`'s incr file with `new_file` (a complete rewrite in
+    /// `dir`): renamed to the next seq's name, the manifest updated and
+    /// persisted, then the old file deleted. Returns the new path. A crash
+    /// before the manifest is persisted leaves the old file in force (the
+    /// renamed one is unreferenced); after, the new one.
+    pub fn replace_shard_file(&self, shard: usize, new_file: &Path) -> std::io::Result<PathBuf> {
+        let lock = dir_lock(&self.dir);
+        let _g = lock.lock();
+        let mut m = self.manifest()?;
+        let seq = m.max_seq() + 1;
+        let name = incr_name(&self.name, seq);
+        let path = self.dir.join(&name);
+        std::fs::rename(new_file, &path)?;
+        let old = m
+            .incr
+            .iter()
+            .position(|f| f.shard == Some(shard))
+            .map(|i| m.incr.remove(i));
+        m.incr.push(AofFileInfo {
+            name,
+            seq,
+            kind: AofFileType::Incr,
+            shard: Some(shard),
+        });
+        m.persist(&self.dir, &self.name)?;
+        if let Some(old) = old {
+            let _ = std::fs::remove_file(self.dir.join(old.name));
+        }
+        Ok(path)
+    }
+
+    /// Replaces every shard's file at once with `files[i]` for shard `i`
+    /// (a reshard, or an import): one manifest swap, then the old files
+    /// (and any history) deleted.
+    pub fn replace_all(&self, files: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
+        let lock = dir_lock(&self.dir);
+        let _g = lock.lock();
+        std::fs::create_dir_all(&self.dir)?;
+        let old = self.manifest()?;
+        let mut seq = old.max_seq();
+        let mut m = AofManifest::default();
+        let mut paths = Vec::with_capacity(files.len());
+        for (shard, f) in files.iter().enumerate() {
+            seq += 1;
+            let name = incr_name(&self.name, seq);
+            let path = self.dir.join(&name);
+            std::fs::rename(f, &path)?;
+            m.incr.push(AofFileInfo {
+                name,
+                seq,
+                kind: AofFileType::Incr,
+                shard: Some(shard),
+            });
+            paths.push(path);
+        }
+        m.persist(&self.dir, &self.name)?;
+        for f in old.base.iter().chain(&old.history).chain(&old.incr) {
+            let _ = std::fs::remove_file(self.dir.join(&f.name));
+        }
+        Ok(paths)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +571,46 @@ mod tests {
         // Unknown keys are ignored, as in Redis.
         let m = AofManifest::parse("file a seq 1 type i future 42 shard 3\n").unwrap();
         assert_eq!(m.incr[0].shard, Some(3));
+    }
+
+    #[test]
+    fn test_shard_files_ensure_replace_and_replace_all() {
+        let dir = std::env::temp_dir().join(format!("rudis-shardaof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = ShardAofFiles::new(dir.join("appendonlydir"), "appendonly.aof");
+        assert!(!files.is_rudis_layout().unwrap());
+        let paths = files.ensure_shards(2).unwrap();
+        assert_eq!(paths[0], files.dir.join("appendonly.aof.1.incr.aof"));
+        assert_eq!(paths[1], files.dir.join("appendonly.aof.2.incr.aof"));
+        assert!(files.is_rudis_layout().unwrap());
+        assert_eq!(files.shard_count().unwrap(), Some(2));
+        // Idempotent.
+        assert_eq!(files.ensure_shards(2).unwrap(), paths);
+        // A shard's rewrite: next seq, the old file gone.
+        let tmp = files.dir.join("temp-rewrite-1.aof");
+        std::fs::write(&tmp, b"*1\r\n$4\r\nPING\r\n").unwrap();
+        let p = files.replace_shard_file(1, &tmp).unwrap();
+        assert_eq!(p, files.dir.join("appendonly.aof.3.incr.aof"));
+        assert!(!paths[1].exists() && !tmp.exists());
+        let m = files.manifest().unwrap();
+        assert_eq!(
+            m.incr.iter().map(|f| (f.seq, f.shard)).collect::<Vec<_>>(),
+            [(1, Some(0)), (3, Some(1))]
+        );
+        // A reshard to 3 shards: one swap, every old file gone.
+        let staged: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let f = files.dir.join(format!("staged-{i}"));
+                std::fs::write(&f, b"").unwrap();
+                f
+            })
+            .collect();
+        let new = files.replace_all(&staged).unwrap();
+        assert_eq!(new.len(), 3);
+        assert!(!paths[0].exists() && !p.exists());
+        assert_eq!(files.shard_count().unwrap(), Some(3));
+        assert_eq!(files.manifest().unwrap().max_seq(), 6);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
