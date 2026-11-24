@@ -13365,9 +13365,17 @@ fn revoked_subscribers(port: u16, hub: &crate::pubsub::PubSubHub) -> Vec<u64> {
 /// Redis ACLKillPubsubClientsIfNeeded, for one shard: after ACL SETUSER or
 /// ACL LOAD, disconnects the clients in `hub` subscribed to anything their
 /// user may no longer access, so a revoked user stops receiving messages.
+/// Their subscriptions go at once, as Redis frees such a client before the
+/// ACL command replies: left to each connection's own cleanup, a PUBLISH
+/// right after the +OK still counted (and tried) the revoked subscribers.
 /// Returns whether `self_id`, the client that ran the ACL command, is one of
 /// them: it gets its reply first, then its caller closes it.
-pub fn kill_revoked_subscribers(port: u16, hub: &crate::pubsub::PubSubHub, self_id: u64) -> bool {
+pub fn kill_revoked_subscribers(
+    port: u16,
+    hub: &mut crate::pubsub::PubSubHub,
+    presence: Option<(usize, &crate::pubsub::ShardedPresenceTable)>,
+    self_id: u64,
+) -> bool {
     if hub.client_channels.is_empty()
         && hub.client_patterns.is_empty()
         && hub.client_shard_channels.is_empty()
@@ -13376,13 +13384,18 @@ pub fn kill_revoked_subscribers(port: u16, hub: &crate::pubsub::PubSubHub, self_
     }
     let revoked = revoked_subscribers(port, hub);
     let mut kill_self = false;
-    let clients = GLOBAL_CLIENTS.read();
-    for cid in revoked {
-        if cid == self_id {
-            kill_self = true;
-        } else if let Some(entry) = clients.get(&(port, cid)) {
-            kill_registered_client(port, cid, entry);
+    {
+        let clients = GLOBAL_CLIENTS.read();
+        for &cid in &revoked {
+            if cid == self_id {
+                kill_self = true;
+            } else if let Some(entry) = clients.get(&(port, cid)) {
+                kill_registered_client(port, cid, entry);
+            }
         }
+    }
+    for cid in revoked {
+        hub.remove_client_with_presence(cid, presence);
     }
     kill_self
 }

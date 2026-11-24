@@ -3536,7 +3536,12 @@ impl Router {
                 self.release_notify_channel(tx, rx);
             }
         }
-        crate::connection::kill_revoked_subscribers(self.port, &self.pubsub.borrow(), self_id)
+        crate::connection::kill_revoked_subscribers(
+            self.port,
+            &mut self.pubsub.borrow_mut(),
+            Some((self.shard_id, &self.presence_table)),
+            self_id,
+        )
     }
 
     pub async fn reset_command_stats(&self) {

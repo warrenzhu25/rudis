@@ -2407,7 +2407,8 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         // here is the one that ran it.
                         crate::connection::kill_revoked_subscribers(
                             cross_shard_port,
-                            &cross_shard_pubsub.borrow(),
+                            &mut cross_shard_pubsub.borrow_mut(),
+                            Some((cross_shard_router.shard_id, &cross_shard_router.presence_table)),
                             0,
                         );
                         let _ = responder.send(());
