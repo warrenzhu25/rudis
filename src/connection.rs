@@ -1575,6 +1575,8 @@ struct CmdStatGuard {
     /// Refused before it ran (NOAUTH, NOPERM, OOM, READONLY, ...): a
     /// rejected call, as Redis's rejectCommand counts it, not a call.
     rejected: std::cell::Cell<bool>,
+    /// The slot its CPU time goes to (CLUSTER SLOT-STATS cpu-usec).
+    slot: Option<u16>,
 }
 
 impl Drop for CmdStatGuard {
@@ -1587,6 +1589,9 @@ impl Drop for CmdStatGuard {
         }
         let nanos = self.start.map_or(0, |s| s.elapsed().as_nanos() as u64);
         record_cmd_stats(self.name, 1, nanos);
+        if self.slot.is_some() && !crate::slot_stats::take_crossed() {
+            crate::slot_stats::record_cpu(self.slot, nanos);
+        }
     }
 }
 
@@ -6935,7 +6940,21 @@ async fn execute_tx_step_inner(
                 false
             }
             Command::Exec => {
-                record_cmd_stat("EXEC");
+                // Timed as a whole, as Redis does (its queued commands are
+                // also counted on their own); CLUSTER SLOT-STATS gives the
+                // transaction's slot the same time.
+                struct ExecStat(Option<u16>, std::time::Instant);
+                impl Drop for ExecStat {
+                    fn drop(&mut self) {
+                        let nanos = self.1.elapsed().as_nanos() as u64;
+                        record_cmd_stats("EXEC", 1, nanos);
+                        crate::slot_stats::record_cpu(self.0, nanos);
+                    }
+                }
+                let _exec_stat = ExecStat(
+                    crate::slot_stats::take_exec_slot(),
+                    std::time::Instant::now(),
+                );
                 let monitor_addr = if has_monitor_clients() {
                     let addr_s = client_registry
                         .borrow()
@@ -7513,10 +7532,12 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
         mut squashed_responses,
         mut commands,
     } = take_conn_scratch(router.num_shards);
-    // The arguments each command in `commands` was sent with, in step with
-    // it (MONITOR and SLOWLOG show them).
-    let mut argvs: std::collections::VecDeque<Option<crate::resp::RawArgv>> =
+    // The arguments each command in `commands` was sent with, and how many
+    // bytes it took, in step with it (MONITOR and SLOWLOG show them,
+    // CLUSTER SLOT-STATS counts them).
+    let mut argvs: std::collections::VecDeque<(Option<crate::resp::RawArgv>, u64)> =
         std::collections::VecDeque::new();
+    let mut slot_acct = crate::slot_stats::ClientAcct::default();
 
     let mut asking = false;
     let mut in_multi = false;
@@ -7631,7 +7652,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 has_special = true;
                             }
                             commands.push(cmd);
-                            argvs.push_back(argv);
+                            argvs.push_back((argv, (len_before - buf.len()) as u64));
                             if is_quit {
                                 buf.clear();
                                 break;
@@ -7716,8 +7737,16 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                             }
                             if in_multi {
                                 for cmd in commands.drain(..) {
-                                    argvs.pop_front();
-                                    if execute_tx_step(
+                                    let in_b = argvs.pop_front().map_or(0, |a| a.1);
+                                    let ss_before = out_buf.len();
+                                    let ss_slot = slot_stats_before(
+                                        &router,
+                                        &mut slot_acct,
+                                        &cmd,
+                                        in_multi,
+                                        in_b,
+                                    );
+                                    let quit = execute_tx_step(
                                         cmd,
                                         &router,
                                         client_id,
@@ -7730,8 +7759,9 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                         &mut tx_queue,
                                         &mut tx_has_error,
                                     )
-                                    .await
-                                    {
+                                    .await;
+                                    slot_acct.after(ss_slot, (out_buf.len() - ss_before) as u64);
+                                    if quit {
                                         should_quit = true;
                                         break;
                                     }
@@ -7739,7 +7769,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 tx_has_error = true;
                             } else {
                                 for cmd in commands.drain(..) {
-                                    let argv = argvs.pop_front().flatten();
+                                    let (argv, _) = argvs.pop_front().unwrap_or((None, 0));
                                     if let Some(c) =
                                         client_registry.borrow_mut().get_mut(&client_id)
                                     {
@@ -7836,7 +7866,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                 // ACL must be enforced here before switching modes.
                 while has_special && let Some(idx) = commands.iter().position(is_mode_switch_cmd) {
                     for c in commands.drain(..idx) {
-                        set_exec_argv(argvs.pop_front().flatten());
+                        set_exec_argv(argvs.pop_front().and_then(|a| a.0));
                         let _ = execute_command(
                             c,
                             &router,
@@ -7876,7 +7906,13 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         let _ = transport.write_all(write_chunk).await.0;
                     }
                     let switch_cmd = commands.remove(0);
-                    argvs.pop_front();
+                    let switch_in = argvs.pop_front().map_or(0, |a| a.1);
+                    if let Command::Ssubscribe(_) = switch_cmd
+                        && crate::slot_stats::net_accounting()
+                        && let Some(slot) = command_slot(&switch_cmd)
+                    {
+                        crate::slot_stats::record(slot, 0, switch_in, 0);
+                    }
                     if matches!(
                         switch_cmd,
                         Command::Psync { .. } | Command::Sync | Command::DflyFlow { .. }
@@ -7975,8 +8011,11 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                     }
                     if has_tx {
                         for cmd in commands.drain(..) {
-                            argvs.pop_front();
-                            if execute_tx_step(
+                            let in_b = argvs.pop_front().map_or(0, |a| a.1);
+                            let ss_before = out_buf.len();
+                            let ss_slot =
+                                slot_stats_before(&router, &mut slot_acct, &cmd, in_multi, in_b);
+                            let quit = execute_tx_step(
                                 cmd,
                                 &router,
                                 client_id,
@@ -7989,8 +8028,9 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 &mut tx_queue,
                                 &mut tx_has_error,
                             )
-                            .await
-                            {
+                            .await;
+                            slot_acct.after(ss_slot, (out_buf.len() - ss_before) as u64);
+                            if quit {
                                 should_quit = true;
                                 break;
                             }
@@ -8004,6 +8044,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         || is_client_paused().is_some()
                         || HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
                         || has_monitor_clients()
+                        || crate::slot_stats::accounting(router.cluster_enabled)
                         || crate::block::has_blocked_waiters(router.port)
                         // Over maxmemory: the squashed path has no per-command
                         // OOM/eviction gate, so take the per-command path.
@@ -8040,7 +8081,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         // Each command counts itself at the pause gate.
                         drop(batch_running.take());
                         for cmd in commands.drain(..) {
-                            let argv = argvs.pop_front().flatten();
+                            let (argv, in_b) = argvs.pop_front().unwrap_or((None, 0));
                             if (is_client_paused().is_some()
                                 || matches!(
                                     cmd,
@@ -8092,6 +8133,9 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 c.last_cmd = get_cmd_name(&cmd);
                             }
                             set_exec_argv(argv);
+                            let ss_before = out_buf.len();
+                            let ss_slot =
+                                slot_stats_before(&router, &mut slot_acct, &cmd, in_multi, in_b);
                             let quit = execute_command(
                                 cmd,
                                 &router,
@@ -8103,6 +8147,8 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 &mut auth_user,
                             )
                             .await;
+                            slot_acct
+                                .after(ss_slot, out_buf.len().saturating_sub(ss_before) as u64);
                             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                                 while let Ok(inval) = track_rx.try_recv() {
                                     out_buf.extend_from_slice(&inval);
@@ -8115,7 +8161,11 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         }
                     } else if commands.len() == 1 {
                         let single_cmd = commands.pop().unwrap();
-                        set_exec_argv(argvs.pop_back().flatten());
+                        let (argv, in_b) = argvs.pop_back().unwrap_or((None, 0));
+                        set_exec_argv(argv);
+                        let ss_before = out_buf.len();
+                        let ss_slot =
+                            slot_stats_before(&router, &mut slot_acct, &single_cmd, in_multi, in_b);
                         if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                             c.last_active = Instant::now();
                             c.last_cmd = get_cmd_name(&single_cmd);
@@ -8131,6 +8181,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                             &mut auth_user,
                         )
                         .await;
+                        slot_acct.after(ss_slot, out_buf.len().saturating_sub(ss_before) as u64);
                         if quit {
                             should_quit = true;
                         }
@@ -9009,6 +9060,7 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                     let count = router
                         .ssubscribe(client_id, ch.clone(), write_tx.clone(), is_resp3)
                         .await;
+                    let reply_start = out.len();
                     out.extend_from_slice(prefix);
                     out.extend_from_slice(b"$10\r\nssubscribe\r\n$");
                     out.extend_from_slice(ch.len().to_string().as_bytes());
@@ -9017,6 +9069,10 @@ async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
                     out.extend_from_slice(b"\r\n:");
                     out.extend_from_slice(count.to_string().as_bytes());
                     out.extend_from_slice(b"\r\n");
+                    if crate::slot_stats::net_accounting() {
+                        let len = (out.len() - reply_start) as u64;
+                        crate::slot_stats::record(crate::router::key_slot(&ch), 0, 0, len);
+                    }
                 }
                 false
             }
@@ -11059,6 +11115,55 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
 
         _ => {}
     }
+}
+
+/// CLUSTER SLOT-STATS accounting before a command from the read loop runs
+/// (nothing unless it is on): counts its `in_bytes`, hands its slot to the
+/// command's CPU statistics, and returns the slot its reply goes to.
+#[inline]
+fn slot_stats_before(
+    router: &Router,
+    acct: &mut crate::slot_stats::ClientAcct,
+    cmd: &Command,
+    in_multi: bool,
+    in_bytes: u64,
+) -> Option<u16> {
+    if !crate::slot_stats::accounting(router.cluster_enabled) {
+        return None;
+    }
+    use crate::slot_stats::TxRole;
+    let role = match cmd {
+        Command::Multi if !in_multi => TxRole::Multi,
+        Command::Exec if in_multi => TxRole::Exec,
+        Command::Discard if in_multi => TxRole::Discard,
+        _ if in_multi => TxRole::Queued,
+        _ => TxRole::None,
+    };
+    let slot = acct.before(role, command_slot(cmd), in_bytes);
+    crate::slot_stats::hand_over(slot);
+    slot
+}
+
+/// The cluster slot a command is accounted to in CLUSTER SLOT-STATS: its
+/// keys' (or sharded channels') slot when they all share one; `None` for
+/// commands without keys or across slots.
+pub fn command_slot(cmd: &Command) -> Option<u16> {
+    let mut slot = None;
+    let mut same = true;
+    let mut see = |k: &[u8]| {
+        let s = crate::router::key_slot(k);
+        match slot {
+            None => slot = Some(s),
+            Some(p) if p != s => same = false,
+            _ => {}
+        }
+    };
+    match cmd {
+        Command::Spublish { channel, .. } => see(channel),
+        Command::Ssubscribe(chs) | Command::Sunsubscribe(chs) => chs.iter().for_each(|c| see(c)),
+        _ => for_each_cmd_key(cmd, see),
+    }
+    if same { slot } else { None }
 }
 
 pub fn cmd_keys(cmd: &Command) -> Vec<&[u8]> {
@@ -13840,8 +13945,10 @@ async fn execute_command(
     authenticated: &mut bool,
     auth_user: &mut String,
 ) -> bool {
-    // First, before any await: the arguments the read loop handed over.
+    // First, before any await: the arguments and the accounting slot the
+    // read loop handed over.
     let raw_argv = EXEC_ARGV.with(|a| a.borrow_mut().take());
+    let stat_slot = crate::slot_stats::take_exec_slot();
     let initial_db = client_registry
         .borrow()
         .get(&client_id)
@@ -13859,6 +13966,7 @@ async fn execute_command(
     let fut = execute_command_inner(
         cmd,
         raw_argv,
+        stat_slot,
         router,
         client_id,
         client_registry,
@@ -14434,12 +14542,20 @@ async fn write_cluster_slot_stats(
     }
     let owned: Vec<u16> = {
         let hub = crate::cluster::get_cluster_hub(router.base_port);
-        let ranges = hub.my_slots.read().clone();
+        // A replica reports its master's slots, as Valkey does.
+        let mut ranges = hub.my_slots.read().clone();
+        if ranges.is_empty() && *hub.role.read() == "slave" {
+            let master = hub.master_id.read().clone();
+            if let Some(m) = hub.nodes.read().get(&master) {
+                ranges = m.slots.clone();
+            }
+        }
         let mut v: Vec<u16> = ranges.iter().flat_map(|&(a, b)| a..=b).collect();
         v.sort_unstable();
         v.dedup();
         v
     };
+    crate::slot_stats::reset_changed_owners(&owned);
     let stats = router.slot_stats().await;
     // [key-count, cpu, in, out, mem], in METRICS order.
     let values = |s: u16| {
@@ -14467,6 +14583,7 @@ async fn write_cluster_slot_stats(
 async fn execute_command_inner(
     cmd: Command,
     raw_argv: Option<crate::resp::RawArgv>,
+    stat_slot: Option<u16>,
     router: &Router,
     client_id: u64,
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
@@ -14560,6 +14677,7 @@ async fn execute_command_inner(
         port: router.port,
         client_id,
         rejected: std::cell::Cell::new(false),
+        slot: stat_slot,
     };
     if cmd.is_write_command() && !dirty_counted_on_change(&cmd) {
         crate::snapshot::note_write();
@@ -15915,6 +16033,7 @@ async fn execute_command_inner(
                         let p0 = String::from_utf8_lossy(&pairs[0].0).to_lowercase();
                         if p0 == "resetstat" {
                             router.reset_command_stats().await;
+                            crate::slot_stats::reset(None);
                             reset_error_stats();
                             crate::slowlog::reset_slowlog_stats();
                             crate::table::reset_expired_keys();
@@ -23478,13 +23597,26 @@ pub fn apply_replicated_command(
     aof: Option<&RefCell<crate::aof::AofWriter>>,
 ) {
     out.clear();
+    if crate::slot_stats::net_accounting()
+        && let Some(slot) = command_slot(cmd)
+        && let Some(bytes) = crate::aof::command_to_resp(cmd)
+    {
+        // What the master sent for it, near enough: its encoding.
+        crate::slot_stats::record(slot, 0, bytes.len() as u64, 0);
+    }
     let start = std::time::Instant::now();
     {
         let _master_write = ReplayingWrites::new();
         execute_local_command(cmd, db, out, aof);
     }
     let name = stat_cmd_name(cmd);
-    record_cmd_stats(name, 1, start.elapsed().as_nanos() as u64);
+    let nanos = start.elapsed().as_nanos() as u64;
+    record_cmd_stats(name, 1, nanos);
+    if crate::slot_stats::accounting(
+        crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
+        crate::slot_stats::record_cpu(command_slot(cmd), nanos);
+    }
     if out.first() == Some(&b'-') {
         let end = out.iter().position(|&b| b == b'\r').unwrap_or(out.len());
         crate::log_warning!(

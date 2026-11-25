@@ -17,6 +17,8 @@ or the persistence format; such changes are called out under **Breaking**.
   the layout back into flat files.
 - `INFO keysizes`: Redis 8's per-type key size histograms (`db0_distrib_strings_sizes`,
   `..._lists_items`, and so on), computed when asked for.
+- `CLUSTER SLOT-STATS` (Valkey 8): per-slot `key-count`, and with `cluster-slot-stats-enabled`
+  `cpu-usec`, `network-bytes-in`/`-out` and `memory-bytes`.
 
 ## [0.1.0] - 2026-11-23
 

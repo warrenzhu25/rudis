@@ -2501,7 +2501,7 @@ impl ShardDb {
 
     /// Per-DB `(db_idx, keys, expires, ttl_sum_ms)` for `INFO keyspace`.
     /// This shard's `CLUSTER SLOT-STATS` values as text for another shard
-    /// to sum: `slot,keys,cpu,in,out,mem` for each slot with any, `;`
+    /// to sum: `slot,keys,mem` for each slot with any, `;`
     /// apart. Keys are db 0's (the only one in cluster mode); memory is
     /// summed over them only when memory tracking is on.
     pub fn slot_stats_part(&mut self) -> String {
@@ -2520,10 +2520,9 @@ impl ShardDb {
         let table = self.table_for_db_mut(0);
         for slot in 0..16384u16 {
             let keys = table.slot_key_count(slot) as u64;
-            let [cpu, inb, outb] = crate::slot_stats::counters(slot);
             let m = mem.get(&slot).copied().unwrap_or(0);
-            if keys | cpu | inb | outb | m != 0 {
-                s.push_str(&format!("{slot},{keys},{cpu},{inb},{outb},{m};"));
+            if keys | m != 0 {
+                s.push_str(&format!("{slot},{keys},{m};"));
             }
         }
         s

@@ -2176,6 +2176,9 @@ impl ReplicationHub {
         {
             self.append_stream(shard, bytes, false);
         }
+        if crate::slot_stats::net_accounting() && self.has_replicas.load(Ordering::Relaxed) {
+            crate::slot_stats::record_replication_egress(bytes, self.replicas.read().len());
+        }
 
         if !self.has_shard_flows.load(Ordering::Relaxed) {
             return;

@@ -190,6 +190,9 @@ fn script_crosses_slot(cmd: &Command) -> bool {
             return false;
         };
         if run.slot.load(Ordering::Relaxed) == SLOT_ANY {
+            crate::connection::for_each_cmd_key(cmd, |k| {
+                crate::slot_stats::script_touch(crate::router::key_slot(k));
+            });
             return false;
         }
         let mut crosses = false;
@@ -1732,6 +1735,7 @@ fn prepare_function(
     argv.extend(keys.iter().cloned());
     argv.extend(args.iter().cloned());
     let run = ScriptRunGuard::start(db.borrow().port, false, Some((func_def.name.clone(), argv)));
+    crate::slot_stats::script_begin(keys.first().map(|k| crate::router::key_slot(k)));
     if in_cluster && !func_def.flags.iter().any(|f| f == "allow-cross-slot-keys") {
         run.pin_slot(keys);
     }
@@ -2084,6 +2088,7 @@ fn prepare_eval(
     let vm = ScriptVm::acquire(db, aof, effective_read_only, allow_oom)?;
     let lua = vm.lua.clone();
     let run = ScriptRunGuard::start(db.borrow().port, true, None);
+    crate::slot_stats::script_begin(keys.first().map(|k| crate::router::key_slot(k)));
     if in_cluster && !cross_slot {
         run.pin_slot(keys);
     }

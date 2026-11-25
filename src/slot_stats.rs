@@ -82,51 +82,286 @@ pub fn startup_done() {
     STARTED.store(true, Ordering::Relaxed);
 }
 
-thread_local! {
-    /// This shard's `cpu-usec`, `network-bytes-in` and `network-bytes-out`
-    /// per slot, allocated on first use.
-    static COUNTERS: std::cell::RefCell<Option<Box<[[u64; 3]; 16384]>>> =
-        const { std::cell::RefCell::new(None) };
+/// `cpu-usec`, `network-bytes-in` and `network-bytes-out` per slot. Global
+/// (each slot lives on one shard, so nothing contends), allocated on first
+/// use.
+static COUNTERS: std::sync::OnceLock<Box<[[std::sync::atomic::AtomicU64; 3]]>> =
+    std::sync::OnceLock::new();
+
+fn counters_table() -> &'static [[std::sync::atomic::AtomicU64; 3]] {
+    COUNTERS.get_or_init(|| (0..16384).map(|_| Default::default()).collect())
 }
 
-/// Adds a command's CPU time and network bytes to `slot` on this shard.
+/// Adds a command's CPU time and network bytes to `slot`.
 #[inline]
 pub fn record(slot: u16, cpu_usec: u64, bytes_in: u64, bytes_out: u64) {
-    COUNTERS.with(|c| {
-        let mut c = c.borrow_mut();
-        let arr = c.get_or_insert_with(|| {
-            vec![[0u64; 3]; 16384]
-                .into_boxed_slice()
-                .try_into()
-                .expect("16384 slots")
-        });
-        let e = &mut arr[slot as usize & 16383];
-        e[0] += cpu_usec;
-        e[1] += bytes_in;
-        e[2] += bytes_out;
-    });
+    let e = &counters_table()[slot as usize & 16383];
+    for (c, v) in e.iter().zip([cpu_usec, bytes_in, bytes_out]) {
+        if v != 0 {
+            c.fetch_add(v, Ordering::Relaxed);
+        }
+    }
 }
 
-/// This shard's counters of `slot`.
+/// The counters of `slot`.
 pub fn counters(slot: u16) -> [u64; 3] {
-    COUNTERS.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map_or([0; 3], |a| a[slot as usize & 16383])
-    })
+    match COUNTERS.get() {
+        Some(t) => t[slot as usize & 16383]
+            .each_ref()
+            .map(|c| c.load(Ordering::Relaxed)),
+        None => [0; 3],
+    }
 }
 
-/// Zeroes this shard's counters: all (`CONFIG RESETSTAT`), or `slot`'s (it
+/// Zeroes the counters: all (`CONFIG RESETSTAT`), or `slot`'s (it
 /// changed owner).
 pub fn reset(slot: Option<u16>) {
-    COUNTERS.with(|c| {
-        if let Some(a) = c.borrow_mut().as_mut() {
-            match slot {
-                Some(s) => a[s as usize & 16383] = [0; 3],
-                None => a.iter_mut().for_each(|e| *e = [0; 3]),
+    let Some(t) = COUNTERS.get() else { return };
+    let zero = |e: &[std::sync::atomic::AtomicU64; 3]| {
+        e.iter().for_each(|c| c.store(0, Ordering::Relaxed))
+    };
+    match slot {
+        Some(s) => zero(&t[s as usize & 16383]),
+        None => t.iter().for_each(zero),
+    }
+}
+
+/// The slots owned when last looked at: a slot that changed owner since
+/// starts from zero, as Valkey resets a slot's stats when it is assigned
+/// or removed.
+static LAST_OWNED: parking_lot::Mutex<Option<Vec<bool>>> = parking_lot::Mutex::new(None);
+
+/// Resets the counters of every slot whose ownership changed since the
+/// last call, given the slots owned now.
+pub fn reset_changed_owners(owned: &[u16]) {
+    let mut now = vec![false; 16384];
+    for &s in owned {
+        now[s as usize & 16383] = true;
+    }
+    let mut last = LAST_OWNED.lock();
+    if let Some(prev) = last.as_ref() {
+        for (slot, (a, b)) in prev.iter().zip(&now).enumerate() {
+            if a != b {
+                reset(Some(slot as u16));
             }
         }
-    });
+    }
+    *last = Some(now);
+}
+
+/// Whether commands are being accounted per slot: cluster mode with CPU or
+/// network tracking on.
+#[inline]
+pub fn accounting(cluster: bool) -> bool {
+    cluster && flags() & (CPU | NET) != 0
+}
+
+thread_local! {
+    /// The slot the command about to run is accounted to, handed from the
+    /// read loop to the command's statistics (taken before its first
+    /// await, so another client's command can't see it).
+    static EXEC_SLOT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
+/// Hands `slot` to the next command that runs on this thread.
+#[inline]
+pub fn hand_over(slot: Option<u16>) {
+    EXEC_SLOT.set(slot);
+}
+
+/// The slot handed over for the command now starting (and clears it).
+#[inline]
+pub fn take_exec_slot() -> Option<u16> {
+    EXEC_SLOT.take()
+}
+
+/// Records a command's CPU time against `slot` if CPU tracking is on.
+#[inline]
+pub fn record_cpu(slot: Option<u16>, nanos: u64) {
+    if let Some(s) = slot
+        && flags() & CPU != 0
+    {
+        record(s, nanos / 1000, 0, 0);
+    }
+}
+
+thread_local! {
+    /// The slot the running script is accounted to (-1: none yet), and
+    /// whether it touched a key of another slot: then, as in Valkey, the
+    /// script isn't accounted to any slot.
+    static SCRIPT_SLOT: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+    static SCRIPT_CROSSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The last command's accounting was dropped (a cross-slot script):
+    /// the read loop doesn't count its bytes either.
+    static DROPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A script starts, accounted to its first declared key's slot.
+pub fn script_begin(first_key_slot: Option<u16>) {
+    SCRIPT_SLOT.set(first_key_slot.map_or(-1, i32::from));
+    SCRIPT_CROSSED.set(false);
+}
+
+/// A script that may touch keys of any slot touched one in `slot`.
+#[inline]
+pub fn script_touch(slot: u16) {
+    match SCRIPT_SLOT.get() {
+        -1 => SCRIPT_SLOT.set(i32::from(slot)),
+        s if s != i32::from(slot) => SCRIPT_CROSSED.set(true),
+        _ => {}
+    }
+}
+
+/// Called as a command's statistics are recorded: whether a script it ran
+/// crossed slots (then nothing of it is accounted to a slot).
+pub fn take_crossed() -> bool {
+    let c = SCRIPT_CROSSED.take();
+    DROPPED.set(c);
+    c
+}
+
+/// Whether network bytes are accounted per slot: cluster mode with
+/// network tracking on.
+#[inline]
+pub fn net_accounting() -> bool {
+    flags() & NET != 0 && crate::cluster::HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed)
+}
+
+/// Splits RESP commands (arrays of bulk strings) in `bytes` and returns,
+/// for each, its length and its first argument after the name (its key,
+/// for the writes a replication stream carries).
+pub fn resp_commands(bytes: &[u8]) -> Vec<(usize, &[u8])> {
+    fn line(b: &[u8], at: usize) -> Option<(&[u8], usize)> {
+        let end = at + b.get(at..)?.windows(2).position(|w| w == b"\r\n")?;
+        Some((&b[at..end], end + 2))
+    }
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let start = pos;
+        let Some((hdr, mut p)) = line(bytes, pos) else {
+            break;
+        };
+        let Some(n) = hdr
+            .strip_prefix(b"*")
+            .and_then(|n| std::str::from_utf8(n).ok()?.parse::<usize>().ok())
+        else {
+            break;
+        };
+        let mut key: &[u8] = &[];
+        let mut name: &[u8] = &[];
+        for i in 0..n {
+            let Some((len_line, q)) = line(bytes, p) else {
+                return out;
+            };
+            let Some(len) = len_line
+                .strip_prefix(b"$")
+                .and_then(|l| std::str::from_utf8(l).ok()?.parse::<usize>().ok())
+            else {
+                return out;
+            };
+            match i {
+                0 => name = bytes.get(q..q + len).unwrap_or(&[]),
+                1 => key = bytes.get(q..q + len).unwrap_or(&[]),
+                _ => {}
+            }
+            p = q + len + 2;
+        }
+        pos = p.min(bytes.len());
+        // SPUBLISH reaches replicas here but goes over the cluster bus in
+        // Valkey, which doesn't count it: leave it out.
+        if name.eq_ignore_ascii_case(b"spublish") {
+            key = &[];
+        }
+        out.push((pos - start, key));
+    }
+    out
+}
+
+/// A master streamed `bytes` (its own writes) to `replicas` replicas: each
+/// command's bytes, times the replicas, go out on its key's slot.
+pub fn record_replication_egress(bytes: &[u8], replicas: usize) {
+    if replicas == 0 {
+        return;
+    }
+    for (len, key) in resp_commands(bytes) {
+        if !key.is_empty() {
+            record(crate::router::key_slot(key), 0, 0, (len * replicas) as u64);
+        }
+    }
+}
+
+/// One connection's network accounting: what a transaction has received
+/// so far goes to its slot at EXEC, as Valkey counts it.
+#[derive(Debug, Default)]
+pub struct ClientAcct {
+    pending_in: u64,
+    tx_slot: Option<u16>,
+    /// The request bytes of the command now running, counted after it.
+    deferred_in: u64,
+}
+
+/// Where a command stands with respect to MULTI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxRole {
+    /// Not in a transaction.
+    None,
+    Multi,
+    /// Queued inside MULTI.
+    Queued,
+    Exec,
+    Discard,
+}
+
+impl ClientAcct {
+    /// Before a command runs: counts its `in_bytes` (now, or at EXEC) and
+    /// returns the slot its CPU time and reply go to.
+    pub fn before(&mut self, role: TxRole, cmd_slot: Option<u16>, in_bytes: u64) -> Option<u16> {
+        match role {
+            TxRole::Multi => {
+                self.pending_in = in_bytes;
+                self.tx_slot = None;
+                None
+            }
+            TxRole::Queued => {
+                self.pending_in += in_bytes;
+                if cmd_slot.is_some() {
+                    self.tx_slot = cmd_slot;
+                }
+                None
+            }
+            TxRole::Discard => {
+                *self = Self::default();
+                None
+            }
+            TxRole::Exec => {
+                let slot = self.tx_slot;
+                self.deferred_in = self.pending_in + in_bytes;
+                self.pending_in = 0;
+                self.tx_slot = None;
+                slot
+            }
+            TxRole::None => {
+                self.deferred_in = in_bytes;
+                cmd_slot
+            }
+        }
+    }
+
+    /// After the command: its request (counted once it ran, so a blocked
+    /// command counts when it unblocks) and its reply, `out_bytes` long, go
+    /// to `slot`, unless the command's accounting was dropped.
+    pub fn after(&mut self, slot: Option<u16>, out_bytes: u64) {
+        let in_bytes = std::mem::take(&mut self.deferred_in);
+        if DROPPED.take() {
+            return;
+        }
+        if let Some(s) = slot
+            && flags() & NET != 0
+        {
+            record(s, 0, in_bytes, out_bytes);
+        }
+    }
 }
 
 /// The metrics, in reply order, with the flag each needs (0: always).
@@ -297,6 +532,37 @@ mod tests {
         };
         assert_eq!(select(&asc, &owned, &vals), [1, 4]);
         assert_eq!(select(&Query::Range(2, 9), &owned, &vals), [2, 3, 4]);
+    }
+
+    #[test]
+    fn test_transaction_bytes_go_to_its_slot_at_exec() {
+        FLAGS.store(CPU | NET, Ordering::Relaxed);
+        reset(None);
+        let mut a = ClientAcct::default();
+        assert_eq!(a.before(TxRole::Multi, None, 15), None);
+        assert_eq!(a.before(TxRole::Queued, Some(7), 33), None);
+        assert_eq!(counters(7), [0, 0, 0]);
+        assert_eq!(a.before(TxRole::Exec, None, 14), Some(7));
+        assert_eq!(counters(7), [0, 0, 0]);
+        a.after(Some(7), 5);
+        assert_eq!(counters(7), [0, 62, 5]);
+        assert_eq!(a.before(TxRole::None, Some(7), 10), Some(7));
+        a.after(Some(7), 0);
+        record_cpu(Some(7), 2500);
+        assert_eq!(counters(7), [2, 72, 5]);
+        reset(Some(7));
+        assert_eq!(counters(7), [0, 0, 0]);
+        FLAGS.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_resp_commands_splits_frames_and_finds_keys() {
+        let b = b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nVALUE\r\n*1\r\n$4\r\nPING\r\n";
+        let v = resp_commands(b);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], (33, &b"key"[..]));
+        assert_eq!(v[1].0, 14);
+        assert!(v[1].1.is_empty());
     }
 
     #[test]

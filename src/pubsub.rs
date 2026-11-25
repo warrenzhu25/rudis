@@ -931,6 +931,7 @@ impl PubSubHub {
 
     pub fn spublish(&self, channel: &[u8], message: &[u8]) -> usize {
         let mut count = 0;
+        let mut delivered_bytes = 0usize;
         let mut limit = None;
         if let Some(subscribers) = self.shard_channels.get(channel) {
             let mut frame_resp2: Option<Bytes> = None;
@@ -948,15 +949,26 @@ impl PubSubHub {
                     })
                 };
                 let is_self = CURRENT_COMMAND_CLIENT_ID.get() == Some(*client_id);
+                let len = frame.len();
                 if is_self {
                     DEFERRED_SELF_PUBSUB.with(|d| d.borrow_mut().push(frame.clone()));
                     count += 1;
+                    delivered_bytes += len;
                 } else if let Some(tx) = self.clients.get(client_id)
                     && tx.deliver(frame, limit.get_or_insert_with(pubsub_limit))
                 {
                     count += 1;
+                    delivered_bytes += len;
                 }
             }
+        }
+        if delivered_bytes > 0 && crate::slot_stats::net_accounting() {
+            crate::slot_stats::record(
+                crate::router::key_slot(channel),
+                0,
+                0,
+                delivered_bytes as u64,
+            );
         }
         count
     }

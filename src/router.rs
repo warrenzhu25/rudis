@@ -3906,13 +3906,12 @@ impl Router {
                     .split(',')
                     .filter_map(|v| v.parse().ok())
                     .collect();
-                if let [slot, keys, cpu, inb, outb, mem] = f[..]
+                if let [slot, keys, mem] = f[..]
                     && slot < 16384
                 {
                     let e: &mut [u64; 5] = all.entry(slot as u16).or_default();
-                    for (a, b) in e.iter_mut().zip([keys, cpu, inb, outb, mem]) {
-                        *a += b;
-                    }
+                    e[0] += keys;
+                    e[4] += mem;
                 }
             }
         };
@@ -3925,6 +3924,16 @@ impl Router {
             });
             if let Some(body) = body {
                 add(body);
+            }
+        }
+        // CPU and network counters are global, not per shard.
+        for slot in 0..16384u16 {
+            let [cpu, inb, outb] = crate::slot_stats::counters(slot);
+            if cpu | inb | outb != 0 {
+                let e = all.entry(slot).or_default();
+                e[1] = cpu;
+                e[2] = inb;
+                e[3] = outb;
             }
         }
         all

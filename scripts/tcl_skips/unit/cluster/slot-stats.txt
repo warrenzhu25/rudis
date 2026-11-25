@@ -1,0 +1,4 @@
+# unit/cluster/slot-stats tests rudis doesn't pass yet.
+#
+# Known gap: no atomic slot migration (CLUSTER MIGRATION, Valkey 9).
+CLUSTER SLOT-STATS reset upon atomic slot migration
