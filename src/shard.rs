@@ -5697,6 +5697,33 @@ pub fn format_keysizes(all: &KeysizesByDb) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// An extended record whose key length's low byte is 0xFC..=0xFF (an
+    /// opcode byte in the legacy format) loads: a vector set element with
+    /// such a `vec:<set>:<element>` key made the whole RDB unloadable.
+    #[test]
+    fn test_ext_records_with_opcode_like_key_lengths_load() {
+        let mut db = ShardDb::new(0);
+        let prefix = "vec:vs:".len();
+        for len in 250..=258 {
+            let element = "e".repeat(len - prefix);
+            db.vadd(
+                "vs",
+                Bytes::from(element),
+                vec![0.5, 0.25, 0.125],
+                None,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        let mut chunk = Vec::new();
+        db.save_extended_rdb_chunk(&mut chunk);
+        let mut restored = ShardDb::new(0);
+        restored.restore_rdb_chunk(&chunk).unwrap();
+        assert_eq!(restored.vector_indexes.get("vs").map(|i| i.len()), Some(9));
+    }
+
     #[test]
     fn test_keysizes_part_merges_and_formats_like_redis() {
         let mut db = ShardDb::new(0);

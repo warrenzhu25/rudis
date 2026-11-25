@@ -17174,7 +17174,7 @@ fn load_legacy_rdb(
     }
     // Skip REDIS0011
     let (cursor, saw_eof, count) =
-        load_legacy_records(data, 9, content_len, db, shard_id, num_shards);
+        load_legacy_records(data, 9, content_len, db, shard_id, num_shards, true);
     if !saw_eof {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -17197,7 +17197,7 @@ pub(crate) fn try_load_legacy_rdb_preamble(
         return None;
     }
     db.flushall();
-    let (cursor, saw_eof, count) = load_legacy_records(data, 9, data.len(), db, 0, 1);
+    let (cursor, saw_eof, count) = load_legacy_records(data, 9, data.len(), db, 0, 1, true);
     if !saw_eof || cursor + 1 + 8 > data.len() {
         db.flushall();
         return None;
@@ -17221,7 +17221,7 @@ pub(crate) fn load_legacy_ext(
     num_shards: usize,
 ) -> Result<usize, String> {
     let (cursor, saw_eof, count) =
-        load_legacy_records(blob, 0, blob.len(), db, shard_id, num_shards);
+        load_legacy_records(blob, 0, blob.len(), db, shard_id, num_shards, false);
     if saw_eof || cursor != blob.len() {
         return Err(format!(
             "truncated, corrupt or unsupported record at offset {cursor}"
@@ -17232,6 +17232,13 @@ pub(crate) fn load_legacy_ext(
 
 /// The legacy record loop over `data[start..content_len]`. Returns where it
 /// stopped, whether that was the EOF opcode, and the keys loaded.
+///
+/// A record starts with an opcode (EOF, SELECTDB, an expiry) or with its
+/// key's length (u32 little-endian), so a key whose length's low byte is
+/// 0xFC..=0xFF reads as an opcode. `opcodes: false` reads every record as
+/// a key: a `rudis-ext` blob ([`load_legacy_ext`]) holds no opcodes, and a
+/// vector set element whose `vec:<set>:<element>` key had such a length
+/// made the whole RDB unloadable.
 fn load_legacy_records(
     data: &[u8],
     start: usize,
@@ -17239,6 +17246,7 @@ fn load_legacy_records(
     db: &mut crate::shard::ShardDb,
     shard_id: usize,
     num_shards: usize,
+    opcodes: bool,
 ) -> (usize, bool, usize) {
     let (now, unix_ns) = crate::clock::now_pair();
     let unix_now = unix_ns.as_millis() as u64;
@@ -17257,7 +17265,7 @@ fn load_legacy_records(
             delayed_for = count;
             std::thread::sleep(Duration::from_micros(key_load_delay));
         }
-        let op = data[cursor];
+        let op = if opcodes { data[cursor] } else { 0 };
         if op == 0xFF {
             // EOF
             saw_eof = true;

@@ -20,6 +20,12 @@ or the persistence format; such changes are called out under **Breaking**.
 - `CLUSTER SLOT-STATS` (Valkey 8): per-slot `key-count`, and with `cluster-slot-stats-enabled`
   `cpu-usec`, `network-bytes-in`/`-out` and `memory-bytes`.
 
+### Fixed
+
+- An RDB with a vector set element whose stored key (`vec:<set>:<element>`) had a length of
+  252 to 255 modulo 256 could not be loaded: restarts refused the file and replicas failed
+  every full sync. Such files load now.
+
 ## [0.1.0] - 2026-11-23
 
 The first tagged release.
