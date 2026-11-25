@@ -15,6 +15,8 @@ or the persistence format; such changes are called out under **Breaking**.
   can load the directory directly. Existing flat `appendonly-<i>.aof` files move into the
   layout at startup; a thread-count change reshards as before; turning the option off imports
   the layout back into flat files.
+- `INFO keysizes`: Redis 8's per-type key size histograms (`db0_distrib_strings_sizes`,
+  `..._lists_items`, and so on), computed when asked for.
 
 ## [0.1.0] - 2026-11-23
 
