@@ -149,7 +149,7 @@ tests for them are skipped (`scripts/tcl_skips/unit/info.txt`).
 * `CONFIG SET appendonly no` during an AOF rewrite stops logging at once, as in Redis, but the rewrite runs to its end (its result is not used); Redis kills the rewriting child. A `BGREWRITEAOF` meanwhile gets "Background append only file rewriting already in progress" until it ends.
 
 ### Cluster Slots Not Covered
-* `cluster-require-full-coverage` is accepted but ignored: a rudis cluster node always behaves as with `no`. While some slots are unassigned, or held by a failed master no replica has taken over, it keeps serving the slots it owns, and only commands on the uncovered slots get `-CLUSTERDOWN Hash slot not served`. Redis's default (`yes`) refuses every key with `-CLUSTERDOWN The cluster is down` then. `CLUSTER INFO` reports the slot counts as Redis does (`cluster_slots_assigned`, `_ok`, `_pfail`, `_fail`). A master cut off from the majority of masters refuses its keys, as in Redis.
+* As in Redis, `cluster-require-full-coverage yes` (the default) takes the node down while some slot is unassigned or held by a failed master no replica has taken over yet: every key gets `-CLUSTERDOWN The cluster is down`. With `no`, the node keeps serving the slots it owns and only the uncovered slots get `-CLUSTERDOWN Hash slot not served`. `CLUSTER INFO` reports the slot counts as Redis does (`cluster_slots_assigned`, `_ok`, `_pfail`, `_fail`). A master cut off from the majority of masters refuses its keys, as in Redis.
 
 ---
 
