@@ -70,6 +70,9 @@ pub struct ConnectedReplica {
     pub announced_ip: RwLock<Option<String>>,
     /// Set while the replica's full-sync snapshot is being taken.
     pub full_sync: Option<FullSyncCut>,
+    /// Set while the replica's full-sync snapshot is being sent (see
+    /// [`SnapshotSending`]).
+    sending_snapshot: AtomicBool,
     /// Stream bytes not yet taken by the writer task, appended in offset
     /// order under the backlog lock.
     pending: Mutex<Vec<u8>>,
@@ -198,6 +201,17 @@ impl ConnectedReplica {
             self.ip
                 .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string())
         })
+    }
+
+    /// The replica's state for INFO: `wait_bgsave` until its full-sync
+    /// snapshot has been taken and sent, as for a Redis replica that gets a
+    /// diskless sync (it is in `wait_bgsave` for the whole transfer).
+    pub fn state_name(&self) -> &'static str {
+        if self.is_online() && !self.sending_snapshot.load(Ordering::Relaxed) {
+            "online"
+        } else {
+            "wait_bgsave"
+        }
     }
 
     /// False while the replica's full-sync snapshot is still being taken
@@ -653,6 +667,8 @@ pub struct ReplicationHub {
     /// dataset is served, and only [`refused_during_async_load`]-style
     /// commands get `-LOADING`.
     async_loading: AtomicBool,
+    /// Replica full-sync snapshots being sent ([`SnapshotSending`]).
+    snapshots_sending: std::sync::atomic::AtomicUsize,
     /// Address details a connection reported before its PSYNC registered
     /// it as a replica (REPLCONF listening-port comes first), by client id.
     pending_peers: Mutex<HashMap<u64, PendingPeer>>,
@@ -1176,6 +1192,7 @@ impl ReplicationHub {
             loading: AtomicBool::new(false),
             startup_loading: AtomicBool::new(false),
             async_loading: AtomicBool::new(false),
+            snapshots_sending: std::sync::atomic::AtomicUsize::new(0),
             sync_conn: Mutex::new(None),
             worker_exit: Mutex::new(None),
             pending_peers: Mutex::new(HashMap::new()),
@@ -1747,6 +1764,7 @@ impl ReplicationHub {
             ip: peer.ip,
             announced_ip: RwLock::new(peer.announced_ip),
             full_sync,
+            sending_snapshot: AtomicBool::new(false),
             pending: Mutex::new(Vec::new()),
             wake_queued: AtomicBool::new(false),
             inflight: std::sync::atomic::AtomicUsize::new(0),
@@ -2534,11 +2552,7 @@ impl ReplicationHub {
                     i,
                     ip,
                     rep.listening_port.load(Ordering::SeqCst),
-                    if rep.is_online() {
-                        "online"
-                    } else {
-                        "wait_bgsave"
-                    },
+                    rep.state_name(),
                     rep.ack_offset.load(Ordering::SeqCst),
                     now.saturating_sub(rep.last_ack_time.load(Ordering::SeqCst)),
                 ),
@@ -2969,6 +2983,40 @@ impl Drop for LoadingGuard<'_> {
     }
 }
 
+/// Marks a replica's full-sync snapshot as being sent until dropped: the
+/// replica shows `state=wait_bgsave`, and `INFO` `rdb_bgsave_in_progress:1`
+/// (Redis forks a BGSAVE for it).
+pub struct SnapshotSending {
+    hub: Arc<ReplicationHub>,
+    rep: Arc<ConnectedReplica>,
+}
+
+impl SnapshotSending {
+    pub fn new(hub: &Arc<ReplicationHub>, rep: &Arc<ConnectedReplica>) -> Self {
+        rep.sending_snapshot.store(true, Ordering::Relaxed);
+        hub.snapshots_sending.fetch_add(1, Ordering::Relaxed);
+        Self {
+            hub: hub.clone(),
+            rep: rep.clone(),
+        }
+    }
+}
+
+impl Drop for SnapshotSending {
+    fn drop(&mut self) {
+        self.rep.sending_snapshot.store(false, Ordering::Relaxed);
+        self.hub.snapshots_sending.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether the server on `port` is sending a replica its full-sync snapshot.
+pub fn sending_snapshot(port: u16) -> bool {
+    get_replication_hub(port)
+        .snapshots_sending
+        .load(Ordering::Relaxed)
+        != 0
+}
+
 /// Whether the server on `port` loads a master's full sync asynchronously
 /// (`INFO` `async_loading:1`).
 #[inline]
@@ -3176,11 +3224,7 @@ pub async fn wait_replicas_before_shutdown(port: u16, shards: usize) -> bool {
             r.listening_port.load(Ordering::SeqCst),
             target.saturating_sub(r.ack_offset.load(Ordering::SeqCst)),
             now_secs.saturating_sub(r.last_ack_time.load(Ordering::SeqCst)),
-            if r.is_online() {
-                "online"
-            } else {
-                "wait_bgsave"
-            }
+            r.state_name()
         );
     }
     crate::log_notice!(

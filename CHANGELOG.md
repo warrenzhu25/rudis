@@ -24,6 +24,9 @@ or the persistence format; such changes are called out under **Breaking**.
   served until the new one has loaded, and a failed load keeps it.
 - `repl-diskless-sync-delay` is honoured: a master waits that long before starting a
   replica's full sync (default 0; Redis's is 5).
+- While a master sends a replica its full-sync snapshot, `INFO replication` shows the replica
+  as `state=wait_bgsave` and `INFO persistence` shows `rdb_bgsave_in_progress:1`, as Redis
+  does during a diskless sync.
 
 ### Fixed
 

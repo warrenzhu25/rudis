@@ -9755,6 +9755,7 @@ async fn stream_full_sync(
     let rep = hub
         .register_full_sync_replica(client_id, write_tx.clone(), router.num_shards)
         .ok_or(Some(ReplicaSnapshotError::NoMasterLink))?;
+    let _sending = crate::replication::SnapshotSending::new(hub, &rep);
     crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
     crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
     let mut guard = SyncImagesGuard {
@@ -14306,7 +14307,9 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
         u8::from(crate::replication::is_async_loading(router.base_port)),
         snap.changes_since_last_save(),
         u8::from(
-            RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed) || snap.in_progress()
+            RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
+                || snap.in_progress()
+                || crate::replication::sending_snapshot(router.base_port)
         ),
         snap.last_save_unix(),
         if snap.last_save_ok() { "ok" } else { "err" },
