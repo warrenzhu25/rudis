@@ -2344,7 +2344,7 @@ fn encode_command_inner(cmd: &Command, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
         Command::Zremrangebyrank { key, start, stop } => {
             let st = start.to_string();
             let sp = stop.to_string();
-            let _ = write!(buf, "*4\r\n$16\r\nZREMRANGEBYRANK\r\n${}\r\n", key.len());
+            let _ = write!(buf, "*4\r\n$15\r\nZREMRANGEBYRANK\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
             let _ = write!(
                 buf,
@@ -2373,7 +2373,7 @@ fn encode_command_inner(cmd: &Command, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
             } else {
                 format!("({}", max_score)
             };
-            let _ = write!(buf, "*4\r\n$17\r\nZREMRANGEBYSCORE\r\n${}\r\n", key.len());
+            let _ = write!(buf, "*4\r\n$16\r\nZREMRANGEBYSCORE\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
             let _ = write!(
                 buf,
@@ -2398,7 +2398,7 @@ fn encode_command_inner(cmd: &Command, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
                 crate::table::LexBound::Inclusive(b) => format!("[{}", String::from_utf8_lossy(b)),
                 crate::table::LexBound::Exclusive(b) => format!("({}", String::from_utf8_lossy(b)),
             };
-            let _ = write!(buf, "*4\r\n$15\r\nZREMRANGEBYLEX\r\n${}\r\n", key.len());
+            let _ = write!(buf, "*4\r\n$14\r\nZREMRANGEBYLEX\r\n${}\r\n", key.len());
             buf.extend_from_slice(key);
             let _ = write!(
                 buf,
@@ -5903,6 +5903,117 @@ mod tests {
             let bytes = command_to_resp(&cmd).unwrap_or_else(|| panic!("{args:?} not encoded"));
             assert_eq!(parse_resp(&bytes), cmd, "{args:?}");
         }
+    }
+
+    /// Every core write the AOF and replicas get re-encoded parses back to
+    /// the same command. ZREMRANGEBY{RANK,SCORE,LEX} were written with a
+    /// length one too long for their name: each one broke every replica's
+    /// link (protocol error, reconnect loop) and the AOF.
+    #[test]
+    fn test_core_writes_round_trip_through_aof_encoding() {
+        let writes: &[&[&str]] = &[
+            &["SET", "k", "v"],
+            &["SET", "k", "v", "PX", "100", "NX"],
+            &["APPEND", "k", "v"],
+            &["INCRBY", "k", "5"],
+            &["INCRBYFLOAT", "k", "1.5"],
+            &["SETRANGE", "k", "2", "xy"],
+            &["SETBIT", "k", "7", "1"],
+            &["DEL", "k"],
+            &["EXPIRE", "k", "10"],
+            &["PEXPIREAT", "k", "1000"],
+            &["PERSIST", "k"],
+            &["LPUSH", "l", "a", "b"],
+            &["RPUSH", "l", "c"],
+            &["LPOP", "l"],
+            &["RPOP", "l", "2"],
+            &["LSET", "l", "0", "x"],
+            &["LTRIM", "l", "0", "1"],
+            &["LREM", "l", "0", "x"],
+            &["LINSERT", "l", "BEFORE", "a", "z"],
+            &["SADD", "s", "a", "b"],
+            &["SREM", "s", "a"],
+            &["SPOP", "s"],
+            &["SMOVE", "s", "t", "b"],
+            &["ZADD", "z", "1", "a", "2", "b"],
+            &["ZADD", "z", "XX", "CH", "3", "a"],
+            &["ZINCRBY", "z", "2", "a"],
+            &["ZREM", "z", "a"],
+            &["ZREMRANGEBYRANK", "z", "0", "1"],
+            &["ZREMRANGEBYSCORE", "z", "-inf", "(3"],
+            &["ZREMRANGEBYSCORE", "z", "(1", "+inf"],
+            &["ZREMRANGEBYSCORE", "z", "1", "2.5"],
+            &["ZREMRANGEBYLEX", "z", "-", "(d"],
+            &["ZREMRANGEBYLEX", "z", "[a", "+"],
+            &["ZPOPMIN", "z"],
+            &["ZPOPMAX", "z", "2"],
+            &["HSET", "h", "f", "v"],
+            &["HDEL", "h", "f"],
+            &["HINCRBY", "h", "f", "1"],
+            &["HINCRBYFLOAT", "h", "f", "0.5"],
+            &["HSETNX", "h", "g", "v"],
+            &["XADD", "x", "*", "f", "v"],
+            &["XTRIM", "x", "MAXLEN", "10"],
+            &["XDEL", "x", "1-1"],
+            &["PFADD", "p", "a", "b"],
+            &["RENAME", "k", "k2"],
+            &["COPY", "k", "k3"],
+        ];
+        for args in writes {
+            let cmd = parse_resp(&resp_argv(args));
+            assert!(cmd.is_write_command(), "{args:?} should be a write");
+            let Some(bytes) = command_to_resp(&cmd) else {
+                continue; // propagated as the client sent it
+            };
+            // Canonical forms differ (a TTL becomes PXAT, an applied NX is
+            // dropped): what matters is one complete, valid command of the
+            // same kind, with nothing left over.
+            let mut buf = bytes::BytesMut::from(&bytes[..]);
+            let parsed = match crate::resp::parse_command(&mut buf) {
+                Ok(Some(c)) => c,
+                other => panic!("{args:?}: {:?}: {other:?}", String::from_utf8_lossy(&bytes)),
+            };
+            assert!(
+                buf.is_empty(),
+                "{args:?}: bytes left over: {:?}",
+                String::from_utf8_lossy(&buf)
+            );
+            assert_eq!(
+                std::mem::discriminant(&parsed),
+                std::mem::discriminant(&cmd),
+                "{args:?}: {:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
+
+    /// No hand-written `$<len>\r\nNAME\r\n` in this file has a length that
+    /// doesn't match the name (how the ZREMRANGEBY* bug happened).
+    #[test]
+    fn test_literal_bulk_lengths_in_aof_encoder_match() {
+        let src = include_str!("aof.rs");
+        let mut rest = src;
+        let mut checked = 0;
+        while let Some(i) = rest.find("$") {
+            rest = &rest[i + 1..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let Some(after) = rest[digits.len()..].strip_prefix("\\r\\n") else {
+                continue;
+            };
+            let Ok(n) = digits.parse::<usize>() else {
+                continue;
+            };
+            let word: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '.')
+                .collect();
+            if word.is_empty() || !after[word.len()..].starts_with("\\r\\n") {
+                continue;
+            }
+            assert_eq!(n, word.len(), "${n} before {word}");
+            checked += 1;
+        }
+        assert!(checked > 50, "only {checked} literals found");
     }
 
     #[test]
