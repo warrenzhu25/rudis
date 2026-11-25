@@ -772,6 +772,12 @@ fn link_state_name(up: bool, phase: u8) -> &'static str {
 /// can take hours.
 pub static REPL_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(60);
 
+/// `repl-diskless-sync-delay` (seconds): a master waits this long before
+/// it starts a full sync for a replica. Redis waits for more replicas to
+/// share one snapshot; rudis builds one per replica, so the default is 0
+/// (Redis's is 5), but tests and operators use it to space out syncs.
+pub static REPL_DISKLESS_SYNC_DELAY: AtomicU64 = AtomicU64::new(0);
+
 /// `repl-diskless-load` values, in [`REPL_DISKLESS_LOAD_NAMES`] order. A
 /// rudis replica always receives the RDB into a temp file first; only
 /// `swapdb` changes anything: see [`async_load_wanted`].

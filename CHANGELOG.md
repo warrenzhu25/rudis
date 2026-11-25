@@ -22,6 +22,8 @@ or the persistence format; such changes are called out under **Breaking**.
 - `repl-diskless-load swapdb` loads a full sync asynchronously (Redis's `async_loading`)
   when the master's replication id is the replica's own: the old dataset keeps being
   served until the new one has loaded, and a failed load keeps it.
+- `repl-diskless-sync-delay` is honoured: a master waits that long before starting a
+  replica's full sync (default 0; Redis's is 5).
 
 ### Fixed
 

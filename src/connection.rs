@@ -4325,6 +4325,8 @@ pub fn apply_config_value(
         }
         "shutdown-timeout" => crate::replication::SHUTDOWN_TIMEOUT_SECS
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "repl-diskless-sync-delay" => crate::replication::REPL_DISKLESS_SYNC_DELAY
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
         "repl-diskless-load" => crate::replication::REPL_DISKLESS_LOAD.store(
             crate::replication::parse_repl_diskless_load(val_str)?,
             Ordering::Relaxed,
@@ -4929,7 +4931,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 122] = [
+    let all_configs: [(&str, String); 123] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -5306,6 +5308,12 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         (
             "repl-diskless-load",
             crate::replication::repl_diskless_load_name().to_string(),
+        ),
+        (
+            "repl-diskless-sync-delay",
+            crate::replication::REPL_DISKLESS_SYNC_DELAY
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
         ),
     ];
     let hidden_configs: [(&str, String); 2] = [
@@ -10171,6 +10179,11 @@ async fn run_master_replica_stream(
                 );
             } else {
                 crate::log_notice!("Full resync requested by replica {}", name);
+            }
+            let delay = crate::replication::REPL_DISKLESS_SYNC_DELAY
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if delay > 0 && !hub.replica_takes_dual_channel(client_id) {
+                monoio::time::sleep(std::time::Duration::from_secs(delay)).await;
             }
             if hub.replica_takes_dual_channel(client_id) {
                 // The replica opens its RDB channel, then comes back for
