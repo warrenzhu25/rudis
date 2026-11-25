@@ -3,6 +3,17 @@ use fxhash::hash64;
 use hashbrown::HashMap;
 
 pub type RudisHashMap = crate::packedhash::PackedHash;
+
+/// The `INFO keysizes` fields, in Redis's order, indexed as
+/// [`RudisTable::keysizes_histogram`] returns them.
+pub const KEYSIZES_TYPES: [&str; 6] = [
+    "distrib_strings_sizes",
+    "distrib_lists_items",
+    "distrib_sets_items",
+    "distrib_zsets_items",
+    "distrib_hashes_items",
+    "distrib_streams_items",
+];
 use crate::compact::{CompactKey, CompactStr};
 use crate::resp::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -3921,6 +3932,61 @@ impl RudisTable {
     #[inline]
     pub fn entries(&self) -> impl Iterator<Item = &RudisEntry> {
         self.table.entries()
+    }
+
+    /// `INFO keysizes`: live keys of the Redis types it reports, counted by
+    /// type and by size bucket (the largest power of two not above the
+    /// length; 0 for empty). Index by [`KEYSIZES_TYPES`]; the inner maps
+    /// go bucket -> keys.
+    pub fn keysizes_histogram(&self) -> [std::collections::BTreeMap<u64, u64>; 6] {
+        let now = crate::clock::now();
+        let mut hist: [std::collections::BTreeMap<u64, u64>; 6] = Default::default();
+        for entry in self.table.entries() {
+            if entry.expire_at().is_some_and(|t| t <= now) {
+                continue;
+            }
+            let val = match &entry.val {
+                RudisValue::Cooled(cv) => &cv.val,
+                v => v,
+            };
+            let (ty, len) = match val {
+                RudisValue::String(s) => (0, s.len()),
+                RudisValue::Int(n) => (0, Self::format_i64(*n).len()),
+                RudisValue::HyperLogLog(regs) => {
+                    (0, crate::hll::hll_create_from_regs(regs, None).len())
+                }
+                RudisValue::List(l) => (1, l.len()),
+                RudisValue::Set(s) => (2, s.len()),
+                RudisValue::ZSet(z) => (3, z.len()),
+                RudisValue::SmallHash(_) | RudisValue::Hash(_) => {
+                    let all = match val {
+                        RudisValue::SmallHash(h) => h.len(),
+                        RudisValue::Hash(h) => h.len(),
+                        _ => unreachable!(),
+                    };
+                    // Fields past their TTL not purged yet are gone already
+                    // (Redis's active expiry would have removed them).
+                    let expired = self
+                        .hash_field_expires
+                        .get(entry.key.as_slice())
+                        .map_or(0, |f| f.values().filter(|&&t| t <= now).count());
+                    match all.saturating_sub(expired) {
+                        0 => continue,
+                        n => (4, n),
+                    }
+                }
+                RudisValue::Stream(s) => (5, s.len()),
+                // On disk: not read back just for a histogram.
+                RudisValue::Tiered(_) | RudisValue::Cooled(_) => continue,
+            };
+            let bucket = if len == 0 {
+                0
+            } else {
+                1u64 << (63 - (len as u64).leading_zeros())
+            };
+            *hist[ty].entry(bucket).or_insert(0) += 1;
+        }
+        hist
     }
 
     /// The entry for `key` as stored, without lazy expiry, LRU updates or

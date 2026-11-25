@@ -150,6 +150,9 @@ use std::sync::atomic::Ordering;
 /// (handled by `execute_local_command`, rejected from clients).
 /// Replies with this shard's `DEBUG DIGEST` part.
 pub const DEBUG_DIGEST_SHARD: &[u8] = b"__shard-digest";
+/// Replies with this shard's `INFO keysizes` histograms (see
+/// [`crate::shard::ShardDb::keysizes_part`]).
+pub const DEBUG_KEYSIZES_SHARD: &[u8] = b"__shard-keysizes";
 /// Empties this shard and replays its AOF file.
 pub const DEBUG_LOADAOF_SHARD: &[u8] = b"__shard-loadaof";
 /// `__shard-populate <prefix> <size|""> <n>...`: creates this shard's
@@ -3886,6 +3889,23 @@ impl Router {
             }
         }
         map
+    }
+
+    /// `INFO keysizes`: every shard's histograms summed, by db then type
+    /// (see [`crate::table::RudisTable::keysizes_histogram`]).
+    pub async fn keysizes(&self) -> crate::shard::KeysizesByDb {
+        let mut all = self.local_db.borrow().keysizes_by_db();
+        let cmd = || Command::Debug(vec![Bytes::from_static(DEBUG_KEYSIZES_SHARD)]);
+        for res in self.execute_remote_many(self.to_other_shards(cmd)).await {
+            let body = res.strip_prefix(b"$").and_then(|r| {
+                let start = r.windows(2).position(|w| w == b"\r\n")? + 2;
+                r.get(start..)?.strip_suffix(b"\r\n")
+            });
+            if let Some(body) = body {
+                crate::shard::merge_keysizes_part(&mut all, body);
+            }
+        }
+        all
     }
 
     /// `DEBUG DIGEST`: XOR of every shard's key digests (see

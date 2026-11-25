@@ -1,0 +1,43 @@
+# unit/info-keysizes tests that don't apply to rudis.
+#
+# Hash fields past their TTL are removed per key, all at once, the next
+# time the key is touched (docs/differences.md, Subkey Notifications);
+# Redis removes them one by one as each is read, which these tests count.
+# (The names end in a space: the suffix is empty outside replica mode.)
+KEYSIZES - Test Hash field lazy expiration (listpackex) 
+KEYSIZES - Test Hash field lazy expiration (hashtable) 
+KEYSIZES - Test Hash field lazy expiration (listpackex) (replica)
+KEYSIZES - Test Hash field lazy expiration (hashtable) (replica)
+# Arrays (ARSET & co.) are an unreleased Redis type rudis doesn't implement.
+KEYSIZES - Untracked types stay out of the histogram 
+KEYSIZES - Untracked types stay out of the histogram (replica)
+# key-memory-histograms (distrib_*_sizes by allocation size) and the
+# per-slot allocation tracking count bytes as Redis's allocator and
+# encodings use them; rudis's values have other sizes, so these exact
+# histograms can't match. The directive is accepted and ignored.
+KEY-MEMORY-STATS - All data types should appear in key memory histogram
+KEY-MEMORY-STATS - can disable key-memory-histograms at runtime and distrib_*_sizes disappear
+KEY-MEMORY-STATS - cannot enable key-memory-histograms at runtime when disabled at startup
+KEY-MEMORY-STATS - cannot re-enable key-memory-histograms at runtime after disabling
+KEY-MEMORY-STATS - DEBUG RELOAD preserves key memory histogram
+KEY-MEMORY-STATS - DEL on primary updates key memory stats on replica
+KEY-MEMORY-STATS - DEL should remove key from key memory histogram
+KEY-MEMORY-STATS disabled - key memory histogram should not appear
+KEY-MEMORY-STATS - Empty database should have empty key memory histogram
+KEY-MEMORY-STATS - EXPIRE eventually removes from histogram
+KEY-MEMORY-STATS - FLUSHALL clears key memory histogram
+KEY-MEMORY-STATS - Hash field lazy expiration (listpackex)
+KEY-MEMORY-STATS - Hash field lazy expiration (hashtable)
+KEY-MEMORY-STATS - Histogram bins should use power-of-2 labels
+KEY-MEMORY-STATS - key memory histogram should appear
+KEY-MEMORY-STATS - Larger allocations go to higher bins
+KEY-MEMORY-STATS - List keys should appear in key memory histogram
+KEY-MEMORY-STATS - Modifying a list should update key memory histogram
+KEY-MEMORY-STATS - RDB save and restart preserves key memory histogram
+KEY-MEMORY-STATS - RENAME should preserve key memory histogram
+KEY-MEMORY-STATS - Replication updates key memory stats on replica
+KEY-MEMORY-STATS - Stream keys should appear in key memory histogram
+KEY-MEMORY-STATS - Test DEBUG KEYSIZES-HIST-ASSERT command
+KEY-MEMORY-STATS - Test RESTORE adds to histogram
+SLOT-ALLOCSIZE - SUNION/SDIFF family keep slot alloc tracking across rehash
+SLOT-ALLOCSIZE - Test DEBUG ALLOCSIZE-SLOTS-ASSERT command

@@ -2500,6 +2500,34 @@ impl ShardDb {
     }
 
     /// Per-DB `(db_idx, keys, expires, ttl_sum_ms)` for `INFO keyspace`.
+    /// This shard's `INFO keysizes` histograms, by db.
+    pub fn keysizes_by_db(&self) -> KeysizesByDb {
+        let mut out = KeysizesByDb::new();
+        for db_idx in 0..self.max_db_len() {
+            if let Some(table) = self.table_for_db(db_idx) {
+                let hist = table.keysizes_histogram();
+                if hist.iter().any(|h| !h.is_empty()) {
+                    out.insert(db_idx, hist);
+                }
+            }
+        }
+        out
+    }
+
+    /// [`Self::keysizes_by_db`] as text for another shard to merge (see
+    /// [`merge_keysizes_part`]): `db,type,bucket,count` items, `;` apart.
+    pub fn keysizes_part(&self) -> String {
+        let mut s = String::new();
+        for (db, hist) in self.keysizes_by_db() {
+            for (ty, buckets) in hist.iter().enumerate() {
+                for (bucket, n) in buckets {
+                    s.push_str(&format!("{db},{ty},{bucket},{n};"));
+                }
+            }
+        }
+        s
+    }
+
     pub fn keyspace_stats_by_db(&self) -> Vec<(usize, usize, usize, u64)> {
         let now = crate::clock::now();
         let max_db = self.max_db_len();
@@ -5582,8 +5610,82 @@ pub fn before_write_table(table: &crate::table::RudisTable, db_idx: usize, key: 
 /// Piece size [`save_rdb_chunk_yielding`] streams to its sink.
 const RDB_FLUSH_BYTES: usize = 4 << 20;
 
+/// `INFO keysizes` histograms by db: per type (see
+/// [`crate::table::KEYSIZES_TYPES`]), size bucket -> keys.
+pub type KeysizesByDb =
+    std::collections::BTreeMap<usize, [std::collections::BTreeMap<u64, u64>; 6]>;
+
+/// Adds another shard's [`ShardDb::keysizes_part`] to `into`.
+pub fn merge_keysizes_part(into: &mut KeysizesByDb, part: &[u8]) {
+    for item in part.split(|&b| b == b';') {
+        let mut f = std::str::from_utf8(item).unwrap_or("").split(',');
+        let (Some(db), Some(ty), Some(bucket), Some(n)) = (
+            f.next().and_then(|v| v.parse::<usize>().ok()),
+            f.next()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&t| t < 6),
+            f.next().and_then(|v| v.parse::<u64>().ok()),
+            f.next().and_then(|v| v.parse::<u64>().ok()),
+        ) else {
+            continue;
+        };
+        *into.entry(db).or_default()[ty].entry(bucket).or_insert(0) += n;
+    }
+}
+
+/// The `# Keysizes` INFO section: one line per db and type that has keys,
+/// `db0_distrib_strings_sizes:1=2,4=1,1K=3`, sizes in K/M/G/T/P (powers
+/// of 1024) from 1024 up, as Redis prints them.
+pub fn format_keysizes(all: &KeysizesByDb) -> String {
+    fn size(b: u64) -> String {
+        let mut b = b;
+        for unit in ["", "K", "M", "G", "T", "P"] {
+            if b < 1024 || !b.is_multiple_of(1024) {
+                return format!("{b}{unit}");
+            }
+            b /= 1024;
+        }
+        format!("{b}E")
+    }
+    let mut s = String::from("# Keysizes\r\n");
+    for (db, hist) in all {
+        for (ty, buckets) in hist.iter().enumerate() {
+            if buckets.is_empty() {
+                continue;
+            }
+            let items: Vec<String> = buckets
+                .iter()
+                .map(|(b, n)| format!("{}={n}", size(*b)))
+                .collect();
+            s.push_str(&format!(
+                "db{db}_{}:{}\r\n",
+                crate::table::KEYSIZES_TYPES[ty],
+                items.join(",")
+            ));
+        }
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_keysizes_part_merges_and_formats_like_redis() {
+        let mut db = ShardDb::new(0);
+        db.set(Bytes::from("s1"), Bytes::from("x"), None);
+        db.set(Bytes::from("s2"), Bytes::from(vec![b'x'; 2048]), None);
+        db.set(Bytes::from("s3"), Bytes::from(vec![b'x'; 3 << 20]), None);
+        let mut all = KeysizesByDb::new();
+        merge_keysizes_part(&mut all, db.keysizes_part().as_bytes());
+        merge_keysizes_part(&mut all, db.keysizes_part().as_bytes());
+        merge_keysizes_part(&mut all, b"0,9,1,1;junk;");
+        assert_eq!(
+            format_keysizes(&all),
+            "# Keysizes\r\ndb0_distrib_strings_sizes:1=2,2K=2,2M=2\r\n"
+        );
+        assert_eq!(format_keysizes(&KeysizesByDb::new()), "# Keysizes\r\n");
+    }
+
     use super::*;
 
     /// Replies of packed values come from a shared slab, but each is its

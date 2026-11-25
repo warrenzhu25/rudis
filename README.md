@@ -59,7 +59,7 @@ container's seccomp profile.
 
 ## How it's tested
 
-- **Redis's own test suite.** 85 of the Redis/Valkey TCL test suites (data types, scripting,
+- **Redis's own test suite.** 86 of the Redis/Valkey TCL test suites (data types, scripting,
   ACLs, replication, persistence, cluster, client eviction, ...) gate every merge, run by
   [`scripts/ci_local.sh`](scripts/ci_local.sh) on a dedicated host. GitHub Actions runs the core
   suites on every push and the timing-heavy rest nightly, since a shared 4-vCPU runner makes
@@ -656,9 +656,9 @@ links go to the corresponding source-verified subsystem specification.
 
 ## Redis/Valkey TCL Compatibility Suite
 
-Rudis is validated against **85 official Redis/Valkey TCL test suites**: the 49 core suites
+Rudis is validated against **86 official Redis/Valkey TCL test suites**: the 49 core suites
 below, which run against one server via
-[`scripts/run_redis_test_suite.sh`](scripts/run_redis_test_suite.sh), plus 36 replication,
+[`scripts/run_redis_test_suite.sh`](scripts/run_redis_test_suite.sh), plus 37 replication,
 persistence and cluster suites that start their own servers:
 
 ```bash
@@ -680,14 +680,14 @@ persistence and cluster suites that start their own servers:
 Suites that start their own servers run through
 [`scripts/run_redis_integration_suite.sh`](scripts/run_redis_integration_suite.sh):
 
-| Category | Suites (36) |
+| Category | Suites (37) |
 | :--- | :--- |
 | **Replication** (11) | `integration/{replication-2,replication-3,replication-4,replication-psync,block-repl,psync2,psync2-pingoff,psync2-master-restart,psync2-reg,failover,shutdown}` |
-| **Persistence** (13) | `unit/{aofrw,client-eviction,wait,violations,memefficiency}`, `integration/{aof-race,convert-ziplist-hash-on-load,convert-ziplist-zset-on-load,convert-zipmap-hash-on-load,rdb,corrupt-dump,corrupt-dump-fuzzer,logging}` |
+| **Persistence** (14) | `unit/{aofrw,client-eviction,wait,violations,memefficiency,info-keysizes}`, `integration/{aof-race,convert-ziplist-hash-on-load,convert-ziplist-zset-on-load,convert-zipmap-hash-on-load,rdb,corrupt-dump,corrupt-dump-fuzzer,logging}` |
 | **Cluster** (12) | `unit/cluster/{failure-marking,internal-secret,multi-slot-operations,misc,scripting,sharded-pubsub,slot-ownership,replica-migration,human-announced-nodename,hostnames,announced-endpoints}`, `integration/dismiss-mem` |
 
-All 85 gate every merge through [`scripts/ci_local.sh`](scripts/ci_local.sh). GitHub Actions
-runs the core suites on every push and 26 of the other 36 nightly; the rest run locally only. Tests that don't apply to rudis (no `fork()`, no Unix socket, ...)
+All 86 gate every merge through [`scripts/ci_local.sh`](scripts/ci_local.sh). GitHub Actions
+runs the core suites on every push and 27 of the other 37 nightly; the rest run locally only. Tests that don't apply to rudis (no `fork()`, no Unix socket, ...)
 and known gaps are listed, each with its reason, in [`scripts/tcl_skips/`](scripts/tcl_skips/);
 [`scripts/tcl_patches/`](scripts/tcl_patches/) adapts a suite where rudis's behavior differs on
 purpose (it refuses corrupt `RESTORE` payloads up front instead of crashing on them later).

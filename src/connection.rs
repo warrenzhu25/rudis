@@ -14335,6 +14335,7 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
                         "errorstats",
                         "cluster",
                         "keyspace",
+                        "keysizes",
                     ] {
                         push_unique(s);
                     }
@@ -14352,6 +14353,7 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
                 "errorstats" => push_unique("errorstats"),
                 "cluster" => push_unique("cluster"),
                 "keyspace" => push_unique("keyspace"),
+                "keysizes" => push_unique("keysizes"),
                 _ => {}
             }
         }
@@ -14376,6 +14378,10 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
                     "# Cluster\r\ncluster_enabled:{}\r\n",
                     u8::from(router.cluster_enabled)
                 )),
+                "keysizes" => {
+                    // A scan of every shard's keys: only when asked for.
+                    acc.push_str(&crate::shard::format_keysizes(&router.keysizes().await));
+                }
                 "keyspace" => {
                     // Only fan out when the section is requested.
                     let stats_by_db = router.keyspace_stats_by_db().await;
@@ -22724,6 +22730,7 @@ async fn execute_command_inner(
                     out.extend_from_slice(b"+Apparently Rudis did not crash: test passed\r\n");
                     return false;
                 } else if sub.as_ref() == crate::router::DEBUG_DIGEST_SHARD
+                    || sub.as_ref() == crate::router::DEBUG_KEYSIZES_SHARD
                     || sub.as_ref() == crate::router::DEBUG_LOADAOF_SHARD
                     || sub.as_ref() == crate::router::DEBUG_POPULATE_SHARD
                     || sub.as_ref() == crate::router::DEBUG_FLUSH_SHARD

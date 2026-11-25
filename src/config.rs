@@ -256,6 +256,7 @@ const REDIS_CONFIG_NAMES: &[&str] = &[
     "io-threads-do-reads",
     "jemalloc-bg-thread",
     "key-load-delay",
+    "key-memory-histograms",
     "latency-monitor-threshold",
     "latency-tracking",
     "latency-tracking-info-percentiles",
