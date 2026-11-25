@@ -629,6 +629,18 @@ impl ClusterHub {
             .any(|&(s, e)| slot >= s && slot <= e)
     }
 
+    /// The id of the master serving `slot` (ours if we do), if any.
+    pub fn slot_owner_id(&self, slot: u16) -> Option<String> {
+        if self.owns_slot(slot) {
+            return Some(self.my_id());
+        }
+        self.nodes
+            .read()
+            .iter()
+            .find(|(_, n)| n.is_master() && n.slots.iter().any(|&(s, e)| slot >= s && slot <= e))
+            .map(|(id, _)| id.clone())
+    }
+
     /// The first half of a manual failover (Redis's MFSTART): asks our
     /// master to pause its writers and returns its replication offset,
     /// which we must reach before taking over so no acknowledged write is
@@ -892,7 +904,7 @@ impl ClusterHub {
     }
 
     /// Has each shard delete its keys in `slots` (see `take_slot_purges`).
-    fn queue_slot_purge(&self, slots: &[u16]) {
+    pub(crate) fn queue_slot_purge(&self, slots: &[u16]) {
         let shards = self.num_shards.load(Ordering::Acquire).max(1);
         let mut q = self.slot_purges.lock();
         if q.len() < shards {
@@ -1746,7 +1758,7 @@ impl ClusterHub {
         let cur_epoch = self.current_epoch.load(Ordering::Relaxed);
         let cfg_epoch = self.config_epoch.load(Ordering::Relaxed);
         format!(
-            "cluster_state:{}\r\ncluster_slots_assigned:{}\r\ncluster_slots_ok:{}\r\ncluster_slots_pfail:{}\r\ncluster_slots_fail:{}\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\ncluster_current_epoch:{}\r\ncluster_my_epoch:{}\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n",
+            "cluster_state:{}\r\ncluster_slots_assigned:{}\r\ncluster_slots_ok:{}\r\ncluster_slots_pfail:{}\r\ncluster_slots_fail:{}\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\ncluster_current_epoch:{}\r\ncluster_my_epoch:{}\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\ncluster_slot_migration_active_tasks:{}\r\ncluster_slot_migration_active_trim_running:{}\r\n",
             state,
             slots_assigned,
             slots_ok,
@@ -1755,7 +1767,9 @@ impl ClusterHub {
             total_nodes,
             size,
             cur_epoch,
-            cfg_epoch
+            cfg_epoch,
+            crate::asm::hub(self.port).active_count(),
+            usize::from(self.slot_purges.lock().iter().any(|s| !s.is_empty())),
         )
     }
 

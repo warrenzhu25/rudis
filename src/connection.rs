@@ -12231,6 +12231,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Failover { .. } => "FAILOVER",
         Command::Psync { .. } => "PSYNC",
         Command::Sync => "SYNC",
+        Command::Trimslots(_) => "TRIMSLOTS",
         Command::Replconf(_) => "REPLCONF",
         Command::Role => "ROLE",
         Command::Tier(_) => "TIER",
@@ -15989,6 +15990,11 @@ async fn execute_command_inner(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
+        Command::Trimslots(ranges) => {
+            crate::asm::trim_slots(router.base_port, &ranges);
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
         Command::Tier(sub) => {
             match sub {
                 crate::resp::TierSubcommand::Spill(key) => {
@@ -16613,6 +16619,9 @@ async fn execute_command_inner(
                         Ok(()) => out.extend_from_slice(b"+OK\r\n"),
                         Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
                     }
+                }
+                ClusterSubcommand::Migration(m) => {
+                    crate::asm::run_migration_command(router, m, out);
                 }
                 ClusterSubcommand::FlushSlots => {
                     let hub = crate::cluster::get_cluster_hub(router.base_port);

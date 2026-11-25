@@ -32,6 +32,8 @@ pub enum ClusterSubcommand {
     KeySlot(Bytes),
     /// CLUSTER SLOT-STATS SLOTSRANGE ... | ORDERBY ...
     SlotStats(crate::slot_stats::Query),
+    /// CLUSTER MIGRATION IMPORT|CANCEL|STATUS ... (atomic slot migration)
+    Migration(crate::asm::MigrationCmd),
     CountKeysInSlot(u16),
     GetKeysInSlot(u16, usize),
     SetSlot(u16, SetSlotSubcommand),
@@ -893,6 +895,9 @@ pub enum Command {
         failover: bool,
     },
     Sync,
+    /// `TRIMSLOTS RANGES <n> <start> <end> ...`: deletes the keys of slots
+    /// this node doesn't serve (atomic slot migration).
+    Trimslots(Vec<(u16, u16)>),
     /// `FAILOVER ABORT`, or `FAILOVER [TO host port [FORCE]] [TIMEOUT ms]`.
     Failover {
         abort: bool,
@@ -4209,6 +4214,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "SLOT-STATS" => Ok(Some(Command::Cluster(ClusterSubcommand::SlotStats(
                     crate::slot_stats::parse_query(&args[2..])?,
                 )))),
+                "MIGRATION" => Ok(Some(Command::Cluster(ClusterSubcommand::Migration(
+                    crate::asm::parse_migration(&args[2..])
+                        .map_err(|e| e.trim_start_matches("ERR ").to_string())?,
+                )))),
                 "COUNTKEYSINSLOT" => {
                     if args.len() < 3 {
                         return Err(
@@ -6952,6 +6961,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Sync))
         }
+        "TRIMSLOTS" => Ok(Some(Command::Trimslots(
+            crate::asm::parse_trimslots(&args[1..])
+                .map_err(|e| e.trim_start_matches("ERR ").to_string())?,
+        ))),
         "REPLCONF" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'replconf' command".to_string());
