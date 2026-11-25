@@ -15,7 +15,3 @@ Using side effects is not a problem with command replication
 Test getfenv availability lua-enable-deprecated-api=yes
 Test setfenv availability lua-enable-deprecated-api=yes
 Test newproxy availability lua-enable-deprecated-api=yes
-#
-# Redis wraps a script's propagated effects in MULTI / EXEC; rudis sends
-# them one by one, so this replication-stream shape check differs.
-Test implicit deletions are replicated despite set_repl(REPL_NONE)

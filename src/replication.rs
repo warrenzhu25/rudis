@@ -2213,6 +2213,49 @@ impl ReplicationHub {
         }
     }
 
+    /// Streams a script's writes, `bytes` (starting in DB `first_db`, ending
+    /// in `last_db`), as one `MULTI` ... `EXEC` block, appended in one step
+    /// so nothing else streams in between. Inside an EXEC's block (already
+    /// a block) they go as they are.
+    pub fn propagate_shard_tx(&self, shard: usize, first_db: usize, last_db: usize, bytes: &[u8]) {
+        if !self.is_master() {
+            return;
+        }
+        if !(self.backlog_active.load(Ordering::Relaxed)
+            || self.has_replicas.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        if crate::slot_stats::net_accounting() && self.has_replicas.load(Ordering::Relaxed) {
+            crate::slot_stats::record_replication_egress(bytes, self.replicas.read().len());
+        }
+        let mut wake = Vec::new();
+        {
+            let mut backlog = self.backlog.write();
+            if !self.is_master() {
+                return;
+            }
+            let wrap = backlog.tx_block == TxBlockState::None;
+            if wrap {
+                self.append_locked(&mut backlog, None, REPL_MULTI, false, &mut wake);
+            }
+            let mut payload = Vec::with_capacity(bytes.len() + 24);
+            if first_db != backlog.stream_db {
+                let d = first_db.to_string();
+                payload.extend_from_slice(
+                    format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{d}\r\n", d.len()).as_bytes(),
+                );
+            }
+            payload.extend_from_slice(bytes);
+            backlog.stream_db = last_db;
+            self.append_locked(&mut backlog, Some(shard), &payload, false, &mut wake);
+            if wrap {
+                self.append_locked(&mut backlog, None, REPL_EXEC, false, &mut wake);
+            }
+        }
+        self.wake_replicas(wake);
+    }
+
     /// Feeds bytes of our master's replication stream, already applied, to
     /// our backlog and our own replicas, unchanged (Redis's
     /// `replicationFeedStreamFromPrimaryStream`): a chain of replicas shares
@@ -3592,6 +3635,71 @@ pub fn wait_writes_streamed_blocking(
     true
 }
 
+/// The writes a running script streams (see [`script_capture_begin`]).
+#[derive(Default)]
+struct ScriptCapture {
+    target: Option<(u16, usize)>,
+    first_db: usize,
+    db: usize,
+    bytes: Vec<u8>,
+    count: usize,
+}
+
+thread_local! {
+    static SCRIPT_CAPTURE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SCRIPT_CAPTURE: std::cell::RefCell<ScriptCapture> = std::cell::RefCell::new(ScriptCapture::default());
+}
+
+/// A script starts on this thread: until [`script_capture_end`], the writes
+/// it streams are held, so that, as in Redis, two or more reach replicas as
+/// one `MULTI` ... `EXEC` block (a replica never shows half a script's
+/// effects), and a single one goes alone.
+pub fn script_capture_begin() {
+    SCRIPT_CAPTURE.with(|c| *c.borrow_mut() = ScriptCapture::default());
+    SCRIPT_CAPTURE_ON.set(true);
+}
+
+fn capture_script_write(port: u16, shard: usize, bytes: &[u8]) {
+    let db = crate::connection::CURRENT_DB.get();
+    SCRIPT_CAPTURE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.target.is_none() {
+            c.target = Some((port, shard));
+            c.first_db = db;
+            c.db = db;
+        } else if c.db != db {
+            // The script SELECTed another DB.
+            let d = db.to_string();
+            c.bytes.extend_from_slice(
+                format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{d}\r\n", d.len()).as_bytes(),
+            );
+            c.db = db;
+        }
+        c.bytes.extend_from_slice(bytes);
+        c.count += 1;
+    });
+}
+
+/// The script ended: streams what it wrote (see [`script_capture_begin`]).
+pub fn script_capture_end() {
+    if !SCRIPT_CAPTURE_ON.replace(false) {
+        return;
+    }
+    let c = SCRIPT_CAPTURE.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let Some((port, shard)) = c.target else {
+        return;
+    };
+    if c.count == 1 {
+        let prev = crate::connection::CURRENT_DB.replace(c.first_db);
+        propagate_shard_bytes(port, shard, &c.bytes);
+        crate::connection::CURRENT_DB.set(prev);
+        return;
+    }
+    // After what this thread held from before, to keep the order.
+    flush_stream_batch();
+    cached_hub(port).propagate_shard_tx(shard, c.first_db, c.db, &c.bytes);
+}
+
 /// `MULTI` and `EXEC` as they go in the stream around a transaction.
 pub const REPL_MULTI: &[u8] = b"*1\r\n$5\r\nMULTI\r\n";
 pub const REPL_EXEC: &[u8] = b"*1\r\n$4\r\nEXEC\r\n";
@@ -3667,6 +3775,10 @@ pub fn propagate_shard_bytes(port: u16, shard_id: usize, bytes: &[u8]) {
     }
     let hub = cached_hub(port);
     if !hub.replication_active.load(Ordering::Relaxed) {
+        return;
+    }
+    if SCRIPT_CAPTURE_ON.get() {
+        capture_script_write(port, shard_id, bytes);
         return;
     }
     if hold_stream_bytes(port, shard_id, bytes) {
@@ -7297,6 +7409,41 @@ mod tests {
             ["MULTI", "SELECT", "3", "INCR", "a", "INCR", "b", "EXEC"],
             "{out:?}"
         );
+        hub.unregister_replica(rep.id);
+    }
+
+    #[test]
+    fn test_script_writes_go_as_one_block_and_a_single_one_alone() {
+        let port = 19962;
+        let hub = get_replication_hub(port);
+        let (tx, _rx) = flume::unbounded();
+        let rep = hub.register_replica(62, tx);
+        let words = |b: Vec<u8>| -> Vec<String> {
+            String::from_utf8(b)
+                .unwrap()
+                .split("\r\n")
+                .filter(|w| !w.is_empty() && !w.starts_with(['*', '$']))
+                .map(String::from)
+                .collect()
+        };
+        script_capture_begin();
+        propagate_shard_bytes(port, 0, b"*2\r\n$4\r\nINCR\r\n$1\r\na\r\n");
+        // Nothing goes out while the script runs.
+        assert!(rep.take_pending().is_empty());
+        propagate_shard_bytes(port, 0, b"*2\r\n$4\r\nINCR\r\n$1\r\nb\r\n");
+        script_capture_end();
+        assert_eq!(
+            words(rep.take_pending()),
+            ["MULTI", "INCR", "a", "INCR", "b", "EXEC"]
+        );
+        script_capture_begin();
+        propagate_shard_bytes(port, 0, b"*2\r\n$4\r\nINCR\r\n$1\r\nc\r\n");
+        script_capture_end();
+        assert_eq!(words(rep.take_pending()), ["INCR", "c"]);
+        // A script that writes nothing streams nothing.
+        script_capture_begin();
+        script_capture_end();
+        assert!(rep.take_pending().is_empty());
         hub.unregister_replica(rep.id);
     }
 

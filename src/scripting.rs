@@ -224,6 +224,7 @@ impl ScriptRunGuard {
         });
         RUNNING_SCRIPTS.lock().push(run.clone());
         CURRENT_SCRIPT.with(|c| *c.borrow_mut() = Some(run.clone()));
+        crate::replication::script_capture_begin();
         Self(run)
     }
 }
@@ -231,6 +232,7 @@ impl ScriptRunGuard {
 impl Drop for ScriptRunGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
+        crate::replication::script_capture_end();
         CURRENT_SCRIPT.with(|c| *c.borrow_mut() = None);
         RUNNING_SCRIPTS
             .lock()
