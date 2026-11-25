@@ -795,6 +795,14 @@ pub enum ShardMessage {
     },
     /// A replica's asynchronous full-sync load (see [`AsyncLoad`]).
     AsyncLoadRdb(Box<AsyncLoad>),
+    /// Atomic slot migration: dump this shard's keys in `ranges` into
+    /// migration `task`'s stream (see `crate::asm::dump_slots`); replies
+    /// with the number of keys.
+    AsmDump {
+        task: u64,
+        ranges: Vec<(u16, u16)>,
+        responder: flume::Sender<usize>,
+    },
     ExecuteReplicaCmd {
         db: usize,
         cmd: Box<Command>,
@@ -1498,6 +1506,12 @@ impl ShardDb {
     #[inline]
     pub fn unstick(&mut self, key: &[u8]) -> bool {
         self.sticky_keys.remove(key)
+    }
+
+    /// This shard's keys (DB 0) in the slots of `ranges`, in one pass.
+    pub fn keys_in_slot_ranges(&mut self, ranges: &[(u16, u16)]) -> Vec<Bytes> {
+        self.select_db(0);
+        self.table.keys_in_slot_ranges(ranges)
     }
 
     #[inline]

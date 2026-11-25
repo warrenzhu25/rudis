@@ -2236,6 +2236,10 @@ fn counts_as_running_write(cmd: &Command) -> bool {
 /// per-command path, which waits at the pause gate.
 pub fn enter_write_batch(commands: &[Command]) -> Option<WriteRunning> {
     let guard = WriteRunning::enter(commands.iter().any(counts_as_running_write));
+    // Writes to slots being handed over wait on the per-command path.
+    if guard.0.is_some() && crate::asm::any_write_pause() {
+        return None;
+    }
     // A congested replica (`repl-backpressure-threshold`) holds writes back
     // at the same gate.
     if guard.0.is_some()
@@ -4325,6 +4329,10 @@ pub fn apply_config_value(
         }
         "shutdown-timeout" => crate::replication::SHUTDOWN_TIMEOUT_SECS
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "cluster-slot-migration-write-pause-timeout" => crate::asm::WRITE_PAUSE_TIMEOUT_MS
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "cluster-slot-migration-handoff-max-lag-bytes" => crate::asm::HANDOFF_MAX_LAG_BYTES
+            .store(parse_config_bytes(name, val_str)?, Ordering::Relaxed),
         "repl-diskless-sync-delay" => crate::replication::REPL_DISKLESS_SYNC_DELAY
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
         "repl-diskless-load" => crate::replication::REPL_DISKLESS_LOAD.store(
@@ -4931,7 +4939,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 123] = [
+    let all_configs: [(&str, String); 125] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -5308,6 +5316,18 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         (
             "repl-diskless-load",
             crate::replication::repl_diskless_load_name().to_string(),
+        ),
+        (
+            "cluster-slot-migration-write-pause-timeout",
+            crate::asm::WRITE_PAUSE_TIMEOUT_MS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "cluster-slot-migration-handoff-max-lag-bytes",
+            crate::asm::HANDOFF_MAX_LAG_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
         ),
         (
             "repl-diskless-sync-delay",
@@ -7095,6 +7115,11 @@ async fn execute_tx_step_inner(
                     write_resp_null_array(out_buf);
                     false
                 } else {
+                    if crate::asm::any_write_pause() {
+                        for c in tx_queue.iter() {
+                            crate::asm::wait_write_pause(router.base_port, c).await;
+                        }
+                    }
                     let _write_running = wait_if_tx_paused(router.port, client_id, tx_queue).await;
                     unwatch_keys(router.port, client_id);
                     let mut shards = hashbrown::HashSet::new();
@@ -7931,7 +7956,10 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                     }
                     if matches!(
                         switch_cmd,
-                        Command::Psync { .. } | Command::Sync | Command::DflyFlow { .. }
+                        Command::Psync { .. }
+                            | Command::Sync
+                            | Command::DflyFlow { .. }
+                            | Command::SyncSlots(_)
                     ) {
                         // The link lives as long as the replica: it isn't a
                         // command batch a shutdown waits for (every SHUTDOWN
@@ -7965,6 +7993,17 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                                 }
                             }
                         }
+                        Command::SyncSlots(args) => match transport.into_tcp_stream() {
+                            Ok(stream) => {
+                                crate::asm::run_migrate_source(stream, client_id, router, args)
+                                    .await;
+                            }
+                            Err(mut transport) => {
+                                let _ = transport
+                                    .write_all(REPLICATION_NEEDS_PLAINTEXT.to_vec())
+                                    .await;
+                            }
+                        },
                         Command::DflyFlow { shard_id, lsn, .. } => {
                             match transport.into_tcp_stream() {
                                 Ok(stream) => {
@@ -11214,7 +11253,7 @@ struct MigrateOpts {
 const SLOT_MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Appends `args` to `out` as a RESP command (an array of bulk strings).
-fn write_resp_command(out: &mut Vec<u8>, args: &[&[u8]]) {
+pub fn write_resp_command(out: &mut Vec<u8>, args: &[&[u8]]) {
     write_resp_array_header(out, args.len());
     for arg in args {
         write_resp_bulk(out, arg);
@@ -12232,6 +12271,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Psync { .. } => "PSYNC",
         Command::Sync => "SYNC",
         Command::Trimslots(_) => "TRIMSLOTS",
+        Command::SyncSlots(_) => "CLUSTER",
         Command::Replconf(_) => "REPLCONF",
         Command::Role => "ROLE",
         Command::Tier(_) => "TIER",
@@ -13286,7 +13326,13 @@ fn is_mode_switch_cmd(cmd: &Command) -> bool {
             | Command::Psync { .. }
             | Command::Sync
             | Command::DflyFlow { .. }
-    )
+    ) || is_syncslots_start(cmd)
+}
+
+/// `CLUSTER SYNCSLOTS START ...`: a node importing slots from this one
+/// (see `crate::asm::run_migrate_source`).
+fn is_syncslots_start(cmd: &Command) -> bool {
+    matches!(cmd, Command::SyncSlots(args) if args.first().is_some_and(|a| a.eq_ignore_ascii_case(b"START")))
 }
 
 const NOPERM_CHANNEL: &[u8] =
@@ -14715,6 +14761,9 @@ async fn execute_command_inner(
         should_reset: !is_caching_or_trackinginfo,
     };
 
+    if crate::asm::any_write_pause() && counts_as_running_write(&cmd) {
+        crate::asm::wait_write_pause(router.base_port, &cmd).await;
+    }
     let _write_running = wait_if_client_paused(router.port, client_id, &cmd).await;
     if !allowed_while_busy(&cmd)
         && let Some(busy) = crate::scripting::busy_script_reply(router.port)
@@ -15993,6 +16042,10 @@ async fn execute_command_inner(
         Command::Trimslots(ranges) => {
             crate::asm::trim_slots(router.base_port, &ranges);
             out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::SyncSlots(_) => {
+            out.extend_from_slice(b"-ERR CLUSTER SYNCSLOTS is used between cluster nodes only\r\n");
             false
         }
         Command::Tier(sub) => {
@@ -22894,6 +22947,19 @@ async fn execute_command_inner(
                         libc::raise(libc::SIGSEGV);
                     }
                     return true;
+                } else if sub.eq_ignore_ascii_case(b"asm-failpoint") {
+                    crate::asm::set_fail_point(
+                        args.get(1).map_or(&b""[..], |a| a),
+                        args.get(2).map_or(&b""[..], |a| a),
+                    );
+                    out.extend_from_slice(b"+OK\r\n");
+                    return false;
+                } else if sub.eq_ignore_ascii_case(b"asm-trim-method") {
+                    match crate::asm::set_trim_method(args.get(1).map_or(&b""[..], |a| a)) {
+                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => out.extend_from_slice(format!("-{e}\r\n").as_bytes()),
+                    }
+                    return false;
                 } else if sub.eq_ignore_ascii_case(b"set-active-expire") {
                     let enabled = args.get(1).map(|v| v.as_ref() != b"0").unwrap_or(true);
                     PAUSE_CRON.store(!enabled, std::sync::atomic::Ordering::Relaxed);
@@ -30909,6 +30975,7 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
             | Command::Psync { .. }
             | Command::Sync
             | Command::DflyFlow { .. }
+            | Command::SyncSlots(_)
             | Command::Multi
             | Command::Exec
             | Command::Discard

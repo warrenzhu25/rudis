@@ -2366,6 +2366,15 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let aof = aof_dir.as_deref().zip(cross_shard_aof.as_ref());
                         let _ = responder.send(db.load_full_sync_rdb(&data, shard_id, num_shards, aof));
                     }
+                    ShardMessage::AsmDump {
+                        task,
+                        ranges,
+                        responder,
+                    } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let n = crate::asm::dump_slots(&mut db, port, shard_id, task, &ranges);
+                        let _ = responder.send(n);
+                    }
                     ShardMessage::AsyncLoadRdb(job) => {
                         // Loads between this shard's other work.
                         let db = cross_shard_db.clone();

@@ -898,7 +898,9 @@ impl ClusterHub {
             // new owner serves the slot now), so they go, here and on our
             // replicas. A master that lost all its slots becomes a replica
             // instead and resyncs from its new master.
-            self.queue_slot_purge(&lost);
+            if !crate::asm::trim_disabled() {
+                self.queue_slot_purge(&lost);
+            }
         }
         let _ = self.save_config();
     }
@@ -1158,7 +1160,7 @@ impl ClusterHub {
 
     /// The slots this node announces to peers: none while it holds only
     /// its default slots, which nobody assigned.
-    fn announced_slots(&self) -> Vec<(u16, u16)> {
+    pub fn announced_slots(&self) -> Vec<(u16, u16)> {
         let my_slots = self.my_slots.read();
         if self.has_default_slots() {
             Vec::new()
@@ -1219,6 +1221,30 @@ impl ClusterHub {
     /// Takes `slot` for this node (CLUSTER SETSLOT <slot> NODE myself, a
     /// rebalance step): a new config epoch, then the slot, in that order
     /// (see `claim_slots`).
+    /// Takes `ranges` over in one step, under a new config epoch (an atomic
+    /// slot migration's handover): no announcement goes out with only part
+    /// of them, and the config is saved once.
+    pub fn take_slots(&self, ranges: &[(u16, u16)]) -> u64 {
+        let epoch = self.bump_config_epoch();
+        let slots: Vec<u16> = ranges.iter().flat_map(|&(s, e)| s..=e).collect();
+        {
+            let mut my_slots = self.my_slots.write();
+            if self.has_default_slots() {
+                self.end_default_slots(&mut my_slots);
+            }
+            my_slots.extend_from_slice(ranges);
+            compact_slots(&mut my_slots);
+        }
+        {
+            let mut nodes = self.nodes.write();
+            for node in nodes.values_mut() {
+                remove_slots(&mut node.slots, &slots);
+            }
+        }
+        let _ = self.save_config();
+        epoch
+    }
+
     pub fn take_slot(&self, slot: u16) {
         self.bump_config_epoch();
         self.assign_slot(slot, &self.my_id());

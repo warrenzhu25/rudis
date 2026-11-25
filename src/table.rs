@@ -11608,6 +11608,23 @@ impl RudisTable {
         result
     }
 
+    /// The keys in the slots of `ranges`, in one pass over the table.
+    pub fn keys_in_slot_ranges(&mut self, ranges: &[(u16, u16)]) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        if self.table.items == 0 {
+            return out;
+        }
+        for (_, opt) in self.table.enumerate_slots() {
+            if let Some(entry) = opt {
+                let slot = crate::router::key_slot(&entry.key);
+                if ranges.iter().any(|&(s, e)| slot >= s && slot <= e) {
+                    out.push(entry.key.to_bytes());
+                }
+            }
+        }
+        out
+    }
+
     pub fn flush_slots(&mut self, ranges: &[(u16, u16)]) -> usize {
         let mut to_remove = Vec::new();
         for (idx, opt) in self.table.enumerate_slots() {

@@ -898,6 +898,10 @@ pub enum Command {
     /// `TRIMSLOTS RANGES <n> <start> <end> ...`: deletes the keys of slots
     /// this node doesn't serve (atomic slot migration).
     Trimslots(Vec<(u16, u16)>),
+    /// `CLUSTER SYNCSLOTS ...`: the atomic slot migration protocol between
+    /// rudis nodes (see `crate::asm`). `START` hands the connection over to
+    /// the source side of the migration.
+    SyncSlots(Vec<Bytes>),
     /// `FAILOVER ABORT`, or `FAILOVER [TO host port [FORCE]] [TIMEOUT ms]`.
     Failover {
         abort: bool,
@@ -4214,6 +4218,14 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "SLOT-STATS" => Ok(Some(Command::Cluster(ClusterSubcommand::SlotStats(
                     crate::slot_stats::parse_query(&args[2..])?,
                 )))),
+                "SYNCSLOTS" => {
+                    if args.len() < 3 {
+                        return Err(
+                            "wrong number of arguments for 'cluster|syncslots' command".to_string()
+                        );
+                    }
+                    Ok(Some(Command::SyncSlots(args[2..].to_vec())))
+                }
                 "MIGRATION" => Ok(Some(Command::Cluster(ClusterSubcommand::Migration(
                     crate::asm::parse_migration(&args[2..])
                         .map_err(|e| e.trim_start_matches("ERR ").to_string())?,

@@ -428,6 +428,19 @@ impl ConnectedReplica {
         data
     }
 
+    /// Queues `bytes` for the writer and wakes it (outside the replication
+    /// stream: the caller orders them itself).
+    pub fn send_bytes(&self, bytes: &[u8]) {
+        if self.append_pending(bytes) {
+            let _ = self.sender.send(Vec::new());
+        }
+    }
+
+    /// Whether bytes are queued or being written.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.lock().is_empty() || self.inflight.load(Ordering::Relaxed) > 0
+    }
+
     /// The writer finished writing the batch from `take_pending`.
     pub fn finish_write(&self) {
         let pending = self.pending.lock();
@@ -669,6 +682,11 @@ pub struct ReplicationHub {
     async_loading: AtomicBool,
     /// Replica full-sync snapshots being sent ([`SnapshotSending`]).
     snapshots_sending: std::sync::atomic::AtomicUsize,
+    /// Atomic slot migrations this master sends (see
+    /// [`ReplicationHub::register_migration`]): streams like a replica's,
+    /// that no replica count, WAIT or INFO sees.
+    migrations: RwLock<HashMap<u64, Arc<ConnectedReplica>>>,
+    has_migrations: AtomicBool,
     /// Address details a connection reported before its PSYNC registered
     /// it as a replica (REPLCONF listening-port comes first), by client id.
     pending_peers: Mutex<HashMap<u64, PendingPeer>>,
@@ -1193,6 +1211,8 @@ impl ReplicationHub {
             startup_loading: AtomicBool::new(false),
             async_loading: AtomicBool::new(false),
             snapshots_sending: std::sync::atomic::AtomicUsize::new(0),
+            migrations: RwLock::new(HashMap::new()),
+            has_migrations: AtomicBool::new(false),
             sync_conn: Mutex::new(None),
             worker_exit: Mutex::new(None),
             pending_peers: Mutex::new(HashMap::new()),
@@ -1750,7 +1770,23 @@ impl ReplicationHub {
     ) -> Arc<ConnectedReplica> {
         self.restart_grace.store(false, Ordering::Relaxed);
         let peer = self.pending_peers.lock().remove(&id).unwrap_or_default();
-        let rep = Arc::new(ConnectedReplica {
+        let rep = Arc::new(Self::new_connected_replica(id, sender, peer, full_sync));
+        self.replicas.write().insert(id, rep.clone());
+        self.no_replicas_since.store(0, Ordering::Relaxed);
+        self.has_replicas.store(true, Ordering::Release);
+        self.backlog_active.store(true, Ordering::Release);
+        self.replication_active.store(true, Ordering::Release);
+        HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
+        rep
+    }
+
+    fn new_connected_replica(
+        id: u64,
+        sender: flume::Sender<Vec<u8>>,
+        peer: PendingPeer,
+        full_sync: Option<FullSyncCut>,
+    ) -> ConnectedReplica {
+        ConnectedReplica {
             id,
             sender,
             listening_port: AtomicU64::new(peer.port as u64),
@@ -1774,14 +1810,103 @@ impl ReplicationHub {
             congested: AtomicBool::new(false),
             conn_fd: Mutex::new(None),
             disconnected: AtomicBool::new(false),
-        });
-        self.replicas.write().insert(id, rep.clone());
-        self.no_replicas_since.store(0, Ordering::Relaxed);
-        self.has_replicas.store(true, Ordering::Release);
-        self.backlog_active.store(true, Ordering::Release);
+        }
+    }
+
+    /// Registers the stream of atomic slot migration `id` (see
+    /// `crate::asm`): it gets this master's changes as a replica in full
+    /// sync does, cut per shard ([`FullSyncCut`]): each shard dumps its keys
+    /// of the migrating slots and arms itself in one step
+    /// ([`Self::arm_migration`]). It is not a replica: no replica count,
+    /// WAIT, INFO or backlog sees it.
+    pub fn register_migration(
+        &self,
+        id: u64,
+        sender: flume::Sender<Vec<u8>>,
+        num_shards: usize,
+    ) -> Arc<ConnectedReplica> {
+        let cut = FullSyncCut {
+            armed: (0..num_shards)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            all_armed: std::sync::atomic::AtomicBool::new(false),
+            pre: Mutex::new(Vec::new()),
+        };
+        let _backlog = self.backlog.write();
+        let rep = Arc::new(Self::new_connected_replica(
+            id,
+            sender,
+            PendingPeer::default(),
+            Some(cut),
+        ));
+        self.migrations.write().insert(id, rep.clone());
+        self.has_migrations.store(true, Ordering::Release);
         self.replication_active.store(true, Ordering::Release);
         HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
         rep
+    }
+
+    pub fn unregister_migration(&self, id: u64) {
+        let _backlog = self.backlog.write();
+        let mut migrations = self.migrations.write();
+        migrations.remove(&id);
+        self.has_migrations
+            .store(!migrations.is_empty(), Ordering::Release);
+    }
+
+    /// On shard `shard_id`'s thread: `dump` (the shard's keys of the
+    /// migrating slots) goes into migration `id`'s stream, and the shard's
+    /// changes from now on follow it.
+    pub fn arm_migration(&self, id: u64, shard_id: usize, dump: &[u8]) {
+        let mut wake = Vec::new();
+        {
+            let _backlog = self.backlog.write();
+            if let Some(rep) = self.migrations.read().get(&id)
+                && let Some(cut) = &rep.full_sync
+                && let Some(armed) = cut.armed.get(shard_id)
+            {
+                if !dump.is_empty() && rep.append_pre(cut, dump) {
+                    wake.push(rep.clone());
+                }
+                armed.store(true, Ordering::Release);
+            }
+        }
+        self.wake_replicas(wake);
+    }
+
+    /// Every shard of migration `id` has dumped: what they buffered goes
+    /// out, then `marker`, then the live changes.
+    pub fn finish_migration_snapshot(&self, id: u64, marker: &[u8]) {
+        let mut wake = Vec::new();
+        {
+            let _backlog = self.backlog.write();
+            if let Some(rep) = self.migrations.read().get(&id)
+                && let Some(cut) = &rep.full_sync
+            {
+                let mut pre = std::mem::take(&mut *cut.pre.lock());
+                pre.extend_from_slice(marker);
+                cut.all_armed.store(true, Ordering::Release);
+                if rep.append_pending(&pre) {
+                    wake.push(rep.clone());
+                }
+            }
+        }
+        self.wake_replicas(wake);
+    }
+
+    /// Appends `bytes` to migration `id`'s stream, in order with the
+    /// changes streamed to it.
+    pub fn append_migration(&self, id: u64, bytes: &[u8]) {
+        let mut wake = Vec::new();
+        {
+            let _backlog = self.backlog.write();
+            if let Some(rep) = self.migrations.read().get(&id)
+                && rep.append_pending(bytes)
+            {
+                wake.push(rep.clone());
+            }
+        }
+        self.wake_replicas(wake);
     }
 
     /// Registers a replica about to receive a full sync of `num_shards`
@@ -2242,7 +2367,9 @@ impl ReplicationHub {
         if !self.is_master() {
             return;
         }
-        if self.backlog_active.load(Ordering::Relaxed) || self.has_replicas.load(Ordering::Relaxed)
+        if self.backlog_active.load(Ordering::Relaxed)
+            || self.has_replicas.load(Ordering::Relaxed)
+            || self.has_migrations.load(Ordering::Relaxed)
         {
             self.append_stream(shard, bytes, false);
         }
@@ -2292,7 +2419,8 @@ impl ReplicationHub {
             return;
         }
         if !(self.backlog_active.load(Ordering::Relaxed)
-            || self.has_replicas.load(Ordering::Relaxed))
+            || self.has_replicas.load(Ordering::Relaxed)
+            || self.has_migrations.load(Ordering::Relaxed))
         {
             return;
         }
@@ -2440,6 +2568,21 @@ impl ReplicationHub {
             }
             if any_skipped && !from_master {
                 backlog.stream_db = usize::MAX;
+            }
+        }
+        if self.has_migrations.load(Ordering::Relaxed) && !from_master {
+            for rep in self.migrations.read().values() {
+                let queued = match rep.delivery(shard) {
+                    Delivery::Send => rep.append_pending(payload),
+                    Delivery::Buffer => rep
+                        .full_sync
+                        .as_ref()
+                        .is_some_and(|cut| rep.append_pre(cut, payload)),
+                    Delivery::Skip => false,
+                };
+                if queued {
+                    wake.push(rep.clone());
+                }
             }
         }
     }
@@ -3109,7 +3252,9 @@ pub fn has_connected_replicas(port: u16) -> bool {
     }
     let hub = cached_hub(port);
     hub.replication_active.load(Ordering::Relaxed)
-        && (hub.has_replicas.load(Ordering::Relaxed) || hub.backlog_active.load(Ordering::Relaxed))
+        && (hub.has_replicas.load(Ordering::Relaxed)
+            || hub.backlog_active.load(Ordering::Relaxed)
+            || hub.has_migrations.load(Ordering::Relaxed))
 }
 
 #[inline(always)]
@@ -4206,7 +4351,7 @@ pub fn set_masteruser(port: u16, user: &str) {
 }
 
 /// The AUTH command a replica sends to its master, if `masterauth` is set.
-fn master_auth_command(port: u16) -> Option<Vec<u8>> {
+pub(crate) fn master_auth_command(port: u16) -> Option<Vec<u8>> {
     let m = MASTER_AUTH.read();
     let (user, pass) = m.get(&port)?;
     let pass = pass.as_ref()?;
