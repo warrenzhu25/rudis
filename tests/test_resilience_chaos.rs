@@ -200,11 +200,20 @@ fn test_maxmemory_eviction_pressure() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
 
-    // Configure 1MB limit and allkeys-lru eviction
-    send_and_read(&mut client, b"CONFIG SET maxmemory 1048576\r\n");
+    // A limit 1MB above what the empty server uses (its own baseline, about
+    // 1-2MB as jemalloc counts it, varies with what its thread caches
+    // hold: a fixed 1MB limit refused the first SET), and allkeys-lru.
+    let info = send_and_read(&mut client, b"INFO memory\r\n");
+    let base: u64 = info
+        .lines()
+        .find_map(|l| l.strip_prefix("used_memory:"))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("used_memory in INFO memory");
+    let limit = format!("CONFIG SET maxmemory {}\r\n", base + 1_048_576);
+    send_and_read(&mut client, limit.as_bytes());
     send_and_read(&mut client, b"CONFIG SET maxmemory-policy allkeys-lru\r\n");
 
-    // Insert 500 keys with 4KB payloads (total ~2MB, exceeding 1MB limit)
+    // Insert 300 keys with 4KB payloads (~1.2MB, past the limit)
     let payload_4kb = "x".repeat(4096);
     for i in 0..300 {
         let cmd = format!(
