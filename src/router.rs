@@ -5511,6 +5511,102 @@ impl Router {
         }
     }
 
+    /// Whether [`Self::restore_rdb_bytes_async`] can load `data`: the Redis
+    /// encoding every rudis and Redis master sends. A file that may be in
+    /// the legacy rudis encoding takes the blocking path.
+    pub fn can_load_async(data: &[u8]) -> bool {
+        data.starts_with(b"REDIS")
+            && matches!(
+                crate::redis_rdb::classify(data),
+                crate::redis_rdb::FileKind::Redis
+            )
+    }
+
+    /// Like [`Self::restore_rdb_bytes`], but asynchronously (a replica's
+    /// `async_loading`): every shard loads its part into a fresh dataset
+    /// between serving its clients from the old one, and only once all of
+    /// them have loaded are the new datasets swapped in and the RDB's
+    /// function libraries installed. If any shard fails, every shard keeps
+    /// its old dataset. Each shard swaps on its own thread, so for a moment
+    /// some shards serve the new dataset and others the old one.
+    pub async fn restore_rdb_bytes_async(&self, data: Bytes) -> Result<(), String> {
+        let aof_dir = self.aof().as_ref().map(|_| self.db_dir.clone());
+        let mut jobs = Vec::new();
+        let mut local_job = None;
+        for (sid, sender) in self.senders.iter().enumerate() {
+            let (loaded_tx, loaded_rx) = flume::bounded(1);
+            let (commit_tx, commit_rx) = flume::bounded(1);
+            let (done_tx, done_rx) = flume::bounded(1);
+            let job = crate::shard::AsyncLoad {
+                data: data.clone(),
+                aof_dir: aof_dir.clone(),
+                loaded: loaded_tx,
+                commit: commit_rx,
+                done: done_tx,
+            };
+            if sid == self.shard_id {
+                local_job = Some(job);
+            } else {
+                sender
+                    .send(ShardMessage::AsyncLoadRdb(Box::new(job)))
+                    .map_err(|_| format!("shard {sid} is gone"))?;
+            }
+            jobs.push((loaded_rx, commit_tx, done_rx));
+        }
+        drop(data);
+        if let Some(job) = local_job {
+            let db = self.local_db.clone();
+            let slot = self.aof_slot.clone();
+            let (sid, n) = (self.shard_id, self.num_shards);
+            monoio::spawn(async move {
+                crate::shard::run_async_load(&db, &slot, sid, n, job).await;
+            });
+        }
+        let mut result: Result<(u64, Vec<String>), String> = Ok((0, Vec::new()));
+        for (loaded_rx, _, _) in &jobs {
+            let shard_result = loaded_rx
+                .recv_async()
+                .await
+                .unwrap_or_else(|_| Err("shard dropped the load".to_string()));
+            result = match (result, shard_result) {
+                (Ok((n, mut f)), Ok((m, g))) => {
+                    f.extend(g);
+                    Ok((n + m, f))
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            };
+        }
+        let commit = result.is_ok();
+        if let Ok((_, functions)) = &result {
+            self.forget_global_search_indices();
+            for code in functions {
+                if let Err(e) = crate::scripting::load_function(code, true) {
+                    tracing::warn!("RDB load: skipping function library: {e}");
+                }
+            }
+        }
+        for (_, commit_tx, _) in &jobs {
+            let _ = commit_tx.send(commit);
+        }
+        let mut swapped = Ok(());
+        for (_, _, done_rx) in &jobs {
+            let r = done_rx
+                .recv_async()
+                .await
+                .unwrap_or_else(|_| Err("shard dropped the load".to_string()));
+            swapped = swapped.and(r);
+        }
+        let (loaded, _) = result?;
+        if let Err(e) = swapped {
+            // Some shards may have swapped: drop every part, as a failed
+            // blocking load does.
+            let _ = self.load_full_sync_rdb_on_all_shards(Bytes::new()).await;
+            return Err(e);
+        }
+        crate::server::set_rdb_last_load_keys_loaded(self.base_port, loaded);
+        Ok(())
+    }
+
     /// Loads `data` on every shard; the keys loaded in all.
     async fn load_full_sync_rdb_on_all_shards(&self, data: Bytes) -> Result<u64, String> {
         let aof_dir = self.aof().as_ref().map(|_| self.db_dir.clone());

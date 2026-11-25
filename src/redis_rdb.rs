@@ -2165,6 +2165,18 @@ struct LoadCtx<'a> {
     /// during the load, so later commands in the AOF (a PERSIST...) still
     /// find them.
     keep_expired: bool,
+    /// The database the records being read belong to (the last SELECTDB).
+    dbid: u64,
+    /// Key records [`load_records`] may still read before it returns
+    /// `Ok(false)` so an asynchronous load can yield ([`load_file_async`]);
+    /// `usize::MAX` for the blocking loads.
+    budget: usize,
+    /// An asynchronous load: `key-load-delay` ends the step (the caller
+    /// sleeps without blocking the thread) instead of sleeping here.
+    yields: bool,
+    /// Function libraries to load, collected here instead of being loaded
+    /// at once when set (an asynchronous load installs them on success).
+    staged_functions: Option<Vec<String>>,
 }
 
 impl LoadCtx<'_> {
@@ -2206,15 +2218,23 @@ pub fn last_rdb_repl_stream_db() -> usize {
 }
 
 /// Reads records until `OP_EOF` (returning true) or, when `chunk` is set,
-/// the end of the input (returning false).
+/// the end of the input (returning false). It also returns false between
+/// two records once `ctx.budget` key records were read; called again, it
+/// carries on from there.
 fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbResult<bool> {
     let key_load_delay = crate::connection::key_load_delay_us();
     let max_dbs = crate::config::databases_count();
     let mut expire_ms: Option<i64> = None;
-    let mut dbid = 0u64;
-    ctx.db.select_db(0);
+    let mut dbid = ctx.dbid;
+    if (dbid as usize) < max_dbs {
+        ctx.db.select_db(dbid as usize);
+    }
     loop {
         if chunk && r.is_empty() {
+            return Ok(false);
+        }
+        if ctx.budget == 0 && expire_ms.is_none() {
+            ctx.dbid = dbid;
             return Ok(false);
         }
         let t = r.u8()?;
@@ -2294,6 +2314,11 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
                 let code = r.string()?;
                 if ctx.load_functions {
                     match std::str::from_utf8(&code) {
+                        Ok(code) if ctx.staged_functions.is_some() => {
+                            if let Some(staged) = ctx.staged_functions.as_mut() {
+                                staged.push(code.to_string());
+                            }
+                        }
                         Ok(code) => {
                             if let Err(e) = crate::scripting::load_function(code, true) {
                                 tracing::warn!("RDB load: skipping function library: {e}");
@@ -2316,6 +2341,7 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
             }
             _ => {
                 let key = r.string()?;
+                ctx.budget = ctx.budget.saturating_sub(1);
                 if (dbid as usize) >= max_dbs {
                     return Err(RdbError::new(format!(
                         "the RDB has keys in database {dbid}; rudis is configured with {max_dbs} databases"
@@ -2338,7 +2364,11 @@ fn load_records(r: &mut Reader<'_>, ctx: &mut LoadCtx<'_>, chunk: bool) -> RdbRe
                     Some(d) if !expired => {
                         ctx.insert(&key, d, exp);
                         if key_load_delay > 0 {
-                            std::thread::sleep(Duration::from_micros(key_load_delay));
+                            if ctx.yields {
+                                ctx.budget = 0;
+                            } else {
+                                std::thread::sleep(Duration::from_micros(key_load_delay));
+                            }
                         }
                     }
                     Some(_) => {}
@@ -2402,6 +2432,10 @@ pub fn load_file(
         anchor: crate::clock::now_pair(),
         count: 0,
         keep_expired: false,
+        dbid: 0,
+        budget: usize::MAX,
+        yields: false,
+        staged_functions: None,
     };
     let res = load_records(&mut r, &mut ctx, false).map_err(|e| {
         RdbError::new(format!(
@@ -2420,6 +2454,95 @@ pub fn load_file(
     Ok(ctx.count)
 }
 
+/// Key records an asynchronous load reads between two yields.
+const ASYNC_LOAD_STEP_KEYS: usize = 128;
+/// Bytes an asynchronous load checksums between two yields.
+const ASYNC_CRC_STEP: usize = 1 << 20;
+
+/// [`load_file`] (not strict) for a replica's asynchronous full-sync load
+/// into a dataset clients don't see yet: the checksum and the records are
+/// processed in steps, yielding to the shard's other tasks (its clients,
+/// served from the live dataset) between them, and `key-load-delay` sleeps
+/// without blocking the thread. Function libraries are returned rather
+/// than loaded, for the caller to install if every shard's load succeeds.
+pub async fn load_file_async(
+    data: &[u8],
+    db: &mut crate::shard::ShardDb,
+    shard_id: usize,
+    num_shards: usize,
+) -> RdbResult<(usize, Vec<String>)> {
+    let ver = header_version(data)?;
+    if ver == 0 || ver > MAX_RDB_VERSION {
+        return Err(RdbError::new(format!(
+            "unsupported RDB version {ver} (rudis reads versions 1 to {MAX_RDB_VERSION})"
+        )));
+    }
+    let body_end = if ver >= 5 {
+        if data.len() < 9 + 1 + 8 {
+            return Err(truncated());
+        }
+        let end = data.len() - 8;
+        let expected = le_u64(data, end)?;
+        if expected != 0 {
+            let mut crc = 0;
+            for piece in data[..end].chunks(ASYNC_CRC_STEP) {
+                crc = crate::table::crc64_update(crc, piece);
+                crate::mailbox::yield_now().await;
+            }
+            if crc != expected {
+                return corrupt("RDB CRC error: CRC64 checksum mismatch in RDB file");
+            }
+        }
+        end
+    } else {
+        data.len()
+    };
+    if shard_id == 0 {
+        LAST_RDB_REPL_STREAM_DB.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    let key_load_delay = crate::connection::key_load_delay_us();
+    let mut r = Reader::new(&data[9..body_end]);
+    let mut ctx = LoadCtx {
+        db,
+        shard: Some((shard_id, num_shards)),
+        strict: false,
+        load_functions: shard_id == 0,
+        now_ms: unix_ms_now(),
+        anchor: crate::clock::now_pair(),
+        count: 0,
+        keep_expired: false,
+        dbid: 0,
+        budget: 0,
+        yields: true,
+        staged_functions: Some(Vec::new()),
+    };
+    let res = loop {
+        ctx.budget = ASYNC_LOAD_STEP_KEYS;
+        match load_records(&mut r, &mut ctx, false) {
+            Ok(true) => break Ok(()),
+            Ok(false) if key_load_delay > 0 => {
+                monoio::time::sleep(Duration::from_micros(key_load_delay)).await;
+            }
+            Ok(false) => crate::mailbox::yield_now().await,
+            Err(e) => {
+                break Err(RdbError::new(format!(
+                    "RDB parse error at offset {}: {e}",
+                    9 + r.position()
+                )));
+            }
+        }
+    };
+    ctx.db.select_db(0);
+    res?;
+    if !r.is_empty() {
+        return Err(RdbError::new(format!(
+            "RDB parse error at offset {}: data after the EOF marker",
+            9 + r.position()
+        )));
+    }
+    Ok((ctx.count, ctx.staged_functions.take().unwrap_or_default()))
+}
+
 /// Loads a header-less record stream (`ShardDb::save_rdb_chunk`'s output)
 /// into `db`, keeping every key.
 pub fn load_chunk(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResult<usize> {
@@ -2433,6 +2556,10 @@ pub fn load_chunk(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResult<usiz
         anchor: crate::clock::now_pair(),
         count: 0,
         keep_expired: false,
+        dbid: 0,
+        budget: usize::MAX,
+        yields: false,
+        staged_functions: None,
     };
     let res = load_records(&mut r, &mut ctx, true);
     ctx.db.select_db(0);
@@ -2468,6 +2595,10 @@ pub fn load_rdb_preamble(data: &[u8], db: &mut crate::shard::ShardDb) -> RdbResu
         anchor: crate::clock::now_pair(),
         count: 0,
         keep_expired: true,
+        dbid: 0,
+        budget: usize::MAX,
+        yields: false,
+        staged_functions: None,
     };
     let res = load_records(&mut r, &mut ctx, false);
     ctx.db.select_db(0);

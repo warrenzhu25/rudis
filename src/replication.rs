@@ -1,6 +1,6 @@
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 /// The replication id and offset are not part of the role: like Redis
@@ -648,6 +648,11 @@ pub struct ReplicationHub {
     /// Set while this server loads its RDB / AOF at startup (see
     /// [`begin_startup_loading`]).
     startup_loading: AtomicBool,
+    /// Set while this server loads a master's full-sync RDB asynchronously
+    /// (see [`async_load_wanted`]): `INFO` shows `async_loading:1`, the old
+    /// dataset is served, and only [`refused_during_async_load`]-style
+    /// commands get `-LOADING`.
+    async_loading: AtomicBool,
     /// Address details a connection reported before its PSYNC registered
     /// it as a replica (REPLCONF listening-port comes first), by client id.
     pending_peers: Mutex<HashMap<u64, PendingPeer>>,
@@ -766,6 +771,46 @@ fn link_state_name(up: bool, phase: u8) -> &'static str {
 /// down, network partition) kept the link "up" until TCP gave up, which
 /// can take hours.
 pub static REPL_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(60);
+
+/// `repl-diskless-load` values, in [`REPL_DISKLESS_LOAD_NAMES`] order. A
+/// rudis replica always receives the RDB into a temp file first; only
+/// `swapdb` changes anything: see [`async_load_wanted`].
+pub const REPL_DISKLESS_LOAD_SWAPDB: u8 = 2;
+pub const REPL_DISKLESS_LOAD_NAMES: [&str; 5] = [
+    "disabled",
+    "on-empty-db",
+    "swapdb",
+    "flush-before-load",
+    "flushdb",
+];
+pub static REPL_DISKLESS_LOAD: AtomicU8 = AtomicU8::new(0);
+
+/// Parses a `repl-diskless-load` value into its index.
+pub fn parse_repl_diskless_load(val: &str) -> Result<u8, String> {
+    REPL_DISKLESS_LOAD_NAMES
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(val))
+        .map(|i| i as u8)
+        .ok_or_else(|| "argument(s) must be one of the following: disabled, on-empty-db, swapdb, flush-before-load, flushdb".to_string())
+}
+
+/// The current `repl-diskless-load` value.
+pub fn repl_diskless_load_name() -> &'static str {
+    REPL_DISKLESS_LOAD_NAMES
+        [REPL_DISKLESS_LOAD.load(Ordering::Relaxed) as usize % REPL_DISKLESS_LOAD_NAMES.len()]
+}
+
+/// Whether a full sync from a master whose replication id is `master_replid`
+/// loads asynchronously (Redis's `async_loading`): the old dataset keeps
+/// being served until the new one is loaded, then they are swapped. Like
+/// Redis, only with `repl-diskless-load swapdb` and when the master's id is
+/// ours, i.e. the old dataset is an earlier point of the same history (the
+/// master's backlog no longer covered us); a replica of a new master must
+/// not serve data from another history meanwhile.
+fn async_load_wanted(our_replid: &str, master_replid: &str) -> bool {
+    REPL_DISKLESS_LOAD.load(Ordering::Relaxed) == REPL_DISKLESS_LOAD_SWAPDB
+        && our_replid == master_replid
+}
 
 pub(crate) fn repl_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(REPL_TIMEOUT_SECS.load(Ordering::Relaxed).max(1))
@@ -1124,6 +1169,7 @@ impl ReplicationHub {
             psync_holes: Mutex::new(Vec::new()),
             loading: AtomicBool::new(false),
             startup_loading: AtomicBool::new(false),
+            async_loading: AtomicBool::new(false),
             sync_conn: Mutex::new(None),
             worker_exit: Mutex::new(None),
             pending_peers: Mutex::new(HashMap::new()),
@@ -2913,6 +2959,34 @@ impl<'a> LoadingGuard<'a> {
 impl Drop for LoadingGuard<'_> {
     fn drop(&mut self) {
         self.0.loading.store(false, Ordering::Relaxed);
+        FULL_SYNC_LOADS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether the server on `port` loads a master's full sync asynchronously
+/// (`INFO` `async_loading:1`).
+#[inline]
+pub fn is_async_loading(port: u16) -> bool {
+    FULL_SYNC_LOADS.load(Ordering::Relaxed) != 0
+        && get_replication_hub(port)
+            .async_loading
+            .load(Ordering::Relaxed)
+}
+
+/// Marks `hub` as loading asynchronously until dropped.
+struct AsyncLoadingGuard<'a>(&'a ReplicationHub);
+
+impl<'a> AsyncLoadingGuard<'a> {
+    fn new(hub: &'a ReplicationHub) -> Self {
+        hub.async_loading.store(true, Ordering::Relaxed);
+        FULL_SYNC_LOADS.fetch_add(1, Ordering::Relaxed);
+        Self(hub)
+    }
+}
+
+impl Drop for AsyncLoadingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.async_loading.store(false, Ordering::Relaxed);
         FULL_SYNC_LOADS.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -5149,6 +5223,10 @@ async fn run_replica_worker(
         } else {
             crate::log_notice!("Full resync from master: {}:{}", new_replid, initial_offset);
             hub.link_phase.store(LINK_SYNC, Ordering::Relaxed);
+            // Our dataset is an earlier point of the master's history: it
+            // keeps being served until the new one is loaded.
+            let async_loading =
+                async_load_wanted(&hub.replid(), &new_replid).then(|| AsyncLoadingGuard::new(&hub));
             // Our history no longer gets continued: if this sync fails, the
             // next attempt is a full one too.
             hub.cached_master.store(false, Ordering::Relaxed);
@@ -5278,10 +5356,14 @@ async fn run_replica_worker(
             // empty; forget the master's history too, so the next attempt
             // is a full resync rather than a partial one on top of nothing.
             hub.attach_to_new_master();
-            crate::log_notice!("MASTER <-> REPLICA sync: Flushing old data");
+            let async_loading =
+                async_loading.filter(|_| crate::router::Router::can_load_async(&rdb_bytes));
+            if async_loading.is_none() {
+                crate::log_notice!("MASTER <-> REPLICA sync: Flushing old data");
+            }
             crate::log_notice!("MASTER <-> REPLICA sync: Loading DB in memory");
             let loaded = {
-                let _loading = LoadingGuard::new(&hub);
+                let _loading = async_loading.is_none().then(|| LoadingGuard::new(&hub));
                 // A broken main connection shows up in the streaming loop,
                 // which resumes from what was applied.
                 let side = dual_stream
@@ -5292,7 +5374,11 @@ async fn run_replica_worker(
                             .ok()
                     })
                     .flatten();
-                let loaded = router.restore_rdb_bytes(rdb_bytes).await;
+                let loaded = if async_loading.is_some() {
+                    router.restore_rdb_bytes_async(rdb_bytes).await
+                } else {
+                    router.restore_rdb_bytes(rdb_bytes).await
+                };
                 if let Some(side) = side {
                     let (read, err) = side.finish();
                     buf.extend_from_slice(&read);
@@ -5309,7 +5395,17 @@ async fn run_replica_worker(
                     master_port,
                     e
                 );
-                hub.forget_master_history();
+                if async_loading.is_some() {
+                    // The old dataset, an earlier point of the same
+                    // history, is still served: the next attempt can load
+                    // asynchronously again.
+                    crate::log_notice!(
+                        "MASTER <-> REPLICA sync: Discarding the half-loaded data and keeping the old dataset"
+                    );
+                } else {
+                    hub.forget_master_history();
+                }
+                drop(async_loading);
                 if is_sync_cancelled(&cancel_rx) {
                     break 'reconnect_loop;
                 }
@@ -5317,6 +5413,7 @@ async fn run_replica_worker(
                 continue 'reconnect_loop;
             }
             hub.finish_full_resync(&new_replid, initial_offset);
+            drop(async_loading);
         }
 
         // 8. Mark link_status up

@@ -19,6 +19,9 @@ or the persistence format; such changes are called out under **Breaking**.
   `..._lists_items`, and so on), computed when asked for.
 - `CLUSTER SLOT-STATS` (Valkey 8): per-slot `key-count`, and with `cluster-slot-stats-enabled`
   `cpu-usec`, `network-bytes-in`/`-out` and `memory-bytes`.
+- `repl-diskless-load swapdb` loads a full sync asynchronously (Redis's `async_loading`)
+  when the master's replication id is the replica's own: the old dataset keeps being
+  served until the new one has loaded, and a failed load keeps it.
 
 ### Fixed
 

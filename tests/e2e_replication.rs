@@ -8164,3 +8164,209 @@ fn test_repl_timeout_change_applies_to_a_waiting_read_e2e() {
     drop(c);
     let _ = replica.0.kill();
 }
+
+/// A Redis-format RDB (an AUX field first, so it is never taken for the
+/// legacy rudis encoding) holding what `fill` puts in a shard; with
+/// `corrupt`, a record of an unknown type follows the keys, so a load
+/// fails only once it has loaded them.
+fn rdb_of(fill: impl FnOnce(&mut rudis::shard::ShardDb), corrupt: bool) -> Vec<u8> {
+    let mut src = rudis::shard::ShardDb::new(0);
+    fill(&mut src);
+    let mut rdb = b"REDIS0011\xFA\x09redis-ver\x057.2.0\xFE\x00".to_vec();
+    src.save_rdb_chunk(&mut rdb).unwrap();
+    if corrupt {
+        rdb.extend_from_slice(b"\x63\x03bad\x00");
+    }
+    rdb.push(0xFF);
+    let crc = rudis::table::crc64(&rdb);
+    rdb.extend_from_slice(&crc.to_le_bytes());
+    rdb
+}
+
+/// Answers a replica's handshake on `conn` up to its PSYNC; false if the
+/// replica went away.
+fn fake_master_handshake(conn: &mut TcpStream) -> bool {
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut read_to = |conn: &mut TcpStream, until: &[u8], crlfs: usize| {
+        got.clear();
+        loop {
+            if let Some(p) = got.windows(until.len()).position(|w| w == until) {
+                let tail = &got[p + until.len()..];
+                if tail.windows(2).filter(|w| w == b"\r\n").count() >= crlfs {
+                    return true;
+                }
+            }
+            match conn.read(&mut buf) {
+                Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+                _ => return false,
+            }
+        }
+    };
+    read_to(conn, b"PING\r\n", 0)
+        && conn.write_all(b"+PONG\r\n").is_ok()
+        && read_to(conn, b"listening-port\r\n", 2)
+        && conn.write_all(b"+OK\r\n").is_ok()
+        && read_to(conn, b"psync2\r\n", 0)
+        && conn.write_all(b"+OK\r\n").is_ok()
+        && read_to(conn, b"PSYNC\r\n", 4)
+}
+
+/// `repl-diskless-load swapdb`: a full sync from the master whose history
+/// the replica already has (its backlog no longer covered the replica)
+/// loads asynchronously, like Redis's `async_loading`. The old dataset is
+/// served meanwhile (no `-LOADING`), replication commands are refused, and
+/// the new dataset replaces it only once loaded; a load that fails keeps
+/// the old one.
+#[test]
+fn test_swapdb_full_sync_loads_asynchronously_e2e() {
+    use std::net::TcpListener;
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for (port, fails) in [(17114u16, false), (17115, true)] {
+        let port_s = port.to_string();
+        let args = ["--port", &port_s, "--threads", "2", "--no-pin"];
+        let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+
+        let old = rdb_of(
+            |db| {
+                for i in 0..100 {
+                    db.table.set(
+                        bytes::Bytes::from(format!("old:{i}")),
+                        bytes::Bytes::from_static(b"o"),
+                        None,
+                    );
+                }
+            },
+            false,
+        );
+        // Every key on one shard, which key-load-delay slows down.
+        let new = rdb_of(
+            |db| {
+                for i in 0..1500 {
+                    db.table.set(
+                        bytes::Bytes::from(format!("{{t}}:{i}")),
+                        bytes::Bytes::from_static(b"v"),
+                        None,
+                    );
+                }
+            },
+            fails,
+        );
+        let master = TcpListener::bind("127.0.0.1:0").unwrap();
+        let master_port = master.local_addr().unwrap().port();
+        let (drop_link_tx, drop_link_rx) = std::sync::mpsc::channel::<()>();
+        thread::spawn(move || {
+            let replid = "c".repeat(40);
+            for (i, rdb) in [old, new].into_iter().enumerate() {
+                let Ok((mut conn, _)) = master.accept() else {
+                    return;
+                };
+                if !fake_master_handshake(&mut conn) {
+                    return;
+                }
+                let mut reply =
+                    format!("+FULLRESYNC {replid} 0\r\n${}\r\n", rdb.len()).into_bytes();
+                reply.extend_from_slice(&rdb);
+                let _ = conn.write_all(&reply);
+                if i == 0 {
+                    // The link breaks once the test says so.
+                    let _ = drop_link_rx.recv();
+                    continue;
+                }
+                let mut buf = [0u8; 4096];
+                while matches!(conn.read(&mut buf), Ok(n) if n > 0) {}
+            }
+        });
+
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        for (k, v) in [
+            ("repl-diskless-load", "swapdb"),
+            ("replica-read-only", "no"),
+        ] {
+            assert_eq!(resp_cmd(&mut c, &["CONFIG", "SET", k, v]), "+OK\r\n");
+        }
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "GET", "repl-diskless-load"]),
+            "*2\r\n$18\r\nrepl-diskless-load\r\n$6\r\nswapdb\r\n"
+        );
+        let mport = master_port.to_string();
+        assert_eq!(
+            resp_cmd(&mut c, &["REPLICAOF", "127.0.0.1", &mport]),
+            "+OK\r\n"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !resp_cmd(&mut c, &["INFO", "replication"]).contains("master_link_status:up") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first sync never finished"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(resp_cmd(&mut c, &["SET", "mykey", "mine"]), "+OK\r\n");
+
+        // The second sync is from the same history: asynchronous.
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "key-load-delay", "50"]),
+            "+OK\r\n"
+        );
+        drop_link_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while info_field(&mut c, "async_loading") != "1" {
+            assert!(std::time::Instant::now() < deadline, "never async_loading");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(info_field(&mut c, "loading"), "0");
+        assert_eq!(resp_cmd(&mut c, &["GET", "mykey"]), "$4\r\nmine\r\n");
+        assert_eq!(resp_cmd(&mut c, &["GET", "old:7"]), "$1\r\no\r\n");
+        assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":101\r\n");
+        assert!(
+            resp_cmd(&mut c, &["REPLICAOF", "NO", "ONE"]).starts_with("-LOADING"),
+            "REPLICAOF ran during async loading"
+        );
+        assert!(resp_cmd(&mut c, &["BGSAVE"]).starts_with("-LOADING"));
+        assert_eq!(info_field(&mut c, "async_loading"), "1");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while info_field(&mut c, "async_loading") != "0" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "async load never ended"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "key-load-delay", "0"]),
+            "+OK\r\n"
+        );
+        if fails {
+            // The old dataset stays.
+            assert_eq!(resp_cmd(&mut c, &["GET", "mykey"]), "$4\r\nmine\r\n");
+            assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":101\r\n");
+            assert_eq!(resp_cmd(&mut c, &["GET", "{t}:0"]), "$-1\r\n");
+        } else {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !resp_cmd(&mut c, &["INFO", "replication"]).contains("master_link_status:up") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "second sync never finished"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(resp_cmd(&mut c, &["GET", "mykey"]), "$-1\r\n");
+            assert_eq!(resp_cmd(&mut c, &["GET", "{t}:1499"]), "$1\r\nv\r\n");
+            assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":1500\r\n");
+        }
+        assert_eq!(resp_cmd(&mut c, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+        drop(c);
+        shutdown_and_wait(port, &mut child.0);
+    }
+}

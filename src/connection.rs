@@ -4325,6 +4325,10 @@ pub fn apply_config_value(
         }
         "shutdown-timeout" => crate::replication::SHUTDOWN_TIMEOUT_SECS
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "repl-diskless-load" => crate::replication::REPL_DISKLESS_LOAD.store(
+            crate::replication::parse_repl_diskless_load(val_str)?,
+            Ordering::Relaxed,
+        ),
         "repl-timeout" => {
             let secs: u64 = parse_config_num(name, val_str)?;
             if secs == 0 {
@@ -4925,7 +4929,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 121] = [
+    let all_configs: [(&str, String); 122] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -5298,6 +5302,10 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
             crate::replication::SHUTDOWN_TIMEOUT_SECS
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .to_string(),
+        ),
+        (
+            "repl-diskless-load",
+            crate::replication::repl_diskless_load_name().to_string(),
         ),
     ];
     let hidden_configs: [(&str, String); 2] = [
@@ -13863,6 +13871,43 @@ fn refused_during_startup_load(cmd: &Command) -> bool {
     }
 }
 
+/// Commands Redis flags `no-async-loading`: refused with `-LOADING` while
+/// a replica loads its master's dataset asynchronously (the old dataset is
+/// served meanwhile), because they would act on the replication link, save
+/// the dataset about to be replaced, or change the cluster under the load.
+/// Turning AOF on is refused too, as during any load.
+fn refused_during_async_load(cmd: &Command) -> bool {
+    use crate::resp::ClusterSubcommand as C;
+    match cmd {
+        Command::Replicaof { .. }
+        | Command::Psync { .. }
+        | Command::Sync
+        | Command::Save
+        | Command::Bgsave { .. }
+        | Command::Bgrewriteaof => true,
+        Command::Cluster(sub) => matches!(
+            sub,
+            C::AddSlots(_)
+                | C::AddSlotsRange(_)
+                | C::DelSlots(_)
+                | C::DelSlotsRange(_)
+                | C::SetSlot(..)
+                | C::Meet { .. }
+                | C::Failover { .. }
+                | C::Forget(_)
+                | C::Replicate(_)
+                | C::SaveConfig
+                | C::BumpEpoch
+                | C::SetConfigEpoch(_)
+                | C::FlushSlots
+        ),
+        Command::ConfigSet(pairs) => pairs
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(b"appendonly")),
+        _ => false,
+    }
+}
+
 pub struct WithCurrentDb<'a, F> {
     pub router: &'a Router,
     pub db: usize,
@@ -14243,8 +14288,9 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
     let persistence_str = format!(
         // The fork/COW fields are always 0: snapshots are taken in
         // place, without a child process.
-        "# Persistence\r\nloading:{}\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:{}\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:{}\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\naof_rewrites:{}\r\naof_rewrites_consecutive_failures:{}\r\naof_rewrite_fallbacks:{}\r\n{}unpropagated_changes:{}\r\n",
+        "# Persistence\r\nloading:{}\r\nasync_loading:{}\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_rewrite_scheduled:{}\r\naof_last_bgrewrite_status:{}\r\naof_last_write_status:{}\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\naof_rewrites:{}\r\naof_rewrites_consecutive_failures:{}\r\naof_rewrite_fallbacks:{}\r\n{}unpropagated_changes:{}\r\n",
         u8::from(crate::replication::is_loading(router.base_port)),
+        u8::from(crate::replication::is_async_loading(router.base_port)),
         snap.changes_since_last_save(),
         u8::from(
             RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed) || snap.in_progress()
@@ -14870,6 +14916,10 @@ async fn execute_command_inner(
                 && refused_during_startup_load(&cmd)))
         && !crate::replication::wait_out_short_load(router.base_port).await
     {
+        out.extend_from_slice(b"-LOADING Redis is loading the dataset in memory\r\n");
+        return false;
+    }
+    if crate::replication::is_async_loading(router.base_port) && refused_during_async_load(&cmd) {
         out.extend_from_slice(b"-LOADING Redis is loading the dataset in memory\r\n");
         return false;
     }

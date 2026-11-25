@@ -793,6 +793,8 @@ pub enum ShardMessage {
         /// The keys loaded.
         responder: flume::Sender<Result<u64, String>>,
     },
+    /// A replica's asynchronous full-sync load (see [`AsyncLoad`]).
+    AsyncLoadRdb(Box<AsyncLoad>),
     ExecuteReplicaCmd {
         db: usize,
         cmd: Box<Command>,
@@ -893,6 +895,68 @@ pub enum ShardMessage {
         condition: Option<Box<(String, Bytes)>>,
         responder: flume::Sender<bool>,
     },
+}
+
+/// A shard's part of a replica's asynchronous full-sync load (Redis's
+/// `async_loading`, see `replication::async_load_wanted`): the shard loads
+/// its keys of the RDB into a fresh dataset while its clients keep being
+/// served from the live one, reports the result on `loaded`, and then, once
+/// every shard has loaded, swaps the new dataset in if `commit` says so or
+/// drops it, reporting on `done` (see [`run_async_load`]).
+pub struct AsyncLoad {
+    pub data: Bytes,
+    /// The AOF directory when AOF is on, to rewrite it after the swap.
+    pub aof_dir: Option<std::path::PathBuf>,
+    /// The keys loaded and the RDB's function libraries (shard 0's).
+    pub loaded: flume::Sender<Result<(u64, Vec<String>), String>>,
+    pub commit: flume::Receiver<bool>,
+    pub done: flume::Sender<Result<(), String>>,
+}
+
+/// Runs a shard's part of an asynchronous full-sync load (see [`AsyncLoad`])
+/// against its live dataset `db`.
+pub async fn run_async_load(
+    db: &std::rc::Rc<std::cell::RefCell<ShardDb>>,
+    aof: &crate::aof::AofSlot,
+    shard_id: usize,
+    num_shards: usize,
+    job: AsyncLoad,
+) {
+    let AsyncLoad {
+        data,
+        aof_dir,
+        loaded,
+        commit,
+        done,
+    } = job;
+    let mut target = db.borrow().new_load_target(shard_id);
+    let res = crate::redis_rdb::load_file_async(&data, &mut target, shard_id, num_shards)
+        .await
+        .map(|(n, functions)| {
+            // As after a blocking load: the keys bypassed the indexing hooks.
+            target.rebuild_search_indices();
+            (n as u64, functions)
+        })
+        .map_err(|e| e.to_string());
+    drop(data);
+    crate::allocator::flush_thread_cache();
+    let ok = res.is_ok();
+    let _ = loaded.send(res);
+    if !(ok && commit.recv_async().await.unwrap_or(false)) {
+        drop(target);
+        crate::allocator::flush_thread_cache();
+        let _ = done.send(Ok(()));
+        return;
+    }
+    // A script suspended past its time limit must keep seeing one dataset.
+    if crate::scripting::script_suspended() {
+        crate::scripting::wait_script_done().await;
+    }
+    let writer = aof.get();
+    let aof = aof_dir.as_deref().zip(writer.as_ref());
+    let res = db.borrow_mut().adopt_loaded_dataset(target, shard_id, aof);
+    crate::allocator::flush_thread_cache();
+    let _ = done.send(res);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2633,6 +2697,59 @@ impl ShardDb {
                 .map_err(|e| format!("rewriting the AOF after the load: {e}"))?;
         }
         loaded
+    }
+
+    /// A fresh, empty dataset for this shard: an asynchronous full-sync
+    /// load ([`crate::redis_rdb::load_file_async`]) fills it while clients
+    /// keep being served from this one, then [`Self::adopt_loaded_dataset`]
+    /// swaps it in.
+    pub fn new_load_target(&self, shard_id: usize) -> ShardDb {
+        let mut db = ShardDb::new(self.port);
+        db.shard_id = shard_id;
+        db
+    }
+
+    /// Replaces this shard's dataset with `loaded` (filled by an
+    /// asynchronous full-sync load) and, with `aof`, rewrites the shard's
+    /// AOF from it, as [`Self::load_full_sync_rdb`] does after its load.
+    /// What is not data (the AOF, tiering, the writable replica's own keys)
+    /// stays.
+    pub fn adopt_loaded_dataset(
+        &mut self,
+        mut loaded: ShardDb,
+        shard_id: usize,
+        aof: Option<(
+            &std::path::Path,
+            &std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>,
+        )>,
+    ) -> Result<(), String> {
+        poison_aof_image("a full resync replaced the dataset during the rewrite");
+        self.select_db(0);
+        self.flushall();
+        loaded.select_db(0);
+        self.table = std::mem::take(&mut loaded.table);
+        self.tables = std::mem::take(&mut loaded.tables);
+        self.vector_indexes = std::mem::take(&mut loaded.vector_indexes);
+        self.semantic_caches = std::mem::take(&mut loaded.semantic_caches);
+        self.agent_memories = std::mem::take(&mut loaded.agent_memories);
+        self.llm_quotas = std::mem::take(&mut loaded.llm_quotas);
+        self.agent_checkpoints = std::mem::take(&mut loaded.agent_checkpoints);
+        self.agent_tools = std::mem::take(&mut loaded.agent_tools);
+        self.json_store = std::mem::replace(&mut loaded.json_store, crate::json::JsonStore::new());
+        self.probabilistic_store = std::mem::replace(
+            &mut loaded.probabilistic_store,
+            crate::probabilistic::ProbabilisticStore::new(),
+        );
+        self.crdt_store.registers = std::mem::take(&mut loaded.crdt_store.registers);
+        self.crdt_store.sets = std::mem::take(&mut loaded.crdt_store.sets);
+        self.crdt_store.counters = std::mem::take(&mut loaded.crdt_store.counters);
+        self.sticky_keys = std::mem::take(&mut loaded.sticky_keys);
+        self.search_indices = std::mem::take(&mut loaded.search_indices);
+        if let Some((dir, writer)) = aof {
+            crate::aof::rewrite_and_swap_shard_aof(self, dir, shard_id, Some(writer))
+                .map_err(|e| format!("rewriting the AOF after the load: {e}"))?;
+        }
+        Ok(())
     }
 
     #[inline]

@@ -2366,6 +2366,15 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let aof = aof_dir.as_deref().zip(cross_shard_aof.as_ref());
                         let _ = responder.send(db.load_full_sync_rdb(&data, shard_id, num_shards, aof));
                     }
+                    ShardMessage::AsyncLoadRdb(job) => {
+                        // Loads between this shard's other work.
+                        let db = cross_shard_db.clone();
+                        let slot = cross_shard_aof_slot.clone();
+                        monoio::spawn(async move {
+                            crate::shard::run_async_load(&db, &slot, shard_id, num_shards, *job)
+                                .await;
+                        });
+                    }
                     ShardMessage::ExecuteReplicaCmd { db, cmd, responder } => {
                         crate::connection::CURRENT_DB.set(db);
                         let mut sdb = cross_shard_db.borrow_mut();

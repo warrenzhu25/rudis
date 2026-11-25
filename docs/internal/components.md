@@ -580,7 +580,7 @@ Rudis persists in-memory shard data across restarts and streams state to replica
 - A replica applies a `MULTI` block shard by shard, so its readers can briefly see part of a block.
 - Dual-channel replication uses rudis's own messages (`+DUALCHANNELSYNC`, `$ENDOFF:`, `REPLCONF rdb-client-id`) and works rudis-to-rudis, not with Valkey's implementation.
 - Unreadable tiered values spilled to NVMe abort saves, rewrites, and full syncs with errors rather than dropping data.
-- Configuration directives for diskless loading and compression (`repl-diskless-load`, `rdbcompression`, `aof-use-rdb-preamble`) are ignored; rewrites always use preambles and replicas always spool the RDB to disk.
+- Configuration directives for compression (`rdbcompression`, `aof-use-rdb-preamble`) are ignored; rewrites always use preambles and replicas always spool the RDB to disk. `repl-diskless-load swapdb` enables `async_loading` (the old dataset is served while a full sync from the same history loads).
 
 ---
 

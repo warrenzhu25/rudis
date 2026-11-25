@@ -1057,10 +1057,10 @@ Details that keep it to one shutdown:
 * **After a restart from an RDB, a master keeps its backlog for 60 s** (at most `repl-backlog-ttl`) unless a replica comes back,
   where Redis keeps it for `repl-backlog-ttl`.
 * **CRC64** is a byte-at-a-time table lookup; there is no hardware CRC path.
-* **Diskless load and related tuning directives** (`repl-diskless-load`, `repl-diskless-sync*`, `aof-use-rdb-preamble`,
+* **Diskless load and related tuning directives** (`repl-diskless-sync*`, `aof-use-rdb-preamble`,
   `rdbcompression`, `rdbchecksum`, `appendfilename`, `appenddirname` and others) are known Redis directive names that Rudis does not
   implement: a config file may contain them and they are ignored with a warning. Behaviour is fixed: replicas always spool the RDB to
-  disk, Rudis-to-Rudis full syncs stream with `$EOF:`, rewrites always use an RDB preamble, RDB strings are never compressed, and AOF
+  disk (`repl-diskless-load swapdb` only enables `async_loading`, see `docs/differences.md`), Rudis-to-Rudis full syncs stream with `$EOF:`, rewrites always use an RDB preamble, RDB strings are never compressed, and AOF
   files are always `appendonly-<shard>.aof` in `dir`.
 * **Module data** in Redis RDB files is rejected; Redis 7.0 RC function records are skipped.
 * **Replication ids** are hash-derived, not cryptographically random.
