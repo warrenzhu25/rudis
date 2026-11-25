@@ -11525,6 +11525,15 @@ impl RudisTable {
         Ok(diff)
     }
 
+    /// Keys in `slot`, not-yet-reaped expired ones included (as Valkey's
+    /// per-slot dict sizes).
+    pub fn slot_key_count(&mut self, slot: u16) -> u32 {
+        if self.table.items == 0 {
+            return 0;
+        }
+        self.table.slot_count(slot)
+    }
+
     pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
         if self.table.items == 0 {
             return 0;

@@ -30,6 +30,8 @@ pub enum ClusterSubcommand {
     /// CLUSTER COUNT-FAILURE-REPORTS <node-id>
     CountFailureReports(String),
     KeySlot(Bytes),
+    /// CLUSTER SLOT-STATS SLOTSRANGE ... | ORDERBY ...
+    SlotStats(crate::slot_stats::Query),
     CountKeysInSlot(u16),
     GetKeysInSlot(u16, usize),
     SetSlot(u16, SetSlotSubcommand),
@@ -4204,6 +4206,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         args[2].clone(),
                     ))))
                 }
+                "SLOT-STATS" => Ok(Some(Command::Cluster(ClusterSubcommand::SlotStats(
+                    crate::slot_stats::parse_query(&args[2..])?,
+                )))),
                 "COUNTKEYSINSLOT" => {
                     if args.len() < 3 {
                         return Err(

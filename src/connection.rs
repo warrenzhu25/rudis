@@ -4631,6 +4631,7 @@ pub fn apply_config_value(
                 .allow_replica_migration
                 .store(parse_config_bool(name, val_str)?, Ordering::Relaxed);
         }
+        "cluster-slot-stats-enabled" => crate::slot_stats::set(val_str)?,
         "cluster-require-full-coverage" => {
             crate::cluster::get_cluster_hub(base_port)
                 .require_full_coverage
@@ -4919,7 +4920,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 120] = [
+    let all_configs: [(&str, String); 121] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -4964,6 +4965,10 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 "no"
             }
             .to_string(),
+        ),
+        (
+            "cluster-slot-stats-enabled",
+            crate::slot_stats::config_value(),
         ),
         (
             "cluster-require-full-coverage",
@@ -14405,6 +14410,59 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
     out.extend_from_slice(b"\r\n");
 }
 
+/// `CLUSTER SLOT-STATS`: for each slot this node serves that the query
+/// selects, `[slot, {metric: value}]`, with `key-count` and the metrics
+/// `cluster-slot-stats-enabled` turns on.
+async fn write_cluster_slot_stats(
+    router: &Router,
+    query: &crate::slot_stats::Query,
+    out: &mut Vec<u8>,
+) {
+    use crate::slot_stats::{METRICS, Query};
+    let flags = crate::slot_stats::flags();
+    if let Query::OrderBy { metric, .. } = query
+        && METRICS[*metric].1 & flags != METRICS[*metric].1
+    {
+        out.extend_from_slice(
+            format!(
+                "-ERR {} is not enabled: set cluster-slot-stats-enabled to report it\r\n",
+                METRICS[*metric].0
+            )
+            .as_bytes(),
+        );
+        return;
+    }
+    let owned: Vec<u16> = {
+        let hub = crate::cluster::get_cluster_hub(router.base_port);
+        let ranges = hub.my_slots.read().clone();
+        let mut v: Vec<u16> = ranges.iter().flat_map(|&(a, b)| a..=b).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let stats = router.slot_stats().await;
+    // [key-count, cpu, in, out, mem], in METRICS order.
+    let values = |s: u16| {
+        let v = stats.get(&s).copied().unwrap_or_default();
+        [v[0], v[1], v[2], v[3], v[4]]
+    };
+    let slots = crate::slot_stats::select(query, &owned, &values);
+    let shown: Vec<usize> = (0..METRICS.len())
+        .filter(|&i| METRICS[i].1 & flags == METRICS[i].1)
+        .collect();
+    write_resp_array_header(out, slots.len());
+    for s in slots {
+        let v = values(s);
+        write_resp_array_header(out, 2);
+        write_resp_integer(out, s as i64);
+        write_resp_map_len(out, shown.len());
+        for &i in &shown {
+            write_resp_bulk(out, METRICS[i].0.as_bytes());
+            write_resp_integer(out, v[i] as i64);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_command_inner(
     cmd: Command,
@@ -15937,6 +15995,9 @@ async fn execute_command_inner(
                 ClusterSubcommand::KeySlot(key) => {
                     let slot = key_slot(&key);
                     out.extend_from_slice(format!(":{}\r\n", slot).as_bytes());
+                }
+                ClusterSubcommand::SlotStats(query) => {
+                    write_cluster_slot_stats(router, &query, out).await;
                 }
                 ClusterSubcommand::CountKeysInSlot(slot) => {
                     let count = router.count_keys_in_slot(slot).await;
@@ -22731,6 +22792,7 @@ async fn execute_command_inner(
                     return false;
                 } else if sub.as_ref() == crate::router::DEBUG_DIGEST_SHARD
                     || sub.as_ref() == crate::router::DEBUG_KEYSIZES_SHARD
+                    || sub.as_ref() == crate::router::DEBUG_SLOTSTATS_SHARD
                     || sub.as_ref() == crate::router::DEBUG_LOADAOF_SHARD
                     || sub.as_ref() == crate::router::DEBUG_POPULATE_SHARD
                     || sub.as_ref() == crate::router::DEBUG_FLUSH_SHARD

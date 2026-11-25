@@ -2500,6 +2500,35 @@ impl ShardDb {
     }
 
     /// Per-DB `(db_idx, keys, expires, ttl_sum_ms)` for `INFO keyspace`.
+    /// This shard's `CLUSTER SLOT-STATS` values as text for another shard
+    /// to sum: `slot,keys,cpu,in,out,mem` for each slot with any, `;`
+    /// apart. Keys are db 0's (the only one in cluster mode); memory is
+    /// summed over them only when memory tracking is on.
+    pub fn slot_stats_part(&mut self) -> String {
+        let flags = crate::slot_stats::flags();
+        let mut mem = std::collections::HashMap::<u16, u64>::new();
+        if flags & crate::slot_stats::MEM != 0
+            && let Some(t) = self.table_for_db(0)
+        {
+            for e in t.entries() {
+                let slot = crate::router::key_slot(e.key.as_slice());
+                *mem.entry(slot).or_insert(0) +=
+                    (e.key.as_slice().len() + e.val.approx_bytes()) as u64;
+            }
+        }
+        let mut s = String::new();
+        let table = self.table_for_db_mut(0);
+        for slot in 0..16384u16 {
+            let keys = table.slot_key_count(slot) as u64;
+            let [cpu, inb, outb] = crate::slot_stats::counters(slot);
+            let m = mem.get(&slot).copied().unwrap_or(0);
+            if keys | cpu | inb | outb | m != 0 {
+                s.push_str(&format!("{slot},{keys},{cpu},{inb},{outb},{m};"));
+            }
+        }
+        s
+    }
+
     /// This shard's `INFO keysizes` histograms, by db.
     pub fn keysizes_by_db(&self) -> KeysizesByDb {
         let mut out = KeysizesByDb::new();

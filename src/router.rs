@@ -153,6 +153,9 @@ pub const DEBUG_DIGEST_SHARD: &[u8] = b"__shard-digest";
 /// Replies with this shard's `INFO keysizes` histograms (see
 /// [`crate::shard::ShardDb::keysizes_part`]).
 pub const DEBUG_KEYSIZES_SHARD: &[u8] = b"__shard-keysizes";
+/// Replies with this shard's `CLUSTER SLOT-STATS` values (see
+/// [`crate::shard::ShardDb::slot_stats_part`]).
+pub const DEBUG_SLOTSTATS_SHARD: &[u8] = b"__shard-slotstats";
 /// Empties this shard and replays its AOF file.
 pub const DEBUG_LOADAOF_SHARD: &[u8] = b"__shard-loadaof";
 /// `__shard-populate <prefix> <size|""> <n>...`: creates this shard's
@@ -3889,6 +3892,42 @@ impl Router {
             }
         }
         map
+    }
+
+    /// `CLUSTER SLOT-STATS` values of every slot with any, summed over the
+    /// shards: slot -> `[key-count, cpu-usec, network-bytes-in,
+    /// network-bytes-out, memory-bytes]`.
+    pub async fn slot_stats(&self) -> std::collections::HashMap<u16, [u64; 5]> {
+        let mut all = std::collections::HashMap::new();
+        let mut add = |part: &[u8]| {
+            for item in part.split(|&b| b == b';') {
+                let f: Vec<u64> = std::str::from_utf8(item)
+                    .unwrap_or("")
+                    .split(',')
+                    .filter_map(|v| v.parse().ok())
+                    .collect();
+                if let [slot, keys, cpu, inb, outb, mem] = f[..]
+                    && slot < 16384
+                {
+                    let e: &mut [u64; 5] = all.entry(slot as u16).or_default();
+                    for (a, b) in e.iter_mut().zip([keys, cpu, inb, outb, mem]) {
+                        *a += b;
+                    }
+                }
+            }
+        };
+        add(self.local_db.borrow_mut().slot_stats_part().as_bytes());
+        let cmd = || Command::Debug(vec![Bytes::from_static(DEBUG_SLOTSTATS_SHARD)]);
+        for res in self.execute_remote_many(self.to_other_shards(cmd)).await {
+            let body = res.strip_prefix(b"$").and_then(|r| {
+                let start = r.windows(2).position(|w| w == b"\r\n")? + 2;
+                r.get(start..)?.strip_suffix(b"\r\n")
+            });
+            if let Some(body) = body {
+                add(body);
+            }
+        }
+        all
     }
 
     /// `INFO keysizes`: every shard's histograms summed, by db then type

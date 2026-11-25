@@ -9,6 +9,7 @@ pub mod agent;
 pub mod allocator;
 pub mod aof;
 pub mod aof_manifest;
+pub mod slot_stats;
 
 pub mod block;
 pub mod cluster;

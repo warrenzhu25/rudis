@@ -477,6 +477,7 @@ fn main() {
             }
         }
     }
+    rudis::slot_stats::startup_done();
     // After the directives, so these go to `logfile` and honour `loglevel`.
     log_notice!("oO0OoO0OoO0Oo Rudis is starting oO0OoO0OoO0Oo");
     log_notice!(

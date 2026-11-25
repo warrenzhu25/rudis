@@ -315,6 +315,10 @@ pub fn execute_shard_debug(
         out.extend_from_slice(b"-ERR wrong number of arguments for 'debug' command\r\n");
         return;
     };
+    if sub.as_ref() == crate::router::DEBUG_SLOTSTATS_SHARD {
+        crate::connection::write_resp_bulk(out, db.slot_stats_part().as_bytes());
+        return;
+    }
     if sub.as_ref() == crate::router::DEBUG_KEYSIZES_SHARD {
         crate::connection::write_resp_bulk(out, db.keysizes_part().as_bytes());
         return;
