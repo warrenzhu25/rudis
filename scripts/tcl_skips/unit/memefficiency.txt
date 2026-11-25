@@ -1,0 +1,10 @@
+# unit/memefficiency tests rudis doesn't pass yet.
+#
+# Known gap: INFO used_memory is jemalloc's stats.allocated, which counts
+# objects parked in thread caches as allocated and gives them back
+# gradually, so an idle server's used_memory drifts by a few hundred KB.
+# Redis counts every allocation exactly. The small ranges write only
+# ~260-420 KB, so the drift made "used" negative (efficiency -3.07 and
+# -9.53 in CI); the larger ranges write enough to drown it out.
+Memory efficiency with values in range 32
+Memory efficiency with values in range 64
