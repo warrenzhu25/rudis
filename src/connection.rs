@@ -12792,6 +12792,7 @@ pub fn acl_cmd_name(cmd: &Command) -> &'static str {
             C::Nodes => "cluster|nodes",
             C::Info => "cluster|info",
             C::MyId => "cluster|myid",
+            C::Migration(_) => "cluster|migration",
             _ => "cluster",
         },
         Command::ConfigGet(_) => "config|get",

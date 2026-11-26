@@ -67,7 +67,9 @@ GROUPS = {"sorted_set": "sorted-set"}
 
 # Rudis-only commands that are real, single commands (not the coarse
 # families) get a minimal synthesized entry. Fields: arity, extra command
-# flags, key spec as (first, last, step) or None, key spec flags, summary.
+# flags, key spec as (first, last, step), None (numkeys key [key ...]) or
+# NO_KEYS, key spec flags, summary. A `container|sub` name is a subcommand.
+NO_KEYS = "no-keys"
 RUDIS_ONLY = {
     "blmovem": (-6, ["BLOCKING"], (1, 2, 1), ["RW", "ACCESS", "DELETE", "INSERT"],
                 "Pops elements from a list and pushes them to another, blocking until available."),
@@ -86,10 +88,12 @@ RUDIS_ONLY = {
                    "Returns the number of members of the union of multiple sets."),
     "xackdel": (-5, [], (1, 1, 1), ["RW", "DELETE"],
                 "Acknowledges and deletes stream entries."),
-    "hotkeys": (-2, [], None, [],
+    "hotkeys": (-2, ["ADMIN"], NO_KEYS, [],
                 "Reports the keys that cost the most CPU time and network bytes."),
-    "trimslots": (-4, [], None, [],
+    "trimslots": (-4, ["ADMIN"], NO_KEYS, [],
                   "Deletes this node's keys in slots it doesn't serve (atomic slot migration)."),
+    "cluster|migration": (-4, ["ADMIN"], NO_KEYS, [],
+                          "Imports slots from another node, or reports or cancels slot migrations."),
     "xcfgset": (-2, [], (1, 1, 1), ["RW", "UPDATE"], "Sets stream configuration."),
     "xdelex": (-4, [], (1, 1, 1), ["RW", "DELETE"], "Deletes stream entries."),
     "xidmprecord": (5, [], (1, 1, 1), ["RW", "UPDATE"],
@@ -321,7 +325,9 @@ def synthesize(name, cats):
         flags.append("READONLY")
     if "fast" in cats:
         flags.append("FAST")
-    if rng is None:
+    if rng == NO_KEYS:
+        specs = []
+    elif rng is None:
         # numkeys key [key ...], like SINTERCARD.
         specs = [{"flags": kflags, "begin_search": {"index": {"pos": 1}},
                   "find_keys": {"keynum": {"keynumidx": 0, "firstkey": 1, "step": 1}}}]
@@ -329,7 +335,8 @@ def synthesize(name, cats):
         first, last, step = rng
         specs = [{"flags": kflags, "begin_search": {"index": {"pos": first}},
                   "find_keys": {"range": {"lastkey": last - first, "step": step, "limit": 0}}}]
-    return {"summary": summary, "since": "rudis", "group": "generic", "arity": arity,
+    group = "cluster" if name.startswith("cluster|") else "generic"
+    return {"summary": summary, "since": "rudis", "group": group, "arity": arity,
             "command_flags": flags, "key_specs": specs}
 
 
