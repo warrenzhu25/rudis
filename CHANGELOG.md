@@ -43,6 +43,7 @@ or the persistence format; such changes are called out under **Breaking**.
   `mem_clients_normal`.
 - `replica-lazy-flush`: a replica drops its old dataset in the background before loading a
   full sync.
+- `CLIENT LIST TYPE normal|master|replica|pubsub`; subscribed clients show the `P` flag.
 
 ### Changed
 

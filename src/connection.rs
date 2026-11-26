@@ -390,14 +390,46 @@ thread_local! {
 
 /// CLIENT LIST run by a script: every shard's clients, as a bulk string.
 #[inline(never)]
-pub fn script_client_list(filter_ids: &[u64], out: &mut Vec<u8>) {
+pub fn script_client_list(filter_ids: &[u64], ty: Option<&str>, out: &mut Vec<u8>) {
     let router = CURRENT_ROUTER.with(|r| r.borrow().clone());
     let clients = SHARD_CLIENTS.with(|c| c.borrow().clone());
     let list = match (router, clients) {
         (Some(router), Some(clients)) => router.client_list_blocking(&clients, filter_ids),
         _ => String::new(),
     };
-    write_resp_bulk(out, list.as_bytes());
+    write_resp_bulk(out, filter_client_list_type(list, ty).as_bytes());
+}
+
+/// Keeps the CLIENT LIST lines of clients of type `ty` (`normal`, `master`,
+/// `replica`/`slave` or `pubsub`), told apart by their `flags` and `resp`
+/// fields as Redis's `getClientType` does: a monitor is a normal client,
+/// and a RESP3 subscriber too.
+pub fn filter_client_list_type(list: String, ty: Option<&str>) -> String {
+    let Some(ty) = ty else { return list };
+    let field = |line: &str, name: &str| -> String {
+        line.split(' ')
+            .find_map(|f| f.strip_prefix(name))
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut out = String::with_capacity(list.len());
+    for line in list.split_inclusive('\n') {
+        let flags = field(line, "flags=");
+        let class = if flags.contains('M') {
+            "master"
+        } else if flags.contains('S') && !flags.contains('O') {
+            "replica"
+        } else if flags.contains('P') && field(line, "resp=").trim_end() != "3" {
+            "pubsub"
+        } else {
+            "normal"
+        };
+        let wanted = if ty == "slave" { "replica" } else { ty };
+        if class == wanted {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// The client whose command this shard thread is running, from
@@ -1240,11 +1272,15 @@ pub(crate) fn format_client_line(
     let is_blocked = crate::block::get_block_hub_for_port(port)
         .lock()
         .is_blocked(c.id);
+    let (sub, psub, ssub, _) = pubsub.client_sub_stats(c.id);
     let mut flags = String::new();
     if c.is_monitor {
         flags.push('O');
     } else if c.stats.is_replica.load(Relaxed) {
         flags.push('S');
+    }
+    if sub + psub + ssub > 0 {
+        flags.push('P');
     }
     if is_blocked {
         flags.push('b');
@@ -1260,7 +1296,6 @@ pub(crate) fn format_client_line(
         flags.push('N');
     }
     let (qbuf, qbuf_free) = c.effective_qbuf(idle);
-    let (sub, psub, ssub, _) = pubsub.client_sub_stats(c.id);
     let s = &c.stats;
     format!(
         "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db={} \
@@ -12264,7 +12299,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Ttl(_, _) => "TTL",
         Command::Cluster(_) => "CLUSTER",
         Command::Client(sub) => match sub {
-            ClientSubcommand::List(_) => "client|list",
+            ClientSubcommand::List(..) => "client|list",
             ClientSubcommand::Info => "client|info",
             ClientSubcommand::SetName(_) => "client|setname",
             ClientSubcommand::GetName => "client|getname",
@@ -16867,8 +16902,9 @@ async fn execute_command_inner(
         Command::Client(sub) => {
             let mut close_conn = false;
             match sub {
-                ClientSubcommand::List(ref filter_ids) => {
+                ClientSubcommand::List(ref filter_ids, ref ty) => {
                     let list = router.client_list(client_registry, filter_ids).await;
+                    let list = filter_client_list_type(list, ty.as_deref());
                     out.extend_from_slice(format!("${}\r\n", list.len()).as_bytes());
                     out.extend_from_slice(list.as_bytes());
                     out.extend_from_slice(b"\r\n");
@@ -33705,6 +33741,25 @@ unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_client_list_type_filter() {
+        let list = "id=1 flags=N resp=2\nid=2 flags=S resp=2\nid=3 flags=P resp=2\n\
+                    id=4 flags=P resp=3\nid=5 flags=O resp=2\n"
+            .to_string();
+        let ids = |ty: &str| -> Vec<String> {
+            super::filter_client_list_type(list.clone(), Some(ty))
+                .lines()
+                .map(|l| l.split(' ').next().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids("normal"), ["id=1", "id=4", "id=5"]);
+        assert_eq!(ids("replica"), ["id=2"]);
+        assert_eq!(ids("slave"), ["id=2"]);
+        assert_eq!(ids("pubsub"), ["id=3"]);
+        assert!(ids("master").is_empty());
+        assert_eq!(super::filter_client_list_type(list.clone(), None), list);
+    }
+
     #[test]
     fn test_port_in_span_covers_every_shard_port() {
         assert!(super::port_in_span(7000, 4, 7000));

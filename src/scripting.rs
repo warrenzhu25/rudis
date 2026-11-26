@@ -252,8 +252,8 @@ fn script_execute(
     aof: Option<&RefCell<crate::aof::AofWriter>>,
 ) {
     match cmd {
-        Command::Client(crate::resp::ClientSubcommand::List(ids)) => {
-            crate::connection::script_client_list(ids, out);
+        Command::Client(crate::resp::ClientSubcommand::List(ids, ty)) => {
+            crate::connection::script_client_list(ids, ty.as_deref(), out);
         }
         // Not under the database borrow: INFO reads this shard's keyspace.
         Command::Info(section) => script_info(section.clone(), out),

@@ -74,7 +74,7 @@ pub fn reshape_for(cmd: &crate::resp::Command) -> Option<Reshape> {
             Some(Reshape::ArrayOfFlatToMaps)
         }
         Command::Info(_)
-        | Command::Client(ClientSubcommand::Info | ClientSubcommand::List(_))
+        | Command::Client(ClientSubcommand::Info | ClientSubcommand::List(..))
         | Command::Lolwut(_)
         | Command::Memory(MemorySubcommand::Doctor)
         | Command::Latency(LatencySubcommand::Doctor) => Some(Reshape::Verbatim),

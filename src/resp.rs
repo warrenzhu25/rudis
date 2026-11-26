@@ -199,7 +199,8 @@ pub enum HimportSubcommand {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClientSubcommand {
-    List(Vec<u64>),
+    /// `CLIENT LIST [TYPE type] [ID id ...]`: the ids and the lowercase type.
+    List(Vec<u64>, Option<String>),
     Info,
     SetName(String),
     GetName,
@@ -4651,28 +4652,35 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             match sub.as_str() {
                 "LIST" => {
                     let mut ids = Vec::new();
+                    let mut ty = None;
                     let mut i = 2;
                     while i < args.len() {
                         let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
                         if opt == "ID" {
+                            // Like Redis, every argument after ID is an id.
                             i += 1;
                             while i < args.len() {
-                                if let Ok(id) =
-                                    std::str::from_utf8(&args[i]).unwrap_or("").parse::<u64>()
-                                {
-                                    ids.push(id);
-                                    i += 1;
-                                } else {
-                                    break;
+                                match std::str::from_utf8(&args[i]).unwrap_or("").parse::<u64>() {
+                                    Ok(id) if id > 0 => ids.push(id),
+                                    _ => return Err("Invalid client ID".to_string()),
                                 }
+                                i += 1;
                             }
-                        } else if opt == "TYPE" {
+                        } else if opt == "TYPE" && i + 1 < args.len() {
+                            let v = String::from_utf8_lossy(&args[i + 1]).to_lowercase();
+                            if !matches!(
+                                v.as_str(),
+                                "normal" | "master" | "replica" | "slave" | "pubsub"
+                            ) {
+                                return Err(format!("Unknown client type '{}'", v));
+                            }
+                            ty = Some(v);
                             i += 2;
                         } else {
-                            i += 1;
+                            return Err("syntax error".to_string());
                         }
                     }
-                    Ok(Some(Command::Client(ClientSubcommand::List(ids))))
+                    Ok(Some(Command::Client(ClientSubcommand::List(ids, ty))))
                 }
                 "INFO" => Ok(Some(Command::Client(ClientSubcommand::Info))),
                 "SETNAME" => {
