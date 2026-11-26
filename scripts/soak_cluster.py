@@ -17,7 +17,10 @@ What runs:
   * chaos, each on its own period: CLUSTER FAILOVER on a random master's
     replica (a manual failover: no acknowledged write may be lost), a reshard
     of a few hundred slots between random masters, kill -9 and restart of a
-    random replica, BGSAVE / BGREWRITEAOF on a random node.
+    random replica, BGSAVE / BGREWRITEAOF on a random node, and an atomic slot
+    migration (CLUSTER MIGRATION IMPORT, Redis 8.4) of a run of a few hundred
+    slots between random masters, waited on until it completes and the
+    source has trimmed what it handed over.
 
 Every --interval seconds it records each node's INFO (memory, ops, role,
 replication), checks that every node answers within 5 s (a hung node is the
@@ -231,9 +234,12 @@ def main():
     ap.add_argument("--reshard-every", type=int, default=1200, help="seconds")
     ap.add_argument("--restart-every", type=int, default=1800, help="seconds")
     ap.add_argument("--save-every", type=int, default=1800, help="seconds")
+    ap.add_argument("--asm-every", type=int, default=1500,
+                    help="seconds between atomic slot migrations (0: none)")
     ap.add_argument("--chaos", choices=["normal", "fast"], default="normal",
                     help="fast: failover every 60 s, reshard 120 s, replica restart 180 s, "
-                         "save 300 s (about a day of normal-pace chaos events in 2-3 h); "
+                         "save 300 s, atomic migration 150 s (about a day of normal-pace "
+                         "chaos events in 2-3 h); "
                          "explicit --*-every flags still win")
     ap.add_argument("--server-args", default="",
                     help='extra rudis arguments for every node, e.g. "--aof-multipart yes"')
@@ -243,7 +249,8 @@ def main():
         for flag, attr, secs in (("--failover-every", "failover_every", 60),
                                  ("--reshard-every", "reshard_every", 120),
                                  ("--restart-every", "restart_every", 180),
-                                 ("--save-every", "save_every", 300)):
+                                 ("--save-every", "save_every", 300),
+                                 ("--asm-every", "asm_every", 150)):
             if flag not in given:
                 setattr(a, attr, secs)
 
@@ -447,9 +454,65 @@ def main():
         if str(reply).startswith("-"):
             bad(f"{cmd} on {p}: {reply}")
 
+    def atomic_migrate():
+        ms, _ = masters()
+        if len(ms) < 2:
+            return
+        src, dst = random.sample(ms, 2)
+        # A run of the source's slots: CLUSTER MIGRATION IMPORT takes ranges.
+        runs = []
+        for part in src[4].split():
+            if part.startswith("["):
+                continue
+            lo, _, hi = part.partition("-")
+            runs.append((int(lo), int(hi or lo)))
+        if not runs:
+            return
+        lo, hi = random.choice(runs)
+        n = random.randint(50, 400)
+        start_slot = random.randint(lo, max(lo, hi - n + 1))
+        end_slot = min(hi, start_slot + n - 1)
+        task_id = Conn(dst[1], timeout=10).cmd("CLUSTER", "MIGRATION", "IMPORT", start_slot, end_slot)
+        if not isinstance(task_id, str) or task_id.startswith("-"):
+            bad(f"CLUSTER MIGRATION IMPORT {start_slot} {end_slot} on {dst[1]}: {task_id}")
+            return
+        began = time.time()
+        state, last_error = "?", ""
+        while time.time() - began < 600:
+            try:
+                reply = Conn(dst[1], timeout=10).cmd("CLUSTER", "MIGRATION", "STATUS", "ID", task_id)
+                fields = reply[0] if reply and isinstance(reply[0], list) else reply
+                info = dict(zip(fields[::2], fields[1::2]))
+                state, last_error = info.get("state", "?"), info.get("last_error", "")
+            except Exception as e:  # noqa: BLE001
+                state, last_error = "?", repr(e)
+            if state in ("completed", "canceled"):
+                break
+            time.sleep(0.5)
+        took = time.time() - began
+        note(f"atomic migration of slots {start_slot}-{end_slot} {src[1]} -> {dst[1]}: "
+             f"{state} in {took:.1f} s{f' ({last_error})' if last_error else ''}")
+        if state != "completed":
+            bad(f"atomic migration {task_id} of {start_slot}-{end_slot} {src[1]} -> {dst[1]} "
+                f"ended {state} after {took:.0f} s: {last_error}")
+            return
+        # The source trims the slots it handed over in the background: wait
+        # for that before the foreign-key check.
+        end = time.time() + 120
+        while time.time() < end:
+            try:
+                if all(cluster_info(p).get("cluster_slot_migration_active_trim_running", "0") == "0"
+                       for p in ports):
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.5)
+        bad("slots handed over by an atomic migration still trimming after 120 s")
+
     chaos = [
         (a.failover_every, failover), (a.reshard_every, reshard),
         (a.restart_every, restart_replica), (a.save_every, save),
+        (a.asm_every, atomic_migrate),
     ]
     last_chaos = {f: start for _, f in chaos}
     probe = ClusterClient(ports)
