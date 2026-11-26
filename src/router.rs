@@ -3862,14 +3862,17 @@ impl Router {
     }
 
     /// Server-wide `(keys, keys with a TTL)` per non-empty database for `INFO keyspace`.
-    pub async fn keyspace_stats_by_db(&self) -> std::collections::BTreeMap<usize, (usize, usize)> {
+    pub async fn keyspace_stats_by_db(
+        &self,
+    ) -> std::collections::BTreeMap<usize, (usize, usize, usize)> {
         let mut map = std::collections::BTreeMap::new();
         {
             let db = self.local_db.borrow();
-            for (db_idx, k, exp, _) in db.keyspace_stats_by_db() {
-                let entry = map.entry(db_idx).or_insert((0, 0));
+            for (db_idx, k, exp, sub) in db.keyspace_stats_by_db() {
+                let entry = map.entry(db_idx).or_insert((0, 0, 0));
                 entry.0 += k;
                 entry.1 += exp;
+                entry.2 += sub as usize;
             }
         }
         let mut pending = Vec::new();
@@ -3886,10 +3889,11 @@ impl Router {
         }
         for rx in pending {
             if let Ok(stats) = rx.recv_async().await {
-                for (db_idx, k, exp, _) in stats {
-                    let entry = map.entry(db_idx).or_insert((0, 0));
+                for (db_idx, k, exp, sub) in stats {
+                    let entry = map.entry(db_idx).or_insert((0, 0, 0));
                     entry.0 += k;
                     entry.1 += exp;
+                    entry.2 += sub as usize;
                 }
             }
         }
@@ -6006,7 +6010,7 @@ impl Router {
             let mut db_ids: Vec<usize> = stats_by_db.keys().copied().collect();
             db_ids.sort_unstable();
             for db_idx in db_ids {
-                if let Some(&(keys, expires)) = stats_by_db.get(&db_idx)
+                if let Some(&(keys, expires, _)) = stats_by_db.get(&db_idx)
                     && keys > 0
                 {
                     if db_idx != 0 {

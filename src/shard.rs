@@ -2634,8 +2634,9 @@ impl ShardDb {
         s
     }
 
+    /// Per DB with keys: `(db, keys, keys with a TTL, keys with hash
+    /// fields that expire)`.
     pub fn keyspace_stats_by_db(&self) -> Vec<(usize, usize, usize, u64)> {
-        let now = crate::clock::now();
         let max_db = self.max_db_len();
         let mut out = Vec::new();
         for db_idx in 0..max_db {
@@ -2655,22 +2656,9 @@ impl ShardDb {
                 continue;
             }
             let expires = table.num_expires;
-            let mut ttl_sum_ms = 0u64;
-            if expires > 0 {
-                let mut sampled = 0usize;
-                for entry in table.entries() {
-                    if let Some(exp) = entry.expire_at() {
-                        if exp > now {
-                            ttl_sum_ms += exp.duration_since(now).as_millis() as u64;
-                        }
-                        sampled += 1;
-                        if sampled >= 100 {
-                            break;
-                        }
-                    }
-                }
-            }
-            out.push((db_idx, keys, expires, ttl_sum_ms));
+            // Keys with hash fields that expire (INFO's `subexpiry`).
+            let subexpiry = table.hash_field_expires.len() as u64;
+            out.push((db_idx, keys, expires, subexpiry));
         }
         out
     }

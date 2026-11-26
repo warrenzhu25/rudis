@@ -14657,11 +14657,11 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
                     // Only fan out when the section is requested.
                     let stats_by_db = router.keyspace_stats_by_db().await;
                     acc.push_str("# Keyspace\r\n");
-                    for (&db_idx, &(keys, expires)) in stats_by_db.iter() {
+                    for (&db_idx, &(keys, expires, subexpiry)) in stats_by_db.iter() {
                         if keys > 0 {
                             acc.push_str(&format!(
-                                "db{}:keys={},expires={},avg_ttl=0,subexpiry=0\r\n",
-                                db_idx, keys, expires
+                                "db{}:keys={},expires={},avg_ttl=0,subexpiry={}\r\n",
+                                db_idx, keys, expires, subexpiry
                             ));
                         }
                     }
@@ -20836,7 +20836,7 @@ async fn execute_command_inner(
                         .keyspace_stats_by_db()
                         .await
                         .into_values()
-                        .map(|(k, _)| k)
+                        .map(|(k, _, _)| k)
                         .sum()
                 } else {
                     router.dbsize().await
