@@ -2954,6 +2954,46 @@ impl ShardDb {
     /// returns how many.
     pub fn trim_keys_in_slot(&mut self, slot: u16, count: usize) -> usize {
         let keys = self.table.slot_keys(slot, count);
+        self.trim_keys(keys)
+    }
+
+    /// Deletes every key of the slots in `slots` (a 16384-bit set), in
+    /// passes over the table, without logging them; returns how many. For
+    /// a `TRIMSLOTS` replayed from the AOF, which must be done before the
+    /// next command. (Asking for each slot's keys in turn scanned the
+    /// whole table once per slot: minutes for a few thousand slots of a
+    /// million keys.)
+    pub fn trim_slot_set(&mut self, slots: &[u64; 256]) -> usize {
+        let mut total = 0;
+        for _pass in 0..4 {
+            let mut cursor = (0, 0);
+            loop {
+                let (keys, done) = self
+                    .table
+                    .keys_in_slot_set_step(slots, &mut cursor, 1 << 16);
+                total += self.trim_keys(keys);
+                if done {
+                    break;
+                }
+            }
+            if self.slot_set_key_count(slots) == 0 {
+                break;
+            }
+        }
+        total
+    }
+
+    /// Keys left in the slots of `slots` (a 16384-bit set).
+    pub fn slot_set_key_count(&mut self, slots: &[u64; 256]) -> u64 {
+        (0..16384u16)
+            .filter(|&s| slots[s as usize >> 6] >> (s & 63) & 1 == 1)
+            .map(|s| self.table.slot_key_count(s) as u64)
+            .sum()
+    }
+
+    /// Deletes `keys` for a slot trim, without logging them; returns how
+    /// many existed.
+    pub fn trim_keys(&mut self, keys: Vec<Bytes>) -> usize {
         let mut n = 0;
         for key in keys {
             // No pre-image for a snapshot in progress: it leaves out keys

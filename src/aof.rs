@@ -4209,9 +4209,11 @@ fn apply_aof_command(cmd: &Command, db: &mut ShardDb, dummy_out: &mut Vec<u8>, c
         // A slot trim the server logged: done at once here, so the commands
         // after it see the slots empty.
         Command::Trimslots(ranges) => {
+            let mut set = [0u64; 256];
             for slot in ranges.iter().flat_map(|&(s, e)| s..=e) {
-                while db.trim_keys_in_slot(slot, 1024) > 0 {}
+                set[slot as usize >> 6] |= 1 << (slot & 63);
             }
+            db.trim_slot_set(&set);
             *count += 1;
         }
         _ => {

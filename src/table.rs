@@ -11666,6 +11666,43 @@ impl RudisTable {
         result
     }
 
+    /// One step of a pass over the table collecting the keys whose slot is
+    /// in `slots` (a 16384-bit set): looks at up to `budget` positions from
+    /// `cursor` (segment, position), which it advances. Returns the keys
+    /// and whether the pass reached the end of the table. Deleting keys
+    /// between steps may move others behind the cursor, so a caller that
+    /// must catch every key repeats the pass until the slots are empty.
+    pub fn keys_in_slot_set_step(
+        &self,
+        slots: &[u64; 256],
+        cursor: &mut (usize, usize),
+        budget: usize,
+    ) -> (Vec<Bytes>, bool) {
+        let mut out = Vec::new();
+        let mut scanned = 0;
+        let segments = &self.table.segments;
+        while cursor.0 < segments.len() {
+            let seg = &segments[cursor.0];
+            let n = seg.slot_count();
+            while cursor.1 < n {
+                if let Some(entry) = seg.slot_entry(cursor.1) {
+                    let s = crate::router::key_slot(&entry.key) as usize;
+                    if slots[s >> 6] >> (s & 63) & 1 == 1 {
+                        out.push(entry.key.to_bytes());
+                    }
+                }
+                cursor.1 += 1;
+                scanned += 1;
+                if scanned >= budget {
+                    return (out, false);
+                }
+            }
+            cursor.0 += 1;
+            cursor.1 = 0;
+        }
+        (out, true)
+    }
+
     /// The keys in the slots of `ranges`, in one pass over the table.
     pub fn keys_in_slot_ranges(&mut self, ranges: &[(u16, u16)]) -> Vec<Bytes> {
         let mut out = Vec::new();

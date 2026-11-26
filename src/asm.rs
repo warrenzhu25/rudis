@@ -878,13 +878,24 @@ pub async fn run_trim_shard(
             mine.iter().map(|&s| d.table.slot_key_count(s) as u64).sum()
         };
         job.keys.fetch_add(keys, Ordering::Relaxed);
-        'slots: for &slot in &mine {
+        let mut set = [0u64; 256];
+        for &s in &mine {
+            set[s as usize >> 6] |= 1 << (s & 63);
+        }
+        // Passes over the table, a bounded step at a time with the shard's
+        // other work in between. (Asking for each slot's keys in turn
+        // scanned the whole table once per slot, and in bg mode never
+        // yielded: trimming 8192 slots of a million keys stalled the shard
+        // for minutes after a migration.) A pass can miss keys that deletes
+        // moved behind its cursor, so it repeats while any are left.
+        'passes: for _pass in 0..4 {
+            let mut cursor = (0, 0);
             loop {
                 // A job waits while clients are paused (it writes), and an
                 // active one while its delay says so.
                 loop {
                     if job.cancelled.load(Ordering::Relaxed) {
-                        break 'slots;
+                        break 'passes;
                     }
                     let held = crate::connection::is_client_paused().is_some()
                         || (!job.bg && active_trim_delay() < 0);
@@ -898,20 +909,46 @@ pub async fn run_trim_shard(
                 } else {
                     active_trim_delay().max(0) as u64
                 };
-                let batch = if delay > 0 { 1 } else { 256 };
-                let keys = db.borrow_mut().trim_keys_in_slot(slot, batch);
-                if keys == 0 {
-                    break;
-                }
-                job.trimmed.fetch_add(keys as u64, Ordering::Relaxed);
-                if job.bg {
-                    crate::table::add_lazyfreed_objects(keys as u64);
-                } else if delay > 0 {
-                    monoio::time::sleep(std::time::Duration::from_micros(delay)).await;
+                let budget = if delay > 0 { 256 } else { 4096 };
+                let (keys, done) =
+                    db.borrow()
+                        .table
+                        .keys_in_slot_set_step(&set, &mut cursor, budget);
+                if delay > 0 {
+                    // One key at a time, the delay apart, holding while
+                    // clients are paused or the delay turns negative.
+                    for key in keys {
+                        loop {
+                            if job.cancelled.load(Ordering::Relaxed) {
+                                break 'passes;
+                            }
+                            if crate::connection::is_client_paused().is_none()
+                                && active_trim_delay() >= 0
+                            {
+                                break;
+                            }
+                            monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        let n = db.borrow_mut().trim_keys(vec![key]);
+                        job.trimmed.fetch_add(n as u64, Ordering::Relaxed);
+                        let delay = active_trim_delay().max(0) as u64;
+                        monoio::time::sleep(std::time::Duration::from_micros(delay)).await;
+                    }
                 } else {
+                    let n = db.borrow_mut().trim_keys(keys);
+                    job.trimmed.fetch_add(n as u64, Ordering::Relaxed);
+                    if job.bg {
+                        crate::table::add_lazyfreed_objects(n as u64);
+                    }
                     // Between other work.
                     monoio::time::sleep(std::time::Duration::ZERO).await;
                 }
+                if done {
+                    break;
+                }
+            }
+            if db.borrow_mut().slot_set_key_count(&set) == 0 {
+                break;
             }
         }
     }

@@ -66,6 +66,11 @@ or the persistence format; such changes are called out under **Breaking**.
 - An atomic slot migration of more data than `client-output-buffer-limit replica` (256 MB by
   default) failed as the first write after the snapshot was queued, and again on every retry:
   the snapshot counted against the limit. It no longer does, as in Redis.
+- After a migration, the source's trim of the slots it handed over asked for each slot's keys
+  in turn, scanning its whole table once per slot, and in `bg` mode never let the shard do
+  anything else: with a million keys, migrating half the slots stalled the source for minutes
+  (and it ignored SIGTERM meanwhile). The trim now makes passes over the table in bounded steps
+  between clients' commands. A `TRIMSLOTS` replayed from the AOF uses the same passes.
 - An RDB with a vector set element whose stored key (`vec:<set>:<element>`) had a length of
   252 to 255 modulo 256 could not be loaded: restarts refused the file and replicas failed
   every full sync. Such files load now.
