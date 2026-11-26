@@ -9640,6 +9640,28 @@ fn parse_fack(args: &[bytes::Bytes]) -> Option<u64> {
     }
 }
 
+/// A command's full lowercase name as Redis logs it: `container|sub` for a
+/// subcommand (`slowlog|get`), from the arguments as sent when there are
+/// any.
+fn full_cmd_name(cmd: &Command, argv: Option<&crate::resp::RawArgv>) -> String {
+    if let Some(args) = argv.map(|a| a.to_vec())
+        && let Some(first) = args.first()
+    {
+        let name = String::from_utf8_lossy(first).to_ascii_lowercase();
+        if let Some(sub) = args.get(1) {
+            let full = format!(
+                "{name}|{}",
+                String::from_utf8_lossy(sub).to_ascii_lowercase()
+            );
+            if crate::acl::command_index(&full).is_some() {
+                return full;
+            }
+        }
+        return name;
+    }
+    stat_cmd_name(cmd).to_ascii_lowercase()
+}
+
 /// Reads what a replica sends back, which is only `REPLCONF ACK <offset>`,
 /// until the link ends. Malformed input or a partial command longer than
 /// any ack drops the link instead of being skipped or buffered without
@@ -9658,15 +9680,35 @@ async fn read_replica_acks<R: AsyncReadRent>(
             Ok(n) => buf.extend_from_slice(&read_buf[..n]),
         }
         loop {
-            match crate::resp::parse_command(&mut buf) {
-                Ok(Some(Command::Replconf(args)))
+            match crate::resp::parse_command_with_argv(&mut buf) {
+                Ok(Some((Command::Replconf(args), _)))
                     if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"ack") =>
                 {
                     if let Some(ack_off) = parse_ack_offset(&args[1]) {
                         on_ack(ack_off, parse_fack(&args));
                     }
                 }
-                Ok(Some(_)) => {}
+                Ok(Some((Command::Replconf(_), _))) => {}
+                // A replica's link carries no replies: a command that
+                // would have one (anything but REPLCONF) drops it, as Redis
+                // does rather than corrupt the stream it sends.
+                Ok(Some((cmd, argv))) => {
+                    let name = full_cmd_name(&cmd, argv.as_ref());
+                    // Redis refuses a replica's keyspace command with an
+                    // error, which it logs as a master erroring at its
+                    // replica, before that reply drops the link.
+                    if cmd.is_write_command() || !cmd_keys(&cmd).is_empty() {
+                        crate::log_warning!(
+                            "== CRITICAL == This master is sending an error to its replica: 'Replica can't interact with the keyspace' after processing the command '{}'",
+                            name
+                        );
+                    }
+                    crate::log_warning!(
+                        "Replica generated a reply to command '{}', disconnecting it: replica link",
+                        name
+                    );
+                    return;
+                }
                 Ok(None) => break,
                 Err(_) => return,
             }
@@ -9716,6 +9758,10 @@ impl Drop for ReplicaLink {
             return;
         }
         if let Some(r) = self.repl.take() {
+            // The writer task still holds the socket's write half: shut it
+            // down so the replica sees the link end now (a link dropped
+            // for a command with a reply would otherwise stay open).
+            r.drop_link();
             r.detach_fd();
         }
         self.hub.unregister_replica(self.client_id);

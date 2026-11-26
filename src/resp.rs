@@ -6959,7 +6959,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .and_then(|s| s.parse::<i64>().ok())
             {
                 Some(o) => o,
-                None => return Err("ERR value is not an integer or out of range".to_string()),
+                None => {
+                    crate::log_warning!(
+                        "Replica client asks for synchronization but with a wrong offset"
+                    );
+                    return Err("ERR value is not an integer or out of range".to_string());
+                }
             };
             Ok(Some(Command::Psync {
                 replid,

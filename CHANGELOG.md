@@ -53,6 +53,8 @@ or the persistence format; such changes are called out under **Breaking**.
   arriving, as in Redis, and a transfer that breaks off leaves the old dataset in place.
 - A replica keeps its cached master (for a partial resync) until the new dataset loads, so
   a full sync that breaks off can still continue with a partial one.
+- A master disconnects a replica that sends anything but `REPLCONF` on its link, and logs a
+  `PSYNC` with an invalid offset, as Redis does.
 - `CLUSTER MEET` with a node the cluster forgot (`CLUSTER FORGET`) lifts the ban on every
   node, so it rejoins the whole cluster at once rather than after the minute-long ban.
 

@@ -31,14 +31,6 @@ Kill rdb child process if its dumping RDB is not useful
 replica can handle EINTR if use diskless load
 #
 # Not yet implemented (see the TCL gap list):
-# - the "Replica generated a reply ... disconnecting it" and "asks for
-#   synchronization but with a wrong offset" log lines, and a master's
-#   FULLRESYNC to a raw PSYNC client starts at its current offset;
-replica do not write the reply to the replication link - SYNC (_addReplyToBufferOrList)
-replica do not write the reply to the replication link - SYNC (addReplyDeferredLen)
-replica do not write the reply to the replication link - PSYNC (_addReplyToBufferOrList)
-replica do not write the reply to the replication link - PSYNC (addReplyDeferredLen)
-PSYNC with wrong offset should throw error
 # - a replica answers -LOADING right after a script it was running
 #   past its time limit is killed during a full sync (to investigate).
 Fullsync should not free scripting engine on a replica while a script is running
