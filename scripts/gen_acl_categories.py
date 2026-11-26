@@ -59,6 +59,7 @@ EXTRA = {
     "sunioncard": ["read", "set", "slow"],
     "xackdel": ["write", "stream", "slow"],
     "trimslots": ["admin", "dangerous", "write", "slow"],
+    "hotkeys": ["admin", "dangerous", "slow"],
     "xcfgset": ["write", "stream", "slow"],
     "xdelex": ["write", "stream", "slow"],
     "xidmprecord": ["write", "stream", "slow"],

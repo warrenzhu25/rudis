@@ -29,6 +29,7 @@ pub mod debug_cmd;
 pub mod digest;
 pub mod geo;
 pub mod hll;
+pub mod hotkeys;
 pub mod json;
 pub mod log;
 pub mod mailbox;

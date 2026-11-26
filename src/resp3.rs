@@ -48,6 +48,7 @@ static MEMORY_STATS: Shape = Shape::Map(&[
 ]);
 static LATENCY_HISTOGRAM: Shape =
     Shape::Map(&[("*", Shape::Map(&[("histogram_usec", Shape::Map(&[]))]))]);
+static HOTKEYS_GET: Shape = Shape::ArrayOf(&Shape::Map(&[]));
 static XINFO_FULL: Shape = Shape::Map(&[(
     "groups",
     Shape::ArrayOf(&Shape::Map(&[(
@@ -66,6 +67,9 @@ pub fn reshape_for(cmd: &crate::resp::Command) -> Option<Reshape> {
         Command::Xinfo(XinfoSubcommand::Stream(_)) => Some(Reshape::FlatToMap),
         Command::Xinfo(XinfoSubcommand::StreamFull { .. }) => Some(Reshape::Nested(&XINFO_FULL)),
         Command::FunctionList { .. } => Some(Reshape::Nested(&FUNCTION_LIST)),
+        Command::Hotkeys(args) if args.first().is_some_and(|a| a.eq_ignore_ascii_case(b"GET")) => {
+            Some(Reshape::Nested(&HOTKEYS_GET))
+        }
         Command::Memory(MemorySubcommand::Stats) => Some(Reshape::Nested(&MEMORY_STATS)),
         Command::Latency(LatencySubcommand::Histogram(_)) => {
             Some(Reshape::Nested(&LATENCY_HISTOGRAM))

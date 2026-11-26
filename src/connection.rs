@@ -1612,6 +1612,8 @@ struct CmdStatGuard {
     rejected: std::cell::Cell<bool>,
     /// The slot its CPU time goes to (CLUSTER SLOT-STATS cpu-usec).
     slot: Option<u16>,
+    /// While a HOTKEYS session runs: the command's keys and request bytes.
+    hot: Option<(Vec<Bytes>, u64)>,
 }
 
 impl Drop for CmdStatGuard {
@@ -1624,6 +1626,9 @@ impl Drop for CmdStatGuard {
         }
         let nanos = self.start.map_or(0, |s| s.elapsed().as_nanos() as u64);
         record_cmd_stats(self.name, 1, nanos);
+        if let Some((keys, net)) = self.hot.take() {
+            crate::hotkeys::record(&keys, nanos, net);
+        }
         if self.slot.is_some() && !crate::slot_stats::take_crossed() {
             crate::slot_stats::record_cpu(self.slot, nanos);
         }
@@ -8184,6 +8189,7 @@ async fn handle_client_loop<T: crate::transport::ClientTransport>(
                         || HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
                         || has_monitor_clients()
                         || crate::slot_stats::accounting(router.cluster_enabled)
+                        || crate::hotkeys::active()
                         || crate::block::has_blocked_waiters(router.port)
                         // Over maxmemory: the squashed path has no per-command
                         // OOM/eviction gate, so take the per-command path.
@@ -11384,6 +11390,20 @@ fn slot_stats_before(
     slot
 }
 
+/// A command's keys and request size for HOTKEYS (its encoding, or near
+/// enough for commands the AOF never logs).
+fn hotkeys_command_info(cmd: &Command) -> (Vec<Bytes>, u64) {
+    let keys: Vec<Bytes> = cmd_keys(cmd)
+        .iter()
+        .map(|k| Bytes::copy_from_slice(k))
+        .collect();
+    let net = crate::aof::command_to_resp(cmd).map_or_else(
+        || keys.iter().map(|k| k.len() as u64 + 16).sum::<u64>() + 16,
+        |b| b.len() as u64,
+    );
+    (keys, net)
+}
+
 /// The cluster slot a command is accounted to in CLUSTER SLOT-STATS: its
 /// keys' (or sharded channels') slot when they all share one; `None` for
 /// commands without keys or across slots.
@@ -12451,6 +12471,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Sync => "SYNC",
         Command::Trimslots(_) => "TRIMSLOTS",
         Command::SyncSlots(_) => "CLUSTER",
+        Command::Hotkeys(_) => "HOTKEYS",
         Command::Replconf(_) => "REPLCONF",
         Command::Role => "ROLE",
         Command::Tier(_) => "TIER",
@@ -14969,6 +14990,7 @@ async fn execute_command_inner(
         client_id,
         rejected: std::cell::Cell::new(false),
         slot: stat_slot,
+        hot: crate::hotkeys::active().then(|| hotkeys_command_info(&cmd)),
     };
     if cmd.is_write_command() && !dirty_counted_on_change(&cmd) {
         crate::snapshot::note_write();
@@ -16238,6 +16260,10 @@ async fn execute_command_inner(
         }
         Command::SyncSlots(_) => {
             out.extend_from_slice(b"-ERR CLUSTER SYNCSLOTS is used between cluster nodes only\r\n");
+            false
+        }
+        Command::Hotkeys(args) => {
+            crate::hotkeys::run(router.base_port, router.cluster_enabled, &args, out);
             false
         }
         Command::Tier(sub) => {

@@ -680,14 +680,14 @@ persistence and cluster suites that start their own servers:
 Suites that start their own servers run through
 [`scripts/run_redis_integration_suite.sh`](scripts/run_redis_integration_suite.sh):
 
-| Category | Suites (38) |
+| Category | Suites (41) |
 | :--- | :--- |
 | **Replication** (12) | `integration/{replication,replication-2,replication-3,replication-4,replication-psync,block-repl,psync2,psync2-pingoff,psync2-master-restart,psync2-reg,failover,shutdown}` |
 | **Persistence** (14) | `unit/{aofrw,client-eviction,wait,violations,memefficiency,info-keysizes}`, `integration/{aof-race,convert-ziplist-hash-on-load,convert-ziplist-zset-on-load,convert-zipmap-hash-on-load,rdb,corrupt-dump,corrupt-dump-fuzzer,logging}` |
-| **Cluster** (14) | `unit/cluster/{failure-marking,internal-secret,multi-slot-operations,misc,scripting,sharded-pubsub,slot-ownership,replica-migration,human-announced-nodename,hostnames,announced-endpoints,slot-stats,atomic-slot-migration}`, `integration/dismiss-mem` |
+| **Cluster** (15) | `unit/cluster/{failure-marking,internal-secret,multi-slot-operations,misc,scripting,sharded-pubsub,slot-ownership,replica-migration,human-announced-nodename,hostnames,announced-endpoints,slot-stats,atomic-slot-migration}`, `unit/hotkeys`, `integration/dismiss-mem` |
 
-All 88 gate every merge through [`scripts/ci_local.sh`](scripts/ci_local.sh). GitHub Actions
-runs the core suites on every push and 28 of the other 38 nightly; the rest run locally only. Tests that don't apply to rudis (no `fork()`, no Unix socket, ...)
+All 90 gate every merge through [`scripts/ci_local.sh`](scripts/ci_local.sh). GitHub Actions
+runs the core suites on every push and 31 of the other 41 nightly; the rest run locally only. Tests that don't apply to rudis (no `fork()`, no Unix socket, ...)
 and known gaps are listed, each with its reason, in [`scripts/tcl_skips/`](scripts/tcl_skips/);
 [`scripts/tcl_patches/`](scripts/tcl_patches/) adapts a suite where rudis's behavior differs on
 purpose (it refuses corrupt `RESTORE` payloads up front instead of crashing on them later).

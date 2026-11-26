@@ -86,6 +86,8 @@ RUDIS_ONLY = {
                    "Returns the number of members of the union of multiple sets."),
     "xackdel": (-5, [], (1, 1, 1), ["RW", "DELETE"],
                 "Acknowledges and deletes stream entries."),
+    "hotkeys": (-2, [], None, [],
+                "Reports the keys that cost the most CPU time and network bytes."),
     "trimslots": (-4, [], None, [],
                   "Deletes this node's keys in slots it doesn't serve (atomic slot migration)."),
     "xcfgset": (-2, [], (1, 1, 1), ["RW", "UPDATE"], "Sets stream configuration."),

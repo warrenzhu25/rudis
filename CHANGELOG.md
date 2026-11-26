@@ -37,6 +37,8 @@ or the persistence format; such changes are called out under **Breaking**.
   background or actively. CLUSTER INFO and INFO report tasks, trims and buffers.
 - `INFO keyspace` reports `subexpiry` (keys with hash fields that expire).
 - In cluster mode KEYS and SCAN return keys slot by slot, as Redis does.
+- `HOTKEYS START|STOP|RESET|GET` (Redis 8.4): samples the keys commands touch and reports the
+  top keys by CPU time and network bytes.
 - `INFO replication` on a replica reports `master_link_down_since_seconds`,
   `master_current_sync_attempts`, `master_total_sync_attempts` and
   `total_disconnect_time_sec`; `INFO memory` reports `mem_clients_slaves` and

@@ -903,6 +903,8 @@ pub enum Command {
     /// rudis nodes (see `crate::asm`). `START` hands the connection over to
     /// the source side of the migration.
     SyncSlots(Vec<Bytes>),
+    /// `HOTKEYS <subcommand> ...` (see `crate::hotkeys`).
+    Hotkeys(Vec<Bytes>),
     /// `FAILOVER ABORT`, or `FAILOVER [TO host port [FORCE]] [TIMEOUT ms]`.
     Failover {
         abort: bool,
@@ -6536,8 +6538,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'hotkeys' command".to_string());
             }
-            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
-            Ok(Some(Command::Unknown(format!("HOTKEYS {}", sub))))
+            Ok(Some(Command::Hotkeys(args[1..].to_vec())))
         }
         "MONITOR" => {
             if args.len() != 1 {
