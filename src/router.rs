@@ -321,7 +321,9 @@ pub fn local_real_parts(
 ) -> (i64, usize) {
     if stats.real_accounting.load(Ordering::Relaxed) {
         (
-            crate::allocator::thread_net_bytes(),
+            // Not the connection scratch this thread keeps for connections
+            // to come (see `connection::pooled_scratch_bytes`).
+            crate::allocator::thread_net_bytes() - crate::connection::pooled_scratch_bytes().max(0),
             db.total_free_arena_bytes(),
         )
     } else {

@@ -8403,7 +8403,56 @@ struct ConnScratch {
 }
 
 thread_local! {
-    static CONN_SCRATCH_POOL: RefCell<Vec<ConnScratch>> = const { RefCell::new(Vec::new()) };
+    static CONN_SCRATCH_POOL: RefCell<Vec<PooledScratch>> = const { RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// Bytes this thread's connection scratch pool holds for connections
+    /// to come: a cache, left out of the shard's used_memory share (see
+    /// `Router::publish_memory_state`) as Redis has nothing like it.
+    /// Counted, a few clients connecting and going moved used_memory by
+    /// megabytes, and a server near maxmemory evicted.
+    static POOLED_SCRATCH_BYTES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`POOLED_SCRATCH_BYTES`] of this thread.
+pub fn pooled_scratch_bytes() -> i64 {
+    POOLED_SCRATCH_BYTES.get()
+}
+
+/// A pooled [`ConnScratch`], counted in this thread's
+/// [`POOLED_SCRATCH_BYTES`] while it is in the pool.
+struct PooledScratch {
+    scratch: Option<ConnScratch>,
+    bytes: i64,
+}
+
+impl PooledScratch {
+    fn new(scratch: ConnScratch) -> Self {
+        let bytes = (scratch.buf.capacity() + scratch.out_buf.capacity()) as i64;
+        POOLED_SCRATCH_BYTES.set(POOLED_SCRATCH_BYTES.get() + bytes);
+        PooledScratch {
+            scratch: Some(scratch),
+            bytes,
+        }
+    }
+
+    fn take(mut self) -> ConnScratch {
+        self.scratch.take().expect("present until taken")
+    }
+}
+
+impl std::ops::Deref for PooledScratch {
+    type Target = ConnScratch;
+    fn deref(&self) -> &ConnScratch {
+        self.scratch.as_ref().expect("present until taken")
+    }
+}
+
+impl Drop for PooledScratch {
+    fn drop(&mut self) {
+        POOLED_SCRATCH_BYTES.set(POOLED_SCRATCH_BYTES.get() - self.bytes);
+    }
 }
 
 fn take_conn_scratch(num_shards: usize) -> ConnScratch {
@@ -8411,7 +8460,7 @@ fn take_conn_scratch(num_shards: usize) -> ConnScratch {
         let mut p = pool.borrow_mut();
         p.iter()
             .rposition(|item| item.responders.len() == num_shards)
-            .map(|idx| p.swap_remove(idx))
+            .map(|idx| p.swap_remove(idx).take())
     }) {
         s.buf.clear();
         let _ = s.buf.try_reclaim(131072);
@@ -8467,7 +8516,7 @@ fn recycle_conn_scratch(mut s: ConnScratch) {
     CONN_SCRATCH_POOL.with(|pool| {
         let mut p = pool.borrow_mut();
         if p.len() < 32 {
-            p.push(s);
+            p.push(PooledScratch::new(s));
         }
     });
 }
