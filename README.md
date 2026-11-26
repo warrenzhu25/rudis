@@ -211,6 +211,29 @@ An older 16-command comparison (`INCR`, `HSET`, `LPUSH`, `ZADD`, ...) is in
 [`docs/benchmarks/multi_command_comparison.md`](docs/benchmarks/multi_command_comparison.md); it
 was measured against Dragonfly v1.39 and predates this rerun.
 
+### Memory per key
+
+Measured with [`scripts/benchmark_memory.py`](scripts/benchmark_memory.py). Each server
+(8 threads on cores `0-7`, persistence off) is filled with string keys `key:<n>` holding random,
+incompressible values, and the table shows its resident memory (RSS) growth per key. The
+comparison servers are Valkey 9.2.0 and Dragonfly v1.39.
+
+| Dataset | Rudis | Valkey 9.2.0 | Dragonfly v1.39 |
+| :--- | ---: | ---: | ---: |
+| 10,000,000 keys × 32 B | 104 B (0.99 GiB) | **81 B** (0.77 GiB) | 87 B (0.86 GiB) |
+| 1,000,000 keys × 1 KiB | 1,154 B (1.10 GiB) | 1,342 B (1.26 GiB) | **1,114 B** (1.09 GiB) |
+
+Small values cost Rudis about 23 bytes more per key than Valkey, so small-key datasets need
+about 28% more memory. With 1 KiB values Rudis needs about 14% less than Valkey, whose values
+(1 KiB plus a header) land in jemalloc's 1,280-byte size class, and it comes within 4% of
+Dragonfly. The servers are not filled with `DEBUG POPULATE`, because its values repeat a single
+byte and Dragonfly compresses them.
+
+```bash
+RUDIS_BIN=target/release/rudis VALKEY_BIN=/path/to/valkey-server \
+DRAGONFLY_BIN=/path/to/dragonfly python3 scripts/benchmark_memory.py
+```
+
 ---
 
 ## Configuration
