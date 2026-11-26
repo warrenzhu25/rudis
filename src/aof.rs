@@ -123,6 +123,20 @@ pub fn aof_progress_all(port: u16, shards: usize) -> Vec<std::sync::Arc<AofProgr
     (0..shards).map(|s| aof_progress(port, s)).collect()
 }
 
+/// Bytes the shards of the server at `port` appended to their AOF but have
+/// not yet written to the kernel.
+pub fn aof_unwritten_bytes(port: u16, shards: usize) -> u64 {
+    use std::sync::atomic::Ordering::Acquire;
+    aof_progress_all(port, shards)
+        .iter()
+        .map(|p| {
+            p.appended
+                .load(Acquire)
+                .saturating_sub(p.written.load(Acquire))
+        })
+        .sum()
+}
+
 /// A shard's AOF writer, if AOF is on, shared by everything on the shard
 /// that appends to it (its router and their clones, its mailbox loop, the
 /// expiry log). Swapped when `CONFIG SET appendonly` turns AOF on or off.

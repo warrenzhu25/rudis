@@ -14582,11 +14582,15 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
         aof_rw.consecutive_failures(),
         // Live rewrites that had to fall back to a blocking pass.
         crate::aof::LIVE_REWRITE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
-        // Redis lists these only while the AOF is on.
+        // Redis lists these only while the AOF is on. The current size
+        // counts what the shards appended but haven't flushed yet: Redis
+        // writes a command to the AOF before it replies, so a client sees
+        // its write in aof_current_size at once.
         if router.aof().is_some() {
             format!(
                 "aof_current_size:{}\r\naof_base_size:{}\r\n",
-                crate::aof::aof_files_size(&router.db_dir, router.num_shards),
+                crate::aof::aof_files_size(&router.db_dir, router.num_shards)
+                    + crate::aof::aof_unwritten_bytes(router.base_port, router.num_shards),
                 aof_rw.base_size()
             )
         } else {
