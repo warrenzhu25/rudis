@@ -7877,10 +7877,11 @@ mod tests {
 
     #[test]
     fn test_script_writes_go_as_one_block_and_a_single_one_alone() {
-        let port = 19962;
+        // A port of its own: tests run in parallel and share the hubs.
+        let port = 19971;
         let hub = get_replication_hub(port);
         let (tx, _rx) = flume::unbounded();
-        let rep = hub.register_replica(62, tx);
+        let rep = hub.register_replica(71, tx);
         let words = |b: Vec<u8>| -> Vec<String> {
             String::from_utf8(b)
                 .unwrap()
