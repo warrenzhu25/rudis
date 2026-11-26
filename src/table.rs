@@ -4178,7 +4178,9 @@ impl RudisTable {
         }
         let is_exp = if let Some(entry) = self.table.get_slot(slot_idx) {
             if let Some(expire_at) = entry.expire_at() {
-                crate::clock::now() >= expire_at
+                // A key of a slot being imported doesn't expire yet: its
+                // TTL may still be updated by the source's stream.
+                crate::clock::now() >= expire_at && !crate::asm::is_importing_key(&entry.key)
             } else {
                 false
             }
@@ -4243,6 +4245,10 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 // If volatile policy, key must have an expiration
                 if is_volatile && entry.expire_at().is_none() {
+                    continue;
+                }
+                // Keys of slots being imported are not ours to evict yet.
+                if crate::asm::is_importing_key(&entry.key) {
                     continue;
                 }
 
@@ -5032,6 +5038,7 @@ impl RudisTable {
                 continue;
             }
             if let Some(entry) = self.table.get_slot(i)
+                && !crate::asm::is_importing_key(&entry.key)
                 && crate::pubsub::glob_match(pattern, &entry.key)
             {
                 res.push(entry.key.to_bytes());
@@ -5053,12 +5060,23 @@ impl RudisTable {
         }
         if self.table.len() <= 8192 {
             let mut candidates: Vec<(usize, usize)> = Vec::with_capacity(self.table.len());
+            // In cluster mode keys come slot by slot, as from Redis's
+            // per-slot dictionaries: the slot leads the cursor value.
+            let by_slot =
+                crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed);
             for cur in 0..bound {
                 let idx = self.table.cursor_to_global_idx(cur);
                 if !self.check_expired_slot(idx)
                     && let Some(entry) = self.table.get_slot(idx)
+                    && !crate::asm::is_importing_key(&entry.key)
                 {
-                    let eh = ((xxhash_rust::xxh3::xxh3_64(&entry.key) as u32) | 1) as usize;
+                    let h = xxhash_rust::xxh3::xxh3_64(&entry.key) as u32;
+                    let eh = if by_slot {
+                        let slot = crate::router::key_slot(&entry.key) as usize;
+                        ((slot << 17) | (h as usize >> 15)) + 1
+                    } else {
+                        (h | 1) as usize
+                    };
                     if cursor == 0 || eh >= cursor {
                         candidates.push((eh, idx));
                     }
@@ -5114,7 +5132,9 @@ impl RudisTable {
                     }
                 }
                 inspected += 1;
-                if inspected >= count {
+                // Keys sharing a cursor value go out together: a cursor
+                // can't resume between them.
+                if inspected >= count && candidates.get(i + 1).is_none_or(|n| n.0 != eh) {
                     for next_cand in &candidates[i + 1..] {
                         if next_cand.0 > eh {
                             next_cursor = next_cand.0;
@@ -5135,6 +5155,7 @@ impl RudisTable {
             let idx = self.table.cursor_to_global_idx(cur);
             if !self.check_expired_slot(idx)
                 && let Some(entry) = self.table.get_slot(idx)
+                && !crate::asm::is_importing_key(&entry.key)
             {
                 let matches = match pattern {
                     Some(pat) => crate::pubsub::glob_match(pat, &entry.key),
@@ -5200,7 +5221,9 @@ impl RudisTable {
             if crate::connection::is_client_paused().is_none() && self.check_expired_slot(idx) {
                 continue;
             }
-            if let Some(entry) = self.table.get_slot(idx) {
+            if let Some(entry) = self.table.get_slot(idx)
+                && !crate::asm::is_importing_key(&entry.key)
+            {
                 return Some(entry.key.to_bytes());
             }
         }
@@ -5232,6 +5255,20 @@ impl RudisTable {
 
     pub fn dbsize(&mut self) -> usize {
         self.table.len()
+    }
+
+    /// [`Self::dbsize`] without the keys of slots being imported (which
+    /// clients can't see yet): what DBSIZE reports.
+    pub fn visible_dbsize(&mut self) -> usize {
+        let total = self.table.len();
+        if !crate::asm::importing_any() || total == 0 {
+            return total;
+        }
+        let hidden: usize = crate::asm::importing_slots()
+            .into_iter()
+            .map(|s| self.table.slot_count(s) as usize)
+            .sum();
+        total.saturating_sub(hidden)
     }
 
     pub fn type_of(&mut self, key: &[u8]) -> &'static str {
@@ -11535,7 +11572,7 @@ impl RudisTable {
     }
 
     pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
-        if self.table.items == 0 {
+        if self.table.items == 0 || crate::asm::is_importing_slot(slot) {
             return 0;
         }
         let slot_count = self.table.slot_count(slot) as usize;
@@ -11572,6 +11609,16 @@ impl RudisTable {
     }
 
     pub fn get_keys_in_slot(&mut self, slot: u16, count: usize) -> Vec<Bytes> {
+        // Keys of a slot being imported don't exist for clients yet.
+        if crate::asm::is_importing_slot(slot) {
+            return Vec::new();
+        }
+        self.slot_keys(slot, count)
+    }
+
+    /// Up to `count` keys of `slot` (expired ones are deleted on the way),
+    /// whether or not the slot is being imported.
+    pub fn slot_keys(&mut self, slot: u16, count: usize) -> Vec<Bytes> {
         if self.table.items == 0 || self.table.slot_count(slot) == 0 {
             return Vec::new();
         }
@@ -12784,6 +12831,9 @@ impl RudisTable {
 
         let mut evicted_fields = 0usize;
         for key in sample_keys {
+            if crate::asm::is_importing_key(&key) {
+                continue;
+            }
             let mut expired: smallvec::SmallVec<[Bytes; 8]> = smallvec::SmallVec::new();
             let mut empty_map = false;
             if let Some(fmap) = self.hash_field_expires.get_mut(&key) {

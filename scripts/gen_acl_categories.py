@@ -58,6 +58,7 @@ EXTRA = {
     "sdiffcard": ["read", "set", "slow"],
     "sunioncard": ["read", "set", "slow"],
     "xackdel": ["write", "stream", "slow"],
+    "trimslots": ["admin", "dangerous", "write", "slow"],
     "xcfgset": ["write", "stream", "slow"],
     "xdelex": ["write", "stream", "slow"],
     "xidmprecord": ["write", "stream", "slow"],

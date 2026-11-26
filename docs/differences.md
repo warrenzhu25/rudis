@@ -154,6 +154,14 @@ tests for them are skipped (`scripts/tcl_skips/unit/info.txt`).
 
 ---
 
+### Atomic Slot Migration (`CLUSTER MIGRATION`)
+* Redis 8.4's atomic slot migration works between rudis nodes: `CLUSTER MIGRATION IMPORT|CANCEL|STATUS`, `TRIMSLOTS`, the `cluster-slot-migration-*` settings, the `CLUSTER INFO` task and trim fields, and the `mem_cluster_slot_migration_*` INFO fields. The nodes talk over rudis's own protocol (`CLUSTER SYNCSLOTS`), so a migration can't run between a rudis node and a Redis node.
+* Redis uses two connections (a forked child sends the snapshot of the slots on one while the writes to them stream on the other); rudis uses one. The source sends the keys, then the writes made to the slots meanwhile, then the live writes. The fail points (`DEBUG ASM-FAILPOINT`) and error messages name Redis's channels and states as they map onto that link.
+* As in Redis, the destination hides keys of slots it is importing from KEYS, SCAN, RANDOMKEY, DBSIZE and `CLUSTER GETKEYSINSLOT`/`COUNTKEYSINSLOT` (INFO keyspace counts them), and never expires or evicts them until it serves the slots; its replicas do the same. A failed import is tried again (from the slots' new master after a failover) until it completes or is canceled; failovers, FLUSHALL, CLIENT PAUSE, slot reassignments and FORGET cancel tasks as in Redis.
+* Trimming (the source's keys after a migration, the destination's after a failed one) is `bg` by default (dropped at once, counted in `lazyfreed_objects`) or `active` (a key at a time) while clients use tracking; replicas and the AOF get one `TRIMSLOTS` instead of a DEL per key. A master that started up, or a replica that became master, trims its keys of slots other nodes serve.
+* Extended structures (JSON documents, probabilistic structures, vector sets) migrate with the slots. `CLUSTER MIGRATION` is listed under `CLUSTER` in `COMMAND`, without its own `cluster|migration` entry.
+* A master whose slots a migration took all of stays an empty master unless `cluster-allow-replica-migration` is on (as in Redis).
+
 ## 4. Multi-Protocol Engine (Redis + Memcached)
 
 * **Redis** requires external proxy layers (like Twemproxy or Envoy) to speak Memcached protocol.

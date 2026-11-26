@@ -890,7 +890,15 @@ impl ClusterHub {
             epoch,
             my_epoch
         );
-        if emptied && *self.role.read() == "master" {
+        // Slots a slot migration handed over leave an empty master behind
+        // unless cluster-allow-replica-migration says to follow (as Redis
+        // does for slots moved away; a master failed over while down,
+        // whose slots were taken from it, follows either way).
+        let handed_over = lost
+            .iter()
+            .all(|&s| crate::asm::slot_in_active_task(self.port, s));
+        let follow = !handed_over || self.allow_replica_migration.load(Ordering::Relaxed);
+        if emptied && follow && *self.role.read() == "master" {
             crate::log_warning!("Cluster: lost all my slots to {}: becoming its replica", id);
             self.become_replica_of(id, master_addr);
         } else if *self.role.read() == "master" {
@@ -898,8 +906,15 @@ impl ClusterHub {
             // new owner serves the slot now), so they go, here and on our
             // replicas. A master that lost all its slots becomes a replica
             // instead and resyncs from its new master.
-            if !crate::asm::trim_disabled() {
-                self.queue_slot_purge(&lost);
+            // Not those a running slot migration hands over: it trims
+            // them itself.
+            let purge: Vec<u16> = lost
+                .iter()
+                .copied()
+                .filter(|&s| !crate::asm::slot_in_active_task(self.port, s))
+                .collect();
+            if !crate::asm::trim_disabled() && !purge.is_empty() {
+                self.queue_slot_purge(&purge);
             }
         }
         let _ = self.save_config();
@@ -1784,7 +1799,7 @@ impl ClusterHub {
         let cur_epoch = self.current_epoch.load(Ordering::Relaxed);
         let cfg_epoch = self.config_epoch.load(Ordering::Relaxed);
         format!(
-            "cluster_state:{}\r\ncluster_slots_assigned:{}\r\ncluster_slots_ok:{}\r\ncluster_slots_pfail:{}\r\ncluster_slots_fail:{}\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\ncluster_current_epoch:{}\r\ncluster_my_epoch:{}\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\ncluster_slot_migration_active_tasks:{}\r\ncluster_slot_migration_active_trim_running:{}\r\n",
+            "cluster_state:{}\r\ncluster_slots_assigned:{}\r\ncluster_slots_ok:{}\r\ncluster_slots_pfail:{}\r\ncluster_slots_fail:{}\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\ncluster_current_epoch:{}\r\ncluster_my_epoch:{}\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\ncluster_slot_migration_active_tasks:{}\r\n",
             state,
             slots_assigned,
             slots_ok,
@@ -1795,6 +1810,8 @@ impl ClusterHub {
             cur_epoch,
             cfg_epoch,
             crate::asm::hub(self.port).active_count(),
+        ) + &crate::asm::trim_info(
+            self.port,
             usize::from(self.slot_purges.lock().iter().any(|s| !s.is_empty())),
         )
     }

@@ -28,6 +28,21 @@ or the persistence format; such changes are called out under **Breaking**.
   as `state=wait_bgsave` and `INFO persistence` shows `rdb_bgsave_in_progress:1`, as Redis
   does during a diskless sync.
 
+- Atomic slot migration (Redis 8.4's `CLUSTER MIGRATION IMPORT|CANCEL|STATUS` and
+  `TRIMSLOTS`) between rudis nodes: the destination imports a set of slots as one unit (their
+  keys, then the writes to them, then a short write pause on the source while it hands the
+  slots over). Keys of slots being imported are hidden and never expire or get evicted until
+  the destination serves them; failed imports are retried; failovers, flushes, client pauses
+  and slot changes cancel tasks as in Redis; the slots' keys left behind are trimmed in the
+  background or actively. CLUSTER INFO and INFO report tasks, trims and buffers.
+- `INFO keyspace` reports `subexpiry` (keys with hash fields that expire).
+- In cluster mode KEYS and SCAN return keys slot by slot, as Redis does.
+
+### Changed
+
+- `CLUSTER MEET` with a node the cluster forgot (`CLUSTER FORGET`) lifts the ban on every
+  node, so it rejoins the whole cluster at once rather than after the minute-long ban.
+
 ### Fixed
 
 - An RDB with a vector set element whose stored key (`vec:<set>:<element>`) had a length of

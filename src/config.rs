@@ -217,6 +217,8 @@ const REDIS_CONFIG_NAMES: &[&str] = &[
     "cluster-slave-no-failover",
     "cluster-slave-validity-factor",
     "cluster-slot-migration-handoff-max-lag-bytes",
+    "replica-full-sync-buffer-limit",
+    "cluster-slot-migration-sync-buffer-drain-timeout",
     "cluster-slot-migration-log-max-len",
     "cluster-slot-migration-write-pause-timeout",
     "cluster-slot-stats-enabled",

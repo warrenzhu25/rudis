@@ -59,7 +59,7 @@ container's seccomp profile.
 
 ## How it's tested
 
-- **Redis's own test suite.** 88 of the Redis/Valkey TCL test suites (data types, scripting,
+- **Redis's own test suite.** 89 of the Redis/Valkey TCL test suites (data types, scripting,
   ACLs, replication, persistence, cluster, client eviction, ...) gate every merge, run by
   [`scripts/ci_local.sh`](scripts/ci_local.sh) on a dedicated host. GitHub Actions runs the core
   suites on every push and the timing-heavy rest nightly, since a shared 4-vCPU runner makes
@@ -646,7 +646,7 @@ links go to the corresponding source-verified subsystem specification.
 | **AOF persistence** | Implemented | Async (`monoio`) periodic flush, distinct I/O strategy from RDB save. | [14](docs/design/14_persistence_replication.md) |
 | **Replication (`PSYNC`)** | Implemented | Single-connection, used for all Rudis-to-Rudis replication. | [replication.md](docs/replication.md) |
 | **Replication (`DFLY FLOW`)** | Implemented, narrow scope | Master-side only, for Dragonfly-protocol clients; Rudis replicas never use it. | [replication.md](docs/replication.md) |
-| **Redis Cluster & gossip** | Implemented | Plain-text gossip bus on `port + 10000` (not `io_uring`), quorum failover, real `CLUSTER SETSLOT`/`REBALANCE`/`RESHARD` key migration. | [11](docs/design/11_cluster_topology.md) |
+| **Redis Cluster & gossip** | Implemented | Plain-text gossip bus on `port + 10000` (not `io_uring`), quorum failover, real `CLUSTER SETSLOT`/`REBALANCE`/`RESHARD` key migration, Redis 8.4 atomic slot migration (`CLUSTER MIGRATION`, between rudis nodes). | [11](docs/design/11_cluster_topology.md) |
 | **HNSW & Redis 8 Vector Sets (`V*`)** | Implemented | Redis 8 Vector Sets (`VADD`/`VSIM`/`VEMB`/`VLINKS`/`VSETATTR`), Cosine/L2/IP SIMD kernels, SQ8/BIN/PQ compression, `REDUCE` projection, NVMe `.vtier` disk reranking (`TIERED` + `RERANK`). | [08](docs/design/08_vector_engine.md) |
 | **Kernel TLS (kTLS)** | Not implemented | `rustls` handles TLS in userspace; there is no kernel offload. | [15](docs/design/15_security_tls.md) |
 | **Experimental extensions** | Off by default | JSON, search and vectors, probabilistic types, NVMe tiering, CRDTs, agent memory, MCP, AF_XDP: see [docs/experimental.md](docs/experimental.md). | [experimental.md](docs/experimental.md) |
@@ -656,9 +656,9 @@ links go to the corresponding source-verified subsystem specification.
 
 ## Redis/Valkey TCL Compatibility Suite
 
-Rudis is validated against **88 official Redis/Valkey TCL test suites**: the 49 core suites
+Rudis is validated against **89 official Redis/Valkey TCL test suites**: the 49 core suites
 below, which run against one server via
-[`scripts/run_redis_test_suite.sh`](scripts/run_redis_test_suite.sh), plus 39 replication,
+[`scripts/run_redis_test_suite.sh`](scripts/run_redis_test_suite.sh), plus 40 replication,
 persistence and cluster suites that start their own servers:
 
 ```bash
@@ -684,7 +684,7 @@ Suites that start their own servers run through
 | :--- | :--- |
 | **Replication** (12) | `integration/{replication,replication-2,replication-3,replication-4,replication-psync,block-repl,psync2,psync2-pingoff,psync2-master-restart,psync2-reg,failover,shutdown}` |
 | **Persistence** (14) | `unit/{aofrw,client-eviction,wait,violations,memefficiency,info-keysizes}`, `integration/{aof-race,convert-ziplist-hash-on-load,convert-ziplist-zset-on-load,convert-zipmap-hash-on-load,rdb,corrupt-dump,corrupt-dump-fuzzer,logging}` |
-| **Cluster** (13) | `unit/cluster/{failure-marking,internal-secret,multi-slot-operations,misc,scripting,sharded-pubsub,slot-ownership,replica-migration,human-announced-nodename,hostnames,announced-endpoints,slot-stats}`, `integration/dismiss-mem` |
+| **Cluster** (14) | `unit/cluster/{failure-marking,internal-secret,multi-slot-operations,misc,scripting,sharded-pubsub,slot-ownership,replica-migration,human-announced-nodename,hostnames,announced-endpoints,slot-stats,atomic-slot-migration}`, `integration/dismiss-mem` |
 
 All 88 gate every merge through [`scripts/ci_local.sh`](scripts/ci_local.sh). GitHub Actions
 runs the core suites on every push and 28 of the other 38 nightly; the rest run locally only. Tests that don't apply to rudis (no `fork()`, no Unix socket, ...)

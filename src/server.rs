@@ -715,7 +715,9 @@ pub fn run_shard_worker(
                         db.replica_local_keys.clear();
                     }
                     purge_lost_slots(&mem_router, &active_db, base_port, shard_id);
+                    crate::asm::shard_cron(&mem_router, &active_db, shard_id, false);
                 } else {
+                    crate::asm::shard_cron(&mem_router, &active_db, shard_id, true);
                     // Except keys clients wrote here, which no master expires.
                     active_db.borrow_mut().expire_replica_local_keys();
                 }
@@ -2372,8 +2374,33 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         responder,
                     } => {
                         let mut db = cross_shard_db.borrow_mut();
-                        let n = crate::asm::dump_slots(&mut db, port, shard_id, task, &ranges);
-                        let _ = responder.send(n);
+                        let cmds = crate::asm::dump_slots(&mut db, port, shard_id, task, &ranges);
+                        let _ = responder.send(cmds);
+                    }
+                    ShardMessage::AsmLoadExt {
+                        records,
+                        command,
+                        responder,
+                    } => {
+                        crate::asm::load_ext_local(
+                            &mut cross_shard_db.borrow_mut(),
+                            cross_shard_aof_slot.get().as_deref(),
+                            shard_id,
+                            num_shards,
+                            &records,
+                            &command,
+                        );
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::AsmTrim(job) => {
+                        monoio::spawn(crate::asm::run_trim_shard(
+                            cross_shard_db.clone(),
+                            cross_shard_aof_slot.clone(),
+                            port,
+                            shard_id,
+                            num_shards,
+                            job,
+                        ));
                     }
                     ShardMessage::AsyncLoadRdb(job) => {
                         // Loads between this shard's other work.

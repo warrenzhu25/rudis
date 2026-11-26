@@ -312,7 +312,7 @@ pub fn format_memory_info(
         number_of_libraries:{}\r\n\
         used_memory_vm_functions:{}\r\n\
         lazyfree_pending_objects:0\r\n\
-        lazyfreed_objects:{}\r\n",
+        lazyfreed_objects:{}\r\n{}",
         used_mem,
         crate::tiering::format_bytes_human(used_mem as u64),
         rss,
@@ -340,6 +340,7 @@ pub fn format_memory_info(
         crate::scripting::count_libraries(),
         32768 + crate::scripting::count_functions() * 256,
         crate::table::get_lazyfreed_objects(),
+        crate::asm::memory_info(),
     )
 }
 

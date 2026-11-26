@@ -3799,7 +3799,7 @@ impl Router {
     }
 
     pub async fn dbsize(&self) -> usize {
-        let mut total = self.local_db.borrow_mut().dbsize();
+        let mut total = self.local_db.borrow_mut().visible_dbsize();
         for res in self
             .execute_remote_many(self.to_other_shards(|| Command::Dbsize))
             .await
@@ -4886,6 +4886,10 @@ impl Router {
                 all_keys.extend(shard_keys);
             }
         }
+        // Slot by slot in cluster mode, as Redis lists them.
+        if self.cluster_enabled {
+            all_keys.sort_by_key(|k| key_slot(k));
+        }
         all_keys
     }
 
@@ -5113,6 +5117,7 @@ impl Router {
         save: Option<bool>,
         own_batches: usize,
     ) -> Result<(), String> {
+        crate::asm::cancel_on_shutdown(self.base_port);
         crate::shutdown::quiesce(own_batches, crate::shutdown::CLIENT_DRAIN_TIMEOUT).await;
         let has_points = !crate::config::save_points(self.base_port).is_empty();
         if !crate::config::should_save_on_shutdown(save, has_points) {
@@ -5377,6 +5382,14 @@ impl Router {
         let res = self.rewrite_all_shard_aofs().await;
         match &res {
             Ok(_) => {
+                let (saved, skipped) = crate::asm::snapshot_counts(1);
+                if skipped > 0 {
+                    crate::log_notice!(
+                        "AOF rewrite done, {} keys saved, {} keys skipped (slots being trimmed)",
+                        saved,
+                        skipped
+                    );
+                }
                 crate::log_notice!("Background AOF rewrite terminated with success");
                 crate::log_notice!("Background AOF rewrite finished successfully");
             }
@@ -5654,6 +5667,9 @@ impl Router {
     /// shard still applies its commands in stream order; commands that span
     /// shards flush the batch first, so they see every earlier change.
     pub async fn apply_replica_command_batched(&self, cmd: Command, batch: &mut [Vec<Command>]) {
+        if crate::asm::trimming_any() {
+            crate::asm::wait_trim_for(self, &cmd, batch).await;
+        }
         match crate::connection::target_shard_of_cmd(&cmd, self.num_shards) {
             Some(target) if target == self.shard_id => {
                 let mut dummy_out = Vec::new();
@@ -5755,6 +5771,16 @@ impl Router {
             self.apply_replica_on(target, cmd).await;
         } else {
             match cmd {
+                // The master's slot import markers.
+                Command::SyncSlots(args) => {
+                    if args.first().is_some_and(|a| a.eq_ignore_ascii_case(b"EXT")) {
+                        crate::asm::load_ext(self, &args).await;
+                    } else {
+                        crate::asm::apply_replicated_syncslots(self.base_port, &args);
+                    }
+                }
+                // The master trims slots: so do we.
+                Command::Trimslots(ranges) => crate::asm::trim_slots(self, &ranges),
                 // Delivered to this replica's subscribers on every shard.
                 Command::Publish { .. } | Command::Spublish { .. } => {
                     let mut dummy_out = Vec::new();
@@ -5927,7 +5953,17 @@ impl Router {
             .join(format!("temp-{}-{}.rdb", std::process::id(), tmp_id));
         let res = self.write_rdb_file(&tmp_filename).await;
         match res {
-            Ok(()) => crate::log_notice!("DB saved on disk"),
+            Ok(()) => {
+                let (saved, skipped) = crate::asm::snapshot_counts(0);
+                if skipped > 0 {
+                    crate::log_notice!(
+                        "BGSAVE done, {} keys saved, {} keys skipped (slots being trimmed)",
+                        saved,
+                        skipped
+                    );
+                }
+                crate::log_notice!("DB saved on disk")
+            }
             Err(ref e) => {
                 crate::log_warning!("Error saving DB on disk: {}", e);
                 let _ = std::fs::remove_file(&tmp_filename);

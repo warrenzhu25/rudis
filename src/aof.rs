@@ -4183,6 +4183,23 @@ fn apply_aof_command(cmd: &Command, db: &mut ShardDb, dummy_out: &mut Vec<u8>, c
             }
             *count += 1;
         }
+        // A migrated extended structure (see `asm::load_ext`).
+        Command::SyncSlots(args)
+            if args.first().is_some_and(|a| a.eq_ignore_ascii_case(b"EXT")) =>
+        {
+            if let Some(records) = args.get(2) {
+                let _ = crate::table::load_legacy_ext(records, db, 0, 1);
+            }
+            *count += 1;
+        }
+        // A slot trim the server logged: done at once here, so the commands
+        // after it see the slots empty.
+        Command::Trimslots(ranges) => {
+            for slot in ranges.iter().flat_map(|&(s, e)| s..=e) {
+                while db.trim_keys_in_slot(slot, 1024) > 0 {}
+            }
+            *count += 1;
+        }
         _ => {
             let is_select = matches!(cmd, Command::Select(_));
             crate::connection::execute_local_command(cmd, db, dummy_out, None);
@@ -7166,6 +7183,10 @@ mod tests {
     fn test_every_write_command_is_propagated() {
         // Not encoded on purpose: the handler logs the effect instead.
         const PROPAGATED_ELSEWHERE: &[(&str, &str)] = &[
+            (
+                "TRIMSLOTS RANGES 1 0 0",
+                "each shard logs TRIMSLOTS for its slots as it trims (asm::run_trim_shard)",
+            ),
             (
                 "BLPOP l 0",
                 "the served pop is logged as LPOP/RPOP (block.rs)",

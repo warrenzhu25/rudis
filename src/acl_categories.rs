@@ -40,7 +40,7 @@ pub struct CmdInfo {
     pub subs: (u16, u16),
 }
 
-pub const NUM_COMMANDS: usize = 470;
+pub const NUM_COMMANDS: usize = 471;
 pub const WORDS: usize = 8;
 
 /// Sorted by `name`.
@@ -430,6 +430,7 @@ pub static COMMANDS: [CmdInfo; NUM_COMMANDS] = [
     CmdInfo { name: "time", cats: 0x4000, key_flags: 0, no_auth: false, parent: None, subs: (0, 0) },
     CmdInfo { name: "topk", cats: 0x8004, key_flags: 3, no_auth: false, parent: None, subs: (0, 0) },
     CmdInfo { name: "touch", cats: 0x4003, key_flags: 0, no_auth: false, parent: None, subs: (0, 0) },
+    CmdInfo { name: "trimslots", cats: 0x2a004, key_flags: 3, no_auth: false, parent: None, subs: (0, 0) },
     CmdInfo { name: "ttl", cats: 0x4003, key_flags: 1, no_auth: false, parent: None, subs: (0, 0) },
     CmdInfo { name: "type", cats: 0x4003, key_flags: 0, no_auth: false, parent: None, subs: (0, 0) },
     CmdInfo { name: "unlink", cats: 0x4005, key_flags: 2, no_auth: false, parent: None, subs: (0, 0) },
@@ -461,19 +462,19 @@ pub static COMMANDS: [CmdInfo; NUM_COMMANDS] = [
     CmdInfo { name: "xdel", cats: 0x4804, key_flags: 2, no_auth: false, parent: None, subs: (0, 0) },
     CmdInfo { name: "xdelex", cats: 0x8804, key_flags: 3, no_auth: false, parent: None, subs: (0, 0) },
     CmdInfo { name: "xdp", cats: 0x2a000, key_flags: 3, no_auth: false, parent: None, subs: (0, 0) },
-    CmdInfo { name: "xgroup", cats: 0x8000, key_flags: 2, no_auth: false, parent: None, subs: (417, 423) },
-    CmdInfo { name: "xgroup|create", cats: 0x8804, key_flags: 2, no_auth: false, parent: Some(416), subs: (0, 0) },
-    CmdInfo { name: "xgroup|createconsumer", cats: 0x8804, key_flags: 2, no_auth: false, parent: Some(416), subs: (0, 0) },
-    CmdInfo { name: "xgroup|delconsumer", cats: 0x8804, key_flags: 2, no_auth: false, parent: Some(416), subs: (0, 0) },
-    CmdInfo { name: "xgroup|destroy", cats: 0x8804, key_flags: 2, no_auth: false, parent: Some(416), subs: (0, 0) },
-    CmdInfo { name: "xgroup|help", cats: 0x8800, key_flags: 0, no_auth: false, parent: Some(416), subs: (0, 0) },
-    CmdInfo { name: "xgroup|setid", cats: 0x8804, key_flags: 2, no_auth: false, parent: Some(416), subs: (0, 0) },
+    CmdInfo { name: "xgroup", cats: 0x8000, key_flags: 2, no_auth: false, parent: None, subs: (418, 424) },
+    CmdInfo { name: "xgroup|create", cats: 0x8804, key_flags: 2, no_auth: false, parent: Some(417), subs: (0, 0) },
+    CmdInfo { name: "xgroup|createconsumer", cats: 0x8804, key_flags: 2, no_auth: false, parent: Some(417), subs: (0, 0) },
+    CmdInfo { name: "xgroup|delconsumer", cats: 0x8804, key_flags: 2, no_auth: false, parent: Some(417), subs: (0, 0) },
+    CmdInfo { name: "xgroup|destroy", cats: 0x8804, key_flags: 2, no_auth: false, parent: Some(417), subs: (0, 0) },
+    CmdInfo { name: "xgroup|help", cats: 0x8800, key_flags: 0, no_auth: false, parent: Some(417), subs: (0, 0) },
+    CmdInfo { name: "xgroup|setid", cats: 0x8804, key_flags: 2, no_auth: false, parent: Some(417), subs: (0, 0) },
     CmdInfo { name: "xidmprecord", cats: 0x8804, key_flags: 3, no_auth: false, parent: None, subs: (0, 0) },
-    CmdInfo { name: "xinfo", cats: 0x8000, key_flags: 1, no_auth: false, parent: None, subs: (425, 429) },
-    CmdInfo { name: "xinfo|consumers", cats: 0x8802, key_flags: 1, no_auth: false, parent: Some(424), subs: (0, 0) },
-    CmdInfo { name: "xinfo|groups", cats: 0x8802, key_flags: 1, no_auth: false, parent: Some(424), subs: (0, 0) },
-    CmdInfo { name: "xinfo|help", cats: 0x8800, key_flags: 0, no_auth: false, parent: Some(424), subs: (0, 0) },
-    CmdInfo { name: "xinfo|stream", cats: 0x8802, key_flags: 1, no_auth: false, parent: Some(424), subs: (0, 0) },
+    CmdInfo { name: "xinfo", cats: 0x8000, key_flags: 1, no_auth: false, parent: None, subs: (426, 430) },
+    CmdInfo { name: "xinfo|consumers", cats: 0x8802, key_flags: 1, no_auth: false, parent: Some(425), subs: (0, 0) },
+    CmdInfo { name: "xinfo|groups", cats: 0x8802, key_flags: 1, no_auth: false, parent: Some(425), subs: (0, 0) },
+    CmdInfo { name: "xinfo|help", cats: 0x8800, key_flags: 0, no_auth: false, parent: Some(425), subs: (0, 0) },
+    CmdInfo { name: "xinfo|stream", cats: 0x8802, key_flags: 1, no_auth: false, parent: Some(425), subs: (0, 0) },
     CmdInfo { name: "xlen", cats: 0x4802, key_flags: 0, no_auth: false, parent: None, subs: (0, 0) },
     CmdInfo { name: "xnack", cats: 0x8804, key_flags: 3, no_auth: false, parent: None, subs: (0, 0) },
     CmdInfo { name: "xpending", cats: 0x8802, key_flags: 1, no_auth: false, parent: None, subs: (0, 0) },

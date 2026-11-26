@@ -6107,3 +6107,103 @@ fn test_cluster_setslot_node_spreads_at_once_e2e() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Atomic slot migration (CLUSTER MIGRATION IMPORT): the destination
+/// imports a slot range as one unit, with TTLs and an extended structure
+/// (a JSON document), then serves it; the source's keys of the slots go.
+#[test]
+fn test_atomic_slot_migration_e2e() {
+    let ports = [18641u16, 18651];
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_asm_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let dirs: Vec<String> = ports.iter().map(|&p| mk_dir(p)).collect();
+    let _srvs: Vec<ServerGuard> = ports
+        .iter()
+        .zip(&dirs)
+        .map(|(&p, dir)| {
+            ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    dir,
+                    "--cluster-enabled",
+                    "yes",
+                    "--threads",
+                    "1",
+                    "--no-pin",
+                    "--enable-experimental-commands",
+                    "yes",
+                ],
+                p,
+            ))
+        })
+        .collect();
+    let [a, b] = ports;
+    let cmd = |p: u16, args: &[&str]| resp_cmd_full(&mut connect_ready(p), args);
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "8191"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["CLUSTER", "ADDSLOTSRANGE", "8192", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(b, &["CLUSTER", "INFO"]).contains("cluster_state:ok")
+        || !cmd(a, &["CLUSTER", "INFO"]).contains("cluster_state:ok")
+    {
+        assert!(std::time::Instant::now() < deadline, "cluster never got ok");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // {06S} hashes to slot 0.
+    assert_eq!(cmd(a, &["SET", "{06S}k1", "v1", "EX", "1000"]), "+OK\r\n");
+    assert_eq!(cmd(a, &["HSET", "{06S}h", "f", "x"]), ":1\r\n");
+    assert_eq!(
+        cmd(a, &["JSON.SET", "{06S}doc", "$", r#"{"a":1}"#]),
+        "+OK\r\n"
+    );
+
+    let task = cmd(b, &["CLUSTER", "MIGRATION", "IMPORT", "0", "100"]);
+    let task_id = task.lines().nth(1).unwrap_or_default().to_string();
+    assert_eq!(task_id.len(), 40, "{task}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let st = cmd(b, &["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
+        if st.contains("completed") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "migration stuck: {st}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(cmd(b, &["GET", "{06S}k1"]), "$2\r\nv1\r\n");
+    let ttl: i64 = cmd(b, &["TTL", "{06S}k1"])
+        .trim_start_matches(':')
+        .trim()
+        .parse()
+        .unwrap();
+    assert!((900..=1000).contains(&ttl), "ttl {ttl}");
+    assert_eq!(cmd(b, &["HGET", "{06S}h", "f"]), "$1\r\nx\r\n");
+    assert!(cmd(b, &["JSON.GET", "{06S}doc"]).contains(r#""a":1"#));
+    // The source redirects and drops its copies.
+    assert!(cmd(a, &["GET", "{06S}k1"]).starts_with("-MOVED 0 "));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !cmd(a, &["DBSIZE"]).starts_with(":0") {
+        assert!(std::time::Instant::now() < deadline, "source kept its keys");
+        thread::sleep(Duration::from_millis(50));
+    }
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

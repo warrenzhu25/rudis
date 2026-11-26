@@ -1,0 +1,16 @@
+# unit/cluster/atomic-slot-migration tests that don't apply to rudis.
+#
+# Template-encoded hashes and HIMPORT are not rudis features.
+Slot migration preserves template-encoded hashes
+ASM forwards a live HIMPORT SET on the source to dest master+replica
+ASM stress: 4000 template keys, half streamed live during migration
+#
+# Redis sends the slots' snapshot from a forked child, which goes on while
+# the test pauses the source process; rudis's source sends it itself, so a
+# paused source stops the snapshot and the destination times out in the
+# snapshot transfer instead (the "rdb channel" timeout test covers that).
+Destination node main channel timeout when waiting stream EOF
+#
+# These load a Redis module (rudis doesn't load modules).
+Test RM_ClusterGetLocalSlotRanges without cluster
+Test RM_GetClusterNodeSlotRanges without cluster

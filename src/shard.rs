@@ -798,10 +798,18 @@ pub enum ShardMessage {
     /// Atomic slot migration: dump this shard's keys in `ranges` into
     /// migration `task`'s stream (see `crate::asm::dump_slots`); replies
     /// with the number of keys.
+    /// Loads a migrated extended structure (see `asm::load_ext`).
+    AsmLoadExt {
+        records: Vec<u8>,
+        command: Vec<u8>,
+        responder: flume::Sender<()>,
+    },
+    /// Runs this shard's part of a slot trim (see `asm::start_trim`).
+    AsmTrim(std::sync::Arc<crate::asm::TrimJob>),
     AsmDump {
         task: u64,
         ranges: Vec<(u16, u16)>,
-        responder: flume::Sender<usize>,
+        responder: flume::Sender<Vec<Vec<u8>>>,
     },
     ExecuteReplicaCmd {
         db: usize,
@@ -2759,6 +2767,12 @@ impl ShardDb {
         self.table.dbsize()
     }
 
+    /// The key count DBSIZE reports (see `RudisTable::visible_dbsize`).
+    #[inline]
+    pub fn visible_dbsize(&mut self) -> usize {
+        self.table.visible_dbsize()
+    }
+
     #[inline]
     pub fn type_of(&mut self, key: &[u8]) -> &'static str {
         let t = self.table.type_of(key);
@@ -2912,6 +2926,31 @@ impl ShardDb {
     #[inline]
     pub fn get_keys_in_slot(&mut self, slot: u16, count: usize) -> Vec<Bytes> {
         self.table.get_keys_in_slot(slot, count)
+    }
+
+    /// Deletes up to `count` keys of `slot` without logging them (a slot
+    /// trim logs one `TRIMSLOTS` instead, see `asm::run_trim_shard`);
+    /// returns how many.
+    pub fn trim_keys_in_slot(&mut self, slot: u16, count: usize) -> usize {
+        let keys = self.table.slot_keys(slot, count);
+        let mut n = 0;
+        for key in keys {
+            // No pre-image for a snapshot in progress: it leaves out keys
+            // of slots being trimmed anyway.
+            if !self.del(&key) {
+                continue;
+            }
+            n += 1;
+            self.delete_document_local(&String::from_utf8_lossy(&key));
+            if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::connection::touch_watched_key_any_port(&key);
+            }
+            if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::connection::notify_key_invalidation_any_port(&key, 0);
+            }
+            crate::connection::notify_stream_or_defer(self, &key);
+        }
+        n
     }
 
     /// Expires the keys clients wrote on this writable replica whose TTL
@@ -5076,6 +5115,10 @@ pub enum ExtKind {
 /// that are idempotent (SET, DEL, PEXPIREAT...) need no hook: the image
 /// then holds their result, which the AOF tail repeats harmlessly.
 pub struct AofImage {
+    /// Which of SAVE (0) or the AOF rewrite (1) this image counts its keys
+    /// for (see `asm::snapshot_counts`): keys of slots being trimmed are
+    /// left out.
+    stats: Option<usize>,
     /// One walk per DB that had keys at the start, in DB order.
     walks: Vec<DbWalk>,
     /// The walk in progress.
@@ -5228,6 +5271,7 @@ impl AofImage {
         let ext_pending: std::collections::VecDeque<_> = db.ext_item_keys().into();
         let ext_keys = ext_pending.iter().map(|(_, k)| k.clone()).collect();
         Ok(AofImage {
+            stats: None,
             walks,
             cur: 0,
             ext_pending,
@@ -5351,7 +5395,12 @@ impl AofImage {
             for entry in table.entries() {
                 let bits = crate::table::key_dir_bits(&entry.key);
                 if !w.written.covers(u8::MAX, bits) && !w.skip.contains(&entry.key[..]) {
+                    if crate::asm::trimming_any() && crate::asm::is_trimming_key(&entry.key) {
+                        crate::asm::snapshot_count(self.stats, false);
+                        continue;
+                    }
                     db.save_rdb_entry(entry, clock, &mut self.buf)?;
+                    crate::asm::snapshot_count(self.stats, true);
                 }
             }
             w.done = true;
@@ -5362,6 +5411,12 @@ impl AofImage {
                 if !w.written.covers(depth, bits) {
                     for entry in table.segment_entries(w.seg) {
                         if w.skip.contains(&entry.key[..]) {
+                            continue;
+                        }
+                        // Keys a slot trim deletes are gone already for
+                        // the snapshot.
+                        if crate::asm::trimming_any() && crate::asm::is_trimming_key(&entry.key) {
+                            crate::asm::snapshot_count(self.stats, false);
                             continue;
                         }
                         // A spilled value is read back from disk, on this
@@ -5375,6 +5430,7 @@ impl AofImage {
                             break;
                         }
                         db.save_rdb_entry(entry, clock, &mut self.buf)?;
+                        crate::asm::snapshot_count(self.stats, true);
                         written += 1;
                     }
                 }
@@ -5501,7 +5557,15 @@ thread_local! {
 
 /// Installs `image` for `owner` (replacing any it had), which
 /// [`before_write`] keeps point-in-time.
-pub fn install_image(owner: ImageOwner, image: AofImage) {
+pub fn install_image(owner: ImageOwner, mut image: AofImage) {
+    image.stats = match owner {
+        ImageOwner::Save => Some(0),
+        ImageOwner::AofRewrite => Some(1),
+        ImageOwner::FullSync(_) => None,
+    };
+    if let Some(k) = image.stats {
+        crate::asm::snapshot_counts_reset(k);
+    }
     IMAGES.with(|i| {
         let mut images = i.borrow_mut();
         images.retain(|(o, _)| *o != owner);

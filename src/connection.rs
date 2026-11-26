@@ -4333,6 +4333,12 @@ pub fn apply_config_value(
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
         "cluster-slot-migration-handoff-max-lag-bytes" => crate::asm::HANDOFF_MAX_LAG_BYTES
             .store(parse_config_bytes(name, val_str)?, Ordering::Relaxed),
+        "replica-full-sync-buffer-limit" => crate::asm::FULL_SYNC_BUFFER_LIMIT
+            .store(parse_config_bytes(name, val_str)?, Ordering::Relaxed),
+        "cluster-slot-migration-sync-buffer-drain-timeout" => {
+            crate::asm::SYNC_BUFFER_DRAIN_TIMEOUT_MS
+                .store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
         "repl-diskless-sync-delay" => crate::replication::REPL_DISKLESS_SYNC_DELAY
             .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
         "repl-diskless-load" => crate::replication::REPL_DISKLESS_LOAD.store(
@@ -4939,7 +4945,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 125] = [
+    let all_configs: [(&str, String); 127] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -5326,6 +5332,18 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         (
             "cluster-slot-migration-handoff-max-lag-bytes",
             crate::asm::HANDOFF_MAX_LAG_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "cluster-slot-migration-sync-buffer-drain-timeout",
+            crate::asm::SYNC_BUFFER_DRAIN_TIMEOUT_MS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "replica-full-sync-buffer-limit",
+            crate::asm::FULL_SYNC_BUFFER_LIMIT
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .to_string(),
         ),
@@ -16089,8 +16107,21 @@ async fn execute_command_inner(
             false
         }
         Command::Trimslots(ranges) => {
-            crate::asm::trim_slots(router.base_port, &ranges);
-            out.extend_from_slice(b"+OK\r\n");
+            let cluster = crate::cluster::get_cluster_hub(router.base_port);
+            match ranges
+                .iter()
+                .flat_map(|&(s, e)| s..=e)
+                .find(|&s| cluster.owns_slot(s))
+            {
+                // As Redis: only slots this node doesn't serve are trimmed.
+                Some(slot) => out.extend_from_slice(
+                    format!("-ERR the slot {slot} is served by this node\r\n").as_bytes(),
+                ),
+                None => {
+                    crate::asm::trim_slots(router, &ranges);
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+            }
             false
         }
         Command::SyncSlots(_) => {
@@ -16284,6 +16315,11 @@ async fn execute_command_inner(
             }
         }
         Command::Cluster(sub) => {
+            // A trim of the slot that only waited for paused clients runs
+            // as soon as they resume: let it finish first.
+            if let ClusterSubcommand::SetSlot(slot, _) = &sub {
+                crate::asm::wait_unpaused_trim(router.base_port, *slot).await;
+            }
             match sub {
                 ClusterSubcommand::KeySlot(key) => {
                     let slot = key_slot(&key);
@@ -16389,6 +16425,22 @@ async fn execute_command_inner(
                         out.extend_from_slice(resp.as_bytes());
                     }
                 },
+                ClusterSubcommand::SetSlot(slot, _)
+                    if crate::asm::slot_in_active_task(router.base_port, slot) =>
+                {
+                    out.extend_from_slice(
+                        format!("-ERR Slot {slot} is in an active atomic slot migration\r\n")
+                            .as_bytes(),
+                    );
+                }
+                ClusterSubcommand::SetSlot(slot, _)
+                    if crate::asm::slot_has_trim_job(router.base_port, slot) =>
+                {
+                    out.extend_from_slice(
+                        format!("-ERR There is a pending trim job for slot {slot}\r\n")
+                            .as_bytes(),
+                    );
+                }
                 ClusterSubcommand::SetSlot(slot, sub_cmd) => match sub_cmd {
                     SetSlotSubcommand::Migrating(node) => {
                         let target_addr = if node.contains(':') {
@@ -20807,6 +20859,8 @@ async fn execute_command_inner(
         Command::Flushdb | Command::Flushall => {
             let is_all = matches!(cmd, Command::Flushall);
             let cur_db = CURRENT_DB.get();
+            // The slots a migration moves lose their keys: it stops.
+            crate::asm::cancel_on_flush(router.base_port);
             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                 let watched_keys_for_port: Vec<(usize, Bytes)> = {
                     let map = WATCHED_KEYS.read();
@@ -23003,8 +23057,20 @@ async fn execute_command_inner(
                     );
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
+                } else if sub.eq_ignore_ascii_case(b"repl-pause") {
+                    let point = args.get(1).map_or(&b""[..], |a| a);
+                    crate::asm::set_repl_pause(if point.eq_ignore_ascii_case(b"clear") {
+                        b""
+                    } else {
+                        point
+                    });
+                    out.extend_from_slice(b"+OK\r\n");
+                    return false;
                 } else if sub.eq_ignore_ascii_case(b"asm-trim-method") {
-                    match crate::asm::set_trim_method(args.get(1).map_or(&b""[..], |a| a)) {
+                    match crate::asm::set_trim_method(
+                        args.get(1).map_or(&b""[..], |a| a),
+                        args.get(2).map(|a| a.as_ref()),
+                    ) {
                         Ok(()) => out.extend_from_slice(b"+OK\r\n"),
                         Err(e) => out.extend_from_slice(format!("-{e}\r\n").as_bytes()),
                     }
@@ -26049,7 +26115,7 @@ pub fn execute_local_command(
                 false
             }
             Command::Dbsize => {
-                let n = db.dbsize();
+                let n = db.visible_dbsize();
                 out.extend_from_slice(format!(":{}\r\n", n).as_bytes());
                 false
             }

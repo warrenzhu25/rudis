@@ -97,6 +97,9 @@ pub struct ConnectedReplica {
     /// Set by `ReplicationHub::disconnect_replicas`: the replica must
     /// reconnect (our history changed); nothing more is sent to it.
     disconnected: AtomicBool,
+    /// A slot migration's stream: never holds writes back
+    /// (`repl-backpressure-threshold`); its output limit bounds it.
+    no_backpressure: AtomicBool,
     /// Counted in [`CONGESTED_REPLICAS`]: its buffered stream reached
     /// `repl-backpressure-threshold` and has not yet fallen to half of it.
     congested: AtomicBool,
@@ -274,7 +277,10 @@ impl ConnectedReplica {
     fn note_congestion(&self, buffered: usize) {
         let threshold = REPL_BACKPRESSURE_THRESHOLD.load(Ordering::Relaxed) as usize;
         let congested = self.congested.load(Ordering::Relaxed);
-        let now = if threshold == 0 || self.overflowed.load(Ordering::Relaxed) {
+        let now = if threshold == 0
+            || self.overflowed.load(Ordering::Relaxed)
+            || self.no_backpressure.load(Ordering::Relaxed)
+        {
             false
         } else if congested {
             buffered > threshold / 2
@@ -303,6 +309,12 @@ impl ConnectedReplica {
         }
         let mut pre = cut.pre.lock();
         pre.extend_from_slice(bytes);
+        // A slot migration's writes during its snapshot: Redis's destination
+        // reads them as they come (into its own buffer, see `asm`), so they
+        // never count against the source's output limit.
+        if self.no_backpressure.load(Ordering::Relaxed) {
+            return false;
+        }
         if self.over_output_limit(pre.len()) {
             *pre = Vec::new();
             self.note_congestion(0);
@@ -434,6 +446,27 @@ impl ConnectedReplica {
         if self.append_pending(bytes) {
             let _ = self.sender.send(Vec::new());
         }
+    }
+
+    /// [`Self::send_bytes`] without the output buffer limit: a slot
+    /// migration's snapshot (Redis sends it on its own channel, which the
+    /// limit doesn't cover).
+    pub fn send_bytes_unlimited(&self, bytes: &[u8]) {
+        if self.overflowed.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut pending = self.pending.lock();
+        pending.extend_from_slice(bytes);
+        self.note_buffers(pending.capacity());
+        drop(pending);
+        if !self.wake_queued.swap(true, Ordering::AcqRel) {
+            let _ = self.sender.send(Vec::new());
+        }
+    }
+
+    /// Bytes queued or being written.
+    pub fn buffered_bytes(&self) -> usize {
+        self.pending.lock().len() + self.inflight.load(Ordering::Relaxed)
     }
 
     /// Whether bytes are queued or being written.
@@ -1441,6 +1474,9 @@ impl ReplicationHub {
         for rep in dropped {
             rep.disconnect();
         }
+        // Slot imports and trims of the old dataset are over for us.
+        crate::asm::end_all_importing(self.port);
+        crate::asm::cancel_trims(self.port);
     }
 
     /// A full sync from the master loaded: our history is now the master's
@@ -1810,6 +1846,7 @@ impl ReplicationHub {
             congested: AtomicBool::new(false),
             conn_fd: Mutex::new(None),
             disconnected: AtomicBool::new(false),
+            no_backpressure: AtomicBool::new(false),
         }
     }
 
@@ -1839,11 +1876,24 @@ impl ReplicationHub {
             PendingPeer::default(),
             Some(cut),
         ));
+        rep.no_backpressure.store(true, Ordering::Relaxed);
         self.migrations.write().insert(id, rep.clone());
         self.has_migrations.store(true, Ordering::Release);
         self.replication_active.store(true, Ordering::Release);
         HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
         rep
+    }
+
+    /// Bytes the slot migrations this master sends hold in their output
+    /// buffers.
+    pub fn migration_output_buffer(&self) -> usize {
+        self.migrations
+            .read()
+            .values()
+            .map(|rep| {
+                rep.buffered_bytes() + rep.full_sync.as_ref().map_or(0, |cut| cut.pre.lock().len())
+            })
+            .sum()
     }
 
     pub fn unregister_migration(&self, id: u64) {
@@ -1874,24 +1924,24 @@ impl ReplicationHub {
         self.wake_replicas(wake);
     }
 
-    /// Every shard of migration `id` has dumped: what they buffered goes
-    /// out, then `marker`, then the live changes.
-    pub fn finish_migration_snapshot(&self, id: u64, marker: &[u8]) {
-        let mut wake = Vec::new();
+    /// Migration `id`'s snapshot is sent: `head` goes out, then what the
+    /// shards held back meanwhile, then `tail`, then the live changes.
+    pub fn finish_migration_snapshot(&self, id: u64, head: &[u8], tail: &[u8]) {
         {
             let _backlog = self.backlog.write();
             if let Some(rep) = self.migrations.read().get(&id)
                 && let Some(cut) = &rep.full_sync
             {
-                let mut pre = std::mem::take(&mut *cut.pre.lock());
-                pre.extend_from_slice(marker);
+                let held = std::mem::take(&mut *cut.pre.lock());
+                let mut pre = Vec::with_capacity(head.len() + held.len() + tail.len());
+                pre.extend_from_slice(head);
+                pre.extend_from_slice(&held);
+                pre.extend_from_slice(tail);
                 cut.all_armed.store(true, Ordering::Release);
-                if rep.append_pending(&pre) {
-                    wake.push(rep.clone());
-                }
+                // As the snapshot: outside the output limit.
+                rep.send_bytes_unlimited(&pre);
             }
         }
-        self.wake_replicas(wake);
     }
 
     /// Appends `bytes` to migration `id`'s stream, in order with the

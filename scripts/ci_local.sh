@@ -186,7 +186,7 @@ lane_coverage() {
 
 TCL_REPL="integration/replication,integration/replication-2,integration/replication-psync,integration/block-repl,integration/psync2,integration/psync2-pingoff,integration/psync2-master-restart,integration/failover,integration/shutdown,integration/replication-3,integration/replication-4,integration/psync2-reg"
 TCL_PERSIST="unit/aofrw,unit/client-eviction,integration/aof-race,integration/convert-ziplist-hash-on-load,integration/convert-ziplist-zset-on-load,integration/rdb,integration/corrupt-dump,integration/corrupt-dump-fuzzer,unit/wait,unit/violations,integration/logging,integration/convert-zipmap-hash-on-load,unit/memefficiency,unit/info-keysizes"
-TCL_CLUSTER="unit/cluster/failure-marking,unit/cluster/internal-secret,unit/cluster/multi-slot-operations,unit/cluster/misc,unit/cluster/scripting,unit/cluster/sharded-pubsub,unit/cluster/slot-ownership,unit/cluster/replica-migration,unit/cluster/human-announced-nodename,unit/cluster/hostnames,unit/cluster/announced-endpoints,unit/cluster/slot-stats,integration/dismiss-mem"
+TCL_CLUSTER="unit/cluster/failure-marking,unit/cluster/internal-secret,unit/cluster/multi-slot-operations,unit/cluster/misc,unit/cluster/scripting,unit/cluster/sharded-pubsub,unit/cluster/slot-ownership,unit/cluster/replica-migration,unit/cluster/human-announced-nodename,unit/cluster/hostnames,unit/cluster/announced-endpoints,unit/cluster/slot-stats,unit/cluster/atomic-slot-migration,integration/dismiss-mem"
 
 lane_tcl_core() {
     export RUDIS_TCL_DIR="$WT/target/tcl-core"
