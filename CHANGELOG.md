@@ -63,6 +63,9 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ### Fixed
 
+- An atomic slot migration of more data than `client-output-buffer-limit replica` (256 MB by
+  default) failed as the first write after the snapshot was queued, and again on every retry:
+  the snapshot counted against the limit. It no longer does, as in Redis.
 - An RDB with a vector set element whose stored key (`vec:<set>:<element>`) had a length of
   252 to 255 modulo 256 could not be loaded: restarts refused the file and replicas failed
   every full sync. Such files load now.

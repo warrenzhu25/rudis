@@ -81,6 +81,11 @@ pub struct ConnectedReplica {
     wake_queued: AtomicBool,
     /// Bytes the writer took from `pending` and is still writing.
     inflight: std::sync::atomic::AtomicUsize,
+    /// Of `pending` and `inflight`: the bytes queued by
+    /// [`Self::send_bytes_unlimited`] (a slot migration's snapshot), which
+    /// the output buffer limit leaves out.
+    exempt_pending: std::sync::atomic::AtomicUsize,
+    exempt_inflight: std::sync::atomic::AtomicUsize,
     /// This replica's output buffers (`pending` and `inflight`) in
     /// [`crate::shard::SYNC_IMAGE_BYTES`]: like Redis's replica output
     /// buffers, they don't count toward maxmemory.
@@ -249,9 +254,17 @@ impl ConnectedReplica {
         }
         let mut pending = self.pending.lock();
         pending.extend_from_slice(bytes);
-        let buffered = pending.len() + self.inflight.load(Ordering::Relaxed);
+        // A slot migration's snapshot ahead of these bytes doesn't count:
+        // Redis sends it on a channel of its own, which the limit doesn't
+        // cover. It used to, so a migration of more than the limit (256 MB
+        // by default) failed as soon as the first write after the snapshot
+        // was queued, and failed again on every retry.
+        let buffered = (pending.len() + self.inflight.load(Ordering::Relaxed))
+            .saturating_sub(self.exempt_pending.load(Ordering::Relaxed))
+            .saturating_sub(self.exempt_inflight.load(Ordering::Relaxed));
         if self.over_output_limit(buffered) {
             *pending = Vec::new();
+            self.exempt_pending.store(0, Ordering::Relaxed);
             self.note_buffers(0);
             drop(pending);
             // Always wake, so the writer notices and drops the link.
@@ -436,6 +449,10 @@ impl ConnectedReplica {
         let mut pending = self.pending.lock();
         let data = std::mem::take(&mut *pending);
         self.inflight.store(data.len(), Ordering::Relaxed);
+        self.exempt_inflight.store(
+            self.exempt_pending.swap(0, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.note_buffers(0);
         data
     }
@@ -457,6 +474,28 @@ impl ConnectedReplica {
         }
         let mut pending = self.pending.lock();
         pending.extend_from_slice(bytes);
+        self.exempt_pending
+            .fetch_add(bytes.len(), Ordering::Relaxed);
+        self.note_buffers(pending.capacity());
+        drop(pending);
+        if !self.wake_queued.swap(true, Ordering::AcqRel) {
+            let _ = self.sender.send(Vec::new());
+        }
+    }
+
+    /// [`Self::send_bytes_unlimited`] for bytes in several pieces, appended
+    /// in order under one lock.
+    pub fn send_bytes_unlimited_parts(&self, parts: &[Vec<u8>]) {
+        if self.overflowed.load(Ordering::Relaxed) {
+            return;
+        }
+        let total: usize = parts.iter().map(Vec::len).sum();
+        let mut pending = self.pending.lock();
+        pending.reserve(total);
+        for p in parts {
+            pending.extend_from_slice(p);
+        }
+        self.exempt_pending.fetch_add(total, Ordering::Relaxed);
         self.note_buffers(pending.capacity());
         drop(pending);
         if !self.wake_queued.swap(true, Ordering::AcqRel) {
@@ -478,6 +517,7 @@ impl ConnectedReplica {
     pub fn finish_write(&self) {
         let pending = self.pending.lock();
         self.inflight.store(0, Ordering::Relaxed);
+        self.exempt_inflight.store(0, Ordering::Relaxed);
         self.note_buffers(pending.capacity());
     }
 }
@@ -1901,6 +1941,8 @@ impl ReplicationHub {
             pending: Mutex::new(Vec::new()),
             wake_queued: AtomicBool::new(false),
             inflight: std::sync::atomic::AtomicUsize::new(0),
+            exempt_pending: std::sync::atomic::AtomicUsize::new(0),
+            exempt_inflight: std::sync::atomic::AtomicUsize::new(0),
             buffers_held: Mutex::new(crate::shard::SyncImageHeld::default()),
             overflowed: AtomicBool::new(false),
             soft_since_ms: AtomicU64::new(0),
@@ -6536,6 +6578,35 @@ mod tests {
         hub.propagate(b"more");
         assert!(rep.take_pending().is_empty());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_migration_snapshot_is_left_out_of_the_output_limit() {
+        let hub = ReplicationHub::new(19972);
+        let replid = hub.replid();
+        let (tx, _rx) = flume::unbounded();
+        let (_, _, rep) = hub.try_partial_resync(1, tx, &replid, 1).unwrap();
+        TEST_REPLICA_LIMIT
+            .with(|l| l.set(Some(crate::connection::BufferLimit::new(4 << 20, 0, 0))));
+        // A snapshot twice the limit, queued and then being written.
+        rep.send_bytes_unlimited(&vec![b's'; 8 << 20]);
+        let chunk = vec![b'x'; 1 << 20];
+        rep.send_bytes(&chunk);
+        assert!(!rep.is_overflowed());
+        let taken = rep.take_pending();
+        assert_eq!(taken.len(), (8 << 20) + (1 << 20));
+        // Writes queued while the snapshot is in flight still count, and
+        // only they do: 1 MB in flight with it, 2 MB queued.
+        for _ in 0..2 {
+            rep.send_bytes(&chunk);
+        }
+        assert!(!rep.is_overflowed());
+        rep.finish_write();
+        // 3 MB queued, then 4 MB: the limit.
+        rep.send_bytes(&chunk);
+        assert!(!rep.is_overflowed());
+        rep.send_bytes(&chunk);
+        assert!(rep.is_overflowed());
     }
 
     #[test]

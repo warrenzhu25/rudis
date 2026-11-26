@@ -1798,7 +1798,10 @@ pub async fn run_migrate_source(
     // saving them would.
     let delay_us = crate::connection::RDB_KEY_SAVE_DELAY.load(Ordering::Relaxed);
     if delay_us == 0 {
-        rep.send_bytes_unlimited(&snapshot.concat());
+        // Straight into the replica's buffer: concatenating first copied
+        // the whole snapshot once more on this thread.
+        rep.send_bytes_unlimited_parts(&snapshot);
+        drop(snapshot);
     } else {
         let per_key = std::time::Duration::from_micros(delay_us);
         for cmd in snapshot {
