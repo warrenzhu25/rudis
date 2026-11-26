@@ -1906,6 +1906,25 @@ impl ClusterHub {
                             let remote_role = parts[3].to_string();
                             let remote_slots =
                                 parts.get(4).map_or_else(Vec::new, |r| parse_slot_ranges(r));
+                            // Met again after a FORGET: the ban the FORGET
+                            // spread goes everywhere, so the node rejoins
+                            // the whole cluster (see `cluster_forget`).
+                            if remote_id != self.my_id()
+                                && self.forgotten.write().remove(&remote_id).is_some()
+                            {
+                                let peers = self.peer_bus_addrs();
+                                let msg = format!("UNFORGET {remote_id}\r\n");
+                                let my_port = self.port;
+                                std::thread::spawn(move || {
+                                    for addr in peers {
+                                        if let Ok(mut stream) =
+                                            bus_dial(my_port, addr, Duration::from_millis(200))
+                                        {
+                                            let _ = stream.write_all(msg.as_bytes());
+                                        }
+                                    }
+                                });
+                            }
                             let mut nodes = self.nodes.write();
                             nodes.remove(&temp_id);
                             // An address of our own we didn't recognize
@@ -4114,6 +4133,12 @@ fn handle_cluster_bus_line_from(
             }
 
             Some(pong_reply(hub))
+        }
+        "UNFORGET" => {
+            // UNFORGET <node_id>: a peer met a node the cluster forgot.
+            let id = parts.get(1)?;
+            hub.forgotten.write().remove(*id);
+            Some("+OK\r\n".to_string())
         }
         "FORGET" => {
             // FORGET <node_id>: a peer ran CLUSTER FORGET.
