@@ -340,7 +340,7 @@ pub fn format_memory_info(
         crate::scripting::count_libraries(),
         32768 + crate::scripting::count_functions() * 256,
         crate::table::get_lazyfreed_objects(),
-        crate::asm::memory_info(),
+        crate::connection::mem_clients_info() + &crate::asm::memory_info(),
     )
 }
 

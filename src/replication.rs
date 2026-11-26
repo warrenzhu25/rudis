@@ -769,6 +769,14 @@ pub struct ReplicationHub {
     pub announce_port: AtomicU16,
     /// Unix timestamp (seconds) of the last successful read from our master (0 if never).
     pub last_master_io_secs: AtomicU64,
+    /// Redis 8.2's master link counters (INFO replication): when the link
+    /// to the master last went down (unix ms, 0 while up or never up),
+    /// the down time accumulated before that, and the connection attempts
+    /// since the link was last up and since REPLICAOF named this master.
+    link_down_since_ms: AtomicU64,
+    total_disconnect_ms: AtomicU64,
+    current_sync_attempts: AtomicU64,
+    total_sync_attempts: AtomicU64,
     /// Bytes read from our master and not applied yet: INFO's
     /// `slave_read_repl_offset` is `slave_repl_offset` plus these.
     pub master_read_ahead: AtomicU64,
@@ -1262,6 +1270,10 @@ impl ReplicationHub {
             announce_ip: RwLock::new(None),
             announce_port: AtomicU16::new(0),
             last_master_io_secs: AtomicU64::new(0),
+            link_down_since_ms: AtomicU64::new(0),
+            total_disconnect_ms: AtomicU64::new(0),
+            current_sync_attempts: AtomicU64::new(0),
+            total_sync_attempts: AtomicU64::new(0),
             master_read_ahead: AtomicU64::new(0),
             link_phase: std::sync::atomic::AtomicU8::new(LINK_CONNECTING),
             failover: Mutex::new(Failover::default()),
@@ -1360,12 +1372,46 @@ impl ReplicationHub {
         };
     }
 
+    /// The master link came up: its down time joins the total.
+    fn note_link_up(&self) {
+        let since = self.link_down_since_ms.swap(0, Ordering::Relaxed);
+        if since > 0 {
+            self.total_disconnect_ms
+                .fetch_add(unix_ms().saturating_sub(since), Ordering::Relaxed);
+        }
+    }
+
+    /// The master link went down (it was up): the down time starts, and
+    /// the attempts to bring it back count from zero.
+    fn note_link_down(&self) {
+        let _ = self.link_down_since_ms.compare_exchange(
+            0,
+            unix_ms(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.current_sync_attempts.store(0, Ordering::Relaxed);
+    }
+
+    /// A connection attempt to the master.
+    fn note_sync_attempt(&self) {
+        self.current_sync_attempts.fetch_add(1, Ordering::Relaxed);
+        self.total_sync_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn link_is_up(&self) -> bool {
+        matches!(&*self.role.read(), ReplicationRole::Slave { link_status, .. } if link_status == "up")
+    }
+
     /// Promotes this server (REPLICAOF NO ONE, failover). Like Redis's
     /// `replicationUnsetPrimary`, a replica keeps its master's history as
     /// replid2 and starts a new one, so the master's other replicas and our
     /// own sub-replicas can partially resync with us; sub-replicas are
     /// disconnected to learn the new id. A master stays as it is.
     pub fn make_master(&self) {
+        if self.link_is_up() {
+            self.note_link_down();
+        }
         let dropped = {
             let mut backlog = self.backlog.write();
             let mut role = self.role.write();
@@ -2830,6 +2876,26 @@ impl ReplicationHub {
                 } else {
                     0
                 };
+                let now_ms = unix_ms();
+                let down_since = self.link_down_since_ms.load(Ordering::Relaxed);
+                let down_line = if link_status == "up" {
+                    String::new()
+                } else {
+                    format!(
+                        "master_link_down_since_seconds:{}\r\n",
+                        if down_since > 0 {
+                            (now_ms.saturating_sub(down_since) / 1000) as i64
+                        } else {
+                            -1
+                        }
+                    )
+                };
+                let disconnected_ms = self.total_disconnect_ms.load(Ordering::Relaxed)
+                    + if down_since > 0 {
+                        now_ms.saturating_sub(down_since)
+                    } else {
+                        0
+                    };
                 format!(
                     "# Replication\r\n\
                      role:slave\r\n\
@@ -2838,6 +2904,10 @@ impl ReplicationHub {
                      master_link_status:{}\r\n\
                      master_last_io_seconds_ago:{}\r\n\
                      master_sync_in_progress:{}\r\n\
+                     {}\
+                     master_current_sync_attempts:{}\r\n\
+                     master_total_sync_attempts:{}\r\n\
+                     total_disconnect_time_sec:{}\r\n\
                      slave_read_repl_offset:{}\r\n\
                      slave_repl_offset:{}\r\n\
                      slave_priority:{}\r\n\
@@ -2851,6 +2921,10 @@ impl ReplicationHub {
                     link_status,
                     last_io_ago,
                     if sync_in_progress { 1 } else { 0 },
+                    down_line,
+                    self.current_sync_attempts.load(Ordering::Relaxed),
+                    self.total_sync_attempts.load(Ordering::Relaxed),
+                    disconnected_ms / 1000,
                     processed + read_ahead,
                     processed,
                     priority,
@@ -4263,6 +4337,13 @@ pub fn start_replica_sync(
     {
         // Under the backlog lock, so no local write lands in our stream
         // after we turned into a replica (see `append_stream`).
+        // REPLICAOF names a master: its link counters start over (a link
+        // that was up goes down here).
+        if hub.link_is_up() {
+            hub.note_link_down();
+        }
+        hub.current_sync_attempts.store(0, Ordering::Relaxed);
+        hub.total_sync_attempts.store(0, Ordering::Relaxed);
         let _backlog = hub.backlog.write();
         let mut role = hub.role.write();
         // Another master than the one our data came from: none of its data
@@ -5113,6 +5194,7 @@ async fn run_replica_worker(
         }
 
         hub.link_phase.store(LINK_CONNECTING, Ordering::Relaxed);
+        hub.note_sync_attempt();
         // Resolved on every attempt, so a master behind a DNS name (e.g. a
         // Kubernetes service) is found again after it moves.
         let addr = resolve_master_addr(&master_host, master_port);
@@ -5674,6 +5756,7 @@ async fn run_replica_worker(
                 *sync_in_progress = false;
             }
         }
+        hub.note_link_up();
         let mut replica_selected_db = if !is_continue {
             let db = crate::redis_rdb::last_rdb_repl_stream_db();
             hub.replica_selected_db.store(db, Ordering::Relaxed);
@@ -5977,6 +6060,9 @@ async fn run_replica_worker(
 
         // Applied before a reconnect resumes from the offset.
         drain_replica_batches(&in_flight, &applied).await;
+        if hub.link_is_up() {
+            hub.note_link_down();
+        }
         if let ReplicationRole::Slave {
             ref mut link_status,
             ..

@@ -4057,6 +4057,26 @@ pub fn measure_client_memory(
     }
 }
 
+/// INFO memory's `mem_clients_slaves` and `mem_clients_normal`: the
+/// clients' memory as last measured (tot-mem, once a second), replicas
+/// apart from the others.
+pub fn mem_clients_info() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (mut replicas, mut normal) = (0u64, 0u64);
+    for e in GLOBAL_CLIENTS.read().values() {
+        if e.stats.killed.load(Relaxed) {
+            continue;
+        }
+        let mem = e.stats.tot_mem.load(Relaxed) as u64;
+        if e.stats.is_replica.load(Relaxed) {
+            replicas += mem;
+        } else {
+            normal += mem;
+        }
+    }
+    format!("mem_clients_slaves:{replicas}\r\nmem_clients_normal:{normal}\r\n")
+}
+
 /// `maxmemory-clients`: while the clients subject to eviction (not
 /// replicas, not CLIENT NO-EVICT) hold more than the limit, closes the
 /// biggest, as Redis evicts clients largest first. Runs on one shard for

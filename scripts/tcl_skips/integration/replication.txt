@@ -46,16 +46,6 @@ Replica should reply LOADING while flushing a large db (disklessload: disabled)
 Replica should reply LOADING while flushing a large db (disklessload: on-empty-db)
 Allow appendonly config change while loading rdb on slave
 Replica flushes db lazily when replica-lazy-flush enabled
-# - Redis 8.2's INFO total_disconnect_time_sec and
-#   master_current_sync_attempts;
-Accumulate repl_total_disconnect_time with delayed reconnection
-Test the total_disconnect_time_sec incr after slaveof no one
-Test correct replication disconnection time counters behavior
-Test normal establishment process of the master link
-Test sync attempts reset after slaveof no one
-Test sync attempts reset on master reconnect
-Test sync attempts reset on master switch
-Replication current attempts counter behavior
 # - a replica answers -LOADING right after a script it was running
 #   past its time limit is killed during a full sync (to investigate).
 Fullsync should not free scripting engine on a replica while a script is running
