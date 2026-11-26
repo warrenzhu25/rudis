@@ -893,6 +893,21 @@ fn async_load_wanted(our_replid: &str, master_replid: &str) -> bool {
         && our_replid == master_replid
 }
 
+/// Whether a (not asynchronous) full sync is loading from the moment the
+/// RDB starts arriving: a Redis replica with `repl-diskless-load` `swapdb`,
+/// `flush-before-load` or `flushdb` loads straight from the socket, so it
+/// reports `loading:1` (and answers `-LOADING`) during the transfer. Rudis
+/// receives into a temp file either way and keeps the old dataset until
+/// the load, so a transfer that breaks off leaves it exposed again, as
+/// Redis's swapdb does. With `on-empty-db` the transfer is diskless only on
+/// an empty dataset, which has nothing to serve meanwhile.
+fn loading_while_receiving() -> bool {
+    matches!(
+        REPL_DISKLESS_LOAD.load(Ordering::Relaxed),
+        REPL_DISKLESS_LOAD_SWAPDB..=4
+    )
+}
+
 pub(crate) fn repl_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(REPL_TIMEOUT_SECS.load(Ordering::Relaxed).max(1))
 }
@@ -5554,12 +5569,15 @@ async fn run_replica_worker(
             // keeps being served until the new one is loaded.
             let async_loading =
                 async_load_wanted(&hub.replid(), &new_replid).then(|| AsyncLoadingGuard::new(&hub));
-            // Our history no longer gets continued: if this sync fails, the
-            // next attempt is a full one too.
-            hub.cached_master.store(false, Ordering::Relaxed);
+            // Our own history stays usable until the new dataset loads
+            // (`attach_to_new_master`): a transfer that breaks off leaves
+            // it to the next attempt, which may continue it with a master
+            // that has it (Redis discards its cached master only before it
+            // loads, too).
             // The main connection's stream from the snapshot on is read
             // while the RDB loads (dual-channel), not left to our master.
             let mut dual_stream = false;
+            let mut receiving = None;
             let (rdb_bytes, rdb_len) = if let Some(d) = dual.take() {
                 stream = d.main;
                 *hub.sync_conn.lock() = Some(std::os::unix::io::AsRawFd::as_raw_fd(&stream));
@@ -5567,6 +5585,8 @@ async fn run_replica_worker(
                 dual_stream = true;
                 (d.rdb, d.rdb_len)
             } else {
+                receiving = (async_loading.is_none() && loading_while_receiving())
+                    .then(|| LoadingGuard::new(&hub));
                 // 5. Read RDB header: $<len>\r\n
                 let rdb_header = loop {
                     match take_rdb_header(&mut buf) {
@@ -5690,7 +5710,9 @@ async fn run_replica_worker(
             }
             crate::log_notice!("MASTER <-> REPLICA sync: Loading DB in memory");
             let loaded = {
-                let _loading = async_loading.is_none().then(|| LoadingGuard::new(&hub));
+                // (Already loading if it was while receiving.)
+                let _loading =
+                    receiving.or_else(|| async_loading.is_none().then(|| LoadingGuard::new(&hub)));
                 // A broken main connection shows up in the streaming loop,
                 // which resumes from what was applied.
                 let side = dual_stream
@@ -5704,7 +5726,20 @@ async fn run_replica_worker(
                 let loaded = if async_loading.is_some() {
                     router.restore_rdb_bytes_async(rdb_bytes).await
                 } else {
-                    router.restore_rdb_bytes(rdb_bytes).await
+                    // The old dataset goes first, a piece at a time between
+                    // clients (who get -LOADING), or in the background
+                    // with replica-lazy-flush, as Redis does.
+                    router.flush_for_full_sync().await;
+                    // The load yields between steps too, so clients get
+                    // -LOADING (and INFO `loading:1`) meanwhile rather than
+                    // a stalled thread; with the old dataset gone, loading
+                    // into a fresh one and swapping it in is the same as
+                    // loading in place. Legacy-encoded files load blocking.
+                    if crate::router::Router::can_load_async(&rdb_bytes) {
+                        router.restore_rdb_bytes_async(rdb_bytes).await
+                    } else {
+                        router.restore_rdb_bytes(rdb_bytes).await
+                    }
                 };
                 if let Some(side) = side {
                     let (read, err) = side.finish();

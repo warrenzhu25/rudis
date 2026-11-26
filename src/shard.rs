@@ -804,6 +804,11 @@ pub enum ShardMessage {
         command: Vec<u8>,
         responder: flume::Sender<()>,
     },
+    /// Drops this shard's dataset before a full-sync load (see
+    /// `Router::flush_for_full_sync`).
+    FlushForFullSync {
+        responder: flume::Sender<()>,
+    },
     /// Runs this shard's part of a slot trim (see `asm::start_trim`).
     AsmTrim(std::sync::Arc<crate::asm::TrimJob>),
     AsmDump {
@@ -2412,6 +2417,22 @@ impl ShardDb {
     /// Empties the shard's whole dataset across ALL databases, every key
     /// family included. The CRDT clock stays, so it never runs backwards.
     #[inline]
+    /// Takes every DB's table out (leaving empty ones), for a full sync to
+    /// drop the old dataset without blocking the shard (see
+    /// `Router::flush_for_full_sync`), then empties the rest as FLUSHALL.
+    /// Returns the tables and how many keys they hold.
+    pub fn take_tables_for_flush(&mut self) -> (Vec<crate::table::RudisTable>, u64) {
+        let mut out = vec![std::mem::take(&mut self.table)];
+        out.extend(self.tables.iter_mut().filter_map(Option::take));
+        let keys = out.iter().map(|t| t.len() as u64).sum();
+        for t in &mut out {
+            // Values on the tier are dropped with the tier's reset below.
+            t.dropped_tier.clear();
+        }
+        self.flushall();
+        (out, keys)
+    }
+
     pub fn flushall(&mut self) {
         self.table.flushdb();
         self.table.dropped_tier.clear();

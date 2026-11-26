@@ -2392,6 +2392,13 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         );
                         let _ = responder.send(());
                     }
+                    ShardMessage::FlushForFullSync { responder } => {
+                        let db = cross_shard_db.clone();
+                        monoio::spawn(async move {
+                            crate::router::flush_shard_for_full_sync(&db).await;
+                            let _ = responder.send(());
+                        });
+                    }
                     ShardMessage::AsmTrim(job) => {
                         monoio::spawn(crate::asm::run_trim_shard(
                             cross_shard_db.clone(),

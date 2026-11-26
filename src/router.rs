@@ -309,6 +309,32 @@ pub fn water_level(sizes: &mut [usize], target: usize) -> usize {
     sizes.last().copied().unwrap_or(0).max(1)
 }
 
+/// `replica-lazy-flush`: a replica's full sync frees its old dataset in
+/// the background instead of before the load.
+pub static REPLICA_LAZY_FLUSH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Drops a shard's dataset for a full-sync load: with `replica-lazy-flush`
+/// on a background thread (counted in `lazyfreed_objects`), otherwise a
+/// few table segments at a time between the shard's other work, so its
+/// clients get `-LOADING` instead of waiting out a long flush (Redis
+/// serves events while it empties a big dataset).
+pub async fn flush_shard_for_full_sync(db: &Rc<RefCell<ShardDb>>) {
+    let (tables, keys) = db.borrow_mut().take_tables_for_flush();
+    if REPLICA_LAZY_FLUSH.load(Ordering::Relaxed) {
+        crate::table::add_lazyfreed_objects(keys);
+        let _ = std::thread::Builder::new()
+            .name("lazy-flush".into())
+            .spawn(move || drop(tables));
+        return;
+    }
+    for mut table in tables {
+        while table.drop_segments(32) {
+            monoio::time::sleep(std::time::Duration::ZERO).await;
+        }
+    }
+}
+
 /// The calling shard thread's memory by the allocator's count, as the pair
 /// (allocated minus freed by this thread, table arena space allocated but
 /// free for reuse). Call on the shard's own thread. Without
@@ -5627,6 +5653,28 @@ impl Router {
     }
 
     /// Loads `data` on every shard; the keys loaded in all.
+    /// A replica's full sync: every shard drops its dataset before the
+    /// load, without blocking its clients for long (see
+    /// [`flush_shard_for_full_sync`]).
+    pub async fn flush_for_full_sync(&self) {
+        let mut waits = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender
+                    .send(ShardMessage::FlushForFullSync { responder: tx })
+                    .is_ok()
+                {
+                    waits.push(rx);
+                }
+            }
+        }
+        flush_shard_for_full_sync(&self.local_db).await;
+        for rx in waits {
+            let _ = rx.recv_async().await;
+        }
+    }
+
     async fn load_full_sync_rdb_on_all_shards(&self, data: Bytes) -> Result<u64, String> {
         let aof_dir = self.aof().as_ref().map(|_| self.db_dir.clone());
         self.forget_global_search_indices();

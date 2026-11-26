@@ -1,15 +1,18 @@
 # integration/replication tests skipped for rudis.
 #
-# A rudis master reports no `wait_bgsave` state for a replica: each
-# replica's snapshot is built for it at once, with no BGSAVE to wait for.
+# Needs repl-rdb-channel (Redis 8's dual-channel full sync, on by default)
+# under that name: rudis has it as dual-channel-replication-enabled, off by
+# default, so a replica waiting out repl-diskless-sync-delay has one
+# replica connection on the master, not two, and is not listed in INFO yet.
 Slave enters wait_bgsave
 #
-# Without async loading (the master's replication id differs), a rudis
-# replica receives the RDB into a temp file before it reports `loading:1`,
-# and flushes the old dataset when the load starts (Redis's swapdb loads
-# into a temp dataset while receiving). See docs/differences.md.
-Diskless load swapdb (different replid): replica enter loading rdbchannel=no
-Diskless load swapdb (different replid): old database is exposed after replication fails rdbchannel=no
+# Timing: the replica drops its 4M keys before loading (answering -LOADING
+# meanwhile), but its shards drop them in parallel in ~45 ms, between two of
+# the test's 100 ms polls; Redis takes a second or more on one thread.
+# "Allow appendonly config change while loading rdb on slave" covers
+# loading:1 and -LOADING during a replica's load.
+Replica should reply LOADING while flushing a large db (disklessload: disabled)
+Replica should reply LOADING while flushing a large db (disklessload: on-empty-db)
 #
 # N/A: a forked BGSAVE child writing to a pipe shared by the replicas, and
 # its log lines. Rudis streams each replica's snapshot from the shards.
@@ -28,10 +31,6 @@ Kill rdb child process if its dumping RDB is not useful
 replica can handle EINTR if use diskless load
 #
 # Not yet implemented (see the TCL gap list):
-# - a replica forgets its cached master when the FULLRESYNC reply arrives,
-#   Redis only right before it loads, so a transfer that breaks off costs
-#   the next attempt a full sync where Redis gets a partial one;
-Discard cache master before loading transferred RDB when full sync
 # - the "Replica generated a reply ... disconnecting it" and "asks for
 #   synchronization but with a wrong offset" log lines, and a master's
 #   FULLRESYNC to a raw PSYNC client starts at its current offset;
@@ -40,15 +39,7 @@ replica do not write the reply to the replication link - SYNC (addReplyDeferredL
 replica do not write the reply to the replication link - PSYNC (_addReplyToBufferOrList)
 replica do not write the reply to the replication link - PSYNC (addReplyDeferredLen)
 PSYNC with wrong offset should throw error
-# - `loading:1` while the old dataset is flushed before a load, and
-#   `replica-lazy-flush`;
-Replica should reply LOADING while flushing a large db (disklessload: disabled)
-Replica should reply LOADING while flushing a large db (disklessload: on-empty-db)
-Allow appendonly config change while loading rdb on slave
-Replica flushes db lazily when replica-lazy-flush enabled
 # - a replica answers -LOADING right after a script it was running
 #   past its time limit is killed during a full sync (to investigate).
 Fullsync should not free scripting engine on a replica while a script is running
 Fullsync should not free scripting engine on a replica while a function is running
-# - INFO mem_clients_normal.
-mem_clients_normal accounting is reversed when cached master is discarded

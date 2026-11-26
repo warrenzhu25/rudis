@@ -5257,6 +5257,17 @@ impl RudisTable {
         self.table.len()
     }
 
+    /// Drops up to `segments` of this (detached) table's segments; returns
+    /// whether any are left. Lets a big table be freed a piece at a time.
+    pub fn drop_segments(&mut self, segments: usize) -> bool {
+        for _ in 0..segments {
+            if self.table.segments.pop().is_none() {
+                return false;
+            }
+        }
+        !self.table.segments.is_empty()
+    }
+
     /// [`Self::dbsize`] without the keys of slots being imported (which
     /// clients can't see yet): what DBSIZE reports.
     pub fn visible_dbsize(&mut self) -> usize {

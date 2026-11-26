@@ -41,9 +41,18 @@ or the persistence format; such changes are called out under **Breaking**.
   `master_current_sync_attempts`, `master_total_sync_attempts` and
   `total_disconnect_time_sec`; `INFO memory` reports `mem_clients_slaves` and
   `mem_clients_normal`.
+- `replica-lazy-flush`: a replica drops its old dataset in the background before loading a
+  full sync.
 
 ### Changed
 
+- A replica loading a full sync (not asynchronously) keeps serving its clients `-LOADING`
+  and `INFO` throughout: the old dataset is dropped a piece at a time and the new one loads
+  in steps, rather than stalling every thread until the load ends. With `repl-diskless-load`
+  `swapdb`, `flush-before-load` or `flushdb` it is loading from the moment the RDB starts
+  arriving, as in Redis, and a transfer that breaks off leaves the old dataset in place.
+- A replica keeps its cached master (for a partial resync) until the new dataset loads, so
+  a full sync that breaks off can still continue with a partial one.
 - `CLUSTER MEET` with a node the cluster forgot (`CLUSTER FORGET`) lifts the ban on every
   node, so it rejoins the whole cluster at once rather than after the minute-long ban.
 

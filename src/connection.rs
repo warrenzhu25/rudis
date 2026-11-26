@@ -4472,6 +4472,8 @@ pub fn apply_config_value(
         }
         "lazyfree-lazy-server-del" => crate::table::LAZYFREE_LAZY_SERVER_DEL
             .store(parse_config_bool(name, val_str)?, Ordering::Relaxed),
+        "replica-lazy-flush" | "slave-lazy-flush" => crate::router::REPLICA_LAZY_FLUSH
+            .store(parse_config_bool(name, val_str)?, Ordering::Relaxed),
         "tracking-table-max-keys" => {
             TRACKING_TABLE_MAX_KEYS.store(parse_config_num(name, val_str)?, Ordering::Relaxed);
             if !PAUSE_CRON.load(Ordering::Relaxed) {
@@ -4965,7 +4967,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 127] = [
+    let all_configs: [(&str, String); 128] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -5244,6 +5246,15 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         ("proto-max-bulk-len", proto_bulk),
         ("notify-keyspace-events", notify_ev),
         ("lazyfree-lazy-expire", lazy_exp),
+        (
+            "replica-lazy-flush",
+            if crate::router::REPLICA_LAZY_FLUSH.load(std::sync::atomic::Ordering::Relaxed) {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
         (
             "lazyfree-lazy-server-del",
             if crate::table::LAZYFREE_LAZY_SERVER_DEL.load(std::sync::atomic::Ordering::Relaxed) {
