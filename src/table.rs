@@ -17173,8 +17173,42 @@ fn dump_crc_ok(data: &[u8], expected: u64, skip: bool) -> bool {
     skip || expected == 0 || expected == crc64(data)
 }
 
+/// Slicing-by-8 tables (as Redis's crcspeed): `CRC64_TAB8[k][b]` is the CRC
+/// of byte `b` followed by `k` zero bytes, so eight bytes fold in at once.
+const CRC64_TAB8: [[u64; 256]; 8] = {
+    let mut t = [[0u64; 256]; 8];
+    t[0] = CRC64_TAB;
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = t[k - 1][i];
+            t[k][i] = (prev >> 8) ^ CRC64_TAB[(prev & 0xFF) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
 pub fn crc64_update(mut crc: u64, data: &[u8]) -> u64 {
-    for &b in data {
+    // Eight bytes at a time: the byte-at-a-time loop was half of the time
+    // a slot migration's source spent dumping its keys (every DUMP payload
+    // carries one), and showed in RDB saves and loads too.
+    let t = &CRC64_TAB8;
+    let (chunks, rest) = data.as_chunks::<8>();
+    for c in chunks {
+        crc ^= u64::from_le_bytes(*c);
+        crc = t[7][(crc & 0xFF) as usize]
+            ^ t[6][((crc >> 8) & 0xFF) as usize]
+            ^ t[5][((crc >> 16) & 0xFF) as usize]
+            ^ t[4][((crc >> 24) & 0xFF) as usize]
+            ^ t[3][((crc >> 32) & 0xFF) as usize]
+            ^ t[2][((crc >> 40) & 0xFF) as usize]
+            ^ t[1][((crc >> 48) & 0xFF) as usize]
+            ^ t[0][(crc >> 56) as usize];
+    }
+    for &b in rest {
         crc = CRC64_TAB[((crc ^ (b as u64)) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc
@@ -17832,6 +17866,28 @@ fn load_legacy_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_crc64_slicing_matches_bytewise_and_redis() {
+        // Redis's crc64 check value (src/crc64.c).
+        assert_eq!(crc64(b"123456789"), 0xe9c6d914c4b8d9ca);
+        let bytewise = |mut crc: u64, data: &[u8]| {
+            for &b in data {
+                crc = CRC64_TAB[((crc ^ (b as u64)) & 0xFF) as usize] ^ (crc >> 8);
+            }
+            crc
+        };
+        let data: Vec<u8> = (0..1000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        for len in 0..64 {
+            assert_eq!(crc64(&data[..len]), bytewise(0, &data[..len]), "len {len}");
+        }
+        assert_eq!(crc64(&data), bytewise(0, &data));
+        // Split at any point, it continues the same.
+        let mid = crc64_update(0, &data[..333]);
+        assert_eq!(crc64_update(mid, &data[333..]), crc64(&data));
+    }
 
     /// A list reports `listpack` while it fits list-max-listpack-size, as
     /// Redis 7 switches it, `quicklist` beyond.

@@ -71,6 +71,8 @@ or the persistence format; such changes are called out under **Breaking**.
   anything else: with a million keys, migrating half the slots stalled the source for minutes
   (and it ignored SIGTERM meanwhile). The trim now makes passes over the table in bounded steps
   between clients' commands. A `TRIMSLOTS` replayed from the AOF uses the same passes.
+- CRC64 (DUMP payloads, RDB files, full syncs) is computed eight bytes at a time; it was half
+  of a migration's dump time.
 - An RDB with a vector set element whose stored key (`vec:<set>:<element>`) had a length of
   252 to 255 modulo 256 could not be loaded: restarts refused the file and replicas failed
   every full sync. Such files load now.
