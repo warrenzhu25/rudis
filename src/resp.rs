@@ -2356,7 +2356,7 @@ impl RawArgv {
                 break;
             };
             let start = e + 2;
-            if start + len > f.len() {
+            if start.checked_add(len).is_none_or(|end| end > f.len()) {
                 break;
             }
             out.push((start, len));
@@ -2657,7 +2657,14 @@ fn parse_resp_array(
         }
 
         let data_start = scan_cursor + next_advance;
-        let data_end = data_start + arg_len;
+        // Trusted input (the AOF, the master's stream) skips the length
+        // limit above, so a corrupt length can be near usize::MAX.
+        let Some(data_end) = data_start
+            .checked_add(arg_len)
+            .filter(|end| end.checked_add(2).is_some())
+        else {
+            return Err("Protocol error: invalid bulk length".to_string());
+        };
 
         if data_end + 2 > buf.len() {
             return Ok(None);
@@ -17003,6 +17010,21 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn test_trusted_parse_rejects_a_bulk_length_that_overflows() {
+        // From the load_aof fuzz target: the AOF and the master's stream skip
+        // proto-max-bulk-len, and a length near usize::MAX overflowed the
+        // end-of-argument arithmetic (a panic with overflow checks, a wrapped
+        // offset without).
+        let mut buf =
+            BytesMut::from(&b"*3\n$00000000000000000000000000000000018446744073709551615\n*"[..]);
+        let err = parse_command_trusted(&mut buf).unwrap_err();
+        assert!(err.contains("invalid bulk length"), "{err}");
+        let mut buf = BytesMut::from(&b"*1\r\n$18446744073709551614\r\nx"[..]);
+        let err = parse_command_trusted(&mut buf).unwrap_err();
+        assert!(err.contains("invalid bulk length"), "{err}");
     }
 
     #[test]

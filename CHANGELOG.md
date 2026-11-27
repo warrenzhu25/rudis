@@ -63,6 +63,8 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ### Fixed
 
+- A bulk length near 2^64 in the AOF or the replication stream (which skip
+  `proto-max-bulk-len`) overflowed the parser; it is now refused as an invalid bulk length.
 - An atomic slot migration of more data than `client-output-buffer-limit replica` (256 MB by
   default) failed as the first write after the snapshot was queued, and again on every retry:
   the snapshot counted against the limit. It no longer does, as in Redis.
