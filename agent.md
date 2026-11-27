@@ -7,6 +7,7 @@ This document defines the mandatory operating guidelines, architectural invarian
 ## 0. Working Preferences
 
 * **Do not use sub-agents.** Do the work directly in the main conversation instead of delegating to sub-agents, parallel agent workflows or swarms. Sub-agents use too many tokens, and their progress can't be followed or steered from the main conversation. If a task looks like it really needs them, ask first.
+* **Read the code rules before editing.** `.agents/rules/` holds path-scoped rules (see §5). Before changing a file, read every rule whose `paths:` match it, plus `.agents/rules/must-read.md` for the area. When reviewing, follow `.agents/rules/review.md`.
 
 ---
 
@@ -148,3 +149,24 @@ All official benchmark numbers must be committed under `docs/benchmarks/`:
 All 21 components are documented in [`docs/design/components.md`](docs/design/components.md) (high-level design and rationale) and [`docs/internal/components.md`](docs/internal/components.md) (concrete implementation and code references),
 written as learning guides against the *actual* shipped code — not just what it does, but why
 it's built that way, with known limitations and gaps called out explicitly rather than left implicit.
+
+---
+
+## 5. Code Rules (`.agents/rules/`)
+
+Short, path-scoped rules for writing and reviewing code. A rule's front
+matter lists the globs it applies to (`paths:`); a rule without front matter
+applies everywhere. Each rule comes from a real failure in this codebase; when
+a new kind of bug gets past review, add or sharpen a rule in the same series as
+the fix.
+
+| Rule | Applies to | In one line |
+| :--- | :--- | :--- |
+| [`comment-style.md`](.agents/rules/comment-style.md) | `**/*.rs` | A comment states a live fact the code can't show; history goes in the commit message |
+| [`test-admission.md`](.agents/rules/test-admission.md) | `src/`, `tests/`, TCL skips/patches | Every test names the diff that turns it red; regressions fail on the old code; unique ports; skips have reasons |
+| [`never-stall-a-shard.md`](.agents/rules/never-stall-a-shard.md) | `src/**` | Work proportional to the data runs in bounded steps that yield; no nested table scans; measure at 1M keys |
+| [`redis-compat.md`](.agents/rules/redis-compat.md) | `src/**`, `docs/differences.md` | Errors, replies, INFO, logs and configs match Redis, with the source cited; differences documented |
+| [`hot-path.md`](.agents/rules/hot-path.md) | dispatcher, router, mailbox, shard, table, RESP | Off features cost one relaxed load; no per-call allocation; A/B every `src/` change; new subsystems in their own module |
+| [`persistence-replication.md`](.agents/rules/persistence-replication.md) | AOF, RDB, replication, ASM | Untrusted-input readers are total; the cut and the bytes counted are consistent; test past the limits; let the soak run |
+| [`must-read.md`](.agents/rules/must-read.md) | — | Which docs to read before touching each area |
+| [`review.md`](.agents/rules/review.md) | — | Review order (data loss, stalls, compat, perf, quality), with findings stated as concrete failures and verified |
