@@ -5091,6 +5091,10 @@ impl SideReader {
     }
 }
 
+/// How much of a dual-channel full sync's RDB the replica reads before it
+/// lets the stream reader run (see [`dual_channel_sync`]).
+const DUAL_CHANNEL_YIELD_BYTES: usize = 1 << 20;
+
 /// A dual-channel full sync's result (see [`dual_channel_sync`]).
 struct DualChannelSync {
     /// The connection the stream after the snapshot comes over.
@@ -5184,17 +5188,29 @@ async fn dual_channel_sync(
         };
         let mut spool = RdbSpool::create(&router.db_dir, router.port, header)
             .map_err(|e| format!("opening the temp file: {e}"))?;
+        // Bytes read since this future last let the stream reader run: on
+        // the epoll driver a read of a socket that has data completes
+        // without suspending, so while our master sends the RDB faster than
+        // we take it, this loop never yields to `read_stream_while`, the
+        // stream isn't read, and our master drops us at its output limit.
+        let mut since_yield = 0usize;
         loop {
             match spool.feed(&mut rdb_buf) {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(e) => return Err(format!("writing the temp file: {e}")),
             }
+            if since_yield >= DUAL_CHANNEL_YIELD_BYTES {
+                since_yield = 0;
+                crate::mailbox::yield_now().await;
+            }
             match read_stream_into(&mut rdb, &mut rdb_buf).await {
                 Ok(0) => return Err("connection lost".to_string()),
-                Ok(_) => hub
-                    .last_master_io_secs
-                    .store(unix_secs(), Ordering::Relaxed),
+                Ok(n) => {
+                    since_yield += n;
+                    hub.last_master_io_secs
+                        .store(unix_secs(), Ordering::Relaxed)
+                }
                 Err(e) => return Err(e.to_string()),
             }
         }

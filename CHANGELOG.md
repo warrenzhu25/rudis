@@ -63,6 +63,10 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ### Fixed
 
+- On the epoll driver (no io_uring, e.g. in Docker), a dual-channel full sync could fail over
+  and over: while the master sent the RDB faster than the replica took it, the replica never
+  read the stream channel, and the master dropped it at `client-output-buffer-limit replica`.
+  The replica now reads the stream between each megabyte of the RDB.
 - An accept error no longer makes a shard spin: on a listener that was shut down or closed the
   shard stops accepting (logged once, silently during SHUTDOWN), and on transient errors such
   as running out of file descriptors it waits 10 ms and logs at most once a second.
