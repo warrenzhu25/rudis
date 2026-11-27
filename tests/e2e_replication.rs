@@ -6711,6 +6711,7 @@ fn test_failover_command_switches_master_and_replica_e2e() {
         );
         wait_for_master_link(r);
     }
+    let pids: Vec<u32> = nodes.iter().map(|n| n.id()).collect();
     let wait_info = |c: &mut TcpStream, what: &str| {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -6718,7 +6719,18 @@ fn test_failover_command_switches_master_and_replica_e2e() {
             if info.contains(what) {
                 return;
             }
-            assert!(std::time::Instant::now() < deadline, "no {what}: {info}");
+            if std::time::Instant::now() >= deadline {
+                // Each node's process state (T: stopped) and log: the
+                // stopped node must not ack the stream sent after its stop.
+                for (port, pid) in [mport, aport, bport].iter().zip(&pids) {
+                    let stat =
+                        std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                    let state = stat.rsplit(") ").next().unwrap_or("").split(' ').next();
+                    eprintln!("node {port} pid {pid} state {state:?}");
+                    report_server_log_now(*pid);
+                }
+                panic!("no {what}: {info}");
+            }
             thread::sleep(Duration::from_millis(50));
         }
     };
