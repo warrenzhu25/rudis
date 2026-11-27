@@ -63,6 +63,9 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ### Fixed
 
+- An accept error no longer makes a shard spin: on a listener that was shut down or closed the
+  shard stops accepting (logged once, silently during SHUTDOWN), and on transient errors such
+  as running out of file descriptors it waits 10 ms and logs at most once a second.
 - A replica's full sync could fail over and over with "CRC64 checksum mismatch" on a busy
   master: socket writes of 10 MB or more went out with `MSG_ZEROCOPY`, and the kernel read the
   buffer after the write returned, while rudis was already filling it with the next part of the

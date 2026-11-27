@@ -3153,6 +3153,16 @@ const ACCEPT_SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_mill
 
 type Accepted = std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>;
 
+/// Whether an accept error means the listening socket is unusable (shut
+/// down, closed or not a listener): accepting again fails the same way at
+/// once, so the accept loop must end rather than retry.
+fn accept_error_ends_listener(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EINVAL | libc::EBADF | libc::ENOTSOCK)
+    )
+}
+
 /// Waits for the next client on `listener`, or `None` once shutdown starts.
 async fn accept_until_shutdown(listener: &monoio::net::TcpListener) -> Option<Accepted> {
     accept_polling(
@@ -3309,9 +3319,32 @@ async fn accept_loop(
                 }
             }
             Err(e) => {
-                if !crate::shutdown::is_shutting_down() {
+                if crate::shutdown::is_shutting_down() {
+                    break;
+                }
+                // The listening socket is unusable (shut down or not a
+                // listener any more): accepting again fails the same way at
+                // once, a spin that logged millions of lines in CI. SHUTDOWN
+                // shuts the listeners down (`stop_listening`) before the
+                // shutdown flag is set, while it saves: end quietly then.
+                if accept_error_ends_listener(&e) {
+                    if !crate::shutdown::shutdown_command_running() {
+                        crate::log_warning!(
+                            "[Shard {}] Accept error: {}; this shard stops accepting connections",
+                            shard_id,
+                            e
+                        );
+                    }
+                    break;
+                }
+                // Out of fds or memory (EMFILE, ENFILE, ENOBUFS, ...): wait
+                // a little for some to be released, as Redis does, and log
+                // at most once a second.
+                static LOG_LIMIT: crate::log::RateLimit = crate::log::RateLimit::new();
+                if LOG_LIMIT.allow(std::time::Duration::from_secs(1)) {
                     crate::log_warning!("[Shard {}] Accept error: {}", shard_id, e);
                 }
+                monoio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
     }
@@ -3378,6 +3411,26 @@ mod tests {
     }
 
     use super::*;
+
+    /// A listener that was shut down (what SHUTDOWN's `stop_listening`
+    /// does) fails every accept at once: the accept loop must end, not retry.
+    /// Running out of fds is transient and must be retried.
+    #[test]
+    fn test_accept_error_ends_listener_on_a_shut_down_listener() {
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert_eq!(
+            // SAFETY: the fd is the listener's own, open for this whole call.
+            unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) },
+            0
+        );
+        let e = listener.accept().unwrap_err();
+        assert!(accept_error_ends_listener(&e), "{e:?}");
+        for transient in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            let e = std::io::Error::from_raw_os_error(transient);
+            assert!(!accept_error_ends_listener(&e), "{e:?}");
+        }
+    }
 
     /// `LoadedDb` is `Send` on the grounds that every `ShardDb` field but
     /// `tier_manager` is. The pattern is exhaustive, so a new field fails to
