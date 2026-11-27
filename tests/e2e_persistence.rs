@@ -4577,7 +4577,7 @@ fn test_bgrewriteaof_does_not_block_and_keeps_every_write_e2e() {
 
 /// BGREWRITEAOF does not block on DBs other than 0 or on probabilistic
 /// structures either (they were serialized in one step at its start): with
-/// 2M keys in DB 1, PING stays fast while writes to DB 1 (INCR, MOVE),
+/// 1-2M keys in DB 1, PING stays fast while writes to DB 1 (INCR, MOVE),
 /// CMS.INCRBY and CF.ADD keep going, and the restart matches.
 #[test]
 fn test_bgrewriteaof_does_not_block_on_other_dbs_e2e() {
@@ -4609,9 +4609,18 @@ fn test_bgrewriteaof_does_not_block_on_other_dbs_e2e() {
     let mut c = connect();
     assert_eq!(send_and_read_reply(&mut c, b"SELECT 1\r\n"), "+OK\r\n");
     assert_eq!(
-        // Enough that the rewrite overlaps 40+ rounds of writes (1M did
-        // until CRC64 got faster).
-        send_and_read_reply(&mut c, b"DEBUG POPULATE 2000000 k1 64\r\n"),
+        // Enough that the rewrite overlaps 40+ rounds of writes: 2M keys in
+        // a release build (1M stopped being enough when CRC64 got faster); an
+        // unoptimized build rewrites slowly enough with 1M, and populating 2M
+        // there takes longer than the 30 s read timeout.
+        send_and_read_reply(
+            &mut c,
+            if cfg!(debug_assertions) {
+                b"DEBUG POPULATE 1000000 k1 64\r\n"
+            } else {
+                b"DEBUG POPULATE 2000000 k1 64\r\n"
+            }
+        ),
         "+OK\r\n"
     );
     assert_eq!(send_and_read_reply(&mut c, b"SELECT 0\r\n"), "+OK\r\n");
