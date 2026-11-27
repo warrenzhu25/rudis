@@ -7,7 +7,47 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ## [Unreleased]
 
-### Added
+## [0.1.0] - 2026-11-27
+
+The first release. (It was first tagged on 2026-11-23 and re-cut on 2026-11-27 with the
+changes listed at the end of this section.)
+
+### Server
+
+- Thread-per-core, shared-nothing engine on `io_uring` (Monoio): one shard per core, a
+  lock-free per-core-pair mesh for cross-shard requests, `SO_REUSEPORT` ingress.
+- Redis protocol (RESP2, and RESP3 via `HELLO 3`) and the Memcached text protocol on the same
+  port.
+- Data types: strings, hashes (with field TTLs), lists, sets, sorted sets, streams and consumer
+  groups, bitmaps and bitfields, HyperLogLog, geo.
+- `MULTI`/`EXEC`/`WATCH`, Lua scripting (`EVAL`) and functions (`FCALL`), pub/sub including
+  sharded pub/sub, keyspace notifications, client-side caching (`CLIENT TRACKING`), blocking
+  commands.
+- ACLs, `AUTH`, protected mode, TLS (including client certificates and the cluster bus).
+- Memory: `maxmemory` with the Redis eviction policies, `maxmemory-clients` client eviction,
+  per-client memory in `CLIENT LIST`, output and query buffer limits.
+
+### Persistence and high availability
+
+- RDB snapshots without `fork()`, loading Redis-written RDB files; AOF with rewrite.
+- `PSYNC` replication with partial resync, diskless sync, `WAIT`/`WAITAOF`.
+- Redis Cluster: gossip bus, automatic failover, manual `CLUSTER FAILOVER`, live slot
+  migration and resharding.
+
+### Experimental (off by default)
+
+- JSON, search and vector search (`FT.*`, Vector Sets), probabilistic types (Bloom, Cuckoo,
+  Count-Min, Top-K), NVMe tiering; enabled with `enable-experimental-commands yes`.
+
+### Testing
+
+- 81 of the Redis/Valkey TCL test suites run in CI, with every skipped test listed with its
+  reason in `scripts/tcl_skips/`.
+- A continuous 6-hour chaos soak of a 6-node cluster (failovers, resharding, `kill -9`,
+  snapshots) checks for lost writes and replica divergence on every change to `main`.
+- A per-commit performance gate and nightly fuzzing of every untrusted input.
+
+### Added since 2026-11-23
 
 - `aof-multipart yes` (startup option, off by default): the per-shard AOF files are kept in
   Redis 7's multi-part layout, `appendonlydir/` with an `appendonly.aof.manifest` naming one
@@ -47,7 +87,7 @@ or the persistence format; such changes are called out under **Breaking**.
   full sync.
 - `CLIENT LIST TYPE normal|master|replica|pubsub`; subscribed clients show the `P` flag.
 
-### Changed
+### Changed since 2026-11-23
 
 - A replica loading a full sync (not asynchronously) keeps serving its clients `-LOADING`
   and `INFO` throughout: the old dataset is dropped a piece at a time and the new one loads
@@ -61,7 +101,7 @@ or the persistence format; such changes are called out under **Breaking**.
 - `CLUSTER MEET` with a node the cluster forgot (`CLUSTER FORGET`) lifts the ban on every
   node, so it rejoins the whole cluster at once rather than after the minute-long ban.
 
-### Fixed
+### Fixed since 2026-11-23
 
 - The check for keys of slots other nodes serve (at startup, or when a replica is promoted)
   trimmed the keys of a slot open for import with `CLUSTER SETSLOT IMPORTING`, so keys a `MIGRATE`
@@ -96,42 +136,3 @@ or the persistence format; such changes are called out under **Breaking**.
 - An RDB with a vector set element whose stored key (`vec:<set>:<element>`) had a length of
   252 to 255 modulo 256 could not be loaded: restarts refused the file and replicas failed
   every full sync. Such files load now.
-
-## [0.1.0] - 2026-11-23
-
-The first tagged release.
-
-### Server
-
-- Thread-per-core, shared-nothing engine on `io_uring` (Monoio): one shard per core, a
-  lock-free per-core-pair mesh for cross-shard requests, `SO_REUSEPORT` ingress.
-- Redis protocol (RESP2, and RESP3 via `HELLO 3`) and the Memcached text protocol on the same
-  port.
-- Data types: strings, hashes (with field TTLs), lists, sets, sorted sets, streams and consumer
-  groups, bitmaps and bitfields, HyperLogLog, geo.
-- `MULTI`/`EXEC`/`WATCH`, Lua scripting (`EVAL`) and functions (`FCALL`), pub/sub including
-  sharded pub/sub, keyspace notifications, client-side caching (`CLIENT TRACKING`), blocking
-  commands.
-- ACLs, `AUTH`, protected mode, TLS (including client certificates and the cluster bus).
-- Memory: `maxmemory` with the Redis eviction policies, `maxmemory-clients` client eviction,
-  per-client memory in `CLIENT LIST`, output and query buffer limits.
-
-### Persistence and high availability
-
-- RDB snapshots without `fork()`, loading Redis-written RDB files; AOF with rewrite.
-- `PSYNC` replication with partial resync, diskless sync, `WAIT`/`WAITAOF`.
-- Redis Cluster: gossip bus, automatic failover, manual `CLUSTER FAILOVER`, live slot
-  migration and resharding.
-
-### Experimental (off by default)
-
-- JSON, search and vector search (`FT.*`, Vector Sets), probabilistic types (Bloom, Cuckoo,
-  Count-Min, Top-K), NVMe tiering; enabled with `enable-experimental-commands yes`.
-
-### Testing
-
-- 81 of the Redis/Valkey TCL test suites run in CI, with every skipped test listed with its
-  reason in `scripts/tcl_skips/`.
-- A continuous 6-hour chaos soak of a 6-node cluster (failovers, resharding, `kill -9`,
-  snapshots) checks for lost writes and replica divergence on every change to `main`.
-- A per-commit performance gate and nightly fuzzing of every untrusted input.
