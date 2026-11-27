@@ -3158,7 +3158,8 @@ fn test_restart_drops_keys_of_unowned_slots_before_serving_e2e() {
 /// The keys of a slot open for import (CLUSTER SETSLOT IMPORTING) are not
 /// another node's leftovers: the check for keys of unowned slots keeps
 /// them, as Redis's does. It trimmed them, so a MIGRATE racing the check
-/// lost the keys it moved.
+/// lost the keys it moved. The import itself (saved by SETSLOT) is still
+/// served as one after the restart.
 #[test]
 fn test_unowned_slot_check_keeps_keys_of_an_importing_slot_e2e() {
     let (a, b) = (18397u16, 18437u16);
@@ -3220,8 +3221,8 @@ fn test_unowned_slot_check_keeps_keys_of_an_importing_slot_e2e() {
         cmd(b, &["DEBUG", "POPULATE", "100", "{06S}", "10"]),
         "+OK\r\n"
     );
-    assert_eq!(cmd(b, &["CLUSTER", "SAVECONFIG"]), "+OK\r\n");
-    // The check runs while a restarted node loads.
+    // The check runs while a restarted node loads. (SETSLOT saved the
+    // import in nodes.conf.)
     let _ = connect_ready(b).write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$4\r\nSAVE\r\n");
     let _ = nb.0.wait();
     nb = ServerGuard(spawn(b, &db));
@@ -3231,6 +3232,14 @@ fn test_unowned_slot_check_keeps_keys_of_an_importing_slot_e2e() {
     );
     thread::sleep(Duration::from_millis(300));
     assert_eq!(cmd(b, &["DBSIZE"]), ":100\r\n");
+    // And the slot is still served as importing: -MOVED to the source
+    // without ASKING, the key with it.
+    let mut c = connect_ready(b);
+    let moved = resp_cmd(&mut c, &["GET", "{06S}:0"]);
+    assert!(moved.starts_with("-MOVED 0 "), "{moved}");
+    assert_eq!(resp_cmd(&mut c, &["ASKING"]), "+OK\r\n");
+    let got = resp_cmd(&mut c, &["GET", "{06S}:0"]);
+    assert!(got.starts_with('$') && !got.starts_with("$-1"), "{got}");
     drop(nb);
     let _ = std::fs::remove_dir_all(&da);
     let _ = std::fs::remove_dir_all(&db);

@@ -850,6 +850,9 @@ pub fn run_shard_worker(
         }
 
         // 4. Spawn background worker to handle incoming cross-shard messages from peer cores
+        if cluster_enabled {
+            router.restore_slot_states_from_cluster();
+        }
         let cross_shard_db = local_db.clone();
         let cross_shard_router = router.clone();
         let cross_shard_clients = client_registry.clone();

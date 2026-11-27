@@ -7,6 +7,13 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ## [Unreleased]
 
+### Fixed
+
+- `CLUSTER SETSLOT MIGRATING|IMPORTING|STABLE` saves `nodes.conf`, as Redis does after every
+  SETSLOT, and a node restarted in the middle of a reshard serves its open slots as open again
+  (`-ASK` for keys already moved, `ASKING` honoured). Only `CLUSTER NODES` showed them after a
+  restart, and only if something else had saved the config.
+
 ## [0.1.0] - 2026-11-27
 
 The first release. (It was first tagged on 2026-11-23 and re-cut on 2026-11-27 with the

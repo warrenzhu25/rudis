@@ -815,6 +815,32 @@ impl Router {
         }
     }
 
+    /// This shard's MIGRATING / IMPORTING slots, from the cluster config
+    /// loaded at startup (nodes.conf keeps them, as Redis's does): without
+    /// them a node restarted in the middle of a reshard listed the slots as
+    /// open but answered as if they were stable (no -ASK for keys already
+    /// moved, -MOVED to RESTORE-ASKING / ASKING clients).
+    pub fn restore_slot_states_from_cluster(&self) {
+        let hub = crate::cluster::get_cluster_hub(self.base_port);
+        let states = hub.slot_states.read();
+        let nodes = hub.nodes.read();
+        let mut mine = self.slot_states.borrow_mut();
+        for (&slot, (state, node)) in states.iter() {
+            let addr = nodes
+                .get(node)
+                .map_or_else(|| node.clone(), |n| format!("{}:{}", n.ip, n.port));
+            match state.as_str() {
+                "migrating" => {
+                    mine.insert(slot, crate::shard::SlotState::Migrating(addr));
+                }
+                "importing" => {
+                    mine.insert(slot, crate::shard::SlotState::Importing(addr));
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn set_slot_owner(&self, slot: u16, owner: usize) {
         self.slot_states.borrow_mut().remove(&slot);
         {

@@ -16603,6 +16603,9 @@ async fn execute_command_inner(
                         hub.slot_states
                             .write()
                             .insert(slot, ("migrating".to_string(), node));
+                        // Kept across a restart, as Redis saves its config
+                        // after every SETSLOT.
+                        let _ = hub.save_config();
                         router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
                     }
@@ -16624,6 +16627,9 @@ async fn execute_command_inner(
                         hub.slot_states
                             .write()
                             .insert(slot, ("importing".to_string(), node));
+                        // Kept across a restart, as Redis saves its config
+                        // after every SETSLOT.
+                        let _ = hub.save_config();
                         router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
                     }
@@ -16631,6 +16637,7 @@ async fn execute_command_inner(
                         router.set_slot_state(slot, crate::shard::SlotState::Stable);
                         let hub = crate::cluster::get_cluster_hub(router.base_port);
                         hub.slot_states.write().remove(&slot);
+                        let _ = hub.save_config();
                         router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
                     }
