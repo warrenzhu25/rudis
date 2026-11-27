@@ -6856,9 +6856,22 @@ fn test_restarted_master_releases_an_unused_backlog_e2e() {
         let mut m = connect(mport);
         let _ = m.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$4\r\nSAVE\r\n");
         let _ = master.wait();
+        let spawned = std::time::Instant::now();
         *master = spawn_rudis_listening(&margs, mport);
         let mut m = connect(mport);
-        assert_eq!(stat(&mut m, "repl_backlog_active"), "1");
+        let active = stat(&mut m, "repl_backlog_active");
+        if active != "1" {
+            // The master's log tells a history lost in the restart from a
+            // grace that ran out before this INFO.
+            report_server_log_now(master.id());
+        }
+        assert_eq!(
+            active,
+            "1",
+            "{:?} after the restart: {}",
+            spawned.elapsed(),
+            resp_cmd_full(&mut m, &["INFO", "replication"])
+        );
         between(&mut m);
         // SAFETY: as above.
         unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGCONT) };
