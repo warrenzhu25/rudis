@@ -6581,6 +6581,46 @@ mod tests {
     }
 
     #[test]
+    fn test_sockets_never_send_zero_copy() {
+        // With monoio's "zero-copy" feature, sends of 10 MB or more used
+        // MSG_ZEROCOPY: the kernel kept reading the buffer after the send
+        // returned, and rudis reuses it at once, so full-sync images reached
+        // replicas with bytes overwritten by later writes. Sockets must not
+        // be set up for zero-copy sends.
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = monoio::net::TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            for s in [&client, &server] {
+                let fd = std::os::unix::io::AsRawFd::as_raw_fd(s);
+                let mut v: libc::c_int = -1;
+                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: getsockopt writes at most `len` bytes into `v`, a
+                // live local of that size; `fd` is an open socket.
+                let r = unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ZEROCOPY,
+                        &mut v as *mut _ as *mut libc::c_void,
+                        &mut len,
+                    )
+                };
+                assert_eq!(r, 0);
+                assert_eq!(
+                    v, 0,
+                    "SO_ZEROCOPY is on: monoio's zero-copy feature is enabled"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn test_migration_snapshot_is_left_out_of_the_output_limit() {
         let hub = ReplicationHub::new(19972);
         let replid = hub.replid();

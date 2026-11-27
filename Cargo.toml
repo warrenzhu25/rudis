@@ -23,7 +23,12 @@ flume = "0.12.0"
 hashbrown = "0.17.1"
 fxhash = "0.2.1"
 smallvec = "1.14"
-monoio = { version = "0.2.4", features = ["sync", "zero-copy"] }
+# No "zero-copy": monoio then sends writes of 10 MB or more with
+# MSG_ZEROCOPY, and the kernel reads the buffer after the send completes,
+# until a completion notification monoio never waits for. Rudis reuses
+# buffers as soon as a write returns, so the bytes on the wire could change
+# (seen: full-sync images corrupted under load).
+monoio = { version = "0.2.4", features = ["sync"] }
 socket2 = { version = "0.6.5", features = ["all"] }
 mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
 sha1 = "0.11.0"

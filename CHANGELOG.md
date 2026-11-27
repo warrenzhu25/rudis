@@ -63,6 +63,10 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ### Fixed
 
+- A replica's full sync could fail over and over with "CRC64 checksum mismatch" on a busy
+  master: socket writes of 10 MB or more went out with `MSG_ZEROCOPY`, and the kernel read the
+  buffer after the write returned, while rudis was already filling it with the next part of the
+  snapshot. Zero-copy sends are off (monoio's `zero-copy` feature).
 - A bulk length near 2^64 in the AOF or the replication stream (which skip
   `proto-max-bulk-len`) overflowed the parser; it is now refused as an invalid bulk length.
 - An atomic slot migration of more data than `client-output-buffer-limit replica` (256 MB by
