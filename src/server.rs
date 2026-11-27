@@ -450,6 +450,14 @@ async fn finish_startup_load(
         aof_slot.set(Some(w.clone()));
         spawn_aof_flusher(aof_slot.clone(), w, base_port);
     }
+    // Keys of slots other nodes serve are scheduled for trimming before
+    // this shard ends -LOADING, as Redis deletes them before it serves
+    // (the cron's check would come 100 ms after the first commands). After
+    // the AOF opens: the trim logs a TRIMSLOTS. A replica leaves them to
+    // its master; the cron checks again if it is promoted.
+    if !crate::replication::get_replication_hub(base_port).is_slave() {
+        crate::asm::shard_cron(router, &router.local_db, shard_id, false);
+    }
     router.publish_memory_state();
     if note_shard_loaded(base_port, num_shards) {
         // Every shard has adopted its loader's bytes and published them:

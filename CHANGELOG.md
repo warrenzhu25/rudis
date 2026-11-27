@@ -63,6 +63,10 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ### Fixed
 
+- A cluster node restarted with keys of slots other nodes serve dropped them only at its first
+  cron tick, 100 ms after it started serving, so the first commands (`DBSIZE`, `INFO keyspace`,
+  `SCAN`) still saw them. They are now scheduled for trimming before the node ends `-LOADING`, as
+  Redis deletes them before it serves.
 - On the epoll driver (no io_uring, e.g. in Docker), a dual-channel full sync could fail over
   and over: while the master sent the RDB faster than the replica took it, the replica never
   read the stream channel, and the master dropped it at `client-output-buffer-limit replica`.

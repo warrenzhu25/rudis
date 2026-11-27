@@ -3077,6 +3077,84 @@ fn test_cluster_persistence_restore_asking_and_dynamic_slots_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A node restarted with keys of a slot another node serves drops them
+/// before it answers its first command, as Redis does while it starts
+/// (atomic-slot-migration.tcl "Restart will clean up unowned slot keys").
+/// They used to go at the first cron tick, 100 ms after the node started
+/// serving, and INFO keyspace in between still showed them.
+#[test]
+fn test_restart_drops_keys_of_unowned_slots_before_serving_e2e() {
+    let (a, b) = (18383u16, 18389u16);
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_unowned_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let (da, db) = (mk_dir(a), mk_dir(b));
+    let args = |p: u16, dir: &str| -> Vec<String> {
+        [
+            "--port",
+            &p.to_string(),
+            "--dir",
+            dir,
+            "--cluster-enabled",
+            "yes",
+            "--threads",
+            "2",
+            "--no-pin",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    };
+    let spawn = |p: u16, dir: &str| {
+        let a = args(p, dir);
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        spawn_rudis_listening(&a, p)
+    };
+    let mut na = ServerGuard(spawn(a, &da));
+    let _nb = ServerGuard(spawn(b, &db));
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    // b serves every slot; a, none.
+    assert_eq!(
+        cmd(b, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let b_id = bulk(cmd(b, &["CLUSTER", "MYID"]));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(a, &["CLUSTER", "NODES"])
+        .lines()
+        .any(|l| l.starts_with(&b_id) && l.ends_with("0-16383"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a never learned b's slots"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Keys of slot 0 on a, which it doesn't serve ({06S} hashes to 0).
+    assert_eq!(rudis::router::key_slot(b"{06S}"), 0);
+    assert_eq!(
+        cmd(a, &["DEBUG", "POPULATE", "1000", "{06S}", "100"]),
+        "+OK\r\n"
+    );
+    assert_eq!(cmd(a, &["DBSIZE"]), ":1000\r\n");
+    let _ = connect_ready(a).write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$4\r\nSAVE\r\n");
+    let _ = na.0.wait();
+    let mut na = ServerGuard(spawn(a, &da));
+    // The first command after the restart.
+    assert_eq!(cmd(a, &["DBSIZE"]), ":0\r\n");
+    shutdown_and_wait(a, &mut na.0);
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}
+
 /// In cluster mode each shard has its own client port, and clients write to
 /// it directly (MOVED points there). The node still has one identity and one
 /// replication stream: writes taken on any shard's port must reach the
