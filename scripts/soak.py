@@ -139,6 +139,7 @@ class BigValueWriter(threading.Thread):
         self.keys = [f"{prefix}{i}" for i in range(keys)]
         self.min_size, self.max_size = min_size, max_size
         self.expect = {}  # key -> sha256 of the value acknowledged last, None after DEL
+        self.sizes = {}  # key -> bytes of the value acknowledged last, 0 after DEL
         self.stats = {"writes": 0, "bytes_written": 0, "verified": 0, "missing": 0, "deletes": 0,
                       "mismatches": 0, "errors": {}}
         self.examples = []
@@ -176,6 +177,7 @@ class BigValueWriter(threading.Thread):
                     r = self.cmd(key, "DEL", key)
                     if isinstance(r, str) and r.startswith(":"):
                         self.expect[key] = None
+                        self.sizes[key] = 0
                         self.stats["deletes"] += 1
                     else:
                         self._err(r)
@@ -189,6 +191,7 @@ class BigValueWriter(threading.Thread):
                     r = self.cmd(key, "SET", key, value)
                     if r == "+OK":
                         self.expect[key] = hashlib.sha256(value.encode()).hexdigest()
+                        self.sizes[key] = size
                         self.stats["writes"] += 1
                         self.stats["bytes_written"] += size
                     else:
@@ -205,6 +208,11 @@ class BigValueWriter(threading.Thread):
             except Exception as e:  # noqa: BLE001
                 self._err(f"-EXC {type(e).__name__}")
                 self.expect[key] = "unknown"
+
+    def live_bytes(self):
+        """Bytes of the values the keys hold now, as far as acknowledged
+        writes and deletes tell (a refused write leaves the size before)."""
+        return sum(self.sizes.values())
 
     def summary(self):
         return dict(self.stats, examples=self.examples)

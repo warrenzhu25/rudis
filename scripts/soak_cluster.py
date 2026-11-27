@@ -594,6 +594,8 @@ def main():
                     note(f"memtier {why}: restarted")
                     memtier = start_memtier()
                 row["memtier_restarts"] = memtier_restarts
+                if big is not None:
+                    row["big_bytes"] = big.live_bytes()
                 out_f.write(json.dumps(row) + "\n")
                 out_f.flush()
                 now = time.time()
@@ -704,10 +706,20 @@ def write_report(a, samples_path, events, anomalies, final):
     if a.server_args:
         lines += [f"Node arguments added: `{a.server_args}`", ""]
     if rows:
-        # The cluster fills its keyspace in the first ~15 min: compare
-        # memory and latency from after a 30 min warmup, not the fill.
+        # Compare memory and latency from after the warmup, not the fill:
+        # at least 30 min, and until the keyspace holds 99% of the keys it
+        # ends with (filling 300k keys took about an hour).
         hour = max(1, 3600 // a.interval)
-        warm = [r for r in rows if r["t"] >= 1800] or rows
+
+        def keys(r):
+            return sum(int(m.group(1)) for n in r["nodes"].values() if n and n.get("role") == "master"
+                       for m in [re.search(r"keys=(\d+)", n.get("db0") or "")] if m)
+
+        final_keys = statistics.median(keys(r) for r in rows[-hour:])
+        warm = [r for r in rows if r["t"] >= 1800]
+        while warm and keys(warm[0]) < 0.99 * final_keys:
+            warm.pop(0)
+        warm = warm or rows
         first, last = warm[:hour], rows[-hour:]
 
         def avg(rs, f):
@@ -728,18 +740,34 @@ def write_report(a, samples_path, events, anomalies, final):
             ("probe max (ms)", lambda r: r["probe"]["max_ms"]),
         ):
             lines.append(f"| {label} | {avg(first, f):.2f} | {avg(last, f):.2f} |")
-        # Memory trend after warmup, a least-squares slope: big values
-        # come and go, so two hourly averages swing by +-10% on their own.
-        pts = [(r["t"] / 3600, (total(r, "used_memory") or 0) / 2**20) for r in warm]
-        trend = ""
-        if len(pts) >= 10 and pts[-1][0] - pts[0][0] >= 1:
+        # Memory trend after warmup, a least-squares slope, leaving out the
+        # big values (16 keys of 512 KB-8 MB, on every master and replica):
+        # which of them exist and how big they are swings used_memory by
+        # +-100 MB, enough to fit a slope of +20 MB/h to a flat server.
+        def copies(r):
+            masters = sum(1 for n in r["nodes"].values() if n and n.get("role") == "master")
+            return len([n for n in r["nodes"].values() if n]) / masters if masters else 1
+
+        def slope_of(pts):
+            if len(pts) < 10 or pts[-1][0] - pts[0][0] < 1:
+                return None
             mx = statistics.mean(x for x, _ in pts)
             my = statistics.mean(y for _, y in pts)
-            slope = sum((x - mx) * (y - my) for x, y in pts) / sum((x - mx) ** 2 for x, _ in pts)
-            trend = f"{slope:+.1f} MB/h ({100 * slope / my:+.2f}%/h of {my:.0f} MB)"
+            return sum((x - mx) * (y - my) for x, y in pts) / sum((x - mx) ** 2 for x, _ in pts), my
+
+        raw = slope_of([(r["t"] / 3600, (total(r, "used_memory") or 0) / 2**20) for r in warm])
+        net = slope_of([(r["t"] / 3600, ((total(r, "used_memory") or 0) - copies(r) * r["big_bytes"]) / 2**20)
+                        for r in warm if "big_bytes" in r]) if all("big_bytes" in r for r in warm) else None
+        trend = ""
+        if net:
+            trend = f"{net[0]:+.1f} MB/h ({100 * net[0] / net[1]:+.2f}%/h of {net[1]:.0f} MB, big values left out)"
+        elif raw:
+            trend = f"{raw[0]:+.1f} MB/h ({100 * raw[0] / raw[1]:+.2f}%/h of {raw[1]:.0f} MB)"
         worst = max(r["probe"]["max_ms"] for r in rows)
         recon = sum(r["probe"].get("reconnects", 0) for r in rows)
         lines += ["", f"* used_memory trend after warmup: {trend or 'n/a (too short)'}",
+                  *([f"* with the big values counted: {raw[0]:+.1f} MB/h"] if net and raw else []),
+                  f"* warmup: the first {warm[0]['t'] / 60:.0f} min",
                   f"* worst probe latency: {worst:.1f} ms",
                   f"* probe GETs that reconnected first (not counted above): {recon}",
                   f"* counter writer at the end: {rows[-1].get('counters')}",
