@@ -797,10 +797,9 @@ fn test_e2e_unlink_readonly_wait_object_and_proto_max() {
         send_and_read(&mut stream, b"OBJECT ENCODING nonexistent\r\n"),
         "$-1\r\n"
     );
-    assert_eq!(
-        send_and_read(&mut stream, b"OBJECT IDLETIME obj_k\r\n"),
-        ":0\r\n"
-    );
+    // The LRU clock counts seconds: it may tick between the SET and this.
+    let idle = send_and_read(&mut stream, b"OBJECT IDLETIME obj_k\r\n");
+    assert!(idle == ":0\r\n" || idle == ":1\r\n", "{idle:?}");
     assert_eq!(
         send_and_read(&mut stream, b"OBJECT REFCOUNT obj_k\r\n"),
         ":1\r\n"
