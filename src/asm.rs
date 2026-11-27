@@ -1118,6 +1118,15 @@ pub async fn wait_trim_for(
 pub fn trim_unowned_keys(router: &crate::router::Router, slots_with_keys: &[u16]) {
     let cluster = crate::cluster::get_cluster_hub(router.base_port);
     let tasks = hub(router.base_port);
+    // Slots open for import with CLUSTER SETSLOT IMPORTING are skipped too,
+    // as Redis does: their keys are arriving with MIGRATE.
+    let setslot_importing: Vec<u16> = cluster
+        .slot_states
+        .read()
+        .iter()
+        .filter(|(_, (state, _))| state == "importing")
+        .map(|(&s, _)| s)
+        .collect();
     let slots: Vec<u16> = slots_with_keys
         .iter()
         .copied()
@@ -1125,6 +1134,7 @@ pub fn trim_unowned_keys(router: &crate::router::Router, slots_with_keys: &[u16]
             !cluster.owns_slot(s)
                 && cluster.slot_owner_id(s).is_some()
                 && !is_importing_slot(s)
+                && !setslot_importing.contains(&s)
                 && !tasks.overlapping_active(&[(s, s)])
                 && !slot_has_trim_job(router.base_port, s)
         })

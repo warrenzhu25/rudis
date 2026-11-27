@@ -3155,6 +3155,87 @@ fn test_restart_drops_keys_of_unowned_slots_before_serving_e2e() {
     let _ = std::fs::remove_dir_all(&db);
 }
 
+/// The keys of a slot open for import (CLUSTER SETSLOT IMPORTING) are not
+/// another node's leftovers: the check for keys of unowned slots keeps
+/// them, as Redis's does. It trimmed them, so a MIGRATE racing the check
+/// lost the keys it moved.
+#[test]
+fn test_unowned_slot_check_keeps_keys_of_an_importing_slot_e2e() {
+    let (a, b) = (18397u16, 18437u16);
+    let mk_dir = |p: u16| {
+        let d =
+            std::env::temp_dir().join(format!("rudis_unowned_imp_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let (da, db) = (mk_dir(a), mk_dir(b));
+    let spawn = |p: u16, dir: &str| {
+        let ps = p.to_string();
+        spawn_rudis_listening(
+            &[
+                "--port",
+                &ps,
+                "--dir",
+                dir,
+                "--cluster-enabled",
+                "yes",
+                "--threads",
+                "2",
+                "--no-pin",
+            ],
+            p,
+        )
+    };
+    let _na = ServerGuard(spawn(a, &da));
+    let mut nb = ServerGuard(spawn(b, &db));
+    let cmd = |p: u16, args: &[&str]| resp_cmd(&mut connect_ready(p), args);
+    let bulk = |r: String| r.lines().nth(1).unwrap_or_default().to_string();
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["CLUSTER", "MEET", "127.0.0.1", &a.to_string()]),
+        "+OK\r\n"
+    );
+    let a_id = bulk(cmd(a, &["CLUSTER", "MYID"]));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(b, &["CLUSTER", "NODES"])
+        .lines()
+        .any(|l| l.starts_with(&a_id) && l.ends_with("0-16383"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "b never learned a's slots"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // b imports slot 0 ({06S}) from a and holds some of its keys.
+    assert_eq!(
+        cmd(b, &["CLUSTER", "SETSLOT", "0", "IMPORTING", &a_id]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["DEBUG", "POPULATE", "100", "{06S}", "10"]),
+        "+OK\r\n"
+    );
+    assert_eq!(cmd(b, &["CLUSTER", "SAVECONFIG"]), "+OK\r\n");
+    // The check runs while a restarted node loads.
+    let _ = connect_ready(b).write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$4\r\nSAVE\r\n");
+    let _ = nb.0.wait();
+    nb = ServerGuard(spawn(b, &db));
+    assert!(
+        cmd(b, &["CLUSTER", "NODES"]).contains(&format!("[0-<-{a_id}]")),
+        "the import didn't survive the restart"
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(cmd(b, &["DBSIZE"]), ":100\r\n");
+    drop(nb);
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}
+
 /// In cluster mode each shard has its own client port, and clients write to
 /// it directly (MOVED points there). The node still has one identity and one
 /// replication stream: writes taken on any shard's port must reach the

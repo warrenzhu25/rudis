@@ -63,6 +63,9 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ### Fixed
 
+- The check for keys of slots other nodes serve (at startup, or when a replica is promoted)
+  trimmed the keys of a slot open for import with `CLUSTER SETSLOT IMPORTING`, so keys a `MIGRATE`
+  had just moved could be deleted. It skips those slots now, as Redis does.
 - A cluster node restarted with keys of slots other nodes serve dropped them only at its first
   cron tick, 100 ms after it started serving, so the first commands (`DBSIZE`, `INFO keyspace`,
   `SCAN`) still saw them. They are now scheduled for trimming before the node ends `-LOADING`, as
