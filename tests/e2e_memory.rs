@@ -1366,34 +1366,6 @@ fn test_eviction_invalidation_precedes_reply_across_shards_e2e() {
         resp_cmd(&mut c, &["HELLO", "3"]);
         resp_cmd(&mut c, &["DEL", "volatile-key", "big-key"]);
         assert_eq!(resp_cmd(&mut c, &["CLIENT", "TRACKING", "on"]), "+OK\r\n");
-        // The limit goes 100 KB above used_memory and the write below takes
-        // 200 KB, so used_memory must have settled. For a second or so after
-        // startup it still falls by up to ~500 KB, and a limit set before
-        // the drop left the write under it (1 round in ~40 on the epoll
-        // driver).
-        let used_memory = |c: &mut TcpStream| -> i64 {
-            resp_cmd(c, &["INFO", "memory"])
-                .lines()
-                .find_map(|l| l.strip_prefix("used_memory:"))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap()
-        };
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let mut last = used_memory(&mut c);
-        loop {
-            thread::sleep(Duration::from_millis(100));
-            let now = used_memory(&mut c);
-            if (now - last).abs() < 8 * 1024 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "used_memory never settled"
-            );
-            last = now;
-        }
         let info = resp_cmd(&mut c, &["INFO", "memory"]);
         let used: u64 = info
             .lines()
@@ -1420,7 +1392,11 @@ fn test_eviction_invalidation_precedes_reply_across_shards_e2e() {
         );
         assert_eq!(resp_cmd(&mut c, &["GET", "volatile-key"]), "$1\r\nx\r\n");
         assert_eq!(
-            resp_cmd(&mut c, &["SETBIT", "big-key", "1600000", "0"]),
+            // 2 MB against a limit 100 KB above used_memory (Redis's test
+            // writes 200 KB): for a second or so after startup used_memory
+            // still falls by up to ~500 KB, and the write must still take
+            // the server over the limit.
+            resp_cmd(&mut c, &["SETBIT", "big-key", "16000000", "0"]),
             ":0\r\n"
         );
         let mut got = resp_cmd(&mut c, &["GETBIT", "big-key", "0"]);
