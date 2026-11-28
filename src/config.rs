@@ -31,9 +31,11 @@ pub struct RudisConfig {
     /// whose keys live on different shards, with Redis Cluster's CROSSSLOT
     /// error (see `connection::cross_shard_strict`).
     pub cross_shard_strict: bool,
-    /// `dual-channel-replication-enabled` (see
-    /// `replication::dual_channel_replication`).
+    /// `dual-channel-replication-enabled`, or `repl-rdb-channel` (see
+    /// `replication::dual_channel_replication`). Default no.
     pub dual_channel_replication: bool,
+    /// `repl-diskless-sync` (see `replication::REPL_DISKLESS_SYNC`).
+    pub repl_diskless_sync: bool,
     pub aof_load_truncated: bool,
     /// `aof-multipart`: keep the shard AOF files in Redis 7's multi-part
     /// layout (`appenddirname`, a manifest naming one incr file per shard)
@@ -97,6 +99,7 @@ impl Default for RudisConfig {
             enable_experimental_commands: false,
             cross_shard_strict: false,
             dual_channel_replication: false,
+            repl_diskless_sync: true,
             aof_load_truncated: true,
             aof_multipart: false,
             appenddirname: "appendonlydir".to_string(),
@@ -334,6 +337,7 @@ const REDIS_CONFIG_NAMES: &[&str] = &[
     "repl-diskless-sync",
     "repl-diskless-sync-delay",
     "repl-diskless-sync-max-replicas",
+    "repl-rdb-channel",
     "replica-announced",
     "replica-announce-ip",
     "replica-announce-port",
@@ -632,13 +636,27 @@ impl RudisConfig {
                         format!("Invalid idle-poll-us at line {}: {}", line_num + 1, e)
                     })?;
                 }
-                "dual-channel-replication-enabled" => {
+                "repl-diskless-sync" => {
+                    config.repl_diskless_sync = match rest[0].to_lowercase().as_str() {
+                        "yes" => true,
+                        "no" => false,
+                        other => {
+                            return Err(format!(
+                                "Invalid repl-diskless-sync at line {}: '{}' (expected yes|no)",
+                                line_num + 1,
+                                other
+                            ));
+                        }
+                    };
+                }
+                "dual-channel-replication-enabled" | "repl-rdb-channel" => {
                     config.dual_channel_replication = match rest[0].to_lowercase().as_str() {
                         "yes" => true,
                         "no" => false,
                         other => {
                             return Err(format!(
-                                "Invalid dual-channel-replication-enabled at line {}: '{}' (expected yes|no)",
+                                "Invalid {} at line {}: '{}' (expected yes|no)",
+                                directive,
                                 line_num + 1,
                                 other
                             ));
@@ -1384,7 +1402,14 @@ mod tests {
                 .unwrap()
                 .dual_channel_replication
         );
+        // Redis 8's name for it.
+        assert!(
+            RudisConfig::parse_str("repl-rdb-channel yes")
+                .unwrap()
+                .dual_channel_replication
+        );
         assert!(RudisConfig::parse_str("dual-channel-replication-enabled 2").is_err());
+        assert!(RudisConfig::parse_str("repl-rdb-channel 2").is_err());
     }
 
     #[test]

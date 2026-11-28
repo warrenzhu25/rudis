@@ -8394,3 +8394,97 @@ fn test_swapdb_full_sync_loads_asynchronously_e2e() {
         shutdown_and_wait(port, &mut child.0);
     }
 }
+
+/// `repl-rdb-channel` (Redis 8's name) is dual-channel replication: set by
+/// either name, shown by both (hidden from CONFIG GET *, as in Redis), and,
+/// as in Redis, used only while the master has `repl-diskless-sync` on.
+#[test]
+fn test_repl_rdb_channel_is_dual_channel_replication_e2e() {
+    let (mp, r1, r2) = (29811u16, 29812u16, 29813u16);
+    let dir = std::env::temp_dir().join(format!("rudis-rdbch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mlog = dir.join("master.log");
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let common = ["--threads", "2", "--no-pin", "--save", ""];
+    let ms = mp.to_string();
+    let master = rudis_bin()
+        .args(["--port", ms.as_str()])
+        .args(common)
+        .args(["--repl-rdb-channel", "yes"])
+        .args(DEBUG_ON)
+        .env("MONOIO_FORCE_LEGACY_DRIVER", legacy_driver_env())
+        .stdout(std::fs::File::create(&mlog).unwrap())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _master = Kill(master);
+    let connect = |port: u16| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                return s;
+            }
+            assert!(std::time::Instant::now() < deadline, "no server on {port}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let mut m = connect(mp);
+    let get = |c: &mut TcpStream, name: &str| resp_cmd_all(c, &["CONFIG", "GET", name]);
+    assert!(get(&mut m, "repl-rdb-channel").ends_with("\r\nyes\r\n"));
+    assert!(get(&mut m, "dual-channel-replication-enabled").ends_with("\r\nyes\r\n"));
+    assert!(!resp_cmd_all(&mut m, &["CONFIG", "GET", "*"]).contains("repl-rdb-channel"));
+    assert!(get(&mut m, "repl-diskless-sync").ends_with("\r\nyes\r\n"));
+    assert_eq!(resp_cmd(&mut m, &["SET", "k", "v"]), "+OK\r\n");
+    let sync = |rport: u16| {
+        let r = Kill(spawn_rudis_listening(
+            &[
+                "--port",
+                &rport.to_string(),
+                "--threads",
+                "2",
+                "--no-pin",
+                "--save",
+                "",
+            ],
+            rport,
+        ));
+        let mut c = connect(rport);
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "repl-rdb-channel", "yes"]),
+            "+OK\r\n"
+        );
+        assert!(get(&mut c, "dual-channel-replication-enabled").ends_with("\r\nyes\r\n"));
+        assert_eq!(
+            resp_cmd(&mut c, &["REPLICAOF", "127.0.0.1", &ms]),
+            "+OK\r\n"
+        );
+        wait_for_master_link(&mut c);
+        assert_eq!(resp_cmd(&mut c, &["GET", "k"]), "$1\r\nv\r\n");
+        r
+    };
+    let rdb_channel_syncs = || {
+        std::fs::read_to_string(&mlog)
+            .unwrap_or_default()
+            .matches("replicas sockets (rdb-channel)")
+            .count()
+    };
+    let _r1 = sync(r1);
+    assert_eq!(rdb_channel_syncs(), 1);
+    // A master with repl-diskless-sync off syncs over one connection.
+    assert_eq!(
+        resp_cmd(&mut m, &["CONFIG", "SET", "repl-diskless-sync", "no"]),
+        "+OK\r\n"
+    );
+    assert!(get(&mut m, "repl-diskless-sync").ends_with("\r\nno\r\n"));
+    let _r2 = sync(r2);
+    assert_eq!(rdb_channel_syncs(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

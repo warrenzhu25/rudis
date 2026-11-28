@@ -1,9 +1,10 @@
 # integration/replication tests skipped for rudis.
 #
-# Needs repl-rdb-channel (Redis 8's dual-channel full sync, on by default)
-# under that name: rudis has it as dual-channel-replication-enabled, off by
-# default, so a replica waiting out repl-diskless-sync-delay has one
-# replica connection on the master, not two, and is not listed in INFO yet.
+# Expect repl-rdb-channel on, Redis 8's default: rudis takes the name (for
+# its dual-channel-replication-enabled) but keeps it off by default until
+# its RDB channel matches Redis's in the handshake state a replica waiting
+# out repl-diskless-sync-delay reports, async loading and the cached master
+# (these tests failed with it on).
 Slave enters wait_bgsave
 #
 # Timing: the replica drops its 4M keys before loading (answering -LOADING

@@ -1247,12 +1247,19 @@ struct PendingPeer {
     rdb_client_id: Option<u64>,
 }
 
-/// `dual-channel-replication-enabled` (as in Valkey): a full sync sends the
-/// RDB over a second connection while the stream after it flows over the
-/// main one, buffered by the replica, so the master doesn't hold it for the
-/// whole transfer and load (which overran `client-output-buffer-limit
-/// replica` under heavy writes). Both sides must have it on.
+/// `dual-channel-replication-enabled` (as in Valkey), also named
+/// `repl-rdb-channel` (as in Redis 8): a full sync sends the RDB over a
+/// second connection while the stream after it flows over the main one,
+/// buffered by the replica, so the master doesn't hold it for the whole
+/// transfer and load (which overran `client-output-buffer-limit replica`
+/// under heavy writes). Both sides must have it on, and the master
+/// `repl-diskless-sync` too. Off by default, unlike Redis 8's (see
+/// docs/differences.md).
 static DUAL_CHANNEL: AtomicBool = AtomicBool::new(false);
+
+/// `repl-diskless-sync` (default yes). Rudis always streams a full sync to
+/// the replica's socket; as in Redis, `no` only turns off the RDB channel.
+pub static REPL_DISKLESS_SYNC: AtomicBool = AtomicBool::new(true);
 
 pub fn set_dual_channel_replication(on: bool) {
     DUAL_CHANNEL.store(on, Ordering::Relaxed);
@@ -2250,6 +2257,7 @@ impl ReplicationHub {
     /// sides have dual-channel replication on, and it takes `$EOF:` ones.
     pub fn replica_takes_dual_channel(&self, id: u64) -> bool {
         dual_channel_replication()
+            && REPL_DISKLESS_SYNC.load(Ordering::Relaxed)
             && self
                 .pending_peers
                 .lock()

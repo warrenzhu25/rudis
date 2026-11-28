@@ -7,6 +7,14 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ## [Unreleased]
 
+### Added
+
+- `repl-rdb-channel`, Redis 8's name for dual-channel replication (`dual-channel-replication-enabled`),
+  in the config file, on the command line and with CONFIG SET / GET (hidden from `CONFIG GET *`, as in
+  Redis). Still off by default (Redis 8: on; see docs/differences.md).
+- `repl-diskless-sync` is honoured: with `no`, a master doesn't use dual-channel replication, as in
+  Redis (it always streams the full sync itself). It was accepted and ignored.
+
 ### Fixed
 
 - As in Redis, the AOF buffers don't count toward `maxmemory`, so a burst of writes with AOF on

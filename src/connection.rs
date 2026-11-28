@@ -4599,9 +4599,11 @@ pub fn apply_config_value(
             LATENCY_TRACKING.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
         }
         "cross-shard-strict" => set_cross_shard_strict(parse_config_bool(name, val_str)?),
-        "dual-channel-replication-enabled" => {
+        "dual-channel-replication-enabled" | "repl-rdb-channel" => {
             crate::replication::set_dual_channel_replication(parse_config_bool(name, val_str)?)
         }
+        "repl-diskless-sync" => crate::replication::REPL_DISKLESS_SYNC
+            .store(parse_config_bool(name, val_str)?, Ordering::Relaxed),
         "latency-tracking-info-percentiles" => {
             let mut ps = Vec::new();
             for t in val_str.split_whitespace() {
@@ -5007,7 +5009,7 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
         )
     };
     let cluster_hub = crate::cluster::get_cluster_hub(router.base_port);
-    let all_configs: [(&str, String); 128] = [
+    let all_configs: [(&str, String); 129] = [
         ("port", port_str),
         (
             "client-default-resp",
@@ -5424,10 +5426,21 @@ fn write_config_get_reply(router: &Router, patterns: &[Bytes], out: &mut Vec<u8>
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .to_string(),
         ),
+        (
+            "repl-diskless-sync",
+            yes_no(
+                crate::replication::REPL_DISKLESS_SYNC.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        ),
     ];
-    let hidden_configs: [(&str, String); 2] = [
+    // As in Redis, which hides repl-rdb-channel from CONFIG GET *.
+    let hidden_configs: [(&str, String); 3] = [
         ("key-load-delay", key_load_delay),
         ("rdb-key-save-delay", rdb_save_delay),
+        (
+            "repl-rdb-channel",
+            yes_no(crate::replication::dual_channel_replication()),
+        ),
     ];
 
     let mut matched: Vec<(&str, &str)> = Vec::new();
@@ -5994,6 +6007,10 @@ fn apply_config_set_pairs(router: &Router, pairs: &[(Bytes, Bytes)], out: &mut V
 }
 
 /// The current value of config parameter `name`, as CONFIG GET reports it.
+fn yes_no(on: bool) -> String {
+    if on { "yes" } else { "no" }.to_string()
+}
+
 fn config_value_string(router: &Router, name: &str) -> Option<String> {
     let mut buf = Vec::new();
     write_config_get_reply(router, &[Bytes::copy_from_slice(name.as_bytes())], &mut buf);
@@ -9980,7 +9997,14 @@ async fn stream_full_sync(
         .register_full_sync_replica(client_id, write_tx.clone(), router.num_shards)
         .ok_or(Some(ReplicaSnapshotError::NoMasterLink))?;
     let _sending = crate::replication::SnapshotSending::new(hub, &rep);
-    crate::log_notice!("Starting BGSAVE for SYNC with target: replicas sockets");
+    crate::log_notice!(
+        "Starting BGSAVE for SYNC with target: replicas sockets{}",
+        if rdb_channel.is_some() {
+            " (rdb-channel)"
+        } else {
+            ""
+        }
+    );
     crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
     let mut guard = SyncImagesGuard {
         router,
