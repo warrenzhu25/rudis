@@ -5277,7 +5277,7 @@ impl Router {
             self.start_rewrite_aof_locked();
             return Ok("Background append only file rewriting started");
         }
-        if crate::snapshot::aof_rewrite_state(self.base_port).in_progress() {
+        if crate::snapshot::aof_rewrite_state(self.base_port).refuses_new_rewrite() {
             return Err("Background append only file rewriting already in progress".to_string());
         }
         let scheduled = crate::snapshot::aof_rewrite_scheduled(self.base_port);

@@ -313,6 +313,14 @@ impl AofRewriteState {
         self.cancel.load(Ordering::SeqCst)
     }
 
+    /// Whether BGREWRITEAOF is refused as "already in progress": a running
+    /// rewrite refuses it, a canceled one winding down doesn't (Redis kills
+    /// its rewrite child at once, so the next BGREWRITEAOF starts; here it
+    /// waits for the canceled one to end).
+    pub fn refuses_new_rewrite(&self) -> bool {
+        self.in_progress() && !self.canceled()
+    }
+
     pub fn finish(&self, ok: bool) {
         // A rewrite stopped on purpose is no failure: it must not delay the
         // next automatic one.
@@ -370,6 +378,21 @@ impl AofRewriteState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rewrite canceled by `CONFIG SET appendonly no` no longer refuses
+    /// BGREWRITEAOF while it winds down; a running one does.
+    #[test]
+    fn test_a_canceled_rewrite_does_not_refuse_the_next() {
+        let state = aof_rewrite_state(61_917);
+        assert!(!state.refuses_new_rewrite());
+        state.begin();
+        assert!(state.refuses_new_rewrite());
+        assert!(state.cancel());
+        assert!(state.in_progress());
+        assert!(!state.refuses_new_rewrite());
+        state.finish(false);
+        assert!(!state.in_progress());
+    }
 
     #[test]
     fn test_failed_save_counts_once_until_a_save_succeeds() {
