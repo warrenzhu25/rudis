@@ -6375,3 +6375,144 @@ fn test_atomic_slot_migration_e2e() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// An atomic slot migration's source dumps the slots' keys a step at a
+/// time: it keeps answering while it sends them (it answered nothing for
+/// ~5 s per GB while it dumped them in one go), and the snapshot stays
+/// point-in-time under writes. INCRs to keys being dumped land on the
+/// destination exactly once: the image holds a key's value from before its
+/// first write, and the stream carries the write.
+#[test]
+fn test_atomic_slot_migration_dumps_in_steps_under_writes_e2e() {
+    let ports = [18661u16, 18671];
+    let mk_dir = |p: u16| {
+        let d = std::env::temp_dir().join(format!("rudis_asm_steps_{}_{}", p, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    };
+    let dirs: Vec<String> = ports.iter().map(|&p| mk_dir(p)).collect();
+    let _srvs: Vec<ServerGuard> = ports
+        .iter()
+        .zip(&dirs)
+        .map(|(&p, dir)| {
+            ServerGuard(spawn_rudis_listening(
+                &[
+                    "--port",
+                    &p.to_string(),
+                    "--dir",
+                    dir,
+                    "--cluster-enabled",
+                    "yes",
+                    "--threads",
+                    "1",
+                    "--no-pin",
+                ],
+                p,
+            ))
+        })
+        .collect();
+    let [a, b] = ports;
+    let cmd = |p: u16, args: &[&str]| resp_cmd_full(&mut connect_ready(p), args);
+    assert_eq!(
+        cmd(a, &["CLUSTER", "ADDSLOTSRANGE", "0", "8191"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(b, &["CLUSTER", "ADDSLOTSRANGE", "8192", "16383"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        cmd(a, &["CLUSTER", "MEET", "127.0.0.1", &b.to_string()]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cmd(b, &["CLUSTER", "INFO"]).contains("cluster_state:ok")
+        || !cmd(a, &["CLUSTER", "INFO"]).contains("cluster_state:ok")
+    {
+        assert!(std::time::Instant::now() < deadline, "cluster never got ok");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // ~200 MB in slot 0 ({06S}), which a dumped in one go in about a
+    // second (several in a debug build).
+    let n = if cfg!(debug_assertions) {
+        100_000
+    } else {
+        200_000
+    };
+    assert_eq!(
+        cmd(a, &["DEBUG", "POPULATE", &n.to_string(), "{06S}", "1000"]),
+        "+OK\r\n"
+    );
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // INCRs to 100 counters in slot 0, counted as acknowledged; MOVED once
+    // the slot is handed over ends them.
+    let writer = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut c = connect_ready(a);
+            let mut acked = vec![0u64; 100];
+            'run: while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for (i, n) in acked.iter_mut().enumerate() {
+                    let r = resp_cmd(&mut c, &["INCR", &format!("{{06S}}c:{i}")]);
+                    if r.starts_with(':') {
+                        *n += 1;
+                    } else {
+                        break 'run;
+                    }
+                }
+            }
+            acked
+        })
+    };
+    // The source's slowest PING while it migrates.
+    let prober = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut c = connect_ready(a);
+            let mut worst = Duration::ZERO;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+                worst = worst.max(t.elapsed());
+                thread::sleep(Duration::from_millis(5));
+            }
+            worst
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+    let task = cmd(b, &["CLUSTER", "MIGRATION", "IMPORT", "0", "8191"]);
+    let task_id = task.lines().nth(1).unwrap_or_default().to_string();
+    assert_eq!(task_id.len(), 40, "{task}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let st = cmd(b, &["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
+        if st.contains("completed") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "migration stuck: {st}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let acked = writer.join().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst = prober.join().unwrap();
+    eprintln!("the source's slowest PING while it migrated: {worst:?}");
+    for (i, n) in acked.iter().enumerate() {
+        assert_eq!(
+            cmd(b, &["GET", &format!("{{06S}}c:{i}")]),
+            format!("${}\r\n{n}\r\n", n.to_string().len()),
+            "counter {i}"
+        );
+    }
+    assert_eq!(cmd(b, &["DBSIZE"]), format!(":{}\r\n", n + 100));
+    assert!(
+        worst < Duration::from_millis(500),
+        "the source stalled for {worst:?} while it dumped the slots"
+    );
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

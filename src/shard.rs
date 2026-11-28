@@ -795,9 +795,6 @@ pub enum ShardMessage {
     },
     /// A replica's asynchronous full-sync load (see [`AsyncLoad`]).
     AsyncLoadRdb(Box<AsyncLoad>),
-    /// Atomic slot migration: dump this shard's keys in `ranges` into
-    /// migration `task`'s stream (see `crate::asm::dump_slots`); replies
-    /// with the number of keys.
     /// Loads a migrated extended structure (see `asm::load_ext`).
     AsmLoadExt {
         records: Vec<u8>,
@@ -811,10 +808,22 @@ pub enum ShardMessage {
     },
     /// Runs this shard's part of a slot trim (see `asm::start_trim`).
     AsmTrim(std::sync::Arc<crate::asm::TrimJob>),
-    AsmDump {
+    /// Starts this shard's part of migration `task`'s snapshot (see
+    /// [`start_migration_image`]).
+    AsmDumpStart {
         task: u64,
         ranges: Vec<(u16, u16)>,
-        responder: flume::Sender<Vec<Vec<u8>>>,
+        responder: flume::Sender<()>,
+    },
+    /// More of it (see [`migration_image_step`]).
+    AsmDumpStep {
+        task: u64,
+        one_key: bool,
+        responder: flume::Sender<Result<(Vec<u8>, bool, u64), String>>,
+    },
+    /// Drops it (the migration ended).
+    AsmDumpAbort {
+        task: u64,
     },
     ExecuteReplicaCmd {
         db: usize,
@@ -5211,6 +5220,15 @@ pub struct AofImage {
     /// A shard's part of a multi-shard RDB (a full sync): no file header
     /// and no `OP_EOF`, like [`ShardDb::save_rdb_chunk`]'s output.
     chunk: bool,
+    /// A slot migration's image ([`AofImage::start_migration`]): the
+    /// migrating slots, as a bit set. The image then holds `RESTORE` (and
+    /// `CLUSTER SYNCSLOTS EXT`) commands for their keys, not RDB records.
+    migration: Option<Box<[u64; 256]>>,
+    /// Keys written so far (a migration paces its sends by them).
+    pub(crate) written_keys: u64,
+    /// At most one key per step (a migration paced by
+    /// `rdb-key-save-delay`, whose keys go out one at a time).
+    one_key_steps: bool,
     /// A buffer handed back once its piece was sent (see
     /// [`Self::give_buffer`]), reused for the next piece.
     spare: Option<Vec<u8>>,
@@ -5287,6 +5305,127 @@ impl AofImage {
         Self::start_inner(db, true)
     }
 
+    /// A slot migration's image of this shard's keys of `ranges` (DB 0, the
+    /// only one in cluster mode), as of now: `RESTORE ... REPLACE [ABSTTL]`
+    /// per key and `CLUSTER SYNCSLOTS EXT` per extended structure, built a
+    /// step at a time like the other images and kept point-in-time by the
+    /// same write hooks.
+    pub fn start_migration(db: &ShardDb, ranges: &[(u16, u16)]) -> Self {
+        let mut set = Box::new([0u64; 256]);
+        for &(lo, hi) in ranges {
+            for slot in lo..=hi.min(16383) {
+                set[slot as usize >> 6] |= 1 << (slot & 63);
+            }
+        }
+        let mut walks = Vec::new();
+        if let Some(table) = db.table_for_db(0)
+            && !table.is_empty()
+        {
+            walks.push(DbWalk {
+                db_idx: 0,
+                src: 0,
+                epoch: table.layout_epoch(),
+                seg: 0,
+                written: WrittenPatterns::default(),
+                skip: Default::default(),
+                done: false,
+            });
+        }
+        let ext_pending: std::collections::VecDeque<_> = db
+            .ext_item_keys()
+            .into_iter()
+            .filter(|(_, k)| in_slot_set(&set, k))
+            .collect();
+        let ext_keys = ext_pending.iter().map(|(_, k)| k.clone()).collect();
+        let mut img = AofImage {
+            stats: None,
+            walks,
+            cur: 0,
+            ext_pending,
+            ext_keys,
+            ext_done: Default::default(),
+            buf: Vec::with_capacity(SYNC_IMAGE_BUF),
+            selected_db: 0,
+            deferred_dbs: Vec::new(),
+            deferred_ext: Vec::new(),
+            done: false,
+            port: db.port,
+            tier: db.tier_manager.clone(),
+            poisoned: None,
+            chunk: true,
+            migration: Some(set),
+            written_keys: 0,
+            one_key_steps: false,
+            spare: None,
+            held: SyncImageHeld::default(),
+        };
+        img.report_held();
+        img
+    }
+
+    /// Writes `entry` into `buf`: an RDB record, or for a migration image
+    /// (`migration`) a `RESTORE` command if its slot migrates. Returns
+    /// whether it wrote one.
+    fn write_entry(
+        migration: Option<&[u64; 256]>,
+        table: &crate::table::RudisTable,
+        entry: &crate::table::RudisEntry,
+        clock: &RdbClock,
+        buf: &mut Vec<u8>,
+        hydrate: impl FnOnce(crate::table::TieredPointer) -> Option<crate::table::RudisValue>,
+    ) -> Result<bool, TieredReadError> {
+        let Some(set) = migration else {
+            ShardDb::save_rdb_entry_with(entry, clock, buf, hydrate)?;
+            return Ok(true);
+        };
+        if !in_slot_set(set, &entry.key) {
+            return Ok(false);
+        }
+        if entry.expire_at().is_some_and(|exp| exp <= clock.now) {
+            return Ok(false);
+        }
+        let hydrated = match &entry.val {
+            crate::table::RudisValue::Tiered(ptr) => match hydrate(**ptr) {
+                Some(val) => Some(val),
+                None => {
+                    return Err(TieredReadError {
+                        key: bytes::Bytes::copy_from_slice(&entry.key),
+                    });
+                }
+            },
+            _ => None,
+        };
+        let val = hydrated.as_ref().unwrap_or(&entry.val);
+        let Some(payload) = table.dump_entry_value(&entry.key, val) else {
+            return Ok(false);
+        };
+        let expire = entry
+            .expire_at()
+            .map(|exp| crate::table::instant_to_unix_ms(exp, clock.now, clock.unix));
+        let ttl = expire.unwrap_or(0).to_string();
+        let mut args: Vec<&[u8]> =
+            vec![b"RESTORE", &entry.key, ttl.as_bytes(), &payload, b"REPLACE"];
+        if expire.is_some() {
+            args.push(b"ABSTTL");
+        }
+        crate::connection::write_resp_command(buf, &args);
+        Ok(true)
+    }
+
+    /// Writes extended structure `key`'s `records` (from
+    /// [`ShardDb::save_ext_item`]) into the image.
+    fn write_ext(&mut self, key: &[u8], records: &[u8]) {
+        if records.is_empty() {
+            return;
+        }
+        if self.migration.is_some() {
+            self.buf
+                .extend_from_slice(&crate::asm::syncslots(&[b"EXT", key, records]));
+        } else {
+            crate::redis_rdb::write_ext_aux(&mut self.buf, records);
+        }
+    }
+
     fn start_inner(db: &ShardDb, chunk: bool) -> Result<Self, TieredReadError> {
         let mut buf = Vec::with_capacity(if chunk {
             SYNC_IMAGE_BUF
@@ -5347,6 +5486,9 @@ impl AofImage {
             tier: db.tier_manager.clone(),
             poisoned: None,
             chunk,
+            migration: None,
+            written_keys: 0,
+            one_key_steps: false,
             spare: None,
             held: SyncImageHeld::default(),
         })
@@ -5410,9 +5552,7 @@ impl AofImage {
                 if !self.ext_done.remove(&(kind, key.clone())) {
                     let mut records = Vec::new();
                     db.save_ext_item(kind, &key, &mut records);
-                    if !records.is_empty() {
-                        crate::redis_rdb::write_ext_aux(&mut self.buf, &records);
-                    }
+                    self.write_ext(&key, &records);
                 }
             } else {
                 self.done = true;
@@ -5460,49 +5600,73 @@ impl AofImage {
                         crate::asm::snapshot_count(self.stats, false);
                         continue;
                     }
-                    db.save_rdb_entry(entry, clock, &mut self.buf)?;
-                    crate::asm::snapshot_count(self.stats, true);
+                    if Self::write_entry(
+                        self.migration.as_deref(),
+                        table,
+                        entry,
+                        clock,
+                        &mut self.buf,
+                        |ptr| db.hydrate_tiered(ptr),
+                    )? {
+                        crate::asm::snapshot_count(self.stats, true);
+                        self.written_keys += 1;
+                    }
                 }
             }
             w.done = true;
         } else if w.seg < table.segment_count() {
             if let Some((depth, bits)) = table.segment_pattern(w.seg) {
                 let mut written = 0usize;
+                // Entries this step went past (written, or left out as
+                // trimmed or, in a migration image, of another slot).
+                let mut passed = 0usize;
                 let mut paused = false;
                 if !w.written.covers(depth, bits) {
                     for entry in table.segment_entries(w.seg) {
                         if w.skip.contains(&entry.key[..]) {
                             continue;
                         }
+                        // A spilled value is read back from disk, on this
+                        // thread: past the step's budget, stop at one and
+                        // finish the segment in a later step.
+                        if written > 0
+                            && (self.one_key_steps
+                                || (matches!(entry.val, crate::table::RudisValue::Tiered(_))
+                                    && deadline.is_some_and(|d| crate::clock::now() >= d)))
+                        {
+                            paused = true;
+                            break;
+                        }
+                        passed += 1;
                         // Keys a slot trim deletes are gone already for
                         // the snapshot.
                         if crate::asm::trimming_any() && crate::asm::is_trimming_key(&entry.key) {
                             crate::asm::snapshot_count(self.stats, false);
                             continue;
                         }
-                        // A spilled value is read back from disk, on this
-                        // thread: past the step's budget, stop at one and
-                        // finish the segment in a later step.
-                        if written > 0
-                            && matches!(entry.val, crate::table::RudisValue::Tiered(_))
-                            && deadline.is_some_and(|d| crate::clock::now() >= d)
-                        {
-                            paused = true;
-                            break;
+                        if Self::write_entry(
+                            self.migration.as_deref(),
+                            table,
+                            entry,
+                            clock,
+                            &mut self.buf,
+                            |ptr| db.hydrate_tiered(ptr),
+                        )? {
+                            crate::asm::snapshot_count(self.stats, true);
+                            self.written_keys += 1;
+                            written += 1;
                         }
-                        db.save_rdb_entry(entry, clock, &mut self.buf)?;
-                        crate::asm::snapshot_count(self.stats, true);
-                        written += 1;
                     }
                 }
                 if paused {
-                    // What this step wrote counts as written out of order
-                    // (the segment is not covered yet). Nothing changed
-                    // since, so the same iteration yields the same keys.
+                    // What this step went past counts as written out of
+                    // order (the segment is not covered yet). Nothing
+                    // changed since, so the same iteration yields the same
+                    // keys.
                     let done: Vec<bytes::Bytes> = table
                         .segment_entries(w.seg)
                         .filter(|e| !w.skip.contains(&e.key[..]))
-                        .take(written)
+                        .take(passed)
                         .map(|e| bytes::Bytes::copy_from_slice(&e.key))
                         .collect();
                     w.skip.extend(done);
@@ -5547,9 +5711,16 @@ impl AofImage {
         db_idx: usize,
         table: &crate::table::RudisTable,
         key: &[u8],
-        save: impl FnOnce(&crate::table::RudisEntry, &mut Vec<u8>) -> Result<(), TieredReadError>,
+        clock: &RdbClock,
+        hydrate: impl FnOnce(crate::table::TieredPointer) -> Option<crate::table::RudisValue>,
     ) {
         if self.poisoned.is_some() {
+            return;
+        }
+        // A migration image holds its slots' keys only.
+        if let Some(set) = &self.migration
+            && !in_slot_set(set, key)
+        {
             return;
         }
         let Some(wi) = self.walks.iter().position(|w| w.src == db_idx) else {
@@ -5567,9 +5738,20 @@ impl AofImage {
         }
         if let Some(entry) = table.peek_entry(key) {
             self.select(self.walks[wi].db_idx);
-            if let Err(e) = save(entry, &mut self.buf) {
-                self.poisoned = Some(e.to_string());
-                return;
+            match Self::write_entry(
+                self.migration.as_deref(),
+                table,
+                entry,
+                clock,
+                &mut self.buf,
+                hydrate,
+            ) {
+                Ok(true) => self.written_keys += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    self.poisoned = Some(e.to_string());
+                    return;
+                }
             }
         }
         // Also when absent: a key created from now on is not in the image.
@@ -5590,9 +5772,7 @@ impl AofImage {
                 db.save_ext_item(*kind, key, &mut records);
             }
         }
-        if !records.is_empty() {
-            crate::redis_rdb::write_ext_aux(&mut self.buf, &records);
-        }
+        self.write_ext(key, &records);
     }
 }
 
@@ -5607,6 +5787,8 @@ pub enum ImageOwner {
     FullSync(u64),
     /// SAVE / BGSAVE (one at a time: `Router::is_saving`).
     Save,
+    /// The slot migration whose stream goes to this client id.
+    Migration(u64),
 }
 
 thread_local! {
@@ -5622,7 +5804,7 @@ pub fn install_image(owner: ImageOwner, mut image: AofImage) {
     image.stats = match owner {
         ImageOwner::Save => Some(0),
         ImageOwner::AofRewrite => Some(1),
-        ImageOwner::FullSync(_) => None,
+        ImageOwner::FullSync(_) | ImageOwner::Migration(_) => None,
     };
     if let Some(k) = image.stats {
         crate::asm::snapshot_counts_reset(k);
@@ -5732,6 +5914,65 @@ pub fn start_sync_image(
 /// Bytes a full-sync image step hands out at most (it may hand out less,
 /// or nothing, when its time budget runs out first).
 const SYNC_IMAGE_PIECE_BYTES: usize = 1 << 20;
+
+/// Whether `key`'s slot is in `set` (a 16384-bit set).
+#[inline]
+fn in_slot_set(set: &[u64; 256], key: &[u8]) -> bool {
+    let slot = crate::router::key_slot(key) as usize;
+    set[slot >> 6] & (1 << (slot & 63)) != 0
+}
+
+/// Starts this shard's part of slot migration `task` (its stream's client
+/// id): a point-in-time image of its keys of `ranges`
+/// ([`AofImage::start_migration`]), and the migration's stream armed right
+/// then, so the writes it carries after the image start where the image
+/// stands.
+pub fn start_migration_image(db: &ShardDb, shard_id: usize, task: u64, ranges: &[(u16, u16)]) {
+    install_image(
+        ImageOwner::Migration(task),
+        AofImage::start_migration(db, ranges),
+    );
+    crate::replication::get_replication_hub(db.port).arm_migration(task, shard_id, &[]);
+}
+
+/// More of migration `task`'s image on this shard (about [`RDB_SAVE_STEP`]
+/// of work, at most [`SYNC_IMAGE_PIECE_BYTES`], or one key with `one_key`,
+/// handed out at once): the commands, whether this
+/// shard's part is done (the image is then removed), and the keys written
+/// so far. An error (a spilled value that can't be read back, a dataset
+/// replaced meanwhile) removes the image: the migration fails.
+pub fn migration_image_step(
+    db: &ShardDb,
+    task: u64,
+    one_key: bool,
+) -> Result<(Vec<u8>, bool, u64), String> {
+    let owner = ImageOwner::Migration(task);
+    let step = with_image(owner, |img| {
+        img.one_key_steps = one_key;
+        let flush = if one_key { 1 } else { SYNC_IMAGE_PIECE_BYTES };
+        img.step(db, RDB_SAVE_STEP, flush)
+            .map(|step| (step, img.written_keys))
+    })
+    .ok_or_else(|| "the slots snapshot is gone".to_string())?;
+    let ((piece, done), keys) = match step {
+        Ok(step) => step,
+        Err(e) => {
+            take_image(owner);
+            return Err(e);
+        }
+    };
+    let mut out = piece.unwrap_or_default();
+    if done {
+        let image = take_image(owner).expect("present above");
+        out.extend(image.finish()?);
+    }
+    Ok((out, done, keys))
+}
+
+/// Drops migration `task`'s image on this shard (the migration ended).
+pub fn abort_migration_image(task: u64) {
+    take_image(ImageOwner::Migration(task));
+}
 
 /// Writes about [`RDB_SAVE_STEP`] more of replica `replica`'s image.
 /// Returns the bytes to send and whether this shard's part is complete (the
@@ -5851,9 +6092,7 @@ pub fn before_write_in(db: &ShardDb, db_idx: usize, key: &[u8]) {
     let clock = RdbClock::now(db.port);
     for_each_image(|img| {
         if let Some(table) = db.table_for_db(db_idx) {
-            img.cover_key(db_idx, table, key, |entry, buf| {
-                db.save_rdb_entry(entry, &clock, buf)
-            });
+            img.cover_key(db_idx, table, key, &clock, |ptr| db.hydrate_tiered(ptr));
         }
         img.cover_ext(db, key);
         img.report_held();
@@ -5870,10 +6109,8 @@ pub fn before_write_table(table: &crate::table::RudisTable, db_idx: usize, key: 
     for_each_image(|img| {
         let clock = RdbClock::now(img.port);
         let tier = img.tier.clone();
-        img.cover_key(db_idx, table, key, |entry, buf| {
-            ShardDb::save_rdb_entry_with(entry, &clock, buf, |ptr| {
-                hydrate_tiered_from(tier.as_deref()?, ptr)
-            })
+        img.cover_key(db_idx, table, key, &clock, |ptr| {
+            hydrate_tiered_from(tier.as_deref()?, ptr)
         });
         img.report_held();
     });

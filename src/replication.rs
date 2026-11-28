@@ -483,24 +483,11 @@ impl ConnectedReplica {
         }
     }
 
-    /// [`Self::send_bytes_unlimited`] for bytes in several pieces, appended
-    /// in order under one lock.
-    pub fn send_bytes_unlimited_parts(&self, parts: &[Vec<u8>]) {
-        if self.overflowed.load(Ordering::Relaxed) {
-            return;
-        }
-        let total: usize = parts.iter().map(Vec::len).sum();
-        let mut pending = self.pending.lock();
-        pending.reserve(total);
-        for p in parts {
-            pending.extend_from_slice(p);
-        }
-        self.exempt_pending.fetch_add(total, Ordering::Relaxed);
-        self.note_buffers(pending.capacity());
-        drop(pending);
-        if !self.wake_queued.swap(true, Ordering::AcqRel) {
-            let _ = self.sender.send(Vec::new());
-        }
+    /// Bytes of a slot migration's snapshot ([`Self::send_bytes_unlimited`])
+    /// queued or being written: its source takes no more from the shards
+    /// while this is high.
+    pub fn snapshot_bytes_queued(&self) -> usize {
+        self.exempt_pending.load(Ordering::Relaxed) + self.exempt_inflight.load(Ordering::Relaxed)
     }
 
     /// Bytes queued or being written.

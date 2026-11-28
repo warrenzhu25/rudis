@@ -1325,54 +1325,15 @@ fn resp_command(args: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-fn syncslots(args: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn syncslots(args: &[&[u8]]) -> Vec<u8> {
     let mut all: Vec<&[u8]> = vec![b"CLUSTER", b"SYNCSLOTS"];
     all.extend_from_slice(args);
     resp_command(&all)
 }
 
-/// On shard `shard_id`'s thread: returns the shard's keys in `ranges` as
-/// `RESTORE ... REPLACE [ABSTTL]` commands, and arms the shard, so its
-/// later writes to them are held for migration `task`'s stream until the
-/// snapshot is sent (see `ReplicationHub::arm_migration`).
-pub fn dump_slots(
-    db: &mut crate::shard::ShardDb,
-    port: u16,
-    shard_id: usize,
-    task: u64,
-    ranges: &[(u16, u16)],
-) -> Vec<Vec<u8>> {
-    let keys = db.keys_in_slot_ranges(ranges);
-    let mut cmds = Vec::with_capacity(keys.len());
-    for key in keys {
-        let Some(payload) = db.dump(&key) else {
-            continue;
-        };
-        let expire_at = db.expiretime(&key, true);
-        let ttl = expire_at.max(0).to_string();
-        let mut args: Vec<&[u8]> = vec![b"RESTORE", &key, ttl.as_bytes(), &payload, b"REPLACE"];
-        if expire_at > 0 {
-            args.push(b"ABSTTL");
-        }
-        let mut bytes = Vec::new();
-        crate::connection::write_resp_command(&mut bytes, &args);
-        cmds.push(bytes);
-    }
-    // Extended structures (JSON, probabilistic, vector sets) aren't in the
-    // table: one `CLUSTER SYNCSLOTS EXT <key> <records>` each.
-    for (kind, key) in db.ext_item_keys() {
-        if !in_ranges(ranges, &key) {
-            continue;
-        }
-        let mut records = Vec::new();
-        db.save_ext_item(kind, &key, &mut records);
-        if !records.is_empty() {
-            cmds.push(syncslots(&[b"EXT", &key, &records]));
-        }
-    }
-    crate::replication::get_replication_hub(port).arm_migration(task, shard_id, &[]);
-    cmds
-}
+/// Bytes of a migration's snapshot queued for the destination beyond which
+/// its source waits before taking more from the shards.
+const MIGRATION_SNAPSHOT_AHEAD: usize = 64 << 20;
 
 fn in_ranges(ranges: &[(u16, u16)], key: &[u8]) -> bool {
     let slot = crate::router::key_slot(key);
@@ -1505,6 +1466,8 @@ struct SourceGuard {
     /// Dropped with the guard: stops the writer task.
     _stop: flume::Sender<()>,
     link: LinkShutdown,
+    /// To drop the shards' snapshot images of a migration that ends early.
+    router: std::rc::Rc<crate::router::Router>,
 }
 
 /// Shuts a migration's socket down when dropped, so the tasks still
@@ -1527,6 +1490,14 @@ impl Drop for SourceGuard {
         self.rep.detach_fd();
         crate::replication::get_replication_hub(self.port).unregister_migration(self.rep_id);
         unpause_slots(self.port, &self.task);
+        // Taken already where a shard's part was sent in full.
+        for (sid, sender) in self.router.senders.iter().enumerate() {
+            if sid == self.router.shard_id {
+                crate::shard::abort_migration_image(self.rep_id);
+            } else {
+                let _ = sender.send(crate::shard::ShardMessage::AsmDumpAbort { task: self.rep_id });
+            }
+        }
     }
 }
 
@@ -1701,6 +1672,7 @@ pub async fn run_migrate_source(
         task: task_id.clone(),
         _stop: stop_tx,
         link: LinkShutdown(fd),
+        router: router.clone(),
     };
     if writer.write_all(b"+OK\r\n".to_vec()).await.0.is_err() {
         tasks.finish(&task_id, State::Failed, "connection lost");
@@ -1814,47 +1786,84 @@ pub async fn run_migrate_source(
         fail(State::Failed, &why);
         return;
     }
-    // The snapshot: each shard dumps its keys of the slots and arms itself.
-    let mut snapshot: Vec<Vec<u8>> = Vec::new();
-    let mut waits = Vec::new();
+    // The snapshot, a step at a time: each shard starts a point-in-time
+    // image of its keys of the slots, arming the stream with it, then hands
+    // out pieces of it, round-robin, between its other work. Pieces go
+    // straight into the migration's buffer, exempt from the output limit,
+    // but at most MIGRATION_SNAPSHOT_AHEAD ahead of what the destination
+    // took.
+    let mut starts = Vec::new();
     for (sid, sender) in router.senders.iter().enumerate() {
         if sid == router.shard_id {
-            continue;
+            crate::shard::start_migration_image(&router.local_db.borrow(), sid, client_id, &ranges);
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let _ = sender.send(crate::shard::ShardMessage::AsmDumpStart {
+                task: client_id,
+                ranges: ranges.clone(),
+                responder: tx,
+            });
+            starts.push(rx);
         }
-        let (tx, rx) = flume::bounded(1);
-        let _ = sender.send(crate::shard::ShardMessage::AsmDump {
-            task: client_id,
-            ranges: ranges.clone(),
-            responder: tx,
-        });
-        waits.push(rx);
     }
-    snapshot.extend(dump_slots(
-        &mut router.local_db.borrow_mut(),
-        port,
-        router.shard_id,
-        client_id,
-        &ranges,
-    ));
-    for rx in waits {
-        snapshot.extend(rx.recv_async().await.unwrap_or_default());
+    for rx in starts {
+        let _ = rx.recv_async().await;
     }
-    let keys = snapshot.len();
-    // The keys go out ahead of the writes held meanwhile. With
-    // `rdb-key-save-delay` (tests), one key per delay, as a forked child
-    // saving them would.
+    // With `rdb-key-save-delay` (tests), one key per step and the delay
+    // after each, as a forked child saving them would take.
     let delay_us = crate::connection::RDB_KEY_SAVE_DELAY.load(Ordering::Relaxed);
-    if delay_us == 0 {
-        // Straight into the replica's buffer: concatenating first copied
-        // the whole snapshot once more on this thread.
-        rep.send_bytes_unlimited_parts(&snapshot);
-        drop(snapshot);
-    } else {
-        let per_key = std::time::Duration::from_micros(delay_us);
-        for cmd in snapshot {
-            rep.send_bytes_unlimited(&cmd);
-            if let Ok(reason) = monoio::time::timeout(per_key, cancel_rx.recv_async()).await {
-                fail(State::Canceled, &reason.unwrap_or_default());
+    let mut keys_by_shard = vec![0u64; router.num_shards];
+    let mut pending: Vec<usize> = (0..router.num_shards).collect();
+    while !pending.is_empty() {
+        let mut next = Vec::with_capacity(pending.len());
+        for sid in pending {
+            let step = if sid == router.shard_id {
+                crate::shard::migration_image_step(
+                    &router.local_db.borrow(),
+                    client_id,
+                    delay_us > 0,
+                )
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let _ = router.senders[sid].send(crate::shard::ShardMessage::AsmDumpStep {
+                    task: client_id,
+                    one_key: delay_us > 0,
+                    responder: tx,
+                });
+                rx.recv_async()
+                    .await
+                    .unwrap_or_else(|_| Err("a shard is gone".to_string()))
+            };
+            let (piece, done, keys) = match step {
+                Ok(step) => step,
+                Err(why) => {
+                    fail(State::Failed, &link_error(&why));
+                    return;
+                }
+            };
+            let new_keys = keys.saturating_sub(keys_by_shard[sid]);
+            keys_by_shard[sid] = keys;
+            if !piece.is_empty() {
+                rep.send_bytes_unlimited(&piece);
+            }
+            if !done {
+                next.push(sid);
+            }
+            if delay_us > 0 && new_keys > 0 {
+                let pace = std::time::Duration::from_micros(delay_us.saturating_mul(new_keys));
+                if let Ok(reason) = monoio::time::timeout(pace, cancel_rx.recv_async()).await {
+                    fail(State::Canceled, &reason.unwrap_or_default());
+                    return;
+                }
+            }
+        }
+        pending = next;
+        // Between steps: the shard's other work, and what may end the
+        // migration meanwhile.
+        crate::mailbox::yield_now().await;
+        loop {
+            if let Ok(reason) = cancel_rx.try_recv() {
+                fail(State::Canceled, &reason);
                 return;
             }
             if let Ok(why) = write_err_rx.try_recv() {
@@ -1865,8 +1874,13 @@ pub async fn run_migrate_source(
                 fail(State::Canceled, &why);
                 return;
             }
+            if rep.snapshot_bytes_queued() <= MIGRATION_SNAPSHOT_AHEAD {
+                break;
+            }
+            monoio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
+    let keys: u64 = keys_by_shard.iter().sum();
     let mut head = Vec::new();
     let functions = crate::scripting::dump_functions();
     if !functions.is_empty() {

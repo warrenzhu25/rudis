@@ -2380,14 +2380,30 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let aof = aof_dir.as_deref().zip(cross_shard_aof.as_ref());
                         let _ = responder.send(db.load_full_sync_rdb(&data, shard_id, num_shards, aof));
                     }
-                    ShardMessage::AsmDump {
+                    ShardMessage::AsmDumpStart {
                         task,
                         ranges,
                         responder,
                     } => {
-                        let mut db = cross_shard_db.borrow_mut();
-                        let cmds = crate::asm::dump_slots(&mut db, port, shard_id, task, &ranges);
-                        let _ = responder.send(cmds);
+                        crate::shard::start_migration_image(
+                            &cross_shard_db.borrow(),
+                            shard_id,
+                            task,
+                            &ranges,
+                        );
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::AsmDumpStep {
+                        task,
+                        one_key,
+                        responder,
+                    } => {
+                        let step =
+                            crate::shard::migration_image_step(&cross_shard_db.borrow(), task, one_key);
+                        let _ = responder.send(step);
+                    }
+                    ShardMessage::AsmDumpAbort { task } => {
+                        crate::shard::abort_migration_image(task);
                     }
                     ShardMessage::AsmLoadExt {
                         records,

@@ -15,6 +15,14 @@ or the persistence format; such changes are called out under **Breaking**.
 - `repl-diskless-sync` is honoured: with `no`, a master doesn't use dual-channel replication, as in
   Redis (it always streams the full sync itself). It was accepted and ignored.
 
+### Changed
+
+- An atomic slot migration's source builds the slots' snapshot a step at a time, between its other
+  work, instead of serializing all their keys at once: the shard keeps answering (it answered
+  nothing for about 5 s per GB of keys), and holds at most 64 MB of the snapshot ahead of the
+  destination instead of all of it. Writes to keys not dumped yet dump them first, so the
+  snapshot stays point-in-time.
+
 ### Fixed
 
 - As in Redis, the AOF buffers don't count toward `maxmemory`, so a burst of writes with AOF on
