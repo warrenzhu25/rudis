@@ -267,6 +267,7 @@ pub fn memory_doctor(r: &MemoryReport) -> String {
 /// Format memory section for INFO command.
 pub fn format_memory_info(
     used_mem: usize,
+    not_counted_for_evict: usize,
     (peak, peak_time): (u64, u64),
     max_mem: u64,
     cooled_keys: u64,
@@ -297,7 +298,7 @@ pub fn format_memory_info(
         used_memory_peak_perc:{:.2}%\r\n\
         maxmemory:{}\r\n\
         maxmemory_human:{}\r\n\
-        mem_not_counted_for_evict:0\r\n\
+        mem_not_counted_for_evict:{}\r\n\
         mem_fragmentation_ratio:{:.2}\r\n\
         mem_allocator:jemalloc\r\n\
         allocator_allocated:{}\r\n\
@@ -327,6 +328,7 @@ pub fn format_memory_info(
         },
         max_mem,
         crate::tiering::format_bytes_human(max_mem),
+        not_counted_for_evict,
         frag,
         stats.allocated,
         stats.active,

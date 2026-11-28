@@ -390,6 +390,7 @@ async fn open_aof_writer(
     match crate::aof::AofWriter::open(aof_path).await {
         Ok(mut w) => {
             w.set_progress(crate::aof::aof_progress(base_port, shard_id));
+            w.count_buffers_in(crate::tiering::get_tier_stats(base_port));
             Some(Rc::new(RefCell::new(w)))
         }
         Err(e) => fatal_startup_error(
@@ -3010,6 +3011,7 @@ pub(crate) async fn set_shard_appendonly(
             .await
             .map_err(|e| format!("shard {shard_id}: opening the AOF: {e}"))?;
         w.set_progress(crate::aof::aof_progress(base_port, shard_id));
+        w.count_buffers_in(crate::tiering::get_tier_stats(base_port));
         let writer = Rc::new(RefCell::new(w));
         slot.set(Some(writer.clone()));
         spawn_aof_flusher(slot.clone(), writer, base_port);

@@ -9,6 +9,10 @@ or the persistence format; such changes are called out under **Breaking**.
 
 ### Fixed
 
+- As in Redis, the AOF buffers don't count toward `maxmemory`, so a burst of writes with AOF on
+  no longer makes the server evict for its own buffers. `INFO memory` reports
+  `mem_not_counted_for_evict` (replication and AOF buffers; it was always 0), and `used_memory`
+  includes it: `used_memory - mem_not_counted_for_evict` is what `maxmemory` limits.
 - `CLUSTER SETSLOT MIGRATING|IMPORTING|STABLE` saves `nodes.conf`, as Redis does after every
   SETSLOT, and a node restarted in the middle of a reshard serves its open slots as open again
   (`-ASK` for keys already moved, `ASKING` honoured). Only `CLUSTER NODES` showed them after a

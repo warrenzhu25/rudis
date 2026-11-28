@@ -183,6 +183,18 @@ impl From<Option<std::rc::Rc<std::cell::RefCell<AofWriter>>>> for AofSlot {
 pub struct AofWriter {
     buffer: Vec<u8>,
     spare_buffer: Option<Vec<u8>>,
+    /// Capacity of the chunks `take_flush_chunk` handed out, until written.
+    inflight_bytes: usize,
+    /// Bytes of its buffers: appends waiting to be written, a spare buffer,
+    /// and chunks being written. Like Redis's AOF buffer they don't count
+    /// toward maxmemory: counted in its server's
+    /// [`crate::tiering::TieringStats::aof_buffer_bytes`] once attached to it
+    /// ([`Self::count_buffers_in`]).
+    counted_bytes: usize,
+    account: Option<std::sync::Arc<crate::tiering::TieringStats>>,
+    /// `buffer`'s capacity when last counted: appends recount only when it
+    /// grew.
+    counted_cap: usize,
     file: Option<std::rc::Rc<monoio::fs::File>>,
     path: PathBuf,
     offset: u64,
@@ -202,6 +214,17 @@ pub struct AofWriter {
     incr_path: Option<PathBuf>,
 }
 
+impl Drop for AofWriter {
+    fn drop(&mut self) {
+        if let Some(account) = &self.account {
+            account.aof_buffer_bytes.fetch_sub(
+                self.counted_bytes as i64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
 impl AofWriter {
     pub async fn open(path: PathBuf) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -216,6 +239,10 @@ impl AofWriter {
         Ok(Self {
             buffer: Vec::with_capacity(65536),
             spare_buffer: None,
+            inflight_bytes: 0,
+            counted_bytes: 0,
+            account: None,
+            counted_cap: 0,
             file: Some(std::rc::Rc::new(file)),
             path,
             offset,
@@ -254,6 +281,10 @@ impl AofWriter {
         Self {
             buffer: Vec::with_capacity(65536),
             spare_buffer: None,
+            inflight_bytes: 0,
+            counted_bytes: 0,
+            account: None,
+            counted_cap: 0,
             file: None,
             path: PathBuf::new(),
             offset: 0,
@@ -362,6 +393,9 @@ impl AofWriter {
     #[inline]
     fn note_appended(&mut self, before: usize) {
         self.appended_total += (self.buffer.len() - before) as u64;
+        if self.buffer.capacity() != self.counted_cap {
+            self.note_buffers();
+        }
         self.progress
             .appended
             .store(self.appended_total, std::sync::atomic::Ordering::Release);
@@ -377,6 +411,37 @@ impl AofWriter {
         self.buffer.extend_from_slice(
             format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{}\r\n", db_str.len(), db_str).as_bytes(),
         );
+    }
+
+    /// Recounts this writer's buffers (see [`Self::counted_bytes`]).
+    fn note_buffers(&mut self) {
+        self.counted_cap = self.buffer.capacity();
+        let now = self.counted_cap
+            + self.spare_buffer.as_ref().map_or(0, Vec::capacity)
+            + self.inflight_bytes;
+        if now != self.counted_bytes {
+            if let Some(account) = &self.account {
+                account.aof_buffer_bytes.fetch_add(
+                    now as i64 - self.counted_bytes as i64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            self.counted_bytes = now;
+        }
+    }
+
+    /// Counts this writer's buffers in `stats` (its server's) from now on.
+    pub fn count_buffers_in(&mut self, stats: std::sync::Arc<crate::tiering::TieringStats>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.note_buffers();
+        if let Some(old) = self.account.take() {
+            old.aof_buffer_bytes
+                .fetch_sub(self.counted_bytes as i64, Relaxed);
+        }
+        stats
+            .aof_buffer_bytes
+            .fetch_add(self.counted_bytes as i64, Relaxed);
+        self.account = Some(stats);
     }
 
     #[inline]
@@ -396,6 +461,7 @@ impl AofWriter {
     #[inline]
     pub fn chunk_written(&mut self, res: &std::io::Result<()>, chunk: Vec<u8>, offset: u64) {
         self.inflight = self.inflight.saturating_sub(1);
+        self.inflight_bytes = self.inflight_bytes.saturating_sub(chunk.capacity());
         match res {
             Ok(()) => {
                 self.recycle_chunk(chunk);
@@ -413,6 +479,7 @@ impl AofWriter {
                     .record_write(Err(e.raw_os_error().unwrap_or(libc::EIO)));
             }
         }
+        self.note_buffers();
     }
 
     #[inline]
@@ -429,6 +496,8 @@ impl AofWriter {
         let off = self.offset;
         self.offset += chunk.len() as u64;
         self.inflight += 1;
+        self.inflight_bytes += chunk.capacity();
+        self.note_buffers();
         Some((file, chunk, off))
     }
 
@@ -5719,6 +5788,54 @@ pub fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writer counts its buffers for `mem_not_counted_for_evict`: the
+    /// pending one, chunks being written, and the spare it keeps; dropping
+    /// it gives the bytes back.
+    #[test]
+    fn test_aof_buffers_are_counted_as_not_for_eviction() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        rt.block_on(async { aof_buffers_are_counted() });
+    }
+
+    fn aof_buffers_are_counted() {
+        let mut w = AofWriter::new_in_memory();
+        w.append(&vec![b'x'; 1 << 20]);
+        assert!(w.counted_bytes >= 1 << 20, "{}", w.counted_bytes);
+        assert_eq!(w.counted_bytes, w.buffer.capacity());
+        // Being written: still held, plus the new pending buffer.
+        w.file = Some(std::rc::Rc::new(
+            monoio::fs::File::from_std(tempfile_for_test()).unwrap(),
+        ));
+        let (_, chunk, off) = w.take_flush_chunk().unwrap();
+        let cap = chunk.capacity();
+        assert_eq!(w.counted_bytes, cap + w.buffer.capacity());
+        // Written: kept as the spare (up to 4 MB).
+        w.chunk_written(&Ok(()), chunk, off);
+        assert_eq!(w.counted_bytes, cap + w.buffer.capacity());
+        assert_eq!(w.inflight_bytes, 0);
+        drop(w);
+    }
+
+    fn tempfile_for_test() -> std::fs::File {
+        let p = std::env::temp_dir().join(format!(
+            "rudis-aof-count-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&p)
+            .unwrap();
+        let _ = std::fs::remove_file(&p);
+        f
+    }
 
     /// RESTORE is logged with its IDLETIME / FREQ, so a replica or an AOF
     /// reload restores the key's LRU / LFU data too (as Redis propagates

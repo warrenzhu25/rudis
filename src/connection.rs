@@ -14398,9 +14398,13 @@ pub(crate) async fn info_reply(router: &Router, section: Option<Bytes>, out: &mu
     let hub = crate::replication::cached_hub(router.base_port);
     let stats = crate::tiering::get_tier_stats(router.base_port);
     let max_mem = crate::tiering::get_max_memory(router.base_port);
-    let used_mem = router.get_total_used_memory().await;
+    // As in Redis, used_memory includes the memory maxmemory leaves out,
+    // and used_memory - mem_not_counted_for_evict is what it is held to.
+    let not_counted = stats.not_counted_for_evict().max(0) as usize;
+    let used_mem = router.get_total_used_memory().await + not_counted;
     let memory_str = crate::allocator::format_memory_info(
         used_mem,
+        not_counted,
         (
             stats.peak_used.load(std::sync::atomic::Ordering::Relaxed),
             stats.peak_time.load(std::sync::atomic::Ordering::Relaxed),

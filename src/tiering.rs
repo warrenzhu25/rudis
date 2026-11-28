@@ -64,6 +64,9 @@ pub struct TieringStats {
     /// process-wide `stats.allocated` while this is the only server in the
     /// process. Zero otherwise.
     pub unattributed: AtomicI64,
+    /// Bytes of this server's AOF buffers (see `aof::AofWriter`): like
+    /// Redis's AOF buffer they don't count toward maxmemory.
+    pub aof_buffer_bytes: AtomicI64,
     /// Full-sync snapshots being built or sent to replicas. Eviction
     /// pauses meanwhile (see [`SnapshotEvictionPause`]).
     pub snapshots_in_progress: std::sync::atomic::AtomicUsize,
@@ -128,6 +131,7 @@ impl Default for TieringStats {
                 .map(|_| crate::mailbox::CachePadded(ShardRealMem::default()))
                 .collect(),
             unattributed: AtomicI64::new(0),
+            aof_buffer_bytes: AtomicI64::new(0),
             snapshots_in_progress: std::sync::atomic::AtomicUsize::new(0),
             tier_shards_open: std::sync::atomic::AtomicUsize::new(0),
             real_accounting: AtomicBool::new(false),
@@ -223,9 +227,19 @@ impl TieringStats {
             .map(|(_, m)| m.net.load(Ordering::Relaxed) - m.slack.load(Ordering::Relaxed))
             .sum::<i64>()
             + self.unattributed.load(Ordering::Relaxed)
-            // Full-sync images' buffers don't count, like Redis's
-            // replication buffers.
-            - crate::shard::SYNC_IMAGE_BYTES.load(Ordering::Relaxed).max(0)
+            - self.not_counted_for_evict()
+    }
+
+    /// Memory that doesn't count toward maxmemory, as in Redis: replication
+    /// buffers (full-sync images, pieces in flight, replicas' output
+    /// buffers) and the AOF buffers. INFO reports it as
+    /// `mem_not_counted_for_evict`, and includes it in `used_memory`.
+    #[inline]
+    pub fn not_counted_for_evict(&self) -> i64 {
+        crate::shard::SYNC_IMAGE_BYTES
+            .load(Ordering::Relaxed)
+            .max(0)
+            + self.aof_buffer_bytes.load(Ordering::Relaxed).max(0)
     }
 
     /// Whether eviction is paused for a full-sync snapshot.

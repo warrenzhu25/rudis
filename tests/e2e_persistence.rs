@@ -6336,3 +6336,49 @@ fn test_multipart_aof_survives_kill9_rewrite_reshard_and_toggle_e2e() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// As in Redis, the AOF buffers don't count toward maxmemory: INFO reports
+/// them in mem_not_counted_for_evict (it said 0 whatever they held), and
+/// used_memory includes them.
+#[test]
+fn test_aof_buffers_are_reported_as_not_counted_for_evict_e2e() {
+    let port = 16901u16;
+    let dir = std::env::temp_dir().join(format!("rudis-aof-notcounted-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ps = port.to_string();
+    let srv = ServerGuard(spawn_rudis_listening(
+        &[
+            "--port",
+            &ps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--dir",
+            dir.to_str().unwrap(),
+            "--appendonly",
+            "yes",
+        ],
+        port,
+    ));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // A write on each shard: each shard's AOF buffer (64 KB) is in use.
+    for i in 0..64 {
+        assert_eq!(resp_cmd(&mut c, &["SET", &format!("k{i}"), "v"]), "+OK\r\n");
+    }
+    let info = resp_cmd_full(&mut c, &["INFO", "memory"]);
+    let field = |name: &str| -> u64 {
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("no {name}: {info}"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let not_counted = field("mem_not_counted_for_evict");
+    assert!(not_counted >= 2 * 65536, "{info}");
+    assert!(field("used_memory") > not_counted, "{info}");
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
