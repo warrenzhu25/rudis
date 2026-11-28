@@ -6387,8 +6387,7 @@ fn test_master_shutdown_waits_for_replicas_e2e() {
         wait_for_master_link(&mut r);
         assert_eq!(resp_cmd(&mut m, &["SET", "k", "1"]), "+OK\r\n");
         assert_eq!(resp_cmd(&mut m, &["WAIT", "1", "5000"]), ":1\r\n");
-        // SAFETY: kill(2) on our own live child.
-        unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGSTOP) };
+        stop_process(replica.id());
         assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":2\r\n");
         // SAFETY: as above.
         unsafe { libc::kill(master.id() as libc::pid_t, libc::SIGTERM) };
@@ -6533,8 +6532,7 @@ fn test_waitaof_counts_fsynced_copies_e2e() {
     );
 
     // WAIT 0 has no timeout: it blocks until the stopped replica acks.
-    // SAFETY: kill(2) on our own live child.
-    unsafe { libc::kill(aof_replica.id() as libc::pid_t, libc::SIGSTOP) };
+    stop_process(aof_replica.id());
     assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":4\r\n");
     m.write_all(b"*3\r\n$4\r\nWAIT\r\n$1\r\n2\r\n$1\r\n0\r\n")
         .unwrap();
@@ -6776,8 +6774,7 @@ fn test_failover_command_switches_master_and_replica_e2e() {
 
     // a's only replica (m) is stopped: the failover times out and aborts.
     wait_info(&mut a, "connected_slaves:1");
-    // SAFETY: kill(2) on our own live child.
-    unsafe { libc::kill(nodes[0].id() as libc::pid_t, libc::SIGSTOP) };
+    stop_process(nodes[0].id());
     assert_eq!(resp_cmd(&mut a, &["SET", "k", "3"]), "+OK\r\n");
     assert_eq!(resp_cmd(&mut a, &["FAILOVER", "TIMEOUT", "500"]), "+OK\r\n");
     assert!(
@@ -6863,8 +6860,7 @@ fn test_restarted_master_releases_an_unused_backlog_e2e() {
     // Restarts the master from its RDB with the replica stopped, runs
     // `between` on the new master, then lets the replica come back.
     let mut restart = |master: &mut std::process::Child, between: &dyn Fn(&mut TcpStream)| {
-        // SAFETY: kill(2) on our own live child.
-        unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGSTOP) };
+        stop_process(replica.id());
         let mut m = connect(mport);
         let _ = m.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$4\r\nSAVE\r\n");
         let _ = master.wait();
@@ -7394,7 +7390,10 @@ fn test_replication_backpressure_holds_writes_for_a_slow_replica_e2e() {
                 .status()
                 .unwrap()
                 .success()
-        )
+        );
+        if sig == "-STOP" {
+            wait_stopped(pid.parse().unwrap());
+        }
     };
     signal("-STOP");
     struct Cont(String);

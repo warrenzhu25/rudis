@@ -5171,8 +5171,7 @@ fn test_shutdown_abort_and_now_e2e() {
         "+OK\r\n"
     );
     wait_for_master_link(&mut r);
-    // SAFETY: kill(2) on our own live child.
-    unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGSTOP) };
+    stop_process(replica.id());
     assert_eq!(resp_cmd(&mut m, &["INCR", "k"]), ":1\r\n");
     let (mut s1, mut s2) = (connect(mport), connect(mport));
     for s in [&mut s1, &mut s2] {

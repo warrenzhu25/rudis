@@ -1900,3 +1900,42 @@ pub fn latency_bound(release_ms: u64) -> std::time::Duration {
         release_ms
     })
 }
+
+/// Stops process `pid` (SIGSTOP) and waits until it has stopped (see
+/// [`wait_stopped`]).
+#[allow(dead_code)]
+pub fn stop_process(pid: u32) {
+    // SAFETY: kill(2) takes no pointers; `pid` is a child of this test.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+    wait_stopped(pid);
+}
+
+/// Waits until every thread of `pid` is stopped, as Redis's tests'
+/// `pause_process` waits for state T. kill(2) only starts a stop: each
+/// thread stops on its own, and on a busy host one can keep running for a
+/// while (a replica "stopped" this way still acked a REPLCONF GETACK sent
+/// after the signal).
+#[allow(dead_code)]
+pub fn wait_stopped(pid: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let stopped = std::fs::read_dir(format!("/proc/{pid}/task")).map_or(true, |tasks| {
+            tasks.flatten().all(|t| {
+                let stat = std::fs::read_to_string(t.path().join("stat")).unwrap_or_default();
+                // The state follows the ")" closing the thread name.
+                matches!(
+                    stat.rsplit(") ").next().and_then(|r| r.split(' ').next()),
+                    Some("T" | "t") | None
+                )
+            })
+        });
+        if stopped {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process {pid} did not stop"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}

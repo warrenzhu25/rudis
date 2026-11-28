@@ -357,6 +357,9 @@ fn signal(server: &ServerGuard, sig: &str) {
         .status()
         .unwrap();
     assert!(status.success());
+    if sig == "-STOP" {
+        wait_stopped(server.id());
+    }
 }
 
 /// A cluster master cut off from the majority of masters (here: the other

@@ -13332,8 +13332,7 @@ fn test_repl_timeout_drops_silent_links_e2e() {
         }
     };
     // The master goes silent: the replica gives up on it.
-    // SAFETY: kill(2) on our own live child.
-    unsafe { libc::kill(master.id() as libc::pid_t, libc::SIGSTOP) };
+    stop_process(master.id());
     wait_for(&mut r, "master_link_status:down");
     // SAFETY: as above.
     unsafe { libc::kill(master.id() as libc::pid_t, libc::SIGCONT) };
@@ -13342,8 +13341,7 @@ fn test_repl_timeout_drops_silent_links_e2e() {
     // The replica goes silent: the master drops it.
     let mut m = connect(mport);
     wait_for(&mut m, "connected_slaves:1");
-    // SAFETY: as above.
-    unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGSTOP) };
+    stop_process(replica.id());
     wait_for(&mut m, "connected_slaves:0");
     // SAFETY: as above.
     unsafe { libc::kill(replica.id() as libc::pid_t, libc::SIGCONT) };

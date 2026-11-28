@@ -6019,6 +6019,9 @@ fn test_cluster_demoted_master_cannot_take_over_before_syncing_e2e() {
             .status()
             .is_ok_and(|s| s.success());
         assert!(ok, "kill {sig}");
+        if sig == "-STOP" {
+            wait_stopped(a_pid.parse().unwrap());
+        }
     };
     signal("-STOP");
     assert_eq!(
@@ -6149,6 +6152,9 @@ fn test_cluster_failover_of_a_frozen_master_converges_e2e() {
             .status()
             .is_ok_and(|s| s.success());
         assert!(ok, "kill {sig}");
+        if sig == "-STOP" {
+            wait_stopped(a_pid.parse().unwrap());
+        }
     };
     signal("-STOP");
     // r takes over, and every live node sees it own a's slots, ok.
