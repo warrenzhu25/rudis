@@ -170,7 +170,7 @@ augmented per-level span counters — see
 
 Redis clients expect exact, C-`printf`-compatible float formatting for scores. Rust's `Display`
 does not match this, so Rudis formats scores via `libc::snprintf` with `%.17g`
-(`format_score`, `src/connection.rs`), special-casing NaN, ±infinity, and signed zero
+(`format_score`, `src/connection/`), special-casing NaN, ±infinity, and signed zero
 (`-0.0` → `"0"`) to match Redis's exact reply strings.
 
 ---
@@ -195,7 +195,7 @@ notification-protocol detail: [`docs/design/06_blocking_hub.md`](design/06_block
 `MULTI` enters a per-connection queuing state (subsequent commands reply `+QUEUED` instead of
 executing); `DISCARD` clears it; `WATCH` registers optimistic-concurrency-control interest in a
 set of keys, aborting the transaction at `EXEC` time if a watched key changed; `EXEC` executes
-the queued commands. Transaction state lives in `src/connection.rs`. When a queued transaction
+the queued commands. Transaction state lives in `src/connection/`. When a queued transaction
 touches keys on more than one shard, execution must still produce a single atomic-looking
 batched reply without ever taking a cross-shard lock — for the concrete dispatch and ordering
 strategy Rudis uses to do this safely, see
@@ -253,7 +253,7 @@ network path today**. This is worth stating plainly rather than leaving to infer
   data structures. It is reachable only through explicit `XDP.*` admin commands; no code path
   makes a real `AF_XDP` socket syscall, loads an eBPF program, or binds to a NIC.
 - `src/zerocopy.rs` implements correct `SO_ZEROCOPY`/registered-buffer primitives, but the
-  real connection write path (`src/connection.rs`, on `monoio`) does not call into it.
+  real connection write path (`src/connection/`, on `monoio`) does not call into it.
 - Kernel TLS (kTLS) is **not implemented**. The former partial `enable_ktls` scaffolding (a
   `TCP_ULP` attach with no key install, whose result was discarded) has been removed; all TLS
   traffic is encrypted/decrypted in userspace by `rustls`.
@@ -301,7 +301,7 @@ and scheduling of that exchange is entirely outside Rudis today. Full detail:
 | Subsystem | Design Doc | Implementation Doc | Primary Source |
 | :--- | :--- | :--- | :--- |
 | **Reactor & Server Loop** | [01_reactor_runtime](design/01_reactor_runtime.md) | [01_reactor_runtime](internal/01_reactor_runtime.md) | `src/server.rs`, `src/main.rs` |
-| **Connection & Execution** | [02_connection_lifecycle](design/02_connection_lifecycle.md) | [02_connection_lifecycle](internal/02_connection_lifecycle.md) | `src/connection.rs` |
+| **Connection & Execution** | [02_connection_lifecycle](design/02_connection_lifecycle.md) | [02_connection_lifecycle](internal/02_connection_lifecycle.md) | `src/connection/` |
 | **RESP Engine** | [03_resp_engine](design/03_resp_engine.md) | [03_resp_engine](internal/03_resp_engine.md) | `src/resp.rs` |
 | **Sharding & Router Mesh** | [04_sharding_mesh](design/04_sharding_mesh.md) | [04_sharding_mesh](internal/04_sharding_mesh.md) | `src/router.rs`, `src/shard.rs`, `src/mailbox.rs` |
 | **Storage Engine & Encodings** | [05_storage_engine](design/05_storage_engine.md) | [05_storage_engine](internal/05_storage_engine.md) | `src/table.rs` |

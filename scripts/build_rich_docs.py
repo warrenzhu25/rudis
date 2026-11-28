@@ -39,7 +39,7 @@ SUBSYSTEMS = [
         "id": "02",
         "slug": "02_connection_lifecycle",
         "name": "Connection Lifecycle & Command Execution",
-        "files": "src/connection.rs",
+        "files": "src/connection/",
         "mental_model": (
             "A connection spends its entire lifetime pinned to the worker core that accepted it. It reads RESP "
             "command frames in batches, groups them by destination shard (pipeline squashing), and executes local "

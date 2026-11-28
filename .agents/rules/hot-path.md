@@ -1,6 +1,6 @@
 ---
 paths:
-  - "src/connection.rs"
+  - "src/connection/**"
   - "src/router.rs"
   - "src/mailbox.rs"
   - "src/shard.rs"
@@ -32,8 +32,9 @@ pooled reply descriptors). In review, check these concretely:
 
 ## File size
 
-`connection.rs` (~37k lines) and `table.rs` (~22k) are far past what anyone
-can review. Don't grow them with new subsystems:
+`src/connection/` (the dispatcher alone: `command.rs` ~8.5k lines,
+`local_command.rs` ~7k, `mod.rs` ~14.5k) and `table.rs` (~22k) are far past
+what anyone can review. Don't grow them with new subsystems:
 - a new feature gets its own module (`src/hotkeys.rs`, `src/asm.rs`,
   `src/slot_stats.rs`) and only a thin hook in the dispatcher;
 - a function that grows past ~100 lines gets split into named helpers, with
