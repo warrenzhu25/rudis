@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Known differences from Redis
+    url: https://github.com/warrenzhu25/rudis/blob/main/docs/differences.md
+    about: Check here first whether a difference is known and why.

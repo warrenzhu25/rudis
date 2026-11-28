@@ -1,0 +1,47 @@
+name: Bug report
+description: Something rudis does wrong, or differently from Redis.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The commands you ran and what rudis answered. What Redis (or Valkey) answers instead, if you know.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The smallest set of steps (redis-cli commands, a script, a config file) that shows it.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The first line of `rudis --version`, e.g. `rudis 0.1.0 (7e124cd0)`.
+    validations:
+      required: true
+  - type: dropdown
+    id: driver
+    attributes:
+      label: I/O driver
+      description: The `I/O Backend` line rudis logs at startup.
+      options:
+        - io_uring
+        - epoll (no io_uring, e.g. in Docker)
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup
+      description: OS and kernel (`uname -r`), threads (`--threads`), standalone / replication / cluster, AOF or RDB, and the client library if it matters.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and INFO
+      description: The server's log around the problem, and `INFO` output if relevant.
+      render: text

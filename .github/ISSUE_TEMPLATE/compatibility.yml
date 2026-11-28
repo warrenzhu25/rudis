@@ -1,0 +1,21 @@
+name: Compatibility gap
+description: A Redis command, option or behavior rudis lacks, or a client or tool that doesn't work with it.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What's missing
+      description: The command, CONFIG option, INFO field or behavior, and the Redis version that has it. Check docs/differences.md first; it lists the known differences.
+    validations:
+      required: true
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need it for
+      description: The client, tool or workload that hits it. This decides what gets done first.
+  - type: input
+    id: version
+    attributes:
+      label: rudis version
+      description: The first line of `rudis --version`.
